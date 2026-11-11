@@ -3,7 +3,8 @@
 import os
 
 import pytest
-from link_helpers import build_nested_link_repos_at
+from error_types import LOCAL_MODIFICATIONS, LocalChanges
+from link_helpers import build_nested_link_repos_at, link_pin
 from test_utils import unstaged_entries, working_tree_files
 
 pytestmark = pytest.mark.own_vfs(
@@ -304,6 +305,41 @@ def test_nested_link_update(new_lore_repo):
 
     fresh = repo_a.clone()
     assert fresh.file_exists(v2_only), "Re-pinned nested content should survive clone"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "staged_parent", [False, True], ids=["nothing staged", "parent staged"]
+)
+@pytest.mark.parametrize("edited", [False, True], ids=["unchanged", "edited"])
+def test_nested_link_update_refuses_only_a_local_change_it_would_overwrite(
+    new_lore_repo, staged_parent, edited
+):
+    """`link update` of a nested link refuses where re-pinning it would overwrite a local edit,
+    and only there, whatever the top-level repository has staged."""
+    repo_a, _repo_b, repo_c, _b_mount, nested_mount = build_nested_link_repos_at(
+        new_lore_repo, "vendor/b", "vendor/c"
+    )
+    c_v1 = repo_c.branch_info().local_latest
+    repo_c.write_commit_push("C v2", {"c-data/inner.txt": "C revision two\n"})
+    c_v2 = repo_c.branch_info().local_latest
+    inner = f"{nested_mount}/c-data/inner.txt"
+    if edited:
+        repo_a.write_files({inner: "locally edited\n"})
+    if staged_parent:
+        repo_a.write_files({"staged.txt": "staged\n"})
+        repo_a.stage("staged.txt")
+
+    if edited:
+        with pytest.raises(LocalChanges) as refused:
+            repo_a.link_update(nested_mount, pin=c_v2)
+        assert refused.value.returncode == LOCAL_MODIFICATIONS, refused.value
+    else:
+        repo_a.link_update(nested_mount, pin=c_v2)
+
+    with repo_a.open_file(inner) as f:
+        assert f.read() == ("locally edited\n" if edited else "C revision two\n")
+    assert link_pin(repo_a, repo_c.get_id()) == (c_v1 if edited else c_v2)
 
 
 @pytest.mark.smoke

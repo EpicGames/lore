@@ -4,7 +4,7 @@ import logging
 import os
 
 import pytest
-from error_types import NotInProgress
+from error_types import LocalChanges, NotInProgress
 
 from lore import Lore
 
@@ -926,3 +926,26 @@ def test_revert_oldest_commit(new_lore_repo):
     assert not repo.file_exists(test_file), (
         "File should be deleted after reverting the commit that created it"
     )
+
+
+@pytest.mark.smoke
+def test_revert_of_a_move_of_a_locally_edited_file_refuses(new_lore_repo):
+    """A revert of a revision that moved a file and changed its content moves it back, so an edit
+    at the path the revision moved it to is local work the revert refuses, and keeps."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"moved/from.txt": "base\n", "other.txt": "o\n"})
+    repo.move("moved/from.txt", "moved/to.txt")
+    repo.stage_move("moved/from.txt", "moved/to.txt")
+    repo.write_files({"moved/to.txt": "moved\n"})
+    repo.stage("moved/to.txt")
+    repo.commit("Move and modify")
+    repo.push()
+    moved = repo.branch_info().local_latest
+    repo.write_files({"moved/to.txt": "locally edited\n"})
+
+    with pytest.raises(LocalChanges):
+        repo.revision_revert(moved)
+
+    with repo.open_file("moved/to.txt") as f:
+        assert f.read() == "locally edited\n", "the refused revert should keep the edit"
+    assert not repo.file_exists("moved/from.txt")

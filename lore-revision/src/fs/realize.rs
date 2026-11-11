@@ -482,108 +482,181 @@ async fn holds_the_replaced_content(
     ))
 }
 
-/// How the working file compares to the node it was realized from, and whether the current
-/// revision is what holds that node.
+/// How the working file at `repository_path`, the path a change names or the one a move carries
+/// its file from, compares to the node it was realized from, and whether the current revision is
+/// what holds that node.
 ///
 /// A three-way merge's from side is the base revision, which answers for nothing on disk, so
 /// the node the current revision holds at the path stands in. Where the change starts at the
 /// current revision the two are the same node, reached by id rather than by path, and where
 /// the current revision holds none the from side is all there is. The node is measured in the
 /// context that holds it, whose partition its content lives in.
-async fn modification_against_measured_node(
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn modification_against_measured_node<'a>(
+    operation: &'a Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    change: &'a NodeChange,
+    current: &'a NodeMapping,
+    force_full_check: bool,
+    repository_path: &'a RelativePath,
+    established: &'a lore_storage::ContentHashes,
+) -> impl Future<Output = Result<crate::fs::filesystem_provider::FileModifiedCheck, SyncError>> + 'a
+{
+    async move {
+        let info = operation.file_info(repository_path).await?;
+        if !info.exists() {
+            return Ok(crate::fs::filesystem_provider::FileModifiedCheck {
+                info,
+                measured: None,
+                modification: None,
+            });
+        }
+
+        let from_is_current = change.from.mapping.state.revision() == current.state.revision();
+        let node_link = if from_is_current {
+            NodeLink::invalid()
+        } else {
+            current.node_at(repository_path).await
+        };
+
+        let (node, repository_measured, is_current) = if node_link.node.is_valid_node_id() {
+            let (repository_current, state_node) = node_link
+                .resolve(repository.clone(), current.state.clone())
+                .await
+                .forward_with::<SyncError, _>(|| {
+                    format!("Failed to deserialize state {}", node_link.revision)
+                })?;
+            let node = state_node
+                .node(repository_current.clone(), node_link.node)
+                .await
+                .forward::<SyncError>("Failed loading the node the current revision holds")?;
+            (Some(node), repository_current, true)
+        } else if change.from.mapping.node.is_valid_node_id() {
+            let node = change
+                .from
+                .get_node()
+                .await
+                .forward::<SyncError>("Failed to find node")?;
+            (
+                Some(node),
+                change.from.mapping.repository.clone(),
+                from_is_current,
+            )
+        } else {
+            (None, repository, from_is_current)
+        };
+
+        let modification = match node.as_ref() {
+            Some(node) if info.is_file() && node.is_file() => {
+                let modification = if force_full_check {
+                    state::file_modification(
+                        repository_measured,
+                        node,
+                        info.mtime(),
+                        info.size(),
+                        repository_path,
+                        true,
+                        operation,
+                        established,
+                    )
+                    .await
+                } else {
+                    state::file_modified_against_node(
+                        repository_measured,
+                        node,
+                        info.mtime(),
+                        info.size(),
+                        repository_path,
+                        is_current,
+                        operation,
+                        established,
+                    )
+                    .await
+                }
+                .forward::<SyncError>("Failed to check file modification")?;
+
+                Some(crate::fs::filesystem_provider::FileDifferenceFromNode {
+                    modified: modification.is_modified(),
+                    mode_differs: info.mode_differs_from(node.mode),
+                })
+            }
+            _ => None,
+        };
+
+        Ok(crate::fs::filesystem_provider::FileModifiedCheck {
+            info,
+            measured: node.map(|node| MeasuredNode { node, is_current }),
+            modification,
+        })
+    }
+}
+
+/// Whether the file at `source`, the path `change` relocates its file from, holds local work:
+/// content other than what it was realized from and what the change brings in.
+///
+/// Where the current revision holds the file at `source`, the realize renames it away and writes
+/// the incoming content over it where the change rewrites it, so an edit there would be lost or
+/// left at a path that never held it. Nothing there, or no file, holds none, and nor does a file
+/// the current revision holds no node for at `source`, as at the source of the current branch's
+/// own move in a three-way merge: that file is not the one the change carries.
+///
+/// Runs only for a change that relocates a file, a cold path its caller boxes: inline, the two
+/// comparisons would make the verify of every change as large as their own.
+async fn moved_file_holds_local_work(
     operation: &Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     change: &NodeChange,
     current: &NodeMapping,
     force_full_check: bool,
-    repository_path: &RelativePath,
-    established: &lore_storage::ContentHashes,
-) -> Result<crate::fs::filesystem_provider::FileModifiedCheck, SyncError> {
-    let info = operation.file_info(repository_path).await?;
-    if !info.exists() {
-        return Ok(crate::fs::filesystem_provider::FileModifiedCheck {
-            info,
-            measured: None,
-            modification: None,
-        });
+    source: &RelativePath,
+) -> Result<bool, SyncError> {
+    let established = lore_storage::ContentHashes::default();
+    let measured = modification_against_measured_node(
+        operation,
+        repository,
+        change,
+        current,
+        force_full_check,
+        source,
+        &established,
+    )
+    .await?;
+    let carried = measured
+        .measured
+        .as_ref()
+        .is_some_and(|measured| measured.is_current);
+    if !carried
+        || !measured
+            .modification
+            .is_some_and(|difference| difference.modified)
+    {
+        return Ok(false);
     }
 
-    let from_is_current = change.from.mapping.state.revision() == current.state.revision();
-    let node_link = if from_is_current {
-        NodeLink::invalid()
-    } else {
-        current.node_at(change.path()).await
-    };
-
-    let (node, repository_measured, is_current) = if node_link.node.is_valid_node_id() {
-        let (repository_current, state_node) = node_link
-            .resolve(repository.clone(), current.state.clone())
-            .await
-            .forward_with::<SyncError, _>(|| {
-                format!("Failed to deserialize state {}", node_link.revision)
-            })?;
-        let node = state_node
-            .node(repository_current.clone(), node_link.node)
-            .await
-            .forward::<SyncError>("Failed loading the node the current revision holds")?;
-        (Some(node), repository_current, true)
-    } else if change.from.mapping.node.is_valid_node_id() {
-        let node = change
-            .from
-            .get_node()
-            .await
-            .forward::<SyncError>("Failed to find node")?;
-        (
-            Some(node),
-            change.from.mapping.repository.clone(),
-            from_is_current,
-        )
-    } else {
-        (None, repository, from_is_current)
-    };
-
-    let modification = match node.as_ref() {
-        Some(node) if info.is_file() && node.is_file() => {
-            let modification = if force_full_check {
-                state::file_modification(
-                    repository_measured,
-                    node,
-                    info.mtime(),
-                    info.size(),
-                    change.path(),
-                    true,
-                    operation,
-                    established,
-                )
-                .await
-            } else {
-                state::file_modified_against_node(
-                    repository_measured,
-                    node,
-                    info.mtime(),
-                    info.size(),
-                    change.path(),
-                    is_current,
-                    operation,
-                    established,
-                )
-                .await
-            }
-            .forward::<SyncError>("Failed to check file modification")?;
-
-            Some(crate::fs::filesystem_provider::FileDifferenceFromNode {
-                modified: modification.is_modified(),
-                mode_differs: info.mode_differs_from(node.mode),
-            })
-        }
-        _ => None,
-    };
-
-    Ok(crate::fs::filesystem_provider::FileModifiedCheck {
-        info,
-        measured: node.map(|node| MeasuredNode { node, is_current }),
-        modification,
-    })
+    let incoming = change
+        .to
+        .get_node()
+        .await
+        .forward::<SyncError>("Failed loading the node the change brings in")?;
+    let comparison = state::file_matches_node(
+        change.to.mapping.repository.clone(),
+        &incoming,
+        measured.info.size(),
+        source,
+        operation,
+        &established,
+    )
+    .await
+    .forward::<SyncError>("Failed to compare the file to the incoming node")?;
+    match comparison {
+        NodeComparison::Matches => Ok(false),
+        NodeComparison::Differs => Ok(true),
+        NodeComparison::Unreadable => Err(SyncError::internal(format!(
+            "Failed to read {source} to compare it against the incoming revision"
+        ))),
+    }
 }
 
 /// Carries the executable bit `wanted` names onto `path`, which is all a change whose content
@@ -824,6 +897,28 @@ pub async fn verify_filesystem(
     incoming: &IncomingMoves,
 ) -> Result<bool, SyncError> {
     lore_trace!("Verify path: {change:?}");
+    if let Some(source) = change.relocated_from()
+        && change.from.flags.contains(NodeFlags::File)
+        && Box::pin(moved_file_holds_local_work(
+            &operation,
+            repository.clone(),
+            change,
+            &current,
+            force_full_check,
+            source,
+        ))
+        .await?
+    {
+        if forward_changes && !realizes_every_change {
+            lore_info!("Keeping the locally modified file a move carries away: {source}");
+            return Ok(false);
+        }
+        lore_error!(
+            "File has local changes: {source}, which the incoming revision moves to {}",
+            change.path()
+        );
+        return Err(LocalModifications.into());
+    }
     let repository_path = change.path().clone();
     // One file is measured against the node it was realized from, the incoming node and the
     // node the change starts at. What comparing it establishes serves all three.

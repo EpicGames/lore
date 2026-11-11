@@ -4,12 +4,20 @@ import logging
 import os
 import re
 import shutil
+import sys
 
 import pytest
-from error_types import LocalChanges, PathExistChildrenLinkError, PathExistLinkError
+from error_types import (
+    LOCAL_MODIFICATIONS,
+    LocalChanges,
+    PathExistChildrenLinkError,
+    PathExistLinkError,
+)
 from link_helpers import (
     DEFAULT_LINK_MOUNT,
+    DEFAULT_PARENT_FILE,
     assert_mount_exposes,
+    link_pin,
     make_parent_with_link,
     make_parent_with_remount,
     make_repo,
@@ -1640,3 +1648,184 @@ def test_link_update_keeps_a_modified_case_variant_of_a_file_the_update_deletes(
 
     with parent_repo.open_file(variant) as f:
         assert f.read() == "locally edited\n"
+
+
+def _make_parent_with_pin_move(new_lore_repo) -> tuple[Lore, Lore, str, str]:
+    """Returns (parent_repo, link_repo, pin_one, pin_two): the parent links the linked repository
+    at `pin_one` and ignores `*.log`. `pin_two` modifies `mod.txt` and `tracked.log`, deletes
+    `gone.txt` and the directory `olddir`, moves `moved/from.txt` to `moved/to.txt` with other
+    content and `moved/plain.txt` to `moved/plain-to.txt` as it is, adds `added.txt` and
+    `added.log`, and leaves `keep.txt` as it is."""
+    parent_repo, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_files={
+            "keep.txt": "keep\n",
+            "mod.txt": "one\n",
+            "tracked.log": "one\n",
+            "gone.txt": "one\n",
+            "olddir/x.txt": "one\n",
+            "moved/from.txt": "one\n",
+            "moved/plain.txt": "plain\n",
+        },
+        parent_files={DEFAULT_PARENT_FILE: "baseline\n", ".loreignore": "*.log\n"},
+    )
+    pin_one = link_repo.branch_info().local_latest
+    for source, destination in [
+        ("moved/from.txt", "moved/to.txt"),
+        ("moved/plain.txt", "moved/plain-to.txt"),
+    ]:
+        link_repo.move(source, destination)
+        link_repo.stage_move(source, destination)
+    link_repo.remove_file("gone.txt")
+    link_repo.rmtree("olddir")
+    link_repo.write_files(
+        {
+            "mod.txt": "two\n",
+            "tracked.log": "two\n",
+            "moved/to.txt": "two\n",
+            "added.txt": "two\n",
+            "added.log": "two\n",
+        }
+    )
+    link_repo.stage(scan=True)
+    link_repo.commit("Pin two")
+    link_repo.push()
+    return parent_repo, link_repo, pin_one, link_repo.branch_info().local_latest
+
+
+def _stage_in_parent(parent_repo: Lore):
+    """Stages a file of the parent's own, outside the link."""
+    parent_repo.write_files({"staged.txt": "staged\n"})
+    parent_repo.stage("staged.txt")
+
+
+STAGED_PARENT = pytest.mark.parametrize(
+    "staged_parent", [False, True], ids=["nothing staged", "parent staged"]
+)
+
+
+@pytest.mark.smoke
+@STAGED_PARENT
+@pytest.mark.parametrize(
+    "variant",
+    [None, "keep.txt", "mod.txt"],
+    ids=[
+        "as pinned",
+        "a case variant of a file the update leaves alone",
+        "a case variant of a file the update modifies",
+    ],
+)
+def test_link_update_of_a_link_without_local_changes(
+    new_lore_repo, staged_parent, variant
+):
+    """A link with no local change updates, whatever the parent has staged. A file spelled in
+    another case holding the pinned content is no local change: on a file system that folds case
+    it is the pinned file, and on one that does not, the update writes the pinned spelling beside
+    it."""
+    parent_repo, link_repo, _, pin_two = _make_parent_with_pin_move(new_lore_repo)
+    if variant:
+        parent_repo.move(
+            f"{DEFAULT_LINK_MOUNT}/{variant}",
+            f"{DEFAULT_LINK_MOUNT}/{variant.upper()}",
+        )
+    if staged_parent:
+        _stage_in_parent(parent_repo)
+
+    parent_repo.link_update(DEFAULT_LINK_MOUNT, pin=pin_two)
+
+    assert link_pin(parent_repo, link_repo.get_id()) == pin_two
+    for path in ["moved/to.txt", "mod.txt"]:
+        with parent_repo.open_file(f"{DEFAULT_LINK_MOUNT}/{path}") as f:
+            assert f.read() == "two\n", "the mount should hold the revision updated to"
+    if staged_parent:
+        assert status_by_path(parent_repo)["staged.txt"].get("flagStaged") is True, (
+            "the update should keep what the parent has staged"
+        )
+
+
+@pytest.mark.smoke
+@STAGED_PARENT
+@pytest.mark.parametrize(
+    "edited",
+    [
+        "mod.txt",
+        "gone.txt",
+        "moved/from.txt",
+        "moved/plain.txt",
+        "tracked.log",
+        "added.txt",
+        "added.log",
+    ],
+    ids=[
+        "a file the update modifies",
+        "a file the update deletes",
+        "a file the update moves and modifies",
+        "a file the update moves",
+        "a file the update modifies that the ignore file names",
+        "an untracked file where the update adds one",
+        "an untracked file the ignore file names where the update adds one",
+    ],
+)
+def test_link_update_refuses_a_local_change_it_would_overwrite(
+    new_lore_repo, staged_parent, edited
+):
+    """A local change the new pin would overwrite or delete refuses the update, whatever the
+    parent has staged and whatever the ignore file names, and the change and the pin stay as
+    they were."""
+    parent_repo, link_repo, pin_one, pin_two = _make_parent_with_pin_move(new_lore_repo)
+    edited_path = f"{DEFAULT_LINK_MOUNT}/{edited}"
+    parent_repo.write_files({edited_path: "locally edited\n"})
+    if staged_parent:
+        _stage_in_parent(parent_repo)
+
+    with pytest.raises(LocalChanges) as refused:
+        parent_repo.link_update(DEFAULT_LINK_MOUNT, pin=pin_two)
+
+    assert refused.value.returncode == LOCAL_MODIFICATIONS, refused.value
+    with parent_repo.open_file(edited_path) as f:
+        assert f.read() == "locally edited\n", "the refused update should keep the edit"
+    assert link_pin(parent_repo, link_repo.get_id()) == pin_one
+
+
+@pytest.mark.smoke
+@STAGED_PARENT
+@pytest.mark.parametrize(
+    "local",
+    [
+        "keep.txt",
+        "untracked.txt",
+        "olddir/untracked.txt",
+        pytest.param(
+            "MOD.txt",
+            marks=pytest.mark.skipif(
+                sys.platform != "linux", reason="Requires case-sensitive filesystem"
+            ),
+        ),
+    ],
+    ids=[
+        "an edit to a file the update leaves alone",
+        "an untracked file",
+        "an untracked file in a directory the update deletes",
+        "an edit to a case variant of a file the update modifies",
+    ],
+)
+def test_link_update_keeps_a_local_change_it_leaves_alone(
+    new_lore_repo, staged_parent, local
+):
+    """A local change the new pin neither overwrites nor deletes stays as it is through the
+    update, whatever the parent has staged."""
+    parent_repo, link_repo, _, pin_two = _make_parent_with_pin_move(new_lore_repo)
+    if local == "MOD.txt":
+        parent_repo.move(
+            f"{DEFAULT_LINK_MOUNT}/mod.txt", f"{DEFAULT_LINK_MOUNT}/MOD.txt"
+        )
+    local_path = f"{DEFAULT_LINK_MOUNT}/{local}"
+    parent_repo.write_files({local_path: "locally edited\n"})
+    if staged_parent:
+        _stage_in_parent(parent_repo)
+
+    parent_repo.link_update(DEFAULT_LINK_MOUNT, pin=pin_two)
+
+    assert link_pin(parent_repo, link_repo.get_id()) == pin_two
+    with parent_repo.open_file(local_path) as f:
+        assert f.read() == "locally edited\n", "the update should keep the local change"

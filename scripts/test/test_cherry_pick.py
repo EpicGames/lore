@@ -5,7 +5,7 @@ import os
 
 import pytest
 
-from error_types import NotInProgress
+from error_types import LocalChanges, NotInProgress
 from lore import Lore
 
 logger = logging.getLogger(__name__)
@@ -1446,3 +1446,28 @@ def test_cherry_pick_default_commit_message(new_lore_repo):
     assert cherry_picked_revision.message == feature_message, (
         "Cherry-pick should use the source commit message when --message is not provided. "
     )
+
+
+@pytest.mark.smoke
+def test_cherry_pick_of_a_move_of_a_locally_edited_file_refuses(new_lore_repo):
+    """A cherry-pick of a revision that moves a file the working tree edited, and changes its
+    content, refuses and keeps the edit at the path the file moves from."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"moved/from.txt": "base\n", "other.txt": "o\n"})
+    repo.branch_create("move-file")
+    repo.move("moved/from.txt", "moved/to.txt")
+    repo.stage_move("moved/from.txt", "moved/to.txt")
+    repo.write_files({"moved/to.txt": "incoming\n"})
+    repo.stage("moved/to.txt")
+    repo.commit("Move and modify")
+    repo.push()
+    moved = repo.branch_info().local_latest
+    repo.branch_switch("main")
+    repo.write_files({"moved/from.txt": "locally edited\n"})
+
+    with pytest.raises(LocalChanges):
+        repo.revision_cherry_pick(moved)
+
+    with repo.open_file("moved/from.txt") as f:
+        assert f.read() == "locally edited\n", "the refused cherry-pick should keep the edit"
+    assert not repo.file_exists("moved/to.txt")

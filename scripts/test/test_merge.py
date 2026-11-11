@@ -1545,3 +1545,28 @@ def test_merge_file_and_folder_both_added(new_lore_repo, current, outcome):
     kept = current if outcome in ("mine", "abort") else incoming
     assert repo.read_files() == {"root.txt": "root\n", **holds[kept]}
     assert not parse_status_json(repo.status(scan=True, json=True))
+
+
+@pytest.mark.smoke
+def test_merge_of_a_move_of_a_locally_edited_file_refuses(new_lore_repo):
+    """A merge bringing a move of a file the working tree edited, which also changes its content,
+    refuses and keeps the edit at the path the file moves from."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"moved/from.txt": "base\n", "other.txt": "o\n"})
+    repo.branch_create("move-file")
+    repo.move("moved/from.txt", "moved/to.txt")
+    repo.stage_move("moved/from.txt", "moved/to.txt")
+    repo.write_files({"moved/to.txt": "incoming\n"})
+    repo.stage("moved/to.txt")
+    repo.commit("Move and modify")
+    repo.push()
+    repo.branch_switch("main")
+    repo.write_commit_push("Main", {"other.txt": "main\n"})
+    repo.write_files({"moved/from.txt": "locally edited\n"})
+
+    with pytest.raises(LocalChanges):
+        repo.branch_merge("move-file", message="Merge move-file")
+
+    with repo.open_file("moved/from.txt") as f:
+        assert f.read() == "locally edited\n", "the refused merge should keep the edit"
+    assert not repo.file_exists("moved/to.txt")

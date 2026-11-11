@@ -97,3 +97,11 @@ def revision_metadata_keys(repo: "Lore") -> set[str]:
     """The keys of the current revision's metadata."""
     events = parse_jsonl(repo.revision_metadata_get(json=True), "metadata")
     return {event["key"] for event in events}
+
+
+def registered_links(repo: "Lore") -> dict[str, str]:
+    """The link registry of `repo`, as the linked repository each link path names."""
+    return {
+        entry["linkPath"]: entry["link"]
+        for entry in parse_jsonl(repo.link_list(json=True), "linkEntry")
+    }

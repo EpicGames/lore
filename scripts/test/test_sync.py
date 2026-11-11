@@ -687,6 +687,66 @@ def _read_bytes(repo: Lore, name: str) -> bytes:
         return f.read()
 
 
+def _commit_move(repo: Lore, modified: bool):
+    """Commits and pushes a move of `moved/from.txt` to `moved/to.txt`, with other content where
+    `modified`."""
+    repo.move("moved/from.txt", "moved/to.txt")
+    repo.stage_move("moved/from.txt", "moved/to.txt")
+    if modified:
+        repo.write_files({"moved/to.txt": "incoming\n"})
+        repo.stage("moved/to.txt")
+    repo.commit("Move")
+    repo.push()
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("modified", [False, True], ids=["move", "move and modify"])
+def test_sync_refuses_a_move_of_a_locally_edited_file(new_lore_repo, modified):
+    """An edit at the path an incoming move carries a file from is local work, refused as an
+    edit at the path it moves to is, whether or not the move changes the content."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"moved/from.txt": "base\n", "other.txt": "o\n"})
+    clone: Lore = repo.clone()
+    _commit_move(repo, modified)
+    clone.write_files({"moved/from.txt": "locally edited\n"})
+
+    with pytest.raises(LocalChanges):
+        clone.sync()
+
+    with clone.open_file("moved/from.txt") as f:
+        assert f.read() == "locally edited\n", "the refused sync should keep the edit"
+    assert not clone.file_exists("moved/to.txt")
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="Requires case-sensitive filesystem"
+)
+def test_sync_refuses_a_directory_rename_in_case_onto_a_locally_edited_file(
+    new_lore_repo,
+):
+    """An edit to a file in a directory an incoming move renames in case, which changes the file
+    too, is local work the sync refuses, and keeps. The file's change is no move of its own, so
+    the sync finds the edit at the path the file stood at below the renamed directory."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"dir/a.txt": "base\n", "dir/b.txt": "b\n"})
+    clone: Lore = repo.clone()
+    repo.move("dir", "Dir")
+    repo.stage_move("dir", "Dir")
+    repo.write_files({"Dir/a.txt": "incoming\n"})
+    repo.stage("Dir/a.txt")
+    repo.commit("Rename the directory in case")
+    repo.push()
+    clone.write_files({"dir/a.txt": "locally edited\n"})
+
+    with pytest.raises(LocalChanges):
+        clone.sync()
+
+    with clone.open_file("dir/a.txt") as f:
+        assert f.read() == "locally edited\n", "the refused sync should keep the edit"
+    assert not clone.path_exists("Dir")
+
+
 @pytest.mark.smoke
 def test_sync_aborted_by_local_change_writes_nothing(new_lore_repo):
     """A sync verifies every incoming change against the file system before it writes any

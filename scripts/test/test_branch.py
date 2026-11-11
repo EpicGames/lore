@@ -813,6 +813,30 @@ def test_switch_to_branch_deleting_dir_with_local_modified_file(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_switch_to_branch_moving_a_locally_edited_file_refuses(new_lore_repo):
+    """A switch to a branch that moves a file the working tree edited, and changes its content,
+    refuses and keeps the edit at the path the file moves from."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Initial commit", {"moved/from.txt": "base\n"})
+    repo.branch_create("move-file")
+    repo.move("moved/from.txt", "moved/to.txt")
+    repo.stage_move("moved/from.txt", "moved/to.txt")
+    repo.write_files({"moved/to.txt": "incoming\n"})
+    repo.stage("moved/to.txt")
+    repo.commit("Move and modify")
+    repo.push()
+    repo.branch_switch("main")
+    repo.write_files({"moved/from.txt": "locally edited\n"})
+
+    with pytest.raises(LocalChanges):
+        repo.branch_switch("move-file")
+
+    with repo.open_file("moved/from.txt") as f:
+        assert f.read() == "locally edited\n", "the refused switch should keep the edit"
+    assert not repo.file_exists("moved/to.txt")
+
+
+@pytest.mark.smoke
 def test_switch_to_branch_deleting_dir_with_local_added_file(new_lore_repo):
     """Locally-added (untracked) file in a doomed directory should not block the
     switch — the verifier is meant to keep locally-added files. Confirms the

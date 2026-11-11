@@ -64,7 +64,8 @@ struct Staged {
     mode: u16,
 }
 
-/// A state holding `node` at `path`, under a revision of its own.
+/// A state holding `node` at `path`, below the directories `path` names, under a revision of its
+/// own.
 async fn state_holding(
     repository: &Arc<RepositoryContext>,
     path: &RelativePath,
@@ -73,6 +74,25 @@ async fn state_holding(
 ) -> Staged {
     let state = State::new();
     state.set_revision(lore_base::types::Hash::from([revision; 32]));
+    let mut directory = RelativePathBuf::new();
+    for name in path
+        .parent()
+        .into_iter()
+        .flat_map(|parent| parent.split('/'))
+    {
+        directory.push(name);
+        lore_revision::stage::stage_single_node(
+            repository.clone(),
+            state.clone(),
+            directory.clone().freeze(),
+            Node::new_zeroed(),
+            Arc::default(),
+            None,
+            FilterMode::Full,
+        )
+        .await
+        .expect("stage the directory");
+    }
     let link = lore_revision::stage::stage_single_node(
         repository.clone(),
         state.clone(),
@@ -748,6 +768,210 @@ async fn a_move_of_unchanged_content_is_realized() {
             .expect("a clean file is not a failure")
             .is_some(),
             "A move must reach realize even where the content is already in place"
+        );
+    }))
+    .await;
+}
+
+/// How a verified change relocates a file: its action and the paths it carries the file from and
+/// to, and what the verify is asked to do with local work.
+struct Relocation {
+    action: FileAction,
+    from: &'static str,
+    to: &'static str,
+    /// Keep local work rather than refuse it.
+    forward_changes: bool,
+    /// The caller realizes every change, whatever the verify answers, as a merge does.
+    realizes_every_change: bool,
+    /// The change starts at a base revision, as a three-way merge's does, and the current
+    /// revision holds the file at the destination alone, as the current branch's own move leaves
+    /// it.
+    current_at_destination: bool,
+}
+
+/// A move of `from.bin` to `to.bin`.
+const MOVE: Relocation = Relocation {
+    action: FileAction::Move,
+    from: "from.bin",
+    to: "to.bin",
+    forward_changes: false,
+    realizes_every_change: false,
+    current_at_destination: false,
+};
+
+/// What the verify answers for `relocation`, starting at the current revision, which holds
+/// `realized` at the source, and bringing in `incoming`, where the working tree holds `working`
+/// at the source, or nothing there for `None`. A relocation from a base revision starts there
+/// instead, with the current revision and the working tree holding `incoming` at the destination.
+async fn verify_relocation(
+    relocation: Relocation,
+    working: Option<&[u8]>,
+    realized: &[u8],
+    incoming: &[u8],
+) -> Result<bool, SyncError> {
+    let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+    let repository = working_tree_repository(dir.path()).await;
+    let (from, to) = (relative(relocation.from), relative(relocation.to));
+    if let Some(working) = working {
+        if let Some(parent) = from.parent() {
+            std::fs::create_dir_all(dir.path().join(parent)).expect("the source's directory");
+        }
+        write_working_file(&repository, &from, working).await;
+    }
+    let start = state_holding(&repository, &from, file_node(realized), 1).await;
+    let target = state_holding(&repository, &to, file_node(incoming), 2).await;
+    let current = if relocation.current_at_destination {
+        write_working_file(&repository, &to, incoming).await;
+        &state_holding(&repository, &to, file_node(incoming), 3).await
+    } else {
+        &start
+    };
+    let operation = repository
+        .file_system()
+        .begin_operation()
+        .await
+        .expect("filesystem operation");
+    let mut change = NodeChange {
+        action: relocation.action,
+        flags: change::Flags::None,
+        from: side(&repository, &start, from),
+        to: side(&repository, &target, to),
+    };
+    Box::pin(verify_filesystem(
+        &mut change,
+        repository.clone(),
+        operation,
+        NodeMapping::root(repository.clone(), current.state.clone()),
+        relocation.forward_changes,
+        relocation.realizes_every_change,
+        false,
+        Arc::default(),
+        FilterMode::Full,
+        &IncomingMoves::new(Arc::default()),
+    ))
+    .await
+}
+
+/// An edit at the path a move carries a file from is local work, whether or not the move
+/// changes the content, and the move is refused.
+#[tokio::test]
+async fn a_move_of_a_locally_edited_file_is_refused() {
+    Box::pin(with_execution(async {
+        let realized = pseudo_random_bytes(20 * 1024, 0);
+        let edited = pseudo_random_bytes(20 * 1024, 1);
+        for incoming in [realized.clone(), pseudo_random_bytes(20 * 1024, 2)] {
+            let verified = verify_relocation(MOVE, Some(&edited), &realized, &incoming).await;
+            assert!(
+                is_local_modifications(&verified),
+                "an edit the move carries away must refuse it, got {verified:?}"
+            );
+        }
+    }))
+    .await;
+}
+
+/// A source holding what it was realized from, the content the move brings in, or nothing at
+/// all holds no local work, and the move is realized.
+#[tokio::test]
+async fn a_move_of_a_file_holding_no_local_work_is_realized() {
+    Box::pin(with_execution(async {
+        let realized = pseudo_random_bytes(20 * 1024, 0);
+        let incoming = pseudo_random_bytes(20 * 1024, 1);
+        for working in [Some(&realized[..]), Some(&incoming[..]), None] {
+            assert!(
+                verify_relocation(MOVE, working, &realized, &incoming)
+                    .await
+                    .expect("a source holding no local work is not a failure"),
+                "the move must reach realize"
+            );
+        }
+    }))
+    .await;
+}
+
+/// Keeping local changes keeps an edit a move would carry away, and leaves the move unrealized.
+#[tokio::test]
+async fn a_move_of_a_locally_edited_file_is_dropped_when_keeping_local_changes() {
+    Box::pin(with_execution(async {
+        let realized = pseudo_random_bytes(20 * 1024, 0);
+        let edited = pseudo_random_bytes(20 * 1024, 1);
+        let incoming = pseudo_random_bytes(20 * 1024, 2);
+        let keeping = Relocation {
+            forward_changes: true,
+            ..MOVE
+        };
+        assert!(
+            !verify_relocation(keeping, Some(&edited), &realized, &incoming)
+                .await
+                .expect("an edit kept is not a failure"),
+            "the move must not reach realize"
+        );
+    }))
+    .await;
+}
+
+/// A caller that realizes every change it verifies cannot keep an edit a move would carry away,
+/// so the move is refused even where keeping local changes is asked for.
+#[tokio::test]
+async fn a_move_of_a_locally_edited_file_is_refused_where_every_change_is_realized() {
+    Box::pin(with_execution(async {
+        let realized = pseudo_random_bytes(20 * 1024, 0);
+        let edited = pseudo_random_bytes(20 * 1024, 1);
+        let incoming = pseudo_random_bytes(20 * 1024, 2);
+        let realizing = Relocation {
+            forward_changes: true,
+            realizes_every_change: true,
+            ..MOVE
+        };
+        let verified = verify_relocation(realizing, Some(&edited), &realized, &incoming).await;
+        assert!(
+            is_local_modifications(&verified),
+            "an edit the move carries away must refuse it, got {verified:?}"
+        );
+    }))
+    .await;
+}
+
+/// A file below a directory a move renamed is carried from the path it stood at, so an edit
+/// there is local work the change is refused for.
+#[tokio::test]
+async fn a_change_below_a_renamed_directory_to_a_locally_edited_file_is_refused() {
+    Box::pin(with_execution(async {
+        let realized = pseudo_random_bytes(20 * 1024, 0);
+        let edited = pseudo_random_bytes(20 * 1024, 1);
+        let incoming = pseudo_random_bytes(20 * 1024, 2);
+        let below_renamed = Relocation {
+            action: FileAction::Keep,
+            from: "dir/a.bin",
+            to: "newdir/a.bin",
+            ..MOVE
+        };
+        let verified = verify_relocation(below_renamed, Some(&edited), &realized, &incoming).await;
+        assert!(
+            is_local_modifications(&verified),
+            "an edit below the renamed directory must refuse the change, got {verified:?}"
+        );
+    }))
+    .await;
+}
+
+/// A file at the source of the current branch's own move, which a three-way merge verifies, is
+/// none the current revision holds there, so the move carries nothing away from it and is
+/// realized.
+#[tokio::test]
+async fn an_untracked_file_at_the_source_of_the_current_branch_s_move_holds_no_local_work() {
+    Box::pin(with_execution(async {
+        let realized = pseudo_random_bytes(20 * 1024, 0);
+        let untracked = pseudo_random_bytes(20 * 1024, 1);
+        let incoming = pseudo_random_bytes(20 * 1024, 2);
+        let own_move = Relocation {
+            current_at_destination: true,
+            ..MOVE
+        };
+        let verified = verify_relocation(own_move, Some(&untracked), &realized, &incoming).await;
+        assert!(
+            matches!(verified, Ok(true)),
+            "an untracked file at the source must not refuse the move, got {verified:?}"
         );
     }))
     .await;

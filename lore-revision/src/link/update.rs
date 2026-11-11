@@ -10,8 +10,6 @@ use crate::errors::InvalidPath;
 use crate::errors::NotALink;
 use crate::event;
 use crate::filter::FilterMode;
-use crate::fs::filesystem_provider::FilesystemDiffIntent;
-use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreFileAction;
 use crate::link;
 use crate::link::LoreLinkChangeEventData;
@@ -21,7 +19,6 @@ use crate::lore_debug;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::stage;
-use crate::state;
 use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util::path::RelativePath;
@@ -85,44 +82,6 @@ pub(crate) async fn update(
     }
 
     let linked_node = link_node.child;
-
-    // TODO(vri): Verify filesystem in any case for local modifications
-    // Tree roots at the innermost node; filesystem path is the full link path.
-    if state_current.revision() != state_staged.revision() {
-        let changed = with_operation(repository.file_system(), async |operation| {
-            let linked_changes = state::diff_filesystem_subtree(
-                &operation,
-                NodeMapping {
-                    repository: inner_repository.clone(),
-                    state: inner_state.clone(),
-                    path: link_path.clone(),
-                    node: node_link.node,
-                },
-                NodeMapping {
-                    repository: inner_repository.clone(),
-                    state: inner_state.clone(),
-                    path: link_path.clone(),
-                    node: node_link.node,
-                },
-                link_path.clone(),
-                FilterMode::View,
-                FilesystemDiffIntent::Report,
-                std::sync::Arc::new(Vec::new()),
-            )
-            .await
-            .forward::<LinkError>("Failed to diff link with filesystem")?;
-            let changed = linked_changes
-                .any(|_change| true)
-                .await
-                .forward::<LinkError>("Failed to diff link with filesystem")?;
-            Ok::<_, LinkError>(changed)
-        })
-        .await?;
-
-        if changed {
-            return Err(LinkError::internal("Link has filesystem changes"));
-        }
-    }
 
     let link = repository
         .to_link_context(link_node.address.context.into())

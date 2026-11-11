@@ -67,6 +67,10 @@ class LocalModificationsError(LocalChanges):
     sites that catch `LocalChanges` keep working."""
 
 
+#: The exit status of a command refused by local modifications.
+LOCAL_MODIFICATIONS = 44
+
+
 class FileAlreadyExist(LoreException): ...
 
 

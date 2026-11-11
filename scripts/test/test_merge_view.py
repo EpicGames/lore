@@ -5,7 +5,7 @@ import os
 import shutil
 
 import pytest
-from lore_parsers import parse_jsonl
+from test_utils import registered_links
 
 from lore import Lore
 
@@ -339,14 +339,15 @@ def _merge_links_under_view(
     change_links,
     base_files: dict[str, str] | None = None,
     compare: bool = False,
+    follow_branches: bool = False,
 ) -> tuple[Lore, Lore]:
     """Merge main into a feature branch of a clone that holds `hidden/` out of
     view, after `change_links(repo, link_repo)` changes the links below `hidden/`
     on main. `base_files` join the base, and `base_links` mount the linked
-    repository in it, not following branches, so the merge's pass over the links
-    it holds leaves them alone and only the adopted subtree changes them. With
-    `compare`, the merge is pushed and checked against the same merge with no
-    view. Returns the clone and the linked repository."""
+    repository in it, not following branches unless `follow_branches` says so, so
+    the merge's pass over the links it holds leaves them alone and only the adopted
+    subtree changes them. With `compare`, the merge is pushed and checked against
+    the same merge with no view. Returns the clone and the linked repository."""
     repo: Lore = new_lore_repo()
     repo.write_commit_push(
         "base",
@@ -355,7 +356,12 @@ def _merge_links_under_view(
     link_repo: Lore = new_lore_repo()
     link_repo.write_commit_push("linked v1", {"linked.txt": "linked v1\n"})
     for link_path in base_links:
-        repo.link_add(link_path, link_repo.get_id(), "/", disable_branching=True)
+        repo.link_add(
+            link_path,
+            link_repo.get_id(),
+            "/",
+            disable_branching=not follow_branches,
+        )
     if base_links:
         repo.commit("base links")
         repo.branch_push()
@@ -385,14 +391,6 @@ def _merge_links_under_view(
     return clone, link_repo
 
 
-def _registered_links(repo: Lore) -> dict[str, str]:
-    """The link registry of `repo`, as the linked repository each link path names."""
-    return {
-        entry["linkPath"]: entry["link"]
-        for entry in parse_jsonl(repo.link_list(json=True), "linkEntry")
-    }
-
-
 @pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_merge_grafts_a_link_added_in_an_out_of_view_subtree(
@@ -409,7 +407,7 @@ def test_merge_grafts_a_link_added_in_an_out_of_view_subtree(
         lambda repo, link_repo: repo.link_add(link_path, link_repo.get_id(), "/"),
     )
 
-    links = _registered_links(clone)
+    links = registered_links(clone)
     assert links == {link_path: link_repo.get_id()}, (
         f"the adopted link has no link registry entry, the registry holds {links}"
     )
@@ -430,7 +428,7 @@ def test_merge_grafts_a_link_removed_in_an_out_of_view_subtree(
         lambda repo, _: repo.link_remove(link_path),
     )
 
-    links = _registered_links(clone)
+    links = registered_links(clone)
     assert links == {}, (
         f"the removed link kept its link registry entry, the registry holds {links}"
     )
@@ -453,10 +451,75 @@ def test_merge_grafts_a_link_moved_in_an_out_of_view_subtree(
         new_lore_repo, scratch_dir, ["hidden/plugins/old"], move_link
     )
 
-    links = _registered_links(clone)
+    links = registered_links(clone)
     assert links == {"hidden/plugins/new": link_repo.get_id()}, (
         f"the moved link is not registered at its new path alone, the registry holds {links}"
     )
+
+
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("old_path", "new_path"),
+    [
+        ("hidden/plugins/old", None),
+        ("hidden/plugins/old", "plugins/new"),
+        pytest.param(
+            "plugins/old",
+            "hidden/plugins/new",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="the graft registers the added link while the in-view link the merge "
+                "removes still holds its row, and fails with Link divergence",
+            ),
+        ),
+    ],
+    ids=[
+        "removed out of view",
+        "removed out of view and added in view",
+        "removed in view and added out of view",
+    ],
+)
+def test_merge_of_a_link_removed_with_incoming_changes_under_a_view(
+    new_lore_repo, scratch_dir, old_path, new_path
+):
+    """A link following branches, which the merged branch removes out of view while its
+    repository has incoming changes, leaves the merge, alone or beside a link the branch adds to
+    the same repository in view, which stands at the pin the branch gives it. An in-view removal
+    beside an out-of-view addition is the failure the xfail names."""
+
+    def change_links(repo: Lore, link_repo: Lore):
+        link_repo.write_commit_push("linked v2", {"linked.txt": "linked v2\n"})
+        repo.link_remove(old_path)
+        if new_path:
+            repo.link_add(new_path, link_repo.get_id(), "/")
+
+    clone, link_repo = _merge_links_under_view(
+        new_lore_repo,
+        scratch_dir,
+        [old_path],
+        change_links,
+        follow_branches=True,
+    )
+
+    links = registered_links(clone)
+    expected = {new_path: link_repo.get_id()} if new_path else {}
+    assert links == expected, (
+        f"the merge should leave the link registry as {expected}, it holds {links}"
+    )
+    assert not clone.path_exists(old_path)
+    if new_path:
+        assert clone.path_exists(new_path) == (not new_path.startswith("hidden/")), (
+            "the added link should be materialized where the view holds it"
+        )
+    clone.branch_push()
+    verify = clone.clone(branch="feature-branch")
+    assert not verify.path_exists(old_path)
+    if new_path:
+        with verify.open_file(f"{new_path}/linked.txt") as input_file:
+            assert input_file.read() == "linked v2\n", (
+                "the added link should expose the revision the merged branch pins"
+            )
 
 
 @pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
@@ -484,7 +547,7 @@ def test_merge_grafts_a_directory_replaced_by_a_link_in_an_out_of_view_subtree(
         compare=True,
     )
 
-    links = _registered_links(clone)
+    links = registered_links(clone)
     assert links == {link_path: link_repo.get_id()}, (
         f"the link in place of the directory is not registered, the registry holds {links}"
     )
@@ -510,7 +573,7 @@ def test_merge_grafts_a_link_replaced_by_a_directory_in_an_out_of_view_subtree(
         new_lore_repo, scratch_dir, [link_path], replace_with_directory, compare=True
     )
 
-    links = _registered_links(clone)
+    links = registered_links(clone)
     assert links == {}, (
         f"the link the directory replaced is still registered, the registry holds {links}"
     )

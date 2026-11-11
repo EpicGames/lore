@@ -2546,6 +2546,11 @@ Updating the link to a different revision is an explicit `link update` operation
 produces a new parent revision; the previous parent revision still pins the previous
 linked revision.
 
+A merge of the parent carries its link changes as the parent's diff records them. A link
+the merged branch removes is removed, and its repository is not merged. A link the merged
+branch adds keeps the pin it was given. A link the merged branch moves is merged where it
+moves to.
+
 #### 22.4 Link-scoped commit and single-link merge
 
 By default, commits and merges in Lore cascade through the parent and any linked

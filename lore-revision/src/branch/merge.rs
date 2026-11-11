@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashSet;
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -462,7 +463,9 @@ struct MergeSource {
     current_signature: Hash,
 }
 
-/// `current` is the revision the merge starts from, at the path the working tree holds it.
+/// Merges the latest of `source_branch` into `current_signature` on `current_branch`, checked
+/// against the working tree, and stages the result. `current` is the revision the merge starts
+/// from, at the path the working tree holds it.
 #[allow(clippy::too_many_arguments)]
 async fn merge_repository(
     repository: Arc<RepositoryContext>,
@@ -1193,8 +1196,8 @@ struct PlannedLinkMerge<'a> {
 /// will be applied to the parent's staged state in a subsequent step.
 struct MergedLink {
     link_path: String,
-    /// Cached `RelativePath` form of `link_path` so the post-loop blocks
-    /// don't re-parse it for every `stage_link_pin` call.
+    /// `link_path` as a `RelativePath`, which `finalize_link_conflict_state` stages the pin at.
+    /// `finalize_main_merge` stages it at the path `link::merged_link_path` resolves instead.
     link_path_rel: RelativePath,
     link_node: Node,
     link_context: Arc<RepositoryContext>,
@@ -1442,10 +1445,11 @@ async fn seed_resumed_merged_links(
 ///
 /// Reads top-down: enumerate eligible links, load existing
 /// `LinkMergeState` for resume detection, seed `merged_links` for any
-/// already-merged entries, check the merge of each remaining eligible link
-/// and of the main repository against the working copy, write each link's
-/// merge in turn, and finalize either as a merge-in-conflict (if any link
-/// conflicted) or by writing the main repository's merge.
+/// already-merged entries, check the main repository's merge against the
+/// working tree, skip the links its diff removes, check the merge of each remaining
+/// eligible link, write each link's merge in turn, and finalize either as a
+/// merge-in-conflict (if any link conflicted) or by writing the main
+/// repository's merge.
 async fn merge_start_all(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -1474,6 +1478,19 @@ async fn merge_start_all(
     let mut has_link_conflicts = false;
     let mut pending_conflict_realizes: Vec<PendingConflictRealize> = Vec::new();
 
+    // The main repository's merge starts from `state_current` whatever the links' merges
+    // write, so it is checked here, before any of theirs is written, and its diff decides which
+    // links the merge removes.
+    let main_merge = check_merge(
+        &repository,
+        branch,
+        current_branch,
+        state_current.revision(),
+        NodeMapping::root(repository.clone(), state_current.clone()),
+    )
+    .await?;
+    let removed_links = links_the_merge_removes(&main_merge, &eligible_links);
+
     let mut planned_links = Vec::new();
     for eligible in &eligible_links {
         // Resume: already merged on a prior pass.
@@ -1483,6 +1500,14 @@ async fn merge_start_all(
         {
             lore_debug!(
                 "Resuming: skipping already-merged link at {}",
+                eligible.link_path
+            );
+            continue;
+        }
+
+        if removed_links.contains(&eligible.link_reference.local_node) {
+            lore_info!(
+                "Skipping link at {}, which the merged branch removes",
                 eligible.link_path
             );
             continue;
@@ -1578,16 +1603,6 @@ async fn merge_start_all(
         });
     }
 
-    // The main repository's merge starts from `state_current` whatever the links' merges
-    // write, so it is checked here, before any of theirs is written.
-    let main_merge = check_merge(
-        &repository,
-        branch,
-        current_branch,
-        state_current.revision(),
-        NodeMapping::root(repository.clone(), state_current.clone()),
-    )
-    .await?;
     let merged_nodes: Vec<NodeID> = merged_links
         .iter()
         .map(|merged| merged.link_reference.local_node)
@@ -1719,6 +1734,25 @@ async fn merge_start_all(
     .await
 }
 
+/// The nodes of the links among `eligible` whose node `main_merge`'s diff deletes, as
+/// [`link::merge_deletes_link`] decides it.
+fn links_the_merge_removes(
+    main_merge: &PreparedMerge,
+    eligible: &[EligibleLink],
+) -> HashSet<NodeID> {
+    eligible
+        .iter()
+        .filter(|link| {
+            link::merge_deletes_link(
+                &main_merge.diff.changes,
+                &link.link_path,
+                link.link_context.id,
+            )
+        })
+        .map(|link| link.link_reference.local_node)
+        .collect()
+}
+
 /// Finalize the parent staged state when at least one linked merge produced
 /// file conflicts. Stages all merged link pins onto the parent, realizes
 /// conflict markers + sidecars on disk, persists the merge metadata, and
@@ -1814,12 +1848,19 @@ async fn finalize_link_conflict_state(
 
 /// Finalize the parent merge: apply `main_merge`, apply collected link pin
 /// updates to its staged state, persist, and auto-commit if no conflicts.
+///
+/// A link merged in its own right takes the pin its merge produced where the merged state holds
+/// its node, at the path a move of the node, as a rename in case, or of a directory above it
+/// carries it to; the pin of one the merge removes or replaces is dropped. Among those is a link
+/// removed inside an out-of-view subtree the merge adopts whole, which the diff sets apart: its
+/// repository is merged first, and that merge is left out here. A per-link message for a link the
+/// merge removes is left out of the commit the merge makes.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_main_merge(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     branch: BranchId,
-    options: MergeStartOptions,
+    mut options: MergeStartOptions,
     state_current: Arc<State>,
     current_branch: BranchId,
     main_merge: PreparedMerge,
@@ -1841,13 +1882,40 @@ async fn finalize_main_merge(
     )
     .await?;
 
-    if !dry_run {
-        for merged in merged_links {
+    let staged_links = link::LinkRows::read(&state_staged, repository.clone())
+        .await
+        .forward::<MergeError>("listing the merged links")?;
+    let mut merged_nodes: Vec<NodeID> = Vec::with_capacity(merged_links.len());
+    let mut left_out: HashSet<NodeID> = HashSet::new();
+    for merged in merged_links {
+        let link_path = link::merged_link_path(
+            &repository,
+            &staged_links,
+            merged.link_reference.local_node,
+            merged.link_context.id,
+            merged.link_reference.resolve_branch(current_branch),
+            current_branch,
+        )
+        .await
+        .forward_with::<MergeError, _>(|| {
+            format!("locating the merged link {}", merged.link_path)
+        })?;
+        let Some(link_path) = link_path else {
+            lore_info!(
+                "The merge removes or replaces link {}, which leaves out the merge of its \
+                 repository",
+                merged.link_path
+            );
+            left_out.insert(merged.link_reference.local_node);
+            continue;
+        };
+        merged_nodes.push(merged.link_reference.local_node);
+        if !dry_run {
             link::stage_link_pin(
                 repository.clone(),
                 &state_staged,
                 &merged.link_context,
-                merged.link_path_rel.clone(),
+                link_path,
                 merged.link_node,
                 merged.link_reference.signature,
                 merged.new_signature,
@@ -1861,14 +1929,17 @@ async fn finalize_main_merge(
             })?;
         }
     }
+    // A link the merge removes or replaces keeps no row for the link merge state to restore it
+    // through, and the parent's abort restores it.
+    let link_merge_entries: Vec<LinkMergeEntry> = link_merge_entries
+        .iter()
+        .filter(|entry| !left_out.contains(&entry.local_node))
+        .copied()
+        .collect();
 
     // Links merged above already carry the pin their own merge produced. The
     // comparison runs on a dry run too, so `--dry-run` reports a row the real
     // merge would refuse.
-    let merged_nodes: Vec<NodeID> = merged_links
-        .iter()
-        .map(|merged| merged.link_reference.local_node)
-        .collect();
     let state_base = state::State::deserialize(repository.clone(), endpoints.base)
         .await
         .forward::<MergeError>("deserializing diff base state")?;
@@ -1897,7 +1968,7 @@ async fn finalize_main_merge(
 
         if !link_merge_entries.is_empty() {
             state_staged
-                .serialize_link_merge_state(repository.clone(), link_merge_entries)
+                .serialize_link_merge_state(repository.clone(), &link_merge_entries)
                 .await
                 .forward::<MergeError>("serializing link merge state")?;
         }
@@ -1924,10 +1995,39 @@ async fn finalize_main_merge(
     }
 
     if !has_conflicts && !dry_run && !options.no_commit {
+        if !options.link_messages.is_empty() {
+            Box::pin(leave_out_messages_of_links_gone(
+                &repository,
+                &state_staged,
+                &mut options.link_messages,
+            ))
+            .await?;
+        }
         return auto_commit_merge(repository, token, options).await;
     }
 
     Ok(state_staged.revision())
+}
+
+/// Leaves out of `link_messages` each message whose path `state_staged`, the merge's result,
+/// holds no link at, as for a link the merge removes, which the commit the merge makes would
+/// refuse. A cold path its caller boxes, taken only where per-link messages were given.
+async fn leave_out_messages_of_links_gone(
+    repository: &Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    link_messages: &mut std::collections::HashMap<String, String>,
+) -> Result<(), MergeError> {
+    for (path, message) in std::mem::take(link_messages) {
+        if link::holds_link_at(state_staged, repository, &path)
+            .await
+            .forward::<MergeError>("resolving a link message path")?
+        {
+            link_messages.insert(path, message);
+        } else {
+            lore_info!("Leaving out the message for link {path}, which the merge removes");
+        }
+    }
+    Ok(())
 }
 
 async fn validate_link_messages(
