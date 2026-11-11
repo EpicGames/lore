@@ -1295,6 +1295,31 @@ impl InstanceOperationImpl {
             "Unable to hold a revision through an operation that holds no State",
         ))
     }
+
+    /// Reads the ignore file at the root of the revision the provider serves into the local store,
+    /// where the provider holds its state in a `State` ([`FilesystemProvider::holds_state`]), so a
+    /// command run offline finds it. A failure is left for the next command to report. Other
+    /// providers read the ignore file from the working tree, and nothing is read here, nor in a dry
+    /// run.
+    #[lore_macro::test_pub]
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
+    pub(crate) async fn warm_held_ignore_file(&self) {
+        if self.dry_run {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch
+            && self.holds_state
+        {
+            this.filesystem().warm_ignore_file().await;
+        }
+        #[cfg(feature = "test-util")]
+        if let StaticDispatchInstanceOperation::Test(this) = &self.dispatch
+            && self.holds_state
+        {
+            this.warm_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 impl InstanceOperation for InstanceOperationImpl {
@@ -1735,8 +1760,8 @@ pub mod test_util {
     pub type StoredCalls = Arc<Mutex<Vec<(String, Address, u64, u16, bool)>>>;
 
     /// Answers the reads and the directory create these tests make, refuses each rename, and
-    /// records each finalize, `stored` and `committed` call, hold and recursive removal. Every
-    /// other member panics.
+    /// records each finalize, `stored` and `committed` call, hold, warm-up of the held ignore file
+    /// and recursive removal. Every other member panics.
     pub struct TestOperation {
         pub file_info_count: Arc<AtomicUsize>,
         pub holds_name_count: Arc<AtomicUsize>,
@@ -1753,6 +1778,9 @@ pub mod test_util {
         /// Whether the provider holds no file at any path.
         pub content_source_missing: bool,
         pub hold_calls: HoldCalls,
+        /// How many times the held ignore file was read into the store
+        /// ([`InstanceOperationImpl::warm_held_ignore_file`]).
+        pub warm_count: Arc<AtomicUsize>,
         pub stored_calls: StoredCalls,
         pub committed_calls: CommittedCalls,
         /// Whether each `committed` call fails.

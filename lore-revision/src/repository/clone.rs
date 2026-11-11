@@ -1611,21 +1611,21 @@ fn refuse_on_held_state(
     Err(hold::refused("restrict a clone to a dependency set").into())
 }
 
-/// The short-circuit `clone_materialize` takes when the provider holds its state in a `State`
-/// ([`InstanceOperationImpl::holds_state`]): hands it `ctx.state` to hold
-/// ([`InstanceOperationImpl::hold_state`]) instead of walking a tree that does not exist, then
-/// starts the background prefetch that `ctx.options` asks for and returns without waiting for
-/// it. The provider loads whatever the prefetch has not yet warmed on demand.
+/// Hands a provider that holds its state in a `State` ([`InstanceOperationImpl::holds_state`])
+/// `ctx.state` to hold ([`InstanceOperationImpl::hold_state`]) instead of walking a tree that does
+/// not exist, then starts the background prefetch that `ctx.options` asks for and returns without
+/// waiting for it, answering whether it held. The provider loads whatever the prefetch has not
+/// yet warmed on demand.
 ///
 /// A bare clone, or one of an empty repository, hands it nothing, as either writes no tree, and
 /// so does a dry run.
 #[lore_macro::test_pub]
-async fn clone_materialize_hold(ctx: &CloneContext) -> Result<(), CloneError> {
+async fn clone_materialize_hold(ctx: &CloneContext) -> Result<bool, CloneError> {
     if ctx.options.bare || ctx.state.revision().is_zero() {
-        return Ok(());
+        return Ok(false);
     }
     if execution_context().globals().dry_run() {
-        return Ok(());
+        return Ok(false);
     }
     ctx.operation
         .hold_state(
@@ -1639,7 +1639,7 @@ async fn clone_materialize_hold(ctx: &CloneContext) -> Result<(), CloneError> {
     if !plan.is_empty() {
         ctx.operation.start_prefetch(plan);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Caches `state`'s own records, and with `file_metadata` its file metadata blocks, in a task of
@@ -1652,6 +1652,23 @@ fn spawn_fragment_cache(
     let repository = repository.clone();
     let state = state.clone();
     lore_spawn!(async move { state.cache_fragments(repository, file_metadata).await })
+}
+
+/// Clones onto a provider that holds its state in a `State`: [`clone_materialize_hold`], then,
+/// where it held, caches the state's records ([`spawn_fragment_cache`]), so the state reads and
+/// commits offline, and reads the held ignore file into the store meanwhile
+/// ([`InstanceOperationImpl::warm_held_ignore_file`]). Answers the caching task.
+#[lore_macro::test_pub]
+async fn clone_onto_held_state(
+    ctx: &CloneContext,
+) -> Result<Option<tokio::task::JoinHandle<Result<(), crate::state::StateError>>>, CloneError> {
+    if !clone_materialize_hold(ctx).await? {
+        return Ok(None);
+    }
+    let cache_task =
+        spawn_fragment_cache(&ctx.repository, &ctx.state, ctx.options.cache_file_metadata);
+    ctx.operation.warm_held_ignore_file().await;
+    Ok(Some(cache_task))
 }
 
 /// Materializes `revision` in the working tree and records it, and `branch_id`, as the instance's
@@ -1674,17 +1691,7 @@ async fn clone_materialize(
     let mut cache_task = None;
 
     if ctx.operation.holds_state() {
-        clone_materialize_hold(&ctx).await?;
-        // The tree loads on demand, but the state's own records, and the file metadata blocks
-        // where asked, are made local as an ordinary clone makes them, so the state reads and
-        // commits offline.
-        if !options.bare && !revision.is_zero() {
-            cache_task = Some(spawn_fragment_cache(
-                &repository,
-                &state,
-                options.cache_file_metadata,
-            ));
-        }
+        cache_task = clone_onto_held_state(&ctx).await?;
     } else if !options.bare && !revision.is_zero() {
         lore_info!("Pull state {revision}");
         let correlation_id = execution_context().globals().correlation_id.to_string();

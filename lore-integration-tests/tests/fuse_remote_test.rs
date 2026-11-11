@@ -2787,6 +2787,7 @@ mod fuse_remote_tests {
     use lore_revision::repository::clone::CloneContext;
     use lore_revision::repository::clone::CloneOptions;
     use lore_revision::repository::clone::clone_materialize_hold;
+    use lore_revision::repository::clone::clone_onto_held_state;
     use lore_revision::repository::prefetch::TreePrefetch;
     use lore_revision::state::State;
     use lore_revision::state::StateNodeChildrenWithNameIterator;
@@ -3459,6 +3460,110 @@ mod fuse_remote_tests {
                     .expect("recording");
                 clone.publish_and_prefetch().await;
                 clone.assert_warmed(&skipped).await;
+                clone.unmount().await;
+            })
+            .await;
+    }
+
+    /// A clone's hold reads none of the root's ignore file, and the warm-up after it reads the file
+    /// into the store, so a command run offline finds it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_warm_up_after_a_hold_reads_the_ignore_file_into_the_store() {
+        skip_without_fuse!();
+        LORE_CONTEXT
+            .scope(execution("held-ignore-file"), async move {
+                let tree = vec![vec![
+                    (".loreignore".to_string(), b"*.held-warm-up\n".to_vec()),
+                    ("top.txt".to_string(), b"top".to_vec()),
+                ]];
+                let clone = vfs_clone(&tree, None, prefetch_options(TreePrefetch::Off, None)).await;
+                clone_materialize_hold(&clone.context)
+                    .await
+                    .expect("the clone publishes");
+                assert!(
+                    !clone.content_local(".loreignore").await,
+                    "the hold reads the ignore file"
+                );
+                clone.context.operation.warm_held_ignore_file().await;
+                assert!(
+                    clone.content_local(".loreignore").await,
+                    "the warm-up reads the ignore file into the store"
+                );
+                clone.unmount().await;
+            })
+            .await;
+    }
+
+    /// A clone onto a mount starts its prefetch before it reads the root's ignore file, and returns
+    /// once that read has stored the file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_clone_starts_its_prefetch_before_it_reads_the_ignore_file() {
+        skip_without_fuse!();
+        LORE_CONTEXT
+            .scope(execution("held-clone-ignore-file"), async move {
+                let recording = lore_base::test_util::TempFile::with_contents(
+                    "lore-fuse-recording-",
+                    b"keep/held-clone.txt\n",
+                );
+                let mut tree = prefetch_tree();
+                tree[0].push((".loreignore".to_string(), b"*.held-clone\n".to_vec()));
+                tree[0].push((
+                    "keep/held-clone.txt".to_string(),
+                    b"held by the clone order test".to_vec(),
+                ));
+                let clone = vfs_clone(
+                    &tree,
+                    None,
+                    prefetch_options(TreePrefetch::Off, Some(recording.path())),
+                )
+                .await;
+                let mut held = Vec::new();
+                for path in [".loreignore", "keep/held-clone.txt"] {
+                    let node = clone
+                        .served_state
+                        .find_node(clone.served_repository.clone(), path)
+                        .await
+                        .expect("a served file");
+                    held.push(node.address.hash);
+                }
+                let ignore_file = held[0];
+                clone.store.hold_hashes(held);
+                let cache_task = {
+                    let mut cloned = std::pin::pin!(clone_onto_held_state(&clone.context));
+                    let asked = async {
+                        while !clone.store.has_arrived(&ignore_file) {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = &mut cloned => panic!("the clone returns before the ignore file is stored"),
+                        asked = tokio::time::timeout(Duration::from_secs(10), asked) => {
+                            asked.expect("the clone asks the remote for the ignore file");
+                        }
+                    }
+                    assert!(
+                        clone.filesystem.prefetch_running(),
+                        "the prefetch starts before the ignore file is read"
+                    );
+                    clone.store.release();
+                    tokio::time::timeout(Duration::from_secs(10), cloned)
+                        .await
+                        .expect("the clone returns once the remote answers")
+                        .expect("the clone publishes")
+                        .expect("the clone caches the state's records")
+                };
+                cache_task
+                    .await
+                    .expect("the caching task")
+                    .expect("the state's records cache");
+                assert!(
+                    clone.content_local(".loreignore").await,
+                    "the ignore file is stored"
+                );
+                tokio::time::timeout(PREFETCH_WAIT, clone.filesystem.prefetch_finished())
+                    .await
+                    .expect("the prefetch finishes once the remote answers");
                 clone.unmount().await;
             })
             .await;

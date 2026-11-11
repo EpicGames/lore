@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Hash;
@@ -43,6 +44,8 @@ async fn two_committed_states(
 struct SyncOutcome {
     result: Result<(), SyncError>,
     holds: Vec<(Hash, HoldOptions)>,
+    /// How many times the held ignore file was read into the store.
+    warms: usize,
     file_infos: usize,
     target: Hash,
 }
@@ -66,23 +69,25 @@ async fn sync_onto(
             let filesystem = Arc::new(filesystem);
             let repository =
                 test_repository_over(immutable_store, mutable_store, filesystem.clone());
-            let operation = repository.file_system().begin_operation().await.unwrap();
+            let target = state_target.clone();
             let result = LORE_CONTEXT
-                .scope(
-                    test_execution_with(args),
+                .scope(test_execution_with(args), async move {
+                    let operation = repository.file_system().begin_operation().await.unwrap();
                     Box::pin(realize_state(
                         repository.clone(),
                         repository,
                         operation,
                         state_current,
-                        state_target.clone(),
+                        target,
                         options,
-                    )),
-                )
+                    ))
+                    .await
+                })
                 .await;
             SyncOutcome {
                 result,
                 holds: filesystem.hold_calls.lock().clone(),
+                warms: filesystem.warm_count.load(Ordering::SeqCst),
                 file_infos: filesystem.file_infos(),
                 target: state_target.revision(),
             }
@@ -91,7 +96,8 @@ async fn sync_onto(
 }
 
 /// A sync onto a provider holding its state hands it the target alone, once, reading nothing
-/// itself: the provider diffs and checks against the State it holds.
+/// itself: the provider diffs and checks against the State it holds. The sync then reads the held
+/// ignore file into the store once.
 #[tokio::test]
 async fn a_sync_hands_a_provider_holding_its_state_the_target_alone() {
     let outcome = sync_onto(
@@ -106,6 +112,7 @@ async fn a_sync_hands_a_provider_holding_its_state_the_target_alone() {
         outcome.holds
     );
     assert_eq!(0, outcome.file_infos, "the sync reads no path");
+    assert_eq!(1, outcome.warms, "the sync reads the held ignore file once");
 }
 
 /// A forced sync asks the provider to overwrite local changes.
@@ -148,7 +155,7 @@ async fn a_sync_forwarding_local_changes_holds_the_target_keeping_them() {
     assert_eq!(vec![(outcome.target, options)], outcome.holds);
 }
 
-/// A dry-run sync asks the provider for a dry run.
+/// A dry-run sync asks the provider for a dry run, and reads no ignore file into the store.
 #[tokio::test]
 async fn a_dry_run_sync_holds_the_target_in_a_dry_run() {
     let outcome = sync_onto(
@@ -166,9 +173,11 @@ async fn a_dry_run_sync_holds_the_target_in_a_dry_run() {
         ..Default::default()
     };
     assert_eq!(vec![(outcome.target, options)], outcome.holds);
+    assert_eq!(0, outcome.warms, "a dry run reads no ignore file");
 }
 
-/// A hold the provider refuses for local changes fails the sync with `LocalModifications`.
+/// A hold the provider refuses for local changes fails the sync with `LocalModifications`, and reads
+/// no ignore file into the store.
 #[tokio::test]
 async fn a_hold_refused_for_local_changes_fails_the_sync() {
     let outcome = sync_onto(
@@ -182,4 +191,5 @@ async fn a_hold_refused_for_local_changes_fails_the_sync() {
         "{:?}",
         outcome.result
     );
+    assert_eq!(0, outcome.warms, "a refused hold reads no ignore file");
 }

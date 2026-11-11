@@ -79,7 +79,8 @@ use crate::util::path::expand_path_ancestors;
 
 /// Carries the working tree from `state_current` to `state_target`. A provider that holds its
 /// state in a `State` is handed `state_target` alone and carries itself there
-/// ([`InstanceOperationImpl::hold_state`]).
+/// ([`InstanceOperationImpl::hold_state`]), then reads the held ignore file into the store
+/// (`InstanceOperationImpl::warm_held_ignore_file`).
 ///
 /// Each context answers for the state beside it: one for a revision change, and two for a view
 /// change, where the tree holds what the current view materialized and is left holding what the
@@ -148,10 +149,12 @@ pub async fn realize_state(
                 dry_run: globals.dry_run(),
             }
         };
-        return operation
+        operation
             .hold_state(repository_target, state_target, hold)
             .await
-            .forward::<SyncError>("Holding the target revision");
+            .forward::<SyncError>("Holding the target revision")?;
+        operation.warm_held_ignore_file().await;
+        return Ok(());
     }
 
     let stats: Arc<SyncRealizeStats> = Arc::default();

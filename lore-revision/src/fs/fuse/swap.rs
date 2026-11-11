@@ -867,16 +867,15 @@ impl HoldHost for Host<'_> {
 /// the served revision ([`hold::changes`]); after an apply that failed or was cancelled, the
 /// State may stand anywhere between the served revision and the targets of those applies, so
 /// the next swap also re-places each path they changed. The kernel is told of the changes the
-/// target's view shows. A hold that applied reads the ignore file it serves afterwards, so the
-/// next command finds it in the store ([`FuseFilesystem::warm_ignore_file`]); the swap does not
-/// wait on that read, which may wait on a listing build.
-pub async fn hold_mounted(
+/// target's view shows. Forwards `swap_through`'s future.
+#[inline]
+pub fn hold_mounted(
     fs: &FuseFilesystem,
     operation: &InstanceOperationImpl,
     repository: Arc<RepositoryContext>,
     target: Arc<State>,
     options: HoldOptions,
-) -> Result<(), FsError> {
+) -> impl Future<Output = Result<(), FsError>> {
     swap_through(
         fs,
         operation,
@@ -885,12 +884,6 @@ pub async fn hold_mounted(
         fs.notifications(),
         options,
     )
-    .await?;
-    if !options.dry_run {
-        // Boxed, as the read it makes would grow every hold's future.
-        Box::pin(fs.warm_ignore_file()).await;
-    }
-    Ok(())
 }
 
 /// [`swap`] through the mount's notification thread.
