@@ -12,6 +12,10 @@ mod case_folding;
 mod change;
 mod commit;
 mod dependency;
+/// The fixtures of the move tests, shared with the process-isolated tests of a commit's dirty
+/// moves.
+#[path = "../support/dirty_move_fixture.rs"]
+mod dirty_move_fixture;
 mod event;
 mod file;
 mod filter;

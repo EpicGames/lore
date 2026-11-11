@@ -3595,20 +3595,48 @@ impl State {
         }
         // Boxed: a walk reaches this only where the ignore rules would leave a node out, and
         // unboxed the revision's read would sit in every walk future that asks.
-        Box::pin(self.base_holds(repository, id, flags.node_type())).await
+        Box::pin(self.base_holds(repository, self.committed_revision(), id, flags.node_type()))
+            .await
     }
 
-    /// Whether the revision this tree was built on holds a node of `node_type` at `id`.
-    async fn base_holds(
+    /// Whether `base`, a revision this tree shares its node IDs with, holds a node of `node_type`
+    /// at `id`.
+    pub(crate) async fn base_holds(
         &self,
         repository: &Arc<RepositoryContext>,
+        base: Hash,
         id: NodeID,
         node_type: crate::interface::LoreNodeType,
     ) -> Result<bool, StateError> {
-        self.base(repository)
+        self.base(repository, base)
             .await?
             .holds_node(repository, id, node_type)
             .await
+    }
+
+    /// The parent `base`, a revision this tree shares its node IDs with, holds a node at `id` under;
+    /// `None` where it holds none there. Only the first read of `base` is boxed, as only it loads
+    /// the revision.
+    pub(crate) async fn base_parent(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        base: Hash,
+        id: NodeID,
+    ) -> Result<Option<NodeID>, StateError> {
+        let cached = self
+            .base
+            .lock()
+            .as_ref()
+            .filter(|(signature, _)| *signature == base)
+            .map(|(_, held)| held.clone());
+        let held = match cached {
+            Some(held) => held,
+            None => Box::pin(self.base(repository, base)).await?,
+        };
+        Ok(held
+            .node_in_use(repository, id)
+            .await?
+            .and_then(|(node, _)| (!node.is_discarded()).then_some(node.parent)))
     }
 
     /// Whether this tree tracks the node it holds at `id`, carrying `flags`, as a directory where
@@ -3639,9 +3667,19 @@ impl State {
             || (flags.contains(NodeFlags::Dirty) && self.tracks(repository, id, flags).await?))
     }
 
-    /// The revision this tree was built on, read once for each revision it is built on.
-    async fn base(&self, repository: &Arc<RepositoryContext>) -> Result<Arc<State>, StateError> {
-        let revision = self.committed_revision();
+    /// Holds `base`, the State of a revision this tree shares its node IDs with, as the one
+    /// [`Self::base`] answers for that revision, for a caller that has read it already.
+    pub(crate) fn hold_base(&self, base: Arc<State>) {
+        *self.base.lock() = Some((base.revision(), base));
+    }
+
+    /// The State of `revision`, a revision this tree shares its node IDs with, read once for as
+    /// long as it is the one asked for.
+    async fn base(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        revision: Hash,
+    ) -> Result<Arc<State>, StateError> {
         let cached = self
             .base
             .lock()
@@ -3666,14 +3704,270 @@ impl State {
         if id == ROOT_NODE {
             return Ok(true);
         }
+        Ok(self
+            .node_in_use(repository, id)
+            .await?
+            .is_some_and(|(node, _)| node.node_type() == node_type))
+    }
+
+    /// The record this tree holds at `id`, with its block; `None` where the slot holds no node.
+    async fn node_in_use(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        id: NodeID,
+    ) -> Result<Option<(Node, Arc<NodeBlock>)>, StateError> {
         let block_index = NodeBlock::index(id);
         if block_index >= self.tree(repository.clone()).await?.block_count as usize {
-            return Ok(false);
+            return Ok(None);
         }
         let block = self.block(repository.clone(), block_index).await?;
-        let reader = block.read();
         let index = Node::index(id);
-        Ok(reader.is_node_in_use(index) && reader.node(index).node_type() == node_type)
+        let node = {
+            let reader = block.read();
+            reader.is_node_in_use(index).then(|| *reader.node(index))
+        };
+        Ok(node.map(|node| (node, block)))
+    }
+
+    /// Moves `id`, which this tree holds marked dirty as moved and not staged, back to the parent
+    /// and name `base` holds it at, `base` being the revision this tree shares its node IDs with,
+    /// and answers what became of it, with the path it stood at where `want_path` asks for it and
+    /// it does not stand there already. `name` is a buffer the caller keeps across nodes.
+    ///
+    /// Where a node that may still leave holds the name, the node waits under the parent by a name
+    /// of its own ([`Return::Parked`]), so its own place, or a directory that is to be discarded,
+    /// holds it no longer. Asked again, it goes back once the name is free. A directory marked
+    /// dirty as added and not staged is such a holder: the caller discards it, unless it holds a
+    /// staged node, which stages it. A staged node holding the name, or a parent that is no live
+    /// directory, keeps the node out for good ([`Return::Displaced`]). A file marked dirty as added
+    /// and not staged does not keep it out: the caller discards each such file before it asks of
+    /// the name there again, so the two hold one name only until then.
+    ///
+    /// The caller asks of a node that holds no staged node, once it has asked of every node below
+    /// it. Each of those then stands under the directory `base` holds it in, is no node of `base`,
+    /// or has left the tree: only a move takes a node from that directory, and none below is
+    /// staged, so each moved one has gone back, waits there, or has left the tree. So the parent,
+    /// which `base` holds above the node, lies inside the node's subtree only where `base` holds a
+    /// cycle, which is an internal error.
+    ///
+    /// Nothing else changes the tree while this runs, so what the checks read stands when the
+    /// node moves ([`Self::node_move`] checks nothing). Only a node that does not stand where
+    /// `base` holds it takes the checks and the move, which are boxed: inline, they would sit in
+    /// the future of every node this is asked about.
+    pub(crate) async fn node_return_unstaged_move(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        base: Hash,
+        id: NodeID,
+        name: &mut String,
+        want_path: bool,
+    ) -> Result<(Return, Option<RelativePath>), StateError> {
+        let (parent, name_hash, flags, context) = {
+            let node = self.node(repository.clone(), id).await?;
+            if node.is_discarded() {
+                return Ok((Return::Gone, None));
+            }
+            (
+                node.parent,
+                node.name_hash,
+                NodeFlags::from_bits_retain(node.flags),
+                node.address.context,
+            )
+        };
+        let Some(committed) = self
+            .base_place(repository, (base, id), (flags, context), name)
+            .await?
+        else {
+            return Ok((Return::Stays, None));
+        };
+        let renamed =
+            name_hash != committed.1 || !self.node_name_is(repository.clone(), id, name).await?;
+        if parent == committed.0 && !renamed {
+            return Ok((Return::Stays, None));
+        }
+        let path = if want_path {
+            self.node_path_below(repository.clone(), id, ROOT_NODE)
+                .await?
+        } else {
+            None
+        };
+        let is_directory = !flags.intersects(NodeFlags::File | NodeFlags::Link);
+        let moved = (id, parent, is_directory);
+        let name = renamed.then_some(name.as_str());
+        let returned = Box::pin(self.node_return_to(repository, moved, committed, name)).await?;
+        Ok((returned, path))
+    }
+
+    /// Whether `id`, this tree's node `node`, stands where `base`, the revision this tree shares
+    /// its node IDs with, holds it, under the same parent by the same name, or `base` holds no
+    /// node of its kind and context at `id`, as [`Self::node_return_unstaged_move`] finds a node
+    /// that stays. `name` is a buffer the caller keeps across nodes.
+    pub(crate) async fn stands_at_base_place(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        base: Hash,
+        (id, node): (NodeID, &Node),
+        name: &mut String,
+    ) -> Result<bool, StateError> {
+        let flags = NodeFlags::from_bits_retain(node.flags);
+        let Some(committed) = self
+            .base_place(repository, (base, id), (flags, node.address.context), name)
+            .await?
+        else {
+            return Ok(true);
+        };
+        Ok(node.parent == committed.0
+            && node.name_hash == committed.1
+            && self.node_name_is(repository.clone(), id, name).await?)
+    }
+
+    /// Moves `node` to the directory `parent`, renamed to `name` where one is given, or parks it
+    /// there, as [`Self::node_return_unstaged_move`] describes. `from` is the directory that holds
+    /// the node now, `is_directory` whether the node is one, and `name_hash` the hash of the name
+    /// it takes.
+    ///
+    /// Flags neither directory, where the unserved tier's reattach ([`Self::node_reattach`]) flags
+    /// both before it moves a node: the node goes back to the place the base revision holds it at,
+    /// so neither directory needs rehashing for it, and the caller clears each dirty flag it
+    /// reaches.
+    async fn node_return_to(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        (node, from, is_directory): (NodeID, NodeID, bool),
+        (parent, name_hash): (NodeID, u64),
+        name: Option<&str>,
+    ) -> Result<Return, StateError> {
+        if !self.is_live_directory(repository, parent).await? {
+            return Ok(Return::Displaced);
+        }
+        if is_directory
+            && parent != from
+            && self
+                .is_inside_subtree(repository.clone(), parent, node)
+                .await?
+        {
+            return Err(StateError::internal(
+                "A move marked dirty would return into its own subtree",
+            ));
+        }
+        let holder = match self
+            .find_subnode(repository.clone(), parent, name_hash)
+            .await
+        {
+            Ok(holder) => (holder != node).then_some(holder),
+            Err(error) if error.is_node_not_found() => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(holder) = holder {
+            let (staged, added_file) = {
+                let held = self.node(repository.clone(), holder).await?;
+                (
+                    held.is_staged(),
+                    held.is_dirty_add() && !held.is_directory(),
+                )
+            };
+            if staged {
+                return Ok(Return::Displaced);
+            }
+            if !added_file {
+                let parked = ParkedName::of(node);
+                if from != parent
+                    || !self
+                        .node_name_is(repository.clone(), node, parked.as_str())
+                        .await?
+                {
+                    self.node_move(
+                        repository.clone(),
+                        node,
+                        parent,
+                        NameChange::Rename(parked.as_str()),
+                        Mark::NONE,
+                    )
+                    .await?;
+                }
+                return Ok(Return::Parked);
+            }
+        }
+        let change = name.map_or(NameChange::Keep, NameChange::Rename);
+        self.node_move(repository.clone(), node, parent, change, Mark::NONE)
+            .await?;
+        Ok(Return::Back)
+    }
+
+    /// Where `base` holds `id`, a node of this tree carrying `flags` and the address `context`: its
+    /// parent and name hash, with its name copied into `name`. `None` where `base` holds no node of
+    /// the same kind and context at `id`.
+    async fn base_place(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        (base, id): (Hash, NodeID),
+        (flags, context): (NodeFlags, Context),
+        name: &mut String,
+    ) -> Result<Option<(NodeID, u64)>, StateError> {
+        let base = self.base(repository, base).await?;
+        let (place, block) = {
+            let Some((held, block)) = base.node_in_use(repository, id).await? else {
+                return Ok(None);
+            };
+            if held.is_discarded()
+                || held.node_type() != flags.node_type()
+                || held.address.context != context
+            {
+                return Ok(None);
+            }
+            ((held.parent, held.name_hash), block)
+        };
+        block.deserialize_nametable(repository.clone()).await?;
+        block
+            .read_node_and_name(Node::index(id), |_, stored| {
+                name.clear();
+                stored.map(|stored| name.push_str(stored))
+            })
+            .forward::<StateError>("Node name")?;
+        Ok(Some(place))
+    }
+
+    /// Whether `node` is a directory this tree holds, not discarded.
+    async fn is_live_directory(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<bool, StateError> {
+        let node = self.node(repository.clone(), node).await?;
+        Ok(!node.is_discarded() && node.is_directory())
+    }
+
+    /// Whether `parent` can take `node`, a directory where `is_directory` says: `parent` is a live
+    /// directory, outside the node's own subtree.
+    pub(crate) async fn can_take(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        parent: NodeID,
+        (node, is_directory): (NodeID, bool),
+    ) -> Result<bool, StateError> {
+        if !self.is_live_directory(repository, parent).await? {
+            return Ok(false);
+        }
+        Ok(!is_directory
+            || !self
+                .is_inside_subtree(repository.clone(), parent, node)
+                .await?)
+    }
+
+    /// Renames `node` where it stands to the name it waits under ([`ParkedName`]), so no lookup of
+    /// a name it held meets it.
+    pub(crate) async fn node_park(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<(), StateError> {
+        let parked = ParkedName::of(node);
+        self.node_rename(
+            repository.clone(),
+            node,
+            NameChange::Rename(parked.as_str()),
+        )
+        .await
     }
 
     pub fn set_revision_number(&self, revision_number: u64) {
@@ -4434,77 +4728,64 @@ impl State {
             .map(|name| name.to_string()))
     }
 
-    pub async fn node_has_staged_children(
+    /// Whether a child of the directory `parent_node` carries the Staged flag, as
+    /// [`Self::holds_child`] reads it.
+    pub fn node_has_staged_children(
         &self,
         repository: Arc<RepositoryContext>,
         parent_node: NodeID,
-    ) -> Result<bool, StateError> {
-        let mut has_staged = false;
-
-        // TODO(vri): UCS-15592 - Improve by iteratively walking children
-        let children = self
-            .node_children(repository.clone(), parent_node)
-            .await
-            .forward::<StateError>("Node not found")?;
-
-        for &child in &children {
-            if self
-                .node(repository.clone(), child)
-                .await
-                .forward::<StateError>("Node not found")?
-                .is_staged()
-            {
-                lore_trace!("Child node {child} is staged");
-                has_staged = true;
-                break;
-            }
-        }
-
-        Ok(has_staged)
+    ) -> impl Future<Output = Result<bool, StateError>> + Send + '_ {
+        self.holds_child(repository, parent_node, Node::is_staged)
     }
 
-    /// Check if a parent node has any children with the Dirty flag set.
-    pub async fn node_has_dirty_children(
+    /// Whether a child of the directory `parent_node` carries the Dirty flag, as
+    /// [`Self::holds_child`] reads it.
+    pub fn node_has_dirty_children(
         &self,
         repository: Arc<RepositoryContext>,
         parent_node: NodeID,
-    ) -> Result<bool, StateError> {
-        let mut has_dirty = false;
-
-        let children = self
-            .node_children(repository.clone(), parent_node)
-            .await
-            .forward::<StateError>("Node not found")?;
-
-        for &child in &children {
-            if self
-                .node(repository.clone(), child)
-                .await
-                .forward::<StateError>("Node not found")?
-                .is_dirty()
-            {
-                lore_trace!("Child node {child} is dirty");
-                has_dirty = true;
-                break;
-            }
-        }
-
-        Ok(has_dirty)
+    ) -> impl Future<Output = Result<bool, StateError>> + Send + '_ {
+        self.holds_child(repository, parent_node, Node::is_dirty)
     }
 
-    /// Check if a parent node has any children with the Staged or Dirty flag set.
-    pub async fn node_has_staged_or_dirty_children(
+    /// Whether a child of the directory `parent_node` carries the Staged or the Dirty flag, as
+    /// [`Self::holds_child`] reads it.
+    pub fn node_has_staged_or_dirty_children(
         &self,
         repository: Arc<RepositoryContext>,
         parent_node: NodeID,
+    ) -> impl Future<Output = Result<bool, StateError>> + Send + '_ {
+        self.holds_child(repository, parent_node, |child| {
+            child.is_staged() || child.is_dirty()
+        })
+    }
+
+    /// Whether a child of the directory `parent_node` answers `carries`, read in one walk of its
+    /// chain that stops at the first. A node that is no directory has no child here, a link
+    /// included, whose children are another tree's.
+    async fn holds_child(
+        &self,
+        repository: Arc<RepositoryContext>,
+        parent_node: NodeID,
+        carries: fn(&Node) -> bool,
     ) -> Result<bool, StateError> {
-        for child in self.node_children(repository.clone(), parent_node).await? {
-            let node = self.node(repository.clone(), child).await?;
-            if node.is_staged() || node.is_dirty() {
-                return Ok(true);
-            }
+        let block = self
+            .block(repository.clone(), NodeBlock::index(parent_node))
+            .await?;
+        let (node, changes) = block.node_with_chain_head(parent_node);
+        if !node.is_directory() {
+            return Ok(false);
         }
-        Ok(false)
+        let walked = self
+            .walk_children(
+                repository,
+                node.child(),
+                ChainWalk::new(parent_node, block, changes),
+                None,
+                |_, child| carries(child).then_some(()),
+            )
+            .await?;
+        Ok(walked.answer.is_some())
     }
 
     /// Collect the repository-relative paths of all dirty nodes at or under
@@ -6145,7 +6426,7 @@ pub(crate) async fn collect_dirty_only_paths(
     repository: Arc<RepositoryContext>,
     parent_node: NodeID,
     mut parent_path: RelativePathBuf,
-    paths: &mut Vec<RelativePath>,
+    paths: &mut impl DirtyPathSink,
 ) -> Result<(), StateError> {
     collect_dirty_paths_inner(
         state,
@@ -6156,6 +6437,62 @@ pub(crate) async fn collect_dirty_only_paths(
         DirtyWalkOptions::from_context(true),
     )
     .await
+}
+
+/// What [`State::node_return_unstaged_move`] did with a node marked dirty as moved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Return {
+    /// Nothing: it stands where the base revision holds it, or that revision holds no node of
+    /// its kind and context at its ID.
+    Stays,
+    /// It went back.
+    Back,
+    /// It waits under its committed parent, by a name of its own, for the name there to come free.
+    Parked,
+    /// It cannot go back: a staged node holds its name, or its committed parent is gone.
+    Displaced,
+    /// It is no longer in the tree.
+    Gone,
+}
+
+/// The name a node waits under while another node holds its own, which its ID spells, so no other
+/// waiting node takes it. A node the tree holds by that name already keeps it beside the waiting
+/// one, which no lookup of another name meets; a move whose committed name it is waits while this
+/// one does. Spelled in place, as it is only compared and stored.
+struct ParkedName {
+    spelled: [u8; PARKED_NAME_CAPACITY],
+    len: u8,
+}
+
+/// Whether `name` is the name `node` waits under ([`ParkedName`]).
+pub(crate) fn names_parked(node: NodeID, name: &str) -> bool {
+    ParkedName::of(node).as_str() == name
+}
+
+/// The prefix of a [`ParkedName`], which the node's ID follows.
+const PARKED_NAME_PREFIX: &str = ".lore-returning-";
+
+/// The bytes a [`ParkedName`] holds at most: its prefix and the digits of the largest ID.
+const PARKED_NAME_CAPACITY: usize = PARKED_NAME_PREFIX.len() + NodeID::MAX.ilog10() as usize + 1;
+
+impl ParkedName {
+    fn of(node: NodeID) -> Self {
+        let mut spelled = [0; PARKED_NAME_CAPACITY];
+        let free = {
+            let mut free = &mut spelled[..];
+            let fits = write!(free, "{PARKED_NAME_PREFIX}{node}").is_ok();
+            debug_assert!(fits, "the name fits its capacity");
+            free.len()
+        };
+        Self {
+            spelled,
+            len: (PARKED_NAME_CAPACITY - free) as u8,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        str::from_utf8(&self.spelled[..usize::from(self.len)]).unwrap_or_default()
+    }
 }
 
 /// What a dirty walk does with the nodes it meets.
@@ -6211,11 +6548,31 @@ fn marked_directory_carried_by_children(node: &Node) -> bool {
 /// (`contributes`).
 ///
 /// A `DirtyDelete` or `DirtyMove` directory recording its path carries its whole subtree when
-/// it is re-applied, so its descendants are covered by its own path. A directory that records
-/// no path of its own is still walked, a moved or deleted one too: staging a file stages the
-/// directories above it, so a staged directory is where a dirty-only file lives.
-fn dirty_path_descends(child: &Node, contributes: bool) -> bool {
-    child.is_directory() && (!contributes || !child.is_dirty_delete() && !child.is_dirty_move())
+/// it is re-applied, so its descendants are covered by its own path, a moved one's unless the
+/// walk goes `through_moves`. A directory that records no path of its own is still walked, a
+/// moved or deleted one too: staging a file stages the directories above it, so a staged
+/// directory is where a dirty-only file lives.
+fn dirty_path_descends(child: &Node, contributes: bool, through_moves: bool) -> bool {
+    child.is_directory()
+        && (!contributes || !child.is_dirty_delete() && (through_moves || !child.is_dirty_move()))
+}
+
+/// Where a dirty walk records the nodes it finds carrying an action of their own.
+#[lore_macro::test_pub]
+pub(crate) trait DirtyPathSink: Send {
+    /// Whether the walk records the nodes below a directory marked dirty as moved that it records,
+    /// rather than leave the directory's path to stand for them ([`dirty_path_descends`]).
+    const THROUGH_MOVES: bool = false;
+
+    /// Records `node`, `id`, found at `path`, in a tree the walk reached through a link where
+    /// `linked` says so.
+    fn record(&mut self, path: &RelativePathBuf, id: NodeID, node: &Node, linked: bool);
+}
+
+impl DirtyPathSink for Vec<RelativePath> {
+    fn record(&mut self, path: &RelativePathBuf, _: NodeID, _: &Node, _: bool) {
+        self.push(path.clone().freeze());
+    }
 }
 
 /// The node block a sibling chain is being read from.
@@ -6379,7 +6736,7 @@ async fn collect_dirty_paths_inner(
     repository: Arc<RepositoryContext>,
     parent_node: NodeID,
     parent_path: &mut RelativePathBuf,
-    paths: &mut Vec<RelativePath>,
+    paths: &mut impl DirtyPathSink,
     options: DirtyWalkOptions,
 ) -> Result<(), StateError> {
     // The parent is folded once; every level below carries the verdict its own
@@ -6401,13 +6758,13 @@ async fn collect_dirty_paths_inner(
 /// [`collect_dirty_paths_inner`] in a state reached through `link_depth` links,
 /// from the filter's verdict for `parent_path`.
 #[allow(clippy::too_many_arguments)]
-async fn collect_dirty_paths_linked(
+async fn collect_dirty_paths_linked<S: DirtyPathSink>(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
     parent_node: NodeID,
     parent_path: &mut RelativePathBuf,
     parent_states: FilterStates,
-    paths: &mut Vec<RelativePath>,
+    paths: &mut S,
     options: DirtyWalkOptions,
     link_depth: usize,
 ) -> Result<(), StateError> {
@@ -6432,7 +6789,7 @@ async fn collect_dirty_paths_linked(
         }
 
         let contributes = dirty_path_contributes(&child, options.skip_staged);
-        let descends = dirty_path_descends(&child, contributes);
+        let descends = dirty_path_descends(&child, contributes, S::THROUGH_MOVES);
         let crosses = child.is_link() && link_depth < MAX_LINK_DEPTH;
         if !contributes && !descends && !crosses {
             continue;
@@ -6482,7 +6839,7 @@ async fn collect_dirty_paths_linked(
         let mut descended = false;
         if !excluded {
             if contributes {
-                paths.push(parent_path.clone().freeze());
+                paths.record(parent_path, child_id, &child, link_depth > 0);
             }
 
             if descends {
@@ -8437,14 +8794,23 @@ fn is_staged_for_descendants_only(node: &Node) -> bool {
         && node.flags & (NodeFlags::ActionBits.bits() | NodeFlags::MergeBits.bits()) == 0
 }
 
+/// Whether `node` is marked dirty for a change of its own, an action bit with no staged change to
+/// claim it, as a directory marked dirty as added or moved is, rather than by the bare `Dirty` bit
+/// a mark below carries up.
+fn is_dirty_in_own_right(node: &Node) -> bool {
+    node.is_dirty() && !node.is_staged() && node.flags & NodeFlags::ActionBits.bits() != 0
+}
+
 /// Clear the `Dirty` and `Staged` bits that marking a node carried up to `ancestor` and the nodes
 /// above it, for a node that has since left the tree, in one walk up the chain. `Dirty` is cleared
-/// up to the first node that still has a dirty child, `Staged` up to the first that still has a
-/// staged child or is not [staged for descendants only](is_staged_for_descendants_only).
+/// up to the first node that still has a dirty child or is [dirty in its own
+/// right](is_dirty_in_own_right), as a directory marked dirty as added is however little it holds,
+/// `Staged` up to the first that still has a staged child or is not [staged for descendants
+/// only](is_staged_for_descendants_only).
 ///
-/// Must not run while another task marks nodes in the tree. Marking stops at the first ancestor
-/// already carrying the bit, so a node marked between this checking an ancestor's children and
-/// clearing its bit is left below an ancestor without it.
+/// Must not run while a walk reads or marks the tree. Marking stops at the first ancestor already
+/// carrying the bit, so a node marked between this checking an ancestor's children and clearing its
+/// bit is left below an ancestor without it.
 pub(crate) async fn clear_propagation(
     state: &Arc<State>,
     repository: &Arc<RepositoryContext>,
@@ -8463,6 +8829,7 @@ pub(crate) async fn clear_propagation(
                 block.clone(),
             );
             staged &= is_staged_for_descendants_only(&node);
+            dirty &= !is_dirty_in_own_right(&node);
             (node.parent, children)
         };
         while (dirty || staged)

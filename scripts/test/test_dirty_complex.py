@@ -1681,6 +1681,92 @@ def test_commit_dirty_only_delete_reverted_in_tree(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_commit_dirty_only_move_reverted_in_tree(new_lore_repo):
+    """A dirty-only move into a directory only marked dirty is left out of the
+    sealed tree, the file staying at its committed path, while it remains
+    pending in status (move/dirty from the committed path); an unrelated staged
+    change is what gets committed."""
+    repo: Lore = new_lore_repo()
+    commit_base(repo, {"base.txt": "base\n", "src/file.txt": "file original\n"})
+
+    repo.make_dirs("newdir")
+    repo.dirty("newdir", offline=True)
+    os.rename(repo._fix_path("base.txt"), repo._fix_path("newdir/base.txt"))
+    repo.dirty_move("base.txt", "newdir/base.txt", offline=True)
+
+    with repo.open_file("src/file.txt", "w+") as f:
+        f.write("file modified longer\n")
+    repo.stage("src/file.txt", offline=True)
+
+    repo.commit("commit unrelated", offline=True)
+
+    entries = get_status_files(repo)
+    assert_file_set(
+        entries, ["newdir/base.txt"], msg="only the dirty-only move remains pending"
+    )
+    assert_entry(
+        entries,
+        "newdir/base.txt",
+        action="move",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        from_path="base.txt",
+        msg="dirty-only move stays pending after commit",
+    )
+
+    repo.status(reset=True, offline=True)
+    dump = repo.repository_dump()
+    assert "newdir" not in dump, (
+        f"dirty-only move must be left out of the sealed tree:\n{dump}"
+    )
+    assert "base.txt" in dump, (
+        f"dirty-only moved file must stay at its committed path:\n{dump}"
+    )
+
+
+@pytest.mark.smoke
+def test_commit_warns_of_a_dirty_only_move_a_staged_add_displaces(new_lore_repo):
+    """A dirty-only move whose committed path a staged new file takes is left
+    out of the sealed tree, which holds the staged file alone at that path. The
+    commit succeeds with a warning to the user, and the moved file is pending
+    as an add afterward."""
+    repo: Lore = new_lore_repo()
+    commit_base(repo, {"base.txt": "base\n", "other.txt": "other\n"})
+
+    os.rename(repo._fix_path("base.txt"), repo._fix_path("moved.txt"))
+    repo.dirty_move("base.txt", "moved.txt", offline=True)
+    with repo.open_file("base.txt", "w+") as f:
+        f.write("replacement content\n")
+    repo.stage("base.txt", offline=True)
+
+    output = repo.commit("replace base", offline=True)
+    assert any(line.startswith("[Warn]") for line in output.splitlines()), (
+        f"the commit must warn of the move it did not keep:\n{output}"
+    )
+
+    entries = get_status_files(repo)
+    assert_file_set(entries, ["moved.txt"], msg="only the moved file remains pending")
+    assert_entry(
+        entries,
+        "moved.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        msg="the displaced move stays pending as an add",
+    )
+
+    repo.status(reset=True, offline=True)
+    dump = repo.repository_dump()
+    assert "moved.txt" not in dump, (
+        f"the displaced move must be left out of the sealed tree:\n{dump}"
+    )
+    with repo.open_file("base.txt", "r") as f:
+        assert f.read() == "replacement content\n", "the staged file stays on disk"
+
+
+@pytest.mark.smoke
 def test_commit_anchor_deleted_when_clean(new_lore_repo):
     """Modify + dirty + stage + commit leaves nothing pending, so the staged
     anchor is removed and a no-scan status is empty."""
@@ -6536,6 +6622,77 @@ def test_scan_dirty_move_into_nested_dir(new_lore_repo):
         msg="--scan must preserve the nested dirty-move provenance",
     )
     assert_absent(scanned, "src.txt", msg="move source must not reappear after scan")
+
+
+def staged_status(repo: Lore) -> list[tuple]:
+    """The (path, action, fromPath, flagStaged) of each `lore status` entry, sorted."""
+    return sorted(
+        (
+            to_posix(entry.get("path", "")),
+            entry.get("action"),
+            to_posix(entry.get("fromPath", "")),
+            entry.get("flagStaged"),
+        )
+        for entry in get_status_files(repo)
+    )
+
+
+@pytest.mark.smoke
+def test_stage_inside_a_dirty_moved_dir_stages_the_directory_move(new_lore_repo):
+    """A stage of an edit inside a directory moved with `lore dirty move` stages the move of the
+    whole directory: `lore status` lists what it lists after `lore stage move` of the directory and
+    the same stage."""
+    listed = []
+    for staged_move in (True, False):
+        repo: Lore = new_lore_repo()
+        commit_base(repo, {"d/a.txt": "a\n", "d/b.txt": "b\n", "d/c.txt": "c\n"})
+        repo.move("d", "e")
+        if staged_move:
+            repo.stage_move("d", "e", offline=True)
+        else:
+            repo.dirty_move("d", "e", offline=True)
+        with repo.open_file("e/a.txt", "w+") as f:
+            f.write("a edited and staged\n")
+        repo.stage("e/a.txt", offline=True)
+        listed.append(staged_status(repo))
+
+    assert listed[1] == listed[0], (
+        f"a stage inside a dirty-moved directory lists {listed[1]}, "
+        f"where `lore stage move` lists {listed[0]}"
+    )
+    assert ("e", "move", "d", True) in listed[1], listed[1]
+
+
+@pytest.mark.smoke
+def test_commit_of_an_edit_in_a_dirty_moved_dir_lists_only_the_edited_files(new_lore_repo):
+    """A commit that takes a directory moved with `lore dirty move`, whose move a stage of an edit
+    in it staged, leaves `lore status` listing the file edited and marked dirty in it as modified,
+    and the file moved with the directory alone not at all: the revision holds it where it
+    stands."""
+    repo: Lore = new_lore_repo()
+    commit_base(repo, {"d/a.txt": "a\n", "d/b.txt": "b\n", "d/c.txt": "c\n"})
+
+    repo.move("d", "e")
+    repo.dirty_move("d", "e", offline=True)
+    with repo.open_file("e/b.txt", "w+") as f:
+        f.write("b edited in place\n")
+    repo.dirty("e/b.txt", offline=True)
+    with repo.open_file("e/a.txt", "w+") as f:
+        f.write("a edited and staged\n")
+    repo.stage("e/a.txt", offline=True)
+    repo.commit("Edited", offline=True)
+
+    entries = get_status_files(repo)
+    assert_file_set(entries, ["e/b.txt"])
+    assert_entry(
+        entries,
+        "e/b.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        msg="the edit marked dirty stays marked past the commit",
+    )
+    assert_absent(entries, "e/c.txt", msg="the move the revision took leaves nothing to list")
 
 
 @pytest.mark.smoke

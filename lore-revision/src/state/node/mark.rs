@@ -197,6 +197,12 @@ pub struct Mark {
 }
 
 impl Mark {
+    /// No mark: neither half.
+    pub(in crate::state) const NONE: Self = Self {
+        staged: None,
+        dirty: None,
+    };
+
     /// The staged half alone.
     pub const fn staged(flags: NodeFlags, force: bool) -> Self {
         Self {

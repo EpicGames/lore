@@ -1818,7 +1818,11 @@ fn a_chain_to_a_held_directory_beside_an_eviction() {
             .await;
             match chained {
                 Ok(found) => {
-                    assert_eq!(found, tree.id("q/r"), "the chain answers 'q/r'");
+                    assert_eq!(
+                        found,
+                        lore_revision::file::dirty::ParentChain::Reached(tree.id("q/r")),
+                        "the chain answers 'q/r'"
+                    );
                     None
                 }
                 Err(_) => Some("find"),

@@ -201,7 +201,8 @@ pub struct ResetStats {
     /// The mounts a purge leaves to each layer's own walk, none where the reset does not purge.
     layer_mounts: Vec<RelativePath>,
 
-    /// The dirty adds the walks drop, discarded once every walk has drained.
+    /// The dirty adds the walks drop, discarded once every walk has drained, each with the
+    /// directories marked dirty as added it leaves empty.
     discards: state::WalkDiscards,
 }
 
@@ -216,7 +217,7 @@ impl Default for ResetStats {
             file_inflight_count: AtomicU64::new(0),
             directory_inflight: AtomicU64::new(0),
             layer_mounts: Vec::new(),
-            discards: state::WalkDiscards::default(),
+            discards: state::WalkDiscards::emptying_adds(),
         }
     }
 }

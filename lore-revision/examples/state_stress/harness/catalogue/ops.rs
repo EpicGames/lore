@@ -1336,7 +1336,8 @@ impl Flagged {
 
 /// Whether directory `dir` has a child carrying `flagged`'s flags, as the commit, the stage and
 /// status ask whether a tree holds work (`node_has_*_children`): `None` where it failed. No link,
-/// which no caller passes: on one the product reads the linked State's ids from its own.
+/// which no caller passes: the product answers none for one, as for any node that is no
+/// directory.
 pub async fn has_children(tree: &Tree, dir: NodeID, flagged: Flagged) -> Option<bool> {
     call(&tree.state, (flagged.kind(), Some(dir)), async {
         let (state, repository) = (&tree.state, tree.repository.clone());

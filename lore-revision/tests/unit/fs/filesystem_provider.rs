@@ -237,6 +237,7 @@ impl FilesystemProvider for TestFilesystemProvider {
                 finalize_fails: self.finalize_fails,
                 write_fails: self.write_fails,
                 file_info_fails: self.file_info_fails,
+                failing_file_infos: Arc::default(),
                 content_source_fails: self.content_source_fails,
                 content_source_missing: self.content_source_missing,
                 holds_paths: self.holds_paths,

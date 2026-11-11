@@ -234,11 +234,12 @@ fn answers_met(
 }
 
 /// A staged or a staged-or-dirty read of a `d/` whose chain crosses blocks beside a C API move of
-/// `d/x`, in the later block, into `e`, which stages it: where the move lands at the listing's
-/// crossing, the walk has listed `x` and reads its words staged in `e`, finding it, which the model
-/// admits of a node the listing held. Every schedule: three preemptions a run reach them all.
+/// `d/x`, in the later block, into `e`, which stages it: the walk reads each child's record as it
+/// reaches it, `x` before its move, unstaged, or not at all once it left the chain, so no schedule
+/// finds a staged child, which the model admits. Every schedule: three preemptions a run reach them
+/// all.
 #[test]
-fn a_staged_read_beside_a_move_out_of_a_child_it_listed_finds_it() {
+fn a_staged_read_beside_a_move_out_of_a_child_it_listed_finds_none() {
     for flagged in [Flagged::Staged, Flagged::StagedOrDirty] {
         let runs = answers_met(across(false), (read_of_d(flagged), flagged), |tree| {
             Box::pin(async move {
@@ -247,8 +248,7 @@ fn a_staged_read_beside_a_move_out_of_a_child_it_listed_finds_it() {
             })
         });
         assert!(
-            runs.contains(&(has(true), true))
-                && runs.iter().any(|(answer, _)| *answer == has(false)),
+            !runs.is_empty() && runs.iter().all(|(answer, _)| *answer == has(false)),
             "{}: {runs:?}",
             flagged.kind().name
         );

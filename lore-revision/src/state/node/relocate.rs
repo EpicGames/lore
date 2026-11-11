@@ -757,10 +757,6 @@ impl State {
             .block_with_nametable(repository.clone(), NodeBlock::index(node_id))
             .await?;
         let renamed = Some((new_name, hash::hash_string(new_name)));
-        let none = Mark {
-            staged: None,
-            dirty: None,
-        };
         for _ in 0..self.chain_change_attempts() {
             let parent = {
                 let node = block.node(Node::index(node_id));
@@ -779,7 +775,7 @@ impl State {
                 (parent, &parent_block),
                 renamed,
                 false,
-                none,
+                Mark::NONE,
             )? {
                 return Ok(());
             }

@@ -441,9 +441,13 @@ pub(crate) async fn restore(
     .await
     .forward::<RestoreError>("preparing commit metadata")?;
 
-    commit::prune_dirty_for_commit(state_staged.clone(), repository.clone())
-        .await
-        .forward::<RestoreError>("pruning dirty nodes before rehash")?;
+    commit::prune_dirty_for_commit(
+        state_staged.clone(),
+        repository.clone(),
+        head_state.revision(),
+    )
+    .await
+    .forward::<RestoreError>("pruning dirty nodes before rehash")?;
 
     let modified_times = commit::rehash_tree_in_operation(
         repository.clone(),

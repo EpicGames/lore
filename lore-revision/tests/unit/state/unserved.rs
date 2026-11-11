@@ -1461,7 +1461,7 @@ async fn a_chain_skips_empty_names_in_its_path() {
             .expect("lore dirty adds 'a/b/m'");
         assert_eq!(
             (scanned, dirtied),
-            (n, m),
+            (n, lore_revision::file::dirty::ParentChain::Reached(m)),
             "each chain answers its last name's node"
         );
         for dir in [ROOT_NODE, t.a, t.b, n, m] {

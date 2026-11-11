@@ -1789,6 +1789,7 @@ pub mod test_util {
     /// Answers the reads and the directory create these tests make, refuses each rename, and
     /// records each finalize, `stored` and `committed` call, hold, warm-up of the held ignore file
     /// and recursive removal. Every other member panics.
+    #[derive(Default)]
     pub struct TestOperation {
         pub file_info_count: Arc<AtomicUsize>,
         pub holds_name_count: Arc<AtomicUsize>,
@@ -1799,6 +1800,8 @@ pub mod test_util {
         /// Whether the provider cannot describe any path, as one that cannot stat the working
         /// tree.
         pub file_info_fails: bool,
+        /// Paths the provider cannot describe.
+        pub failing_file_infos: Arc<Mutex<Vec<String>>>,
         pub holds_paths: bool,
         /// Whether the provider cannot name the content at any path.
         pub content_source_fails: bool,
@@ -1913,10 +1916,17 @@ pub mod test_util {
         }
 
         /// Counts the lookup, and reports what the directory it reads from holds where given and
-        /// otherwise what the provider was told to hold.
+        /// otherwise what the provider was told to hold, except where it was told it cannot
+        /// describe the path.
         async fn file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
             self.file_info_count.fetch_add(1, Ordering::AcqRel);
-            if self.file_info_fails {
+            if self.file_info_fails
+                || self
+                    .failing_file_infos
+                    .lock()
+                    .iter()
+                    .any(|failing| failing == path.as_str())
+            {
                 return Err(FsError::internal("File information failed"));
             }
             match &self.reads {
