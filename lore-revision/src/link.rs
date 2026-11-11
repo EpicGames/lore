@@ -409,13 +409,15 @@ pub async fn create_branch(
 
 /// Links a merge works on at once. Each pins deserialized revisions of its linked repository, as a
 /// history walk does, so it shares the bound measured for those.
+#[lore_macro::test_pub]
 const MAX_CONCURRENT_LINK_TASKS: usize = crate::revision::DEFAULT_HISTORY_WALK_CONCURRENCY;
 
 /// Awaits per-link work [`MAX_CONCURRENT_LINK_TASKS`] at a time, in order, stopping at the first
 /// error. A future starts no work until it is polled, so only those in flight do any.
-async fn try_join_links<T>(
-    work: Vec<impl Future<Output = Result<T, LinkError>>>,
-) -> Result<Vec<T>, LinkError> {
+#[lore_macro::test_pub]
+pub(crate) async fn try_join_links<T, E>(
+    work: Vec<impl Future<Output = Result<T, E>>>,
+) -> Result<Vec<T>, E> {
     let mut in_flight = futures::stream::FuturesOrdered::new();
     let mut results = Vec::with_capacity(work.len());
     for future in work {
@@ -464,7 +466,7 @@ pub async fn create_branches_for_merged_links(
                         .is_none_or(|(_, node)| {
                             RepositoryId::from(node.address.context) != link.repository
                         });
-                    Ok(merged_in.then_some((link, link_path)))
+                    Ok::<_, LinkError>(merged_in.then_some((link, link_path)))
                 }
             })
             .collect(),
@@ -1469,7 +1471,7 @@ pub async fn drain_link_tracker(
 /// Force-realizes specific file paths from a linked repository state at the
 /// mount path, regardless of any state-to-state diff.
 ///
-/// Restore on-disk content for `paths` (link-relative) from `link_state`
+/// Restore on-disk content for `paths` (mount-relative) from `link_state`
 /// and unlink any `~mine`/`~theirs`/`~base` sidecars at the same paths.
 ///
 /// Used during merge abort to clean up filesystem-only artifacts: marker
@@ -1478,14 +1480,14 @@ pub async fn drain_link_tracker(
 /// (sidecars aren't in any state, and marker bytes inside a file are not
 /// produced by `realize_changes` — they're produced by `realize_conflicts`).
 ///
-/// `link_path` is the link's mount path in the parent repository. Paths
-/// are mount-prefixed under it, which is how the parent's filesystem
-/// operation names them.
+/// `link_path` is the link's mount path in the parent repository, and `mounted` the node of
+/// `link_state` mounted there. `paths` are below the mount.
 pub async fn restore_link_paths_from_state(
     repository: Arc<RepositoryContext>,
     link_context: Arc<RepositoryContext>,
     link_path: RelativePath,
     link_state: Arc<State>,
+    mounted: NodeID,
     paths: &[RelativePath],
 ) -> Result<(), LinkError> {
     if paths.is_empty() {
@@ -1498,7 +1500,7 @@ pub async fn restore_link_paths_from_state(
             sync::unlink_merge_artifacts(&operation, &mount_path).await;
 
             let node_link = link_state
-                .find_node_link(link_context.clone(), link_relative.as_str())
+                .find_relative_node_link(link_context.clone(), mounted, link_relative.as_str())
                 .await
                 .forward::<LinkError>("Failed resolving link node")?;
             if !node_link.is_valid_or_root() {
@@ -1526,6 +1528,27 @@ pub async fn restore_link_paths_from_state(
         Ok(())
     })
     .await
+}
+
+/// The links of `state`'s registry, each with whether the merge in progress in `state` merged it.
+pub(crate) async fn links_and_merged(
+    state: &State,
+    repository: Arc<RepositoryContext>,
+) -> Result<Vec<(LinkReference, bool)>, LinkError> {
+    let (entries, links) = tokio::try_join!(
+        state.deserialize_link_merge_state(repository.clone()),
+        state.link_list(repository),
+    )
+    .forward::<LinkError>("Failed to read the links of the merge")?;
+    Ok(links
+        .into_iter()
+        .map(|link| {
+            let merged = entries
+                .iter()
+                .any(|entry| entry.local_node == link.local_node);
+            (link, merged)
+        })
+        .collect())
 }
 
 /// Returns the absolute path of every staged link node (add, delete, or

@@ -1197,82 +1197,195 @@ def test_a_type_change_inside_a_link_conflicts_and_refuses_the_folder(
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize("staging", [True, False], ids=["stage", "mark"])
-def test_resolving_the_whole_tree_passes_over_a_link(new_lore_repo, staging):
-    """Resolving the whole tree, staging a side or marking what is on disk
-    resolved, resolves the conflict in the parent and keeps the content of a
-    link the merge did not touch."""
-    parent, _source = make_parent_with_link(
-        new_lore_repo, "linked/repo", {"data.txt": "linked\n"}, {"root.txt": "base\n"}
+def test_abort_restores_a_link_holding_a_nested_link(new_lore_repo):
+    """Aborting a merge that conflicts inside a linked repository which holds a
+    link of its own restores both pins and the conflicted file, and leaves the
+    nested link's content in place."""
+    b_mount, nested_mount = "b", "b/sub/c"
+    parent, repo_b = make_parent_with_link(
+        new_lore_repo, b_mount, {"b-root.txt": "base\n"}
     )
+    repo_c = make_repo(new_lore_repo, {"c-data/inner.txt": "inner\n"})
+    conflicted = f"{b_mount}/b-root.txt"
+
+    # Branch creation does not make the branch in a nested linked repository, which pushing a
+    # branch created over a nested link needs, so the nested link is added once branched.
     parent.branch_create("feature")
-    parent.write_commit_push("Theirs", {"root.txt": "theirs\n"})
+    parent.write_commit_push("Change B on feature", {conflicted: "theirs\n"})
     parent.branch_switch("main")
-    parent.write_commit_push("Mine", {"root.txt": "mine\n"})
+    parent.link_add(nested_mount, repo_c.get_id(), "/")
+    parent.commit("Link C inside B")
+    parent.push()
+    parent.write_commit_push("Change B on main", {conflicted: "mine\n"})
+    head_before = parent.branch_info().local_latest
+    pins_before = {
+        repo.get_id(): link_pin(parent, repo.get_id()) for repo in (repo_b, repo_c)
+    }
 
-    parent.branch_merge_start("feature", message="Merge feature", check=False)
-    assert parent.unresolved_paths() == {"root.txt"}, (
-        "the merge must conflict on the file both branches changed"
+    output = parent.branch_merge_start("feature", message="Merge feature", check=False)
+    assert _conflicted_count(output) == 1, (
+        f"the merge must report the conflict inside the link, got:\n{output}"
     )
 
-    if staging:
-        expected = "mine\n"
-        parent.branch_merge_resolve_mine(".")
-    else:
-        expected = "merged\n"
-        parent.write_files({"root.txt": expected})
-        parent.branch_merge_resolve(".")
-    parent.commit("Merge feature")
-    parent.push()
+    parent.branch_merge_abort()
 
-    clone = parent.clone(branch="main")
-    with clone.open_file("root.txt", "r") as input_file:
-        assert input_file.read() == expected, (
-            "the merged revision must hold the resolution"
+    assert parent.branch_info().local_latest == head_before, (
+        "aborting the merge must leave the branch on its pre-merge revision"
+    )
+    pins_after = {repo_id: link_pin(parent, repo_id) for repo_id in pins_before}
+    assert pins_after == pins_before, "aborting the merge must restore every pin"
+    with parent.open_file(conflicted, "r") as input_file:
+        assert input_file.read() == "mine\n", (
+            "aborting the merge must restore the conflicted file"
         )
-    with clone.open_file("linked/repo/data.txt", "r") as input_file:
-        assert input_file.read() == "linked\n", "the link must keep its content"
+    assert_crr_clean(
+        parent,
+        expected_files_present=[f"{nested_mount}/c-data/inner.txt"],
+        expected_files_absent=[],
+        expected_link_registry=dict.fromkeys(pins_before, True),
+    )
 
 
 @pytest.mark.smoke
-def test_resolving_the_whole_tree_refuses_a_link_holding_conflicts(new_lore_repo):
-    """Both branches changed a file inside a link. Resolving the whole tree,
-    staging a side or marking it resolved, is refused rather than passing over
-    the link's conflict; naming the file inside the link resolves it."""
+def test_abort_restores_a_conflict_inside_a_link_mounted_from_a_folder(new_lore_repo):
+    """Aborting a merge that conflicts inside a link mounted from a folder
+    restores the conflicted file from the folder and the link's pin."""
     link_path = "linked/repo"
-    inside = f"{link_path}/data.txt"
-    parent, _source = make_parent_with_link(
-        new_lore_repo, link_path, {"data.txt": "base\n"}, {"root.txt": "root\n"}
+    parent, source = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {"src/data.txt": "base\n", "data.txt": "outside the mount\n"},
+        source_path="src",
     )
+    conflicted = f"{link_path}/data.txt"
+
     parent.branch_create("feature")
-    parent.write_commit_push("Theirs", {inside: "theirs\n"})
+    parent.write_commit_push("Theirs", {conflicted: "theirs\n"})
     parent.branch_switch("main")
-    parent.write_commit_push("Mine", {inside: "mine\n"})
+    parent.write_commit_push("Mine", {conflicted: "mine\n"})
+    pin_before = link_pin(parent, source.get_id())
 
     parent.branch_merge_start("feature", message="Merge feature", check=False)
-    assert parent.unresolved_paths() == {inside}, (
+    assert parent.unresolved_paths() == {conflicted}, (
         "the merge must conflict on the file both branches changed inside the link"
     )
 
-    for refused in (
-        lambda: parent.branch_merge_resolve_theirs("."),
-        lambda: parent.branch_merge_resolve("."),
-    ):
-        with pytest.raises(NotSupportedError):
-            refused()
-        assert parent.unresolved_paths() == {inside}, (
-            "a refused resolve must leave the conflict inside the link unresolved"
+    parent.branch_merge_abort()
+
+    assert link_pin(parent, source.get_id()) == pin_before, (
+        "aborting the merge must restore the link's pin"
+    )
+    with parent.open_file(conflicted, "r") as input_file:
+        assert input_file.read() == "mine\n", (
+            "aborting the merge must restore the conflicted file"
         )
 
-    parent.branch_merge_resolve_theirs(inside)
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("staging", [True, False], ids=["stage", "mark"])
+def test_resolving_the_whole_tree_reaches_into_links(new_lore_repo, staging):
+    """Resolving the whole tree, staging a side or marking what is on disk
+    resolved, resolves a conflict inside a link mounted from a folder and, once
+    the merge is started again to merge the parent, one in the parent, and
+    passes over a link the merge did not touch."""
+    link_path = "linked/repo"
+    parent, _source = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {"src/data.txt": "base\n", "data.txt": "outside the mount\n"},
+        {"root.txt": "base\n"},
+        source_path="src",
+    )
+    untouched = make_repo(new_lore_repo, {"other.txt": "other\n"})
+    parent.link_add("vendor/other", untouched.get_id(), "/")
+    parent.commit("Add a link no branch changes")
+    parent.push()
+    untouched_pin = link_pin(parent, untouched.get_id())
+    conflicted = ["root.txt", f"{link_path}/data.txt"]
+    expected = "mine\n" if staging else "merged\n"
+
+    def resolve_whole_tree(path: str) -> None:
+        if staging:
+            parent.branch_merge_resolve_mine(".")
+        else:
+            parent.write_files({path: expected})
+            parent.branch_merge_resolve(".")
+
+    parent.branch_create("feature")
+    parent.write_commit_push("Theirs", dict.fromkeys(conflicted, "theirs\n"))
+    parent.branch_switch("main")
+    parent.write_commit_push("Mine", dict.fromkeys(conflicted, "mine\n"))
+
+    # A conflicted link merge holds back the parent's merge until it is resolved.
+    parent.branch_merge_start("feature", message="Merge feature", check=False)
+    assert parent.unresolved_paths() == {f"{link_path}/data.txt"}, (
+        "the merge must conflict on the file both branches changed inside the link"
+    )
+    parent.branch_merge_start("feature", message="Merge feature", check=False)
+    assert parent.unresolved_paths() == {f"{link_path}/data.txt"}, (
+        "starting the merge again must stop while the link holds a conflict"
+    )
+    resolve_whole_tree(f"{link_path}/data.txt")
+
+    parent.branch_merge_start("feature", message="Merge feature", check=False)
+    assert parent.unresolved_paths() == {"root.txt"}, (
+        "starting the merge again must conflict on the file both branches changed"
+    )
+    resolve_whole_tree("root.txt")
     parent.commit("Merge feature")
     parent.push()
 
     clone = parent.clone(branch="main")
-    with clone.open_file(inside, "r") as input_file:
-        assert input_file.read() == "theirs\n", (
-            "a fresh clone must hold the side taken inside the link"
+    for path in conflicted:
+        with clone.open_file(path, "r") as input_file:
+            assert input_file.read() == expected, (
+                f"the merged revision must hold the resolution of {path}"
+            )
+    assert link_pin(clone, untouched.get_id()) == untouched_pin, (
+        "the untouched link must keep its pin"
+    )
+
+
+@pytest.mark.smoke
+def test_resolving_the_whole_tree_reaches_into_each_mount_of_one_repository(
+    new_lore_repo,
+):
+    """A linked repository mounted twice, from two folders, conflicts inside
+    each mount. Resolving the whole tree resolves the conflicts of both."""
+    source = make_repo(new_lore_repo, {"a/data.txt": "base\n", "b/data.txt": "base\n"})
+    parent = make_repo(new_lore_repo, {"root.txt": "root\n"})
+    parent.link_add("first", source.get_id(), "a")
+    parent.link_add("second", source.get_id(), "b")
+    parent.commit("Mount two folders of one repository")
+    parent.push()
+    conflicted = ["first/data.txt", "second/data.txt"]
+    parent.branch_create("feature")
+    parent.push()
+
+    # Two mounts of one repository cannot both commit through the parent, so the
+    # linked repository changes on its own and each branch of the parent repins both.
+    for branch, content in (("feature", "theirs\n"), ("main", "mine\n")):
+        source.branch_switch(branch)
+        source.write_commit_push(
+            f"Change both folders on {branch}",
+            {"a/data.txt": content, "b/data.txt": content},
         )
+        parent.branch_switch(branch)
+        for mount in ("first", "second"):
+            parent.link_update(mount)
+            parent.commit(f"Repin {mount} on {branch}")
+            parent.push()
+
+    parent.branch_merge_start("feature", message="Merge feature", check=False)
+    assert parent.unresolved_paths() == set(conflicted), (
+        "the merge must conflict inside each mount"
+    )
+
+    parent.write_files(dict.fromkeys(conflicted, "merged\n"))
+    parent.branch_merge_resolve(".")
+    assert parent.unresolved_paths() == set(), (
+        "resolving the whole tree must resolve the conflict inside each mount"
+    )
 
 
 @pytest.mark.smoke
@@ -1360,6 +1473,62 @@ def test_resolving_a_file_against_a_link_takes_the_file_and_refuses_the_link(
         assert input_file.read() == "a plain file\n", (
             "a fresh clone of the merged revision must hold the file"
         )
+
+
+@pytest.mark.smoke
+def test_a_refused_resolve_keeps_the_resolution_inside_a_link_named_with_it(
+    new_lore_repo,
+):
+    """Resolving a conflict inside a link together with a file meeting a link
+    elsewhere is refused as a whole: the conflict inside the link keeps the
+    resolution it had and the link keeps the pin the merge staged."""
+    link_path = "linked/repo"
+    parent, source = make_parent_with_link(
+        new_lore_repo, link_path, {"data.txt": "base\n"}, {"root.txt": "root\n"}
+    )
+    other = make_repo(new_lore_repo, {"other.txt": "other\n"})
+
+    parent.branch_create("feature")
+    parent.write_files({f"{link_path}/data.txt": "theirs\n"})
+    parent.stage(scan=True)
+    parent.link_add("other", other.get_id(), "/")
+    parent.commit("Change a file inside the link and add another link")
+    parent.push()
+
+    parent.branch_switch("main")
+    parent.write_files({f"{link_path}/data.txt": "mine\n", "other": "a plain file\n"})
+    parent.stage(scan=True)
+    parent.commit("Change the same file and add a file where the other link lives")
+    parent.push()
+
+    # A conflicted link merge holds back the parent's merge until it is resolved.
+    parent.branch_merge_start("feature", message="Merge feature", check=False)
+    assert parent.unresolved_paths() == {f"{link_path}/data.txt"}, (
+        "the merge must conflict on the file both branches changed inside the link"
+    )
+    parent.branch_merge_resolve_mine(link_path)
+
+    parent.branch_merge_start("feature", message="Merge feature", check=False)
+    assert parent.unresolved_paths() == {"other"}, (
+        "starting the merge again must conflict at the path both branches added"
+    )
+    pin_before = link_pin(parent, source.get_id())
+    with parent.open_file(f"{link_path}/data.txt", "r") as input_file:
+        content_before = input_file.read()
+
+    with pytest.raises(NotSupportedError):
+        parent.branch_merge_resolve_theirs([f"{link_path}/data.txt", "other"])
+
+    assert link_pin(parent, source.get_id()) == pin_before, (
+        "a refused resolve must leave the link's pin as the merge staged it"
+    )
+    with parent.open_file(f"{link_path}/data.txt", "r") as input_file:
+        assert input_file.read() == content_before, (
+            "a refused resolve must leave the resolution inside the link on disk"
+        )
+    assert "other" in parent.unresolved_paths(), (
+        "a refused resolve must leave the conflict unresolved"
+    )
 
 
 @pytest.mark.smoke

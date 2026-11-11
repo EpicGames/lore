@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: MIT
 
 import os
-import sys
 
 import pytest
 from error_types import ImproperArgumentsError
@@ -2050,22 +2049,7 @@ def test_link_merge_all_of_a_branch_moving_a_link(new_lore_repo, pinned, how):
 
 @pytest.mark.smoke
 @pytest.mark.parametrize("pinned", [False, True], ids=["tracking", "pinned"])
-@pytest.mark.parametrize(
-    "how",
-    [
-        pytest.param(
-            "link-in-case",
-            marks=pytest.mark.xfail(
-                sys.platform == "linux",
-                strict=True,
-                reason="on a case-sensitive file system, the abort renames the link back in "
-                "case and leaves its mount empty",
-            ),
-        ),
-        "directory-in-case",
-        "directory-elsewhere",
-    ],
-)
+@pytest.mark.parametrize("how", LINK_MOVES.keys())
 def test_link_merge_abort_of_a_branch_moving_a_link(new_lore_repo, pinned, how):
     """Aborting a merge that moves a link, or the directory holding it, puts the link back where
     it was."""

@@ -71,6 +71,35 @@ async fn only_a_node_change_in_a_linked_repository_marks_links() {
         .await;
 }
 
+/// Per-link work past the limit runs at most the limit at a time, and every result comes back in
+/// order.
+#[tokio::test]
+async fn link_work_past_the_limit_runs_the_limit_at_a_time() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    let in_flight = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(0);
+    let count = MAX_CONCURRENT_LINK_TASKS * 2 + 1;
+    let work = (0..count)
+        .map(|index| {
+            let (in_flight, peak) = (&in_flight, &peak);
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok::<_, ()>(index)
+            }
+        })
+        .collect();
+
+    let results = try_join_links(work).await.expect("no work fails");
+
+    assert_eq!(results, (0..count).collect::<Vec<_>>());
+    assert_eq!(peak.load(Ordering::SeqCst), MAX_CONCURRENT_LINK_TASKS);
+}
+
 /// The repository the merged link points at.
 fn merged() -> RepositoryId {
     RepositoryId::from([1; 16])

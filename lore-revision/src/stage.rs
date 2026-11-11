@@ -3541,10 +3541,9 @@ struct MergeInProgress {
     abort: &'static str,
 }
 
-/// What a resolve of the merge in progress refuses because resolving it would corrupt a link or
-/// leave its conflicts behind: a type change at a link mount either side of the merge holds, a
-/// link holding unresolved conflicts met from above, and a folder or link conflict inside a
-/// linked repository.
+/// What a resolve of the merge in progress refuses because resolving it would corrupt a link: a
+/// type change at a link mount either side of the merge holds, and a folder or link conflict
+/// inside a linked repository.
 #[derive(Clone)]
 pub(crate) struct ResolveRefusal {
     merge: Arc<MergeInProgress>,
@@ -3635,49 +3634,6 @@ impl ResolveRefusal {
         Ok(None)
     }
 
-    /// The refusal for the link `node` at `path` that a walk meets, where the linked repository
-    /// holds unresolved conflicts.
-    async fn at_link(
-        &self,
-        node: &Node,
-        path: &RelativePath,
-    ) -> Result<Option<NotSupported>, StageError> {
-        // A link nested in a linked repository is not merged with it.
-        if self.scope == ResolveScope::InsideLink {
-            return Ok(None);
-        }
-        let mounted = node.linked_node();
-        let link_context = self
-            .merge
-            .repository
-            .to_link_context(mounted.repository)
-            .await;
-        let link_state = State::deserialize(link_context.clone(), mounted.revision)
-            .await
-            .forward::<StageError>("Failed to deserialize link state")?;
-        if !link_state.is_conflict() {
-            return Ok(None);
-        }
-        let unresolved = collect_merge_paths(
-            link_context,
-            link_state,
-            mounted.node,
-            path.clone(),
-            MergeWalk {
-                unresolved_only: true,
-                whole_directories: true,
-            },
-            None,
-        )
-        .await?;
-        Ok((!unresolved.files.is_empty()).then(|| NotSupported {
-            operation: format!(
-                "resolving the conflicts inside the link at {path} from outside it - name the paths \
-                 inside the link"
-            ),
-        }))
-    }
-
     /// The refusal for resolving a path inside the link whose node in the parent's state is
     /// `local_node`, mounted at `mount`, where that node carries an unresolved conflict.
     pub(crate) async fn entering_link(
@@ -3760,6 +3716,9 @@ pub(crate) struct StagedMergePaths {
     pub(crate) files: Vec<RelativePath>,
     /// Whether a node collected carries a merge conflict.
     pub(crate) holds_conflict: bool,
+    /// The mount and the mounted node of each link met, whose paths are resolved in the linked
+    /// repository's own state.
+    pub(crate) links: Vec<(RelativePath, NodeLink)>,
 }
 
 /// Which nodes [`collect_merge_paths`] collects.
@@ -3772,7 +3731,7 @@ pub(crate) struct MergeWalk {
     pub(crate) whole_directories: bool,
 }
 
-/// Collects the paths of the merged nodes at and below `node_id`, passing over links, with what
+/// Collects the paths of the merged nodes at and below `node_id`, and the links met, with what
 /// `refusal` refuses on the way.
 pub(crate) fn collect_merge_paths(
     repository: Arc<RepositoryContext>,
@@ -3804,6 +3763,7 @@ pub(crate) fn collect_merge_paths(
             return Ok(StagedMergePaths {
                 files: vec![base_path],
                 holds_conflict: node.is_staged_merge_conflict(),
+                links: Vec::new(),
             });
         }
         if let Some(refusal) = &refusal
@@ -3813,12 +3773,15 @@ pub(crate) fn collect_merge_paths(
             return Err(refused.into());
         }
         if node.is_link() {
-            if let Some(refusal) = &refusal
-                && let Some(refused) = refusal.at_link(&node, &base_path).await?
+            let mut collected = StagedMergePaths::default();
+            // A link nested in a linked repository is not merged with it, so it holds no merge.
+            if refusal
+                .as_ref()
+                .is_none_or(|refusal| refusal.scope == ResolveScope::Parent)
             {
-                return Err(refused.into());
+                collected.links.push((base_path, node.linked_node()));
             }
-            return Ok(StagedMergePaths::default());
+            return Ok(collected);
         }
 
         let mut collected = StagedMergePaths::default();
@@ -3846,6 +3809,7 @@ pub(crate) fn collect_merge_paths(
             .await?;
             collected.files.append(&mut child.files);
             collected.holds_conflict |= child.holds_conflict;
+            collected.links.append(&mut child.links);
         }
 
         if walk.whole_directories
@@ -3856,6 +3820,7 @@ pub(crate) fn collect_merge_paths(
             return Ok(StagedMergePaths {
                 files: vec![base_path],
                 holds_conflict: true,
+                links: collected.links,
             });
         }
         Ok(collected)
@@ -3984,7 +3949,7 @@ async fn stage_from_parent_revision_in_operation(
     // Link-paths need a separate helper that operates against each link's
     // own state (and updates the parent's pin afterwards).
     let mut parent_paths: Vec<LoreString> = Vec::new();
-    let mut link_paths: Vec<LoreString> = Vec::new();
+    let mut link_paths: Vec<LinkPath> = Vec::new();
     for path in paths.as_slice().iter() {
         let Ok(relative_path) =
             RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
@@ -3999,18 +3964,21 @@ async fn stage_from_parent_revision_in_operation(
             .await
             .unwrap_or_default();
         if node_link.is_valid_or_root() && node_link.repository != repository.id {
-            link_paths.push(path.clone());
+            link_paths.push(LinkPath {
+                path: relative_path,
+                named: Some(path.clone()),
+            });
         } else {
             parent_paths.push(path.clone());
         }
     }
 
-    // Every path is checked before any is staged, so a refused resolve stages nothing.
+    // Every path passes the refusals before any is staged, so a refused resolve stages nothing.
     let refusal = ResolveRefusal::new(&repository, &state);
-    let link_groups =
-        collect_link_groups(&repository, &state, &link_paths, merge_parent, &refusal).await?;
 
     if parent_paths.is_empty() {
+        let link_groups =
+            collect_link_groups(&repository, &state, link_paths, merge_parent, &refusal).await?;
         return Box::pin(stage_link_groups(
             operation,
             repository,
@@ -4101,9 +4069,15 @@ async fn stage_from_parent_revision_in_operation(
             )
             .await?;
             resolved_paths.extend(expanded.files);
+            link_paths.extend(expanded.links.into_iter().map(|(mount, _)| LinkPath {
+                path: mount,
+                named: None,
+            }));
         }
     }
 
+    let link_groups =
+        collect_link_groups(&repository, &state, link_paths, merge_parent, &refusal).await?;
     if let Some(refused) = refusal.restoring(merge_parent, &resolved_paths).await? {
         return Err(refused.into());
     }
@@ -4510,84 +4484,110 @@ async fn stage_from_parent_revision_in_operation(
     Ok(())
 }
 
+/// A path inside a linked repository for [`collect_link_groups`] to resolve.
+struct LinkPath {
+    path: RelativePath,
+    /// The path as the caller named it, where a walk did not meet it, to report it ignored.
+    named: Option<LoreString>,
+}
+
+/// Reports `named` as ignored, where the caller named the path rather than a walk meeting it.
+async fn emit_named_path_ignore(named: Option<&LoreString>) {
+    if let Some(named) = named {
+        emit_path_ignore(named.as_str()).await;
+    }
+}
+
+/// A file a resolve restores inside a linked repository.
+struct LinkFile {
+    /// The path from the parent's root.
+    user: RelativePath,
+    below_mount: RelativePath,
+    /// The path in the link's own states, which each number their nodes as they please.
+    in_link: RelativePath,
+    /// The node the target holds at `in_link`.
+    target: NodeLink,
+}
+
 /// The files a resolve restores inside one linked repository, from one of the link's merge
 /// parents (Mine = `parent_self`, Theirs = `parent_other`).
 struct LinkGroup {
+    local_node: NodeID,
     link_context: Arc<RepositoryContext>,
-    link_path: String,
     link_path_rel: RelativePath,
+    /// The node of `link_state_staged` mounted at `link_path_rel`.
+    mounted: NodeID,
+    source_path: RelativePath,
     link_state_staged: Arc<State>,
     link_state_target: Arc<State>,
     link_state_current: Arc<State>,
-    /// The path from the parent's root, the path in the link and the node the target holds there.
-    files: Vec<(RelativePath, RelativePath, NodeLink)>,
+    files: Vec<LinkFile>,
     link_branch: BranchId,
 }
 
 /// Groups `paths`, which lie inside linked repositories, by link, and checks each against
-/// `refusal` without staging anything.
+/// `refusal` without staging anything. A link the merge did not merge holds nothing to resolve.
 async fn collect_link_groups(
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
-    paths: &[LoreString],
+    paths: Vec<LinkPath>,
     merge_parent: MergeParent,
     refusal: &ResolveRefusal,
 ) -> Result<Vec<LinkGroup>, StageError> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
     let refusal = refusal.inside_link();
     let mut groups: Vec<LinkGroup> = Vec::new();
 
-    for path in paths {
-        let Ok(relative_path) =
-            RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
-        else {
-            emit_path_ignore(path.as_str()).await;
-            lore_debug!("Ignoring invalid path: {path}");
-            continue;
-        };
-
-        let link_list = state
-            .link_list(repository.clone())
+    let links = crate::link::links_and_merged(state, repository.clone())
+        .await
+        .forward::<StageError>("Failed to read the links of the merge")?;
+    let mut mounts = Vec::with_capacity(links.len());
+    for (link_ref, merged) in links {
+        let mount = state
+            .node_path(repository.clone(), link_ref.local_node)
             .await
-            .forward::<StageError>("Failed to read parent link list")?;
+            .forward::<StageError>("Failed to resolve a link mount path")?;
+        mounts.push((
+            link_ref,
+            merged,
+            RelativePath::from_str(&mount).unwrap_or_default(),
+        ));
+    }
 
-        let mut chosen_link: Option<state::LinkReference> = None;
-        let mut chosen_mount: Option<String> = None;
-        for link_ref in &link_list {
-            let mount = state
-                .node_path(repository.clone(), link_ref.local_node)
-                .await
-                .unwrap_or_default();
-            if relative_path.as_str() == mount
-                || relative_path.as_str().starts_with(&format!("{mount}/"))
-            {
-                chosen_link = Some(*link_ref);
-                chosen_mount = Some(mount);
-                break;
-            }
-        }
-        let (Some(link_ref), Some(mount)) = (chosen_link, chosen_mount) else {
-            emit_path_ignore(path.as_str()).await;
-            lore_debug!("Ignoring invalid path, does not resolve to any link: {path}");
+    for LinkPath {
+        path: relative_path,
+        named,
+    } in paths
+    {
+        let Some(&(link_ref, merged, ref mount)) = mounts
+            .iter()
+            .filter(|(_, _, mount)| relative_path.below(mount).is_some())
+            .max_by_key(|(_, _, mount)| mount.as_str().len())
+        else {
+            emit_named_path_ignore(named.as_ref()).await;
+            lore_debug!("Ignoring path, does not resolve to any link: {relative_path}");
             continue;
         };
-
-        // For a `source_path == "/"` link, the mount-relative path IS the
-        // link-relative path. Non-trivial source paths would need the
-        // source_path prepended; not yet supported.
-        let after_mount = relative_path
-            .as_str()
-            .strip_prefix(&mount)
-            .unwrap_or(relative_path.as_str());
-        let link_relative_str = after_mount.strip_prefix('/').unwrap_or(after_mount);
-        let link_relative =
-            RelativePath::from_str(link_relative_str).unwrap_or_else(|_| RelativePath::new());
 
         let group_index = groups
             .iter()
-            .position(|g| g.link_context.id == link_ref.repository);
+            .position(|g| g.local_node == link_ref.local_node);
         let group = if let Some(idx) = group_index {
             &mut groups[idx]
         } else {
+            if let Some(refused) = refusal
+                .entering_link(link_ref.local_node as NodeID, mount)
+                .await?
+            {
+                return Err(refused.into());
+            }
+            if !merged {
+                emit_named_path_ignore(named.as_ref()).await;
+                lore_debug!("Ignoring path, the link holding it is not merged: {relative_path}");
+                continue;
+            }
             let link_context = repository.to_link_context(link_ref.repository).await;
             let link_state_staged =
                 state::State::deserialize(link_context.clone(), link_ref.signature)
@@ -4604,30 +4604,38 @@ async fn collect_link_groups(
                     link_state_staged.parent_other()
                 }
             };
-            let link_state_target = state::State::deserialize(link_context.clone(), target_hash)
+            let mounted = state
+                .node(repository.clone(), link_ref.local_node)
                 .await
-                .forward::<StageError>("Failed to deserialize link target state")?;
+                .forward::<StageError>("Failed to load the link node")?
+                .child;
             // `link_state_current` is approximated by `parent_self` — only
             // used for `determine_merge_action` so a precise distinction
             // (an actual pre-merge HEAD) isn't needed.
-            let link_state_current =
-                state::State::deserialize(link_context.clone(), link_state_staged.parent_self())
-                    .await
-                    .forward::<StageError>("Failed to deserialize link current state")?;
-
-            let link_path_rel =
-                RelativePath::from_str(&mount).unwrap_or_else(|_| RelativePath::new());
-            if let Some(refused) = refusal
-                .entering_link(link_ref.local_node as NodeID, &link_path_rel)
-                .await?
-            {
-                return Err(refused.into());
-            }
+            let (link_state_target, link_state_current, source_path) = tokio::try_join!(
+                async {
+                    state::State::deserialize(link_context.clone(), target_hash)
+                        .await
+                        .forward::<StageError>("Failed to deserialize link target state")
+                },
+                async {
+                    state::State::deserialize(link_context.clone(), link_state_staged.parent_self())
+                        .await
+                        .forward::<StageError>("Failed to deserialize link current state")
+                },
+                async {
+                    crate::link::link_source_path(link_context.clone(), &link_state_staged, mounted)
+                        .await
+                        .forward::<StageError>("Failed to resolve the link source path")
+                },
+            )?;
 
             groups.push(LinkGroup {
+                local_node: link_ref.local_node,
                 link_context,
-                link_path: mount.clone(),
-                link_path_rel,
+                link_path_rel: mount.clone(),
+                mounted,
+                source_path,
                 link_state_staged,
                 link_state_target,
                 link_state_current,
@@ -4637,14 +4645,22 @@ async fn collect_link_groups(
             groups.last_mut().expect("just pushed")
         };
 
+        let in_group = |user: RelativePath| {
+            let below_mount = RelativePath::from_str(user.below(&group.link_path_rel)?).ok()?;
+            let in_link = group.source_path.join(below_mount.as_str());
+            Some((user, below_mount, in_link))
+        };
+        let Some((user, below_mount, in_link)) = in_group(relative_path) else {
+            continue;
+        };
         let node_link = group
             .link_state_staged
-            .find_node_link(group.link_context.clone(), link_relative.as_str())
+            .find_node_link(group.link_context.clone(), in_link.as_str())
             .await
             .unwrap_or_default();
         if !node_link.is_valid_or_root() {
-            emit_path_ignore(path.as_str()).await;
-            lore_debug!("Ignoring invalid link path, does not exist in link staged state: {path}");
+            emit_named_path_ignore(named.as_ref()).await;
+            lore_debug!("Ignoring invalid link path, does not exist in link staged state: {user}");
             continue;
         }
         let block = group
@@ -4655,17 +4671,17 @@ async fn collect_link_groups(
         let node = block.node(Node::index(node_link.node));
         let files = if node.is_file() {
             if !node.is_staged_merge() {
-                emit_path_ignore(path.as_str()).await;
-                lore_debug!("Ignoring invalid path, link node is not a staged merge: {path}");
+                emit_named_path_ignore(named.as_ref()).await;
+                lore_debug!("Ignoring invalid path, link node is not a staged merge: {user}");
                 continue;
             }
-            vec![(relative_path, link_relative)]
+            vec![(user, below_mount, in_link)]
         } else {
             collect_merge_paths(
                 group.link_context.clone(),
                 group.link_state_staged.clone(),
                 node_link.node,
-                relative_path,
+                user,
                 MergeWalk {
                     unresolved_only: false,
                     whole_directories: false,
@@ -4675,24 +4691,13 @@ async fn collect_link_groups(
             .await?
             .files
             .into_iter()
-            .map(|user| {
-                let link_relative = user
-                    .below(&group.link_path_rel)
-                    .and_then(|below| RelativePath::from_str(below).ok())
-                    .ok_or_else(|| {
-                        StageError::internal(format!(
-                            "{user} lies outside the link mounted at {}",
-                            group.link_path
-                        ))
-                    })?;
-                Ok((user, link_relative))
-            })
-            .collect::<Result<Vec<_>, StageError>>()?
+            .filter_map(in_group)
+            .collect()
         };
-        for (user, link_relative) in files {
+        for (user, below_mount, in_link) in files {
             let target = match group
                 .link_state_target
-                .find_node_link(group.link_context.clone(), link_relative.as_str())
+                .find_node_link(group.link_context.clone(), in_link.as_str())
                 .await
             {
                 Ok(target) => target,
@@ -4711,7 +4716,12 @@ async fn collect_link_groups(
                     return Err(refused.into());
                 }
             }
-            group.files.push((user, link_relative, target));
+            group.files.push(LinkFile {
+                user,
+                below_mount,
+                in_link,
+                target,
+            });
         }
     }
     Ok(groups)
@@ -4734,7 +4744,13 @@ async fn stage_link_groups(
     let stats = Arc::new(StageStats::default());
 
     for group in groups.iter().filter(|group| !group.files.is_empty()) {
-        for (mount_path, link_relative, target_node_link) in &group.files {
+        for LinkFile {
+            user: mount_path,
+            below_mount,
+            in_link: link_relative,
+            target: target_node_link,
+        } in &group.files
+        {
             let staged_node_link = group
                 .link_state_staged
                 .find_node_link(group.link_context.clone(), link_relative.as_str())
@@ -4805,8 +4821,8 @@ async fn stage_link_groups(
 
             // Mirror `stage_from_parent_revision`: realize the chosen
             // target's content on disk, then read it back into state via
-            // `stage_filesystem_path`, anchored at the mount, whose node is
-            // the root of the link's own state.
+            // `stage_filesystem_path`, anchored at the mount and the node of
+            // the link's own state mounted there.
             if !target_node_link.is_valid() {
                 // No file at the path → `stage_filesystem_path` stages a
                 // delete; we just clear the on-disk file first.
@@ -4817,9 +4833,9 @@ async fn stage_link_groups(
                         repository: group.link_context.clone(),
                         state: group.link_state_staged.clone(),
                         path: group.link_path_rel.clone(),
-                        node: ROOT_NODE,
+                        node: group.mounted,
                     },
-                    link_relative.clone(),
+                    below_mount.clone(),
                     stats.clone(),
                     options,
                     None,
@@ -4862,9 +4878,9 @@ async fn stage_link_groups(
                         repository: group.link_context.clone(),
                         state: group.link_state_staged.clone(),
                         path: group.link_path_rel.clone(),
-                        node: ROOT_NODE,
+                        node: group.mounted,
                     },
-                    link_relative.clone(),
+                    below_mount.clone(),
                     stats.clone(),
                     options,
                     None,
@@ -4886,7 +4902,7 @@ async fn stage_link_groups(
         crate::link::update_link_pin_by_path(
             &state,
             repository.clone(),
-            &group.link_path,
+            group.link_path_rel.as_str(),
             group.link_branch,
             new_link_sig,
         )
