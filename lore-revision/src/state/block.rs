@@ -3776,14 +3776,17 @@ impl NodeLink {
         }
     }
 
+    pub fn crosses_link(&self, repository: &RepositoryContext, state: &State) -> bool {
+        self.is_valid_or_root()
+            && (repository.id != self.repository || state.revision() != self.revision)
+    }
+
     pub async fn resolve(
         &self,
         repository: Arc<RepositoryContext>,
         state: Arc<State>,
     ) -> Result<(Arc<RepositoryContext>, Arc<State>), StateError> {
-        if self.is_valid_or_root()
-            && (repository.id != self.repository || state.revision() != self.revision)
-        {
+        if self.crosses_link(&repository, &state) {
             self.open(&repository).await
         } else {
             Ok((repository, state))

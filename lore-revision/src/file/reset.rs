@@ -1046,7 +1046,7 @@ async fn resolve_last_merged_target(
         let state_branch_point = state::State::deserialize(repository.clone(), branch_point)
             .await
             .forward::<ResetError>("Failed to deserialize revision state")?;
-        if let Some(state_merge) = absent_unless_refused::<_, _, ResetError>(
+        if let Some(state_merge) = absent_unless::<_, _, ResetError>(
             find_merge_state(
                 repository.clone(),
                 state_start,
@@ -1055,6 +1055,7 @@ async fn resolve_last_merged_target(
                 relative_path,
             )
             .await,
+            |err| is_refusal(err) || err.is_not_supported(),
             "finding the last merge from the branch",
         )? {
             lore_debug!(
@@ -1155,6 +1156,15 @@ where
     }
 }
 
+fn last_merged_inside_link(relative_path: &RelativePath) -> ResetError {
+    NotSupported {
+        operation: format!(
+            "Resetting {relative_path} inside a link to its last merge from a branch"
+        ),
+    }
+    .into()
+}
+
 async fn find_start_state(
     repository: Arc<RepositoryContext>,
     parent: Hash,
@@ -1207,6 +1217,21 @@ async fn find_merge_state(
             state.parent_self(),
             state.parent_other()
         );
+        let node_link = state
+            .find_node_link(repository.clone(), relative_path.as_str())
+            .await
+            .map_err(|err| {
+                forward_refusal_or(err, "finding the node", |err| {
+                    ResetError::internal_with_context(err, "Failed to find node")
+                })
+            });
+
+        if let Ok(node_link) = &node_link
+            && node_link.crosses_link(&repository, &state)
+        {
+            return Err(last_merged_inside_link(relative_path));
+        }
+
         if !state.parent_other().is_zero()
             && let Some(state_merged) = absent_unless_refused::<_, _, ResetError>(
                 state::State::deserialize(repository.clone(), state.parent_other()).await,
@@ -1220,14 +1245,7 @@ async fn find_merge_state(
             return Ok(state);
         }
 
-        let node_link = state
-            .find_node_link(repository.clone(), relative_path.as_str())
-            .await
-            .map_err(|err| {
-                forward_refusal_or(err, "finding the node", |err| {
-                    ResetError::internal_with_context(err, "Failed to find node")
-                })
-            })?;
+        let node_link = node_link?;
 
         let node_id = node_link.node;
 
@@ -1429,12 +1447,22 @@ async fn reset_walk_named_path(
             // in the current revision but added after the target (delete it so the
             // working tree matches the target, unless the view excludes it, which
             // only --purge deletes), a pending dirty-add, or an untracked file (keep
-            // on disk unless --purge, discarding add tracking).
+            // on disk unless --purge, discarding add tracking). A path inside a link is refused,
+            // since its node is numbered in the linked tree, not in `state_staged`.
             let mut delete_path = options.purge;
             if let Ok(staged_link) = state_staged
                 .find_node_link(repository.clone(), state_path.as_str())
                 .await
             {
+                if staged_link.crosses_link(&repository, &state_staged) {
+                    return Err(NotSupported {
+                        operation: format!(
+                            "Resetting {relative_path} inside a link, which the target revision \
+                             does not hold"
+                        ),
+                    }
+                    .into());
+                }
                 // The flags alone, so the record is not held across the awaits below.
                 let (staged, dirty_add, link, directory) = state_staged
                     .node(repository.clone(), staged_link.node)

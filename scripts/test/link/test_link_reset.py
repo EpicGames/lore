@@ -4,7 +4,7 @@ import json
 import os
 
 import pytest
-from error_types import LocalChanges, LoreException
+from error_types import LocalChanges, LoreException, NotSupportedError
 from link_helpers import assert_crr_clean, make_parent_with_link, make_repo
 from lore_parsers import parse_status_json
 from test_utils import has_staged_anchor, status_by_path
@@ -269,6 +269,77 @@ def test_link_reset_refuses_a_staged_file_inside_a_link(new_lore_repo):
         assert f.read() == "MODIFIED file 1 for staged test\n", (
             "A refused reset must leave the staged edit on disk"
         )
+
+
+@pytest.mark.smoke
+def test_link_reset_refuses_a_file_added_inside_a_link(new_lore_repo):
+    """`reset` refuses a file added inside a link, staged or marked dirty, and leaves the
+    working tree and the status as they were. An untracked file there still resets.
+
+    The parent holds more nodes than the linked repository, so the added file's node id
+    also numbers a committed file in the parent.
+    """
+    repo, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        "linked",
+        parent_files={f"parent{i}.txt": f"parent {i}\n" for i in range(6)},
+    )
+    staged_file = "linked/staged.txt"
+    dirty_file = "linked/dirty.txt"
+    untracked_file = "linked/untracked.txt"
+    repo.write_files({staged_file: "staged\n", dirty_file: "dirty\n"})
+    repo.stage(staged_file)
+    repo.dirty(dirty_file)
+    files = repo.read_files()
+    status = status_by_path(repo)
+    repo.write_files({untracked_file: "untracked\n"})
+
+    for path in (staged_file, dirty_file):
+        with pytest.raises(NotSupportedError):
+            repo.reset(path)
+    repo.reset(untracked_file, purge=True)
+
+    assert repo.read_files() == files
+    assert files[staged_file] == "staged\n"
+    assert files[dirty_file] == "dirty\n"
+    assert status_by_path(repo) == status
+    assert status[staged_file]["flagStaged"]
+    assert status[dirty_file]["flagDirty"]
+
+
+@pytest.mark.smoke
+def test_link_reset_last_merged_refuses_a_file_inside_a_link(new_lore_repo):
+    """`reset --last-merged-from` refuses a file inside a link, at the merge and after it, and
+    leaves the working tree as it was.
+
+    The linked file's node id also numbers parent files that a merge changed, so the file's
+    history must not be read in the parent's tree.
+    """
+    parent_files = {f"parent{i}.txt": f"parent {i}\n" for i in range(6)}
+    repo, _link_repo = make_parent_with_link(
+        new_lore_repo, "linked", parent_files=parent_files
+    )
+    repo.branch_create("feature")
+    repo.write_commit_push("Edit the linked file", {"linked/linked.txt": "feature\n"})
+    repo.branch_switch("main")
+    repo.write_commit_push("Edit the parent", {path: "main\n" for path in parent_files})
+    repo.branch_switch("feature")
+    repo.branch_merge("main")
+    files = repo.read_files()
+
+    with pytest.raises(NotSupportedError):
+        repo.reset("linked/linked.txt", last_merged_from="main")
+    assert repo.read_files() == files
+
+    repo.write_commit_push(
+        "Edit the parent after the merge", {"parent0.txt": "after\n"}
+    )
+    files = repo.read_files()
+
+    with pytest.raises(NotSupportedError):
+        repo.reset("linked/linked.txt", last_merged_from="main")
+    assert repo.read_files() == files
+    assert files["linked/linked.txt"] == "feature\n"
 
 
 @pytest.mark.smoke
