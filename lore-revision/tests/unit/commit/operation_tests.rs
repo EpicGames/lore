@@ -155,33 +155,36 @@ async fn a_provider_not_holding_its_state_is_handed_nothing() {
 }
 
 /// The operation a commit read its files through, on a provider holding its state, is told what
-/// each file was stored as, the address, size and mode the revision records, before the revision
-/// is handed over. A view-excluded file, whose content the commit takes from the staged node, is
-/// not told of.
+/// each file it read was stored as, the address, size and mode the revision records, before the
+/// revision is handed over: a file the view excludes, staged from the working tree, included, and
+/// one a merge staged past the view that a forced stage took from the working tree since, which
+/// resolves the merge. A file a merge staged past the view and no stage took since, whose content
+/// the commit takes from the staged node, is not told of. Each records the size of its content.
 #[tokio::test]
-async fn the_operation_is_told_what_each_file_in_view_was_stored_as_before_the_hand_over() {
+async fn the_operation_is_told_what_each_file_it_read_was_stored_as_before_the_hand_over() {
     let dir = lore_base::test_util::TempDir::new("lore-commit-test-");
     let filesystem = Arc::new(TestFilesystemProvider::holding_state_reading(dir.path()));
-    std::fs::write(dir.path().join("one.txt"), b"one").expect("write file");
-    std::fs::write(dir.path().join("excluded.txt"), b"one").expect("write file");
+    for file in ["one.txt", "excluded.txt", "merged.txt", "adopted.txt"] {
+        std::fs::write(dir.path().join(file), b"one").expect("write file");
+    }
     let (immutable_store, mutable_store, execution) =
         test_store_create().await.expect("Making test stores");
     let root = dir.to_path_buf();
     let committed = filesystem.clone();
     let mut filter = Filter::default();
-    filter
-        .view
-        .add_exclusion("excluded.txt")
-        .expect("A view line");
+    for file in ["excluded.txt", "merged.txt", "adopted.txt"] {
+        filter.view.add_exclusion(file).expect("A view line");
+    }
+    let filter = Arc::new(filter);
 
-    let (signature, node) = runtime()
+    let (signature, read, sizes) = runtime()
         .spawn(LORE_CONTEXT.scope(execution, async move {
             let (fixture, committing) = committing_repository(
                 &root,
                 immutable_store,
                 mutable_store,
                 committed,
-                Arc::new(filter),
+                filter.clone(),
             )
             .await;
             stage_working_tree(&fixture, &root).await;
@@ -190,38 +193,116 @@ async fn the_operation_is_told_what_each_file_in_view_was_stored_as_before_the_h
                 .expect("Committing through the OS filesystem");
 
             std::fs::write(root.join("one.txt"), b"two!").expect("rewrite file");
-            std::fs::write(root.join("excluded.txt"), b"two!").expect("rewrite file");
             stage_working_tree(&fixture, &root).await;
+            stage_as_merged(&fixture, &["merged.txt", "adopted.txt"]).await;
+            for file in ["excluded.txt", "merged.txt"] {
+                std::fs::write(root.join(file), b"two!").expect("rewrite file");
+            }
+            let sparse = Arc::new(fixture.repository.to_filter_context(filter));
+            LORE_CONTEXT
+                .scope(
+                    crate::helper::forced_execution(),
+                    lore_revision::file::stage::stage(
+                        sparse,
+                        &fixture.token,
+                        LoreArray::from_vec(vec![LoreString::from(&root)]),
+                        lore_revision::stage::StageOptions {
+                            scan: true,
+                            ..Default::default()
+                        },
+                    ),
+                )
+                .await
+                .expect("Forced staging of the working tree");
             let signature = commit_staged(&committing, &fixture.token, test_commit())
                 .await
                 .expect("Committing");
-            let node = State::deserialize(committing.clone(), signature)
+            let state = State::deserialize(committing.clone(), signature)
                 .await
-                .expect("The committed State")
-                .find_node(committing, "one.txt")
+                .expect("The committed State");
+            let mut read = Vec::new();
+            let mut sizes = Vec::new();
+            for file in ["adopted.txt", "excluded.txt", "merged.txt", "one.txt"] {
+                let node = state
+                    .find_node(committing.clone(), file)
+                    .await
+                    .expect("The committed file");
+                let content = lore_revision::immutable::read(
+                    committing.clone(),
+                    node.address,
+                    None,
+                    lore_revision::immutable::read_options_from_repository(&committing),
+                )
                 .await
-                .expect("The committed file");
-            (signature, node)
+                .expect("The committed content");
+                sizes.push((file, node.size, content.len() as u64));
+                if file != "adopted.txt" {
+                    read.push((
+                        String::from(file),
+                        node.address,
+                        node.size,
+                        node.mode,
+                        false,
+                    ));
+                }
+            }
+            (signature, read, sizes)
         }))
         .await
         .expect("Test task failed");
 
+    let mut stored = filesystem.stored_calls.lock().clone();
+    stored.sort_by(|left, right| left.0.cmp(&right.0));
     assert_eq!(
-        *filesystem.stored_calls.lock(),
-        [(
-            String::from("one.txt"),
-            node.address,
-            node.size,
-            node.mode,
-            false
-        )],
-        "The commit told of other content than the revision records, of the view-excluded file, \
-         or after the hand-over"
+        stored, read,
+        "The commit told of other content than the revision records, of the file a merge staged \
+         that no stage took since, or after the hand-over"
     );
+    for (file, size, content) in sizes {
+        assert_eq!(
+            size, content,
+            "{file} records another size than its content's"
+        );
+    }
     assert_eq!(
         *filesystem.committed_calls.lock(),
         [(signature, signature, true)]
     );
+}
+
+/// Marks each of `files` in `fixture`'s staged state as a merge stages it, with the content it
+/// holds.
+async fn stage_as_merged(fixture: &CountingRepository, files: &[&str]) {
+    let repository = &fixture.repository;
+    let (_, staged, _) = State::deserialize_current_and_staged(repository.clone())
+        .await
+        .expect("The current and staged States");
+    let staged = staged.expect("A staged State");
+    for file in files {
+        let node = staged
+            .find_node_link(repository.clone(), file)
+            .await
+            .expect("The staged file")
+            .node;
+        staged
+            .node_mark(
+                repository,
+                node,
+                lore_revision::state::Mark::staged(
+                    lore_revision::node::NodeFlags::StagedMerge,
+                    true,
+                ),
+            )
+            .await
+            .expect("Marking the file merged");
+    }
+    let signature = staged
+        .serialize(repository.clone(), &fixture.token)
+        .await
+        .expect("Storing the staged State");
+    lore_revision::instance::store_staged_anchor(repository, signature)
+        .await
+        .expect("Storing the staged anchor");
 }
 
 /// A commit of a link alone or of a layer is refused on a provider holding its state, which would

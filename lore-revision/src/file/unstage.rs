@@ -17,6 +17,7 @@ use crate::event::EventError;
 use crate::file::stage::route_layer_paths;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::filter::query_depth;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
@@ -46,6 +47,7 @@ use crate::repository::is_reserved_node_name;
 use crate::state;
 use crate::state::Clear;
 use crate::state::LinkPin;
+use crate::state::Mark;
 use crate::state::NodeMapping;
 use crate::state::OwnFlags;
 use crate::state::State;
@@ -305,7 +307,7 @@ async fn unstage_parent(
     let link_tracker = LinkTracker::new();
     let is_merge_or_cherry_pick_or_revert = state_staged.is_merge_or_cherry_pick_or_revert();
 
-    let mut clear = with_operation(repository.file_system(), async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         unstage_each_path(UnstagePaths {
             operation: &operation,
             repository: &repository,
@@ -316,30 +318,16 @@ async fn unstage_parent(
             options,
             stats: &stats,
             link_tracker: &link_tracker,
-            is_merge_or_cherry_pick_or_revert,
         })
         .await
     })
     .await?;
 
-    if !clear && !is_merge_or_cherry_pick_or_revert {
-        clear = !state_staged
+    let mut clear = !is_merge_or_cherry_pick_or_revert
+        && !state_staged
             .node_has_staged_or_dirty_children(repository.clone(), ROOT_NODE)
             .await
             .forward::<UnstageError>("Failed to find subnode")?;
-    };
-
-    // Even if we plan to clear, check for dirty nodes — preserve anchor if dirty remain
-    if clear {
-        let has_dirty = state_staged
-            .node_has_dirty_children(repository.clone(), ROOT_NODE)
-            .await
-            .forward::<UnstageError>("Failed to find subnode")?;
-        if has_dirty {
-            lore_debug!("Dirty nodes remain, preserving staged anchor");
-            clear = false;
-        }
-    }
 
     if clear {
         lore_debug!("Unstaged all, clean by removing staged state anchor");
@@ -500,14 +488,10 @@ struct UnstagePaths<'a> {
     options: UnstageOptions,
     stats: &'a Arc<UnstageStats>,
     link_tracker: &'a Arc<LinkTracker>,
-    is_merge_or_cherry_pick_or_revert: bool,
 }
 
 /// Unstage each path in turn, reporting progress while one runs.
-///
-/// Reports whether the whole tree was named, which is what makes removing the staged anchor
-/// the outcome rather than rewriting it.
-async fn unstage_each_path(args: UnstagePaths<'_>) -> Result<bool, UnstageError> {
+async fn unstage_each_path(args: UnstagePaths<'_>) -> Result<(), UnstageError> {
     let UnstagePaths {
         operation,
         repository,
@@ -518,17 +502,9 @@ async fn unstage_each_path(args: UnstagePaths<'_>) -> Result<bool, UnstageError>
         options,
         stats,
         link_tracker,
-        is_merge_or_cherry_pick_or_revert,
     } = args;
-    let mut clear = false;
     for relative_path in paths {
         let relative_path = relative_path.clone();
-
-        // If we unstage everything, mark for potential clearing, unless we're in a merge/cherry-pick.
-        // The actual deletion check also considers dirty nodes (checked later).
-        if !is_merge_or_cherry_pick_or_revert && relative_path.is_empty() {
-            clear = true;
-        }
 
         lore_debug!("Unstage options: {:?}", options);
 
@@ -575,7 +551,7 @@ async fn unstage_each_path(args: UnstagePaths<'_>) -> Result<bool, UnstageError>
         result?;
     }
 
-    Ok(clear)
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -945,14 +921,19 @@ async fn unstage_directory(
     Ok(())
 }
 
+/// Clears the staged flags of `starting_parent`, and of each directory above it, while it holds
+/// no staged child. With `stop_at_staged_add`, it stops at a staged add, which it leaves staged;
+/// without it, it clears the dirty flags too, where no dirty child keeps them. Returns whether it
+/// cleared `starting_parent`.
 async fn unstage_parent_chain(
     repository: Arc<RepositoryContext>,
     state_staged: Arc<State>,
     starting_parent: NodeID,
     link_tracker: Arc<LinkTracker>,
     stop_at_staged_add: bool,
-) -> Result<(), UnstageError> {
+) -> Result<bool, UnstageError> {
     let mut parent_node_id = starting_parent;
+    let mut cleared = false;
     while !state_staged
         .node_has_staged_children(repository.clone(), parent_node_id)
         .await
@@ -994,6 +975,7 @@ async fn unstage_parent_chain(
             OwnFlags::Change
         };
         state_staged.node_clear_own(&parent_block, parent_node_id, flags);
+        cleared |= parent_node_id == starting_parent;
 
         link_tracker.on_node_changed(&repository);
 
@@ -1004,13 +986,22 @@ async fn unstage_parent_chain(
         parent_node_id = grandparent;
     }
 
-    Ok(())
+    Ok(cleared)
 }
 
 /// Unstages the node `at` maps.
 ///
 /// `states` carries the verdict this node's own query steps from, which the query asks about
 /// `at`'s path from.
+///
+/// A staged file takes back the content of the current revision's file where
+/// [`takes_back_content`] says so.
+///
+/// Unless `options` asks for the single node, a directory other than an add keeps its own staged
+/// flags while anything below it stays staged: once its children are unstaged,
+/// [`unstage_parent_chain`] runs from the directory itself, and clears them only where nothing
+/// below is staged. A link is marked staged again while the linked tree holds something staged,
+/// which an unstage that follows the view leaves past it.
 #[allow(clippy::too_many_arguments)]
 async fn unstage_node(
     operation: Arc<InstanceOperationImpl>,
@@ -1105,6 +1096,7 @@ async fn unstage_node(
     // removes it only when no staged AND no dirty nodes remain. A
     // staged-add LINK is still discarded so its registry entry is cleaned.
     let mut keep_as_dirty_add = false;
+    let mut kept_below = false;
     if node.is_staged_add() {
         if node.is_link() {
             return discard_staged_add(
@@ -1127,22 +1119,22 @@ async fn unstage_node(
 
         lore_debug!("Unstaging staged add {node_id}: keep as dirty add");
 
-        // Clearing the staged flags on a dirty node preserves Dirty +
-        // action bits, leaving a plain dirty add.
-        state_staged.node_clear_own(&block, node_id, OwnFlags::Staged);
-        node.clear_staged_flags();
-        link_tracker.on_node_changed(&repository);
-
-        if node.is_directory() {
-            demote_subnodes_to_dirty(
+        kept_below = node.is_directory()
+            && demote_subnodes_to_dirty(
                 repository.clone(),
                 state_staged.clone(),
                 node_path.clone(),
                 node_id,
+                view_below(&repository, (!force).then_some(child_states), &node_path),
                 stats.clone(),
             )
             .await?;
+
+        if !kept_below {
+            state_staged.node_clear_own(&block, node_id, OwnFlags::Staged);
+            node.clear_staged_flags();
         }
+        link_tracker.on_node_changed(&repository);
 
         keep_as_dirty_add = true;
     }
@@ -1206,16 +1198,23 @@ async fn unstage_node(
                 .fetch_add(1, Ordering::Relaxed);
         }
 
-        {
-            // Read here, in a scope no await crosses; nothing above changes the flags.
-            let restore_file = node.is_staged_modify() && node.is_file();
+        let restore_file = node.is_staged_modify() && node.is_file();
+        let restore_content = takes_back_content(&node, &current_node)
+            .forward_with::<UnstageError, _>(|| {
+                format!("taking back the content of {node_path}")
+            })?;
+        link_tracker.on_node_changed(&repository);
+        if !node.is_directory() || options.single_node {
             node.clear_staged_flags();
-
-            link_tracker.on_node_changed(&repository);
-
             let place = (node.parent, node.name_hash);
             state_staged.node_change_in_place(&block, node_id, place, |held| {
-                if restore_file {
+                if restore_content {
+                    held.overwrite_content(
+                        current_node.address,
+                        current_node.size,
+                        current_node.mode,
+                    );
+                } else if restore_file {
                     held.set_mode(current_node.mode);
                     held.set_size(current_node.size);
                 }
@@ -1357,6 +1356,17 @@ async fn unstage_node(
                 child_states,
             )
             .await?;
+
+            if linked_state
+                .node_has_staged_children(linked_repository.clone(), node.child)
+                .await
+                .forward::<UnstageError>("Failed to check node children")?
+            {
+                state_staged
+                    .node_mark(&repository, node_id, Mark::staged(NodeFlags::Staged, true))
+                    .await
+                    .forward::<UnstageError>("Failed to mark the link staged")?;
+            }
         }
     } else if node.is_directory() {
         if options.single_node {
@@ -1380,9 +1390,28 @@ async fn unstage_node(
         )
         .await?;
 
-        stats
-            .directory_unstaged_count
-            .fetch_add(1, Ordering::Relaxed);
+        let unstaged = if keep_as_dirty_add {
+            !kept_below
+        } else {
+            !state_staged
+                .node(repository.clone(), node_id)
+                .await
+                .forward::<UnstageError>("Failed deserializing state node block")?
+                .is_staged()
+                || unstage_parent_chain(
+                    repository.clone(),
+                    state_staged.clone(),
+                    node_id,
+                    link_tracker.clone(),
+                    true,
+                )
+                .await?
+        };
+        if unstaged {
+            stats
+                .directory_unstaged_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
     } else {
         stats.file_unstaged_count.fetch_add(1, Ordering::Relaxed);
         event::LoreEvent::FileUnstageFile(LoreFileUnstageFileEventData {
@@ -1510,20 +1539,64 @@ async fn process_link_unstage_updates(
     .forward::<UnstageError>("Failed to unstage link nodes")
 }
 
+/// Whether an unstage of `node` takes back the content of `current`, the node the current
+/// revision holds at the same node: where `node` is a staged file whose content hash is zero,
+/// content a forced stage took from the working tree over a merge, or an empty file, and `current`
+/// is a live file, its address, mode and size. A zero hash with a nonzero size and no live file
+/// to take back is content no commit stored, which the unstage refuses to leave.
+#[lore_macro::test_pub]
+fn takes_back_content(node: &Node, current: &Node) -> Result<bool, UnstageError> {
+    if !(node.is_staged() && node.is_file() && node.address.hash.is_zero()) {
+        return Ok(false);
+    }
+    if current.is_file() && !current.is_discarded() {
+        return Ok(true);
+    }
+    if node.size != 0 {
+        return Err(UnstageError::internal(
+            "A staged file holds content no commit stored, and the current revision holds no file \
+             to take back",
+        ));
+    }
+    Ok(false)
+}
+
+/// The filter states a demotion below the directory `path` asks the view with: `states`, the
+/// walk's at `path`, where the view could exclude something below it, and `None` where the view
+/// takes in everything below `path`, so an unstage with no view asks it nothing. `None` stays
+/// `None`, as under force, which passes the view.
+fn view_below(
+    repository: &RepositoryContext,
+    states: Option<FilterStates>,
+    path: &RelativePath,
+) -> Option<FilterStates> {
+    let filter = &repository.filter;
+    states.filter(|&states| {
+        !filter.view.is_empty()
+            && !filter.covers_subtree(states, path, query_depth(path.as_str()), FilterMode::View)
+    })
+}
+
 /// Demote a staged-add subtree to dirty in place: clear the staged flags on every
 /// descendant (preserving Dirty + action bits), so an unstaged directory add
 /// survives as a tree of dirty adds rather than being discarded. Each demoted node
 /// is counted as unstaged and (for files) emits a Keep unstage event, matching the
 /// normal per-node unstage path. Self-contained — it walks the subtree directly and
 /// never re-enters `unstage_node`.
+///
+/// Where `view` carries the states of the walk at `relative_path` ([`view_below`]), a descendant
+/// the view excludes stays staged, as the walk leaves it, and so does every directory above it.
+/// Returns whether anything below stays staged.
 fn demote_subnodes_to_dirty<'a>(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     relative_path: RelativePath,
     node_id: NodeID,
+    view: Option<FilterStates>,
     stats: Arc<UnstageStats>,
-) -> Pin<Box<dyn Future<Output = Result<(), UnstageError>> + Send + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<bool, UnstageError>> + Send + 'a>> {
     Box::pin(async move {
+        let mut kept = false;
         let block_index = NodeBlock::index(node_id);
         let node_index = Node::index(node_id);
         let block = state
@@ -1557,22 +1630,41 @@ fn demote_subnodes_to_dirty<'a>(
             // Takes the name by value so its block read lock ends here, rather than reaching the
             // write below (see NodeNameLock docs).
             let child_path = relative_path.push_into_buf(child_name).freeze();
+            child_node_iter = next_child_sibling;
 
-            // Clear staged flags (preserves Dirty + action bits when Dirty is set).
-            state.node_clear_own(&child_block, child_node_id, OwnFlags::Staged);
+            let mut child_states = None;
+            if let Some(states) = view {
+                let (states, excluded) = repository.filter.child_excludes_tree(
+                    states,
+                    &child_path,
+                    child_node.is_directory(),
+                    FilterMode::View,
+                );
+                if excluded {
+                    kept |= child_node.is_staged();
+                    continue;
+                }
+                child_states = Some(states);
+            }
 
             if child_node.is_directory() {
-                stats
-                    .directory_unstaged_count
-                    .fetch_add(1, Ordering::Relaxed);
-                demote_subnodes_to_dirty(
+                let child_view = view_below(&repository, child_states, &child_path);
+                if demote_subnodes_to_dirty(
                     repository.clone(),
                     state.clone(),
                     child_path,
                     child_node_id,
+                    child_view,
                     stats.clone(),
                 )
-                .await?;
+                .await?
+                {
+                    kept = true;
+                    continue;
+                }
+                stats
+                    .directory_unstaged_count
+                    .fetch_add(1, Ordering::Relaxed);
             } else {
                 stats.file_unstaged_count.fetch_add(1, Ordering::Relaxed);
                 event::LoreEvent::FileUnstageFile(LoreFileUnstageFileEventData {
@@ -1582,10 +1674,10 @@ fn demote_subnodes_to_dirty<'a>(
                 .send();
             }
 
-            child_node_iter = next_child_sibling;
+            state.node_clear_own(&child_block, child_node_id, OwnFlags::Staged);
         }
 
-        Ok(())
+        Ok(kept)
     })
 }
 
@@ -1639,7 +1731,8 @@ async fn discard_staged_add(
 
     queue_discard(discard, at.repository.id, at.node);
 
-    unstage_parent_chain(at.repository, at.state, node.parent, link_tracker, false).await
+    unstage_parent_chain(at.repository, at.state, node.parent, link_tracker, false).await?;
+    Ok(())
 }
 
 fn queue_discard(

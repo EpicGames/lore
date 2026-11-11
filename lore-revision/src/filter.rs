@@ -1855,6 +1855,11 @@ bitflags! {
         /// tracked, ignored directory is ignored. A walk clears the bit for each node the tree
         /// does not hold; see [`FilterMode::at`].
         const KeepTracked = 0b1000;
+        /// The view slot does not exclude a node that holds a staged change at or below it. The
+        /// slot is still stepped, and the bit is cleared for each node the tree does not hold, as
+        /// [`KeepTracked`](Self::KeepTracked) is, and for each node that holds nothing staged; see
+        /// [`FilterMode::at_staged`].
+        const KeepStagedInView = 0b10000;
     }
 }
 bitflagsops!(FilterMode, u16);
@@ -1867,23 +1872,47 @@ impl FilterMode {
     /// changed in it has nothing to report, and an ignored one is pruned without being entered.
     pub const TRACKED: Self = Self::Full.union(Self::KeepTracked);
 
+    /// The mode for the changes a stage holds: [`TRACKED`](Self::TRACKED), and the view, which
+    /// excludes nothing staged.
+    ///
+    /// A comparison of trees in this mode also asks [`at_staged`](Self::at_staged) whether
+    /// something is staged at or below a node, so a subtree past the view with nothing staged in
+    /// it is pruned without being entered.
+    pub const CHANGES: Self = Self::TRACKED.union(Self::KeepStagedInView);
+
+    /// The bits that keep a slot from excluding a tracked node.
+    const KEEPS: Self = Self::KeepTracked.union(Self::KeepStagedInView);
+
     /// The mode a walk through `self` asks about a node in, `tracked` saying whether the node is
     /// one the tree tracks.
     pub fn at(self, tracked: bool) -> Self {
         if tracked {
             self
         } else {
-            self.difference(Self::KeepTracked)
+            self.difference(Self::KEEPS)
+        }
+    }
+
+    /// The mode a walk through `self` asks about a node in, `staged` saying whether the node holds
+    /// a staged change at or below it.
+    pub fn at_staged(self, staged: bool) -> Self {
+        if staged {
+            self
+        } else {
+            self.difference(Self::KeepStagedInView)
         }
     }
 
     /// The slots that exclude.
     fn excluding(self) -> Self {
+        let mut slots = self;
         if self.contains(Self::KeepTracked) {
-            self.difference(Self::Ignore)
-        } else {
-            self
+            slots.remove(Self::Ignore);
         }
+        if self.contains(Self::KeepStagedInView) {
+            slots.remove(Self::View);
+        }
+        slots
     }
 }
 
@@ -2015,9 +2044,9 @@ impl Filter {
     }
 
     /// The mode a walk asks about `path` in, from `parent`: `mode` where `tracked` answers that the
-    /// tree tracks the node there, and `mode` without [`FilterMode::KeepTracked`] otherwise.
-    /// `tracked` is awaited only where `mode` carries the bit and the ignore rules would leave the
-    /// node out, so a walk reads nothing more for a node they keep.
+    /// tree tracks the node there, and `mode` without its keep bits otherwise ([`FilterMode::at`]).
+    /// `tracked` is awaited only where `mode` carries a keep bit and the filter would leave the
+    /// node out, so a walk reads nothing more for a node it keeps.
     pub async fn tracked_mode<E, F>(
         &self,
         parent: FilterStates,
@@ -2030,7 +2059,7 @@ impl Filter {
         F: std::future::Future<Output = Result<bool, E>>,
     {
         let untracked = mode.at(false);
-        if !mode.contains(FilterMode::KeepTracked)
+        if !mode.intersects(FilterMode::KEEPS)
             || !self
                 .child_excludes_tree(parent, path, is_directory, untracked)
                 .1
@@ -2242,7 +2271,9 @@ impl Filter {
     /// reported ahead of one that only excludes at the leaf.
     ///
     /// [`FilterMode::KeepTracked`] keeps the ancestors past the ignore slot as
-    /// well as the leaf, since every ancestor of a tracked path is tracked.
+    /// well as the leaf, since every ancestor of a tracked path is tracked, and
+    /// [`FilterMode::KeepStagedInView`] past the view slot, since every ancestor of a staged
+    /// node is staged.
     fn exclude_reason(
         &self,
         path: &impl FilterPath,

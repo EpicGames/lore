@@ -11753,7 +11753,7 @@ async fn walk_hierarchy(
                 level.states,
                 &path,
                 child_node.is_directory(),
-                filter_mode,
+                filter_mode.at_staged(child_node.is_staged()),
                 async || {
                     side.mapping
                         .state

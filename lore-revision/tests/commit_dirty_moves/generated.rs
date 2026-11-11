@@ -15,20 +15,20 @@
 //! leave one revision in all three runs; the unaided run is checked against the base, the staged
 //! tree it took and the working tree as well ([`assert_kept`], [`assert_marked`]).
 //!
-//! The sequences leave out the shapes other work items own:
-//! - lore-aspc, marking dirty a new node at a path a moved committed node left: no new node is
+//! The sequences leave out the shapes the commit does not handle yet:
+//! - Marking dirty a new node at a path a moved committed node left: no new node is
 //!   added or moved there, and where a move the commit leaves out had its path at such a path, what
 //!   the working tree holds there is not checked.
-//! - lore-y87y, a name the staged tree holds twice below a directory, as a node staged for deletion
+//! - A name the staged tree holds twice below a directory, as a node staged for deletion
 //!   and one moved to its name, which `lore dirty move` and `lore stage` take the first of: such a
 //!   name is neither moved to the front nor staged.
-//! - lore-jnbn, marking dirty the removal of a directory that holds a new node or one moved into
+//! - Marking dirty the removal of a directory that holds a new node or one moved into
 //!   it, or of a new directory that holds a committed node, which replaces their marks.
-//! - lore-o7bv, a move of a directory holding a node whose removal is marked dirty, which loses
+//! - A move of a directory holding a node whose removal is marked dirty, which loses
 //!   that mark past a commit that leaves the move out.
-//! - lore-t6ib, marking dirty the removal of a directory below which a removal is staged, which
+//! - Marking dirty the removal of a directory below which a removal is staged, which
 //!   then reads as staged.
-//! - lore-4quv, a new node at the name of a node staged for deletion.
+//! - A new node at the name of a node staged for deletion.
 //!
 //! A path that spells a committed path in another case is not staged either: a stage refuses it as
 //! a case mismatch.

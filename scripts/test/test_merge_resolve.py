@@ -290,7 +290,8 @@ def test_merge_resolve_mine_directory(new_lore_repo):
 
 @pytest.mark.smoke
 def test_merge_resolve_theirs_directory(new_lore_repo):
-    """Resolve all conflicts under a directory using 'theirs'."""
+    """Resolve all conflicts under a directory using 'theirs'. A file the merge took
+    without a conflict there stays a staged change, not a conflict."""
     repo: Lore = new_lore_repo()
 
     base = ["base\n"]
@@ -300,6 +301,7 @@ def test_merge_resolve_theirs_directory(new_lore_repo):
     files = {
         "src/a.txt": (base, current, incoming),
         "src/b.txt": (base, current, incoming),
+        "src/merged.txt": (base, base, incoming),
         "other/c.txt": (base, current, incoming),
     }
     setup_merge_conflict(repo, files)
@@ -315,6 +317,14 @@ def test_merge_resolve_theirs_directory(new_lore_repo):
     assert "other/c.txt" in still_conflicted, "other/c.txt should still be conflicted"
     assert "src/a.txt" not in still_conflicted, "src/a.txt should be resolved"
     assert "src/b.txt" not in still_conflicted, "src/b.txt should be resolved"
+    merged = [
+        entry
+        for entry in parse_status_json(repo.status(offline=True, json=True))
+        if entry["path"] == "src/merged.txt"
+    ]
+    assert len(merged) == 1, merged
+    assert merged[0].get("flagStaged") is True, merged
+    assert merged[0].get("flagConflictUnresolved") is False, merged
 
     # Verify content is "theirs" (incoming branch version)
     for path in ["src/a.txt", "src/b.txt"]:

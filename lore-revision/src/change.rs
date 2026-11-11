@@ -134,8 +134,12 @@ impl Flags {
         self.contains(Flags::ConflictTheirs)
     }
 
+    /// Whether the change is a conflict that is neither resolved nor settled by taking one side.
     pub fn is_conflict_unresolved(&self) -> bool {
-        self.contains(Flags::Conflict) && !self.contains(Flags::ConflictResolved)
+        self.contains(Flags::Conflict)
+            && !self.contains(Flags::ConflictResolved)
+            && !self.contains(Flags::ConflictMine)
+            && !self.contains(Flags::ConflictTheirs)
     }
 }
 

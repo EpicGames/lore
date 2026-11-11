@@ -564,24 +564,21 @@ fn a_view_of_reincluded_prefixes_with_excluded_extensions() {
     );
 }
 
-/// Every named mode other than [`FilterMode::KeepTracked`] keeps its bits through
-/// [`FilterMode::at`], so no mode can share the tracked bit.
+/// Every named mode other than the keep bits, [`FilterMode::KeepTracked`] and
+/// [`FilterMode::KeepStagedInView`], keeps its bits through [`FilterMode::at`], so no mode can
+/// share a keep bit.
 #[test]
-fn a_mode_keeps_every_bit_but_the_tracked_one_through_at() {
+fn a_mode_keeps_every_bit_but_the_keep_bits_through_at() {
     use bitflags::Flags;
 
+    let keeps = FilterMode::KeepTracked | FilterMode::KeepStagedInView;
     for flag in FilterMode::FLAGS {
-        if flag.name() == "KeepTracked" {
+        let mode = *flag.value();
+        if keeps.contains(mode) {
             continue;
         }
-        let mode = *flag.value();
         assert_eq!(mode.at(false), mode, "{}", flag.name());
-        assert_eq!(
-            (mode | FilterMode::KeepTracked).at(false),
-            mode,
-            "{}",
-            flag.name()
-        );
+        assert_eq!((mode | keeps).at(false), mode, "{}", flag.name());
     }
 }
 
@@ -630,4 +627,44 @@ fn a_tracked_node_passes_the_ignore_slot_and_its_untracked_children_do_not() {
     assert!(!filter.should_descend(states, &bin, FilterMode::TRACKED.at(false)));
     assert!(!filter.excludes_any_kind(states, &child, FilterMode::TRACKED));
     assert!(filter.excludes_any_kind(states, &child, FilterMode::TRACKED.at(false)));
+}
+
+/// The view slot keeps a node that holds a staged change in a comparison of trees and nowhere
+/// else, and steps its children from the node's verdict, so a child holding nothing staged is
+/// excluded below it, a tracked one marked dirty included.
+#[test]
+fn a_staged_node_passes_the_view_slot_only_in_a_comparison() {
+    let mut filter = Filter::default();
+    filter.view.add_exclusion("/*").expect("Filter exclusion");
+    let engine = path("Engine");
+    let child = path("Engine/a.txt");
+    let staged = FilterMode::CHANGES.at(true).at_staged(true);
+
+    let (states, excluded) = filter.child_excludes_tree(FilterStates::ROOT, &engine, true, staged);
+    assert!(
+        !excluded,
+        "a staged directory passes the view in a comparison"
+    );
+    for mode in [
+        FilterMode::CHANGES.at(false),
+        FilterMode::CHANGES.at(true).at_staged(false),
+        FilterMode::TRACKED.at(true),
+    ] {
+        assert!(
+            filter
+                .child_excludes_tree(FilterStates::ROOT, &engine, true, mode)
+                .1,
+            "{mode:?} keeps the directory"
+        );
+        assert!(
+            filter.child_excludes_tree(states, &child, false, mode).1,
+            "{mode:?} keeps the child of the staged directory"
+        );
+    }
+    assert!(
+        !filter.child_excludes_tree(states, &child, false, staged).1,
+        "a staged child passes it"
+    );
+    assert!(!filter.excludes_tree(&child, false, FilterMode::CHANGES));
+    assert!(filter.excludes_tree(&child, false, FilterMode::TRACKED));
 }

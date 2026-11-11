@@ -5,7 +5,8 @@ import os
 import pytest
 from error_types import LOCAL_MODIFICATIONS, LocalChanges
 from link_helpers import build_nested_link_repos_at, link_pin
-from test_utils import unstaged_entries, working_tree_files
+from lore_parsers import parse_status_json
+from test_utils import to_posix, unstaged_entries, working_tree_files
 
 pytestmark = pytest.mark.own_vfs(
     "links a repository, which a virtual clone does not hold"
@@ -642,3 +643,36 @@ def test_link_branch_archive_include_links_reaches_nested_link(new_lore_repo):
     assert sorted(repo_c.branch_list().remote_branches) == nested_before, (
         f"Expected nested link branches {nested_before}, got: {repo_c.branch_list()}"
     )
+
+
+@pytest.mark.smoke
+def test_unstage_below_a_nested_link_leaves_what_a_forced_stage_staged_past_the_view(
+    new_lore_repo, scratch_dir
+):
+    """A plain unstage of the tree leaves staged what a forced staging scan took past the view
+    in a link inside a link: the inner link's mark climbs into the outer linked tree, status lists
+    the file staged, and the commit takes it into the innermost repository."""
+    repo_a, _repo_b, repo_c, _b_mount, nested_mount = build_nested_link_repos_at(
+        new_lore_repo, "b", "c"
+    )
+    view = os.path.join(scratch_dir("view", create=True), "view.txt")
+    with open(view, "w") as view_file:
+        view_file.write(f"/{nested_mount}/Hidden/\n")
+    clone = repo_a.clone(view=view)
+    hidden, content = f"{nested_mount}/Hidden/new.txt", "new below a nested link\n"
+    clone.write_files({hidden: content})
+    clone.stage(".", scan=True, force=True)
+    clone.unstage(".", offline=True)
+
+    staged = {
+        to_posix(entry["path"])
+        for entry in parse_status_json(clone.status(json=True, offline=True))
+        if entry.get("flagStaged")
+    }
+    assert hidden in staged, staged
+
+    clone.commit("Past the view below a nested link")
+    clone.push()
+    repo_c.sync()
+    with repo_c.open_file("Hidden/new.txt") as committed:
+        assert committed.read() == content

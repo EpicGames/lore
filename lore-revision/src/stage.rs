@@ -36,6 +36,7 @@ use crate::interface::LoreArray;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
 use crate::link;
+use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Context;
 use crate::lore::Hash;
@@ -2891,6 +2892,15 @@ async fn holds_both_spellings(
 ///
 /// `parent_states` is the filter verdict for `base`'s path, which the child named here steps from
 /// rather than folding its whole path.
+///
+/// A changed file a merge in progress staged past the view ([`crate::commit::merged_past_the_view`]),
+/// which only a forced stage reaches, is taken from the working tree as the merge's resolution,
+/// again where a forced stage resolved it before: its content hash is dropped, and its size is the
+/// working tree's. A zero hash with a nonzero size is content not yet stored, the state
+/// a newly staged add has, so the commit reads the file, as it reads a merged file in view. An
+/// empty file leaves a zero hash with size 0, which the commit takes from the node as it stands,
+/// and the file's mode with it. The file ID and the merge bits stay, and a staged add or move, a
+/// merge's included, keeps its action.
 #[allow(clippy::too_many_arguments, unused_assignments)]
 #[lore_macro::test_pub]
 pub(crate) async fn stage_node_from_metadata(
@@ -3308,6 +3318,7 @@ pub(crate) async fn stage_node_from_metadata(
         // Whether the node's own fields are written in place: a node of another kind than the
         // filesystem entry was staged for deletion above, and a new one added.
         let mut write_content = false;
+        let mut resolves_merge = false;
 
         if !info.is_dir() {
             debug_assert!(node.is_file(), "a file entry over a node of another kind");
@@ -3334,6 +3345,8 @@ pub(crate) async fn stage_node_from_metadata(
                 // alone would be lost.
                 write_content = true;
                 maybe_content_modified = true;
+                resolves_merge =
+                    crate::commit::merged_past_the_view(&repository, &node_path, &node);
             } else if was_dirty_add {
                 maybe_content_modified = true;
             }
@@ -3360,6 +3373,13 @@ pub(crate) async fn stage_node_from_metadata(
                     |held| {
                         if info.is_dir() {
                             held.set_mode(0);
+                        } else if resolves_merge {
+                            let mode = if info.size() == 0 {
+                                info.mode(held.mode)
+                            } else {
+                                held.mode
+                            };
+                            held.set_content(Address::default(), info.size(), mode);
                         } else {
                             held.set_size(info.size());
                         }
@@ -3369,10 +3389,24 @@ pub(crate) async fn stage_node_from_metadata(
                 debug_assert!(changed, "the staged node left its place");
             }
 
-            let (staged_flag, dirty_flag) = if was_dirty_add {
-                (NodeFlags::StagedAdd, NodeFlags::DirtyAdd)
+            let (staged_flag, dirty_flag, action) = if was_dirty_add || node.is_staged_add() {
+                (
+                    NodeFlags::StagedAdd,
+                    NodeFlags::DirtyAdd,
+                    LoreFileAction::Add,
+                )
+            } else if node.is_staged_move() {
+                (
+                    NodeFlags::StagedMove,
+                    NodeFlags::DirtyMove,
+                    LoreFileAction::Move,
+                )
             } else {
-                (NodeFlags::StagedModify, NodeFlags::DirtyModify)
+                (
+                    NodeFlags::StagedModify,
+                    NodeFlags::DirtyModify,
+                    LoreFileAction::Keep,
+                )
             };
 
             let mark = staged_change(staged_flag, dirty_flag, options.node_flags);
@@ -3392,11 +3426,7 @@ pub(crate) async fn stage_node_from_metadata(
             }
 
             if event_action.is_none() {
-                event_action = Some(if was_dirty_add {
-                    LoreFileAction::Add
-                } else {
-                    LoreFileAction::Keep
-                });
+                event_action = Some(action);
             }
         }
     }

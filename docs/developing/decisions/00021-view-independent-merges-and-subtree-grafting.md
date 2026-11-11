@@ -1,7 +1,7 @@
 ---
 status: accepted
 date: 2026-07-29
-amended: 2026-11-10
+amended: 2026-11-11
 deciders: Raghav Narula
 ---
 
@@ -41,7 +41,7 @@ A conflict at an out-of-view path:
 
 - The merge diffs over a filter-free repository context, so out-of-view nodes enter the changeset.
 - Realization gates every filesystem side effect for a node on the view, while still staging the node.
-- A commit of a view-excluded staged file adopts the staged content hash rather than re-fragmenting a working-tree file that is absent or stale.
+- A commit of a view-excluded staged file adopts the staged content hash rather than re-fragmenting a working-tree file that is absent or stale. **Amended 2026-11-11:** that holds for a file a merge staged. A forced stage takes a file past the view from the working tree, and the commit reads it there like any other staged file. A forced stage of a file the merge staged resolves the merge with the working tree's file, as an edit of a merged file in view does: it drops the node's content hash, taking the working tree's size, keeping the file ID and the merge bits. A zero hash with a nonzero size is content not yet stored, the state a newly staged add has, so the commit reads the file from the working tree and records it as merged. A zero hash with size 0 is an empty file, which a merge stages that way and the commit takes from the staged node as it stands.
 
 **An out-of-view subtree the branch never touched is adopted by reconciling it.** `GraftOracle` requires the view to exclude every path below the directory, and the branch's version of it to be byte-identical to the base's. It refuses a path resolving into a linked repository. The walk then emits one `FileAction::Graft` change instead of descending, and the apply diffs the staged subtree against source's: a child whose address matches is skipped without descending, and a differing file is overwritten in place. **Amended 2026-10-30:** an added node is created, and an add and a delete of one file pair into a move by the file's identity, through the pairing the diff of a merge with no view uses. Each add, move, overwrite and delete takes the staged flags a per-file merge gives it, the ancestors of an add or a move included, so the commit discards the deletes, recomputes every directory the reconcile changed, and records the grafted changes in the merge's delta as a merge with no view does. Both record an added directory as an add, empty or not. A link the subtree deletes leaves the link registry before any link is added, so a link moved to a new path and pin is recorded at its new path. A move across the subtree's boundary is recorded as an add and a delete: the diff that pairs moves sees only the side outside the subtree. **Amended 2026-11-10:** the reconcile treats a link as a node and never descends into it. A link pinning another revision of the subtree it mounts is left to the merge's pass over the link pins, as in a merge with no view. Any other change to a link, one to a link the merge cannot read included, overwrites it whole. A type change is a delete of the staged node and an add of the other kind beside it, as staging one is.
 
@@ -69,6 +69,6 @@ Validate any change here by measurement, not by reading the code. Merge the same
 
 One trap, because the bit layout hides it: `NodeFlags::StagedMergeResolved` contains the `StagedMergeConflict` bits, so setting "resolved" also sets "conflicted". An adopted node marked resolved reads as a conflict, and the commit then looks for conflict markers in a file a sparse working tree does not have. `StagedMergeTheirs` does not carry those bits and is the correct flag on its own.
 
-Two known gaps. `merge resolve theirs` does nothing at an out-of-view path, and such a path is absent from both the merge's conflict list and `lore status`. Adopting the incoming side means a merge no longer depends on either, but both remain broken for anything else reaching a conflict there.
+Two known gaps. `merge resolve theirs` does nothing at an out-of-view path, and such a path is absent from both the merge's conflict list and `lore status`. **Amended 2026-11-11:** `lore status` lists it as a staged change with the incoming side taken ([ADR-00027](00027-ignore-filter-applies-to-untracked-paths-only.md)). Adopting the incoming side means a merge no longer depends on either, but the conflict list and `merge resolve theirs` remain broken for anything else reaching a conflict there.
 
 Expressing the walk scope through `FilterMode` instead of a second filter argument does not work today, because `revision::diff3` already uses the view slot for a path scope derived from the source changes. Splitting realization into a tree pass and a materialization pass would remove the two-filter problem, and is the shape to aim for if this area is revisited.

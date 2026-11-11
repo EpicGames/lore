@@ -2617,9 +2617,45 @@ async fn info_before_fragmenting(
     Ok(info)
 }
 
+/// Whether a commit takes the content of the staged file `node` at `path` from the node rather
+/// than from the working tree: where a merge staged the file and the view excludes the path,
+/// unless a forced stage took the file from the working tree since. A sparse working tree holds no
+/// file at such a path, or a stale one, so the commit neither reads it nor looks for conflict
+/// markers in it.
+///
+/// A forced stage of such a file resolves the merge with the working tree's file: it drops the
+/// node's content hash, taking the working tree's size, keeping the file ID and the merge bits
+/// ([`crate::stage::stage_node_from_metadata`]). A zero hash with a nonzero size is content not
+/// yet stored, the state a newly staged add has, which the commit reads from the working tree. A
+/// zero hash with size 0 is an empty file, taken from the staged node as it stands: a merge stages
+/// one that way, and so does a forced stage of an empty working-tree file.
+pub(crate) fn takes_staged_content(
+    repository: &RepositoryContext,
+    path: &RelativePath,
+    node: &Node,
+) -> bool {
+    !(node.address.is_zero() && node.size != 0) && merged_past_the_view(repository, path, node)
+}
+
+/// Whether a merge staged the file `node` at `path` and the view excludes the path, whatever
+/// content the node holds.
+///
+/// The view test must stay identical to the one realize gates disk writes on (`fs/realize.rs`),
+/// because that is what decided whether the file was written.
+pub(crate) fn merged_past_the_view(
+    repository: &RepositoryContext,
+    path: &RelativePath,
+    node: &Node,
+) -> bool {
+    node.is_staged_merge()
+        && repository
+            .filter
+            .excludes_tree(path, false, FilterMode::View)
+}
+
 /// Commits one file node, recording the modified time it read the file at and telling the
-/// operation what it stored ([`InstanceOperation::stored`]). A view-excluded path records and
-/// tells nothing: its content is taken from the staged node rather than disk.
+/// operation what it stored ([`InstanceOperation::stored`]). A file whose content is taken from
+/// the staged node ([`takes_staged_content`]) records and tells nothing.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -2645,20 +2681,11 @@ fn commit_file(
 
         debug_assert!(node.is_file());
 
-        // A sparse checkout has no working-tree file for a view-excluded path, so
-        // the staged content hash is the only source and no markers are read.
-        // Re-fragmenting would read a file that is absent or stale.
-        //
-        // This test must stay identical to the one realize gates disk writes on
-        // (`fs/realize.rs`), because that is what decided whether the file was
-        // written.
-        let excluded = repository
-            .filter
-            .excludes_tree(&relative_path, false, FilterMode::View);
+        let staged_content = takes_staged_content(&repository, &relative_path, &node);
 
         if node.is_staged_merge_conflict() {
             reject_unresolved_conflict(&node, relative_path.as_str())?;
-            if !excluded
+            if !staged_content
                 && operation
                     .infer_is_conflicted(&relative_path)
                     .await
@@ -2683,7 +2710,7 @@ fn commit_file(
             node.flags
         );
 
-        let (address, content_size, mode, modified_time) = if excluded {
+        let (address, content_size, mode, modified_time) = if staged_content {
             (node.address, node.size, node.mode, None)
         } else {
             if node.address.context.is_zero() {

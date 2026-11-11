@@ -32,3 +32,19 @@ fn dirty_and_modify_combine() {
     assert!(flags.contains(Flags::Modify));
     assert!(!flags.is_stage());
 }
+
+/// A conflict stays unresolved until it is resolved or one side is taken, as a merge takes the
+/// incoming side at a path the view excludes.
+#[test]
+fn a_conflict_is_unresolved_until_resolved_or_a_side_is_taken() {
+    assert!(Flags::Conflict.is_conflict_unresolved());
+    for settled in [
+        Flags::ConflictResolved,
+        Flags::ConflictMine,
+        Flags::ConflictTheirs,
+        Flags::ConflictResolved | Flags::ConflictTheirs,
+    ] {
+        assert!(!settled.is_conflict_unresolved(), "{settled:?}");
+    }
+    assert!(!Flags::Merge.is_conflict_unresolved());
+}

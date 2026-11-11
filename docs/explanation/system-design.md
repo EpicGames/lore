@@ -1335,8 +1335,11 @@ The rule is simple: operations on *committed state* consult the view only; opera
   excludes things the user has declared shouldn't be staged. The ignore file is asked only about
   paths the tree does not hold yet: a path already staged or committed, for example one staged
   past the ignore file with `--force`, keeps flowing through staging, status and locking like any
-  other, its deletion included. A working-tree entry of another kind at its path is new content
-  ([ADR-00027](../developing/decisions/00027-ignore-filter-applies-to-untracked-paths-only.md)).
+  other, its deletion included. A working-tree entry of another kind at its path is new content.
+  A change staged past the view, by a forced stage or a merge, is listed by status and committed
+  like any other. A forced stage of a file a merge staged there resolves the merge with the
+  working tree's file. Unstaging follows the view, below links too but not yet below a layer
+  mount, and a forced unstage takes back what a forced stage staged there outside a merge.
 
 This split is what keeps `.loreignore` from breaking earlier history: a newly-added ignore
 rule does not retroactively excise committed files, because committed-state operations consult

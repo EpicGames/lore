@@ -8,4 +8,5 @@ mod info;
 mod obliterate;
 mod purge;
 mod stage;
+mod unstage;
 mod write;

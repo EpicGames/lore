@@ -311,7 +311,7 @@ async fn assert_merges_spelled(
 /// working tree and the merge revision hold the file below both new spellings, with the content
 /// the edit gave it, and no path spells either old one. The other directions are left out: a
 /// realize in them, the switch back from the merged branch included, moves or renames a child from
-/// below a directory it renames only in case in the same pass (lore-5w1m).
+/// below a directory it renames only in case in the same pass, which it does not handle yet.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_edit_against_a_move_across_nested_case_only_renames_merges_all() {
     type Case = ([Edit; 2], [Edit; 2], &'static str, &'static str);
@@ -394,7 +394,7 @@ const DEEP_TREE: [&str; 5] = [
 /// moves it within `Deep`: the working tree and the merge revision hold the file below the three
 /// new spellings, with the content the edit gave it. The other directions are left out: a realize
 /// in them, the switch back from the merged branch included, moves or renames a child from below a
-/// directory it renames only in case in the same pass (lore-5w1m).
+/// directory it renames only in case in the same pass, which it does not handle yet.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_edit_below_case_only_renames_alternating_over_three_levels_merges_all() {
     const RENAME_DEEP: Edit = Edit::Move("dir/Sub/Deep", "dir/Sub/deep");

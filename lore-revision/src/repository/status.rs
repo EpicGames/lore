@@ -911,7 +911,7 @@ async fn report_repository_staged_diff(
         repository.clone(),
         state_staged,
         path,
-        FilterMode::TRACKED,
+        FilterMode::CHANGES,
     )
     .await
     .forward::<StatusError>("computing diff against staged state")?;
@@ -943,7 +943,7 @@ async fn report_layer_staged_diff(
         )
         .await,
         selection.mount_path.clone(),
-        FilterMode::TRACKED,
+        FilterMode::CHANGES,
     )
     .await
     .forward::<StatusError>("computing diff against staged state")?;

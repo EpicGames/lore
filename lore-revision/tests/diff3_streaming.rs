@@ -1508,7 +1508,7 @@ mod tests {
     /// directory's hash. The merge under the view has to record the move, and leave
     /// `engine/` as main holds it, since the feature branch never touched it.
     ///
-    /// A staged move leaves the moved-from directory's hash stale (lore-g2fl), so
+    /// A staged move leaves the moved-from directory's hash stale, so
     /// main also adds a file to that directory and deletes it in a later commit,
     /// and its own tree holds the directory's new hash. The merge with no view
     /// relinks the file the same way, and leaves the directory stale; it is not

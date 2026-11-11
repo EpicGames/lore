@@ -5,6 +5,7 @@ import os
 import shutil
 
 import pytest
+from lore_parsers import parse_status_json
 from test_utils import registered_links
 
 from lore import Lore
@@ -245,6 +246,7 @@ def test_merge_grafts_untouched_out_of_view_subtree(new_lore_repo, scratch_dir):
         "hidden/deep/one.txt",
         "hidden/deep/nested/two.txt",
     ]
+    empty_file = "hidden/deep/empty.txt"
 
     repo.write_files(
         {in_view_file: "keep v1\n"} | {p: "v1\n" for p in out_of_view_files}
@@ -268,9 +270,10 @@ def test_merge_grafts_untouched_out_of_view_subtree(new_lore_repo, scratch_dir):
     clone.commit("feature changes the in-view file")
     clone.branch_push()
 
-    # main advances the out-of-view subtree at every depth.
+    # main advances the out-of-view subtree at every depth, and adds an empty
+    # file to it, which a node records as a zero hash with size 0.
     clone.branch_switch("main")
-    repo.write_files({p: "v2\n" for p in out_of_view_files})
+    repo.write_files({p: "v2\n" for p in out_of_view_files} | {empty_file: ""})
     repo.stage(scan=True)
     repo.commit("main changes the out-of-view subtree")
     repo.branch_push()
@@ -304,6 +307,8 @@ def test_merge_grafts_untouched_out_of_view_subtree(new_lore_repo, scratch_dir):
             assert input_file.read() == "v2\n", (
                 "merged branch did not adopt main's content for " + path
             )
+    with verify.open_file(empty_file) as input_file:
+        assert input_file.read() == "", "merged branch did not adopt the empty file"
 
 
 def _merge_with_no_view(repo: Lore) -> Lore:
@@ -896,6 +901,17 @@ def test_merge_out_of_view_conflict_takes_theirs(new_lore_repo, scratch_dir):
     assert in_view_file in clone.run(["status"], check=False), (
         "in-view conflict missing from status: " + in_view_file
     )
+    # Status lists the adopted path as staged, with the side taken, not as a conflict.
+    status = {
+        entry["path"]: entry
+        for entry in parse_status_json(clone.status(json=True, offline=True))
+    }
+    adopted = status.get(out_of_view_file, {})
+    assert (
+        adopted.get("flagStaged") is True
+        and adopted.get("flagConflictTheirs") is True
+        and adopted.get("flagConflictUnresolved") is False
+    ), status
 
     # Adopting is a tree operation only.
     for suffix in ("", "~mine", "~theirs", "~base"):

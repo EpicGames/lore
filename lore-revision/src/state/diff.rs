@@ -354,6 +354,7 @@ pub(crate) fn diff_subtree_flagged(
                         .holds_tracked_change(&to.mapping.repository, to.mapping.node, to.flags)
                         .await?
                 };
+                let filter_mode = filter_mode.at_staged(false);
                 seeded_subtree(from, to, path, graft, extra, &changes, filter_mode, tracked).await
             })
                 as std::pin::Pin<
@@ -848,7 +849,9 @@ fn diff_subtree_node_walk(
                 from_named_node.node,
                 &paths.from,
                 states.from,
-                filter_mode,
+                filter_mode.at_staged(paired.is_some_and(|to_named_node| {
+                    to_named_node.flags().contains(NodeFlags::Staged)
+                })),
                 // The from side is the tree the to side was built on, so its node is tracked,
                 // and what is staged or marked on its counterpart is the change below it. Where
                 // the to side is a working tree's State, the from side is lore's tree, which
@@ -1126,7 +1129,7 @@ async fn add_change_for_solo_to_node(
         to_named_node.node,
         &paths.to,
         states.to,
-        filter_mode,
+        filter_mode.at_staged(to_named_node.flags().contains(NodeFlags::Staged)),
         async |flags: NodeFlags| {
             if working_tree {
                 return Ok(false);
@@ -1485,7 +1488,7 @@ async fn add_change_for_paired_nodes(
                 states.to,
                 &subpath,
                 !to_node.is_file(),
-                filter_mode,
+                filter_mode.at_staged(to_node.is_staged()),
                 || async {
                     if working_tree {
                         return Ok(same_type);
