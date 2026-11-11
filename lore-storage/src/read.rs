@@ -308,24 +308,28 @@ fn landed_before_probe(address: Address, options: ReadOptions) -> Option<u64> {
     (options.local && !options.never_wait).then(|| crate::write::stores_landed(address))
 }
 
-/// Whether a store of `address` may have written its payload since the count `landed` was read
-/// ([`landed_before_probe`]): a store in flight is waited for, and one waited on or one landed
-/// since may have written it, so only then is the local store worth probing again.
+/// Whether a store of `address` in `store` may have written its payload since the count `landed`
+/// was read ([`landed_before_probe`]): a store in flight is waited for, and one waited on or one
+/// landed since may have written it, so only then is the local store worth probing again.
 ///
-/// Not an `async fn`, which would hold a second copy of its arguments.
-#[allow(clippy::manual_async_fn)]
+/// Looks for the store in flight at the call, so the future holds only the wait for it, `address`
+/// and `landed`.
+#[lore_macro::test_pub]
 fn stored_since(
+    store: &dyn ImmutableStore,
     partition: Partition,
     address: Address,
     landed: Option<u64>,
-) -> impl Future<Output = bool> {
-    async move {
-        let Some(landed) = landed else {
-            return false;
-        };
-        crate::write::wait_if_in_flight(partition, address).await
-            || crate::write::stores_landed(address) != landed
-    }
+) -> impl Future<Output = bool> + use<> {
+    let since = landed.map(|landed| {
+        futures::FutureExt::map(
+            crate::write::wait_if_in_flight(store, partition, address),
+            move |waited| waited || crate::write::stores_landed(address) != landed,
+        )
+    });
+    futures::FutureExt::map(futures::future::OptionFuture::from(since), |stored| {
+        stored == Some(true)
+    })
 }
 
 /// Checks a remote payload on receipt, its sizes ([`check_payload_sizes`]) and its content against
@@ -559,7 +563,7 @@ pub fn load_fragment(
         let landed = landed_before_probe(address, options);
         let mut probed = probe_local(store.clone(), partition, address, options).await;
         if matches!(probed, Err(LocalFailure::Corrupt | LocalFailure::Other))
-            && stored_since(partition, address, landed).await
+            && stored_since(store.as_ref(), partition, address, landed).await
         {
             probed = probe_local(store.clone(), partition, address, options).await;
         }
@@ -686,7 +690,7 @@ where
         let mut on_follow = Some(on_follow);
         loop {
             match crate::read_flight::join_read_flight(
-                crate::read_flight::FlightStore::of(store.as_ref()),
+                crate::write::FlightStore::of(store.as_ref()),
                 keep,
                 partition,
                 address,
@@ -713,7 +717,7 @@ where
                     if let Some(on_follow) = on_follow.take() {
                         on_follow();
                     }
-                    let own = follower.led_by(partition, address);
+                    let own = follower.same_address();
                     let kept = follower.kept();
                     match crate::read_flight::await_flight(follower).await {
                         Some(Ok(fetched)) => {
@@ -919,7 +923,7 @@ pub fn read_into(
         let (fragment, buffer) = if let Some(content) = expanded {
             content
         } else {
-            let local = held || stored_since(partition, address, landed).await;
+            let local = held || stored_since(store.as_ref(), partition, address, landed).await;
             load_root(
                 store.clone(),
                 partition,
@@ -1074,7 +1078,7 @@ fn content_payload_for_buffer(
             return Ok(None);
         }
 
-        let local = reprobe || stored_since(partition, address, landed).await;
+        let local = reprobe || stored_since(store.as_ref(), partition, address, landed).await;
         let (fragment, content) = Box::pin(load_fragment(
             store,
             partition,
@@ -1871,7 +1875,7 @@ fn load_resolved_local(
         let landed = landed_before_probe(address, options);
         let mut loaded = probe_local(store.clone(), partition, address, options).await;
         if matches!(loaded, Err(LocalFailure::Corrupt | LocalFailure::Other))
-            && stored_since(partition, address, landed).await
+            && stored_since(store.as_ref(), partition, address, landed).await
         {
             loaded = probe_local(store, partition, address, options).await;
         }

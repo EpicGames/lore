@@ -38,15 +38,16 @@ use lore_storage::write::*;
 
 /// A reader looking for a store while its guard drops finds the entry or sees the count
 /// moved, never neither: neither would let it skip the probe that finds the store.
-#[test]
-fn a_dropping_guard_is_never_both_gone_and_uncounted() {
+#[tokio::test]
+async fn a_dropping_guard_is_never_both_gone_and_uncounted() {
+    let (_dir, store) = make_test_store().await;
     let partition = Partition::from([0xC7; 16]);
     let address = Address {
         hash: lore_storage::hash::hash_slice(b"a dropping guard"),
         context: Context::from([0xC7; 16]),
     };
     let before = stores_landed(address);
-    let guard = try_acquire_in_flight(partition, address).expect("fresh address");
+    let guard = try_acquire_in_flight(&store, partition, address).expect("fresh address");
     let seen = std::rc::Rc::new(std::cell::Cell::new(None));
     {
         let seen = seen.clone();
@@ -318,10 +319,6 @@ fn make_input(seed: u8) -> (Partition, Address, Fragment, Bytes) {
 }
 
 /// [`make_input`] rehomed under `partition`.
-///
-/// [`STORE_IN_FLIGHT`] is keyed on partition and address alone and carries no store identity,
-/// so every test deriving its partition from the same seeds shares in-flight entries with the
-/// rest of the process. A partition of its own keeps a test's leaders and followers to itself.
 fn make_input_in(partition: Partition, seed: u8) -> (Partition, Address, Fragment, Bytes) {
     let (_, address, fragment, buffer) = make_input(seed);
     (partition, address, fragment, buffer)
@@ -409,7 +406,8 @@ async fn store_fragment_follower_path_registers_in_tracker() {
     let (partition, address, fragment, buffer) = make_input(0x30);
 
     // Manually hold a STORE_IN_FLIGHT guard to force the follower path.
-    let held_guard = try_acquire_in_flight(partition, address).expect("acquire in-flight guard");
+    let held_guard =
+        try_acquire_in_flight(&store, partition, address).expect("acquire in-flight guard");
 
     let tracker = Arc::new(WriteTracker::new());
     let result = store_fragment(
@@ -438,6 +436,85 @@ async fn store_fragment_follower_path_registers_in_tracker() {
         msg.contains("leader upload failed"),
         "expected follower's leader-fail error, got: {msg}"
     );
+}
+
+/// A write to a store while a write of the same address to another store is in flight stores the
+/// content in its own store, rather than following the other store's write.
+#[tokio::test]
+async fn a_write_beside_another_stores_write_of_its_address_stores_its_own() {
+    let (_held_dir, held_store) = make_test_store().await;
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, buffer) = make_input(0x31);
+    let _held =
+        try_acquire_in_flight(&held_store, partition, address).expect("acquire in-flight guard");
+    let session = Arc::new(StorageSession::pending(|| async {
+        Err(lore_transport::ProtocolError::internal(
+            "the stand-in remote takes no upload",
+        ))
+    }));
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        store_fragment(
+            store.clone(),
+            partition,
+            address,
+            fragment,
+            buffer,
+            false,
+            Some(session),
+            WriteContext::counted(None),
+            None,
+        ),
+    )
+    .await
+    .expect("the write waited on the other store's write")
+    .expect("store_fragment");
+
+    assert!(!result.deduplicated);
+    assert!(result.stored_local);
+    let resolved = query_one(&store, partition, address)
+        .await
+        .expect("query the store");
+    assert_eq!(resolved.match_made, StoreMatch::MatchFull);
+    assert!(resolved.stored_local);
+}
+
+/// [`a_write_beside_another_stores_write_of_its_address_stores_its_own`], for a write the tracker
+/// dispatches.
+#[tokio::test]
+async fn a_dispatched_write_beside_another_stores_write_of_its_address_stores_its_own() {
+    let (_held_dir, held_store) = make_test_store().await;
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, buffer) = make_input(0x32);
+    let _held =
+        try_acquire_in_flight(&held_store, partition, address).expect("acquire in-flight guard");
+
+    let tracker = Arc::new(WriteTracker::new());
+    let result = store_fragment(
+        store.clone(),
+        partition,
+        address,
+        fragment,
+        buffer,
+        false,
+        None,
+        WriteContext::tracked(Some(tracker.clone()), None),
+        None,
+    )
+    .await
+    .expect("store_fragment");
+    tokio::time::timeout(std::time::Duration::from_secs(10), tracker.await_all())
+        .await
+        .expect("the write waited on the other store's write")
+        .expect("the write stores its own content");
+
+    assert!(!result.deduplicated);
+    let resolved = query_one(&store, partition, address)
+        .await
+        .expect("query the store");
+    assert_eq!(resolved.match_made, StoreMatch::MatchFull);
+    assert!(resolved.stored_local);
 }
 
 #[tokio::test]
@@ -1341,10 +1418,8 @@ async fn memory_permit_stress_caps_concurrent_leaders_under_budget() {
     });
     let tracker = Arc::new(WriteTracker::new());
 
-    // Dedicated per-test partition so the process-global STORE_IN_FLIGHT
-    // map cannot collide with other tests running in parallel. Each task
-    // within this test gets a unique `context` — combined with the
-    // payload-derived hash, that produces N globally-unique addresses.
+    // Each task gets a unique `context`, which with the payload-derived hash gives N unique
+    // addresses.
     let test_partition = Partition::from([0xA7u8; 16]);
 
     // Spawn N call-site coroutines. Each acquires its own permit from the

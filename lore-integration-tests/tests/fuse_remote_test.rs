@@ -1258,15 +1258,19 @@ mod fuse_remote_tests {
                 let (ino, address, partition) = file_root(&fixture, "big.bin").await;
                 let repository = fixture.mount.filesystem.served().repository.clone();
                 lore_revision::immutable::read(
-                    repository,
+                    repository.clone(),
                     address,
                     None,
                     lore_storage::ReadOptions::default().with_cache(),
                 )
                 .await
                 .expect("the content is fetched into the local store");
-                let store = lore_storage::write::try_acquire_in_flight(partition, address)
-                    .expect("no store of the file is in flight yet");
+                let store = lore_storage::write::try_acquire_in_flight(
+                    repository.immutable_store_ref(),
+                    partition,
+                    address,
+                )
+                .expect("no store of the file is in flight yet");
 
                 let page = worker_read_first_page(&fixture, ino)
                     .await
@@ -1287,8 +1291,17 @@ mod fuse_remote_tests {
             .scope(execution("worker-miss-in-flight"), async move {
                 let fixture = remote_fixture().await;
                 let (ino, address, partition) = file_root(&fixture, REMOTE_FILE).await;
-                let store = lore_storage::write::try_acquire_in_flight(partition, address)
-                    .expect("no store of the file is in flight yet");
+                let store = lore_storage::write::try_acquire_in_flight(
+                    fixture
+                        .mount
+                        .filesystem
+                        .served()
+                        .repository
+                        .immutable_store_ref(),
+                    partition,
+                    address,
+                )
+                .expect("no store of the file is in flight yet");
 
                 let read = worker_read_first_page(&fixture, ino).await;
                 assert_eq!(read, Err("WouldFetch".to_string()));

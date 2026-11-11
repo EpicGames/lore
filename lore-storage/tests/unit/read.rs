@@ -259,6 +259,23 @@ impl CountingReadStore {
         Self::with_hooks(inner, ReadHooks::default())
     }
 
+    /// `inner` wrapped, landing a store of `address` in the wrapping store after its first read
+    /// ([`ReadHooks::landing`]).
+    fn landing(
+        inner: Arc<dyn ImmutableStore>,
+        partition: Partition,
+        address: Address,
+        fragment: Fragment,
+        payload: Bytes,
+    ) -> (Arc<dyn ImmutableStore>, Self) {
+        let (store, counts) = Self::wrap(inner);
+        let guard =
+            try_acquire_in_flight(&store, partition, address).expect("no contention in fresh test");
+        counts.hooks.lock().expect("hooks").landing =
+            Some((partition, address, fragment, payload, guard));
+        (store, counts)
+    }
+
     /// A store padding every payload it hands back ([`Self::pad`]).
     fn padding(inner: Arc<dyn ImmutableStore>) -> Arc<dyn ImmutableStore> {
         let (_, counts) = Self::wrap(inner);
@@ -1945,7 +1962,8 @@ async fn load_fragment_waits_for_in_flight_leader() {
     let (_dir, store) = make_test_store().await;
     let (partition, address, fragment, payload) = make_input(0xDE);
 
-    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+    let guard =
+        try_acquire_in_flight(&store, partition, address).expect("no contention in fresh test");
 
     let reader_store = store.clone();
     let reader = lore_base::lore_spawn!(async move {
@@ -1994,7 +2012,8 @@ async fn a_local_hit_never_waits_on_a_store_in_flight() {
         .put(partition, address, fragment, Some(payload.clone()), false)
         .await
         .expect("put the payload locally");
-    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+    let guard =
+        try_acquire_in_flight(&store, partition, address).expect("no contention in fresh test");
 
     let (_, loaded) = tokio::time::timeout(
         Duration::from_secs(2),
@@ -2013,7 +2032,8 @@ async fn a_local_hit_never_waits_on_a_store_in_flight() {
 async fn a_never_waiting_miss_answers_at_once_while_a_store_is_in_flight() {
     let (_dir, store) = make_test_store().await;
     let (partition, address, _fragment, _payload) = make_input(0xC4);
-    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+    let guard =
+        try_acquire_in_flight(&store, partition, address).expect("no contention in fresh test");
 
     let loaded = tokio::time::timeout(
         Duration::from_secs(2),
@@ -2032,6 +2052,125 @@ async fn a_never_waiting_miss_answers_at_once_while_a_store_is_in_flight() {
         "a never-waiting miss answers AddressNotFound, got {loaded:?}"
     );
     drop(guard);
+}
+
+/// A miss answers at once while a write of the same address to another store is in flight: a read
+/// waits only for a write in flight to its own store. Each read that waits on a write
+/// ([`load_fragment`], [`read_into`], [`read_into_buffer`] and the local load of a resolved key in
+/// [`resolve_root`]) is held to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_miss_never_waits_on_a_write_in_flight_to_another_store() {
+    let (dir, store) = make_test_store().await;
+    let (_other_dir, other_store) = make_test_store().await;
+    let (partition, address, _fragment, payload) = make_input(0xE9);
+    let guard = try_acquire_in_flight(&other_store, partition, address)
+        .expect("no contention in fresh test");
+    let options = ReadOptions::default().no_remote();
+    let missed =
+        |read: Result<(), StorageError>| matches!(read, Err(StorageError::AddressNotFound(_)));
+
+    let loaded = tokio::time::timeout(
+        Duration::from_secs(2),
+        load_fragment(store.clone(), partition, address, options, None),
+    )
+    .await
+    .expect("the load waited on the other store's write");
+    assert!(missed(loaded.map(drop)), "the load answers AddressNotFound");
+
+    let mut slice = vec![0u8; payload.len()];
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_into(
+            store.clone(),
+            partition,
+            address,
+            None,
+            &mut slice,
+            options,
+            None,
+        ),
+    )
+    .await
+    .expect("the read into a slice waited on the other store's write");
+    assert!(
+        missed(read),
+        "the read into a slice answers AddressNotFound"
+    );
+
+    let mut buffer = vec![0u8; payload.len()];
+    // SAFETY: the buffer outlives the read and nothing else touches it.
+    let mut dst = unsafe { CallerBuffer::new(buffer.as_mut_ptr(), buffer.len()) };
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_into_buffer(
+            store.clone(),
+            partition,
+            address,
+            None,
+            &mut dst,
+            options,
+            None,
+        ),
+    )
+    .await
+    .expect("the read into a buffer waited on the other store's write");
+    assert!(
+        missed(read.map(drop)),
+        "the read into a buffer answers AddressNotFound"
+    );
+
+    let mutable = test_mutable_store(&dir, &store).await;
+    let key = hash::hash_slice(b"a key resolving to a store in flight elsewhere");
+    mutable
+        .clone()
+        .store(partition, key, address.hash, KeyType::Resolve)
+        .await
+        .expect("map the key locally");
+    let resolved = tokio::time::timeout(
+        Duration::from_secs(2),
+        resolve_root(
+            store,
+            mutable,
+            partition,
+            key,
+            address.context,
+            0,
+            options,
+            None,
+        ),
+    )
+    .await
+    .expect("the resolve waited on the other store's write");
+    assert!(
+        missed(resolved.map(drop)),
+        "the resolve answers AddressNotFound"
+    );
+    drop(guard);
+}
+
+/// A wait for a write in flight looks for it at the call: its future holds the wait for the token
+/// alone, not the key it looked up, and a probe's wait ([`stored_since`]) holds that wait with only
+/// the address and the count it compares, not the store or the partition.
+#[tokio::test]
+async fn a_wait_for_a_write_in_flight_holds_neither_its_store_nor_its_partition() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, _fragment, _payload) = make_input(0xEA);
+    let wait = lore_storage::write::wait_if_in_flight(store.as_ref(), partition, address);
+    let since = stored_since(store.as_ref(), partition, address, Some(0));
+
+    assert!(
+        size_of_val(&wait)
+            < size_of::<lore_storage::write::StoreInFlightKey>()
+                + size_of::<tokio_util::sync::WaitForCancellationFutureOwned>(),
+        "the wait holds {} bytes",
+        size_of_val(&wait)
+    );
+    assert!(
+        size_of_val(&since) < size_of_val(&wait) + size_of::<Address>() + size_of::<Partition>(),
+        "the probe's wait holds {} bytes beside a wait of {}",
+        size_of_val(&since),
+        size_of_val(&wait)
+    );
 }
 
 /// A miss probes the local store once when no store of the address lands meanwhile. Another
@@ -2073,14 +2212,8 @@ async fn a_miss_with_no_store_landing_probes_once() {
 async fn a_store_landing_during_the_probe_is_found_by_a_second_probe() {
     let (_dir, inner) = make_test_store().await;
     let (partition, address, fragment, payload) = make_input(0xA6);
-    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
-    let (store, counts) = CountingReadStore::with_hooks(
-        inner,
-        ReadHooks {
-            landing: Some((partition, address, fragment, payload.clone(), guard)),
-            ..ReadHooks::default()
-        },
-    );
+    let (store, counts) =
+        CountingReadStore::landing(inner, partition, address, fragment, payload.clone());
 
     let (_, loaded) = tokio::time::timeout(
         Duration::from_secs(2),
@@ -2172,14 +2305,8 @@ async fn a_buffer_read_missing_with_no_store_landing_probes_once() {
 async fn a_store_landing_during_a_read_into_probe_is_found_by_a_second_probe() {
     let (_dir, inner) = make_test_store().await;
     let (partition, address, fragment, payload) = make_input(0xC6);
-    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
-    let (store, counts) = CountingReadStore::with_hooks(
-        inner,
-        ReadHooks {
-            landing: Some((partition, address, fragment, payload.clone(), guard)),
-            ..ReadHooks::default()
-        },
-    );
+    let (store, counts) =
+        CountingReadStore::landing(inner, partition, address, fragment, payload.clone());
 
     let mut slice = vec![0u8; payload.len()];
     tokio::time::timeout(
@@ -2207,14 +2334,8 @@ async fn a_store_landing_during_a_read_into_probe_is_found_by_a_second_probe() {
 async fn a_store_landing_during_a_buffer_read_probe_is_found_by_a_second_probe() {
     let (_dir, inner) = make_test_store().await;
     let (partition, address, fragment, payload) = make_input(0xC8);
-    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
-    let (store, counts) = CountingReadStore::with_hooks(
-        inner,
-        ReadHooks {
-            landing: Some((partition, address, fragment, payload.clone(), guard)),
-            ..ReadHooks::default()
-        },
-    );
+    let (store, counts) =
+        CountingReadStore::landing(inner, partition, address, fragment, payload.clone());
 
     let mut buffer = vec![0u8; payload.len()];
     // SAFETY: the buffer outlives the read and nothing else touches it.
@@ -2314,7 +2435,8 @@ async fn a_placement_failing_otherwise_is_a_miss() {
 async fn a_never_waiting_read_into_answers_a_miss_at_once_while_a_store_is_in_flight() {
     let (_dir, store) = make_test_store().await;
     let (partition, address, _fragment, payload) = make_input(0xE5);
-    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+    let guard =
+        try_acquire_in_flight(&store, partition, address).expect("no contention in fresh test");
 
     let mut slice = vec![0u8; payload.len()];
     let read = tokio::time::timeout(
@@ -2346,7 +2468,8 @@ async fn load_fragment_returns_not_found_when_leader_drops_without_writing() {
     let (_dir, store) = make_test_store().await;
     let (partition, address, _fragment, _payload) = make_input(0xAD);
 
-    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+    let guard =
+        try_acquire_in_flight(&store, partition, address).expect("no contention in fresh test");
 
     let reader_store = store.clone();
     let reader = lore_base::lore_spawn!(async move {
@@ -3380,9 +3503,9 @@ async fn concurrent_misses_of_one_content_under_different_addresses_fetch_once()
 /// context fetches and stores for itself, and one under the same address answers the error.
 #[tokio::test(flavor = "multi_thread")]
 async fn only_a_follower_of_the_leaders_address_takes_its_error() {
-    use lore_storage::read_flight::FlightStore;
     use lore_storage::read_flight::ReadFlight;
     use lore_storage::read_flight::join_read_flight;
+    use lore_storage::write::FlightStore;
 
     let (_dir, store) = make_test_store().await;
     for (seed, same_address) in [(0xE9, false), (0xEA, true)] {
@@ -3466,9 +3589,9 @@ async fn only_a_follower_of_the_leaders_address_takes_its_error() {
 /// a payload checked less than it asks.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_untrusting_fetch_never_follows_a_trusting_flight() {
-    use lore_storage::read_flight::FlightStore;
     use lore_storage::read_flight::ReadFlight;
     use lore_storage::read_flight::join_read_flight;
+    use lore_storage::write::FlightStore;
 
     let (_dir, store) = make_test_store().await;
     let (partition, address, fragment, payload) = make_input(0xEC);
@@ -3518,9 +3641,9 @@ async fn an_untrusting_fetch_never_follows_a_trusting_flight() {
 /// than following a flight for the same content held in another.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_isolating_store_never_shares_a_flight_across_partitions() {
-    use lore_storage::read_flight::FlightStore;
     use lore_storage::read_flight::ReadFlight;
     use lore_storage::read_flight::join_read_flight;
+    use lore_storage::write::FlightStore;
 
     let (_dir, store) = store_with_isolation(true).await;
     let (partition, address, fragment, payload) = make_input(0xEB);
@@ -4067,9 +4190,9 @@ async fn a_follower_of_a_leader_dropped_during_its_put_stores_the_content_itself
 /// the fetch itself.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_follower_joining_once_the_leader_took_less_than_it_keeps_stores_its_own() {
-    use lore_storage::read_flight::FlightStore;
     use lore_storage::read_flight::ReadFlight;
     use lore_storage::read_flight::join_read_flight;
+    use lore_storage::write::FlightStore;
 
     let (_dir, store) = make_test_store().await;
     let (partition, address, fragment, payload) = make_input(0xFC);
@@ -4467,9 +4590,9 @@ async fn never_wait_with_a_session_never_follows_a_flight() {
         .expect("the leader fetches");
 }
 
-/// A whole read into a buffer that misses while a tracker-dispatched store of the address is
-/// held in its upload reads the store's local write once it lands, rather than fetching it:
-/// the read's own probe releases the upload.
+/// A whole read into a buffer that misses while a tracker-dispatched store of the address in its
+/// store is held in its upload reads the store's local write once it lands, rather than fetching
+/// it: the read's own probe releases the upload.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_whole_read_into_a_buffer_reads_a_dispatched_store_it_missed_locally() {
     let (_dir, inner) = make_test_store().await;
@@ -4478,9 +4601,16 @@ async fn a_whole_read_into_a_buffer_reads_a_dispatched_store_it_missed_locally()
         Arc::new(tokio::sync::Notify::new()),
         Arc::new(tokio::sync::Notify::new()),
     );
+    let (store, counts) = CountingReadStore::with_hooks(
+        inner,
+        ReadHooks {
+            release: Some(release.clone()),
+            ..ReadHooks::default()
+        },
+    );
     let tracker = Arc::new(lore_storage::WriteTracker::new());
     lore_storage::write::store_fragment(
-        inner.clone(),
+        store.clone(),
         partition,
         address,
         Fragment {
@@ -4498,13 +4628,6 @@ async fn a_whole_read_into_a_buffer_reads_a_dispatched_store_it_missed_locally()
     tokio::time::timeout(Duration::from_secs(5), entered.notified())
         .await
         .expect("the leader reached its upload");
-    let (store, counts) = CountingReadStore::with_hooks(
-        inner,
-        ReadHooks {
-            release: Some(release),
-            ..ReadHooks::default()
-        },
-    );
 
     let mut buffer = vec![0u8; 4096];
     // SAFETY: the buffer outlives the read and nothing else touches it.
@@ -4606,7 +4729,8 @@ async fn a_never_waiting_whole_read_into_a_buffer_answers_a_miss_at_once_while_a
  {
     let (_dir, store) = make_test_store().await;
     let (partition, address, _fragment, _payload) = make_input(0xE7);
-    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+    let guard =
+        try_acquire_in_flight(&store, partition, address).expect("no contention in fresh test");
 
     let mut buffer = vec![0u8; 4096];
     // SAFETY: the buffer outlives the read and nothing else touches it.

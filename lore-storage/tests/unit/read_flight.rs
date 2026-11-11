@@ -8,9 +8,10 @@ use lore_storage::error::StorageError;
 use lore_storage::errors::AddressNotFound;
 use lore_storage::read::Keep;
 use lore_storage::read_flight::*;
+use lore_storage::write::FlightStore;
 
 /// The store every flight here reads into.
-const STORE: FlightStore = FlightStore(1);
+const STORE: FlightStore = FlightStore(std::num::NonZeroUsize::MIN);
 
 /// Joins the read single-flight as a caller in [`STORE`] keeping nothing of the fetch.
 fn join(
@@ -121,7 +122,8 @@ async fn a_cancelled_follower_releases_its_receiver() {
 }
 
 /// A read of the same content under another context or partition follows the flight where the
-/// store does not isolate partitions, and is told the leader's address is not its own.
+/// store does not isolate partitions, and is told the leader's address is not its own, where a
+/// read of the leader's address is told it is.
 #[tokio::test]
 async fn a_read_of_the_same_content_under_another_address_follows() {
     let (partition, address) = test_key(5);
@@ -135,11 +137,12 @@ async fn a_read_of_the_same_content_under_another_address_follows() {
         ..address
     };
     match join(other_partition, other_address, false, false) {
-        ReadFlight::Follower(follower) => {
-            assert!(!follower.led_by(other_partition, other_address));
-            assert!(follower.led_by(partition, address));
-        }
+        ReadFlight::Follower(follower) => assert!(!follower.same_address()),
         ReadFlight::Leader(_) => panic!("a read of the same content must follow"),
+    }
+    match join(partition, address, false, false) {
+        ReadFlight::Follower(follower) => assert!(follower.same_address()),
+        ReadFlight::Leader(_) => panic!("a read of the same address must follow"),
     }
     drop(leader);
 }

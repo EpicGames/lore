@@ -84,15 +84,49 @@ pub async fn write_raw(
     }
 }
 
-// This map holds the set of unique (partition, address) pairs that are currently
-// in flight to be stored locally, and a token to wait for completion
-static STORE_IN_FLIGHT: OnceLock<DashMap<StoreInFlightKey, CancellationToken>> = OnceLock::new();
+/// Writes in flight, keyed by the store object, partition and address: each entry holds the token
+/// cancelled when its guard drops, landed or not, and the store object it writes, so that no other
+/// store object takes the object address its key holds while the entry exists.
+static STORE_IN_FLIGHT: OnceLock<DashMap<StoreInFlightKey, StoreInFlight>> = OnceLock::new();
 
+/// A write in flight: the token cancelled when its guard drops, and the store object it writes.
+struct StoreInFlight {
+    token: CancellationToken,
+    _store: Arc<dyn ImmutableStore>,
+}
+
+/// The store a single-flight writes or reads into, by the address of the store object.
+#[lore_macro::test_pub]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub(crate) struct FlightStore(std::num::NonZeroUsize);
+
+impl FlightStore {
+    /// The identity of `store`.
+    #[lore_macro::test_pub]
+    pub(crate) fn of(store: &dyn ImmutableStore) -> Self {
+        Self(std::ptr::NonNull::from(store).cast::<()>().addr())
+    }
+}
+
+/// A store object, partition and address: the key of a write in flight, and the association a
+/// read single-flight reads into.
 #[lore_macro::test_pub]
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) struct StoreInFlightKey {
+    pub store: FlightStore,
     pub partition: Partition,
     pub address: Address,
+}
+
+impl StoreInFlightKey {
+    /// The key of `address` in `partition` of `store`.
+    fn of(store: &dyn ImmutableStore, partition: Partition, address: Address) -> Self {
+        Self {
+            store: FlightStore::of(store),
+            partition,
+            address,
+        }
+    }
 }
 
 /// Stores that have left [`STORE_IN_FLIGHT`], counted per bucket of addresses before each entry
@@ -128,21 +162,22 @@ impl Drop for StoreInFlightGuard {
                 .is_some_and(|in_flight| in_flight.contains_key(&self.key))
         });
         if let Some(in_flight) = STORE_IN_FLIGHT.get()
-            && let Some((_, token)) = in_flight.remove(&self.key)
+            && let Some((_, flight)) = in_flight.remove(&self.key)
         {
             // Let waiters know we have finished the request that was in flight
-            token.cancel();
+            flight.token.cancel();
         }
     }
 }
 
-// Either returns a new in-flight token if request was not in flight, or waits for the request
-// to finish and then return none if already in-flight
+/// The guard of a write of `address` in `partition` of `store`, where no other write of it is in
+/// flight; otherwise waits for the one in flight to land and answers `None`.
 pub async fn stored_in_flight(
+    store: &Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
 ) -> Option<StoreInFlightGuard> {
-    match try_acquire_in_flight(partition, address) {
+    match try_acquire_in_flight(store, partition, address) {
         Ok(guard) => Some(guard),
         Err(token) => {
             token.cancelled().await;
@@ -151,47 +186,50 @@ pub async fn stored_in_flight(
     }
 }
 
-/// Non-blocking attempt to acquire the in-flight guard for `(partition, address)`.
+/// Non-blocking attempt to acquire the in-flight guard for `address` in `partition` of `store`.
 ///
-/// Returns `Ok(guard)` if no one else is currently writing this address — the
-/// caller becomes the leader and must drop the guard when the terminal store
-/// entry is written.
+/// Returns `Ok(guard)` if no one else is currently writing this address to this store — the
+/// caller becomes the leader and must drop the guard when the terminal store entry is written.
 ///
 /// Returns `Err(token)` if another task already holds the guard. The token is
 /// cancelled when that task drops its guard; callers that want to observe the
 /// leader's outcome should await the token and then query the store.
 pub fn try_acquire_in_flight(
+    store: &Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
 ) -> Result<StoreInFlightGuard, CancellationToken> {
-    let key = StoreInFlightKey { partition, address };
+    let key = StoreInFlightKey::of(store.as_ref(), partition, address);
     let in_flight = STORE_IN_FLIGHT.get_or_init(DashMap::new);
     // `DashMap::entry` is safe here as it is not held across any awaits and no other locks are acquired while held
     #[allow(clippy::disallowed_methods)]
     match in_flight.entry(key.clone()) {
-        Entry::Occupied(entry) => Err(entry.get().clone()),
+        Entry::Occupied(entry) => Err(entry.get().token.clone()),
         Entry::Vacant(entry) => {
-            entry.insert(CancellationToken::new());
+            entry.insert(StoreInFlight {
+                token: CancellationToken::new(),
+                _store: store.clone(),
+            });
             Ok(StoreInFlightGuard { key })
         }
     }
 }
 
-/// If another task is currently writing `(partition, address)` via the tracker
-/// path, wait for its cancellation token so subsequent reads observe the
-/// terminal store entry the leader produces, and answer true. Returns false
-/// immediately when no write is in flight.
-pub async fn wait_if_in_flight(partition: Partition, address: Address) -> bool {
-    let Some(in_flight) = STORE_IN_FLIGHT.get() else {
-        return false;
-    };
-    let key = StoreInFlightKey { partition, address };
-    let token = in_flight.get(&key).map(|entry| entry.value().clone());
-    let Some(token) = token else {
-        return false;
-    };
-    token.cancelled().await;
-    true
+/// If another task is currently writing `address` in `partition` of `store`, wait for its
+/// cancellation token so subsequent reads observe the terminal store entry the leader produces,
+/// and answer true. Returns false immediately when no write is in flight. Looks for the write at
+/// the call, so the future holds none of the arguments.
+pub fn wait_if_in_flight(
+    store: &dyn ImmutableStore,
+    partition: Partition,
+    address: Address,
+) -> impl Future<Output = bool> + use<> {
+    let key = StoreInFlightKey::of(store, partition, address);
+    let token = STORE_IN_FLIGHT
+        .get()
+        .and_then(|in_flight| in_flight.get(&key).map(|entry| entry.value().token.clone()));
+    futures::future::OptionFuture::from(token.map(CancellationToken::cancelled_owned))
+        .map(|waited| waited.is_some())
 }
 
 /// Result of a [`store_fragment`] operation.
@@ -652,8 +690,8 @@ impl FusedPublish {
 /// A publishing write is never dispatched into the tracker, whatever the caller's `writes` says. A
 /// dispatched write returns before its leader has uploaded anything, so there would be no upload
 /// for the key to ride on and no placement to report — the two are incompatible by construction
-/// rather than by policy. It does take the in-flight guard, so concurrent writers of one address
-/// collapse onto a single upload; a publishing write whose leader left the content durable reports
+/// rather than by policy. It does take the in-flight guard, so concurrent writers of one address to
+/// one store collapse onto a single upload; a publishing write whose leader left the content durable reports
 /// `published = false` and its key follows as a `mutable_store`, the same round trip its own upload
 /// would have cost and none of the payload. A leader that left the content *not* durable — one
 /// writing locally, or one whose upload failed — cannot satisfy a publish, so this call uploads
@@ -766,10 +804,10 @@ fn observed_fragment(fragment: Fragment, result: &StoreResult) -> Fragment {
 /// inline, and returns only after the terminal store entry is written.
 ///
 /// When `remote_session` is `None`, the in-flight machinery is bypassed entirely: it exists
-/// to coordinate concurrent uploads to the same address (so duplicate uploads collapse onto
-/// one wire call), which is moot for pure-local writes. Concurrent local writers may briefly
-/// do duplicate compression work, but the bucket-level write is content-addressed and
-/// idempotent. Items with no remote consult must not enter the dedup tracker.
+/// to coordinate concurrent uploads of the same address from one store (so duplicate uploads
+/// collapse onto one wire call), which is moot for pure-local writes. Concurrent local writers
+/// may briefly do duplicate compression work, but the bucket-level write is content-addressed
+/// and idempotent. Items with no remote consult must not enter the dedup tracker.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -836,9 +874,9 @@ fn store_fragment_inline(
             });
         }
 
-        // Remote-coupled path: acquire the in-flight guard so a concurrent writer to the same
-        // address dedupes onto one upload.
-        let guard = stored_in_flight(partition, address).await;
+        // Remote-coupled path: acquire the in-flight guard so a concurrent writer of the same
+        // address to this store dedupes onto one upload.
+        let guard = stored_in_flight(&store, partition, address).await;
         if guard.is_none()
             && let Some((stored_local, stored_durable)) =
                 inherited_placement(&store, partition, address, publish).await
@@ -915,7 +953,7 @@ async fn store_fragment_dispatched(
     permit: Option<OwnedSemaphorePermit>,
 ) -> Result<StoreResult, StorageError> {
     tracker.claim(&store).await;
-    let guard = match try_acquire_in_flight(partition, address) {
+    let guard = match try_acquire_in_flight(&store, partition, address) {
         Ok(guard) => guard,
         Err(token) => {
             // Follower path: drop buffer and permit, register on the tracker.
