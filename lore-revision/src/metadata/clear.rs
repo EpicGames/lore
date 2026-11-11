@@ -6,7 +6,6 @@ use lore_error_set::prelude::*;
 use serde::Serialize;
 
 use super::MetadataErrors;
-use crate::errors::FileNotFound;
 use crate::event;
 use crate::interface::LoreString;
 use crate::lore::Hash;
@@ -16,7 +15,6 @@ use crate::node::NodeFileMetadataBlock;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::state;
-use crate::util::path::RelativePath;
 
 /// Data for an event reporting that revision metadata was cleared.
 #[repr(C)]
@@ -103,21 +101,9 @@ pub async fn clear_file(
         .await
         .forward::<MetadataErrors>("deserializing state")?;
 
-    let relative_path = RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
-        .forward::<MetadataErrors>("resolving user path")?;
+    let node = super::file_node_outside_links(&state, &repository, &path).await?;
 
-    let node_link = state
-        .find_node_link(repository.clone(), relative_path.as_str())
-        .await
-        .forward::<MetadataErrors>("finding node")?;
-    if !node_link.is_valid() {
-        return Err(FileNotFound {
-            resource: path.clone(),
-        }
-        .into());
-    }
-
-    let metadata_node = node::node_to_file_metadata(node_link.node);
+    let metadata_node = node::node_to_file_metadata(node);
     let block_index = NodeFileMetadataBlock::index(metadata_node);
     let node_index = NodeFileMetadata::index(metadata_node);
 

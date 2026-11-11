@@ -19,6 +19,7 @@ Run as a script, this module is the driver a test invokes as a subprocess:
     python lore_ffi.py revision-bisect <library-path> <repository-path> <start> <end> <keep-store-alive-seconds>
     python lore_ffi.py file-audit <library-path> <repository-path> <path>
                                   [--stop-after <n>]
+    python lore_ffi.py file-metadata-set <library-path> <repository-path> <key> <value-file> <path>...
 
 exiting with the call's FFI code. Tests go through `Lore`'s `*_capi` methods
 rather than importing `LoreLibrary` directly:
@@ -62,6 +63,7 @@ from pathlib import Path
 # validation, 28-39 is connectivity and availability, 80-95 is not-found.
 NOT_AUTHENTICATED = 16
 NOT_SUPPORTED = 9
+OVERSIZED = 118
 DISCONNECTED = 28
 NOT_CONNECTED = 29
 FILE_NOT_FOUND = 82
@@ -124,6 +126,19 @@ class LoreGlobalArgs(Structure):
         ("trust_remote", c_uint8),
         ("fast_flush", c_uint8),
     ]
+
+
+class LoreUint32Array(Structure):
+    """`lore_uint32_array_t`: pointer to first element + count."""
+
+    _fields_ = [("ptr", POINTER(c_uint32)), ("count", c_size_t)]
+
+
+class LoreMetadataTypeArray(Structure):
+    """`lore_metadata_type_array_t`. `lore_metadata_type_t` is a C enum, so each
+    element is an `int`."""
+
+    _fields_ = [("ptr", POINTER(c_int)), ("count", c_size_t)]
 
 
 class LoreEventCallbackConfig(Structure):
@@ -252,6 +267,19 @@ class LoreFileAuditArgs(Structure):
     ]
 
 
+class LoreFileMetadataSetArgs(Structure):
+    """`lore_file_metadata_set_args_t`. `entries` holds, per path, how many of
+    the keys, values and formats that follow in order are set on it."""
+
+    _fields_ = [
+        ("paths", LoreStringArray),
+        ("keys", LoreStringArray),
+        ("values", LoreStringArray),
+        ("formats", LoreMetadataTypeArray),
+        ("entries", LoreUint32Array),
+    ]
+
+
 class LoreFileAuditEventData(Structure):
     """`lore_file_audit_event_data_t`: one range of lines and what it resolved
     to. `outcome` is a C enum, so it is `int`."""
@@ -319,6 +347,9 @@ MIRRORED_STRUCTS = [
     ("lore_complete_event_data_t", LoreCompleteEventData),
     ("lore_file_audit_args_t", LoreFileAuditArgs),
     ("lore_file_audit_event_data_t", LoreFileAuditEventData),
+    ("lore_uint32_array_t", LoreUint32Array),
+    ("lore_metadata_type_array_t", LoreMetadataTypeArray),
+    ("lore_file_metadata_set_args_t", LoreFileMetadataSetArgs),
 ]
 
 # One field per line, either a function pointer (`void (*func)(...)`) or a plain
@@ -452,6 +483,12 @@ class LoreLibrary:
         self._lib.lore_file_audit.argtypes = [
             POINTER(LoreGlobalArgs),
             POINTER(LoreFileAuditArgs),
+            LoreEventCallbackConfig,
+        ]
+        self._lib.lore_file_metadata_set.restype = c_int32
+        self._lib.lore_file_metadata_set.argtypes = [
+            POINTER(LoreGlobalArgs),
+            POINTER(LoreFileMetadataSetArgs),
             LoreEventCallbackConfig,
         ]
 
@@ -660,6 +697,50 @@ class LoreLibrary:
             LoreEventCallbackConfig(0, ctypes.cast(callback, c_void_p).value),
         )
 
+    def file_metadata_set(
+        self, repository_path: str, key: str, value: str, paths: list[str]
+    ) -> int:
+        """Call `lore_file_metadata_set` with one string entry, `key` set to
+        `value`, on every path in one call, returning its FFI code."""
+        # Encoded buffers must outlive the call; keep references on the stack.
+        repository_bytes = repository_path.encode()
+        key_bytes = key.encode()
+        value_bytes = value.encode()
+        path_bytes = [path.encode() for path in paths]
+        count = len(path_bytes)
+
+        globals_args = LoreGlobalArgs()
+        globals_args.repository_path = LoreString(
+            repository_bytes, len(repository_bytes)
+        )
+
+        path_strings = (LoreString * count)(
+            *(LoreString(encoded, len(encoded)) for encoded in path_bytes)
+        )
+        keys = (LoreString * count)(*([LoreString(key_bytes, len(key_bytes))] * count))
+        values = (LoreString * count)(
+            *([LoreString(value_bytes, len(value_bytes))] * count)
+        )
+        string_type = header_enum_value(
+            "lore_metadata_type_t", "LORE_METADATA_TYPE_STRING"
+        )
+        formats = (c_int * count)(*([string_type] * count))
+        entries = (c_uint32 * count)(*([1] * count))
+
+        args = LoreFileMetadataSetArgs(
+            LoreStringArray(path_strings, count),
+            LoreStringArray(keys, count),
+            LoreStringArray(values, count),
+            LoreMetadataTypeArray(formats, count),
+            LoreUint32Array(entries, count),
+        )
+
+        return self._lib.lore_file_metadata_set(
+            ctypes.byref(globals_args),
+            ctypes.byref(args),
+            LoreEventCallbackConfig(0, None),
+        )
+
 
 USAGE = """usage:
   lore_ffi.py auth-user-info <library-path> <repository-path> [user-id...]
@@ -672,7 +753,8 @@ USAGE = """usage:
   lore_ffi.py revision-sync <library-path> <repository-path> <view-file>
   lore_ffi.py revision-bisect <library-path> <repository-path> <start> <end> <keep-store-alive-seconds>
   lore_ffi.py file-audit <library-path> <repository-path> <path>
-                         [--stop-after <n>]"""
+                         [--stop-after <n>]
+  lore_ffi.py file-metadata-set <library-path> <repository-path> <key> <value-file> <path>..."""
 
 
 def main(argv: list[str]) -> int:
@@ -711,6 +793,17 @@ def main(argv: list[str]) -> int:
                         return 2
             return LoreLibrary(library_path).file_audit(
                 repository_path, path, stop_after
+            )
+        case [
+            "file-metadata-set",
+            library_path,
+            repository_path,
+            key,
+            value_file,
+            *paths,
+        ]:
+            return LoreLibrary(library_path).file_metadata_set(
+                repository_path, key, Path(value_file).read_text(), paths
             )
         case _:
             print(USAGE, file=sys.stderr)

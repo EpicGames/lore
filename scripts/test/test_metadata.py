@@ -5,8 +5,9 @@ import logging
 import os
 
 import pytest
+from error_types import FileNotFound, ImproperArgumentsError
+from lore_ffi import OVERSIZED
 
-from error_types import ImproperArgumentsError
 from lore import Lore
 
 logger = logging.getLogger(__name__)
@@ -244,3 +245,27 @@ def test_file_metadata_set_even_args_succeeds(new_lore_repo):
 
     output = repo.file_metadata_get(text_file, "str_value", offline=True)
     assert "kept" in output, f"Expected metadata value in output.\nGot: {output}"
+
+
+@pytest.mark.smoke
+def test_file_metadata_set_on_a_missing_path_is_refused(new_lore_repo):
+    repo: Lore = new_lore_repo()
+    _staged_file(repo)
+
+    with pytest.raises(FileNotFound, match="missing.txt"):
+        repo.file_metadata_set("missing.txt", ["key", "value"], offline=True)
+
+
+@pytest.mark.smoke
+def test_file_metadata_set_past_the_size_limit_is_refused(
+    new_lore_repo, lore_library_path
+):
+    repo: Lore = new_lore_repo()
+    text_file = _staged_file(repo)
+
+    code = repo.file_metadata_set_capi(
+        lore_library_path, [text_file], "key", "v" * 1024 * 1024
+    )
+
+    assert code == OVERSIZED
+    assert "key" not in repo.file_metadata_get(text_file, offline=True)

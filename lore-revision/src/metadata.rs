@@ -28,7 +28,9 @@ use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Context;
 use crate::lore::Hash;
+use crate::node::NodeID;
 use crate::repository::RepositoryContext;
+use crate::state::State;
 use crate::util::path::RelativePath;
 use crate::util::path::is_path_inside_repository;
 use crate::util::path::make_absolute;
@@ -210,6 +212,43 @@ where
     let outside =
         make_absolute(&user_path).forward_any::<E>("Failed to resolve the binary metadata path")?;
     store(ContentSource::owned_file(outside)).await
+}
+
+/// The node the user path `path` names in `state`, refused where `path` is inside a link: a node
+/// reached through a link is numbered in the linked tree, so `state` holds another file's metadata
+/// under it.
+pub(crate) async fn file_node_outside_links(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+    path: &str,
+) -> Result<NodeID, MetadataErrors> {
+    let relative_path = RelativePath::new_from_user_path(repository.require_path()?, path)
+        .forward_any::<MetadataErrors>("resolving user path")?;
+    let node_link = state
+        .find_node_link(repository.clone(), relative_path.as_str())
+        .await
+        .map_matched_err("finding node", |m| match m {
+            MatchedStateErrors::NodeNotFound(traced) => MetadataErrors::FileNotFound(
+                FileNotFound {
+                    resource: path.to_string(),
+                }
+                .chain_err(traced, "the revision does not hold the path"),
+            ),
+            other => other.forward::<MetadataErrors>("finding node"),
+        })?;
+    if !node_link.is_valid() {
+        return Err(FileNotFound {
+            resource: path.to_string(),
+        }
+        .into());
+    }
+    if node_link.crosses_link(repository, state) {
+        return Err(NotSupported {
+            operation: format!("file metadata on `{relative_path}`, which is inside a link"),
+        }
+        .into());
+    }
+    Ok(node_link.node)
 }
 
 /// Which of a source revision's keys a merge or cherry-pick carries onto the

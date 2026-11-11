@@ -108,6 +108,12 @@ pub(crate) async fn dump_file(
         return Err(DumpError::internal("invalid node"));
     }
 
+    // A node inside a link is numbered in the linked tree.
+    let (repository, state) = node_link
+        .resolve(repository, state)
+        .await
+        .forward::<DumpError>("entering the link the path resolves into")?;
+
     let node = state
         .node(repository.clone(), node_link.node)
         .await

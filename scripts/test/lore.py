@@ -13,6 +13,7 @@ import shutil
 import string
 import subprocess
 import sys
+import tempfile
 import uuid
 from collections.abc import Iterable
 from pathlib import Path
@@ -2014,6 +2015,24 @@ class Lore:
             end,
             str(keep_store_alive_seconds),
         )
+
+    def file_metadata_set_capi(
+        self, library_path: str, paths: list[str], key: str, value: str
+    ) -> int:
+        """Set `key` to `value` on every path in one call through the public C API,
+        returning the FFI code. The CLI sets metadata on one path per call."""
+        # The value goes through a file, as a Windows command line holds at most 32 KiB.
+        with tempfile.TemporaryDirectory() as directory:
+            value_file = Path(directory) / "value"
+            value_file.write_text(value)
+            return self._capi_driver(
+                library_path,
+                "file-metadata-set",
+                self.path,
+                key,
+                str(value_file),
+                *(self._fix_path(path) for path in paths),
+            )
 
     def layer_add(
         self,

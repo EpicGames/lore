@@ -338,7 +338,7 @@ pub async fn audit(
     // own chain, so the walk continues against that repository's revision. The
     // link is entered through the resolve the read path already uses, which
     // leaves a path in the audit's own repository where it stands.
-    let linked = node_link.repository != repository.id;
+    let linked = node_link.crosses_link(&repository, &state);
     let (repository, state) = node_link
         .resolve(repository, state)
         .await

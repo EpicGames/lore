@@ -3840,7 +3840,7 @@ async fn refuse_losing_local_work(
         .find_node_link(repository.clone(), path.as_str())
         .await
         .unwrap_or_default();
-    if !node_link.is_valid() || node_link.repository != repository.id {
+    if !node_link.is_valid() || node_link.crosses_link(repository, replaced) {
         return Err(LocalModifications.into());
     }
     if !state::collect_link_mounts_below(replaced, repository, node_link.node, path)

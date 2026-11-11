@@ -1685,7 +1685,7 @@ async fn layer_commit_root(
     if !node_link.is_valid() {
         return Err(CommitError::internal("Invalid subpath"));
     }
-    if node_link.repository != repository.id {
+    if node_link.crosses_link(repository, state_staged) {
         // TODO(mjansson): Layers that specify a path living inside a link need
         //                 special snowflake care here to commit from the link and down
         return Err(CommitError::internal("Not supported"));
