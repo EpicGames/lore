@@ -210,7 +210,7 @@ A crate may stop or fail its own code at a test point, so that its race tests ru
 
 **Frameworks:** `tokio`, `mockall`, `async-trait`
 
-Every async test in a crate that depends on `lore-base` runs its body in `LORE_CONTEXT.scope()`, so the code under test has the execution context it has in production:
+In `lore-revision` and the crates that depend on it, every async test of code that relies on its caller to set `LORE_CONTEXT`, directly or through the code it calls, runs its body in `LORE_CONTEXT.scope()`. The code under test then has the execution context it has in production:
 
 ```rust
 #[tokio::test]
@@ -222,6 +222,8 @@ async fn test_example() {
         .await;
 }
 ```
+
+Only those crates can build an `ExecutionContext`, the type of the value `LORE_CONTEXT` carries in production, since `lore-revision` defines it.
 
 ### Test independence
 
@@ -586,7 +588,7 @@ Wall-clock benchmarks on a shared machine vary by more than the regressions wort
 1. **Target risk, not line count** — spend test effort on business logic; leave plumbing and trivial code with few or no tests.
 2. **Test every fix and every behavior change** with a test that fails without it (see [What a change tests](#what-a-change-tests)).
 3. **All Lore commands must have smoke tests** in `scripts/test/`.
-4. **Use `LORE_CONTEXT.scope()`** for every async Rust test in a crate that depends on `lore-base`.
+4. **Use `LORE_CONTEXT.scope()`** for every async Rust test in `lore-revision` or a crate that depends on it, of code that relies on its caller to set `LORE_CONTEXT`.
 5. **Keep tests independent** — Avoid `#[serial]` and test dependencies; use isolated fixtures.
 6. **Poll instead of sleeping** for async state; reserve fixed sleeps for time-based behavior or sub-20ms task startup.
 7. **Use the `new_lore_repo` fixture** for smoke tests, and `scratch_dir` for anything
