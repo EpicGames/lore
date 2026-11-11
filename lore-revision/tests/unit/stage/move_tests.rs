@@ -13,12 +13,14 @@ use lore_revision::interface::LoreString;
 use lore_revision::lore::RepositoryId;
 use lore_revision::node::Node;
 use lore_revision::node::NodeID;
+use lore_revision::stage::StageError;
 use lore_revision::stage::StageOptions;
 use lore_revision::state::Clear;
 use lore_revision::state::State;
 
 use crate::fs::filesystem_provider::test_store_create;
 use crate::helper::TestRepository;
+use crate::helper::mount_intermediate;
 use crate::helper::test_commit;
 use crate::helper::test_commit_tree;
 use crate::helper::test_file_write;
@@ -828,6 +830,63 @@ async fn a_dirty_move_of_a_directory_into_itself_is_refused() {
         assert!(
             result.is_err_and(|error| error.is_invalid_arguments()),
             "the move below itself is refused"
+        );
+    })
+    .await;
+}
+
+/// A staged move into, onto, out of or within a mount, or of the mount itself, is refused as not
+/// supported.
+#[tokio::test]
+async fn a_staged_move_across_a_link_is_not_supported() {
+    for (from, to) in [
+        ("a.txt", "vendor/src/a.txt"),
+        ("a.txt", "vendor/src/Intermediate"),
+        ("vendor/src/Intermediate", "b.txt"),
+        ("vendor/src/Intermediate", "vendor/src/b.txt"),
+        ("vendor", "moved"),
+    ] {
+        with_instance(|instance| async move {
+            committed(&instance, &["a.txt"]).await;
+            mount_intermediate(
+                &instance.repository,
+                "vendor",
+                RepositoryId::from(uuid::Uuid::now_v7()),
+            )
+            .await;
+            let refused = lore_revision::file::stage::stage_move(
+                instance.repository.clone(),
+                &instance.write_token,
+                instance.path.join(from).to_string_lossy().into_owned(),
+                instance.path.join(to).to_string_lossy().into_owned(),
+                StageOptions::default(),
+            )
+            .await;
+            assert!(
+                matches!(refused, Err(StageError::NotSupported(_))),
+                "the move of {from} to {to} was not refused as not supported: {refused:?}"
+            );
+        })
+        .await;
+    }
+}
+
+/// A staged move onto the repository root is refused as invalid.
+#[tokio::test]
+async fn a_staged_move_onto_the_root_is_invalid() {
+    with_instance(|instance| async move {
+        committed(&instance, &["dir/a.txt"]).await;
+        let refused = lore_revision::file::stage::stage_move(
+            instance.repository.clone(),
+            &instance.write_token,
+            instance.path.join("dir").to_string_lossy().into_owned(),
+            instance.path.to_string_lossy().into_owned(),
+            StageOptions::default(),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(StageError::InvalidArguments(_))),
+            "the move onto the root was not refused as invalid: {refused:?}"
         );
     })
     .await;

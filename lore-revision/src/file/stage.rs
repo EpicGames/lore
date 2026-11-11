@@ -9,6 +9,8 @@ use tokio::task::JoinSet;
 
 use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::event;
+use crate::file::existing_node_outside_links;
+use crate::file::node_outside_links;
 use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
@@ -22,6 +24,7 @@ use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_limit_drain_tasks;
 use crate::node::NodeFlags;
+use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::path::emit_path_ignore;
 use crate::repository::RepositoryContext;
@@ -1201,6 +1204,12 @@ pub async fn stage_move(
         }
         .into());
     }
+    if to_path.is_empty() {
+        return Err(crate::errors::InvalidArguments {
+            reason: "Cannot move a path onto the repository root".into(),
+        }
+        .into());
+    }
 
     let (state_current, state_staged, _branch) =
         State::deserialize_current_and_staged(repository.clone())
@@ -1211,30 +1220,15 @@ pub async fn stage_move(
     let current_revision = state_current.revision();
     let state = state_staged.unwrap_or(state_current);
 
-    // Find from node (must exist, optionally already staged for delete)
-    let from_node = {
-        let link = state
-            .find_node_link(repository.clone(), from_path.as_str())
-            .await
-            .forward_with::<StageError, _>(|| {
-                format!("Path {from_path} does not exist in repository ")
-            })?;
-        if !link.is_valid() {
-            return Err(StageError::internal(format!(
-                "Path {from_path} does not exist in repository "
-            )));
-        }
-        if link.repository != repository.id {
-            // TODO(vri): UCS-18009 - Implement stage move for linked changes
-            // The lookup crossed a link, so the node it answers with is numbered by that
-            // repository's state and names nothing in this one. Everything below reads and
-            // relinks it here.
-            return Err(StageError::internal(
-                "Links not yet implemented, cannot perform actions in other repositories",
-            ));
-        }
-        link.node
-    };
+    // TODO(vri): UCS-18009 - Implement stage move for linked changes
+    let from_node = node_outside_links(&state, &repository, from_path.as_str())
+        .await
+        .forward_with::<StageError, _>(|| format!("looking up the move source {from_path}"))?;
+    if !from_node.is_valid_node_id() {
+        return Err(StageError::internal(format!(
+            "Path {from_path} does not exist in repository "
+        )));
+    }
 
     let (is_directory, is_file, added, deleted, dirty) = {
         let node = state
@@ -1258,20 +1252,9 @@ pub async fn stage_move(
         return Err(StageError::internal(format!("Ignored path {to_path}")));
     }
 
-    // Find to node (optional)
-    let to_node = {
-        let link = state
-            .find_node_link(repository.clone(), to_path.as_str())
-            .await
-            .unwrap_or_default();
-        if link.is_valid() && link.repository != repository.id {
-            // TODO(vri): UCS-18009 - Implement stage move for linked changes
-            return Err(StageError::internal(
-                "Links not yet implemented, cannot perform actions in other repositories",
-            ));
-        }
-        link.is_valid().then_some(link.node)
-    };
+    let to_node = existing_node_outside_links(&state, &repository, &to_path)
+        .await
+        .forward_with::<StageError, _>(|| format!("looking up the move target {to_path}"))?;
 
     let stats = Arc::new(StageStats::default());
 

@@ -816,6 +816,89 @@ pub async fn replaced_intermediate_repository(
     (ruled, tempdir)
 }
 
+/// Mounts at `mount` in `repository`'s staged tree a link to the repository `linked_id`, at a
+/// revision whose tree holds the file `src/Intermediate`, the link added there and not committed.
+#[allow(dead_code)]
+pub async fn mount_intermediate(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    mount: &str,
+    linked_id: lore_revision::lore::RepositoryId,
+) {
+    let linked = repository.to_link_context(linked_id).await;
+    let token = repository
+        .try_write_token()
+        .expect("The repository was opened for writing");
+    let linked_tree = lore_revision::state::State::new();
+    let src = linked_tree
+        .node_add(
+            linked.clone(),
+            lore_revision::node::ROOT_NODE,
+            lore_revision::node::Node {
+                name_hash: lore_storage::hash::hash_string("src"),
+                ..Default::default()
+            },
+            "src",
+        )
+        .await
+        .expect("Adding src failed");
+    linked_tree
+        .node_add(
+            linked.clone(),
+            src,
+            lore_revision::node::Node {
+                flags: lore_revision::node::NodeFlags::File.bits(),
+                name_hash: lore_storage::hash::hash_string("Intermediate"),
+                ..Default::default()
+            },
+            "Intermediate",
+        )
+        .await
+        .expect("Adding src/Intermediate failed");
+    linked_tree.set_revision_number(1);
+    let revision = linked_tree
+        .serialize(linked, token)
+        .await
+        .expect("Serializing the linked tree failed");
+
+    let staged = next_tree(repository).await;
+    let link = staged
+        .node_add(
+            repository.clone(),
+            lore_revision::node::ROOT_NODE,
+            lore_revision::node::Node {
+                flags: lore_revision::node::NodeFlags::Link.bits(),
+                name_hash: lore_storage::hash::hash_string(mount),
+                child: lore_revision::node::ROOT_NODE,
+                address: lore_base::types::Address {
+                    hash: revision,
+                    context: linked_id.into(),
+                },
+                ..Default::default()
+            },
+            mount,
+        )
+        .await
+        .expect("Adding the link failed");
+    staged
+        .link_add(
+            repository.clone(),
+            linked_id,
+            lore_revision::lore::BranchId::default(),
+            revision,
+            link,
+            lore_revision::link::LinkFlags::NoFlags,
+        )
+        .await
+        .expect("Registering the link failed");
+    let signature = staged
+        .serialize(repository.clone(), token)
+        .await
+        .expect("Serializing the staged tree failed");
+    lore_revision::instance::store_staged_anchor(repository, signature)
+        .await
+        .expect("Storing the staged anchor failed");
+}
+
 /// The tree the next commit takes: the staged one, or the current one where nothing is staged.
 #[allow(dead_code)]
 pub async fn next_tree(

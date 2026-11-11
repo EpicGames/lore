@@ -4058,88 +4058,6 @@ mod tests {
         .await;
     }
 
-    /// Mounts at `mount` in `repository`'s staged tree a link to a repository whose tree holds the
-    /// file `src/Intermediate`, the link added there and not committed.
-    async fn mount_intermediate(
-        repository: &Arc<lore_revision::repository::RepositoryContext>,
-        mount: &str,
-    ) {
-        let linked_id = RepositoryId::from(uuid::Uuid::now_v7());
-        let linked = repository.to_link_context(linked_id).await;
-        let token = repository
-            .try_write_token()
-            .expect("The repository was opened for writing");
-        let linked_tree = State::new();
-        let src = linked_tree
-            .node_add(
-                linked.clone(),
-                ROOT_NODE,
-                Node {
-                    name_hash: hash_string("src"),
-                    ..Default::default()
-                },
-                "src",
-            )
-            .await
-            .expect("Adding src failed");
-        linked_tree
-            .node_add(
-                linked.clone(),
-                src,
-                Node {
-                    flags: NodeFlags::File.bits(),
-                    name_hash: hash_string("Intermediate"),
-                    ..Default::default()
-                },
-                "Intermediate",
-            )
-            .await
-            .expect("Adding src/Intermediate failed");
-        linked_tree.set_revision_number(1);
-        let revision = linked_tree
-            .serialize(linked, token)
-            .await
-            .expect("Serializing the linked tree failed");
-
-        let staged = next_tree(repository).await;
-        let link = staged
-            .node_add(
-                repository.clone(),
-                ROOT_NODE,
-                Node {
-                    flags: NodeFlags::Link.bits(),
-                    name_hash: hash_string(mount),
-                    child: ROOT_NODE,
-                    address: Address {
-                        hash: revision,
-                        context: linked_id.into(),
-                    },
-                    ..Default::default()
-                },
-                mount,
-            )
-            .await
-            .expect("Adding the link failed");
-        staged
-            .link_add(
-                repository.clone(),
-                linked_id,
-                lore_revision::lore::BranchId::default(),
-                revision,
-                link,
-                lore_revision::link::LinkFlags::NoFlags,
-            )
-            .await
-            .expect("Registering the link failed");
-        let signature = staged
-            .serialize(repository.clone(), token)
-            .await
-            .expect("Serializing the staged tree failed");
-        lore_revision::instance::store_staged_anchor(repository, signature)
-            .await
-            .expect("Storing the staged anchor failed");
-    }
-
     /// A dirty mark of a file below a link mount, removed from the working tree, marks its removal
     /// where a directory-only rule names it: the path is asked about as the file the linked tree
     /// holds there.
@@ -4148,7 +4066,12 @@ mod tests {
         in_execution(async {
             let (repository, tempdir) = committed_repository("Intermediate/\n", &[]).await;
             let root = tempdir.to_path_buf();
-            mount_intermediate(&repository, "vendor").await;
+            mount_intermediate(
+                &repository,
+                "vendor",
+                RepositoryId::from(uuid::Uuid::now_v7()),
+            )
+            .await;
             std::fs::create_dir_all(root.join("vendor/src")).expect("Create directory failed");
             file::dirty::dirty(
                 repository.clone(),
@@ -4164,6 +4087,74 @@ mod tests {
             );
         })
         .await;
+    }
+
+    /// A dirty move or copy onto the repository root is refused as invalid.
+    #[tokio::test]
+    async fn a_dirty_move_or_copy_onto_the_root_is_invalid() {
+        in_execution(async {
+            let (repository, tempdir) = committed_repository("", &[]).await;
+            let at = |path: &str| {
+                tempdir
+                    .to_path_buf()
+                    .join(path)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let moved = file::dirty::dirty_move(repository.clone(), at("seed.txt"), at("")).await;
+            let copied = file::dirty::dirty_copy(repository.clone(), at("seed.txt"), at("")).await;
+            assert!(
+                matches!(moved, Err(file::dirty::DirtyError::InvalidArguments(_)))
+                    && matches!(copied, Err(file::dirty::DirtyError::InvalidArguments(_))),
+                "a move or copy onto the root was not refused as invalid: {moved:?}, {copied:?}"
+            );
+        })
+        .await;
+    }
+
+    /// A dirty copy into a mount, or into new directories below one however deep they go, is
+    /// refused as not supported, whether the mount draws from another repository or from this one
+    /// at another revision. A copy into new directories outside links finds no parent.
+    #[tokio::test]
+    async fn a_dirty_copy_into_a_mount_is_not_supported() {
+        for from_this_repository in [false, true] {
+            in_execution(async move {
+                let (repository, tempdir) = committed_repository("", &[]).await;
+                let linked_id = if from_this_repository {
+                    repository.id
+                } else {
+                    RepositoryId::from(uuid::Uuid::now_v7())
+                };
+                mount_intermediate(&repository, "vendor", linked_id).await;
+                let at = |path: &str| {
+                    tempdir
+                        .to_path_buf()
+                        .join(path)
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                for to in ["vendor/src/copy.txt", "vendor/fresh/deeper/copy.txt"] {
+                    let copied =
+                        file::dirty::dirty_copy(repository.clone(), at("seed.txt"), at(to)).await;
+                    assert!(
+                        matches!(copied, Err(file::dirty::DirtyError::NotSupported(_))),
+                        "a copy to {to}, mounted from this repository {from_this_repository}, \
+                         was not refused as not supported: {copied:?}"
+                    );
+                }
+                let copied = file::dirty::dirty_copy(
+                    repository.clone(),
+                    at("seed.txt"),
+                    at("fresh/deeper/copy.txt"),
+                )
+                .await;
+                assert!(
+                    matches!(copied, Err(file::dirty::DirtyError::NodeNotFound(_))),
+                    "a copy into new directories outside links found a parent: {copied:?}"
+                );
+            })
+            .await;
+        }
     }
 
     /// A status of a tracked file the working tree replaced with a directory a directory-only rule

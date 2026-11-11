@@ -1358,43 +1358,6 @@ def test_link_remount_realized_by_branch_switch(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_link_stage_move_on_mount_is_refused(new_lore_repo):
-    """Renaming a link mount is refused, and the link survives the attempt.
-
-    `stage move` does not perform the rename itself, so the on-disk move has to
-    happen first; without it the command fails on the missing destination with a
-    generic os error and never reaches any node checks.
-
-    The refusal is not link-aware: it is the generic non-directory guard, which
-    fires because a mount is not a directory node — the same message a plain
-    tracked file produces when moved onto a directory. So the message is not
-    asserted here, and it will change if renaming a mount is ever implemented. The
-    load-bearing assertions are the link registry checks below: the mount is still
-    registered at its original path, and the rename was not recorded.
-    """
-    parent, link_repo = make_parent_with_link(new_lore_repo)
-
-    parent.move(DEFAULT_LINK_MOUNT, "vendor/renamed")
-    output = parent.stage_move(DEFAULT_LINK_MOUNT, "vendor/renamed", check=False)
-
-    assert "[Error]" in output, (
-        f"Renaming a link mount should not succeed, got: {output}"
-    )
-
-    # The link is intact and still registered at its original path.
-    links = parent.link_list()
-    assert link_repo.get_id() in links, (
-        f"Link should survive a refused stage move: {links}"
-    )
-    assert (
-        DEFAULT_LINK_MOUNT in links or DEFAULT_LINK_MOUNT.replace("/", "\\") in links
-    ), f"Link path should be unchanged after a refused stage move: {links}"
-    assert "vendor/renamed" not in links and "vendor\\renamed" not in links, (
-        f"The rename should not be recorded against the link: {links}"
-    )
-
-
-@pytest.mark.smoke
 def test_link_add_accepts_a_scoped_bare_name(new_lore_repo, lore_remote_url):
     """A scoped name such as `org/project` is a name, not a host and a path.
 
@@ -1582,29 +1545,6 @@ def test_link_move_realizes_at_the_mount(new_lore_repo):
     )
     assert not parent_repo.file_exists(moved_from), (
         f"the path moved from should not survive at the mount.\nStatus:\n{parent_repo.status()}"
-    )
-
-
-@pytest.mark.smoke
-def test_link_stage_move_inside_a_link_is_refused(new_lore_repo):
-    """Staging a move of a path inside a link is refused rather than acted on.
-
-    Resolving the path crosses the link, so the node it answers with is numbered by the linked
-    repository's state and names nothing in the parent's. The move reads and relinks it in the
-    parent, so it has to stop at the boundary, as the destination side already does.
-    """
-    link_path = "vendor/b"
-    parent_repo, _link_repo = make_parent_with_link(
-        new_lore_repo, link_path, {"dir/f1.txt": "content\n"}
-    )
-
-    moved_from = f"{link_path}/dir/f1.txt"
-    moved_to = f"{link_path}/dir/f2.txt"
-    parent_repo.move(moved_from, moved_to)
-
-    output = parent_repo.stage_move(moved_from, moved_to, check=False)
-    assert "Links not yet implemented" in output, (
-        f"A move across a link boundary should be refused, got: {output}"
     )
 
 

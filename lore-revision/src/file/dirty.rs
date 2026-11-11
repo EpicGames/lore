@@ -6,6 +6,8 @@ use std::sync::atomic::Ordering;
 use lore_error_set::prelude::*;
 
 use crate::errors::*;
+use crate::file::node_outside_links;
+use crate::file::parent_outside_links;
 use crate::file::stage::is_path_under_layer_mask;
 use crate::file::stage::route_layer_paths;
 use crate::filter::FilterMode;
@@ -1524,41 +1526,6 @@ fn absent_child_states(
     })
 }
 
-async fn node_outside_links(
-    state: &State,
-    repository: &Arc<RepositoryContext>,
-    path: &str,
-) -> Result<NodeID, DirtyError> {
-    let node_link = state
-        .find_node_link(repository.clone(), path)
-        .await
-        .forward_with::<DirtyError, _>(|| format!("Path {path} does not exist"))?;
-    let is_link = node_link.repository != repository.id
-        || state
-            .node(repository.clone(), node_link.node)
-            .await
-            .forward::<DirtyError>("Failed to read node")?
-            .is_link();
-    if is_link {
-        return Err(NotSupported {
-            operation: format!("Marking a move or copy in a link at {path}"),
-        }
-        .into());
-    }
-    Ok(node_link.node)
-}
-
-async fn parent_outside_links(
-    state: &State,
-    repository: &Arc<RepositoryContext>,
-    path: &RelativePath,
-) -> Result<NodeID, DirtyError> {
-    match path.parent() {
-        Some(parent) if !parent.is_empty() => node_outside_links(state, repository, parent).await,
-        _ => Ok(ROOT_NODE),
-    }
-}
-
 /// Mark a file as dirty-moved. Relocates the node in the staged tree from source to destination.
 /// No filesystem checks — fully caller-trusted.
 /// Propagates Dirty to both source parent (child removed) and destination parent (child added).
@@ -1591,7 +1558,9 @@ pub async fn dirty_move(
     let current_revision = state_current.revision();
     let state = state_staged.unwrap_or_else(|| state_current.clone());
 
-    let from_node = node_outside_links(&state, &repository, from_path.as_str()).await?;
+    let from_node = node_outside_links(&state, &repository, from_path.as_str())
+        .await
+        .forward_with::<DirtyError, _>(|| format!("looking up the source {from_path}"))?;
 
     let (is_directory, added, deleted) = {
         let node = state
@@ -1601,7 +1570,9 @@ pub async fn dirty_move(
         (node.is_directory(), node.is_added(), node.is_deleted())
     };
 
-    let to_parent_id = parent_outside_links(&state, &repository, &to_path).await?;
+    let to_parent_id = parent_outside_links(&state, &repository, &to_path)
+        .await
+        .forward_with::<DirtyError, _>(|| format!("looking up the parent of {to_path}"))?;
 
     let to_name = to_path.name();
     let from_name = from_path.name();
@@ -1687,10 +1658,14 @@ pub async fn dirty_copy(
     let current_revision = state_current.revision();
     let state = state_staged.unwrap_or_else(|| state_current.clone());
 
-    node_outside_links(&state, &repository, from_path.as_str()).await?;
+    node_outside_links(&state, &repository, from_path.as_str())
+        .await
+        .forward_with::<DirtyError, _>(|| format!("looking up the source {from_path}"))?;
 
     let to_name = to_path.name();
-    let to_parent_id = parent_outside_links(&state, &repository, &to_path).await?;
+    let to_parent_id = parent_outside_links(&state, &repository, &to_path)
+        .await
+        .forward_with::<DirtyError, _>(|| format!("looking up the parent of {to_path}"))?;
 
     // Create destination node with Dirty+Copy
     let node = Node {

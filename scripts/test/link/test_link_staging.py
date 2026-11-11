@@ -4,7 +4,9 @@ import os
 import re
 
 import pytest
+from error_types import NotSupportedError
 from link_helpers import (
+    DEFAULT_LINK_MOUNT,
     DEFAULT_PARENT_FILE,
     assert_crr_clean,
     assert_mount_exposes,
@@ -949,3 +951,55 @@ def test_link_stage_a_file_written_over_the_mount_replaces_the_link(new_lore_rep
     with clone.open_file("shared") as f:
         assert f.read() == "file\n", "shared must hold the replacement file"
     assert "No links found" in clone.link_list()
+
+
+_MOVED_FILE = "docs/a.txt"
+_LINKED_FILE = f"{DEFAULT_LINK_MOUNT}/linked.txt"
+
+
+def _make_parent_with_link_and_moved_file(new_lore_repo) -> Lore:
+    parent, _ = make_parent_with_link(
+        new_lore_repo,
+        parent_files={DEFAULT_PARENT_FILE: "baseline\n", _MOVED_FILE: "moved\n"},
+    )
+    return parent
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("from_path", "to_path"),
+    [
+        pytest.param(_MOVED_FILE, f"{DEFAULT_LINK_MOUNT}/a.txt", id="into"),
+        pytest.param(_MOVED_FILE, _LINKED_FILE, id="onto"),
+        pytest.param(_LINKED_FILE, "docs/linked.txt", id="out-of"),
+        pytest.param(_LINKED_FILE, f"{DEFAULT_LINK_MOUNT}/renamed.txt", id="within"),
+        pytest.param(DEFAULT_LINK_MOUNT, "vendor/moved", id="mount"),
+    ],
+)
+def test_link_stage_move_across_a_link_is_not_supported(
+    new_lore_repo, from_path, to_path
+):
+    parent = _make_parent_with_link_and_moved_file(new_lore_repo)
+    parent.make_dirs(os.path.dirname(to_path))
+    parent.move(from_path, to_path)
+    before = status_by_path(parent)
+
+    with pytest.raises(NotSupportedError):
+        parent.stage_move(from_path, to_path)
+
+    assert status_by_path(parent) == before
+
+
+@pytest.mark.smoke
+def test_link_stage_move_outside_links(new_lore_repo):
+    parent = _make_parent_with_link_and_moved_file(new_lore_repo)
+    to_path = "vendor/a.txt"
+    parent.move(_MOVED_FILE, to_path)
+
+    parent.stage_move(_MOVED_FILE, to_path)
+
+    staged = {
+        path: (entry.get("action"), entry.get("fromPath"), entry.get("flagStaged"))
+        for path, entry in status_by_path(parent).items()
+    }
+    assert staged == {to_path: ("move", _MOVED_FILE, True)}
