@@ -676,13 +676,15 @@ async fn check_merge(
             MergeType::BranchMerge,
         )
         .await?;
-        // Applying checks again where it writes; clearing `LocalMode` lets that check settle it
-        // afresh.
+        // Applying checks again where it writes; clearing what this check found lets that check
+        // settle it afresh.
         for change in changes
             .iter_mut()
             .chain(conflicts.iter_mut().map(|(_, change_to)| change_to))
         {
-            change.flags.remove(change::Flags::LocalMode);
+            change
+                .flags
+                .remove(change::Flags::LocalMode | change::Flags::HoldsContent);
         }
         Ok::<_, MergeError>(())
     })

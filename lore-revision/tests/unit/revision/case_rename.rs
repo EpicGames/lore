@@ -10,8 +10,6 @@ use lore_revision::branch;
 use lore_revision::branch::BranchLatestStatus;
 use lore_revision::filter::FilterMode;
 use lore_revision::node::Node;
-use lore_revision::revision::sync;
-use lore_revision::revision::sync::SyncOptions;
 use lore_revision::state;
 
 use super::instance::Instance;
@@ -26,6 +24,7 @@ use super::instance::run;
 use super::instance::stage;
 use super::instance::stage_and_commit;
 use super::instance::switch_to;
+use super::instance::sync_to;
 use super::instance::working_tree;
 use super::instance::write;
 use crate::case_folding::case_folding;
@@ -44,19 +43,6 @@ const TREE: [&str; 5] = [
 
 /// A file of [`TREE`] the fixtures edit where a change beside the rename is needed.
 const ELSEWHERE: &str = "Elsewhere.txt";
-
-async fn sync_to(instance: &Instance, revision: Hash) {
-    sync::sync_boxed(
-        instance.repository.clone(),
-        &instance.write_token,
-        SyncOptions {
-            revision: Some(revision.to_string()),
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("Failed to sync");
-}
 
 /// The changes the revision diff reports from `from` to `to`, by action and path.
 async fn reported(instance: &Instance, from: Hash, to: Hash) -> Vec<(String, String)> {
@@ -89,9 +75,9 @@ async fn sync_and_switch_across(name: &str, from: &'static str, to: &'static str
             vec![("V".to_string(), to.to_string())]
         );
 
-        sync_to(&instance, first).await;
+        sync_to(&instance, first).await.expect("Failed to sync");
         assert_eq!(working_tree(&instance.path), before, "synced back");
-        sync_to(&instance, second).await;
+        sync_to(&instance, second).await.expect("Failed to sync");
         assert_eq!(working_tree(&instance.path), after, "synced forward");
 
         switch_to(&instance, branch::DEFAULT_DEFAULT_NAME).await;
@@ -277,7 +263,7 @@ async fn a_tree_hashed_folding_case_carries_a_case_only_rename() {
             .await
             .expect("Failed to move the branch");
             let before = working_tree(&instance.path);
-            sync_to(&instance, folding).await;
+            sync_to(&instance, folding).await.expect("Failed to sync");
             assert_eq!(
                 working_tree(&instance.path),
                 before,
@@ -300,9 +286,11 @@ async fn a_tree_hashed_folding_case_carries_a_case_only_rename() {
                 node_at(&instance, folding, "Dir/Sub").await.address
             );
 
-            sync_to(&instance, folding).await;
+            sync_to(&instance, folding).await.expect("Failed to sync");
             assert_eq!(working_tree(&instance.path), before, "synced back");
-            sync_to(&instance, renamed_revision).await;
+            sync_to(&instance, renamed_revision)
+                .await
+                .expect("Failed to sync");
             assert_eq!(
                 working_tree(&instance.path),
                 renamed(&before, "Dir/Build.cs", "Dir/build.cs"),
@@ -333,7 +321,7 @@ async fn a_tree_hashed_folding_case_commits_an_unchanged_file_once() {
             )
             .await
             .expect("Failed to move the branch");
-            sync_to(&instance, folding).await;
+            sync_to(&instance, folding).await.expect("Failed to sync");
             let file = instance.path.join("Dir/Build.cs");
 
             write(&instance, "Dir/Build.cs", "edited");

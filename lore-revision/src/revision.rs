@@ -484,14 +484,13 @@ pub async fn diff3_with_source_cap(
             }
         }
 
-        for mount in target_mounts.iter() {
-            if source_changes
-                .iter()
-                .any(|change| is_below(mount, change.path()))
-            {
-                push_unique_path(&mut conflicting_mounts, mount);
-            }
+        let won_mounts = won_mounts(&target_mounts, &source_changes, &mut conflicting_mounts);
+        if !won_mounts.is_empty() {
+            joined_changes.retain(|change| !is_below_any(&won_mounts, change.path()));
+            target_changes
+                .retain(|change| !won_mounts.iter().any(|mount| mount.covers(change.path())));
         }
+        drop(won_mounts);
 
         pair_moved_nodes(
             &mut joined_changes,
@@ -912,6 +911,9 @@ async fn join_target_walk<Summary: Default + Send + 'static>(
                 .iter()
                 .find(|mount| is_below(mount, target_change.path()))
             {
+                if changes_mode_alone(&target_change) {
+                    continue;
+                }
                 push_unique_path(conflicting_mounts, mount);
             }
             let at = index_at(source_changes, target_change.path().as_str());
@@ -963,15 +965,16 @@ async fn join_target_walk<Summary: Default + Send + 'static>(
     Ok(joined)
 }
 
-/// Whether `change` leaves its node where it stood with the content it held, which a walk reports
-/// where only the file ID differs, or puts another file holding that content where a rename of a
-/// directory above it carried the node.
+/// Whether `change` puts another file in place of its node, holding the content and the executable
+/// bit the node held: a walk reports one where only the file ID differs, at the path the node stood
+/// at or where a rename of a directory above it carried the node.
 fn is_file_id_only_churn(change: &NodeChange) -> bool {
     change.action != FileAction::Delete
-        && (change.relocated_from().is_none()
-            || (is_carried(change) && change.from.address.context != change.to.address.context))
+        && (change.relocated_from().is_none() || is_carried(change))
+        && change.from.address.context != change.to.address.context
         && !change.from.address.hash.is_zero()
         && change.from.address.hash == change.to.address.hash
+        && !crate::util::fs::mode_changed(change.from.mode, change.to.mode)
 }
 
 /// The path a change leaves its node away from, and the empty path, which orders first, for a
@@ -1056,20 +1059,58 @@ fn take_piece(rest: &mut &[u8], piece: &str) -> Option<std::cmp::Ordering> {
     }
 }
 
-/// Whether `change` changes what a node other than a directory holds: its content or its mode.
+/// Whether `change` changes what a node other than a directory holds: a file's content or a link's
+/// pin. A file's executable bit merges on its own, as [`change::merged_mode`] gives it.
 fn edits(change: &NodeChange) -> bool {
-    !change.to.flags.is_directory() && change.from.differs_from(&change.to)
+    !change.to.flags.is_directory() && change.from.address.hash != change.to.address.hash
 }
 
 /// Whether the two sides' changes of one file or link both change what it holds, a file's content
-/// or a link's pin, or its mode, and leave it different.
+/// or a link's pin, and leave it different.
 fn edits_both(source: &NodeChange, target: &NodeChange) -> bool {
     let holds = NodeFlags::File | NodeFlags::Link;
     source.to.flags.intersects(holds)
         && target.to.flags.intersects(holds)
         && edits(source)
         && edits(target)
-        && source.to.differs_from(&target.to)
+        && source.to.address.hash != target.to.address.hash
+}
+
+/// The target's mounts, `target_mounts`, that win against the source's changes below them: those
+/// below which the source changes only the executable bits of files, which give way to the mount
+/// as to a delete. Adds to `conflicting_mounts` each mount below which the source changes anything
+/// else.
+fn won_mounts(
+    target_mounts: &[RelativePath],
+    source_changes: &[NodeChange],
+    conflicting_mounts: &mut Vec<RelativePath>,
+) -> Vec<RelativePath> {
+    let mut won = Vec::new();
+    for mount in target_mounts {
+        let mut below = source_changes
+            .iter()
+            .filter(|change| is_below(mount, change.path()));
+        let Some(first) = below.next() else {
+            continue;
+        };
+        if changes_mode_alone(first) && below.all(changes_mode_alone) {
+            won.push(mount.clone());
+        } else {
+            push_unique_path(conflicting_mounts, mount);
+        }
+    }
+    won
+}
+
+/// Whether `path` stands below one of `mounts`.
+fn is_below_any(mounts: &[RelativePath], path: &RelativePath) -> bool {
+    mounts.iter().any(|mount| is_below(mount, path))
+}
+
+/// Whether `change` changes a file's executable bit and nothing else: the file stays where it
+/// stood, or where a rename of a directory above it carried it, with the content it held.
+fn changes_mode_alone(change: &NodeChange) -> bool {
+    change.action == FileAction::Keep && !edits(change) && change.changes_mode()
 }
 
 /// Whether `change` leaves another file, or nothing, where its node stood: the node was a file of
@@ -1119,6 +1160,38 @@ fn on_target(
     }
 }
 
+/// Puts `change`, the source's change of a node the target changed too, onto the target's node:
+/// its `from` side where the target holds the node, its `to` side at `at`, holding what the
+/// target's node holds where `takes_content` says, and the executable bit `mode` where the merge
+/// gives one.
+fn onto_target_node(
+    change: &mut NodeChange,
+    target: &NodeChange,
+    at: &RelativePath,
+    takes_content: bool,
+    mode: Option<u16>,
+) {
+    change.from = on_target(&change.from, &target.to, target.path());
+    if takes_content {
+        change.to = on_target(&change.to, &target.to, at);
+    } else {
+        change.to.mapping.path = at.clone();
+    }
+    if let Some(mode) = mode {
+        change.to.mode = mode;
+    }
+}
+
+/// What settling a source change with the target's change of its node leaves of the source's.
+enum Settled {
+    /// The source's change stands, as the settling left it.
+    Stands,
+    /// The source's change gives way to the target's, with no conflict.
+    GivesWay,
+    /// The two conflict, and the pair is recorded as a conflict.
+    Conflict,
+}
+
 /// Records `source` and `target` as a pair of changes that conflict.
 fn push_conflict(
     conflicts: &mut Vec<(NodeChange, NodeChange)>,
@@ -1130,26 +1203,88 @@ fn push_conflict(
     conflicts.push((source, target));
 }
 
+/// The executable bit [`change::merged_mode`] gives the file `source` and `target` both leave, and
+/// whether it is another bit than `target` leaves it with.
+fn mode_against_target(source: &NodeChange, target: &NodeChange) -> (Option<u16>, bool) {
+    let mode = change::merged_mode(source, target);
+    let differs = mode.is_some_and(|mode| crate::util::fs::mode_changed(mode, target.to.mode));
+    (mode, differs)
+}
+
 /// What is left to apply of the source's move where the target made the same move: the source's
 /// edit, as a change of the node where the target holds it, standing where the source's change
-/// stands. `None` where the source left the node as it was or as the target holds it, or moved a
-/// directory, unless `include_same` asks for the changes the two sides make alike.
+/// stands, with the executable bit the merge gives it. `None` where the source left the node as it
+/// was or as the target holds it, or moved a directory, unless `include_same` asks for the changes
+/// the two sides make alike.
 fn onto_target_move(
     source: &NodeChange,
     target: &NodeChange,
     include_same: bool,
 ) -> Option<NodeChange> {
-    let edited = edits(source) && source.to.differs_from(&target.to);
-    if !edited && !include_same {
+    let edited = edits(source) && source.to.address.hash != target.to.address.hash;
+    let (mode, mode_differs) = mode_against_target(source, target);
+    if !edited && !mode_differs && !include_same {
         return None;
     }
     let mut change = source.clone();
     change.action = FileAction::Keep;
-    change.from = on_target(&source.from, &target.to, target.path());
-    if !edited {
-        change.to = on_target(&source.to, &target.to, source.path());
-    }
+    onto_target_node(&mut change, target, source.path(), !edited, mode);
     Some(change)
+}
+
+/// What becomes of the source's change of a path where the target's change stands at the same
+/// path. `Stands` holds the change by value: a box would cost an allocation for each change that
+/// stands.
+#[allow(clippy::large_enum_variant)]
+enum AtPath {
+    /// The two conflict.
+    Conflict,
+    /// The source's change gives way to the target's, which leaves what the merge leaves there.
+    GivesWay,
+    /// The source's change stands, as this change.
+    Stands(NodeChange),
+}
+
+/// Settles `source` with `target`, the target's change at the path `source` stands at. A change of
+/// a file's executable bit alone gives the bit to the file the other side's change leaves, and
+/// gives way to a delete or a replacement of the file. Two changes of a link that leave it at one
+/// pin give way to the target's, which leaves what each mounts to a link merge where one runs. Any
+/// other pair conflicts where [`is_conflict`] says so, and leaves the file the bit
+/// [`change::merged_mode`] gives it, on the target's node where the two leave one content, so the
+/// realize finds the file holding it. A pair that leaves the path alike lets the source's change
+/// stand only for `include_same`.
+async fn settle_at_path(
+    source: &NodeChange,
+    target: &NodeChange,
+    include_same: bool,
+) -> Result<AtPath, StateError> {
+    if source.to.is_link() && target.to.is_link() && source.to.address == target.to.address {
+        return Ok(AtPath::GivesWay);
+    }
+    let (mode, mode_differs) = mode_against_target(source, target);
+    if changes_mode_alone(source) {
+        let Some(mode) = mode.filter(|_| mode_differs || include_same) else {
+            return Ok(AtPath::GivesWay);
+        };
+        let mut change = source.clone();
+        onto_target_node(&mut change, target, target.path(), true, Some(mode));
+        return Ok(AtPath::Stands(change));
+    }
+    if !changes_mode_alone(target) {
+        if is_conflict(source, target, true).await? {
+            return Ok(AtPath::Conflict);
+        }
+        if !mode_differs && !include_same {
+            return Ok(AtPath::GivesWay);
+        }
+    }
+    let mut change = source.clone();
+    if mode.is_some() && source.to.address.hash == target.to.address.hash {
+        onto_target_node(&mut change, target, source.path(), true, mode);
+    } else if let Some(mode) = mode {
+        change.to.mode = mode;
+    }
+    Ok(AtPath::Stands(change))
 }
 
 /// Whether `change` changes its node where it stands, at another path than the node stood at only
@@ -1159,23 +1294,34 @@ fn is_carried(change: &NodeChange) -> bool {
 }
 
 /// Settles `source`, a change that leaves its node at another path, with `target`, the target's
-/// change of the node at the path the target holds it at. A delete, a replacement, and an edit of
-/// a file the source edits too conflict, and a source change that leaves the content as it was
-/// takes the target's. Answers whether the two conflict.
+/// change of the node at the path the target holds it at. A delete or a replacement of the file
+/// wins against a source change of its executable bit alone and conflicts with any other. An edit
+/// of a file the source edits too conflicts, and a source change that leaves the content as it was
+/// takes the target's. The file takes the executable bit [`change::merged_mode`] gives it.
 fn settle_with_target_change(
     source: &mut NodeChange,
     target: &NodeChange,
     conflicts: &mut Vec<(NodeChange, NodeChange)>,
-) -> bool {
-    if target.action == FileAction::Delete || replaces(target) || edits_both(source, target) {
+) -> Settled {
+    if target.action == FileAction::Delete || replaces(target) {
+        if changes_mode_alone(source) {
+            return Settled::GivesWay;
+        }
         push_conflict(conflicts, source.clone(), target.clone());
-        return true;
+        return Settled::Conflict;
     }
+    if edits_both(source, target) {
+        push_conflict(conflicts, source.clone(), target.clone());
+        return Settled::Conflict;
+    }
+    let mode = change::merged_mode(source, target);
     if source.from.address.hash == source.to.address.hash {
-        source.from = on_target(&source.from, &target.to, target.path());
-        source.to = on_target(&source.to, &target.to, &source.to.mapping.path);
+        let at = source.to.mapping.path.clone();
+        onto_target_node(source, target, &at, true, mode);
+    } else if let Some(mode) = mode {
+        source.to.mode = mode;
     }
-    false
+    Settled::Stands
 }
 
 /// Whether `change` renames a directory only in case.
@@ -1525,8 +1671,7 @@ impl Joined {
     /// Joins `target_change` with the source's change at `at`, its index among `source_changes`
     /// by path. The same move on both sides conflicts only where both edit the file, and is kept
     /// in [`Self::renamed_alike`] where it renames a directory only in case. Any other pair
-    /// conflicts where [`is_conflict`] says so, and a pair that leaves the path alike keeps the
-    /// source's change only for `include_same`.
+    /// settles as [`settle_at_path`] settles it.
     #[lore_macro::test_pub]
     async fn join(
         &mut self,
@@ -1556,15 +1701,22 @@ impl Joined {
             if renames_directory(&target_change) {
                 self.renamed_alike.push(target_change);
             }
-        } else if is_conflict(source_change, &target_change, true).await? {
-            push_conflict(&mut self.conflicts, source_change.clone(), target_change);
-        } else if include_same
-            && self
-                .changes
-                .last()
-                .is_none_or(|last| last.path() != source_change.path())
-        {
-            self.changes.push(source_change.clone());
+        } else {
+            match settle_at_path(source_change, &target_change, include_same).await? {
+                AtPath::Conflict => {
+                    push_conflict(&mut self.conflicts, source_change.clone(), target_change);
+                }
+                AtPath::GivesWay => {}
+                AtPath::Stands(change) => {
+                    if self
+                        .changes
+                        .last()
+                        .is_none_or(|last| last.path() != change.path())
+                    {
+                        self.changes.push(change);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1572,25 +1724,26 @@ impl Joined {
 
 /// Settles the source change at `index` with `target`, the target's change at the path a move put
 /// one of the two at. A target change of the same node gives way to the source's. Any other
-/// conflicts with it unless the two leave the path alike, where the source's change stands only for
-/// `include_same`. Marks a source change that gives way in `source_gone`.
+/// settles as [`settle_at_path`] settles it. Marks a source change that gives way in
+/// `source_gone`.
 async fn settle_moved(
-    sources: &[NodeChange],
+    sources: &mut [NodeChange],
     source_gone: &mut [bool],
     conflicts: &mut Vec<(NodeChange, NodeChange)>,
     index: usize,
     target: &NodeChange,
     include_same: bool,
 ) -> Result<(), StateError> {
-    let source = &sources[index];
-    if source_gone[index] || holds_node(target, source) {
+    if source_gone[index] || holds_node(target, &sources[index]) {
         return Ok(());
     }
-    if is_conflict(source, target, true).await? {
-        push_conflict(conflicts, source.clone(), target.clone());
-        source_gone[index] = true;
-    } else if !include_same {
-        source_gone[index] = true;
+    match settle_at_path(&sources[index], target, include_same).await? {
+        AtPath::Conflict => {
+            push_conflict(conflicts, sources[index].clone(), target.clone());
+            source_gone[index] = true;
+        }
+        AtPath::GivesWay => source_gone[index] = true,
+        AtPath::Stands(change) => sources[index] = change,
     }
     Ok(())
 }
@@ -1606,10 +1759,11 @@ async fn settle_moved(
 ///
 /// - Where one side moves a file and the other edits it, the edit stands where the move put the
 ///   file, and a move that leaves the content as it was carries the other side's content.
-/// - Where both sides change what a file holds, its content or its mode, where one side moves a
-///   node and the other deletes or replaces it, and where the two move it to different paths, the
-///   pair conflicts. Two moves of a node to one place in the merged tree are one move, however
-///   each side spells the directories above it.
+/// - Where both sides change a file's content, where one side moves a node and the other deletes
+///   or replaces it, and where the two move it to different paths, the pair conflicts. A change of
+///   a file's executable bit conflicts with none: the file takes the bit [`change::merged_mode`]
+///   gives it. Two moves of a node to one place in the merged tree are one move, however each side
+///   spells the directories above it.
 /// - The target's changes below a directory the source moves travel with the directory, and the
 ///   source's changes below one the target moves are put where the target put it. A walk reports a
 ///   directory as moved where a rename changes only its case; a directory moved to another name
@@ -1748,7 +1902,7 @@ impl<'a> MovePairing<'a> {
             if from.is_empty() {
                 continue;
             }
-            let (gone, conflicted) = if let Ok(other) = self
+            let settled = if let Ok(other) = self
                 .target_moves
                 .binary_search_by(|target| relocation_source(target).cmp(from))
             {
@@ -1758,16 +1912,13 @@ impl<'a> MovePairing<'a> {
                 }
                 self.target_move_paired[other] = true;
                 if is_carried(target) {
-                    let gone = if self.conflicts_above(source.path())
-                        || self.conflicts_above(target.path())
-                    {
+                    if self.conflicts_above(source.path()) || self.conflicts_above(target.path()) {
                         push_conflict(self.conflicts, source.clone(), target.clone());
-                        true
+                        Settled::Conflict
                     } else {
                         let target = &self.target_moves[other];
                         settle_with_target_change(&mut self.sources[index], target, self.conflicts)
-                    };
-                    (gone, gone)
+                    }
                 } else if moves_to_one_place(source, target) {
                     self.settle_same_move(index, other)
                 } else {
@@ -1775,21 +1926,22 @@ impl<'a> MovePairing<'a> {
                     if let Some(renames) = self.renames.as_deref_mut() {
                         renames.mark_target_conflict(&self.target_moves, other);
                     }
-                    (true, true)
+                    Settled::Conflict
                 }
             } else if let Ok(other) = index_at(self.targets, from) {
                 self.target_gone[other] = true;
-                let gone = settle_with_target_change(
+                settle_with_target_change(
                     &mut self.sources[index],
                     &self.targets[other],
                     self.conflicts,
-                );
-                (gone, gone)
+                )
             } else {
-                (false, false)
+                Settled::Stands
             };
-            self.source_gone[index] = gone;
-            if conflicted && let Some(renames) = self.renames.as_deref_mut() {
+            self.source_gone[index] = !matches!(settled, Settled::Stands);
+            if matches!(settled, Settled::Conflict)
+                && let Some(renames) = self.renames.as_deref_mut()
+            {
                 renames.mark_source_conflict(self.sources, index);
             }
         }
@@ -1799,22 +1951,21 @@ impl<'a> MovePairing<'a> {
     /// at one place in the merged tree, as the join settles a move both sides make: the two
     /// conflict where both edit the file, and otherwise what is left of the source's change is what
     /// [`onto_target_move`] leaves, standing where the source's change stands, so the source's
-    /// changes keep their order by path, and the target's move's other half is taken up. Answers
-    /// whether the source's change is used up, and whether the two conflict.
-    fn settle_same_move(&mut self, index: usize, other: usize) -> (bool, bool) {
+    /// changes keep their order by path, and the target's move's other half is taken up.
+    fn settle_same_move(&mut self, index: usize, other: usize) -> Settled {
         let (source, target) = (&self.sources[index], &self.target_moves[other]);
         if edits_both(source, target) {
             push_conflict(self.conflicts, source.clone(), target.clone());
-            return (true, true);
+            return Settled::Conflict;
         }
         let left = onto_target_move(source, target, self.include_same);
         self.take_move_half(other);
         match left {
             Some(change) => {
                 self.sources[index] = change;
-                (false, false)
+                Settled::Stands
             }
-            None => (true, false),
+            None => Settled::GivesWay,
         }
     }
 
@@ -1897,11 +2048,16 @@ impl<'a> MovePairing<'a> {
     ///
     /// - A delete, a replacement, and an edit of a file the target edits too conflict with the
     ///   move, a delete where the move put the node. The source's changes below a directory it
-    ///   deletes wait for that conflict.
-    /// - Where the move leaves the content as it was, or where the diff lists the changes the two
-    ///   sides make alike, the source's change follows the move, as
-    ///   [`Self::follow_destination`] says where to, or conflicts with it. The target's change
-    ///   where the move put the node, the move's other half, goes with the change that follows.
+    ///   deletes wait for that conflict. A delete or a replacement of a file whose executable bit
+    ///   alone the target changes, where a rename of a directory above it carried it, wins
+    ///   instead, and follows to where the target holds the file.
+    /// - Where the move leaves the content as it was, where the source's change gives the file
+    ///   another executable bit, or where the diff lists the changes the two sides make alike, the
+    ///   source's change follows the move, as [`Self::follow_destination`] says where to, or
+    ///   conflicts with it. A change of a file that follows takes the content the move left where
+    ///   it holds no edit of its own and is no other file, and the bit [`change::merged_mode`]
+    ///   gives the file. The target's change where the move put the node, the move's other half,
+    ///   goes with the change that follows.
     /// - Any other source change gives way to the move.
     fn pair_target_moves(&mut self) -> Vec<usize> {
         if self.target_moves.is_empty() {
@@ -1929,7 +2085,11 @@ impl<'a> MovePairing<'a> {
             if self.source_gone[other] {
                 continue;
             }
-            if source.action == FileAction::Delete {
+            if (source.action == FileAction::Delete || replaces(source))
+                && changes_mode_alone(target)
+            {
+                followed.push((other, index, target.path().clone()));
+            } else if source.action == FileAction::Delete {
                 let mut source = source.clone();
                 source.from = on_target(&source.from, &target.to, target.path());
                 source.to.mapping.path = target.path().clone();
@@ -1940,7 +2100,10 @@ impl<'a> MovePairing<'a> {
             } else if replaces(source) || edits_both(source, target) {
                 push_conflict(self.conflicts, source.clone(), target.clone());
                 self.source_gone[other] = true;
-            } else if self.include_same || target.from.address.hash == target.to.address.hash {
+            } else if self.include_same
+                || target.from.address.hash == target.to.address.hash
+                || (source.changes_mode() && change::merged_mode(source, target).is_some())
+            {
                 if let Some(destination) = self.follow_destination(other, index) {
                     followed.push((other, index, destination));
                 } else {
@@ -1956,11 +2119,13 @@ impl<'a> MovePairing<'a> {
             .into_iter()
             .map(|(other, index, destination)| {
                 let target = &self.target_moves[index];
-                let from = on_target(&self.sources[other].from, &target.to, target.path());
-                self.take_move_half(index);
                 let source = &mut self.sources[other];
-                source.from = from;
-                source.to.mapping.path = destination;
+                let mode = change::merged_mode(source, target);
+                let takes_content = !edits(source)
+                    && !replaces(source)
+                    && source.to.flags.contains(NodeFlags::File);
+                onto_target_node(source, target, &destination, takes_content, mode);
+                self.take_move_half(index);
                 other
             })
             .collect()

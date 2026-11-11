@@ -20,6 +20,7 @@ use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::sync::SyncError;
 use lore_revision::revision::sync::SyncRealizeStats;
+use lore_revision::revision::sync::SyncVerifyArgs;
 use lore_revision::state;
 use lore_revision::state::Mark;
 use lore_revision::state::NodeMapping;
@@ -148,7 +149,7 @@ fn side(
 }
 
 /// Verify one merge change, whose from side is the base revision, against the
-/// working tree at `state_current`.
+/// working tree at `state_current`, answering the change where it is to be realized.
 async fn verify(
     repository: &Arc<RepositoryContext>,
     path: &RelativePath,
@@ -156,7 +157,7 @@ async fn verify(
     source: &Staged,
     current: &Staged,
 ) -> Result<Option<NodeChange>, SyncError> {
-    Box::pin(verify_action(
+    let (verdict, change) = Box::pin(verify_action(
         repository,
         path,
         base,
@@ -164,10 +165,11 @@ async fn verify(
         current,
         FileAction::Keep,
     ))
-    .await
+    .await?;
+    Ok((verdict == Verdict::Realize).then_some(change))
 }
 
-/// [`verify`] for a change of a given action.
+/// [`verify`] for a change of a given action, answering the verdict with the change.
 async fn verify_action(
     repository: &Arc<RepositoryContext>,
     path: &RelativePath,
@@ -175,7 +177,7 @@ async fn verify_action(
     source: &Staged,
     current: &Staged,
     action: FileAction,
-) -> Result<Option<NodeChange>, SyncError> {
+) -> Result<(Verdict, NodeChange), SyncError> {
     let operation = repository
         .file_system()
         .begin_operation()
@@ -188,7 +190,7 @@ async fn verify_action(
         to: side(repository, source, path.clone()),
     };
 
-    let realize = Box::pin(verify_filesystem(
+    let verdict = Box::pin(verify_filesystem(
         &mut change,
         repository.clone(),
         operation,
@@ -202,7 +204,38 @@ async fn verify_action(
     ))
     .await?;
 
-    Ok(realize.then_some(change))
+    Ok((verdict, change))
+}
+
+/// The changes a sync still has to realize of the one change of the file at `path` from `base` to
+/// `source`, verified as a sync verifies its change set over a working tree on `current`.
+async fn verify_as_a_sync(
+    repository: &Arc<RepositoryContext>,
+    path: &RelativePath,
+    base: &Staged,
+    source: &Staged,
+    current: &Staged,
+) -> Result<Arc<Vec<NodeChange>>, SyncError> {
+    let operation = repository
+        .file_system()
+        .begin_operation()
+        .await
+        .expect("filesystem operation");
+    let change = NodeChange {
+        action: FileAction::Keep,
+        flags: change::Flags::None,
+        from: side(repository, base, path.clone()),
+        to: side(repository, source, path.clone()),
+    };
+    Box::pin(verify_filesystem_for_changes(Arc::new(SyncVerifyArgs {
+        changes: Arc::new(vec![change]),
+        repository_current: repository.clone(),
+        operation,
+        current: NodeMapping::root(repository.clone(), current.state.clone()),
+        options: Arc::default(),
+        carries_modes: true,
+    })))
+    .await
 }
 
 /// Record that the working file holds the current revision's content, which is what a
@@ -490,9 +523,9 @@ fn executable_node(content: &[u8]) -> Node {
     node
 }
 
-/// A change that moves the executable bit alone is carried by the verify that drops it:
-/// the content is in place, so writing the file would replace it with the bytes it
-/// already holds.
+/// A change that moves the executable bit alone has the bit carried by the verify that drops it,
+/// once the change set has passed: the content is in place, so writing the file would replace it
+/// with the bytes it already holds. The verify of the one change answers the bit as still to carry.
 #[cfg(target_family = "unix")]
 #[tokio::test]
 async fn a_mode_change_over_the_current_content_is_carried() {
@@ -507,11 +540,29 @@ async fn a_mode_change_over_the_current_content_is_carried() {
         let source = state_holding(&repository, &path, executable_node(&content), 2).await;
         let current = state_holding(&repository, &path, file_node(&content), 3).await;
 
+        let (verdict, _) = Box::pin(verify_action(
+            &repository,
+            &path,
+            &base,
+            &source,
+            &current,
+            FileAction::Keep,
+        ))
+        .await
+        .expect("a mode change over matching content is not a failure");
+        assert_eq!(verdict, Verdict::CarryMode);
+        assert!(!working_executable(&repository, &path).await);
         assert!(
-            Box::pin(verify(&repository, &path, &base, &source, &current))
-                .await
-                .expect("a mode change over matching content is not a failure")
-                .is_none()
+            Box::pin(verify_as_a_sync(
+                &repository,
+                &path,
+                &base,
+                &source,
+                &current
+            ))
+            .await
+            .expect("a mode change over matching content is not a failure")
+            .is_empty()
         );
         assert!(working_executable(&repository, &path).await);
     }))
@@ -535,11 +586,29 @@ async fn a_mode_change_over_the_incoming_content_is_carried() {
         let source = state_holding(&repository, &path, executable_node(&source_content), 2).await;
         let current = state_holding(&repository, &path, file_node(&base_content), 3).await;
 
+        let (verdict, _) = Box::pin(verify_action(
+            &repository,
+            &path,
+            &base,
+            &source,
+            &current,
+            FileAction::Keep,
+        ))
+        .await
+        .expect("a mode change over the incoming content is not a failure");
+        assert_eq!(verdict, Verdict::CarryMode);
+        assert!(!working_executable(&repository, &path).await);
         assert!(
-            Box::pin(verify(&repository, &path, &base, &source, &current))
-                .await
-                .expect("a mode change over the incoming content is not a failure")
-                .is_none()
+            Box::pin(verify_as_a_sync(
+                &repository,
+                &path,
+                &base,
+                &source,
+                &current
+            ))
+            .await
+            .expect("a mode change over the incoming content is not a failure")
+            .is_empty()
         );
         assert!(working_executable(&repository, &path).await);
     }))
@@ -755,7 +824,7 @@ async fn a_move_of_unchanged_content_is_realized() {
         let source = state_holding(&repository, &path, node, 2).await;
         let current = state_holding(&repository, &path, node, 3).await;
 
-        assert!(
+        assert_eq!(
             Box::pin(verify_action(
                 &repository,
                 &path,
@@ -766,7 +835,8 @@ async fn a_move_of_unchanged_content_is_realized() {
             ))
             .await
             .expect("a clean file is not a failure")
-            .is_some(),
+            .0,
+            Verdict::Realize,
             "A move must reach realize even where the content is already in place"
         );
     }))
@@ -808,7 +878,7 @@ async fn verify_relocation(
     working: Option<&[u8]>,
     realized: &[u8],
     incoming: &[u8],
-) -> Result<bool, SyncError> {
+) -> Result<Verdict, SyncError> {
     let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
     let repository = working_tree_repository(dir.path()).await;
     let (from, to) = (relative(relocation.from), relative(relocation.to));
@@ -878,10 +948,11 @@ async fn a_move_of_a_file_holding_no_local_work_is_realized() {
         let realized = pseudo_random_bytes(20 * 1024, 0);
         let incoming = pseudo_random_bytes(20 * 1024, 1);
         for working in [Some(&realized[..]), Some(&incoming[..]), None] {
-            assert!(
+            assert_eq!(
                 verify_relocation(MOVE, working, &realized, &incoming)
                     .await
                     .expect("a source holding no local work is not a failure"),
+                Verdict::Realize,
                 "the move must reach realize"
             );
         }
@@ -900,10 +971,11 @@ async fn a_move_of_a_locally_edited_file_is_dropped_when_keeping_local_changes()
             forward_changes: true,
             ..MOVE
         };
-        assert!(
-            !verify_relocation(keeping, Some(&edited), &realized, &incoming)
+        assert_eq!(
+            verify_relocation(keeping, Some(&edited), &realized, &incoming)
                 .await
                 .expect("an edit kept is not a failure"),
+            Verdict::Drop,
             "the move must not reach realize"
         );
     }))
@@ -970,7 +1042,7 @@ async fn an_untracked_file_at_the_source_of_the_current_branch_s_move_holds_no_l
         };
         let verified = verify_relocation(own_move, Some(&untracked), &realized, &incoming).await;
         assert!(
-            matches!(verified, Ok(true)),
+            matches!(verified, Ok(Verdict::Realize)),
             "an untracked file at the source must not refuse the move, got {verified:?}"
         );
     }))
@@ -1106,7 +1178,7 @@ async fn verify_change(
     incoming: &[NodeChange],
 ) -> Result<Option<NodeChange>, SyncError> {
     let operation = repository.file_system().begin_operation().await.unwrap();
-    let realize = Box::pin(verify_filesystem(
+    let verdict = Box::pin(verify_filesystem(
         &mut change,
         repository.clone(),
         operation,
@@ -1119,7 +1191,7 @@ async fn verify_change(
         &IncomingMoves::new(Arc::new(incoming.to_vec())),
     ))
     .await?;
-    Ok(realize.then_some(change))
+    Ok((verdict == Verdict::Realize).then_some(change))
 }
 
 async fn verify_delete(

@@ -4223,7 +4223,9 @@ fn emit_diff_item_with_auto_resolve(
 /// Realises the three sides of one conflict into temp files and runs
 /// `merge3_text_by_pathbuf`. Returns `Some(resolved_change)` only when
 /// the merge produces no conflict markers — any merge failure or any
-/// markers in the output preserve the conflict (returns `None`).
+/// markers in the output preserve the conflict (returns `None`). The
+/// resolved change carries the executable bit [`change::merged_mode`] gives
+/// the file.
 #[lore_macro::test_pub]
 async fn try_auto_resolve_conflict(
     change_from: &NodeChange,
@@ -4407,11 +4409,15 @@ async fn try_auto_resolve_conflict(
     let _ = util::fs::unlink(mine_path).await;
 
     if resolved {
+        let mut to = change_to.to.clone();
+        if let Some(mode) = change::merged_mode(change_from, change_to) {
+            to.mode = mode;
+        }
         Ok(Some(NodeChange {
             action: change_to.action,
             flags: change_to.flags | change::Flags::ConflictAutomerged,
             from: change_to.from.clone(),
-            to: change_to.to.clone(),
+            to,
         }))
     } else {
         Ok(None)

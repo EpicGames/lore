@@ -1875,6 +1875,7 @@ async fn verify_link_pin_diff(
     link_context: Arc<RepositoryContext>,
     new_sig: Hash,
     diff: LinkPinDiff,
+    carries_modes: bool,
 ) -> Result<Arc<Vec<NodeChange>>, LinkError> {
     let LinkPinDiff { changes, current } = diff;
     if changes.is_empty() {
@@ -1898,6 +1899,7 @@ async fn verify_link_pin_diff(
             operation: operation.clone(),
             current,
             options,
+            carries_modes,
         }),
     )
     .await
@@ -1916,7 +1918,7 @@ async fn realize_link_pin_diff(
     let changes = if overwrite_local {
         diff.changes
     } else {
-        verify_link_pin_diff(operation, link_context, new_sig, diff).await?
+        verify_link_pin_diff(operation, link_context, new_sig, diff, true).await?
     };
 
     // The realize deletes before it moves, so a directory whose files move out is still occupied
@@ -2523,7 +2525,8 @@ impl PlannedLinkPin {
 }
 
 /// Check the working tree against what [`apply_link_pins`] realizes for `planned`, refusing where a
-/// local modification would be overwritten.
+/// local modification would be overwritten. Changes nothing in the working tree: the realize the
+/// pins' application runs verifies again, and carries the executable bits then.
 pub async fn verify_link_pins(
     operation: &Arc<InstanceOperationImpl>,
     repository: &Arc<RepositoryContext>,
@@ -2553,7 +2556,7 @@ pub async fn verify_link_pins(
         )
         .await?;
         let diff = link_pin_diff(&link_context, &pin).await?;
-        verify_link_pin_diff(operation, link_context, pin.new_signature, diff).await?;
+        verify_link_pin_diff(operation, link_context, pin.new_signature, diff, false).await?;
     }
     Ok(())
 }

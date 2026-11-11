@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
+import os
 import re
+import stat
+import sys
 
 import pytest
 from link_helpers import (
@@ -426,6 +429,47 @@ def test_link_merge_file_conflict_resolve(new_lore_repo):
     assert "manually resolved content" in content, (
         f"File should have manually resolved content - Got: {content}"
     )
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows holds no executable bit")
+@pytest.mark.parametrize("side", ["mine", "theirs"])
+def test_link_merge_resolve_keeps_the_merged_executable_bit(new_lore_repo, side):
+    """Resolving a conflict inside a linked repository to one side chooses only the
+    content: the file keeps the executable bit the merged branch gave it, in the
+    working tree and in a clone of the merge."""
+    link_path = "linked/repo"
+    conflict_file = f"{link_path}/data.txt"
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {"data.txt": "base\n"},
+        {"main-file.txt": "main repo content\n"},
+    )
+
+    urc.branch_create("feature-branch")
+    urc.write_files({conflict_file: "theirs\n"})
+    os.chmod(os.path.join(urc.path, conflict_file), 0o755)
+    urc.stage(conflict_file)
+    urc.commit("Feature branch changes")
+    urc.push()
+
+    urc.branch_switch("main")
+    urc.write_commit_push("Main branch changes", {conflict_file: "mine\n"})
+
+    urc.branch_merge_start("feature-branch", link=link_path, no_commit=True)
+    if side == "mine":
+        urc.branch_merge_resolve_mine(conflict_file)
+    else:
+        urc.branch_merge_resolve_theirs(conflict_file)
+    urc.commit("Merge with the conflict resolved")
+    urc.push()
+
+    for instance in (urc, urc.clone()):
+        mode = os.stat(os.path.join(instance.path, conflict_file)).st_mode
+        assert mode & stat.S_IXUSR, f"{instance.path}: {mode:o}"
+        with instance.open_file(conflict_file, "r") as f:
+            assert f.read() == f"{side}\n"
 
 
 @pytest.mark.smoke

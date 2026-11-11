@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import sys
 
 import pytest
@@ -1725,6 +1726,37 @@ def test_link_update_refuses_a_local_change_it_would_overwrite(
     with parent_repo.open_file(edited_path) as f:
         assert f.read() == "locally edited\n", "the refused update should keep the edit"
     assert link_pin(parent_repo, link_repo.get_id()) == pin_one
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows holds no executable bit")
+def test_link_update_refused_for_a_local_change_leaves_the_bits(new_lore_repo):
+    """An update refused for a local change it would overwrite changes no executable bit in the
+    link: a file the new pin gives the bit, whose content the working tree holds, keeps its
+    mode. With the change reset, the update gives it the bit."""
+    parent_repo, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_files={"mod.txt": "one\n", "tool.sh": "tool\n"},
+        parent_files={DEFAULT_PARENT_FILE: "baseline\n"},
+    )
+    link_repo.write_files({"mod.txt": "two\n"})
+    os.chmod(os.path.join(link_repo.path, "tool.sh"), 0o755)
+    link_repo.stage(["mod.txt", "tool.sh"])
+    link_repo.commit("Pin two")
+    link_repo.push()
+    pin_two = link_repo.branch_info().local_latest
+    parent_repo.write_files({f"{DEFAULT_LINK_MOUNT}/mod.txt": "locally edited\n"})
+    tool = os.path.join(parent_repo.path, DEFAULT_LINK_MOUNT, "tool.sh")
+
+    with pytest.raises(LocalChanges):
+        parent_repo.link_update(DEFAULT_LINK_MOUNT, pin=pin_two)
+    mode = os.stat(tool).st_mode
+    assert not mode & stat.S_IXUSR, f"{mode:o}"
+
+    parent_repo.reset(f"{DEFAULT_LINK_MOUNT}/mod.txt", purge=True)
+    parent_repo.link_update(DEFAULT_LINK_MOUNT, pin=pin_two)
+    mode = os.stat(tool).st_mode
+    assert mode & stat.S_IXUSR, f"{mode:o}"
 
 
 @pytest.mark.smoke

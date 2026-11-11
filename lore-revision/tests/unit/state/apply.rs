@@ -76,10 +76,14 @@ enum Edit {
     Write(&'static str, u64),
     /// Gives the file at the path the mode, at version 1.
     Chmod(&'static str, u16),
+    /// Gives the file at the path the content of the version and the mode.
+    WriteMode(&'static str, u64, u16),
     /// Deletes the node at the path.
     Delete(&'static str),
     /// Adds a file at the path, in a directory that exists, holding the version.
     Add(&'static str, u64),
+    /// Adds a file at the path as [`Edit::Add`] does, with the mode.
+    AddMode(&'static str, u64, u16),
     /// Adds a directory `Bulk` of that many files, which takes a revision's changes past the count
     /// at which the 3-way diff walks the other side unfiltered.
     Bulk(u32),
@@ -174,17 +178,14 @@ async fn edited(repository: &Arc<RepositoryContext>, base: Hash, edits: &[Edit])
                     .expect("deleting the node");
                 continue;
             }
-            Edit::Add(path, version) => {
+            Edit::Add(path, version) | Edit::AddMode(path, version, _) => {
                 let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
                 let parent = node_at(repository, &state, parent).await;
-                add(
-                    &state,
-                    repository.clone(),
-                    parent,
-                    added_at(path, version),
-                    name,
-                )
-                .await;
+                let mut file = added_at(path, version);
+                if let Edit::AddMode(_, _, mode) = *edit {
+                    file.mode = mode;
+                }
+                add(&state, repository.clone(), parent, file, name).await;
                 continue;
             }
             Edit::Bulk(count) => {
@@ -205,6 +206,7 @@ async fn edited(repository: &Arc<RepositoryContext>, base: Hash, edits: &[Edit])
             }
             Edit::Write(path, version) => (path, 0o644, version),
             Edit::Chmod(path, mode) => (path, mode, 1),
+            Edit::WriteMode(path, version, mode) => (path, mode, version),
         };
         let node = node_at(repository, &state, path).await;
         let file = state
@@ -704,57 +706,543 @@ async fn edits_on_both_sides_conflict_whether_or_not_one_side_moved() {
     .await;
 }
 
-/// A change of a moved file's mode on one side and an edit of it on the other conflict, the same
-/// move on both sides included, as two edits of the file do. So do the two for a file below a
-/// directory renamed only in case.
+/// A change of a moved file's mode on one side and an edit of it on the other merge, the same move
+/// on both sides included: the file stands where the move put it, with the edit and the mode. So
+/// do the two for a file below a directory renamed only in case.
 #[tokio::test]
-async fn a_mode_change_against_an_edit_of_a_moved_file_conflicts() {
+async fn a_mode_change_of_a_moved_file_merges_with_an_edit() {
     run(|repository| async move {
         for moved in [&MOVES[0], &MOVES[1], &MOVES[3]] {
             let (file, moved_file) = (moved.file, moved.file_moved);
             let movement = Edit::Move(moved.from, moved.to);
-            let renamed = format!("Move {} <- {}", moved.to, moved.from);
-            let source_renames = if moved.from == file {
-                vec![]
-            } else {
-                vec![renamed]
-            };
-            for (source, target, changes, conflict) in [
+            for (source, target, version) in [
                 (
                     vec![movement, Edit::Chmod(moved_file, 0o755)],
                     vec![movement, Edit::Write(moved_file, 3)],
-                    vec![],
-                    (moved_file, moved_file),
+                    3,
                 ),
                 (
                     vec![movement, Edit::Write(moved_file, 2)],
                     vec![movement, Edit::Chmod(moved_file, 0o755)],
-                    vec![],
-                    (moved_file, moved_file),
+                    2,
                 ),
                 (
                     vec![movement, Edit::Chmod(moved_file, 0o755)],
                     vec![Edit::Write(file, 3)],
-                    source_renames.clone(),
-                    (moved_file, file),
+                    3,
                 ),
                 (
                     vec![Edit::Write(file, 2)],
                     vec![movement, Edit::Chmod(moved_file, 0o755)],
-                    vec![],
-                    (file, moved_file),
+                    2,
                 ),
             ] {
-                let diff = diff(&repository, &source, &target).await;
+                let merged = merge(&repository, &source, &target).await;
+                let context = format!("{source:?} against {target:?}: {merged:?}");
                 assert_eq!(
-                    outcome(&diff),
-                    (
-                        changes,
-                        vec![(conflict.0.to_string(), conflict.1.to_string())]
-                    ),
-                    "{source:?} against {target:?}"
+                    merged.get(moved_file),
+                    Some(&content(version, 0o755)),
+                    "{context}"
                 );
+                assert!(!merged.contains_key(file), "{context}");
             }
+        }
+    })
+    .await;
+}
+
+/// A change of a file's mode alone merges with an edit of another file and with an edit of the
+/// file itself, whichever side changes the mode: the file holds the edit and the mode.
+#[tokio::test]
+async fn a_mode_change_merges_with_an_edit() {
+    run(|repository| async move {
+        let chmod = Edit::Chmod("File.txt", 0o755);
+        for (source, target, file, other) in [
+            (chmod, Edit::Write("Other.txt", 3), 1, 3),
+            (Edit::Write("Other.txt", 2), chmod, 1, 2),
+            (chmod, Edit::Write("File.txt", 3), 3, 1),
+            (Edit::Write("File.txt", 2), chmod, 2, 1),
+        ] {
+            let merged = merge(&repository, &[source], &[target]).await;
+            let context = format!("{source:?} against {target:?}: {merged:?}");
+            assert_eq!(
+                merged.get("File.txt"),
+                Some(&content(file, 0o755)),
+                "{context}"
+            );
+            assert_eq!(
+                merged.get("Other.txt"),
+                Some(&content(other, 0o644)),
+                "{context}"
+            );
+        }
+    })
+    .await;
+}
+
+/// A change of a file's mode alone merges with the other side's move of the file, to another name
+/// or only in case, of the file or of its directory, and with a move that also edits it, whichever
+/// side changes the mode: the moved file holds the mode, and the edit where the move made one.
+#[tokio::test]
+async fn a_mode_change_merges_with_a_move_of_the_file() {
+    run(|repository| async move {
+        for moved in &MOVES {
+            for version in [None, Some(3)] {
+                let chmod = vec![Edit::Chmod(moved.file, 0o755)];
+                for (source, target) in [
+                    (chmod.clone(), moving(moved, version)),
+                    (moving(moved, version), chmod),
+                ] {
+                    let merged = merge(&repository, &source, &target).await;
+                    let context = format!("{source:?} against {target:?}: {merged:?}");
+                    assert_eq!(
+                        merged.get(moved.file_moved),
+                        Some(&content(version.unwrap_or(1), 0o755)),
+                        "{context}"
+                    );
+                    assert!(!merged.contains_key(moved.file), "{context}");
+                }
+            }
+        }
+    })
+    .await;
+}
+
+/// A change of a file's mode alone gives way to the other side's delete of the file, whichever
+/// side deletes, where the file stands and below a directory the side changing the mode renames
+/// only in case, alone or alike with the deleting side, whether or not the diff lists the changes
+/// the two sides make alike: the merge deletes the file, with no conflict.
+#[tokio::test]
+async fn a_mode_change_gives_way_to_a_delete() {
+    run(|repository| async move {
+        for (chmod, delete, file) in [
+            (
+                vec![Edit::Chmod("File.txt", 0o755)],
+                vec![Edit::Delete("File.txt")],
+                "File.txt",
+            ),
+            (
+                vec![RENAME_SUB, Edit::Chmod("Dir/sub/c.txt", 0o755)],
+                vec![Edit::Delete("Dir/Sub/c.txt")],
+                "c.txt",
+            ),
+            (
+                vec![RENAME_SUB, Edit::Chmod("Dir/sub/c.txt", 0o755)],
+                vec![RENAME_SUB, Edit::Delete("Dir/sub/c.txt")],
+                "c.txt",
+            ),
+        ] {
+            for (source, target) in [(&chmod, &delete), (&delete, &chmod)] {
+                for include_same in [false, true] {
+                    let diff = diff_with(&repository, source, target, include_same).await;
+                    let context = format!(
+                        "{source:?} against {target:?}, include_same {include_same}: {:?}",
+                        outcome(&diff)
+                    );
+                    assert!(diff.conflicts.is_empty(), "{context}");
+                    let merged = contents(
+                        &repository,
+                        &*revision_state(&repository, apply(&repository, &diff).await).await,
+                    )
+                    .await;
+                    assert!(
+                        !merged.keys().any(|path| path.ends_with(file)),
+                        "{context}: {merged:?}"
+                    );
+                }
+            }
+        }
+    })
+    .await;
+}
+
+/// The same change of a file's mode on both sides merges, and so do edits alike on both sides of
+/// which one also changes the mode: the file holds the mode, with no conflict.
+#[tokio::test]
+async fn mode_changes_on_both_sides_merge() {
+    run(|repository| async move {
+        for (source, target, version) in [
+            (
+                Edit::Chmod("File.txt", 0o755),
+                Edit::Chmod("File.txt", 0o755),
+                1,
+            ),
+            (
+                Edit::WriteMode("File.txt", 3, 0o755),
+                Edit::Write("File.txt", 3),
+                3,
+            ),
+            (
+                Edit::Write("File.txt", 3),
+                Edit::WriteMode("File.txt", 3, 0o755),
+                3,
+            ),
+        ] {
+            let merged = merge(&repository, &[source], &[target]).await;
+            assert_eq!(
+                merged.get("File.txt"),
+                Some(&content(version, 0o755)),
+                "{source:?} against {target:?}: {merged:?}"
+            );
+        }
+    })
+    .await;
+}
+
+/// Edits of one file on both sides conflict where one side also changes its mode, as two edits of
+/// the file do: the conflict is the content's, not the mode's.
+#[tokio::test]
+async fn edits_on_both_sides_conflict_where_one_also_changes_the_mode() {
+    run(|repository| async move {
+        for (source, target) in [
+            (
+                Edit::WriteMode("File.txt", 2, 0o755),
+                Edit::Write("File.txt", 3),
+            ),
+            (
+                Edit::Write("File.txt", 2),
+                Edit::WriteMode("File.txt", 3, 0o755),
+            ),
+        ] {
+            let diff = diff(&repository, &[source], &[target]).await;
+            assert_eq!(
+                outcome(&diff),
+                (
+                    vec![],
+                    vec![("File.txt".to_string(), "File.txt".to_string())]
+                ),
+                "{source:?} against {target:?}"
+            );
+        }
+    })
+    .await;
+}
+
+/// A file one side deletes and adds again is a new file, which takes its own mode: one with the
+/// executable bit in place of one without keeps the bit, and one without in place of one with has
+/// none, whether it holds the content the old one held or other content, at a path and below a
+/// directory the same side renames only in case. The diff lists the new file even where only its
+/// mode differs from the old one's.
+#[tokio::test]
+async fn a_file_added_again_takes_its_own_mode() {
+    run(|repository| async move {
+        let plain = base(&repository).await;
+        let executable = edited(
+            &repository,
+            plain,
+            &[
+                Edit::Chmod("File.txt", 0o755),
+                Edit::Chmod("Dir/Sub/c.txt", 0o755),
+            ],
+        )
+        .await;
+        for (base, mode) in [(plain, 0o755), (executable, 0o644)] {
+            let target = edited(&repository, base, &[Edit::Write("Other.txt", 3)]).await;
+            for (renaming, path) in [(&[][..], "File.txt"), (&[RENAME_SUB][..], "Dir/sub/c.txt")] {
+                let deleted = edited(
+                    &repository,
+                    base,
+                    &[renaming, &[Edit::Delete(path)]].concat(),
+                )
+                .await;
+                for version in [1, 5] {
+                    let source =
+                        edited(&repository, deleted, &[Edit::AddMode(path, version, mode)]).await;
+                    let diff = diff3_collect(repository.clone(), base, source, target, None, false)
+                        .await
+                        .expect("diffing the revisions");
+                    let (changes, conflicts) = outcome(&diff);
+                    let context = format!("{path} at {mode:o}, version {version}: {changes:?}");
+                    assert!(conflicts.is_empty(), "{context} {conflicts:?}");
+                    assert!(
+                        changes.iter().any(|change| change.contains(path)),
+                        "{context}"
+                    );
+                    let merged = contents(
+                        &repository,
+                        &*revision_state(&repository, apply(&repository, &diff).await).await,
+                    )
+                    .await;
+                    assert_eq!(
+                        merged.get(path),
+                        Some(&content(version, mode)),
+                        "{context}: {merged:?}"
+                    );
+                }
+            }
+        }
+    })
+    .await;
+}
+
+/// A revert of a revision that put a new file, with its own mode, in place of a file restores the
+/// old file with the old file's mode: the mode the revision's new file had is not its.
+#[tokio::test]
+async fn a_revert_of_a_replaced_file_restores_its_own_mode() {
+    run(|repository| async move {
+        let parent = edited(
+            &repository,
+            base(&repository).await,
+            &[Edit::Chmod("File.txt", 0o755)],
+        )
+        .await;
+        let replaced = edited(
+            &repository,
+            parent,
+            &[Edit::Delete("File.txt"), Edit::Add("File.txt", 5)],
+        )
+        .await;
+        let diff = diff3_collect(repository.clone(), replaced, parent, replaced, None, false)
+            .await
+            .expect("diffing the revisions");
+        assert!(diff.conflicts.is_empty(), "{:?}", outcome(&diff));
+        let merged = contents(
+            &repository,
+            &*revision_state(&repository, apply(&repository, &diff).await).await,
+        )
+        .await;
+        assert_eq!(
+            merged.get("File.txt"),
+            Some(&content(1, 0o755)),
+            "{:?}: {merged:?}",
+            outcome(&diff)
+        );
+    })
+    .await;
+}
+
+/// A file one side deletes and adds again with other content wins against the other side's change
+/// of its mode, as a delete does, whichever side changes the mode: the merged file is the new one,
+/// with its content and its mode, and nothing conflicts.
+#[tokio::test]
+async fn a_file_added_again_wins_against_a_mode_change() {
+    run(|repository| async move {
+        let base = base(&repository).await;
+        let deleted = edited(&repository, base, &[Edit::Delete("File.txt")]).await;
+        let added_again = edited(&repository, deleted, &[Edit::Add("File.txt", 5)]).await;
+        let chmod = edited(&repository, base, &[Edit::Chmod("File.txt", 0o755)]).await;
+        let expected = tree_on(&repository, deleted, &[Edit::Add("File.txt", 5)]).await;
+        for (source, target) in [(added_again, chmod), (chmod, added_again)] {
+            let diff = diff3_collect(repository.clone(), base, source, target, None, false)
+                .await
+                .expect("diffing the revisions");
+            assert_merged_spelling(&repository, &diff, &expected, "File.txt", &[]).await;
+        }
+    })
+    .await;
+}
+
+/// A change of a file's mode gives way to the other side's change that adds a file again in its
+/// place below a directory that side renames only in case, whichever side changes the mode: the
+/// diff lists no change of the file but the side's own that adds it again, and the merged file is
+/// the new one.
+#[tokio::test]
+async fn a_mode_change_gives_way_to_a_file_added_again_below_a_case_only_rename() {
+    run(|repository| async move {
+        let base = base(&repository).await;
+        let deleted = edited(
+            &repository,
+            base,
+            &[RENAME_SUB, Edit::Delete("Dir/sub/c.txt")],
+        )
+        .await;
+        let added_again = edited(&repository, deleted, &[Edit::Add("Dir/sub/c.txt", 5)]).await;
+        let chmod = edited(&repository, base, &[Edit::Chmod("Dir/Sub/c.txt", 0o755)]).await;
+        let expected = tree_on(&repository, deleted, &[Edit::Add("Dir/sub/c.txt", 5)]).await;
+        for (source, target, changes) in [
+            (chmod, added_again, &[][..]),
+            (
+                added_again,
+                chmod,
+                &[
+                    "Move Dir/sub <- Dir/Sub",
+                    "Keep Dir/sub/c.txt <- Dir/Sub/c.txt",
+                ],
+            ),
+        ] {
+            let diff = diff3_collect(repository.clone(), base, source, target, None, false)
+                .await
+                .expect("diffing the revisions");
+            assert_eq!(
+                outcome(&diff),
+                (
+                    changes.iter().map(|change| change.to_string()).collect(),
+                    vec![]
+                )
+            );
+            assert_merged_spelling(&repository, &diff, &expected, "Dir/sub/c.txt", &[]).await;
+        }
+    })
+    .await;
+}
+
+/// A file one side deletes and adds again wins against the other side's change of its mode below a
+/// directory that side renames only in case, whichever side makes which: the merged tree takes the
+/// rename and holds the new file below it, with its own content and mode, and nothing conflicts.
+/// So does a new file holding the old content with the bit the other side gives the old one, which
+/// stays the new file.
+#[tokio::test]
+async fn a_file_added_again_wins_against_a_mode_change_below_a_case_only_rename() {
+    run(|repository| async move {
+        let base = base(&repository).await;
+        let deleted = edited(&repository, base, &[Edit::Delete("Dir/Sub/c.txt")]).await;
+        let chmod = edited(
+            &repository,
+            base,
+            &[RENAME_SUB, Edit::Chmod("Dir/sub/c.txt", 0o755)],
+        )
+        .await;
+        for added in [
+            Edit::Add("Dir/Sub/c.txt", 5),
+            Edit::AddMode("Dir/Sub/c.txt", 1, 0o755),
+        ] {
+            let added_again = edited(&repository, deleted, &[added]).await;
+            let new_file = revision_state(&repository, added_again).await;
+            let new_file = new_file
+                .node(
+                    repository.clone(),
+                    node_at(&repository, &new_file, "Dir/Sub/c.txt").await,
+                )
+                .await
+                .expect("reading the new file")
+                .address
+                .context;
+            let expected = tree_on(&repository, deleted, &[RENAME_SUB, added]).await;
+            let expected = renamed_in_tree(&expected, "Dir/Sub/c.txt", "Dir/sub/c.txt");
+            for (source, target) in [(added_again, chmod), (chmod, added_again)] {
+                for include_same in [false, true] {
+                    let diff =
+                        diff3_collect(repository.clone(), base, source, target, None, include_same)
+                            .await
+                            .expect("diffing the revisions");
+                    let context = format!("{added:?}, include_same {include_same}");
+                    assert!(diff.conflicts.is_empty(), "{context}: {:?}", outcome(&diff));
+                    let stored = apply(&repository, &diff).await;
+                    let merged = revision_state(&repository, stored).await;
+                    assert_eq!(
+                        files(&contents(&repository, &merged).await),
+                        files(&expected),
+                        "{context}: {:?}",
+                        outcome(&diff)
+                    );
+                    let file = merged
+                        .node(
+                            repository.clone(),
+                            node_at(&repository, &merged, "Dir/sub/c.txt").await,
+                        )
+                        .await
+                        .expect("reading the merged file");
+                    assert_eq!(file.address.context, new_file, "{context}");
+                }
+            }
+        }
+    })
+    .await;
+}
+
+/// `tree` with the entry at `from` moved to `to`.
+fn renamed_in_tree(
+    tree: &BTreeMap<String, Content>,
+    from: &str,
+    to: &str,
+) -> BTreeMap<String, Content> {
+    let mut tree = tree.clone();
+    if let Some(content) = tree.remove(from) {
+        tree.insert(to.to_string(), content);
+    }
+    tree
+}
+
+/// A change that takes a file's executable bit away merges with an edit of the file on the other
+/// side, whichever side takes it: the file holds the edit, without the bit.
+#[tokio::test]
+async fn a_mode_change_taking_the_bit_away_merges_with_an_edit() {
+    run(|repository| async move {
+        let base = edited(
+            &repository,
+            base(&repository).await,
+            &[Edit::Chmod("File.txt", 0o755)],
+        )
+        .await;
+        let chmod = edited(&repository, base, &[Edit::Chmod("File.txt", 0o644)]).await;
+        let edit = edited(&repository, base, &[Edit::WriteMode("File.txt", 3, 0o755)]).await;
+        for (source, target) in [(chmod, edit), (edit, chmod)] {
+            let diff = diff3_collect(repository.clone(), base, source, target, None, false)
+                .await
+                .expect("diffing the revisions");
+            assert!(diff.conflicts.is_empty(), "{:?}", outcome(&diff));
+            let merged = contents(
+                &repository,
+                &*revision_state(&repository, apply(&repository, &diff).await).await,
+            )
+            .await;
+            assert_eq!(
+                merged.get("File.txt"),
+                Some(&content(3, 0o644)),
+                "{merged:?}"
+            );
+        }
+    })
+    .await;
+}
+
+/// The revision `base` with the directory `Dir/Sub` replaced by a link to the revision `pin` of
+/// the repository `linked`.
+async fn linked_in_place_of_sub(
+    repository: &Arc<RepositoryContext>,
+    base: Hash,
+    (linked, pin): (uuid::Uuid, Hash),
+) -> Hash {
+    let state = revision_state(repository, base).await;
+    let sub = node_at(repository, &state, "Dir/Sub").await;
+    state
+        .node_delete(repository.clone(), sub)
+        .await
+        .expect("deleting the directory");
+    let parent = node_at(repository, &state, "Dir").await;
+    let link = Node {
+        name_hash: hash_string("Sub"),
+        ..link_to(linked, pin)
+    };
+    add(&state, repository.clone(), parent, link, "Sub").await;
+    commit(repository, &state, base, branch_id()).await
+}
+
+/// A change of a file's mode gives way to the other side's replacement of the directory above it
+/// with a link, as it does to a delete, whichever side makes which: nothing conflicts, and the
+/// merged tree holds the link.
+#[tokio::test]
+async fn a_mode_change_gives_way_to_a_link_in_place_of_its_directory() {
+    run(|repository| async move {
+        let (id, linked) = linked_repository(&repository).await;
+        let state = State::new();
+        add(
+            &state,
+            linked.clone(),
+            ROOT_NODE,
+            file_at("sub.txt", 9),
+            "sub.txt",
+        )
+        .await;
+        let pin = commit(&linked, &state, Hash::default(), branch_id()).await;
+        let base = base(&repository).await;
+        let link = linked_in_place_of_sub(&repository, base, (id, pin)).await;
+        let chmod = edited(&repository, base, &[Edit::Chmod("Dir/Sub/c.txt", 0o755)]).await;
+        for (source, target) in [(link, chmod), (chmod, link)] {
+            let diff = diff3_collect(repository.clone(), base, source, target, None, false)
+                .await
+                .expect("diffing the revisions");
+            assert!(diff.conflicts.is_empty(), "{:?}", outcome(&diff));
+            let merged = contents(
+                &repository,
+                &*revision_state(&repository, apply(&repository, &diff).await).await,
+            )
+            .await;
+            assert!(
+                merged.get("Dir/Sub").is_some_and(|sub| sub.3.is_some()),
+                "{merged:?}"
+            );
+            assert!(!merged.contains_key("Dir/Sub/c.txt"), "{merged:?}");
         }
     })
     .await;
@@ -1256,14 +1744,14 @@ async fn assert_merge_stores_a_commit(
 /// A fast-forward merge stores the tree a commit of the source's edits on the target stores, for
 /// an edit, a move across directories, a rename that only changes case of a file and of a
 /// directory, the latter on a tree hashed under the rule folding case too, a rename of a link, a
-/// delete and an add, a directory the merge empties, an added directory, a moved file's mode, and
-/// the mode of a file below a directory renamed only in case.
+/// delete and an add, a directory the merge empties, an added directory, a moved file's mode, a
+/// file's mode alone, and the mode of a file below a directory renamed only in case.
 #[tokio::test]
 async fn a_fast_forward_merge_stores_the_tree_a_commit_stores() {
     run(|repository| async move {
         let base = base(&repository).await;
         let target = edited(&repository, base, &[Edit::Write("Other.txt", 3)]).await;
-        let cases: [&[Edit]; 10] = [
+        let cases: [&[Edit]; 11] = [
             &[Edit::Write("Dir/Sub/c.txt", 2), Edit::Write("File.txt", 4)],
             &[Edit::Move("Dir/a.txt", "Dir/Sub/a.txt")],
             &[Edit::Move("File.txt", "file.txt")],
@@ -1276,6 +1764,7 @@ async fn a_fast_forward_merge_stores_the_tree_a_commit_stores() {
                 Edit::Move("File.txt", "Moved.txt"),
                 Edit::Chmod("Moved.txt", 0o755),
             ],
+            &[Edit::Chmod("File.txt", 0o755)],
             &[RENAME_SUB, Edit::Chmod("Dir/sub/c.txt", 0o755)],
         ];
         for edits in cases {
@@ -2494,11 +2983,11 @@ async fn walk(
     .expect("walking the revisions")
 }
 
-/// A link below a directory renamed only in case, mounting another node of the revision it pins on
-/// the side that renames, is that side's change of the link where the rename put it: the diff lists
-/// it, and a fast-forward merge takes the rename and the mount.
+/// A link mounting another node of the revision it pins, on one side, is that side's change of the
+/// link, where the link stands and below a directory the same side renames only in case: the diff
+/// lists it, and a fast-forward merge takes the mount, and the rename.
 #[tokio::test]
-async fn a_link_remounted_below_a_case_only_rename_is_a_change() {
+async fn a_link_remounted_is_a_change_where_it_stands_and_below_a_case_only_rename() {
     run(|repository| async move {
         let (id, linked) = linked_repository(&repository).await;
         let linked_state = State::new();
@@ -2525,9 +3014,100 @@ async fn a_link_remounted_below_a_case_only_rename_is_a_change() {
         };
         add(&state, repository.clone(), sub, link, "Link").await;
         let base = commit(&repository, &state, base(&repository).await, branch_id()).await;
-        let state =
-            revision_state(&repository, edited(&repository, base, &[RENAME_SUB]).await).await;
-        let link = node_at(&repository, &state, "Dir/sub/Link").await;
+        let target = edited(&repository, base, &[Edit::Write("Other.txt", 3)]).await;
+        for (renaming, changes, at) in [
+            (
+                &[RENAME_SUB][..],
+                &[
+                    "Move Dir/sub <- Dir/Sub",
+                    "Keep Dir/sub/Link <- Dir/Sub/Link",
+                ][..],
+                "Dir/sub/Link",
+            ),
+            (&[], &["Keep Dir/Sub/Link <- Dir/Sub/Link"], "Dir/Sub/Link"),
+        ] {
+            let state =
+                revision_state(&repository, edited(&repository, base, renaming).await).await;
+            let link = node_at(&repository, &state, at).await;
+            let address = Address {
+                hash: pin,
+                context: Context::from(id),
+            };
+            state
+                .node_set_link_target(
+                    &repository,
+                    link,
+                    LinkPin::Whole {
+                        address,
+                        child: second,
+                    },
+                )
+                .await
+                .expect("mounting another node");
+            state
+                .node_mark(
+                    &repository,
+                    link,
+                    lore_revision::state::Mark::staged_and_dirty(
+                        NodeFlags::StagedModify,
+                        NodeFlags::DirtyModify,
+                    ),
+                )
+                .await
+                .expect("staging the mount");
+            let source = commit(&repository, &state, base, branch_id()).await;
+            let diff = diff3_collect(repository.clone(), base, source, target, None, false)
+                .await
+                .expect("diffing the revisions");
+            assert_eq!(
+                outcome(&diff),
+                (changes.iter().map(ToString::to_string).collect(), vec![])
+            );
+            let merged = contents(
+                &repository,
+                &*revision_state(&repository, apply(&repository, &diff).await).await,
+            )
+            .await;
+            assert_eq!(
+                merged.get(at).and_then(|link| link.3),
+                Some((Context::from(id), second)),
+                "{merged:?}"
+            );
+        }
+    })
+    .await;
+}
+
+/// A link one side mounts at another node of the revision it pins, against the other side's
+/// rename of the link that changes only case, whichever side makes which: the fast-forward merge
+/// stores the link at the new name, mounting the new node.
+#[tokio::test]
+async fn a_remount_merges_with_a_case_only_rename_of_the_link() {
+    run(|repository| async move {
+        let (id, linked) = linked_repository(&repository).await;
+        let linked_state = State::new();
+        for name in ["first.txt", "second.txt"] {
+            add(
+                &linked_state,
+                linked.clone(),
+                ROOT_NODE,
+                file_at(name, 4),
+                name,
+            )
+            .await;
+        }
+        let pin = commit(&linked, &linked_state, Hash::default(), branch_id()).await;
+        let pinned = revision_state(&linked, pin).await;
+        let second = node_at(&linked, &pinned, "second.txt").await;
+        let state = State::new();
+        let link = Node {
+            child: node_at(&linked, &pinned, "first.txt").await,
+            ..link_to(id, pin)
+        };
+        add(&state, repository.clone(), ROOT_NODE, link, "Mount").await;
+        let base = commit(&repository, &state, Hash::default(), branch_id()).await;
+        let state = revision_state(&repository, base).await;
+        let link = node_at(&repository, &state, "Mount").await;
         let address = Address {
             hash: pin,
             context: Context::from(id),
@@ -2554,31 +3134,96 @@ async fn a_link_remounted_below_a_case_only_rename_is_a_change() {
             )
             .await
             .expect("staging the mount");
-        let source = commit(&repository, &state, base, branch_id()).await;
-        let target = edited(&repository, base, &[Edit::Write("Other.txt", 3)]).await;
-        let diff = diff3_collect(repository.clone(), base, source, target, None, false)
-            .await
-            .expect("diffing the revisions");
-        assert_eq!(
-            outcome(&diff),
-            (
-                vec![
-                    "Move Dir/sub <- Dir/Sub".to_string(),
-                    "Keep Dir/sub/Link <- Dir/Sub/Link".to_string(),
-                ],
-                vec![]
+        let remounted = commit(&repository, &state, base, branch_id()).await;
+        let renamed = edited(&repository, base, &[Edit::Move("Mount", "mount")]).await;
+        for (source, target) in [(remounted, renamed), (renamed, remounted)] {
+            let diff = diff3_collect(repository.clone(), base, source, target, None, false)
+                .await
+                .expect("diffing the revisions");
+            assert!(diff.conflicts.is_empty(), "{:?}", outcome(&diff));
+            let merged = contents(
+                &repository,
+                &*revision_state(&repository, apply(&repository, &diff).await).await,
             )
-        );
-        let merged = contents(
-            &repository,
-            &*revision_state(&repository, apply(&repository, &diff).await).await,
-        )
-        .await;
-        assert_eq!(
-            merged.get("Dir/sub/Link").and_then(|link| link.3),
-            Some((Context::from(id), second)),
-            "{merged:?}"
-        );
+            .await;
+            assert_eq!(
+                merged.get("mount").and_then(|link| link.3),
+                Some((Context::from(id), second)),
+                "{:?}: {merged:?}",
+                outcome(&diff)
+            );
+            assert!(!merged.contains_key("Mount"), "{merged:?}");
+        }
+    })
+    .await;
+}
+
+/// Two changes of one link that keep its pin and mount other nodes of the revision it pins, one on
+/// each side, leave the diff nothing to apply and no conflict, whether or not it lists the changes
+/// the two sides make alike: a link merge, where one runs, settles the two mounts.
+#[tokio::test]
+async fn remounts_of_one_link_on_both_sides_are_left_to_the_link_merge() {
+    run(|repository| async move {
+        let (id, linked) = linked_repository(&repository).await;
+        let linked_state = State::new();
+        for name in ["first.txt", "second.txt", "third.txt"] {
+            add(
+                &linked_state,
+                linked.clone(),
+                ROOT_NODE,
+                file_at(name, 4),
+                name,
+            )
+            .await;
+        }
+        let pin = commit(&linked, &linked_state, Hash::default(), branch_id()).await;
+        let pinned = revision_state(&linked, pin).await;
+        let state = State::new();
+        let link = Node {
+            child: node_at(&linked, &pinned, "first.txt").await,
+            ..link_to(id, pin)
+        };
+        add(&state, repository.clone(), ROOT_NODE, link, "Mount").await;
+        let base = commit(&repository, &state, Hash::default(), branch_id()).await;
+        let mut remounted = Vec::new();
+        for name in ["second.txt", "third.txt"] {
+            let state = revision_state(&repository, base).await;
+            let link = node_at(&repository, &state, "Mount").await;
+            let child = node_at(&linked, &pinned, name).await;
+            let address = Address {
+                hash: pin,
+                context: Context::from(id),
+            };
+            state
+                .node_set_link_target(&repository, link, LinkPin::Whole { address, child })
+                .await
+                .expect("mounting another node");
+            state
+                .node_mark(
+                    &repository,
+                    link,
+                    lore_revision::state::Mark::staged_and_dirty(
+                        NodeFlags::StagedModify,
+                        NodeFlags::DirtyModify,
+                    ),
+                )
+                .await
+                .expect("staging the mount");
+            remounted.push(commit(&repository, &state, base, branch_id()).await);
+        }
+        for (source, target) in [(remounted[0], remounted[1]), (remounted[1], remounted[0])] {
+            for include_same in [false, true] {
+                let diff =
+                    diff3_collect(repository.clone(), base, source, target, None, include_same)
+                        .await
+                        .expect("diffing the revisions");
+                assert_eq!(
+                    outcome(&diff),
+                    (vec![], vec![]),
+                    "include_same {include_same}"
+                );
+            }
+        }
     })
     .await;
 }
@@ -2685,7 +3330,8 @@ enum Respelling {
 
 /// What one side of a generated case does below `Dir/Sub`: nothing, an edit of `c.txt`, an add of
 /// `new.txt`, a delete of `c.txt`, a move of `c.txt` within the directory or out of both, a move
-/// of `File.txt` into the directory, or a rename of `c.txt` only in case.
+/// of `File.txt` into the directory, a rename of `c.txt` only in case, a change of the mode of
+/// `c.txt` alone, or a delete of `c.txt` and an add of another file in its place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Below {
     Nothing,
@@ -2696,11 +3342,13 @@ enum Below {
     MoveOut,
     MoveIn,
     RenameFile,
+    Chmod,
+    Replace,
 }
 
 impl Below {
     /// Every change below `Dir/Sub` a generated case makes.
-    const ALL: [Below; 8] = [
+    const ALL: [Below; 10] = [
         Below::Nothing,
         Below::Edit,
         Below::Add,
@@ -2709,21 +3357,25 @@ impl Below {
         Below::MoveOut,
         Below::MoveIn,
         Below::RenameFile,
+        Below::Chmod,
+        Below::Replace,
     ];
 
-    /// The edit this makes below `dir/sub`, as the side spells the two, writing and adding content
-    /// `version`.
-    fn edit(self, dir: &str, sub: &str, version: u64) -> Option<Edit> {
+    /// The edits this makes below `dir/sub`, as the side spells the two, writing and adding
+    /// content `version`.
+    fn edits(self, dir: &str, sub: &str, version: u64) -> Vec<Edit> {
         let at = |name: &str| leaked(format!("{dir}/{sub}/{name}"));
         match self {
-            Below::Nothing => None,
-            Below::Edit => Some(Edit::Write(at("c.txt"), version)),
-            Below::Add => Some(Edit::Add(at("new.txt"), version)),
-            Below::Delete => Some(Edit::Delete(at("c.txt"))),
-            Below::MoveWithin => Some(Edit::Move(at("c.txt"), at("d.txt"))),
-            Below::MoveOut => Some(Edit::Move(at("c.txt"), "Out.txt")),
-            Below::MoveIn => Some(Edit::Move("File.txt", at("File.txt"))),
-            Below::RenameFile => Some(Edit::Move(at("c.txt"), at("C.txt"))),
+            Below::Nothing => vec![],
+            Below::Edit => vec![Edit::Write(at("c.txt"), version)],
+            Below::Add => vec![Edit::Add(at("new.txt"), version)],
+            Below::Delete => vec![Edit::Delete(at("c.txt"))],
+            Below::MoveWithin => vec![Edit::Move(at("c.txt"), at("d.txt"))],
+            Below::MoveOut => vec![Edit::Move(at("c.txt"), "Out.txt")],
+            Below::MoveIn => vec![Edit::Move("File.txt", at("File.txt"))],
+            Below::RenameFile => vec![Edit::Move(at("c.txt"), at("C.txt"))],
+            Below::Chmod => vec![Edit::Chmod(at("c.txt"), 0o755)],
+            Below::Replace => vec![Edit::Delete(at("c.txt")), Edit::Add(at("c.txt"), version)],
         }
     }
 
@@ -2744,7 +3396,7 @@ impl Below {
     fn names(self) -> &'static [&'static str] {
         match self {
             Below::Nothing => &[],
-            Below::Edit | Below::Delete => &["c.txt"],
+            Below::Edit | Below::Delete | Below::Chmod | Below::Replace => &["c.txt"],
             Below::Add => &["new.txt"],
             Below::MoveWithin => &["c.txt", "d.txt"],
             Below::MoveOut => &["c.txt", "Out.txt"],
@@ -2754,13 +3406,17 @@ impl Below {
     }
 
     /// Whether what `source` and `target` do below one spelling of `Dir/Sub` conflicts: two adds
-    /// at one path, two edits of `c.txt`, an edit and a delete of it, a delete and a move of it, or
-    /// two moves of it to different places.
+    /// at one path, two edits of `c.txt`, an edit and a delete of it, a delete and a move of it, two
+    /// moves of it to different places, or another file in its place against anything but a change
+    /// of its mode or the same nothing.
     fn conflicts(source: Below, target: Below) -> bool {
         match (source, target) {
             (Below::Add, Below::Add)
             | (Below::Edit, Below::Edit | Below::Delete)
             | (Below::Delete, Below::Edit) => true,
+            (Below::Replace, other) | (other, Below::Replace) => {
+                matches!(other, Below::Edit | Below::Delete | Below::Replace) || other.moves_c()
+            }
             (Below::Delete, other) | (other, Below::Delete) => other.moves_c(),
             (lhs, rhs) => lhs != rhs && lhs.moves_c() && rhs.moves_c(),
         }
@@ -2800,7 +3456,7 @@ impl Side {
     fn edits(self, version: u64) -> Vec<Edit> {
         let (dir, sub) = self.names();
         let mut edits = renamed_to(dir, sub);
-        edits.extend(self.below.edit(dir, sub, version));
+        edits.extend(self.below.edits(dir, sub, version));
         edits
     }
 }
@@ -2823,7 +3479,9 @@ fn renamed_to(dir: &'static str, sub: &'static str) -> Vec<Edit> {
 /// The edits whose tree a merge of `source` and `target` stores, where nothing conflicts: the
 /// merged renames, then what each side does below them, spelled as the merged tree spells them,
 /// the source's at content 2 and the target's at content 3. A change both sides make is made
-/// once, and the moves come last, so that a move takes the content an edit gives the file.
+/// once, and the moves come last, so that a move takes the content and the mode an edit gives
+/// the file. A change of the mode gives way to a delete and to another file in its place, and joins
+/// an edit of the content.
 fn merged_edits(
     (dir, sub): (&'static str, &'static str),
     source: Below,
@@ -2833,12 +3491,32 @@ fn merged_edits(
     if target != source {
         belows.push((target, 3));
     }
+    let edited = belows
+        .iter()
+        .find(|(below, _)| *below == Below::Edit)
+        .map(|&(_, version)| version);
+    if belows.iter().any(|(below, _)| *below == Below::Chmod)
+        && (edited.is_some()
+            || belows
+                .iter()
+                .any(|(below, _)| matches!(below, Below::Delete | Below::Replace)))
+    {
+        belows.retain(|(below, _)| !matches!(below, Below::Chmod | Below::Edit));
+    }
     belows.sort_by_key(|(below, _)| below.moves());
     let mut edits = renamed_to(dir, sub);
+    if let Some(version) = edited.filter(|_| !belows.iter().any(|(below, _)| *below == Below::Edit))
+    {
+        edits.push(Edit::WriteMode(
+            leaked(format!("{dir}/{sub}/c.txt")),
+            version,
+            0o755,
+        ));
+    }
     edits.extend(
         belows
             .into_iter()
-            .filter_map(|(below, version)| below.edit(dir, sub, version)),
+            .flat_map(|(below, version)| below.edits(dir, sub, version)),
     );
     edits
 }
@@ -2875,8 +3553,8 @@ fn merged_name(
 ///   node, drops only the target's own changes, and leaves the same conflicts, their paths
 ///   compared ignoring case.
 ///
-/// Every case of the product runs: 25 pairs of renames by 64 pairs of changes below them. A case
-/// that panics fails with its two sides named.
+/// Every case of the product runs: 25 pairs of renames by 100 pairs of changes below them, 2500
+/// cases. A case that panics fails with its two sides named.
 #[tokio::test]
 async fn merges_below_case_only_renames_keep_their_invariants() {
     run(|repository| async move {

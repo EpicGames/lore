@@ -4,7 +4,9 @@ import logging
 import os
 import pytest
 import re
+import stat
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 from lore import Lore
@@ -2291,6 +2293,23 @@ def _stage_layer_change(repo: Lore) -> None:
     assert paths == ["lay/staged_new.txt"], (
         f"setup: expected the new layer file staged, got {paths}: {status_entries}"
     )
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows holds no executable bit")
+def test_layer_sync_gives_a_file_its_bit_alone(new_lore_repo):
+    """A sync that advances a layer to a revision changing only a file's executable bit gives the
+    file the bit: the working tree holds its content, so the bit is all the sync has to carry."""
+    repo, layer_repo = _setup_layer_behind(new_lore_repo, advance_layer=False)
+    os.chmod(os.path.join(layer_repo.path, LAYER_FILE), 0o755)
+    layer_repo.stage(LAYER_FILE)
+    layer_repo.commit("Give the layer file the executable bit")
+    layer_repo.push()
+
+    repo.sync()
+
+    mode = os.stat(os.path.join(repo.path, LAYER_FILE)).st_mode
+    assert mode & stat.S_IXUSR, f"{mode:o}"
 
 
 @pytest.mark.smoke

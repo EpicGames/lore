@@ -8,6 +8,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use tokio::sync::mpsc;
@@ -288,6 +290,7 @@ pub async fn realize_state(
             operation: operation.clone(),
             current: NodeMapping::root(repository_current.clone(), state_current.clone()),
             options: options.clone(),
+            carries_modes: true,
         }))
         .await?
     } else {
@@ -326,24 +329,28 @@ pub async fn realize_state(
 /// Verifies the changes `args` holds against the working copy, each as [`verify_filesystem`]
 /// does, and answers those still having work to do, sorted by path.
 ///
+/// Where [`SyncVerifyArgs::carries_modes`] is set, gives each file found holding the incoming
+/// content with the other executable bit the change's bit, once no change has refused; otherwise
+/// sets none, and the realize that follows verifies again and sets them.
+///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
 pub fn verify_filesystem_for_changes(
     args: Arc<SyncVerifyArgs>,
 ) -> impl Future<Output = Result<Arc<Vec<NodeChange>>, SyncError>> {
     async move {
-        // Each task answers with the flags its change is realized with, or nothing where it is not:
-        // verification only ever adds flags. The list to realize is the original filtered in place,
-        // so a large sync holds the changes once.
+        // Each task answers with its change's verdict and the flags the verify left on it:
+        // verification only ever adds flags. The list to realize is the original filtered in
+        // place, so a large sync holds the changes once.
         let mut failure = None;
         let mut tasks = JoinSet::new();
-        let mut verdicts: Vec<Option<change::Flags>> = vec![None; args.changes.len()];
+        let mut verdicts = vec![(Verdict::Drop, change::Flags::None); args.changes.len()];
         let stats = Arc::new(SyncVerifyStats::default());
         let incoming = Arc::new(IncomingMoves::new(args.changes.clone()));
-        let record = |verdicts: &mut Vec<Option<change::Flags>>,
+        let record = |verdicts: &mut Vec<(Verdict, change::Flags)>,
                       failure: &mut Option<SyncError>,
                       result: Result<
-            Result<Option<(usize, change::Flags)>, SyncError>,
+            Result<(usize, Verdict, change::Flags), SyncError>,
             tokio::task::JoinError,
         >| {
             match result
@@ -351,8 +358,7 @@ pub fn verify_filesystem_for_changes(
                 .map_err(SyncError::from)
                 .flatten()
             {
-                Ok(Some((index, flags))) => verdicts[index] = Some(flags),
-                Ok(None) => {}
+                Ok((index, verdict, flags)) => verdicts[index] = (verdict, flags),
                 Err(err) => *failure = failure.take().or(Some(err)),
             }
         };
@@ -369,7 +375,7 @@ pub fn verify_filesystem_for_changes(
                 let incoming = incoming.clone();
                 async move {
                     let mut change = change;
-                    let realize = verify_filesystem(
+                    let verdict = verify_filesystem(
                         &mut change,
                         repository_current,
                         operation,
@@ -383,7 +389,7 @@ pub fn verify_filesystem_for_changes(
                     )
                     .await?;
 
-                    Ok(realize.then_some((index, change.flags)))
+                    Ok((index, verdict, change.flags))
                 }
             });
             while tasks.len() > MAX_CONCURRENT_TREE_TASKS
@@ -404,6 +410,15 @@ pub fn verify_filesystem_for_changes(
         if let Some(err) = failure {
             return Err(err);
         }
+        if args.carries_modes
+            && verdicts
+                .iter()
+                .any(|(verdict, _)| *verdict == Verdict::CarryMode)
+        {
+            let carried: crate::BoxFuture<'_, Result<(), SyncError>> =
+                Box::pin(carry_held_modes(&args.operation, &args.changes, &verdicts));
+            carried.await?;
+        }
 
         // The moves hold a reference to the list; with them dropped, the list is taken back without
         // a copy where this holds the only reference to it, which a caller that moves its list in
@@ -417,8 +432,8 @@ pub fn verify_filesystem_for_changes(
         let mut changes: Vec<NodeChange> = original
             .into_iter()
             .zip(verdicts)
-            .filter_map(|(mut change, verdict)| {
-                verdict.map(|flags| {
+            .filter_map(|(mut change, (verdict, flags))| {
+                (verdict == Verdict::Realize).then(|| {
                     change.flags = flags;
                     change
                 })
@@ -430,6 +445,51 @@ pub fn verify_filesystem_for_changes(
         change::sort_by_path(&mut changes);
 
         Ok(Arc::new(changes))
+    }
+}
+
+/// The executable bits [`carry_held_modes`] sets at once: more than the IO pool has threads, so
+/// that none of its threads sits idle.
+const CONCURRENT_CARRIES: usize = 64;
+
+/// Gives the file of each change of `changes` whose verdict is [`Verdict::CarryMode`] the change's
+/// executable bit, which the verify found the file holding the incoming content without. Up to
+/// [`CONCURRENT_CARRIES`] futures run together, each taking every so many changes in turn, so the
+/// bits are set in parallel with an allocation per future rather than per file. Every future runs
+/// to its end, or to its own first error, before the first error is answered, so no carry outlives
+/// the call.
+///
+/// Boxed by its caller: only a verify that found such a file reaches it, and inline it would grow
+/// every verify's future.
+async fn carry_held_modes(
+    operation: &InstanceOperationImpl,
+    changes: &[NodeChange],
+    verdicts: &[(Verdict, change::Flags)],
+) -> Result<(), SyncError> {
+    let carried = verdicts
+        .iter()
+        .filter(|(verdict, _)| *verdict == Verdict::CarryMode);
+    let parallel = carried.count().min(CONCURRENT_CARRIES);
+    let mut carrying: FuturesUnordered<_> = (0..parallel)
+        .map(|first| async move {
+            for index in (first..changes.len()).step_by(parallel) {
+                if verdicts[index].0 == Verdict::CarryMode {
+                    let change = &changes[index];
+                    let held = change.to.mode ^ NodeFileMode::Executable.bits();
+                    carry_file_mode(operation, change.path(), held, change.to.mode).await?;
+                }
+            }
+            Ok::<_, SyncError>(())
+        })
+        .collect();
+    let mut failure = None;
+    loop {
+        let Some(carried) = carrying.next().await else {
+            return failure.map_or(Ok(()), Err);
+        };
+        if let Err(err) = carried {
+            failure = failure.or(Some(err));
+        }
     }
 }
 
@@ -692,6 +752,17 @@ async fn carry_file_mode(
         .forward_with::<SyncError, _>(|| format!("Failed to set the mode of {path}"))
 }
 
+/// What [`verify_filesystem`] answers for a change whose working file holds the content it
+/// brings in with the executable bit `held`: the bit to carry where it differs from the change's
+/// own and is no local one, and nothing to do otherwise.
+fn held_content_verdict(change: &NodeChange, held: u16) -> Verdict {
+    if !change.flags.is_local_mode() && util::fs::mode_changed(held, change.to.mode) {
+        Verdict::CarryMode
+    } else {
+        Verdict::Drop
+    }
+}
+
 /// Whether the executable bit the file a change realizes carries is the working tree's own, which
 /// no revision gave it.
 ///
@@ -878,13 +949,27 @@ async fn remove_directory_of_case_variants<C: Borrow<NodeChange>>(
     removed && operation.remove(directory).await.is_ok()
 }
 
+/// What [`verify_filesystem`] leaves to do with a change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Nothing: the working tree holds what the change brings in, or keeps local work over it.
+    Drop,
+    /// Realize the change.
+    Realize,
+    /// Give the file the change's executable bit: it holds the rest of what the change brings in.
+    CarryMode,
+}
+
 /// Checks `change` against the working copy, refusing the ones that would overwrite local work
-/// and settling on it what realizing it has to know, and answers whether it still has work to do.
+/// and settling on it what realizing it has to know, and answers what is left to do with it.
 ///
 /// A caller that realizes every change it verified, which a merge does to build the staged state
 /// out of them, takes the change as this leaves it and disregards the answer, and says so in
 /// `realizes_every_change`. One that realizes only what the working copy still needs, which a
-/// sync does, drops the rest.
+/// sync does, acts on the answer. This changes no executable bit: [`verify_filesystem_for_changes`]
+/// carries the bits it answers [`Verdict::CarryMode`] for once every change has passed, where its
+/// caller asks for it ([`SyncVerifyArgs::carries_modes`]), and a caller realizing every change
+/// carries them in the realize.
 ///
 /// A file found to hold the incoming content has its time recorded where it is older than the
 /// operation's clock floor ([`InstanceOperationImpl::clock_floor`]), which a comparison reads
@@ -904,7 +989,7 @@ pub async fn verify_filesystem(
     stats: Arc<SyncVerifyStats>,
     filter_mode: FilterMode,
     incoming: &IncomingMoves,
-) -> Result<bool, SyncError> {
+) -> Result<Verdict, SyncError> {
     lore_trace!("Verify path: {change:?}");
     if let Some(source) = change.relocated_from()
         && change.from.flags.contains(NodeFlags::File)
@@ -920,7 +1005,7 @@ pub async fn verify_filesystem(
     {
         if forward_changes && !realizes_every_change {
             lore_info!("Keeping the locally modified file a move carries away: {source}");
-            return Ok(false);
+            return Ok(Verdict::Drop);
         }
         lore_error!(
             "File has local changes: {source}, which the incoming revision moves to {}",
@@ -955,7 +1040,7 @@ pub async fn verify_filesystem(
             // A caller realizing every change would write over it whatever this answers.
             if forward_changes && !realizes_every_change {
                 lore_info!("Keeping the symbolic link at {}", change.path());
-                return Ok(false);
+                return Ok(Verdict::Drop);
             }
             lore_error!("A symbolic link stands at or above {}", change.path());
             return Err(LocalModifications.into());
@@ -967,7 +1052,7 @@ pub async fn verify_filesystem(
                     "Nothing exist in file system for {}, safe to add",
                     change.path()
                 );
-                Ok(true)
+                Ok(Verdict::Realize)
             }
             change::FileAction::Delete => {
                 // Nothing exists, delete is a no-op
@@ -975,7 +1060,7 @@ pub async fn verify_filesystem(
                     "Nothing exist in file system for {}, delete is no-op",
                     change.path()
                 );
-                Ok(true)
+                Ok(Verdict::Realize)
             }
             _ => {
                 if forward_changes {
@@ -983,13 +1068,13 @@ pub async fn verify_filesystem(
                         "Keeping modified file as locally deleted: {}",
                         change.path()
                     );
-                    Ok(false)
+                    Ok(Verdict::Drop)
                 } else {
                     lore_trace!(
                         "Restoring modified file which was locally deleted: {}",
                         change.path()
                     );
-                    Ok(true)
+                    Ok(Verdict::Realize)
                 }
             }
         };
@@ -1001,21 +1086,15 @@ pub async fn verify_filesystem(
     if let Some(modification) = modifications.modification {
         // Check if file is modified
         if !modification.modified {
+            if holds_the_content(change, modifications.measured.as_ref()) {
+                change.flags |= change::Flags::HoldsContent;
+            }
             if change.action == change::FileAction::Keep
                 && let Some(measured) = modifications.measured.as_ref()
                 && measured.is_current
                 && !measured.node.address.is_zero()
                 && measured.node.address == incoming_address(change).await
             {
-                if !change.flags.is_local_mode() {
-                    carry_file_mode(
-                        &operation,
-                        change.path(),
-                        modifications.info.mode(change.to.mode),
-                        change.to.mode,
-                    )
-                    .await?;
-                }
                 if modifications.info.mtime() < operation.clock_floor(&repository).await {
                     operation.record_modified_time(
                         &change.from.mapping.repository,
@@ -1023,10 +1102,13 @@ pub async fn verify_filesystem(
                         modifications.info.mtime(),
                     );
                 }
-                return Ok(false);
+                return Ok(held_content_verdict(
+                    change,
+                    modifications.info.mode(change.to.mode),
+                ));
             }
             stats.file_retain.fetch_add(1, Ordering::Relaxed);
-            return Ok(true);
+            return Ok(Verdict::Realize);
         }
         stats.file_replace.fetch_add(1, Ordering::Relaxed);
     }
@@ -1036,7 +1118,7 @@ pub async fn verify_filesystem(
 
     if is_delete && was_link {
         lore_debug!("Link is for delete, skipping filesystem verification");
-        return Ok(true);
+        return Ok(Verdict::Realize);
     }
 
     let node_to = if !is_delete {
@@ -1062,7 +1144,7 @@ pub async fn verify_filesystem(
                         "Keeping deleted file as locally modified: {}",
                         change.path()
                     );
-                    return Ok(false);
+                    return Ok(Verdict::Drop);
                 }
                 lore_error!(
                     "Deleted file is currently modified in file system: {}",
@@ -1080,14 +1162,14 @@ pub async fn verify_filesystem(
                     "Keeping created directory as a locally modified file: {}",
                     change.path()
                 );
-                return Ok(false);
+                return Ok(Verdict::Drop);
             }
 
             lore_trace!(
                 "Change {} from file to directory, previous change will have deleted it",
                 change.path()
             );
-            return Ok(true);
+            return Ok(Verdict::Realize);
         }
 
         let differs_from = modifications
@@ -1116,7 +1198,7 @@ pub async fn verify_filesystem(
                         "Keeping modified file as locally modified: {}",
                         change.path()
                     );
-                    return Ok(false);
+                    return Ok(Verdict::Drop);
                 }
 
                 if holds_the_replaced_content(
@@ -1129,7 +1211,7 @@ pub async fn verify_filesystem(
                 )
                 .await?
                 {
-                    return Ok(true);
+                    return Ok(Verdict::Realize);
                 }
 
                 lore_error!(
@@ -1156,15 +1238,6 @@ pub async fn verify_filesystem(
                     change.path()
                 );
 
-                if !change.flags.is_local_mode() {
-                    carry_file_mode(
-                        &operation,
-                        change.path(),
-                        modifications.info.mode(node_to.mode),
-                        node_to.mode,
-                    )
-                    .await?;
-                }
                 if modifications.info.mtime() < operation.clock_floor(&repository).await {
                     operation.record_modified_time(
                         &change.from.mapping.repository,
@@ -1173,7 +1246,10 @@ pub async fn verify_filesystem(
                     );
                 }
 
-                return Ok(false);
+                return Ok(held_content_verdict(
+                    change,
+                    modifications.info.mode(change.to.mode),
+                ));
             }
         }
     }
@@ -1193,7 +1269,7 @@ pub async fn verify_filesystem(
                 "Keeping modified/deleted file as a local directory: {}",
                 change.path()
             );
-            return Ok(false);
+            return Ok(Verdict::Drop);
         }
 
         if is_delete {
@@ -1289,7 +1365,7 @@ pub async fn verify_filesystem(
             if has_modified_file {
                 return Err(LocalModifications.into());
             }
-            return Ok(true);
+            return Ok(Verdict::Realize);
         }
         // If this is a change from directory to file, there will have been a previous change
         // which deletes the existing directory node which will have verified the filesystem
@@ -1298,10 +1374,10 @@ pub async fn verify_filesystem(
             "Change {} from directory to file, previous change will have deleted it",
             change.path()
         );
-        return Ok(true);
+        return Ok(Verdict::Realize);
     }
 
-    Ok(true)
+    Ok(Verdict::Realize)
 }
 
 pub async fn realize_changes(
@@ -2011,6 +2087,8 @@ struct SyncWorkItem {
     node: Node,
 }
 
+/// Sends each change that deletes nothing to `tx`, with the node its `to` side names given the
+/// mode `to` states.
 async fn sync_discover_modify_add(
     changes: Arc<Vec<NodeChange>>,
     stats: Arc<SyncRealizeStats>,
@@ -2029,7 +2107,8 @@ async fn sync_discover_modify_add(
             .block(repository.clone(), NodeBlock::index(change.to.mapping.node))
             .await
             .forward::<SyncError>("Failed deserializing state node block")?;
-        let node = block.node(Node::index(change.to.mapping.node));
+        let mut node = block.node(Node::index(change.to.mapping.node));
+        node.mode = change.to.mode;
 
         if node.is_file() {
             stats.discovery.total_files.fetch_add(1, Ordering::Relaxed);
@@ -2239,21 +2318,32 @@ pub(crate) async fn stage_link_registry_entry(
         })
 }
 
-/// Whether the rename a move was realized by left the destination holding the content it should, so
-/// that writing it from the immutable store would replace it with the same bytes.
+/// Whether `change` leaves its file in place with the content it held, and `measured`, the node an
+/// unmodified working file matches, holds that content: the working file then needs only the
+/// change's executable bit. A move is left out, as realizing it renames the file and can remove
+/// what stands at its destination.
+fn holds_the_content(change: &NodeChange, measured: Option<&MeasuredNode>) -> bool {
+    change.action == change::FileAction::Keep
+        && change.from.address.hash == change.to.address.hash
+        && measured.is_some_and(|measured| measured.node.address.hash == change.to.address.hash)
+}
+
+/// Whether the destination holds the content the change ends at, so that writing it from the
+/// immutable store would replace it with the same bytes: where the verify found the file holding
+/// it ([`change::Flags::HoldsContent`]), or where the rename a move was realized by carried it.
 ///
-/// Two things have to hold. `renamed` reports a rename that completed, which is what says the source
-/// was there to be carried: a sparse working tree holds nothing at a source its view excludes, and a
-/// tree the move has already been applied to holds nothing at it either. And the two sides address
-/// the same content, since a move that rewrites the file carries the old bytes to the destination and
-/// the new ones are only in the store.
+/// For the rename, two things have to hold. `renamed` reports a rename that completed, which is
+/// what says the source was there to be carried: a sparse working tree holds nothing at a source
+/// its view excludes, and a tree the move has already been applied to holds nothing at it either.
+/// And the two sides address the same content, since a move that rewrites the file carries the old
+/// bytes to the destination and the new ones are only in the store.
 ///
 /// The rename answers the first for itself, so nothing here infers from a view whether the file was
 /// on disk. A view could not answer it: the source is materialized under the view the tree is carried
 /// *from* while realize holds the one it is carried *to*, and neither tells a source that was never
 /// materialized from one an earlier pass already carried away.
-fn rename_carried_the_content(change: &NodeChange, renamed: bool) -> bool {
-    renamed && change.from.address.hash == change.to.address.hash
+fn content_is_in_place(change: &NodeChange, renamed: bool) -> bool {
+    (renamed && change.from.address.hash == change.to.address.hash) || change.flags.holds_content()
 }
 
 /// `node` with the executable bit the working file carries, where [`change::Flags::LocalMode`]
@@ -2415,7 +2505,10 @@ fn report_kept_moves(kept: &KeptMoves) {
 /// Realizes on disk a node a change adds, modifies or moves, and stages it in `state_stage` when
 /// given.
 ///
-/// A move whose rename fails is realized as [`recover_refused_move`] describes.
+/// A move whose rename fails is realized as [`recover_refused_move`] describes. A move is staged
+/// by moving the node the staged tree holds, which keeps the bit that node held, so a moved file
+/// is given the change's bit ([`carry_staged_mode`]): a commit records the staged bit where it
+/// reads none from the working tree.
 ///
 /// Cloning an added link and recording a staged link in the registry are boxed. Only a link
 /// reaches them, and inline they would make the future of every change realized as large as
@@ -2510,7 +2603,7 @@ fn realize_change_modify_add(
                 realize_moved_mount(&operation, &change, node).await?;
             }
         } else if node.is_file() && !dry_run && write_to_disk {
-            if rename_carried_the_content(&change, renamed) {
+            if content_is_in_place(&change, renamed) {
                 if !change.flags.is_local_mode() {
                     carry_file_mode(&operation, path, change.from.mode, realized.mode).await?;
                 }
@@ -2546,6 +2639,11 @@ fn realize_change_modify_add(
                     is_merge,
                 )
                 .await?;
+                if node.is_file() {
+                    carry_staged_mode(&state_stage, &repository, from_node, node.mode)
+                        .await
+                        .forward::<SyncError>("Failed to stage change")?;
+                }
             } else {
                 let mut node = node;
                 if is_merge {
@@ -2689,6 +2787,32 @@ pub(crate) async fn relink_moved_node(
     Ok(new_parent_id)
 }
 
+/// Gives the staged file `node_id` the executable bit `mode`, where it holds another.
+pub(crate) async fn carry_staged_mode(
+    state_stage: &State,
+    repository: &Arc<RepositoryContext>,
+    node_id: NodeID,
+    mode: u16,
+) -> Result<(), state::StateError> {
+    let staged = state_stage.node(repository.clone(), node_id).await?;
+    if !util::fs::mode_changed(staged.mode, mode) {
+        return Ok(());
+    }
+    state_stage
+        .node_rewrite(
+            repository,
+            node_id,
+            &state::Content {
+                mode,
+                size: staged.size,
+                address: staged.address,
+            },
+            state::Rewrite::Plain,
+        )
+        .await?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn realize_changes_merge(
     repository: Arc<RepositoryContext>,
@@ -2754,7 +2878,9 @@ async fn realize_changes_merge(
     Ok(())
 }
 
-/// Merges the file of the pair of changes at `index` in `merges`, which both sides changed.
+/// Merges the file of the pair of changes at `index` in `merges`, which both sides changed, giving a
+/// file both leave the executable bit [`change::merged_mode`] gives it, whatever the content's
+/// merge leaves.
 ///
 /// Takes the shared list and an index rather than the pair, so that the task holds an `Arc` in place
 /// of two changes. Not an `async fn`, which would hold a second copy of its arguments.
@@ -2804,6 +2930,9 @@ fn realize_file_merge(
                 )
                 .await?;
                 conflict = !resolved;
+                if !dry_run && let Some(mode) = change::merged_mode(change_from, change_to) {
+                    carry_file_mode(&operation, change_to.path(), change_to.to.mode, mode).await?;
+                }
             }
 
             if let Some(state_stage) = &state_stage {
@@ -3131,8 +3260,9 @@ async fn merge_file_in_view(
 }
 
 /// Stages the node a file both sides changed at the same path resolves to, flagged with how its
-/// merge left it, and records a conflict on `state_stage` where one is left. Removes the file where
-/// the conflict deletes it. Returns the node's size.
+/// merge left it and with the executable bit [`change::merged_mode`] gives it, and records a
+/// conflict on `state_stage` where one is left. Removes the file where the conflict deletes it.
+/// Returns the node's size.
 ///
 /// A function of its own, so that the node is not reserved in the states of the other cases of
 /// [`realize_file_merge`].
@@ -3187,6 +3317,9 @@ async fn stage_merged_file(
         return Err(SyncError::internal("Invalid change data"));
     };
     let size = node.size;
+    if let Some(mode) = change::merged_mode(change_from, change_to) {
+        node.mode = mode;
+    }
     if take_theirs && !change_from.to.mapping.node.is_valid_node_id() {
         // The incoming side deleted the path, so adopting it deletes.
         node.flags |= NodeFlags::StagedDelete;

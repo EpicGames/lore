@@ -1348,6 +1348,10 @@ pub struct SyncVerifyArgs {
     pub operation: Arc<InstanceOperationImpl>,
     pub current: crate::state::NodeMapping,
     pub options: Arc<SyncOptions>,
+    /// Whether the verify gives the files it finds holding the incoming content the changes' own
+    /// executable bits, once every change has passed. False where a realize that verifies again
+    /// follows.
+    pub carries_modes: bool,
 }
 
 pub async fn sync_verify_filesystem(

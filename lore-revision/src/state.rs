@@ -11274,7 +11274,7 @@ fn collect_new_addresses_recurse(
 ///
 /// The `target_state` is the state being modified (e.g., the current branch head).
 /// Each `NodeChange` carries source node data in its `to` field, which is copied into
-/// the target state tree.
+/// the target state tree with the mode `to` states.
 ///
 /// A move deletes the node at its source and stages the moved node at its destination. The
 /// destination of a move that only changes case resolves to the node at its source, so that node
@@ -11392,9 +11392,10 @@ pub(crate) async fn apply_tree_changes(
             continue;
         }
 
-        let node = source_state
+        let mut node = source_state
             .node(change.to.mapping.repository.clone(), source_node_id)
             .await?;
+        node.mode = change.to.mode;
 
         // Stage the node into the target state at the change path
         crate::stage::stage_single_node(

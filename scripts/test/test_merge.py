@@ -6,6 +6,7 @@ import random
 import shutil
 import stat
 import string
+import sys
 
 import pytest
 from error_types import CommitFailed, LocalChanges
@@ -1545,6 +1546,83 @@ def test_merge_file_and_folder_both_added(new_lore_repo, current, outcome):
     kept = current if outcome in ("mine", "abort") else incoming
     assert repo.read_files() == {"root.txt": "root\n", **holds[kept]}
     assert not parse_status_json(repo.status(scan=True, json=True))
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows holds no executable bit")
+@pytest.mark.parametrize("edited", ["Top.txt", "Dir/a.txt"], ids=["other-file", "same-file"])
+@pytest.mark.parametrize(
+    "operation",
+    ["merge", "sync", "cherry-pick", "revert", "fast-forward-merge"],
+)
+def test_a_mode_change_merges_with_an_edit(new_lore_repo, operation, edited):
+    """Each operation that joins two lines of history keeps a change of a file's
+    executable bit on one line where the other edits that file or another one: the
+    file holds the edit and the bit, nothing conflicts, and the revision holds what
+    the working tree does. A revert of the change takes the bit away and keeps the
+    edit."""
+    repo: Lore = new_lore_repo()
+    repo.make_dirs("Dir")
+    for path in ["Dir/a.txt", "Top.txt"]:
+        with repo.open_file(path, "w") as f:
+            f.write(f"{path}\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit("Base", offline=True)
+    repo.push()
+
+    def chmod(instance: Lore):
+        os.chmod(os.path.join(instance.path, "Dir/a.txt"), 0o755)
+        instance.file_stage("Dir/a.txt", offline=True)
+        instance.commit("Chmod", offline=True)
+
+    def edit(instance: Lore):
+        with instance.open_file(edited, "w") as f:
+            f.write("edited\n")
+        instance.file_stage(edited, offline=True)
+        instance.commit("Edit", offline=True)
+
+    joined = repo
+    executable = True
+    if operation == "merge":
+        repo.branch_create("feature", offline=True)
+        chmod(repo)
+        repo.branch_switch("main", offline=True)
+        edit(repo)
+        repo.branch_merge("feature", offline=True)
+    elif operation == "sync":
+        clone = repo.clone()
+        edit(repo)
+        repo.push()
+        chmod(clone)
+        clone.sync()
+        joined = clone
+    elif operation == "cherry-pick":
+        repo.branch_create("feature", offline=True)
+        chmod(repo)
+        picked = repo.history(branch="feature", offline=True)[-1].signature
+        repo.branch_switch("main", offline=True)
+        edit(repo)
+        repo.revision_cherry_pick(revision=picked, message="Pick", offline=True)
+    elif operation == "revert":
+        chmod(repo)
+        reverted = repo.history(offline=True)[-1].signature
+        edit(repo)
+        repo.revision_revert(revision=reverted, message="Revert", offline=True)
+        executable = False
+    else:
+        clone = repo.clone()
+        edit(clone)
+        clone.push()
+        chmod(repo)
+        repo.push(fast_forward_merge=True)
+        joined = repo.clone()
+
+    mode = os.stat(os.path.join(joined.path, "Dir/a.txt")).st_mode
+    assert bool(mode & stat.S_IXUSR) == executable, f"{mode:o}"
+    with joined.open_file(edited, "r") as f:
+        assert f.read() == "edited\n"
+    status = parse_status_json(joined.status(scan=True, offline=True, json=True))
+    assert status == [], status
 
 
 @pytest.mark.smoke

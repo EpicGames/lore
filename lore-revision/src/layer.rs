@@ -1055,6 +1055,7 @@ pub(crate) async fn sync_in_operation(
                 operation: operation.clone(),
                 current: current_tree,
                 options: options.clone(),
+                carries_modes: true,
             }),
         )
         .await

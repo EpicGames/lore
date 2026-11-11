@@ -3908,6 +3908,38 @@ pub(crate) async fn stage_from_parent_revision(
     .await
 }
 
+/// Gives the staged file `node` the executable bit `mode`, which a resolve realized it with:
+/// staging it from the working tree records no bit, and a commit records the staged bit where it
+/// reads none from the working tree. Does nothing for an invalid `node`.
+async fn stage_resolved_mode(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    node: NodeID,
+    mode: u16,
+) -> Result<(), StageError> {
+    if !node.is_valid_node_id() {
+        return Ok(());
+    }
+    crate::fs::realize::carry_staged_mode(state, repository, node, mode)
+        .await
+        .forward::<StageError>("Failed to stage the resolved file's mode")
+}
+
+/// The file `chosen`, the side a resolve takes, with the executable bit of `merged`, the file the
+/// merge staged at its path, where the two are one file: a resolve chooses the content where the
+/// sides conflict and never undoes a change of the bit, on every file it touches, conflicted or
+/// merged cleanly. A file of another identity, added again on that side, keeps its own bit.
+fn with_merged_mode(chosen: Node, merged: &Node) -> Node {
+    if merged.is_file() && merged.address.context == chosen.address.context {
+        Node {
+            mode: merged.mode,
+            ..chosen
+        }
+    } else {
+        chosen
+    }
+}
+
 /// Stages `paths` from the revision `merge_parent` names: a file is restored and staged here,
 /// and a directory's changes are found and staged by [`stage_from_parent_state`], in a task per
 /// directory.
@@ -4372,6 +4404,8 @@ async fn stage_from_parent_revision_in_operation(
                 // Restoring to a merge parent leaves content the current revision does not
                 // hold, so the times it lands with state nothing and are left to drop with
                 // the operation.
+                let node = with_merged_mode(node, &node_staged);
+                let mode = node.mode;
                 crate::fs::realize::realize_file(
                     repository.clone(),
                     operation.clone(),
@@ -4382,7 +4416,7 @@ async fn stage_from_parent_revision_in_operation(
                 .await
                 .forward::<StageError>("Unable to restore path to selected state")?;
 
-                Box::pin(stage_filesystem_path(
+                let staged = Box::pin(stage_filesystem_path(
                     operation.clone(),
                     NodeMapping::root(repository.clone(), state.clone()),
                     relative_path.clone(),
@@ -4394,6 +4428,7 @@ async fn stage_from_parent_revision_in_operation(
                     None, // No discard queue
                 ))
                 .await?;
+                stage_resolved_mode(&repository, &state, staged.node, mode).await?;
 
                 if !had_conflict_files {
                     sync::unlink_merge_artifacts(&operation, &relative_path).await;
@@ -4862,6 +4897,8 @@ async fn stage_link_groups(
                 // `link_context.path` shares the parent's path and
                 // `mount_path` is parent-relative, so realizing through the
                 // link context writes to `<parent>/<mount>/<file>`.
+                let node_t = with_merged_mode(node_t, &node_staged);
+                let mode = node_t.mode;
                 crate::fs::realize::realize_file(
                     group.link_context.clone(),
                     operation.clone(),
@@ -4888,6 +4925,13 @@ async fn stage_link_groups(
                     None, // No prefix map for a path resolved on its own
                     None, // No discard queue
                 ))
+                .await?;
+                stage_resolved_mode(
+                    &group.link_context,
+                    &group.link_state_staged,
+                    staged_node_link.node,
+                    mode,
+                )
                 .await?;
 
                 sync::unlink_merge_artifacts(&operation, mount_path).await;

@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
+import os
 import re
+import stat
+import sys
 from collections.abc import Callable
 
 import pytest
@@ -1675,6 +1678,92 @@ def test_link_merge_start_refuses_local_work_inside_the_link(
     for path, content in incoming.items():
         with repo.open_file(f"{mount}/{path}") as f:
             assert f.read() == content, f"{mount}/{path} should hold the merge"
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows holds no executable bit")
+def test_merge_refused_at_a_link_pin_leaves_the_bits(new_lore_repo):
+    """`merge start` refused at its check of a fixed link's pin, for a local edit inside the
+    link, changes no executable bit there: a file the pin's move gives the bit, whose content
+    the working tree holds, keeps its mode. With the edit reset, the merge gives it the bit."""
+    repo = make_repo(new_lore_repo, {"main.txt": "base\n"})
+    fixed = make_repo(new_lore_repo, {"a.txt": "base\n", "tool.sh": "tool\n"})
+    repo.link_add("linked/fixed", fixed.get_id(), "/", disable_branching=True)
+    repo.commit("Add a fixed link")
+    repo.push()
+
+    repo.branch_create("feature-branch")
+    fixed.write_files({"a.txt": "theirs\n"})
+    os.chmod(os.path.join(fixed.path, "tool.sh"), 0o755)
+    fixed.stage(["a.txt", "tool.sh"])
+    fixed.commit("Change the fixed link")
+    fixed.push()
+    upstream = repo.clone(branch="main")
+    upstream.link_update("linked/fixed")
+    upstream.write_files({"main.txt": "theirs\n"})
+    upstream.stage(["main.txt"])
+    upstream.commit("Move the fixed link's pin")
+    upstream.push()
+
+    repo.write_files({"linked/fixed/a.txt": "local edit\n"})
+    tool = os.path.join(repo.path, "linked/fixed/tool.sh")
+
+    with pytest.raises(LocalChanges):
+        repo.branch_merge_start("main", message="Merge main")
+    mode = os.stat(tool).st_mode
+    assert not mode & stat.S_IXUSR, f"{mode:o}"
+
+    repo.reset("linked/fixed/a.txt", purge=True)
+    repo.branch_merge_start("main", message="Merge main")
+    mode = os.stat(tool).st_mode
+    assert mode & stat.S_IXUSR, f"{mode:o}"
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows holds no executable bit")
+@pytest.mark.parametrize("edited", ["one", "two"])
+def test_merge_refused_at_another_link_pin_leaves_the_bits(new_lore_repo, edited):
+    """`merge start` refused at its check of one fixed link's pin, for a local edit inside that
+    link, changes no executable bit in another fixed link whose pin's move only gives a file the
+    bit, whichever of the two the check reaches first. With the edit reset, the merge gives the
+    file the bit."""
+    repo = make_repo(new_lore_repo, {"main.txt": "base\n"})
+    links = {
+        name: make_repo(new_lore_repo, {"a.txt": "base\n", "tool.sh": "tool\n"})
+        for name in ("one", "two")
+    }
+    for name, link in links.items():
+        repo.link_add(f"linked/{name}", link.get_id(), "/", disable_branching=True)
+    repo.commit("Add two fixed links")
+    repo.push()
+
+    repo.branch_create("feature-branch")
+    moved = "two" if edited == "one" else "one"
+    links[edited].write_commit_push("Edit the file", {"a.txt": "theirs\n"})
+    os.chmod(os.path.join(links[moved].path, "tool.sh"), 0o755)
+    links[moved].stage(["tool.sh"])
+    links[moved].commit("Give the tool the executable bit")
+    links[moved].push()
+    upstream = repo.clone(branch="main")
+    for name in links:
+        upstream.link_update(f"linked/{name}")
+    upstream.write_files({"main.txt": "theirs\n"})
+    upstream.stage(["main.txt"])
+    upstream.commit("Move both fixed links' pins")
+    upstream.push()
+
+    repo.write_files({f"linked/{edited}/a.txt": "local edit\n"})
+    tool = os.path.join(repo.path, f"linked/{moved}/tool.sh")
+
+    with pytest.raises(LocalChanges):
+        repo.branch_merge_start("main", message="Merge main")
+    mode = os.stat(tool).st_mode
+    assert not mode & stat.S_IXUSR, f"{mode:o}"
+
+    repo.reset(f"linked/{edited}/a.txt", purge=True)
+    repo.branch_merge_start("main", message="Merge main")
+    mode = os.stat(tool).st_mode
+    assert mode & stat.S_IXUSR, f"{mode:o}"
 
 
 @pytest.mark.smoke

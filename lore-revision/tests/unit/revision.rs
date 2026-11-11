@@ -23,6 +23,8 @@ mod diff;
 mod instance;
 mod last_merged;
 mod merge_local_work;
+#[cfg(unix)]
+mod merge_modes;
 mod merge_moves;
 mod remote_comparison;
 mod resolve;
