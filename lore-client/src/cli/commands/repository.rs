@@ -226,7 +226,7 @@ pub struct RepositoryCloneArgs {
     #[clap(long, action)]
     no_tracking: bool,
 
-    /// Root files for dependency-based selective clone (only clone these files and their dependencies)
+    /// Root files for dependency-based selective clone (only clone these files and their dependencies). A root file inside a link is skipped
     #[clap(long = "root-file", value_name = "path")]
     root_files: Vec<String>,
 

@@ -416,7 +416,8 @@ virtual clone writes no files and reads them from the remote when a command need
 * `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 * `--no-tracking` — Clone without local repository tracking (memory-only stores)
-* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies)
+* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies).
+  A root file inside a link is skipped
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based clone
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based clone
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
@@ -1173,7 +1174,7 @@ Synchronize to a given state of a repository
 * `--forward-changes` — Fast forward any local changes if syncing to a local revision
 * `--reset` — Reset any local modified files to match the incoming revision
 * `--root-file <path>` — Root files for dependency-based selective sync (only sync changes for these files and their
-  dependencies)
+  dependencies). A root file inside a link is skipped
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based sync
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based sync
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
@@ -1519,7 +1520,7 @@ File commands
 
 * `info` — Get info about the given file or directory
 * `metadata` — Manage metadata of a given file or directory
-* `dependency` — Manage file dependencies
+* `dependency` — Manage file dependencies of files outside links
 * `stage` — Stage changes for commit
 * `dirty` — Mark files as dirty so they show up in `lore status` and get picked up by directory-scoped `lore stage` (no
   content is read or staged)
@@ -1603,7 +1604,7 @@ Set metadata on for a staged file
 
 ## `lore file dependency`
 
-Manage file dependencies
+Manage file dependencies of files outside links
 
 **Usage:** `lore file dependency <COMMAND>`
 
@@ -2260,7 +2261,8 @@ virtual clone writes no files and reads them from the remote when a command need
 * `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 * `--no-tracking` — Clone without local repository tracking (memory-only stores)
-* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies)
+* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies).
+  A root file inside a link is skipped
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based clone
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based clone
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
@@ -2502,7 +2504,7 @@ Synchronize to a repository state
 * `--forward-changes` — Fast forward any local changes if syncing to a local revision
 * `--reset` — Reset any local modified files to match the incoming revision
 * `--root-file <path>` — Root files for dependency-based selective sync (only sync changes for these files and their
-  dependencies)
+  dependencies). A root file inside a link is skipped
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based sync
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based sync
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)

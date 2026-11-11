@@ -830,7 +830,7 @@ mod tests {
                 let result = resolve_dependency_file_set(
                     repository,
                     state,
-                    &["nonexistent/path"],
+                    &["nonexistent/path".to_string()],
                     &[],
                     false,
                     0,

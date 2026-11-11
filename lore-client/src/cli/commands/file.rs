@@ -576,7 +576,7 @@ pub enum FileCommands {
     Info(FileInfoArgs),
     /// Manage metadata of a given file or directory
     Metadata(FileMetadataArgs),
-    /// Manage file dependencies
+    /// Manage file dependencies of files outside links
     Dependency(FileDependencyArgs),
     /// Stage changes for commit.
     ///

@@ -12,7 +12,6 @@ use lore_revision::change::NodeChange;
 use lore_revision::change::NodeChangeState;
 use lore_revision::link::*;
 use lore_revision::lore::RepositoryId;
-use lore_revision::node::Node;
 use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
@@ -30,6 +29,8 @@ use crate::helper::in_memory;
 use crate::helper::in_memory::add;
 use crate::helper::in_memory::branch_id;
 use crate::helper::in_memory::directory;
+use crate::helper::in_memory::link_node;
+use crate::helper::in_memory::linked_revision;
 
 fn link(link_repository_id: RepositoryId, link_node_id: NodeID) -> LinkContext {
     LinkContext {
@@ -108,21 +109,6 @@ fn merged() -> RepositoryId {
 /// The branch a row following the parent's branch stores.
 fn tracking() -> BranchId {
     BranchId::default()
-}
-
-/// A link named `name` to the root of the revision `pin` of `link_repository`.
-fn link_node(name: &str, link_repository: RepositoryId, pin: Hash) -> Node {
-    Node {
-        flags: NodeFlags::Link.bits(),
-        mode: 0o755,
-        name_hash: hash_string(name),
-        child: ROOT_NODE,
-        address: Address {
-            hash: pin,
-            context: Context::from(link_repository),
-        },
-        ..Default::default()
-    }
 }
 
 /// A state holding each of `links`: its path, the repository it links, the branch its row
@@ -433,24 +419,6 @@ async fn diff_deletes(edit: SourceEdit, path: &'static str) -> bool {
         .changes;
     lore_revision::change::sort_by_path(&mut changes);
     merge_deletes_link(&changes, path, merged)
-}
-
-/// A revision of the repository `link_repository` holding `l.txt`.
-async fn linked_revision(
-    repository: &Arc<RepositoryContext>,
-    link_repository: RepositoryId,
-) -> Hash {
-    let linked = repository.to_link_context(link_repository).await;
-    let state = State::new();
-    add(
-        &state,
-        linked.clone(),
-        ROOT_NODE,
-        in_memory::file("l.txt"),
-        "l.txt",
-    )
-    .await;
-    in_memory::commit(&linked, &state, Hash::default(), branch_id()).await
 }
 
 /// A link deleted, deleted and replaced at its path by a link to another repository, or below a

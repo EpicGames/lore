@@ -1,6 +1,21 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::Hash;
+use lore_revision::dependency::resolve::resolve_dependency_file_set;
 use lore_revision::dependency::*;
+use lore_revision::lore::RepositoryId;
+use lore_revision::node::NodeID;
+use lore_revision::node::ROOT_NODE;
+use lore_revision::repository::RepositoryContext;
+use lore_revision::state::State;
+
+use crate::fs::filesystem_provider::setup_test_execution;
+use crate::fs::filesystem_provider::test_store_create;
+use crate::helper::in_memory;
 
 /// Build a raw dependency blob header (16 bytes) with the given
 /// `entry_count`. Used by tests to craft malformed inputs without going
@@ -98,4 +113,68 @@ fn deserialize_rejects_unsupported_version() {
 fn deserialize_rejects_blob_shorter_than_header() {
     let bytes = vec![0u8; HEADER_SIZE - 1];
     assert!(DependencyData::deserialize(&bytes).is_err());
+}
+
+/// A revision holding `a.txt` and a link at `vendor` to a revision holding `l.txt`.
+async fn state_with_link(repository: &Arc<RepositoryContext>) -> Arc<State> {
+    let linked = RepositoryId::from(uuid::Uuid::now_v7());
+    let pin = in_memory::linked_revision(repository, linked).await;
+    let state = State::new();
+    let file = in_memory::file("a.txt");
+    in_memory::add(&state, repository.clone(), ROOT_NODE, file, "a.txt").await;
+    let link = in_memory::link_node("vendor", linked, pin);
+    in_memory::add(&state, repository.clone(), ROOT_NODE, link, "vendor").await;
+    let revision =
+        in_memory::commit(repository, &state, Hash::default(), in_memory::branch_id()).await;
+    in_memory::revision_state(repository, revision).await
+}
+
+/// The dependency set of the root files `roots` in `state`.
+async fn file_set(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    roots: &[&str],
+) -> Result<HashSet<NodeID>, DependencyError> {
+    let roots: Vec<String> = roots.iter().map(|root| root.to_string()).collect();
+    resolve_dependency_file_set(repository.clone(), state.clone(), &roots, &[], false, 0).await
+}
+
+/// A root file inside a link is skipped, and refused when every root file is. The link itself
+/// is a root file like any other, a path missing inside a link is not found, and root files are
+/// read in any spelling a clone accepts.
+#[tokio::test]
+async fn a_root_file_inside_a_link_is_skipped_or_refused() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let state = state_with_link(&repository).await;
+            let node = async |path: &str| {
+                state
+                    .find_node_link(repository.clone(), path)
+                    .await
+                    .expect("finding the node")
+                    .node
+            };
+            let (file, link) = (node("a.txt").await, node("vendor").await);
+
+            let kept = file_set(&repository, &state, &["./a.txt", "vendor/l.txt"]).await;
+            assert_eq!(kept.expect("the file set"), HashSet::from([file]));
+            let mount = file_set(&repository, &state, &["vendor"]).await;
+            assert_eq!(mount.expect("the file set"), HashSet::from([link]));
+            let refused = file_set(&repository, &state, &["vendor/l.txt"]).await;
+            assert!(
+                refused.as_ref().is_err_and(|err| err.is_not_supported()),
+                "{refused:?}"
+            );
+            let missing = file_set(&repository, &state, &["vendor/missing.txt"]).await;
+            assert!(
+                missing.as_ref().is_err_and(|err| err.is_file_not_found()),
+                "{missing:?}"
+            );
+            let none = file_set(&repository, &state, &[]).await;
+            assert_eq!(none.expect("the file set"), HashSet::new());
+        })
+        .await;
 }

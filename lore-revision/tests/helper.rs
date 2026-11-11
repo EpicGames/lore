@@ -1101,10 +1101,12 @@ pub mod in_memory {
     use lore_revision::commit::BasedOn;
     use lore_revision::commit::commit_in_memory_revision;
     use lore_revision::commit::weave_history;
+    use lore_revision::lore::RepositoryId;
     use lore_revision::metadata::Metadata;
     use lore_revision::node::Node;
     use lore_revision::node::NodeFlags;
     use lore_revision::node::NodeID;
+    use lore_revision::node::ROOT_NODE;
     use lore_revision::repository::InMemoryContext;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryWriteToken;
@@ -1158,6 +1160,32 @@ pub mod in_memory {
 
     pub fn branch_id() -> BranchId {
         Context::from(uuid::Uuid::now_v7())
+    }
+
+    /// A link named `name` to the root of the revision `pin` of `link_repository`.
+    pub fn link_node(name: &str, link_repository: RepositoryId, pin: Hash) -> Node {
+        Node {
+            flags: NodeFlags::Link.bits(),
+            mode: 0o755,
+            name_hash: hash_string(name),
+            child: ROOT_NODE,
+            address: Address {
+                hash: pin,
+                context: Context::from(link_repository),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// A revision of the repository `link_repository` holding `l.txt`.
+    pub async fn linked_revision(
+        repository: &Arc<RepositoryContext>,
+        link_repository: RepositoryId,
+    ) -> Hash {
+        let linked = repository.to_link_context(link_repository).await;
+        let state = State::new();
+        add(&state, linked.clone(), ROOT_NODE, file("l.txt"), "l.txt").await;
+        commit(&linked, &state, Hash::default(), branch_id()).await
     }
 
     /// Adds `node` as `name` under `parent`, staged as an add. Every write verb marks its staged

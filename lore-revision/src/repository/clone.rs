@@ -1796,25 +1796,12 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
             visited: DashSet::new(),
         });
 
-        event::LoreEvent::DependencyResolveBegin(dependency::LoreDependencyResolveBeginEventData {
-            root_count: options.root_files.len() as u64,
-        })
-        .send();
-
-        for root_path in &options.root_files {
-            let relative = RelativePath::new_from_initial_path(root_path)
-                .forward_with::<CloneError, _>(|| format!("Invalid path: {root_path}"))?;
-            let repository_path = relative;
-            let node_link = state
-                .find_node_link(repository.clone(), repository_path.as_str())
+        let roots =
+            dependency::resolve::resolve_root_nodes(&repository, &state, &options.root_files)
                 .await
-                .forward_with::<CloneError, _>(|| format!("Root file not found: {root_path}"))?;
-            if !node_link.is_valid() {
-                return Err(CloneError::internal(format!(
-                    "Root file not found: {root_path}"
-                )));
-            }
-            let node_id = node_link.node;
+                .forward::<CloneError>("Resolving the root files")?;
+
+        for (_, repository_path) in &roots {
             let parent = repository_path.parent_path();
             if !parent.is_empty() {
                 ctx.operation
@@ -1822,6 +1809,8 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
                     .await
                     .forward::<CloneError>("Failed to root path parent directory")?;
             }
+        }
+        for (node_id, repository_path) in roots {
             dep_ctx.visited.insert(node_id);
             dispatcher.dispatch(BlockDiscoverItem {
                 node_id,

@@ -12,6 +12,7 @@ use super::load_dependency_data;
 use super::resolve;
 use super::store_dependency_data;
 use crate::errors::FileNotFound;
+use crate::errors::NotSupported;
 use crate::lore::Hash;
 use crate::node::NodeID;
 use crate::repository::RepositoryContext;
@@ -151,6 +152,8 @@ pub async fn add_file_dependencies(
     Ok(AddResult { added })
 }
 
+/// The node of the file at `path` in `state`'s own tree. Returns `NotSupported` when `path` is
+/// inside a link.
 pub async fn resolve_path(
     repository: &Arc<RepositoryContext>,
     state: &State,
@@ -161,21 +164,46 @@ pub async fn resolve_path(
             resource: path.to_string(),
         })?;
 
-    let node_link = state
-        .find_node_link(repository.clone(), relative_path.as_str())
-        .await
-        .map_err(|_e| FileNotFound {
-            resource: path.to_string(),
-        })?;
+    find_own_node(repository, state, relative_path.as_str())
+        .await?
+        .ok_or_else(|| {
+            NotSupported {
+                operation: format!("file dependencies on `{path}`, which is inside a link"),
+            }
+            .into()
+        })
+}
 
+/// The node at the repository path `path` in `state`'s own tree, or `None` where `path` is inside
+/// a link. A path `state` does not hold is `FileNotFound`, and any other failure of the lookup
+/// keeps its variant.
+pub(crate) async fn find_own_node(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    path: &str,
+) -> Result<Option<NodeID>, DependencyError> {
+    let node_link = match state.find_node_link(repository.clone(), path).await {
+        Ok(node_link) => node_link,
+        Err(err) if err.is_node_not_found() => {
+            return Err(DependencyError::FileNotFound(
+                FileNotFound {
+                    resource: path.to_string(),
+                }
+                .chain_err_from(err, "path not found in state"),
+            ));
+        }
+        Err(err) => return Err(err).forward_any::<DependencyError>("finding the path"),
+    };
+    if node_link.crosses_link(repository, state) {
+        return Ok(None);
+    }
     if !node_link.is_valid() {
         return Err(FileNotFound {
             resource: path.to_string(),
         }
         .into());
     }
-
-    Ok(node_link.node)
+    Ok(Some(node_link.node))
 }
 
 pub(super) async fn flush_state(

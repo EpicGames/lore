@@ -5123,7 +5123,8 @@ typedef struct lore_repository_clone_args_t {
   struct lore_string_t shared_store_path;
   // Clone without local repository tracking (memory-only stores)
   uint8_t no_tracking;
-  // Root files for dependency-based selective clone
+  // Root files for dependency-based selective clone. A root file inside a link is skipped, and
+  // error code 9 (not supported) is returned when every root file is.
   struct lore_string_array_t root_files;
   // Tags to filter dependencies by during resolution
   struct lore_string_array_t dependency_tags;
@@ -5393,7 +5394,8 @@ typedef struct lore_revision_sync_args_t {
   uint8_t forward_changes;
   // Reset local modified files to match the incoming revision
   uint8_t reset;
-  // Root files for dependency-based selective sync
+  // Root files for dependency-based selective sync. A root file inside a link is skipped, and
+  // error code 9 (not supported) is returned when every root file is.
   struct lore_string_array_t root_files;
   // Tags to filter dependencies by during resolution
   struct lore_string_array_t dependency_tags;
@@ -9139,6 +9141,8 @@ void lore_file_dump_async(const struct lore_global_args_t *globals,
 
 // Adds dependency relationships between files.
 //
+// Fails with error code 9 (not supported) when a path is inside a link, and changes nothing.
+//
 // # Events
 //
 // ## Standard Events
@@ -9187,6 +9191,8 @@ void lore_file_dependency_add_async(const struct lore_global_args_t *globals,
 
 // Removes dependency relationships between files.
 //
+// Fails with error code 9 (not supported) when a path is inside a link, and changes nothing.
+//
 // # Events
 //
 // ## Standard Events
@@ -9234,6 +9240,8 @@ void lore_file_dependency_remove_async(const struct lore_global_args_t *globals,
                                        struct lore_event_callback_config_t callback);
 
 // Queries dependency information for files.
+//
+// Fails with error code 9 (not supported) when a path is inside a link.
 //
 // # Events
 //

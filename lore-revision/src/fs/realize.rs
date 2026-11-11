@@ -157,6 +157,24 @@ pub async fn realize_state(
         return Ok(());
     }
 
+    let inclusion_set = if options.root_files.is_empty() {
+        None
+    } else {
+        let tags: Vec<&str> = options.dependency_tags.iter().map(|s| s.as_str()).collect();
+        Some(
+            dependency::resolve::resolve_dependency_file_set(
+                repository_target.clone(),
+                state_target.clone(),
+                &options.root_files,
+                &tags,
+                options.dependency_recursive,
+                options.dependency_depth_limit,
+            )
+            .await
+            .forward::<SyncError>("Failed to resolve dependency set")?,
+        )
+    };
+
     let stats: Arc<SyncRealizeStats> = Arc::default();
     let changes = if !options.reset {
         lore_info!(
@@ -221,27 +239,18 @@ pub async fn realize_state(
         changes
     };
 
-    // Filter changes by dependency set when root_files is specified
-    let changes = if !options.root_files.is_empty() {
-        let tags: Vec<&str> = options.dependency_tags.iter().map(|s| s.as_str()).collect();
-        let root_refs: Vec<&str> = options.root_files.iter().map(|s| s.as_str()).collect();
-        let inclusion_set = dependency::resolve::resolve_dependency_file_set(
-            repository_target.clone(),
-            state_target.clone(),
-            &root_refs,
-            &tags,
-            options.dependency_recursive,
-            options.dependency_depth_limit,
-        )
-        .await
-        .forward::<SyncError>("Failed to resolve dependency set")?;
-
+    let changes = if let Some(inclusion_set) = inclusion_set {
         let change_count = changes.len();
         let filtered: Vec<NodeChange> = changes
             .into_iter()
-            .filter(|change| match change.action {
-                change::FileAction::Delete => inclusion_set.contains(&change.from.mapping.node),
-                _ => inclusion_set.contains(&change.to.mapping.node),
+            .filter(|change| {
+                let (mapping, state) = match change.action {
+                    change::FileAction::Delete => (&change.from.mapping, &state_current),
+                    _ => (&change.to.mapping, &state_target),
+                };
+                // Node ids are numbered per tree, so a change inside a link can carry the id of a
+                // node in the dependency set.
+                inclusion_set.contains(&mapping.node) && Arc::ptr_eq(&mapping.state, state)
             })
             .collect();
         lore_info!(

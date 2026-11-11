@@ -3259,6 +3259,8 @@ pub type LoreFileDependencyAddArgs = crate::dependency::LoreFileDependencyAddArg
 
 /// Adds dependency relationships between files.
 ///
+/// Fails with error code 9 (not supported) when a path is inside a link, and changes nothing.
+///
 /// # Events
 ///
 /// ## Standard Events
@@ -3319,6 +3321,8 @@ pub type LoreFileDependencyRemoveArgs = crate::dependency::LoreFileDependencyRem
 
 /// Removes dependency relationships between files.
 ///
+/// Fails with error code 9 (not supported) when a path is inside a link, and changes nothing.
+///
 /// # Events
 ///
 /// ## Standard Events
@@ -3378,6 +3382,8 @@ pub extern "C" fn lore_file_dependency_remove_async(
 pub type LoreFileDependencyListArgs = crate::dependency::LoreFileDependencyListArgs;
 
 /// Queries dependency information for files.
+///
+/// Fails with error code 9 (not supported) when a path is inside a link.
 ///
 /// # Events
 ///

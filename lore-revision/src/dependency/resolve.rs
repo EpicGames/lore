@@ -12,16 +12,18 @@ use super::DependencyError;
 use super::LoreDependencyResolveBeginEventData;
 use super::LoreDependencyResolveEndEventData;
 use super::LoreDependencyResolveItemEventData;
+use super::add::find_own_node;
 use super::load_dependency_data;
-use crate::errors::FileNotFound;
 use crate::errors::InvalidArguments;
-use crate::errors::forward_refusal_or;
+use crate::errors::NotSupported;
 use crate::event;
 use crate::interface::LoreArray;
 use crate::interface::LoreString;
+use crate::lore_warn;
 use crate::node::NodeID;
 use crate::repository::RepositoryContext;
 use crate::state::State;
+use crate::util::path::RelativePath;
 
 /// Compute the transitive closure of dependency relationships starting
 /// from `root_nodes`, following edges stored under `key` (either
@@ -193,11 +195,49 @@ pub async fn check_cycle(
     Ok(())
 }
 
+/// The nodes of the root files `root_paths` in `state`, each with its repository path. A root
+/// file inside a link is skipped with a warning, and `NotSupported` is returned when every root
+/// file is, since file dependencies inside a link are not supported. Emits
+/// `DependencyResolveBegin` with the number of root files kept.
+pub(crate) async fn resolve_root_nodes(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    root_paths: &[String],
+) -> Result<Vec<(NodeID, RelativePath)>, DependencyError> {
+    let mut roots = Vec::with_capacity(root_paths.len());
+    let mut skipped = false;
+    for root_path in root_paths {
+        let path = RelativePath::new_from_initial_path(root_path)
+            .forward_with::<DependencyError, _>(|| format!("Invalid path: {root_path}"))?;
+        if let Some(node) = find_own_node(repository, state, path.as_str()).await? {
+            roots.push((node, path));
+        } else {
+            lore_warn!(
+                "Skipping root file {path}: file dependencies inside a link are not supported"
+            );
+            skipped = true;
+        }
+    }
+    if roots.is_empty() && skipped {
+        return Err(NotSupported {
+            operation: "file dependencies on root files that are all inside links".into(),
+        }
+        .into());
+    }
+
+    event::LoreEvent::DependencyResolveBegin(LoreDependencyResolveBeginEventData {
+        root_count: roots.len() as u64,
+    })
+    .send();
+    Ok(roots)
+}
+
 /// Resolve the complete set of files to include based on dependency metadata.
 ///
 /// Starting from `root_paths`, resolves each to a `NodeID`, loads its forward
 /// dependencies (filtered by `tags`), and optionally follows transitive
-/// dependencies up to `depth_limit` levels deep.
+/// dependencies up to `depth_limit` levels deep. Root files are resolved as
+/// [`resolve_root_nodes`] describes.
 ///
 /// Returns the union of all root `NodeID`s and their resolved dependency `NodeID`s.
 /// Emits `DependencyResolveBegin`, `DependencyResolveItem`, and `DependencyResolveEnd`
@@ -205,42 +245,17 @@ pub async fn check_cycle(
 pub async fn resolve_dependency_file_set(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
-    root_paths: &[&str],
+    root_paths: &[String],
     tags: &[&str],
     recursive: bool,
     depth_limit: u32,
 ) -> Result<HashSet<NodeID>, DependencyError> {
-    event::LoreEvent::DependencyResolveBegin(LoreDependencyResolveBeginEventData {
-        root_count: root_paths.len() as u64,
-    })
-    .send();
-
-    // Resolve root paths to NodeIDs
-    let mut root_nodes = Vec::with_capacity(root_paths.len());
-    let mut inclusion_set = HashSet::new();
-    for path in root_paths {
-        let node_link = state
-            .find_node_link(repository.clone(), path)
-            .await
-            .map_err(|err| {
-                forward_refusal_or(err, "finding the root path", |err| {
-                    DependencyError::FileNotFound(
-                        FileNotFound {
-                            resource: (*path).to_string(),
-                        }
-                        .chain_err_from(err, "root path not found in state"),
-                    )
-                })
-            })?;
-        if !node_link.is_valid() {
-            return Err(FileNotFound {
-                resource: (*path).to_string(),
-            }
-            .into());
-        }
-        root_nodes.push(node_link.node);
-        inclusion_set.insert(node_link.node);
-    }
+    let root_nodes: Vec<NodeID> = resolve_root_nodes(&repository, &state, root_paths)
+        .await?
+        .into_iter()
+        .map(|(node, _)| node)
+        .collect();
+    let mut inclusion_set: HashSet<NodeID> = root_nodes.iter().copied().collect();
 
     // Resolve dependencies — events are emitted from within the transitive
     // closure producers (recursive) or inline below (direct only)

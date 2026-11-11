@@ -700,7 +700,8 @@ pub struct LoreRevisionSyncArgs {
     pub forward_changes: u8,
     /// Reset local modified files to match the incoming revision
     pub reset: u8,
-    /// Root files for dependency-based selective sync
+    /// Root files for dependency-based selective sync. A root file inside a link is skipped, and
+    /// error code 9 (not supported) is returned when every root file is.
     pub root_files: LoreArray<LoreString>,
     /// Tags to filter dependencies by during resolution
     pub dependency_tags: LoreArray<LoreString>,

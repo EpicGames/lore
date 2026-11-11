@@ -130,7 +130,8 @@ pub struct LoreRepositoryCloneArgs {
     pub shared_store_path: LoreString,
     /// Clone without local repository tracking (memory-only stores)
     pub no_tracking: u8,
-    /// Root files for dependency-based selective clone
+    /// Root files for dependency-based selective clone. A root file inside a link is skipped, and
+    /// error code 9 (not supported) is returned when every root file is.
     pub root_files: LoreArray<LoreString>,
     /// Tags to filter dependencies by during resolution
     pub dependency_tags: LoreArray<LoreString>,

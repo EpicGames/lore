@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 LoreLab.io
 // SPDX-License-Identifier: MIT
 
-//! A tree walk whose read the store refuses as `SlowDown`. Its own process, as it lowers the
-//! process-wide store retry bound to one try, so the refusal reaches the walk at once.
+//! Reads of a revision's tree that the store refuses as `SlowDown`. Its own process, as it lowers
+//! the process-wide store retry bound to one try, so the refusal reaches the reader at once.
 
 #[path = "helper.rs"]
 mod helper;
@@ -20,6 +20,7 @@ use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_base::types::VerifyResult;
+use lore_revision::dependency::resolve::resolve_dependency_file_set;
 use lore_revision::link::LinkFlags;
 use lore_revision::lore::RepositoryId;
 use lore_revision::node::Node;
@@ -148,16 +149,9 @@ async fn commit_a_change(source: &Arc<RepositoryContext>) -> (Hash, Tree) {
     (second, tree)
 }
 
-/// The walk of the tree of `revision`, `max_depth` levels deep or all of them for 0, by a
-/// repository with nothing stored, reading through a remote that serves what `source` stores and
-/// refuses `refused` as `SlowDown`.
-async fn walk_refusing(
-    source: &Arc<RepositoryContext>,
-    revision: Hash,
-    refused: Hash,
-    max_depth: usize,
-    attribute: bool,
-) -> Result<TreeWalk, StateError> {
+/// A repository with nothing stored, reading through a remote that serves what `source` stores
+/// and refuses `refused` as `SlowDown`.
+async fn refusing_reader(source: &Arc<RepositoryContext>, refused: Hash) -> Arc<RepositoryContext> {
     let (immutable, mutable, _) = helper::test_store_create()
         .await
         .expect("creating the stores");
@@ -165,13 +159,24 @@ async fn walk_refusing(
         source: source.clone(),
         refused,
     });
-    let reader = Arc::new(RepositoryContext::new(
+    Arc::new(RepositoryContext::new(
         helper::default_repository_creation_args(immutable, mutable)
             .with_id(source.id)
             .with_remote(Ok(Connection::detached(vec![remote]))),
-    ));
+    ))
+}
+
+/// The walk of the tree of `revision`, `max_depth` levels deep or all of them for 0, by
+/// [`refusing_reader`].
+async fn walk_refusing(
+    source: &Arc<RepositoryContext>,
+    revision: Hash,
+    refused: Hash,
+    max_depth: usize,
+    attribute: bool,
+) -> Result<TreeWalk, StateError> {
     tree(
-        reader,
+        refusing_reader(source, refused).await,
         revision,
         RelativePath::default(),
         max_depth,
@@ -260,6 +265,28 @@ async fn a_refused_link_list_read_fails_the_walk() {
                 walked.err()
             );
         }
+    })
+    .await;
+}
+
+/// A node-block read refused as `SlowDown` fails the lookup of a dependency set's root file with
+/// it, rather than reporting the file missing.
+#[tokio::test]
+async fn a_refused_node_block_read_fails_a_root_file_lookup() {
+    with_repository(async |source| {
+        let (revision, tree) = commit_a_change(&source).await;
+        let reader = refusing_reader(&source, tree.hash_node).await;
+        let state = State::deserialize(reader.clone(), revision)
+            .await
+            .expect("the revision state");
+        let resolved =
+            resolve_dependency_file_set(reader, state, &["kept.bin".to_string()], &[], false, 0)
+                .await;
+        assert!(
+            resolved.as_ref().is_err_and(|err| err.is_slow_down()),
+            "{:?}",
+            resolved.err()
+        );
     })
     .await;
 }

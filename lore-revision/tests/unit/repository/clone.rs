@@ -351,6 +351,38 @@ async fn a_clone_reports_missing_content_across_many_blocks() {
         .await;
 }
 
+/// A clone whose root file the revision does not hold reports the file as not found.
+#[tokio::test]
+async fn a_clone_reports_a_missing_root_file_as_not_found() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let temp = TempDir::new("lore-clone-missing-root-file-");
+            let repository = working_tree_repository(temp.path()).await;
+            let ctx = CloneContext {
+                operation: repository
+                    .file_system()
+                    .begin_operation()
+                    .await
+                    .expect("Starting test operation"),
+                repository,
+                state: State::new(),
+                options: Arc::new(CloneOptions {
+                    root_files: vec!["missing.txt".to_string()],
+                    ..Default::default()
+                }),
+                stats: Arc::default(),
+                modified_times: Arc::default(),
+            };
+
+            let error = clone_in_path(ctx)
+                .await
+                .expect_err("the root file is missing");
+
+            assert!(error.is_file_not_found(), "{error:?}");
+        })
+        .await;
+}
+
 /// The directories `a` and `a/b`, and the files `a/b/f` and `g`.
 fn nested_entries() -> Vec<(String, Node)> {
     vec![
