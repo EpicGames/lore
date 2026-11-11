@@ -39,6 +39,7 @@ use zerocopy::FromZeros;
 use crate::branch::null_repository;
 use crate::fs::filesystem_provider::setup_test_execution;
 use crate::hooked_store::StoreCall;
+use crate::repository::test_helpers::caused_by;
 use crate::repository::test_helpers::file_node;
 use crate::repository::test_helpers::working_tree_repository;
 use crate::repository::test_helpers::working_tree_repository_filtered;
@@ -310,11 +311,6 @@ async fn state_of_unwritable_files(
         }
     }
     state
-}
-
-/// Whether `error`, or an error among its sources, is a `T`.
-fn caused_by<T: std::error::Error + 'static>(error: &(dyn std::error::Error + 'static)) -> bool {
-    std::iter::successors(Some(error), |error| error.source()).any(|error| error.is::<T>())
 }
 
 /// A clone with unavailable content reports the missing address even when discovery spans

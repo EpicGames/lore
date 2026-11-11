@@ -12,12 +12,8 @@ use tokio_util::task::AbortOnDropHandle;
 
 use crate::errors::*;
 use crate::find;
-use crate::immutable::ImmutableError;
-use crate::immutable::ReadFromImmutable;
-use crate::lore::Address;
 use crate::lore::Hash;
 use crate::repository::RepositoryContext;
-use crate::state::StateData;
 
 #[error_set]
 pub enum HistoryError {
@@ -141,8 +137,9 @@ impl Line {
     }
 
     /// Walk up to ten revisions of the line in the local store, as far as the store holds them,
-    /// reading each state from the store alone. The first revision the store lacks is added to the
-    /// line, numbered zero, and the line asks the remote for the page holding it.
+    /// reading each state with a [`find::local_line_step`]. The first revision the store lacks is
+    /// added to the line, numbered zero, and the line asks the remote for the page holding it. A
+    /// blob that is not a revision state fails the walk.
     async fn walk_store(
         &mut self,
         repository: &Arc<RepositoryContext>,
@@ -151,29 +148,29 @@ impl Line {
             if self.cursor.is_zero() {
                 break;
             }
-            let hash = self.cursor;
-            let state = match StateData::read_from_immutable(
-                repository.clone(),
-                Address::zero_context_hash(hash),
-                ReadOptions::default().no_remote(),
+            let (number, parent) = match find::local_line_step(
+                repository,
+                self.cursor,
+                ReadOptions::default(),
             )
             .await
             {
-                Ok(state) => state,
-                Err(ImmutableError::AddressNotFound(_) | ImmutableError::PayloadNotFound(_)) => {
-                    self.push(0, hash);
+                Ok(Some(step)) => step,
+                Ok(None) => {
+                    self.push(0, self.cursor);
                     self.step = Step::Remote;
                     break;
                 }
                 Err(err) => {
+                    let hash = self.cursor;
                     return Err(err).forward_with::<HistoryError, _>(|| {
                         format!("reading the state of revision {hash}")
                     });
                 }
             };
-            self.push(state.revision_number, hash);
+            self.push(number, self.cursor);
             // TODO(mjansson): Support finding through merged and other parent
-            self.cursor = state.parent[0];
+            self.cursor = parent;
         }
         Ok(())
     }
@@ -456,7 +453,8 @@ fn stall<T>(left: Line, right: Line) -> Result<T, HistoryError> {
 /// new cursor, and a line ends where the remote does not hold the revision asked for. A request
 /// that fails, or a page that does not move the line, stops the line where it is, and the remote
 /// is not asked for it again. A page that lists a revision on the line without its own state fails
-/// the walk, as [`ask_remote`] describes.
+/// the walk, as [`ask_remote`] describes, and so does a blob in the local store that is not a
+/// revision state, as [`Line::walk_store`] describes.
 ///
 /// Each round takes the lines on to where they meet as [`meet`] describes, from where the round
 /// before left them: before the remote is asked, short of the revisions the page will number, as

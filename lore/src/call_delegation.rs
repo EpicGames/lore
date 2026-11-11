@@ -19,8 +19,7 @@ use crate::args::LoreArgs;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreEventCallbackConfig;
 use crate::remote::call::ServiceCallError;
-use crate::remote::call::service_call;
-use crate::remote::call::service_call_over;
+use crate::remote::call::run_service_call;
 use crate::remote::command::LoreCommand;
 use crate::remote::service_process::ServiceProcessError;
 use crate::remote::service_process::ServiceStart;
@@ -340,7 +339,7 @@ async fn forced_service_call(
 ) -> i32 {
     let unreached = match connect_to_running_service().await {
         Ok(Some(connection)) => {
-            return service_call_over(connection, globals, command, callback).await;
+            return run_service_call(Some(connection), globals, command, callback).await;
         }
         Ok(None) => None,
         Err(error) => Some(error),
@@ -355,7 +354,7 @@ async fn forced_service_call(
 /// where that is `None`, finding none running. Starts one where [`starts_a_service`] holds and
 /// runs the call on it, or else reports why none could be had.
 ///
-/// Boxed by its caller: it holds a second [`service_call_over`], and runs only where a service is
+/// Boxed by its caller: it holds a second [`run_service_call`], and runs only where a service is
 /// missing, so the future of every forced call stays the size of the call over a running service.
 async fn unanswered_forced_service_call(
     globals: LoreGlobalArgs,
@@ -370,7 +369,7 @@ async fn unanswered_forced_service_call(
     if unreached.is_none() && starts_a_service(&globals, makes_instance).await {
         match connect_or_spawn_service(ServiceStart::NamedOrThisProgram).await {
             Ok(connection) => {
-                return service_call_over(connection, globals, command, callback).await;
+                return run_service_call(Some(connection), globals, command, callback).await;
             }
             Err(error) => unreached = Some(error),
         }
@@ -445,7 +444,7 @@ fn run_forced(globals: LoreGlobalArgs, command: LoreCommand, callback: LoreEvent
 /// future is in a frame of its own rather than under every command run in this process.
 #[inline(never)]
 fn run_relayed(globals: LoreGlobalArgs, command: LoreCommand, callback: LoreEventCallback) -> i32 {
-    block_on_command(pin!(service_call(globals, command, callback)))
+    block_on_command(pin!(run_service_call(None, globals, command, callback)))
 }
 
 /// Runs `command` to completion in this process, for the commands that act on the Lore service
@@ -480,7 +479,7 @@ pub(crate) async fn dispatch_command(
         let relay = pin!(forced_service_call(globals, command, callback));
         relay.await
     } else if service_in_use().await {
-        let relay = pin!(service_call(globals, command, callback));
+        let relay = pin!(run_service_call(None, globals, command, callback));
         relay.await
     } else {
         let handler = pin!(command.invoke_local(globals, callback));
@@ -513,7 +512,7 @@ pub(crate) async fn dispatch_call<
         return forced_service_call(globals, args.to_command(), callback).await;
     }
     if service_in_use().await {
-        service_call(globals, args.to_command(), callback).await
+        run_service_call(None, globals, args.to_command(), callback).await
     } else {
         handler(globals, args, callback).await
     }

@@ -1805,6 +1805,7 @@ async fn create_branch(
             &metadata.stack,
         )
         .await
+        .map(|record| record.latest)
         .forward::<PushError>("creating branch on remote")
 }
 

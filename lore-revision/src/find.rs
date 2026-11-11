@@ -13,6 +13,7 @@ use crate::errors::SlowDown;
 use crate::errors::absent_unless;
 use crate::event;
 use crate::immutable;
+use crate::immutable::ImmutableError;
 use crate::immutable::ReadFromImmutable;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
@@ -254,14 +255,116 @@ pub async fn revision_by_number(
     .await
 }
 
+/// What a walk of a revision's line in the local store finds for a revision number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumberWalk {
+    /// The revision with the number.
+    Found(Hash),
+    /// No revision on the line has the number: the walk reached a revision numbered below it, or
+    /// the end of the line.
+    Absent,
+    /// The read of this revision's state answered `AddressNotFound` before the walk could tell
+    /// whether the line holds the number: the local store lacks the state or, on a context without
+    /// strict-local reads, the read failed or found its payload corrupt. With the remote off, a
+    /// context that reads from the remote alone ([`RepositoryContext::reading_remote_only`]) reads
+    /// nothing, so the walk answers this for any non-zero start.
+    Missing(Hash),
+}
+
+/// Find the revision numbered `number` on the line from `revision` back through self parents, in
+/// the local store alone. The walk stops at the first revision numbered at or below `number`, as
+/// [`revision_by_number`] does, and where the line ends or leaves the store. Each step is one
+/// [`local_line_step`], with the options `repository` gives its reads. A state the store lacks is
+/// [`NumberWalk::Missing`]; any other read error fails the walk, a failed or corrupt read among
+/// them on a strict-local context, and so does a blob that is not a revision state.
+///
+/// [`revision_by_number`] costs more per step: it probes the store, builds a [`State`], and fetches
+/// and caches from the remote what the store lacks.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn revision_by_number_local(
+    repository: &Arc<RepositoryContext>,
+    mut revision: Hash,
+    number: u64,
+) -> impl Future<Output = Result<NumberWalk, FindError>> + '_ {
+    async move {
+        let options = immutable::read_options_from_repository(repository);
+        while !revision.is_zero() {
+            let (revision_number, parent) =
+                match local_line_step(repository, revision, options).await {
+                    Ok(Some(step)) => step,
+                    Ok(None) => return Ok(NumberWalk::Missing(revision)),
+                    Err(err) => {
+                        return Err(err).forward_any_with::<FindError, _>(|| {
+                            format!("reading the state of revision {revision}")
+                        });
+                    }
+                };
+            match revision_number.cmp(&number) {
+                Ordering::Equal => return Ok(NumberWalk::Found(revision)),
+                Ordering::Less => break,
+                Ordering::Greater => revision = parent,
+            }
+        }
+        Ok(NumberWalk::Absent)
+    }
+}
+
+/// One step of a walk along a line in the local store: the number and first parent of `revision`,
+/// read from its state with `options` and the remote off, as [`line_step`] describes. Its error
+/// does not name `revision`.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[inline]
+pub(crate) fn local_line_step(
+    repository: &Arc<RepositoryContext>,
+    revision: Hash,
+    options: ReadOptions,
+) -> impl Future<Output = Result<Option<(u64, Hash)>, ImmutableError>> + Send {
+    let read = StateData::read_from_immutable(
+        repository.clone(),
+        Address::zero_context_hash(revision),
+        options.no_remote(),
+    );
+    futures::FutureExt::map(read, line_step)
+}
+
+/// The number and first parent of the state `read` gives, or `None` where the store answered
+/// `AddressNotFound`. A blob whose header lacks the state magic fails with an internal error,
+/// rather than giving its bytes as a number and a parent. The format version is not checked, so a
+/// state a newer client wrote is still walked.
+fn line_step(
+    read: Result<StateData, ImmutableError>,
+) -> Result<Option<(u64, Hash)>, ImmutableError> {
+    match read {
+        Ok(state) if state.has_state_magic() => Ok(Some((state.revision_number, state.parent[0]))),
+        Ok(_) => Err(ImmutableError::internal("the blob is not a revision state")),
+        Err(ImmutableError::AddressNotFound(_)) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 pub const BATCH_COUNT: usize = 100;
 
+/// The revisions of `batch`, a batch [`batch_load_history`] loaded from `start`, below `start`:
+/// without `start`, which the batch lists first. Empty where nothing below `start` was loaded, as
+/// at the end of the line.
+pub(crate) fn below(batch: &[(u64, Hash)], start: Hash) -> &[(u64, Hash)] {
+    match batch.split_first() {
+        Some((first, rest)) if first.1 == start => rest,
+        _ => batch,
+    }
+}
+
 /// The line from `revision` back through self parents, newest first, each revision with its
-/// number: the revisions the local store holds, up to [`BATCH_COUNT`], then the remote's page from
-/// the first revision the store lacks, whole. Empty where the remote cannot list that page. The
-/// number of a listed revision is read from its state, as [`verified_number`] describes, and the
-/// page's states are cached as [`cache_page_states`] describes. Fails where the page lists a
-/// revision on the line without its own state.
+/// number: the revisions the local store holds, up to [`BATCH_COUNT`], each read by a
+/// [`local_line_step`], then the remote's page from the revision the local walk stops at, whole.
+/// The local walk stops at a revision whose step gives no number and parent: one the store lacks,
+/// a failed read, or a blob that is not a revision state. Where the remote cannot list that page,
+/// only the revisions the local walk read. The number of a listed revision is read from its state,
+/// as [`verified_number`] describes, and the page's states are cached as [`cache_page_states`]
+/// describes. Fails where the page lists a revision on the line without its own state.
 pub async fn batch_load_history(
     repository: Arc<RepositoryContext>,
     mut revision: Hash,
@@ -270,15 +373,11 @@ pub async fn batch_load_history(
 
     while !revision.is_zero()
         && history.len() < BATCH_COUNT
-        && let Ok(state) = StateData::read_from_immutable(
-            repository.clone(),
-            Address::zero_context_hash(revision),
-            ReadOptions::default().no_remote(),
-        )
-        .await
+        && let Ok(Some((number, parent))) =
+            local_line_step(&repository, revision, ReadOptions::default()).await
     {
-        history.push((state.revision_number, revision));
-        revision = state.parent[0];
+        history.push((number, revision));
+        revision = parent;
     }
 
     if revision.is_zero() || history.len() >= BATCH_COUNT {
@@ -286,16 +385,16 @@ pub async fn batch_load_history(
     }
 
     let Ok(remote) = repository.remote().await else {
-        return Ok(vec![]);
+        return Ok(history);
     };
     let Ok(revision_protocol) = remote.revision(repository.id).await else {
-        return Ok(vec![]);
+        return Ok(history);
     };
 
     lore_debug!("Query remote for revision state history");
 
     let Ok(response) = revision_protocol.revision_list(revision.into()).await else {
-        return Ok(vec![]);
+        return Ok(history);
     };
 
     lore_debug!("Got {} revisions", response.items.len(),);

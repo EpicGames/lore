@@ -24,7 +24,7 @@ use crate::call::no_repository_call;
 use crate::interface::LoreEvent;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreString;
-use crate::remote::call::service_call_over;
+use crate::remote::call::run_service_call;
 use crate::remote::service_process::ServiceProcessError;
 use crate::remote::service_process::ServiceStart;
 use crate::remote::service_process::collect_exited_services;
@@ -168,7 +168,7 @@ async fn stop_local(
     // on a service that is running and must not be what starts one.
     match connect_to_running_service().await {
         Ok(Some(connection)) => {
-            let status = service_call_over(connection, globals, args.into(), callback).await;
+            let status = run_service_call(Some(connection), globals, args.into(), callback).await;
             if status != 0 {
                 return status;
             }
@@ -436,7 +436,7 @@ async fn status_local(
     match connect_to_running_service().await {
         Ok(Some(connection)) => {
             // Service is running; relay the status command to it.
-            service_call_over(connection, globals, args.into(), callback).await
+            run_service_call(Some(connection), globals, args.into(), callback).await
         }
         Ok(None) => {
             // No service is listening; emit not-running status.

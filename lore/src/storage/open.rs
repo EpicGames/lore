@@ -29,6 +29,7 @@ use lore_macro::ValidateText;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreString;
 use lore_revision::lore::execution_context;
+use lore_revision::protocol::RemoteEndpoint;
 use lore_revision::repository;
 use lore_revision::repository::get_dot_lore_path;
 use lore_revision::store::event::LoreStorageOpenedEventData;
@@ -47,7 +48,6 @@ use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::storage::handle;
-use crate::storage::remote::RemoteEndpoint;
 use crate::storage::store::BoundFlags;
 use crate::storage::store::StoreInternal;
 

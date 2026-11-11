@@ -3,3 +3,4 @@
 
 mod complete_outcome_tests;
 mod drain_tests;
+mod filter_tests;

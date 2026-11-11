@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::Path;
@@ -13,6 +14,8 @@ use lore_base::fs::lock::FSLock;
 use lore_base::types::Hash;
 use lore_error_set::prelude::*;
 use lore_io::clone::CloneStats;
+use lore_storage::ReadOptions;
+use lore_storage::StoreError;
 use lore_storage::store_types::KeyType;
 use serde::Serialize;
 use zerocopy::FromBytes;
@@ -57,6 +60,7 @@ use crate::metadata::Metadata;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryContextCreationArgs;
 use crate::repository::VfsType;
+use crate::util::to_hex_str;
 
 pub const INSTANCE_METADATA: &str = "instance-metadata";
 pub const ANCHOR_CURRENT: &str = "anchor-current";
@@ -140,8 +144,10 @@ impl InstanceId {
 /// The value stored at this key is the hash of the instance metadata blob
 /// in the immutable store (containing instance ID, path, and creation timestamp).
 pub fn instance_key(salt: &[u8], instance: InstanceId) -> (Hash, KeyType) {
-    let key = hash::hash_function_arg(salt, INSTANCE_METADATA, instance.text_encoding().as_str());
-    (key, KeyType::Instance)
+    (
+        hash_instance_function(salt, INSTANCE_METADATA, instance),
+        KeyType::Instance,
+    )
 }
 
 /// Derive the mutable store key for an instance's anchor.
@@ -149,29 +155,16 @@ pub fn instance_key(salt: &[u8], instance: InstanceId) -> (Hash, KeyType) {
 /// The `function` parameter selects which anchor (`ANCHOR_CURRENT` or
 /// `ANCHOR_STAGED`). The value stored at this key is the revision hash.
 pub fn anchor_key(salt: &[u8], function: &str, instance: InstanceId) -> (Hash, KeyType) {
-    let key = hash::hash_function_arg(salt, function, hex::encode(instance.data()).as_str());
-    (key, KeyType::Untyped)
+    (
+        hash_instance_function(salt, function, instance),
+        KeyType::Untyped,
+    )
 }
 
-/// The anchor `function` of `instance`, zero where the store holds none.
-///
-/// # Errors
-///
-/// The store's error reading it.
-pub(crate) async fn load_anchor(
-    repository: &RepositoryContext,
-    function: &str,
-    instance: InstanceId,
-) -> Result<Hash, lore_storage::StoreError> {
-    let (key, key_type) = anchor_key(repository.salt(), function, instance);
-    match repository
-        .read_mutable_store()
-        .load(repository.id, key, key_type)
-        .await
-    {
-        Err(err) if err.is_address_not_found() => Ok(Hash::default()),
-        loaded => loaded,
-    }
+/// Hash `salt`, `function` and the lower-case hex of `instance`, encoding the hex on the stack.
+fn hash_instance_function(salt: &[u8], function: &str, instance: InstanceId) -> Hash {
+    let mut digits = [0u8; 32];
+    hash::hash_function_arg(salt, function, to_hex_str(instance.data(), &mut digits))
 }
 
 const PATH: &str = "path";
@@ -425,38 +418,36 @@ pub async fn load_instance_metadata(
     let metadata = Metadata::deserialize(repository.clone(), metadata_hash)
         .await
         .forward::<InstanceRegistryError>("failed to deserialize instance metadata")?;
+    Ok(instance_metadata_of(&metadata))
+}
 
-    // Missing or corrupt fields are non-fatal — instance metadata is advisory
-    // (used for branch checkout warnings and stale instance detection), not
-    // required for correctness. Default values degrade gracefully: an empty
-    // path causes the instance to appear stale, zero timestamp is harmless,
-    // and a zero instance ID means the ID can be recovered from the mutable
-    // store key instead.
-    let instance_id = metadata
-        .get_string(INSTANCE_ID)
-        .ok()
-        .and_then(|s| hex::decode(s).ok())
-        .and_then(|bytes| {
-            let mut id = InstanceId::default();
-            if bytes.len() == 16 {
-                id.as_mut_bytes().copy_from_slice(&bytes);
-                Some(id)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
-    let path = metadata
+/// The registration that the blob `metadata` holds. A missing or corrupt field reads as its
+/// default, and [`instance_staleness`] reads an empty path as active.
+fn instance_metadata_of(metadata: &Metadata) -> InstanceMetadata {
+    InstanceMetadata {
+        instance_id: registered_id(metadata),
+        path: registered_path(metadata),
+        created: metadata.get_u64(CREATED).unwrap_or_default(),
+    }
+}
+
+/// The instance id that the registration blob `metadata` holds, zero where it holds none or one
+/// that isn't 16 bytes in hex.
+fn registered_id(metadata: &Metadata) -> InstanceId {
+    let mut id = InstanceId::default();
+    match metadata.get_string(INSTANCE_ID) {
+        Ok(text) if hex::decode_to_slice(text, id.as_mut_bytes()).is_ok() => id,
+        _ => InstanceId::default(),
+    }
+}
+
+/// The path that the registration blob `metadata` holds, empty where it holds none or one that
+/// isn't UTF-8.
+fn registered_path(metadata: &Metadata) -> String {
+    metadata
         .get_string(PATH)
-        .map(|s| s.to_string())
-        .unwrap_or_default();
-    let created = metadata.get_u64(CREATED).unwrap_or_default();
-
-    Ok(InstanceMetadata {
-        instance_id,
-        path,
-        created,
-    })
+        .map(str::to_owned)
+        .unwrap_or_default()
 }
 
 /// Attempt to recover a lost instance ID by enumerating all registered
@@ -562,25 +553,202 @@ pub async fn instances_on_branch(
 
         // Load the branch from the ANCHOR_CURRENT_BRANCH key — the
         // authoritative source of which branch an instance is on.
-        let (branch_key, branch_key_type) = anchor_key(
-            repository.salt(),
-            ANCHOR_CURRENT_BRANCH,
-            instance.instance_id,
-        );
-        let branch = match repository
-            .read_mutable_store()
-            .load(repository.id, branch_key, branch_key_type)
-            .await
-        {
-            Ok(hash) if !hash.is_zero() => hash.to_context(),
-            _ => continue,
-        };
+        let branch =
+            match load_anchor(repository, ANCHOR_CURRENT_BRANCH, instance.instance_id).await {
+                Ok(Some(hash)) => hash.to_context(),
+                _ => continue,
+            };
 
         if branch == target_branch {
             matches.push(instance);
         }
     }
     Ok(matches)
+}
+
+/// The value of the anchor key of `instance_id` that `function` names: `None` where the key is
+/// absent or holds zero.
+async fn load_anchor(
+    repository: &RepositoryContext,
+    function: &str,
+    instance_id: InstanceId,
+) -> Result<Option<Hash>, StoreError> {
+    let (key, key_type) = anchor_key(repository.salt(), function, instance_id);
+    match repository
+        .read_mutable_store()
+        .load(repository.id, key, key_type)
+        .await
+    {
+        Ok(hash) => Ok(Some(hash).filter(|hash| !hash.is_zero())),
+        Err(err) if err.is_absent() => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// A registered instance on a branch, as [`records_by_branch`] and [`records_on_branch`] report
+/// it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstanceRecord {
+    /// The instance's id, from its registration
+    pub instance_id: InstanceId,
+    /// The instance's working directory, as registered
+    pub path: String,
+    /// The instance's current revision, zero where it has none
+    pub revision: Hash,
+    /// Whether the registration still describes a live checkout
+    pub staleness: InstanceStaleness,
+}
+
+/// The records of every registered instance with a current branch, grouped by that branch.
+///
+/// Lists the registrations once and reads each one's blob, from the local store alone, and its
+/// current branch, then, for each instance with a current branch, its current revision and its
+/// staleness ([`instance_staleness`]). Retires nothing. A failed store read fails the lookup rather
+/// than leaving the instance out. A registration blob the store doesn't hold is skipped, and so is
+/// one that names no usable instance id.
+pub async fn records_by_branch(
+    repository: &Arc<RepositoryContext>,
+) -> Result<HashMap<BranchId, Vec<InstanceRecord>>, InstanceError> {
+    let mut records: HashMap<BranchId, Vec<InstanceRecord>> = HashMap::new();
+    visit_records(repository, None, |branch, record| {
+        records.entry(branch).or_default().push(record);
+    })
+    .await?;
+    Ok(records)
+}
+
+/// The records of the registered instances whose current branch is `branch`.
+///
+/// Reads as [`records_by_branch`] does, except that it reads the current revision and the
+/// staleness only of the instances on `branch`.
+pub async fn records_on_branch(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+) -> Result<Vec<InstanceRecord>, InstanceError> {
+    let mut records = Vec::new();
+    visit_records(repository, Some(branch), |_, record| records.push(record)).await?;
+    Ok(records)
+}
+
+/// Pass the current branch and record of each registered instance with a current branch to
+/// `visit`, or only of those on `only`, reading as [`records_by_branch`] describes.
+///
+/// Every registration's blob is read, since only the blob holds the instance id the anchor keys
+/// derive from. The instance of `repository` is visited as any other.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn visit_records<'a>(
+    repository: &'a Arc<RepositoryContext>,
+    only: Option<BranchId>,
+    mut visit: impl FnMut(BranchId, InstanceRecord) + 'a,
+) -> impl Future<Output = Result<(), InstanceError>> + 'a {
+    async move {
+        use futures::StreamExt;
+
+        let mut registrations = repository
+            .read_mutable_store()
+            .list(repository.id, KeyType::Instance)
+            .await
+            .forward::<InstanceError>("listing registered instances")?;
+        loop {
+            let Some((_, metadata_hash)) = registrations.next().await else {
+                return Ok(());
+            };
+            let Some((registration, instance_id)) =
+                read_registration(repository, metadata_hash).await?
+            else {
+                continue;
+            };
+            if let Some((branch, record)) =
+                instance_record(repository, only, registration, instance_id).await?
+            {
+                visit(branch, record);
+            }
+        }
+    }
+}
+
+/// The current branch and record of the instance `instance_id` that the registration blob
+/// `registration` holds, or `None` where it has no current branch or, where `only` is given,
+/// another one. The path is read from the blob only for an instance this reports.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn instance_record(
+    repository: &Arc<RepositoryContext>,
+    only: Option<BranchId>,
+    registration: Metadata,
+    instance_id: InstanceId,
+) -> impl Future<Output = Result<Option<(BranchId, InstanceRecord)>, InstanceError>> + '_ {
+    async move {
+        let Some(branch) = load_anchor(repository, ANCHOR_CURRENT_BRANCH, instance_id)
+            .await
+            .forward::<InstanceError>("loading the current branch of an instance")?
+            .map(|hash| hash.to_context())
+        else {
+            return Ok(None);
+        };
+        if only.is_some_and(|only| only != branch) {
+            return Ok(None);
+        }
+        let path = registered_path(&registration);
+        let revision = load_anchor(repository, ANCHOR_CURRENT, instance_id)
+            .await
+            .forward::<InstanceError>("loading the current revision of an instance")?
+            .unwrap_or_default();
+        let staleness = instance_staleness(&path, instance_id).await;
+        Ok(Some((
+            branch,
+            InstanceRecord {
+                instance_id,
+                path,
+                revision,
+                staleness,
+            },
+        )))
+    }
+}
+
+/// The registration blob that `metadata_hash` names and the instance id it holds, read from the
+/// local store alone with strict local reads, or `None` where `metadata_hash` is zero, as the key
+/// of a retired registration holds, the store doesn't hold the blob, or the blob names no usable
+/// instance id ([`registered_id`]). The anchors under the zero id are any that a context with a
+/// zero instance id wrote, not that registration's.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn read_registration(
+    repository: &Arc<RepositoryContext>,
+    metadata_hash: Hash,
+) -> impl Future<Output = Result<Option<(Metadata, InstanceId)>, InstanceError>> + '_ {
+    async move {
+        if metadata_hash.is_zero() {
+            return Ok(None);
+        }
+        let options = ReadOptions::default().no_remote().with_strict_local();
+        match Metadata::deserialize_with(repository.clone(), metadata_hash, options).await {
+            Err(err) if err.is_address_not_found() => {
+                lore_debug!(
+                    "Skipping instance registration {metadata_hash}, whose blob the store doesn't \
+                     hold"
+                );
+                Ok(None)
+            }
+            Ok(registration) => {
+                let instance_id = registered_id(&registration);
+                if instance_id.is_zero() {
+                    lore_debug!(
+                        "Skipping instance registration {metadata_hash}, whose blob names no \
+                         usable instance id"
+                    );
+                    return Ok(None);
+                }
+                Ok(Some((registration, instance_id)))
+            }
+            Err(err) => Err(err).forward::<InstanceError>("reading an instance registration"),
+        }
+    }
 }
 
 /// Event data warning that several instances share the same checked-out branch.
@@ -630,11 +798,13 @@ pub(crate) async fn load_current_anchor(
 ) -> Result<(Hash, BranchId), AnchorError> {
     let revision = load_anchor(repository, ANCHOR_CURRENT, repository.instance_id)
         .await
+        .ok()
+        .flatten()
         .unwrap_or_default();
     let branch = load_anchor(repository, ANCHOR_CURRENT_BRANCH, repository.instance_id)
         .await
         .ok()
-        .filter(|h| !h.is_zero())
+        .flatten()
         .map(|h| h.to_context());
 
     if let Some(branch) = branch {
@@ -675,12 +845,10 @@ pub fn load_current_anchor_boxed(
 pub async fn load_staged_revision(
     repository: &Arc<RepositoryContext>,
 ) -> Result<Option<Hash>, AnchorError> {
-    let (key, key_type) = anchor_key(repository.salt(), ANCHOR_STAGED, repository.instance_id);
-    if let Ok(hash) = repository
-        .read_mutable_store()
-        .load(repository.id, key, key_type)
+    if let Some(hash) = load_anchor(repository, ANCHOR_STAGED, repository.instance_id)
         .await
-        && !hash.is_zero()
+        .ok()
+        .flatten()
     {
         return Ok(Some(hash));
     }
@@ -980,7 +1148,7 @@ async fn instance_anchor_state(
     let branch_id = load_anchor(repository, ANCHOR_CURRENT_BRANCH, instance_id)
         .await
         .ok()
-        .filter(|h| !h.is_zero())
+        .flatten()
         .map(|h| h.to_context())
         .unwrap_or_default();
     let branch_name = if !branch_id.is_zero() {
@@ -995,6 +1163,8 @@ async fn instance_anchor_state(
 
     let revision = load_anchor(repository, ANCHOR_CURRENT, instance_id)
         .await
+        .ok()
+        .flatten()
         .unwrap_or_default();
 
     (branch_id, branch_name, revision)
@@ -2345,7 +2515,8 @@ async fn clone_anchors(
             .await
             .forward_with::<InstanceError, _>(|| {
                 format!("reading the {function} of instance {instance}")
-            })?;
+            })?
+            .unwrap_or_default();
     }
     if anchors[1].is_zero() {
         return Err(InstanceError::internal(format!(

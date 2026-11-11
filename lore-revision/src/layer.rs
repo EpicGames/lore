@@ -393,7 +393,8 @@ pub async fn add(
                     &branch_stack,
                 )
                 .await
-                .forward::<LayerError>("Failed to create branch in layer repository")?;
+                .forward::<LayerError>("Failed to create branch in layer repository")?
+                .latest;
 
             lore_debug!(
                 "Layer repository branch {branch_name} created at latest revision {layer_latest}"
@@ -1147,7 +1148,12 @@ pub async fn latest_revision(
 /// The revision of `layer`, searched back from `latest`, whose `metadata` value matches that of a
 /// revision of `repository` at or below `state`, with that revision. Without `metadata`, `latest`
 /// and `state`'s revision. Fails where a batch of either history fails to load, as
-/// [`find::batch_load_history`] describes.
+/// [`find::batch_load_history`] describes, and where no revision matches, as
+/// [`no_matching_revision`] describes.
+///
+/// Where the source line holds more than one revision, as with `search_nearest`, a round keeps the
+/// layer revisions it compared, so the source revisions a later round adds are compared with them.
+/// Otherwise each round compares only the next layer batch.
 #[allow(clippy::too_many_arguments)]
 pub async fn find_revision_match(
     repository: Arc<RepositoryContext>,
@@ -1260,46 +1266,51 @@ pub async fn find_revision_match(
         }
 
         if target_search_count >= search_limit {
-            return Err(LayerError::internal(
-                "Failed to find matching revision for link metadata",
-            ));
+            return Err(no_matching_revision());
         }
 
+        let mut source_grew = false;
         if search_nearest {
             lore_debug!("Batch load additional revisions for source history");
-            let last_revision = source_revisions
-                .last()
-                .map(|tuple| tuple.0)
-                .unwrap_or_default();
-            let revisions = find::batch_load_history(repository.clone(), last_revision)
-                .await
-                .forward::<LayerError>("loading the next batch of the source history")?;
-            let mut additional = revisions
-                .into_iter()
-                .map(|(_, hash)| (hash, None))
-                .collect();
-            source_revisions.append(&mut additional);
+            let revisions =
+                find::batch_load_history(repository.clone(), last_hash(&source_revisions))
+                    .await
+                    .forward::<LayerError>("loading the next batch of the source history")?;
+            let below = find::below(&revisions, last_hash(&source_revisions));
+            source_grew = !below.is_empty();
+            source_revisions.extend(below.iter().map(|&(_, hash)| (hash, None)));
         }
 
         lore_debug!("Batch load additional revisions for target history");
-        let last_revision = target_revisions
-            .last()
-            .map(|tuple| tuple.0)
-            .unwrap_or_default();
-        let revisions = find::batch_load_history(layer.clone(), last_revision)
+        let revisions = find::batch_load_history(layer.clone(), last_hash(&target_revisions))
             .await
             .forward::<LayerError>("loading the next batch of the layer's history")?;
-        let mut additional: Vec<_> = revisions
-            .into_iter()
-            .map(|(_, hash)| (hash, None))
-            .collect();
-        target_search_count += additional.len();
-        if source_revisions.len() > 1 {
-            target_revisions.append(&mut additional);
-        } else {
-            target_revisions = additional;
+        let additional = find::below(&revisions, last_hash(&target_revisions));
+        if additional.is_empty() && !source_grew {
+            return Err(no_matching_revision());
         }
+        target_search_count += additional.len();
+        if source_revisions.len() <= 1 {
+            target_revisions.clear();
+        }
+        target_revisions.extend(additional.iter().map(|&(_, hash)| (hash, None)));
     }
+}
+
+/// The hash of the last revision of `revisions`, a line [`find_revision_match`] searches, or zero
+/// where it holds none. Read again after a batch load rather than held across it, which would
+/// grow the search's future by the hash.
+fn last_hash(revisions: &[(Hash, Option<Vec<u8>>)]) -> Hash {
+    revisions.last().map(|tuple| tuple.0).unwrap_or_default()
+}
+
+/// The error [`find_revision_match`] fails with where no revision matches: its search reached the
+/// search limit, or a round added no revision to either line, so a later round would compare
+/// nothing new. Each line adds the part of its batch below the revision the batch was read from
+/// ([`find::below`]), so a line adds none once it ends, or leaves the local store where no remote
+/// lists it.
+fn no_matching_revision() -> LayerError {
+    LayerError::internal("Failed to find matching revision for link metadata")
 }
 
 pub async fn store_layer_current(

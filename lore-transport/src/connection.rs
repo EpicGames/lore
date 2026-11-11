@@ -1430,6 +1430,14 @@ impl Connection {
             .ok_or_else(|| ProtocolError::internal("not connected"))
     }
 
+    /// The `session_start` fan-outs this connection's storage connector has begun, as
+    /// [`StorageConnector::session_starts`] counts them. 0 while storage isn't connected.
+    #[cfg(feature = "test-util")]
+    pub fn storage_session_starts(&self) -> usize {
+        self.storage_connector()
+            .map_or(0, |connector| connector.session_starts())
+    }
+
     /// Returns a raw storage connection from the pool via round-robin.
     pub async fn storage(self: &Arc<Self>) -> Result<Arc<dyn Storage>, ProtocolError> {
         self.ensure_storage_connected().await?;

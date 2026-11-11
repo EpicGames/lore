@@ -11,270 +11,29 @@
 
 #[cfg(all(test, feature = "integration_tests"))]
 mod storage_copy_on_write_tests {
-    use std::collections::HashMap;
     use std::error::Error;
-    use std::net::SocketAddr;
     use std::sync::Arc;
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
 
-    use bytes::Bytes;
+    use lore::storage::handle::LoreStore;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Address;
     use lore_base::types::Context;
-    use lore_base::types::Fragment;
     use lore_base::types::Partition;
-    use lore_revision::environment::EnvironmentConfig;
-    use lore_revision::event::LoreBytes;
-    use lore_revision::event::LoreEvent;
-    use lore_revision::interface::LoreArray;
-    use lore_revision::interface::LoreEventCallback;
-    use lore_revision::interface::LoreGlobalArgs;
-    use lore_revision::interface::LoreString;
-    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
-    use lore_server::authnz::repository_catalog::BaselineRepositoryCatalog;
-    use lore_server::grpc::server::FeatureSettings;
-    use lore_server::grpc::server::GrpcServerBuilder;
-    use lore_server::grpc::server::GrpcTimeouts;
-    use lore_server::hooks::HookDispatcher;
-    use lore_server::settings::BaselineAccess;
     use lore_storage::ImmutableStore;
-    use lore_storage::StoreError;
-    use lore_storage::StoreGetData;
     use lore_storage::StoreMatch;
-    use lore_storage::StoreMatchResult;
-    use lore_storage::StoreObliterateStats;
-    use lore_storage::immutable_store::CopyBehavior;
     use lore_storage::immutable_store::query_one;
-    use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
-    use lore_storage::local::immutable_store::ImmutableStoreSettings;
 
+    use crate::common::net_common::CountingStore;
+    use crate::common::net_common::Partitions;
+    use crate::common::net_common::Traffic;
+    use crate::common::net_common::close_handle;
+    use crate::common::net_common::make_backends;
+    use crate::common::net_common::open_handle;
+    use crate::common::net_common::put_content;
+    use crate::common::net_common::start_grpc_server;
     use crate::setup_execution;
 
     type TestResult = Result<(), Box<dyn Error>>;
-
-    /// What the peer was asked to do, so a test can say a payload never crossed the wire.
-    #[derive(Debug, Default, PartialEq, Eq)]
-    struct Traffic {
-        payload_puts: usize,
-        empty_puts: usize,
-        copies: usize,
-    }
-
-    /// Counts the write verbs reaching the served store, and optionally refuses `copy` so the
-    /// caller's fallback can be exercised against a peer that will not answer one.
-    struct CountingStore {
-        inner: Arc<dyn ImmutableStore>,
-        payload_puts: AtomicUsize,
-        empty_puts: AtomicUsize,
-        copies: AtomicUsize,
-        copy_sources: Mutex<Vec<(Partition, Address)>>,
-        refuse_copy: bool,
-    }
-
-    impl CountingStore {
-        fn wrapping(inner: Arc<dyn ImmutableStore>, refuse_copy: bool) -> Arc<Self> {
-            Arc::new(Self {
-                inner,
-                payload_puts: AtomicUsize::new(0),
-                empty_puts: AtomicUsize::new(0),
-                copies: AtomicUsize::new(0),
-                copy_sources: Mutex::new(Vec::new()),
-                refuse_copy,
-            })
-        }
-
-        fn new(inner: Arc<dyn ImmutableStore>) -> Arc<Self> {
-            Self::wrapping(inner, false)
-        }
-
-        fn refusing_copy(inner: Arc<dyn ImmutableStore>) -> Arc<Self> {
-            Self::wrapping(inner, true)
-        }
-
-        fn traffic(&self) -> Traffic {
-            Traffic {
-                payload_puts: self.payload_puts.load(Ordering::SeqCst),
-                empty_puts: self.empty_puts.load(Ordering::SeqCst),
-                copies: self.copies.load(Ordering::SeqCst),
-            }
-        }
-
-        fn reset(&self) {
-            self.payload_puts.store(0, Ordering::SeqCst);
-            self.empty_puts.store(0, Ordering::SeqCst);
-            self.copies.store(0, Ordering::SeqCst);
-            self.copy_sources.lock().unwrap().clear();
-        }
-
-        fn copy_sources(&self) -> Vec<(Partition, Address)> {
-            self.copy_sources.lock().unwrap().clone()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ImmutableStore for CountingStore {
-        /// Joins the claim of the store this one wraps.
-        async fn hold_for_command(
-            self: std::sync::Arc<Self>,
-        ) -> std::result::Result<
-            Option<lore_storage::local::store_lock::StoreGuard>,
-            lore_storage::StoreError,
-        > {
-            lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
-        }
-
-        fn is_local(&self) -> bool {
-            self.inner.is_local()
-        }
-
-        fn isolates_partitions(&self) -> bool {
-            self.inner.isolates_partitions()
-        }
-
-        fn read_scope(&self) -> StoreMatch {
-            self.inner.read_scope()
-        }
-
-        fn query_scope(&self) -> StoreMatch {
-            self.inner.query_scope()
-        }
-
-        async fn get(
-            self: Arc<Self>,
-            partition: Partition,
-            address: Address,
-        ) -> Result<StoreGetData, StoreError> {
-            self.inner.clone().get(partition, address).await
-        }
-
-        async fn get_metadata(
-            self: Arc<Self>,
-            partition: Partition,
-            address: Address,
-        ) -> Result<StoreGetData, StoreError> {
-            self.inner.clone().get_metadata(partition, address).await
-        }
-
-        async fn query(
-            self: Arc<Self>,
-            partition: Partition,
-            addresses: &[Address],
-            results: &mut [StoreMatchResult],
-        ) -> Result<(), StoreError> {
-            self.inner
-                .clone()
-                .query(partition, addresses, results)
-                .await
-        }
-
-        async fn put(
-            self: Arc<Self>,
-            partition: Partition,
-            address: Address,
-            fragment: Fragment,
-            payload: Option<Bytes>,
-            force: bool,
-        ) -> Result<(), StoreError> {
-            if payload.is_some() {
-                self.payload_puts.fetch_add(1, Ordering::SeqCst);
-            } else {
-                self.empty_puts.fetch_add(1, Ordering::SeqCst);
-            }
-            self.inner
-                .clone()
-                .put(partition, address, fragment, payload, force)
-                .await
-        }
-
-        async fn copy(
-            self: Arc<Self>,
-            source_partition: Partition,
-            source_address: Address,
-            destination_partition: Partition,
-            destination_context: Context,
-            behavior: CopyBehavior,
-        ) -> Result<(), StoreError> {
-            self.copies.fetch_add(1, Ordering::SeqCst);
-            self.copy_sources
-                .lock()
-                .unwrap()
-                .push((source_partition, source_address));
-            if self.refuse_copy {
-                return Err(StoreError::from(lore_base::error::AddressNotFound::from(
-                    source_address,
-                )));
-            }
-            self.inner
-                .clone()
-                .copy(
-                    source_partition,
-                    source_address,
-                    destination_partition,
-                    destination_context,
-                    behavior,
-                )
-                .await
-        }
-
-        async fn obliterate(
-            self: Arc<Self>,
-            partition: Partition,
-            address: Address,
-            stats: Arc<StoreObliterateStats>,
-        ) -> Result<(), StoreError> {
-            self.inner
-                .clone()
-                .obliterate(partition, address, stats)
-                .await
-        }
-
-        async fn evict(
-            self: Arc<Self>,
-            max_capacity: usize,
-            sync_data: bool,
-            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
-        ) -> Result<usize, StoreError> {
-            self.inner
-                .clone()
-                .evict(max_capacity, sync_data, sink)
-                .await
-        }
-
-        async fn compact(
-            self: Arc<Self>,
-            max_size: usize,
-            at: Option<usize>,
-            sync_data: bool,
-            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
-        ) -> Result<Option<usize>, StoreError> {
-            self.inner
-                .clone()
-                .compact(max_size, at, sync_data, sink)
-                .await
-        }
-
-        async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
-            self.inner.clone().compact_resume_at().await
-        }
-
-        fn max_query_batch(&self) -> Option<usize> {
-            self.inner.max_query_batch()
-        }
-
-        async fn flush(
-            self: Arc<Self>,
-            options: lore_storage::FlushOptions,
-        ) -> Result<(), StoreError> {
-            self.inner.clone().flush(options).await
-        }
-
-        async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
-            self.inner.clone().verify(heal).await
-        }
-    }
 
     struct TestServer {
         url: String,
@@ -293,207 +52,35 @@ mod storage_copy_on_write_tests {
     async fn start_server_with(
         wrap: impl FnOnce(Arc<dyn ImmutableStore>) -> Arc<CountingStore>,
     ) -> TestServer {
-        // The served store isolates partitions and implies durability, as a real server's does:
-        // both decide what the client is told about content it did not store itself.
-        let backend = lore_storage::local::immutable_store::create(
-            None::<&str>,
-            ImmutableStoreCreateOptions::none(),
-            false,
-            ImmutableStoreSettings {
-                protect_local_fragment: false,
-                implicit_durable_stored: true,
-                isolate_partitions: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let mutable = lore_storage::local::mutable_store::create(
-            None::<&str>,
-            lore_storage::MutableStoreSettings::default(),
-            backend.clone(),
-        )
-        .await
-        .unwrap();
-
+        // Isolated, as Lore Server's store is: isolation decides what the client is told about
+        // content it did not store itself.
+        let (backend, mutable) = make_backends(Partitions::Isolated).await;
         let counted = wrap(backend);
-        let served: Arc<dyn ImmutableStore> = counted.clone();
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr: SocketAddr = listener.local_addr().unwrap();
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let signal = async {
-            shutdown_rx.await.ok();
-        };
-
-        let notification_sender: Arc<dyn lore_revision::notification::NotificationSender> =
-            Arc::new(lore_server::notification::local::NotificationSender::default());
-
-        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel::<String>();
-        // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
-        #[allow(clippy::disallowed_methods)]
-        tokio::spawn(async move {
-            let repository_catalog = Arc::new(BaselineRepositoryCatalog::new(
-                BaselineAccess::Reachable,
-                served.clone(),
-                mutable.clone(),
-            ));
-            let outcome = GrpcServerBuilder::new()
-                .with_environment(EnvironmentConfig::default())
-                .with_feature(FeatureSettings::default())
-                .with_immutable_store(served.clone(), served)
-                .with_mutable_store(mutable)
-                .with_lock_store(None)
-                .with_notification(notification_sender, None)
-                .with_hook_dispatcher(Arc::new(HookDispatcher::empty()))
-                .with_tls_config(None, None, None)
-                .unwrap()
-                .with_admin_endpoints(HashMap::new(), vec![])
-                .with_http2_config(
-                    None,
-                    None,
-                    GrpcTimeouts {
-                        request_handler: Duration::from_secs(30),
-                        authorization: Duration::from_secs(30),
-                    },
-                    Default::default(),
-                    Default::default(),
-                    None,
-                )
-                .with_token_verification(
-                    lore_server::auth::jwt::TokenVerification::Ignore,
-                    Arc::new(AllowAllRepositoryAuthorizer),
-                    repository_catalog,
-                )
-                .unwrap()
-                .serve_with_listener(listener, signal)
-                .await;
-            let _ = stopped_tx.send(match outcome {
-                Ok(()) => "stopped before the test finished".to_string(),
-                Err(error) => format!("failed: {error}"),
-            });
-        });
-
-        let mut ready = false;
-        for _ in 0..50 {
-            if let Ok(reason) = stopped_rx.try_recv() {
-                panic!("test server on {addr} {reason}");
-            }
-            if tokio::net::TcpStream::connect(addr).await.is_ok() {
-                ready = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(ready, "test server on {addr} never accepted a connection");
+        let (url, shutdown, _stopped) = start_grpc_server(counted.clone(), mutable);
 
         TestServer {
-            url: format!("grpc://127.0.0.1:{}", addr.port()),
+            url,
             counted,
-            _shutdown: shutdown_tx,
+            _shutdown: shutdown,
         }
-    }
-
-    async fn open_handle(server: &TestServer) -> u64 {
-        let opened: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
-        let sink = opened.clone();
-        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
-            if let LoreEvent::StorageOpened(data) = event {
-                *sink.lock().unwrap() = Some(data.handle_id);
-            }
-        }));
-        let status = lore::storage::open::open(
-            LoreGlobalArgs::default(),
-            lore::storage::open::LoreStorageOpenArgs {
-                repository_path: LoreString::default(),
-                in_memory: 1,
-                remote_config: lore::storage::open::LoreStorageRemoteConfig {
-                    remote_url: LoreString::from(server.url.as_str()),
-                },
-                has_remote_config: 1,
-                ..Default::default()
-            },
-            callback,
-        )
-        .await;
-        assert_eq!(status, 0, "open with remote_config must succeed");
-        opened.lock().unwrap().expect("STORAGE_OPENED must fire")
-    }
-
-    async fn close_handle(handle_id: u64) {
-        let status = lore::storage::close::close(
-            LoreGlobalArgs::default(),
-            lore::storage::close::LoreStorageCloseArgs {
-                handle: lore::storage::handle::LoreStore { handle_id },
-            },
-            None,
-        )
-        .await;
-        assert_eq!(status, 0, "close must succeed");
-    }
-
-    /// One `lore_storage_put`, returning the address it produced.
-    async fn put(
-        handle_id: u64,
-        partition: Partition,
-        context: Context,
-        bytes: &[u8],
-        remote_write: u8,
-        chunk: u64,
-    ) -> Address {
-        let captured: Arc<Mutex<Vec<(Address, i32)>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = captured.clone();
-        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
-            if let LoreEvent::StoragePutItemComplete(data) = event {
-                sink.lock()
-                    .unwrap()
-                    .push((data.address, data.error.error_code));
-            }
-        }));
-        let status = lore::storage::put::put(
-            LoreGlobalArgs::default(),
-            lore::storage::put::LoreStoragePutArgs {
-                handle: lore::storage::handle::LoreStore { handle_id },
-                items: LoreArray::from_vec(vec![lore::storage::put::LoreStoragePutItem {
-                    id: 1,
-                    partition,
-                    context,
-                    data: LoreBytes {
-                        ptr: bytes.as_ptr().cast(),
-                        len: bytes.len(),
-                    },
-                    remote_write,
-                    local_cache: 0,
-                    fixed_size_chunk: chunk,
-                }]),
-            },
-            callback,
-        )
-        .await;
-        assert_eq!(status, 0, "put must succeed");
-        let events = captured.lock().unwrap().clone();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].1, 0);
-        events[0].0
     }
 
     async fn put_remote(
-        handle_id: u64,
+        handle: LoreStore,
         partition: Partition,
         context: Context,
         bytes: &[u8],
     ) -> Address {
-        put(handle_id, partition, context, bytes, 1, 0).await
+        put_content(handle, partition, context, bytes, 1, 0).await
     }
 
     async fn put_local_only(
-        handle_id: u64,
+        handle: LoreStore,
         partition: Partition,
         context: Context,
         bytes: &[u8],
     ) -> Address {
-        put(handle_id, partition, context, bytes, 0, 0).await
+        put_content(handle, partition, context, bytes, 0, 0).await
     }
 
     async fn assert_peer_holds(
@@ -537,14 +124,14 @@ mod storage_copy_on_write_tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let server = start_server().await;
-                let handle_id = open_handle(&server).await;
+                let handle = open_handle(Some(&server.url)).await;
 
                 let partition = Partition::from([0x11u8; 16]);
                 let first_context = Context::from([0x12u8; 16]);
                 let second_context = Context::from([0x13u8; 16]);
                 let payload = b"one payload, two files that happen to be identical".to_vec();
 
-                let first = put_remote(handle_id, partition, first_context, &payload).await;
+                let first = put_remote(handle, partition, first_context, &payload).await;
                 assert_eq!(
                     server.counted.traffic(),
                     Traffic {
@@ -556,7 +143,7 @@ mod storage_copy_on_write_tests {
                 );
 
                 server.counted.reset();
-                let second = put_remote(handle_id, partition, second_context, &payload).await;
+                let second = put_remote(handle, partition, second_context, &payload).await;
 
                 assert_eq!(
                     server.counted.traffic(),
@@ -585,7 +172,7 @@ mod storage_copy_on_write_tests {
                 assert_peer_holds(&server, partition, second, &payload).await;
                 assert_peer_holds(&server, partition, first, &payload).await;
 
-                close_handle(handle_id).await;
+                close_handle(handle).await;
                 Ok(())
             })
             .await
@@ -599,17 +186,17 @@ mod storage_copy_on_write_tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let server = start_server().await;
-                let handle_id = open_handle(&server).await;
+                let handle = open_handle(Some(&server.url)).await;
 
                 let source_partition = Partition::from([0x21u8; 16]);
                 let target_partition = Partition::from([0x22u8; 16]);
                 let context = Context::from([0x23u8; 16]);
                 let payload = b"shared store, two repositories, one payload".to_vec();
 
-                let first = put_remote(handle_id, source_partition, context, &payload).await;
+                let first = put_remote(handle, source_partition, context, &payload).await;
                 server.counted.reset();
 
-                let second = put_remote(handle_id, target_partition, context, &payload).await;
+                let second = put_remote(handle, target_partition, context, &payload).await;
 
                 assert_eq!(
                     server.counted.traffic(),
@@ -635,7 +222,7 @@ mod storage_copy_on_write_tests {
                 assert_peer_holds(&server, target_partition, second, &payload).await;
                 assert_peer_holds(&server, source_partition, first, &payload).await;
 
-                close_handle(handle_id).await;
+                close_handle(handle).await;
                 Ok(())
             })
             .await
@@ -649,12 +236,12 @@ mod storage_copy_on_write_tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let server = start_server().await;
-                let handle_id = open_handle(&server).await;
+                let handle = open_handle(Some(&server.url)).await;
 
                 let partition = Partition::from([0x31u8; 16]);
                 let payload = b"stored locally, never pushed".to_vec();
 
-                put_local_only(handle_id, partition, Context::from([0x32u8; 16]), &payload).await;
+                put_local_only(handle, partition, Context::from([0x32u8; 16]), &payload).await;
                 assert_eq!(
                     server.counted.traffic(),
                     Traffic::default(),
@@ -662,7 +249,7 @@ mod storage_copy_on_write_tests {
                 );
 
                 let second =
-                    put_remote(handle_id, partition, Context::from([0x33u8; 16]), &payload).await;
+                    put_remote(handle, partition, Context::from([0x33u8; 16]), &payload).await;
 
                 assert_eq!(
                     server.counted.traffic(),
@@ -675,7 +262,7 @@ mod storage_copy_on_write_tests {
                 );
                 assert_peer_holds(&server, partition, second, &payload).await;
 
-                close_handle(handle_id).await;
+                close_handle(handle).await;
                 Ok(())
             })
             .await
@@ -689,16 +276,16 @@ mod storage_copy_on_write_tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let server = start_refusing_server().await;
-                let handle_id = open_handle(&server).await;
+                let handle = open_handle(Some(&server.url)).await;
 
                 let partition = Partition::from([0x41u8; 16]);
                 let payload = b"the peer will not answer a copy for this".to_vec();
 
-                put_remote(handle_id, partition, Context::from([0x42u8; 16]), &payload).await;
+                put_remote(handle, partition, Context::from([0x42u8; 16]), &payload).await;
                 server.counted.reset();
 
                 let second =
-                    put_remote(handle_id, partition, Context::from([0x43u8; 16]), &payload).await;
+                    put_remote(handle, partition, Context::from([0x43u8; 16]), &payload).await;
 
                 assert_eq!(
                     server.counted.traffic(),
@@ -711,7 +298,7 @@ mod storage_copy_on_write_tests {
                 );
                 assert_peer_holds(&server, partition, second, &payload).await;
 
-                close_handle(handle_id).await;
+                close_handle(handle).await;
                 Ok(())
             })
             .await
@@ -724,16 +311,16 @@ mod storage_copy_on_write_tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let server = start_server().await;
-                let handle_id = open_handle(&server).await;
+                let handle = open_handle(Some(&server.url)).await;
 
                 let partition = Partition::from([0x51u8; 16]);
                 let context = Context::from([0x52u8; 16]);
                 let payload = b"written once, written again identically".to_vec();
 
-                put_remote(handle_id, partition, context, &payload).await;
+                put_remote(handle, partition, context, &payload).await;
                 server.counted.reset();
 
-                put_remote(handle_id, partition, context, &payload).await;
+                put_remote(handle, partition, context, &payload).await;
 
                 assert_eq!(
                     server.counted.traffic(),
@@ -741,7 +328,7 @@ mod storage_copy_on_write_tests {
                     "the association already exists, so there is nothing to send or duplicate"
                 );
 
-                close_handle(handle_id).await;
+                close_handle(handle).await;
                 Ok(())
             })
             .await
@@ -755,7 +342,7 @@ mod storage_copy_on_write_tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let server = start_server().await;
-                let handle_id = open_handle(&server).await;
+                let handle = open_handle(Some(&server.url)).await;
 
                 let partition = Partition::from([0x61u8; 16]);
                 let chunk = 64 * 1024u64;
@@ -764,8 +351,8 @@ mod storage_copy_on_write_tests {
                     .map(|index| (index.wrapping_mul(2_654_435_761) >> 11) as u8)
                     .collect();
 
-                let first = put(
-                    handle_id,
+                let first = put_content(
+                    handle,
                     partition,
                     Context::from([0x62u8; 16]),
                     &payload,
@@ -780,8 +367,8 @@ mod storage_copy_on_write_tests {
                 );
 
                 server.counted.reset();
-                let second = put(
-                    handle_id,
+                let second = put_content(
+                    handle,
                     partition,
                     Context::from([0x63u8; 16]),
                     &payload,
@@ -803,7 +390,7 @@ mod storage_copy_on_write_tests {
 
                 assert_peer_holds(&server, partition, second, &payload).await;
 
-                close_handle(handle_id).await;
+                close_handle(handle).await;
                 Ok(())
             })
             .await
@@ -817,16 +404,16 @@ mod storage_copy_on_write_tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let server = start_server().await;
-                let handle_id = open_handle(&server).await;
+                let handle = open_handle(Some(&server.url)).await;
 
                 let partition = Partition::from([0x71u8; 16]);
                 let held = Context::from([0x72u8; 16]);
                 let payload = b"the source is named, not searched for".to_vec();
 
-                let first = put_remote(handle_id, partition, held, &payload).await;
+                let first = put_remote(handle, partition, held, &payload).await;
                 server.counted.reset();
 
-                put_remote(handle_id, partition, Context::from([0x73u8; 16]), &payload).await;
+                put_remote(handle, partition, Context::from([0x73u8; 16]), &payload).await;
 
                 let sources = server.counted.copy_sources();
                 assert_eq!(sources.len(), 1);
@@ -837,7 +424,7 @@ mod storage_copy_on_write_tests {
                     "an unnamed context would make the peer search the partition instead"
                 );
 
-                close_handle(handle_id).await;
+                close_handle(handle).await;
                 Ok(())
             })
             .await

@@ -61,6 +61,7 @@ use lore_revision::state::State;
 use lore_transport::BranchListResponse;
 use lore_transport::BranchPushResponse;
 use lore_transport::BranchQueryResponse;
+use lore_transport::BranchRecord;
 use lore_transport::Connection;
 use lore_transport::EnvironmentConfig;
 use lore_transport::MetadataSetResult;
@@ -85,6 +86,7 @@ use crate::helper::RepositoryContextCreationArgsExt;
 use crate::helper::TempDir;
 use crate::helper::TestRepository;
 use crate::helper::committed_repository;
+use crate::helper::create_branch_on_instance;
 use crate::helper::default_repository_creation_args;
 use crate::helper::in_memory;
 use crate::helper::path_arguments;
@@ -128,7 +130,7 @@ impl Revision for RefusingRevision {
         _: &str,
         _: &str,
         _: &[BranchPoint],
-    ) -> Result<Hash, ProtocolError> {
+    ) -> Result<BranchRecord, ProtocolError> {
         Err(refusal())
     }
 
@@ -150,8 +152,7 @@ impl Revision for RefusingRevision {
         Ok(BranchQueryResponse {
             id: branch.unwrap_or_default(),
             latest,
-            metadata: Hash::default(),
-            deleted: false,
+            ..Default::default()
         })
     }
 
@@ -165,7 +166,11 @@ impl Revision for RefusingRevision {
         Err(refusal())
     }
 
-    async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError> {
+    async fn branch_list(
+        &self,
+        _: Option<&str>,
+        _: bool,
+    ) -> Result<BranchListResponse, ProtocolError> {
         Err(refusal())
     }
 
@@ -522,16 +527,7 @@ fn reopened(
 async fn create_feature_branch(
     repository: Arc<RepositoryContext>,
 ) -> Result<(), branch::create::CreateError> {
-    let token = token_of(&repository);
-    branch::create::create(
-        repository,
-        &token,
-        "feature".to_string(),
-        None,
-        String::new(),
-        false,
-    )
-    .await
+    create_branch_on_instance(&repository, "feature", None, "", false).await
 }
 
 async fn with_execution<F: Future>(body: F) -> F::Output {
@@ -719,6 +715,24 @@ async fn a_branch_metadata_lookup_past_an_unreadable_local_copy_reports_the_refu
     .await;
 }
 
+/// A batch of a line that leaves the local store, over each refusing remote, holds the revisions
+/// the walk of the local store read: the refusal ends the line there.
+#[tokio::test]
+async fn a_batch_over_a_refusing_remote_holds_the_local_revisions() {
+    with_execution(async {
+        for (name, repository) in refusing_contexts().await {
+            let line = crate::branch::write_line(&repository, Hash::from([9; 32]), 2, 2).await;
+
+            let history = lore_revision::find::batch_load_history(repository, line[1])
+                .await
+                .expect(name);
+
+            assert_eq!(history, vec![(3, line[1]), (2, line[0])], "{name}");
+        }
+    })
+    .await;
+}
+
 /// The diff base of two revisions on one branch whose histories don't meet is the branch point,
 /// from the branch's metadata. Metadata the instance does not hold is read from the remote, whose
 /// refusal is the failure rather than no branch point.
@@ -758,15 +772,8 @@ async fn creating_a_branch_the_remote_refuses_writes_nothing() {
         let mut differing = Vec::new();
         for (case, remote) in refusing_remotes(repository.id) {
             let refused = reopened(&repository, &tempdir, remote);
-            let created = branch::create::create(
-                refused.clone(),
-                &token_of(&refused),
-                "feature".to_string(),
-                Some(feature),
-                String::new(),
-                false,
-            )
-            .await;
+            let created =
+                create_branch_on_instance(&refused, "feature", Some(feature), "", false).await;
             expect_refused(&mut differing, case, created);
             match branch::load_name_to_id_local(refused.clone(), "feature").await {
                 Err(err) if err.is_branch_not_found() => {}
@@ -867,16 +874,9 @@ async fn force_creating_a_branch_the_remote_refuses_reports_the_refusal() {
             .expect("the instance holds the feature branch");
         let refused = reopened(&repository, &tempdir, Err(refusal()));
 
-        let error = branch::create::create(
-            refused.clone(),
-            &token_of(&refused),
-            "renamed".to_string(),
-            Some(feature),
-            String::new(),
-            true,
-        )
-        .await
-        .expect_err("the remote refuses the lookup of the new name");
+        let error = create_branch_on_instance(&refused, "renamed", Some(feature), "", true)
+            .await
+            .expect_err("the remote refuses the lookup of the new name");
         assert!(error.is_not_authorized(), "{error:?}");
     }))
     .await;

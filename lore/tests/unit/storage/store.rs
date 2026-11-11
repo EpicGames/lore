@@ -161,7 +161,7 @@ async fn a_batch_reuses_the_session_of_each_partition_it_returns_to() {
         "reuse",
         bare.immutable.clone(),
         bare.mutable.clone(),
-        Some(Arc::new(lore::storage::remote::RemoteEndpoint::new(
+        Some(Arc::new(lore_revision::protocol::RemoteEndpoint::new(
             "lore://127.0.0.1:1",
             None,
         ))),

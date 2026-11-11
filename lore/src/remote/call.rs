@@ -8,6 +8,7 @@ use lore_error_set::prelude::*;
 use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::relay::EventDispatcher;
+use tokio::task::JoinHandle;
 
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
@@ -42,69 +43,70 @@ fn fill_working_directory(globals: &mut LoreGlobalArgs) {
     }
 }
 
-/// Runs the call on the service, starting one when none is running.
-pub async fn service_call(
-    globals: LoreGlobalArgs,
-    command: LoreCommand,
-    callback: LoreEventCallback,
-) -> i32 {
-    run_service_call(None, globals, command, callback).await
-}
-
-/// Runs the call over a connection the caller already holds, rather than one
-/// resolved here.
+/// Runs the call on the service: over `connection` when the caller holds one, or else over a
+/// connection to the running service, starting one from the named executable when none is running.
 ///
-/// A caller that acts on the service only when one is already running connects
-/// itself, so that its check for a service and the call it makes cannot
-/// disagree about whether there was one to act on.
-pub async fn service_call_over(
-    connection: UdsStream,
-    globals: LoreGlobalArgs,
-    command: LoreCommand,
-    callback: LoreEventCallback,
-) -> i32 {
-    run_service_call(Some(connection), globals, command, callback).await
-}
-
-async fn run_service_call(
+/// Not an `async fn`, which would hold a second copy of its arguments. The dispatcher is built
+/// before the future, which then holds it and not the callback it is built from. Building the
+/// dispatcher starts its forwarder, so a caller awaits the future where it builds it. The future
+/// moves `globals` and `command` from its captures into the write of the request: passed to a
+/// helper's future, they would be held a second time.
+#[inline]
+pub(crate) fn run_service_call(
     connection: Option<UdsStream>,
     mut globals: LoreGlobalArgs,
     command: LoreCommand,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     fill_working_directory(&mut globals);
-    let mut event_dispatcher = EventDispatcher::new(callback);
+    let event_dispatcher = EventDispatcher::new(callback);
 
-    match service_call_impl(&mut event_dispatcher, globals, command, connection).await {
-        Ok(status) => {
-            // The read loop returns on the result, leaving events queued for this
-            // process's forwarder. Drained so a caller reading what its callback
-            // collected sees all of it; a local call's `complete` does the same.
-            event_dispatcher.drain().await;
-            status
-        }
-        Err(err) => {
-            // No service completed the command, so it completes here as a failing
-            // command does, with the failure's own code: a caller has to be able
-            // to tell a call that never reached a service from one the service
-            // ran and reported on.
-            event_dispatcher.send(LoreEvent::Log(EventDispatcher::make_log(
-                LoreLogLevel::Error,
-                format!("Failed to send command to Lore service because: {err}"),
-            )));
-            event_dispatcher
-                .complete(LoreErrorDetail::from_error(&err))
-                .await
+    async move {
+        let result = match reach_service(connection).await {
+            Ok(mut connection) => {
+                let sent = lore_base::lore_spawn_blocking!(move || {
+                    let message = MessageToServer {
+                        globals,
+                        command,
+                        environment: CallEnvironment::capture(),
+                    };
+                    write_message(connection.writer(), &message)
+                        .forward::<ServiceCallError>("sending message")?;
+                    Ok::<UdsStream, ServiceCallError>(connection)
+                });
+                relay_events(&event_dispatcher, sent).await
+            }
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(status) => {
+                // The read loop returns on the result, leaving events queued for this
+                // process's forwarder. Drained so a caller reading what its callback
+                // collected sees all of it; a local call's `complete` does the same.
+                event_dispatcher.drain().await;
+                status
+            }
+            Err(err) => {
+                // No service completed the command, so it completes here as a failing
+                // command does, with the failure's own code: a caller has to be able
+                // to tell a call that never reached a service from one the service
+                // ran and reported on.
+                event_dispatcher.send(LoreEvent::Log(EventDispatcher::make_log(
+                    LoreLogLevel::Error,
+                    format!("Failed to send command to Lore service because: {err}"),
+                )));
+                event_dispatcher
+                    .complete(LoreErrorDetail::from_error(&err))
+                    .await
+            }
         }
     }
 }
 
-pub async fn service_call_impl(
-    event_dispatcher: &mut EventDispatcher,
-    globals: LoreGlobalArgs,
-    command: LoreCommand,
-    connection: Option<UdsStream>,
-) -> Result<i32, ServiceCallError> {
+/// The connection the call runs over: `connection` where the caller holds one, or else one to the
+/// running service, started from the named executable when none is running. Fails with
+/// `ServiceUnavailable` where the OS supports no IPC, whether or not the caller holds a connection.
+async fn reach_service(connection: Option<UdsStream>) -> Result<UdsStream, ServiceCallError> {
     if !uds_supported() {
         // No service can be reached here at all, which is the same answer for a
         // caller as one that could not be started.
@@ -114,27 +116,21 @@ pub async fn service_call_impl(
         .into());
     }
 
-    let connection = match connection {
-        Some(connection) => connection,
+    match connection {
+        Some(connection) => Ok(connection),
         None => connect_or_spawn_service(ServiceStart::Named)
             .await
-            .forward::<ServiceCallError>("reaching a Lore service")?,
-    };
+            .forward::<ServiceCallError>("reaching a Lore service"),
+    }
+}
 
-    let connection = lore_base::lore_spawn_blocking!(move || {
-        let mut connection = connection;
-
-        let message = MessageToServer {
-            globals,
-            command,
-            environment: CallEnvironment::capture(),
-        };
-        write_message(connection.writer(), &message)
-            .forward::<ServiceCallError>("sending message")?;
-        Ok::<UdsStream, ServiceCallError>(connection)
-    })
-    .await
-    .internal("joining connection task")??;
+/// Hands each event the service sends to `event_dispatcher`, once `sent` has written the request,
+/// and returns the call's result.
+async fn relay_events(
+    event_dispatcher: &EventDispatcher,
+    sent: JoinHandle<Result<UdsStream, ServiceCallError>>,
+) -> Result<i32, ServiceCallError> {
+    let connection = sent.await.internal("joining connection task")??;
 
     'read_from_stream: loop {
         let mut connection = connection.try_clone().internal("cloning connection")?;
@@ -163,7 +159,7 @@ pub async fn service_call_impl(
 /// Hands an event to the callback, keeping `payload`, which holds any `LoreBytes` it carries,
 /// alive until the callback has run.
 pub fn handle_message(
-    event_dispatcher: &mut EventDispatcher,
+    event_dispatcher: &EventDispatcher,
     message: MessageToClient,
     payload: Bytes,
 ) -> Result<Option<i32>, ServiceCallError> {

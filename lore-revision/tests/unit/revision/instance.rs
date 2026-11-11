@@ -40,6 +40,7 @@ use lore_revision::stage::StageCaseChange;
 use lore_revision::stage::StageOptions;
 use lore_revision::state::State;
 
+use crate::helper::create_branch_on_instance;
 use crate::helper::test_file_write;
 use crate::helper::test_store_create;
 
@@ -263,16 +264,9 @@ pub(super) async fn switch_to(instance: &Instance, branch: &str) {
 }
 
 pub(super) async fn create_branch(instance: &Instance, name: &str) {
-    branch::create::create(
-        instance.repository.clone(),
-        &instance.write_token,
-        name.to_string(),
-        None,
-        String::new(),
-        false,
-    )
-    .await
-    .expect("Failed to create the branch");
+    create_branch_on_instance(&instance.repository, name, None, "", false)
+        .await
+        .expect("Failed to create the branch");
 }
 
 pub(super) async fn current(instance: &Instance) -> Hash {

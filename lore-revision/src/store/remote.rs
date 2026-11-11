@@ -90,33 +90,22 @@ impl RemoteImmutableStore {
         remote_session(&self.connections, &self.pools, partition)
     }
 
-    /// The remote's admin service for `partition`.
+    /// The remote's admin service for `partition`, as [`protocol::RemoteConnections::admin`] hands
+    /// it out.
     ///
-    /// Not an `async fn`, which would hold a second copy of its arguments.
-    #[allow(clippy::manual_async_fn)]
+    /// Returns that future mapped, without a future of its own.
     pub fn admin(
         &self,
         partition: Partition,
     ) -> impl Future<Output = Result<Arc<dyn Admin>, StoreError>> + '_ {
-        async move {
-            self.connections
-                .connection(partition)
-                .await
-                .forward_with::<StoreError, _>(|| {
-                    format!(
-                        "connecting to remote store at {}",
-                        self.connections.remote_url()
-                    )
-                })?
-                .admin(partition)
-                .await
-                .forward_with(|| {
-                    format!(
-                        "connecting to remote store at {}",
-                        self.connections.remote_url()
-                    )
-                })
-        }
+        futures::FutureExt::map(self.connections.admin(partition), move |admin| {
+            admin.forward_with::<StoreError, _>(|| {
+                format!(
+                    "connecting to remote store at {}",
+                    self.connections.remote_url()
+                )
+            })
+        })
     }
 }
 

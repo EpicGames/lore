@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -28,6 +27,7 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tonic::Streaming;
+use tonic::service::Routes;
 
 const TEST_PAYLOAD: &[u8] = b"rotation test payload";
 
@@ -289,32 +289,13 @@ async fn start_test_connection(
     let requests_read = Arc::new(AtomicUsize::new(0));
     let copied = Arc::new(Mutex::new(vec![]));
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr: SocketAddr = listener.local_addr().unwrap();
     let server = StreamKillingServer {
         accepted: accepted.clone(),
         requests_read: requests_read.clone(),
         kill_mode,
         copied: copied.clone(),
     };
-
-    #[allow(clippy::disallowed_methods)] // Test-local server task.
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(StorageServiceServer::new(server))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .unwrap();
-    });
-
-    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .expect("connect to test server");
-    let channel = tower::ServiceBuilder::new()
-        .layer(lore_transport::grpc::RequestLoggerLayer {})
-        .service(channel);
+    let (addr, channel) = super::serve_logged(Routes::new(StorageServiceServer::new(server))).await;
 
     let connection = Arc::new(lore_transport::grpc::GRPCConnection::for_test(
         format!("http://{addr}").parse().expect("test url"),

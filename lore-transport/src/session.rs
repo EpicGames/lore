@@ -681,6 +681,8 @@ pub struct StorageConnector {
     /// answer will not change until the identity does, and asking again is a round trip that can
     /// only fail. Cleared by a `session_start` that later succeeds, which is proof it has.
     refused_partitions: dashmap::DashSet<Partition>,
+    /// The `session_start` fan-outs begun: one per miss of [`session_pool`](Self::session_pool).
+    session_starts: AtomicUsize,
 }
 
 impl StorageConnector {
@@ -691,7 +693,14 @@ impl StorageConnector {
             pools: dashmap::DashMap::new(),
             authorized_partitions: dashmap::DashSet::new(),
             refused_partitions: dashmap::DashSet::new(),
+            session_starts: AtomicUsize::new(0),
         }
+    }
+
+    /// The `session_start` fan-outs this connector has begun, whether or not the starts succeed.
+    #[cfg(feature = "test-util")]
+    pub fn session_starts(&self) -> usize {
+        self.session_starts.load(Ordering::Relaxed)
     }
 
     /// Whether the given partition has previously had `session_start` succeed on every
@@ -751,6 +760,7 @@ impl StorageConnector {
         }
 
         // Slow path: start one session per connection in parallel. No lock held.
+        self.session_starts.fetch_add(1, Ordering::Relaxed);
         let correlation: Arc<str> = Arc::from(correlation_id);
         let mut tasks = DetachingJoinSet::default();
         for storage in self.connections.iter().cloned() {

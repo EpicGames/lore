@@ -1,5 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use lore_base::types::BranchId;
+use lore_base::types::BranchPoint;
+use lore_base::types::Hash;
+use lore_proto::lore::model::v1 as model;
 use lore_transport::types::*;
 
 const FALLBACK: &str = "grpc://fallback.example:1234";
@@ -70,9 +74,56 @@ fn per_service_overrides_are_independent() {
     assert_eq!(env.notification_url(FALLBACK), FALLBACK);
 }
 
+/// A branch with every field set, and the record it converts to.
+pub(crate) fn full_branch() -> (model::Branch, BranchRecord) {
+    let record = BranchRecord {
+        id: BranchId::from([1; 16]),
+        name: "feature".to_string(),
+        category: "release".to_string(),
+        creator: "alice".to_string(),
+        created: 1_700_000_000_123,
+        latest: Hash::from([2; 32]),
+        metadata: Hash::from([3; 32]),
+        deleted: true,
+        stack: vec![
+            BranchPoint {
+                branch: BranchId::from([4; 16]),
+                revision: Hash::from([5; 32]),
+            },
+            BranchPoint {
+                branch: BranchId::from([6; 16]),
+                revision: Hash::from([7; 32]),
+            },
+        ],
+    };
+    let branch = model::Branch {
+        id: record.id.into(),
+        name: record.name.clone(),
+        creator: record.creator.clone(),
+        category: record.category.clone(),
+        created: record.created,
+        latest: record.latest.into(),
+        deleted: record.deleted,
+        metadata: record.metadata.into(),
+        stack: record.stack.iter().map(model::BranchPoint::from).collect(),
+    };
+    (branch, record)
+}
+
+mod branch_record {
+    use lore_transport::grpc::revision_client::branch_record_from_v1;
+
+    use super::*;
+
+    #[test]
+    fn branch_record_from_v1_keeps_every_field() {
+        let (branch, expected) = full_branch();
+        assert_eq!(branch_record_from_v1(branch), expected);
+    }
+}
+
 mod items_from {
     use bytes::Bytes;
-    use lore_base::types::Hash;
 
     use super::*;
 

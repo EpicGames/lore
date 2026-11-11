@@ -6,8 +6,7 @@
 
 //! Tests for the `RemoteState` state machine and the `RepositoryContext::remote()`
 //! lazy resolution path. These exercise the classification logic and the Pending →
-//! terminal-state promotion without requiring a real `Arc<Connection>` (Connection
-//! construction is non-trivial and covered by integration tests instead). We cover:
+//! terminal-state promotion without a real `Arc<Connection>`. We cover:
 //!
 //! - Classification: `RemoteState::from_result` routes each error variant correctly.
 //! - Terminal-state passthrough: `remote()` on Offline/Failed returns the expected
@@ -16,16 +15,35 @@
 //! - Concurrent awaiters: N tasks awaiting the same Pending converge on one result.
 //! - Cancellation: cancelling awaiters mid-await does not break subsequent awaiters
 //!   or the promotion.
+//! - Session pools: the pool a context holds and reuses, and the endpoint it takes pools from
+//!   where one is set, over a detached connection.
 use std::sync::Arc;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use lore_base::error::Disconnected;
 use lore_base::error::NoRemote;
+use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::Address;
+use lore_base::types::Context;
+use lore_base::types::FragmentFlags;
+use lore_base::types::Hash;
+use lore_revision::immutable::load_raw;
+use lore_revision::immutable::read_options_from_repository;
+use lore_revision::interface::LoreGlobalArgs;
+use lore_revision::lore::RepositoryId;
 use lore_revision::protocol::RemoteFuture;
 use lore_revision::repository::RemoteState;
+use lore_revision::repository::RepositoryContext;
 use lore_revision::test_util::context_with_state;
+use lore_storage::options::ReadOptions;
 use lore_transport::ProtocolError;
+
+use super::test_helpers::built_context;
+use super::test_helpers::counted_endpoint;
+use super::test_helpers::store_fragment;
+use crate::helper::setup_test_execution;
+use crate::helper::test_execution_with;
 
 fn disconnected() -> ProtocolError {
     ProtocolError::from(Disconnected)
@@ -65,7 +83,7 @@ async fn an_offline_context_resolves_no_session_pool() {
     assert!(context.cached_session_pool("correlation").is_none());
 }
 
-/// A pool for a context to hold, started for `correlation_id`. The session in it is never
+/// A pool to hold, started for `correlation_id`. The session in it is never
 /// resolved: these tests ask which pool answered, not what it yields.
 fn held_pool(correlation_id: &str) -> Arc<lore_transport::SessionPool> {
     let session = Arc::new(lore_transport::StorageSession::pending(|| async {
@@ -123,6 +141,148 @@ async fn a_pool_is_not_reused_under_another_correlation_id() {
         context.session_pool("second").await.is_err(),
         "another correlation id must send the caller back to the remote"
     );
+}
+
+/// Building a context with an endpoint, and a read the local store serves, ask the endpoint for
+/// nothing. The first read that needs a session asks it once, under the correlation id of the call
+/// that read, and the context holds the pool the endpoint started and holds.
+#[tokio::test]
+async fn an_endpoint_is_asked_only_when_a_read_needs_a_session() {
+    let globals = LoreGlobalArgs {
+        correlation_id: "c1".into(),
+        ..Default::default()
+    };
+    LORE_CONTEXT
+        .scope(test_execution_with(globals), async {
+            let (endpoint, connection) = counted_endpoint(RepositoryId::default()).await;
+            let context =
+                built_context(|context| context.with_remote_endpoint(endpoint.clone())).await;
+            let stored = store_fragment(&context, b"held", FragmentFlags::empty(), 4).await;
+            load_raw(context.clone(), stored, ReadOptions::default())
+                .await
+                .expect("the local store serves what it holds");
+            assert_eq!(connection.storage_session_starts(), 0);
+
+            let absent = Address {
+                hash: Hash::from([0xa5u8; 32]),
+                context: Context::from([0xa5u8; 16]),
+            };
+            load_raw(context.clone(), absent, ReadOptions::default())
+                .await
+                .expect_err("the endpoint's remote holds nothing");
+            assert_eq!(connection.storage_session_starts(), 1);
+            let held = endpoint
+                .pools
+                .get(context.id, "c1")
+                .expect("the endpoint holds the pool it started");
+            assert!(
+                context
+                    .cached_session_pool("c1")
+                    .is_some_and(|pool| Arc::ptr_eq(&pool, &held))
+            );
+        })
+        .await;
+}
+
+/// A context answers with the pool the endpoint holds for its correlation id, and a call under
+/// another correlation id asks the endpoint again, which starts a pool for that id.
+#[tokio::test]
+async fn the_endpoint_answer_serves_its_correlation_id() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (endpoint, connection) = counted_endpoint(RepositoryId::default()).await;
+            let held = held_pool("c1");
+            endpoint.pools.hold(RepositoryId::default(), held.clone());
+            let context =
+                built_context(|context| context.with_remote_endpoint(endpoint.clone())).await;
+
+            let answered = context
+                .session_pool("c1")
+                .await
+                .expect("the endpoint answers with the pool it holds");
+            assert!(Arc::ptr_eq(&answered, &held));
+            assert!(context.cached_session_pool("c2").is_none());
+            assert_eq!(connection.storage_session_starts(), 0);
+
+            let other = context
+                .session_pool("c2")
+                .await
+                .expect("the endpoint starts a pool for another correlation id");
+            assert!(other.serves("c2"));
+            assert_eq!(connection.storage_session_starts(), 1);
+        })
+        .await;
+}
+
+/// A pool the endpoint holds that a session over it has invalidated is not handed out again: the
+/// endpoint starts a pool for the correlation id and holds it in the stale one's place.
+#[tokio::test]
+async fn the_endpoint_replaces_a_stale_pool() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let partition = RepositoryId::default();
+            let (endpoint, connection) = counted_endpoint(partition).await;
+            let stale = held_pool("c1");
+            endpoint.pools.hold(partition, stale.clone());
+            lore_transport::StorageSession::pooled(stale.clone())
+                .invalidate()
+                .await;
+
+            let answered = endpoint
+                .session_pool(&partition, "c1")
+                .await
+                .expect("the endpoint starts a pool in place of the stale one");
+            assert_eq!(connection.storage_session_starts(), 1);
+            assert!(!Arc::ptr_eq(&answered, &stale));
+            assert!(
+                endpoint
+                    .pools
+                    .get(partition, "c1")
+                    .is_some_and(|held| Arc::ptr_eq(&held, &answered)),
+                "the endpoint holds the pool it started in place of the stale one"
+            );
+        })
+        .await;
+}
+
+/// A link context keeps the local reads and the endpoint of the context it is derived from, and
+/// asks the endpoint for a pool on the link's partition.
+#[tokio::test]
+async fn a_link_context_keeps_the_local_reads_and_the_endpoint() {
+    type Build = fn(RepositoryContext) -> RepositoryContext;
+    let builds: [(Build, (bool, bool, bool)); 2] = [
+        (RepositoryContext::reading_remote_only, (false, true, false)),
+        (RepositoryContext::strict_local_reads, (true, false, true)),
+    ];
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            for (build, expected) in builds {
+                let link_id: RepositoryId = Context::from(uuid::Uuid::now_v7()).into();
+                let (endpoint, connection) = counted_endpoint(link_id).await;
+                let context =
+                    built_context(|context| build(context).with_remote_endpoint(endpoint.clone()))
+                        .await;
+                let link = context.to_link_context(link_id).await;
+
+                let options = read_options_from_repository(&link);
+                assert_eq!(
+                    (options.local, options.no_local_write, options.strict_local),
+                    expected
+                );
+                let pool = link
+                    .session_pool("c1")
+                    .await
+                    .expect("the endpoint answers for the link's partition");
+                assert_eq!(connection.storage_session_starts(), 1);
+                assert!(
+                    endpoint
+                        .pools
+                        .get(link_id, "c1")
+                        .is_some_and(|held| Arc::ptr_eq(&held, &pool))
+                );
+            }
+        })
+        .await;
 }
 
 /// Only the terminal no-remote state answers yes. A failure and a connect

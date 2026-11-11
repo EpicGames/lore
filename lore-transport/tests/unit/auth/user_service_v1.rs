@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -16,7 +15,7 @@ use lore_proto::lore::user::v1::user_service_server::UserService as Service;
 use lore_proto::lore::user::v1::user_service_server::UserServiceServer;
 use lore_transport::auth::user_service_v1::UserServiceV1;
 use lore_transport::traits::UserService;
-use tokio_stream::wrappers::TcpListenerStream;
+use tonic::service::Routes;
 
 /// `(id, display_name, username)`. Two users share the display name Sam.
 const USERS: [(&str, &str, &str); 4] = [
@@ -72,15 +71,9 @@ async fn serve() -> (String, Arc<Directory>) {
     let directory = Arc::new(Directory {
         finds: AtomicUsize::new(0),
     });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address: SocketAddr = listener.local_addr().unwrap();
-    let service = directory.clone();
-    lore_base::lore_spawn!(async move {
-        tonic::transport::Server::builder()
-            .add_service(UserServiceServer::from_arc(service))
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
+    let address =
+        crate::grpc::serve_on_loopback(Routes::new(UserServiceServer::from_arc(directory.clone())))
+            .await;
     (format!("http://{address}"), directory)
 }
 

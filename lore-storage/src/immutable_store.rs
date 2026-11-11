@@ -50,6 +50,17 @@ pub enum StoreError {
     NotSupported,
 }
 
+impl StoreError {
+    /// Whether this is a store's answer for content it does not hold: `AddressNotFound`,
+    /// `PayloadNotFound` or `NotFound`.
+    pub fn is_absent(&self) -> bool {
+        matches!(
+            self,
+            Self::AddressNotFound(_) | Self::PayloadNotFound(_) | Self::NotFound(_)
+        )
+    }
+}
+
 /// Validate that a fragment's sizes appear valid. Use before allocating or
 /// streaming a payload buffer based on attacker-influenced metadata.
 /// These checks are necessary for data that may exist before hardening at the point of ingress

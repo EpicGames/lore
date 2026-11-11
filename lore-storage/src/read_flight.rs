@@ -9,6 +9,7 @@ use dashmap::Entry;
 use tokio::sync::watch;
 
 use crate::error::StorageError;
+use crate::options::ReadOptions;
 use crate::read::Keep;
 use crate::read::Loaded;
 use crate::types::Address;
@@ -30,30 +31,33 @@ type Channel = (
 
 /// Reads in flight, keyed by content hash: an address's context does not change its content, so a
 /// read of the same content under any context, and into any store, joins the flight. The partition
-/// is part of the key only where the store isolates partitions, and whether the remote is trusted
-/// always is.
+/// is part of the key only where the store isolates partitions; whether the remote is trusted, and
+/// whether the read stores nothing locally, always are.
 static READ_IN_FLIGHT: OnceLock<
     DashMap<ReadFlightKey, ReadFlightEntry, BuildHasherDefault<PassThroughHasher>>,
 > = OnceLock::new();
 
 /// The content a read single-flight fetches: its hash, the partition where the store isolates
-/// partitions, and whether the remote it is fetched from is trusted.
+/// partitions, whether the remote it is fetched from is trusted, and whether the read stores
+/// nothing it fetches locally ([`ReadOptions::no_local_write`]).
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct ReadFlightKey {
     hash: Hash,
     partition: Option<Partition>,
     trusted: bool,
+    no_local_write: bool,
 }
 
 /// Writes one word, which [`PassThroughHasher`] takes as the hash: the first eight bytes of the
-/// content hash, which is uniform already, folded with the partition's where the key carries one
-/// and with its trust.
+/// content hash, which is uniform already, folded with the partition's where the key carries one,
+/// and with whether the remote is trusted and whether the read stores nothing locally, a bit each.
 impl std::hash::Hash for ReadFlightKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let partition = self
             .partition
             .map_or(0, |partition| leading_word(partition.as_ref()));
-        state.write_u64(leading_word(self.hash.as_ref()) ^ partition ^ u64::from(self.trusted));
+        let flags = u64::from(self.trusted) | (u64::from(self.no_local_write) << 1);
+        state.write_u64(leading_word(self.hash.as_ref()) ^ partition ^ flags);
     }
 }
 
@@ -226,13 +230,14 @@ fn close(key: ReadFlightKey) -> Option<ReadFlightEntry> {
 /// Join the read single-flight for `address`'s content: its hash, `partition` where
 /// `isolate_partitions` says the store serves each association only what it holds for it rather
 /// than whatever it holds for the hash ([`crate::immutable_store::ImmutableStore::read_scope`]),
-/// and whether the remote is `trusted`. The first caller becomes the leader and must perform the
-/// read, store what [`ReadFlightGuard::take_keep`] answers where the read succeeded, then call
-/// `ReadFlightGuard::complete`. Later callers become followers, whatever their context and store,
-/// and should pass the follower to `await_flight`. `store` is the store the caller reads into, and
-/// `keep` what it keeps there of the fetch; the leader keeps a follower's as
-/// [`ReadFlightEntry::subscribe`] describes. The caller must hold `store` while it leads, so no
-/// other store takes its address while the flight is open.
+/// and whether `options` trust the remote ([`ReadOptions::trust_remote`]) and store nothing the
+/// read fetches locally ([`ReadOptions::no_local_write`]). The first caller becomes the leader and
+/// must perform the read, store what [`ReadFlightGuard::take_keep`] answers where the read
+/// succeeded, then call `ReadFlightGuard::complete`. Later callers with the same key become
+/// followers, whatever their context and store, and should pass the follower to `await_flight`.
+/// `store` is the store the caller reads into, and `keep` what it keeps there of the fetch; the
+/// leader keeps a follower's as [`ReadFlightEntry::subscribe`] describes. The caller must hold
+/// `store` while it leads, so no other store takes its address while the flight is open.
 ///
 /// One shard lock serves each join, held only to insert the flight or subscribe to it, and nothing
 /// is allocated under it. A leader allocates nothing. The first follower of a flight creates its
@@ -244,12 +249,13 @@ pub(crate) fn join_read_flight(
     partition: Partition,
     address: Address,
     isolate_partitions: bool,
-    trusted: bool,
+    options: ReadOptions,
 ) -> ReadFlight {
     let key = ReadFlightKey {
         hash: address.hash,
         partition: isolate_partitions.then_some(partition),
-        trusted,
+        trusted: options.trust_remote,
+        no_local_write: options.no_local_write,
     };
     let in_flight =
         READ_IN_FLIGHT.get_or_init(|| DashMap::with_hasher(BuildHasherDefault::default()));

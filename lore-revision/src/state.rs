@@ -1363,6 +1363,19 @@ pub struct StateData {
     reserved_buffer_second: [u8; 32],
 }
 
+impl StateData {
+    /// The hash of the revision's metadata.
+    pub fn metadata_hash(&self) -> Hash {
+        self.hash_metadata
+    }
+
+    /// Whether the header carries the state magic, which every revision state's does, whatever its
+    /// format version.
+    pub(crate) fn has_state_magic(&self) -> bool {
+        self.magic == STATE_MAGIC
+    }
+}
+
 #[lore_macro::test_pub]
 #[repr(C)]
 #[derive(Copy, Clone, Default, IntoBytes, FromBytes, Immutable)]
@@ -2013,7 +2026,7 @@ impl State {
                 Err(err) => return Err(state_data_read_failure(err)),
             };
 
-        if data.magic != STATE_MAGIC {
+        if !data.has_state_magic() {
             Err(StateError::internal("Corrupt header"))
         } else if data.format == 0 || data.format > StateFormat::LowerCaseHash as u32 {
             if data.format > StateFormat::LowerCaseHash as u32 && data.format < 0xFFF {

@@ -161,20 +161,35 @@ pub struct BranchPushResponse {
     pub message: Option<String>,
 }
 
-pub struct BranchQueryResponse {
-    /// Branch ID
+/// A branch as Lore Server records it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BranchRecord {
+    /// Branch identifier.
     pub id: BranchId,
-    /// Latest revision
+    /// Branch name.
+    pub name: String,
+    /// Category the branch belongs to.
+    pub category: String,
+    /// Identity that created the branch.
+    pub creator: String,
+    /// Creation time, in milliseconds since the Unix epoch.
+    pub created: u64,
+    /// Latest revision on the branch.
     pub latest: Hash,
-    /// Metadata hash
+    /// Hash of the branch's metadata blob.
     pub metadata: Hash,
-    /// Whether the branch has been deleted (name->id mapping removed)
+    /// Whether the branch is archived: the record remains, and its name no longer maps to it.
     pub deleted: bool,
+    /// Branch points the branch is built on, from its parent's to the root's.
+    pub stack: Vec<BranchPoint>,
 }
+
+/// The answer to a branch query: the branch's record.
+pub type BranchQueryResponse = BranchRecord;
 
 pub struct BranchListResponse {
     /// Branch list
-    pub list: Vec<BranchMetadata>,
+    pub list: Vec<BranchRecord>,
 }
 
 pub struct RevisionListResponse {

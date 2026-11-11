@@ -53,6 +53,8 @@ mod aws_store_tests {
     use crate::common::aws_common::STORE_BUCKET_NAME;
     use crate::common::aws_common::dynamodb_setup;
     use crate::common::aws_common::setup;
+    use crate::common::net_common::CountingStore;
+    use crate::common::net_common::Traffic;
     use crate::setup_execution;
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -347,188 +349,12 @@ mod aws_store_tests {
             .await
     }
 
-    /// Wraps the durable store to record which write verb it was asked for, so a test can say the
-    /// payload never reached S3 a second time rather than only that the read works.
-    struct CountingDurable {
-        inner: Arc<dyn ImmutableStore>,
-        puts: std::sync::atomic::AtomicUsize,
-        copies: std::sync::atomic::AtomicUsize,
-    }
-
-    impl CountingDurable {
-        fn new(inner: Arc<dyn ImmutableStore>) -> Arc<Self> {
-            Arc::new(Self {
-                inner,
-                puts: std::sync::atomic::AtomicUsize::new(0),
-                copies: std::sync::atomic::AtomicUsize::new(0),
-            })
-        }
-
-        fn puts(&self) -> usize {
-            self.puts.load(std::sync::atomic::Ordering::SeqCst)
-        }
-
-        fn copies(&self) -> usize {
-            self.copies.load(std::sync::atomic::Ordering::SeqCst)
-        }
-    }
-
-    #[async_trait]
-    impl ImmutableStore for CountingDurable {
-        /// Joins the claim of the store this one wraps.
-        async fn hold_for_command(
-            self: std::sync::Arc<Self>,
-        ) -> std::result::Result<
-            Option<lore_storage::local::store_lock::StoreGuard>,
-            lore_storage::StoreError,
-        > {
-            lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
-        }
-
-        fn is_local(&self) -> bool {
-            self.inner.is_local()
-        }
-
-        fn isolates_partitions(&self) -> bool {
-            self.inner.isolates_partitions()
-        }
-
-        fn read_scope(&self) -> StoreMatch {
-            self.inner.read_scope()
-        }
-
-        fn query_scope(&self) -> StoreMatch {
-            self.inner.query_scope()
-        }
-
-        async fn get(
-            self: Arc<Self>,
-            partition: Partition,
-            address: Address,
-        ) -> Result<StoreGetData, StoreError> {
-            self.inner.clone().get(partition, address).await
-        }
-
-        async fn get_metadata(
-            self: Arc<Self>,
-            partition: Partition,
-            address: Address,
-        ) -> Result<StoreGetData, StoreError> {
-            self.inner.clone().get_metadata(partition, address).await
-        }
-
-        async fn query(
-            self: Arc<Self>,
-            partition: Partition,
-            addresses: &[Address],
-            results: &mut [StoreMatchResult],
-        ) -> Result<(), StoreError> {
-            self.inner
-                .clone()
-                .query(partition, addresses, results)
-                .await
-        }
-
-        async fn put(
-            self: Arc<Self>,
-            partition: Partition,
-            address: Address,
-            fragment: Fragment,
-            payload: Option<Bytes>,
-            force: bool,
-        ) -> Result<(), StoreError> {
-            self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.inner
-                .clone()
-                .put(partition, address, fragment, payload, force)
-                .await
-        }
-
-        async fn copy(
-            self: Arc<Self>,
-            source_partition: Partition,
-            source_address: Address,
-            destination_partition: Partition,
-            destination_context: Context,
-            behavior: CopyBehavior,
-        ) -> Result<(), StoreError> {
-            self.copies
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.inner
-                .clone()
-                .copy(
-                    source_partition,
-                    source_address,
-                    destination_partition,
-                    destination_context,
-                    behavior,
-                )
-                .await
-        }
-
-        async fn obliterate(
-            self: Arc<Self>,
-            partition: Partition,
-            address: Address,
-            stats: Arc<StoreObliterateStats>,
-        ) -> Result<(), StoreError> {
-            self.inner
-                .clone()
-                .obliterate(partition, address, stats)
-                .await
-        }
-
-        async fn evict(
-            self: Arc<Self>,
-            max_capacity: usize,
-            sync_data: bool,
-            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
-        ) -> Result<usize, StoreError> {
-            self.inner
-                .clone()
-                .evict(max_capacity, sync_data, sink)
-                .await
-        }
-
-        async fn compact(
-            self: Arc<Self>,
-            max_size: usize,
-            at: Option<usize>,
-            sync_data: bool,
-            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
-        ) -> Result<Option<usize>, StoreError> {
-            self.inner
-                .clone()
-                .compact(max_size, at, sync_data, sink)
-                .await
-        }
-
-        async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
-            self.inner.clone().compact_resume_at().await
-        }
-
-        fn max_query_batch(&self) -> Option<usize> {
-            self.inner.max_query_batch()
-        }
-
-        async fn flush(
-            self: Arc<Self>,
-            options: lore_storage::FlushOptions,
-        ) -> Result<(), StoreError> {
-            self.inner.clone().flush(options).await
-        }
-
-        async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
-            self.inner.clone().verify(heal).await
-        }
-    }
-
     /// A composite shaped like a server's: a real in-memory local cache in front of the AWS store,
     /// which is what lets a second put see the first one's association and duplicate it.
     async fn initialize_store_with_local_cache() -> Result<
         (
             Arc<CompositeStore>,
-            Arc<CountingDurable>,
+            Arc<CountingStore>,
             Arc<ExecutionContext>,
         ),
         Box<dyn Error>,
@@ -552,7 +378,7 @@ mod aws_store_tests {
                     false,
                 );
 
-                let durable = CountingDurable::new(Arc::new(AwsImmutableStore::new(
+                let durable = CountingStore::new(Arc::new(AwsImmutableStore::new(
                     s3,
                     dynamo_immutable,
                     &aws_immutable_settings,
@@ -606,8 +432,15 @@ mod aws_store_tests {
                     .put(partition, first, fragment, Some(payload.clone()), false)
                     .await
                     .expect("first put should store the payload");
-                assert_eq!(durable.puts(), 1, "the first put has to upload the payload");
-                assert_eq!(durable.copies(), 0);
+                assert_eq!(
+                    durable.traffic(),
+                    Traffic {
+                        payload_puts: 1,
+                        empty_puts: 0,
+                        copies: 0
+                    },
+                    "the first put has to upload the payload"
+                );
 
                 // The composite caches into the local store detached, and it is that cached
                 // association the second put names as its source.
@@ -628,14 +461,14 @@ mod aws_store_tests {
                     .expect("second put should duplicate the association");
 
                 assert_eq!(
-                    durable.copies(),
-                    1,
-                    "the durable store already holds these bytes, so it must be asked to copy"
-                );
-                assert_eq!(
-                    durable.puts(),
-                    1,
-                    "no second upload: the payload must not reach S3 again"
+                    durable.traffic(),
+                    Traffic {
+                        payload_puts: 1,
+                        empty_puts: 0,
+                        copies: 1
+                    },
+                    "the durable store already holds these bytes, so it must be asked to copy, and the \
+                     payload must not reach S3 again"
                 );
 
                 let (read_fragment, read_payload) = store

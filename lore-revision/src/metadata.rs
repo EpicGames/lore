@@ -13,9 +13,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use bytes::BytesMut;
+use futures::FutureExt;
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 use lore_error_set::prelude::*;
 use lore_storage::ContentSource;
+use lore_storage::ReadOptions;
 use zerocopy::IntoBytes;
 
 use crate::errors::*;
@@ -446,35 +448,52 @@ impl Metadata {
         Self { buffer }
     }
 
-    /// Read a stored metadata blob.
+    /// Read a stored metadata blob as [`Self::deserialize_with`] does, with the read options of
+    /// `repository` and the cache on.
+    ///
+    /// Returns the future of [`Self::deserialize_with`], without a future of its own.
+    #[inline]
+    pub fn deserialize(
+        repository: Arc<RepositoryContext>,
+        hash: Hash,
+    ) -> impl Future<Output = Result<Self, MetadataError>> {
+        let options = immutable::read_options_from_repository(&repository).with_cache();
+        Self::deserialize_with(repository, hash, options)
+    }
+
+    /// Read a stored metadata blob with `options`, refusing one larger than
+    /// [`METADATA_MAX_SIZE`].
     ///
     /// This is the only way bytes this process did not write become a
     /// [`Metadata`], so it is the one place the entry chain has to be checked —
     /// a buffer built by [`Self::set`] is correct by construction and pays
     /// nothing. The check is one pass of integer arithmetic over the entries,
     /// against a fetch that dominates it.
-    pub async fn deserialize(
+    ///
+    /// Returns the read's future, built at the call, with the check mapped onto its output, so it
+    /// holds nothing beside the read.
+    #[inline]
+    pub fn deserialize_with(
         repository: Arc<RepositoryContext>,
         hash: Hash,
-    ) -> Result<Self, MetadataError> {
+        options: ReadOptions,
+    ) -> impl Future<Output = Result<Self, MetadataError>> {
         let address = Address {
             hash,
             context: Context::default(),
         };
-        let options = immutable::read_options_from_repository(&repository)
-            .with_cache()
-            .with_max_content_size(METADATA_MAX_SIZE as u64);
-        let buffer = immutable::read(
-            repository, address, None, /* No range, read all */
-            options,
+        immutable::read(
+            repository,
+            address,
+            None, /* No range, read all */
+            options.with_max_content_size(METADATA_MAX_SIZE as u64),
         )
-        .await
-        .forward::<MetadataError>("reading metadata")?;
-
-        let metadata = Metadata::new_with_buffer(BytesMut::from(buffer));
-        metadata.check_buffer()?;
-
-        Ok(metadata)
+        .map(|read| -> Result<Self, MetadataError> {
+            let buffer = read.forward::<MetadataError>("reading metadata")?;
+            let metadata = Metadata::new_with_buffer(BytesMut::from(buffer));
+            metadata.check_buffer()?;
+            Ok(metadata)
+        })
     }
 
     pub async fn serialize(

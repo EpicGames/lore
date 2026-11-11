@@ -10,8 +10,12 @@ use futures::future::Shared;
 use lore_base::lore_spawn_net;
 use lore_base::retry::Retry;
 use lore_base::retry::retry;
+use lore_transport::Admin;
 use lore_transport::Connection;
+use lore_transport::PartitionSessions;
 use lore_transport::ProtocolError;
+use lore_transport::SessionPool;
+use lore_transport::StorageSession;
 use lore_transport::connection::RECONNECT_MAX_DELAY;
 use lore_transport::connection::RECONNECT_START_DELAY;
 use tokio::time::Instant;
@@ -173,6 +177,18 @@ impl RemoteConnections {
         &self.remote_url
     }
 
+    /// The [`Admin`] handle for `partition`, opened on first use and held by its connection
+    /// ([`Self::connection`]).
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
+    #[allow(clippy::manual_async_fn)]
+    pub(crate) fn admin(
+        &self,
+        partition: RepositoryId,
+    ) -> impl Future<Output = Result<Arc<dyn Admin>, ProtocolError>> + '_ {
+        async move { self.connection(partition).await?.admin(partition).await }
+    }
+
     /// The connection held for `repository`, a connection marked stale included until its
     /// connect's back-off has passed unless its storage was refused its credentials, or one newly
     /// opened in place of none, of a stale one past that back-off or refused, or of a failure whose
@@ -280,6 +296,116 @@ impl RemoteConnections {
             }
             connected
         }
+    }
+}
+
+/// A remote's storage: connections per partition, each taken from the process-wide connection cache
+/// by the first call that needs it, and the session pool held per partition.
+#[lore_macro::test_pub]
+pub struct RemoteEndpoint {
+    connections: RemoteConnections,
+    /// The session pool held for each partition, which calls under one correlation id share. A
+    /// call under another id replaces it, as does any call once it or its connection is stale, and
+    /// [`Self::clear_pools`] drops it.
+    pools: PartitionSessions,
+}
+
+impl RemoteEndpoint {
+    /// An endpoint for the remote at `remote_url`, connecting as `identity`, with nothing open.
+    pub fn new(remote_url: impl Into<String>, identity: Option<&str>) -> Self {
+        Self {
+            connections: RemoteConnections::new(remote_url, identity),
+            pools: PartitionSessions::default(),
+        }
+    }
+
+    /// An endpoint over `connections`, holding no session pool.
+    #[cfg(feature = "test-util")]
+    pub fn over(connections: RemoteConnections) -> Self {
+        Self {
+            connections,
+            pools: PartitionSessions::default(),
+        }
+    }
+
+    /// The connection for calls on `partition`, as [`RemoteConnections::connection`] hands it out.
+    pub fn connection(
+        &self,
+        partition: RepositoryId,
+    ) -> impl Future<Output = Result<Arc<Connection>, ProtocolError>> + '_ {
+        self.connections.connection(partition)
+    }
+
+    /// The session pool for `partition` that serves `correlation_id`: the pool held for the
+    /// partition, while it serves that id over a connection that is not stale, or else the
+    /// partition's connection's pool for that id ([`Connection::unpinned_session_pool`]), held in
+    /// its place.
+    ///
+    /// The correlation id is a parameter because a lazy session resolves wherever its first
+    /// operation runs, which need not be under the execution context of the call that built it.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
+    #[lore_macro::test_pub]
+    #[allow(clippy::manual_async_fn)]
+    pub(crate) fn session_pool<'a>(
+        &'a self,
+        partition: &'a RepositoryId,
+        correlation_id: &'a str,
+    ) -> impl Future<Output = Result<Arc<SessionPool>, ProtocolError>> + 'a {
+        async move {
+            if let Some(pool) = self.pools.get_live(*partition, correlation_id) {
+                return Ok(pool);
+            }
+            let pool = self
+                .connection(*partition)
+                .await?
+                .unpinned_session_pool(*partition, correlation_id)
+                .await?;
+            self.pools.hold(*partition, pool.clone());
+            Ok(pool)
+        }
+    }
+
+    /// A session for `partition` over [`Self::session_pool`] under the call's correlation id.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
+    #[allow(clippy::manual_async_fn)]
+    pub fn session(
+        &self,
+        partition: RepositoryId,
+    ) -> impl Future<Output = Result<Arc<StorageSession>, ProtocolError>> + '_ {
+        async move {
+            let execution = crate::lore::execution_context();
+            let correlation_id = execution.globals().correlation_id.as_str();
+            Ok(Arc::new(StorageSession::pooled(
+                self.session_pool(&partition, correlation_id).await?,
+            )))
+        }
+    }
+
+    /// Has the server authorize `partition` on the partition's connection without leaving a
+    /// session pinned. A partition the connection has already registered makes no wire call
+    /// ([`Connection::ensure_partition_authorized`]).
+    pub async fn ensure_authorized(&self, partition: RepositoryId) -> Result<(), ProtocolError> {
+        let connection = self.connection(partition).await?;
+        let execution = crate::lore::execution_context();
+        connection
+            .ensure_partition_authorized(partition, execution.globals().correlation_id.as_str())
+            .await
+    }
+
+    /// The [`Admin`] handle for `partition`, as [`RemoteConnections::admin`] hands it out.
+    pub fn admin(
+        &self,
+        partition: RepositoryId,
+    ) -> impl Future<Output = Result<Arc<dyn Admin>, ProtocolError>> + '_ {
+        self.connections.admin(partition)
+    }
+
+    /// Drops every session pool this endpoint holds, so their sessions stop once no call holds
+    /// them.
+    pub fn clear_pools(&self) {
+        self.pools.clear();
     }
 }
 

@@ -212,6 +212,7 @@ mod pooled {
             .await;
 
         assert!(started.is_err_and(|err| err.is_slow_down()));
+        assert_eq!(connector.session_starts(), 1);
         wait_until(
             || serving.started_sessions_per_connection() == [1, 1],
             "a session start the failed pool left running never reached the server",
@@ -325,5 +326,31 @@ mod pooled {
             "the losing start's sessions were left open",
         )
         .await;
+    }
+
+    /// The connector counts one `session_start` fan-out per pool it starts, however many
+    /// connections the pool starts a session on, and none for a pool it hands out again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_starts_counts_one_per_pool_started() {
+        let server = TestStorageServer::start();
+        let connector = StorageConnector::new(server.connect(2).await);
+        let pool_for = async |correlation_id: &str| {
+            connector
+                .session_pool(
+                    partition(),
+                    correlation_id,
+                    Connection::detached(Vec::new()),
+                )
+                .await
+                .expect("a pool")
+        };
+
+        let first = pool_for("first").await;
+        let again = pool_for("first").await;
+        let _second = pool_for("second").await;
+
+        assert!(Arc::ptr_eq(&first, &again));
+        assert_eq!(connector.session_starts(), 2);
+        assert_eq!(server.started_sessions_per_connection(), [2, 2]);
     }
 }

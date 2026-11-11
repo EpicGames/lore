@@ -76,10 +76,6 @@ pub mod put_file;
 pub mod put_file_resolved;
 pub mod put_resolved;
 #[cfg(not(feature = "test-util"))]
-pub(crate) mod remote;
-#[cfg(feature = "test-util")]
-pub mod remote;
-#[cfg(not(feature = "test-util"))]
 pub(crate) mod store;
 #[cfg(feature = "test-util")]
 pub mod store;

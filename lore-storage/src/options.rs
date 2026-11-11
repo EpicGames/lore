@@ -10,7 +10,8 @@ pub struct WriteOptions {
     /// This fragment stores a revision state
     pub revision_state: bool,
     /// This fragment should be cached locally with payload if possible. Recorded in the fragment's
-    /// flags, so it travels with the fragment and every store that fetches it caches it too.
+    /// flags, so it travels with the fragment and every store that fetches it caches it too, unless
+    /// the read stores nothing locally ([`ReadOptions::no_local_write`]).
     pub local_cache_priority: bool,
     /// Keep the payload in this store even where the write makes it durable on the remote,
     /// without asking anyone else to cache it: unlike `local_cache_priority`, it is not recorded in
@@ -150,6 +151,14 @@ pub struct ReadOptions {
     pub remote: bool,
     /// Cache locally
     pub cache: bool,
+    /// Store nothing the read fetches in the local store, whatever `cache`, a local copy that does
+    /// not load, or the fragment's local cache priority asks.
+    pub no_local_write: bool,
+    /// Where no remote is in reach, answer a local read that fails with its error, and a local
+    /// payload that fails its size check or does not decompress with an internal error, rather
+    /// than with `AddressNotFound`, which stays the answer for an address the local store does not
+    /// hold.
+    pub strict_local: bool,
     /// Write to file directly
     pub direct_write: bool,
     /// Force sync data to storage media after write
@@ -179,6 +188,8 @@ impl Default for ReadOptions {
             local: true,
             remote: true,
             cache: false,
+            no_local_write: false,
+            strict_local: false,
             direct_write: false,
             sync_data: false,
             create_parent: false,
@@ -223,6 +234,18 @@ impl ReadOptions {
 
     pub fn optional_cache(mut self, cache: bool) -> Self {
         self.cache = cache;
+        self
+    }
+
+    /// See [`ReadOptions::no_local_write`].
+    pub fn with_no_local_write(mut self) -> Self {
+        self.no_local_write = true;
+        self
+    }
+
+    /// See [`ReadOptions::strict_local`].
+    pub fn with_strict_local(mut self) -> Self {
+        self.strict_local = true;
         self
     }
 

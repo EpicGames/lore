@@ -19,6 +19,7 @@ mod find_branch_point {
     use crate::branch::null_repository;
     use crate::branch::write_branch_revision;
     use crate::branch::write_line;
+    use crate::branch::write_not_a_state;
     use crate::helper::setup_test_execution;
     use crate::paged_remote::Anchor;
     use crate::paged_remote::BranchedFromRemoteLine;
@@ -424,6 +425,28 @@ mod find_branch_point {
             Some(right_base.to_string()),
             "{error:?}"
         );
+    }
+
+    /// A walk that reaches a blob that is not a revision state in the local store fails with an
+    /// internal error, whether a latest or a parent names it, rather than reading the blob as a
+    /// number and a parent.
+    #[tokio::test]
+    async fn walk_fails_on_a_blob_that_is_not_a_state() {
+        let repository = null_repository().await;
+        let not_a_state = LORE_CONTEXT
+            .scope(setup_test_execution(), write_not_a_state(&repository))
+            .await;
+        let left = write_line(&repository, not_a_state, 5, 1).await[0];
+        let right = write_line(&repository, Hash::default(), 1, 2).await;
+
+        for (named_by, latest) in [("a latest", not_a_state), ("a parent", left)] {
+            let walked = walk(repository.clone(), latest, right[1]).await;
+
+            assert!(
+                walked.as_ref().is_err_and(|error| error.is_internal()),
+                "named by {named_by}: {walked:?}"
+            );
+        }
     }
 
     /// A side that stops early leaves the other walking, and the walk answers the revision where

@@ -1164,7 +1164,8 @@ const MAX_RECONNECTS_PER_OP: usize = 3;
 /// connections while failing every RPC on them reconnects successfully every round.
 ///
 /// The rebuild is boxed. It runs only after a lost channel, and inline it would make every
-/// request's future as large as a reconnect.
+/// request's future as large as a reconnect. It runs after the match ends, so the future does
+/// not hold an attempt's result across it.
 #[lore_macro::test_pub]
 async fn with_reconnect<T, Op, OpFut, Rebuild, RebuildFut>(
     connection: &GRPCConnection,
@@ -1180,9 +1181,10 @@ where
     for _ in 0..MAX_RECONNECTS_PER_OP {
         let reconnect_id = connection.reconnect.load(Ordering::Relaxed);
         match op().await {
-            Err(ProtocolError::Disconnected(_)) => Box::pin(rebuild(reconnect_id)).await?,
+            Err(ProtocolError::Disconnected(_)) => {}
             result => return result,
         }
+        Box::pin(rebuild(reconnect_id)).await?;
     }
     Err(ProtocolError::from(lore_base::error::Disconnected))
 }
@@ -1435,7 +1437,7 @@ impl Revision for GRPCRevision {
         category: &str,
         creator: &str,
         stack: &[BranchPoint],
-    ) -> Result<Hash, ProtocolError> {
+    ) -> Result<BranchRecord, ProtocolError> {
         with_reconnect(
             &self.connection,
             || async {
@@ -1493,10 +1495,20 @@ impl Revision for GRPCRevision {
         .await
     }
 
-    async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError> {
+    async fn branch_list(
+        &self,
+        creator: Option<&str>,
+        include_deleted: bool,
+    ) -> Result<BranchListResponse, ProtocolError> {
         with_reconnect(
             &self.connection,
-            || async { self.client.read().await.branch_list().await },
+            || async {
+                self.client
+                    .read()
+                    .await
+                    .branch_list(creator, include_deleted)
+                    .await
+            },
             |reconnect_id| self.reconnect(reconnect_id),
         )
         .await

@@ -4,11 +4,13 @@
 //! counts the reads reaching it.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lore_base::error::Disconnected;
 use lore_base::error::NotFound;
 use lore_base::types::Address;
 use lore_base::types::BranchId;
@@ -32,6 +34,7 @@ use lore_storage::immutable_store::CopyBehavior;
 use lore_transport::BranchListResponse;
 use lore_transport::BranchPushResponse;
 use lore_transport::BranchQueryResponse;
+use lore_transport::BranchRecord;
 use lore_transport::Connection;
 use lore_transport::MetadataSetResult;
 use lore_transport::ProtocolError;
@@ -341,20 +344,22 @@ pub(crate) async fn counted_client_stores() -> (ClientStores, Arc<CountingStore>
         inner: immutable,
         payloads: AtomicUsize::new(0),
         queries: AtomicUsize::new(0),
+        failing: AtomicBool::new(false),
     });
     (stores_over(counting.clone(), mutable), counting)
 }
 
-/// [`client_stores`] whose mutable store runs `hook` before each load, store and compare-and-swap
-/// it forwards.
+/// [`client_stores`] whose mutable store runs `hook` before each load, store, compare-and-swap and
+/// list it forwards.
 pub(crate) async fn hooked_client_stores(
     hook: impl Fn(StoreCall, Hash, KeyType) -> Result<(), StoreError> + Send + Sync + 'static,
 ) -> ClientStores {
     answering_client_stores(hook, None).await
 }
 
-/// [`hooked_client_stores`] whose mutable store also shows each call it answers without an error
-/// to `answered`, if any ([`HookedStore`]), so a test can write between a command's calls.
+/// [`hooked_client_stores`] whose mutable store also shows each load, store and compare-and-swap
+/// it answers without an error to `answered`, if any ([`HookedStore`]), so a test can write
+/// between a command's calls.
 pub(crate) async fn answering_client_stores(
     hook: impl Fn(StoreCall, Hash, KeyType) -> Result<(), StoreError> + Send + Sync + 'static,
     answered: Option<Answered>,
@@ -363,6 +368,17 @@ pub(crate) async fn answering_client_stores(
         .await
         .expect("in-memory stores should be creatable");
     stores_over(immutable, HookedStore::wrap(mutable, hook, answered))
+}
+
+impl ClientStores {
+    /// A context over the stores, as `writer` is, whose local reads tell a failed read apart from
+    /// a miss ([`RepositoryContext::strict_local_reads`]).
+    pub(crate) fn strict_reader(&self) -> Arc<RepositoryContext> {
+        Arc::new(
+            RepositoryContext::new_null_context(self.immutable.clone(), self.mutable.clone())
+                .strict_local_reads(),
+        )
+    }
 }
 
 fn stores_over(immutable: Arc<dyn ImmutableStore>, mutable: Arc<dyn MutableStore>) -> ClientStores {
@@ -385,11 +401,13 @@ pub(crate) struct Reads {
     pub queries: usize,
 }
 
-/// An immutable store that counts the reads reaching the store it wraps.
+/// An immutable store that counts the reads reaching the store it wraps, and fails each payload
+/// read after [`Self::fail_reads`] is called.
 pub(crate) struct CountingStore {
     inner: Arc<dyn ImmutableStore>,
     payloads: AtomicUsize,
     queries: AtomicUsize,
+    failing: AtomicBool,
 }
 
 impl CountingStore {
@@ -399,6 +417,11 @@ impl CountingStore {
             payloads: self.payloads.swap(0, Ordering::Relaxed),
             queries: self.queries.swap(0, Ordering::Relaxed),
         }
+    }
+
+    /// Answer each payload read from now on with `Disconnected`, which no local read retries.
+    pub(crate) fn fail_reads(&self) {
+        self.failing.store(true, Ordering::Relaxed);
     }
 }
 
@@ -431,6 +454,9 @@ impl ImmutableStore for CountingStore {
         partition: Partition,
         address: Address,
     ) -> Result<StoreGetData, StoreError> {
+        if self.failing.load(Ordering::Relaxed) {
+            return Err(StoreError::from(Disconnected));
+        }
         self.payloads.fetch_add(1, Ordering::Relaxed);
         self.inner.clone().get(partition, address).await
     }
@@ -699,7 +725,7 @@ impl Revision for PagedRemote {
         _: &str,
         _: &str,
         _: &[BranchPoint],
-    ) -> Result<Hash, ProtocolError> {
+    ) -> Result<BranchRecord, ProtocolError> {
         unreachable!("no test of a paged remote creates a branch")
     }
 
@@ -729,7 +755,7 @@ impl Revision for PagedRemote {
             id: self.branch,
             latest: self.latest,
             metadata: self.metadata,
-            deleted: false,
+            ..Default::default()
         })
     }
 
@@ -743,7 +769,11 @@ impl Revision for PagedRemote {
         unreachable!("no test of a paged remote pushes a branch")
     }
 
-    async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError> {
+    async fn branch_list(
+        &self,
+        _: Option<&str>,
+        _: bool,
+    ) -> Result<BranchListResponse, ProtocolError> {
         unreachable!("no test of a paged remote lists branches")
     }
 

@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use lore_base::error::AddressNotFound;
 use lore_transport::error::ProtocolError;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Status;
+use tonic::service::Routes;
 use tower::ServiceBuilder;
 
 mod environment_client;
@@ -25,6 +28,38 @@ fn test_connection() -> GRPCConnection {
         .layer(RequestLoggerLayer {})
         .service(endpoint.connect_lazy());
     GRPCConnection::for_test("http://127.0.0.1:1".parse().expect("test url"), channel)
+}
+
+/// Serves `routes` on a loopback listener for the rest of the test, and returns the listener's
+/// address.
+pub(crate) async fn serve_on_loopback(routes: Routes) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback listener");
+    let address = listener.local_addr().expect("the listener's address");
+    lore_base::lore_spawn!(
+        tonic::transport::Server::builder()
+            .add_routes(routes)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+    );
+    address
+}
+
+/// Serves `routes` as [`serve_on_loopback`] does, and returns the listener's address and a
+/// channel connected to it through [`RequestLoggerLayer`].
+pub(crate) async fn serve_logged(routes: Routes) -> (SocketAddr, Channel) {
+    let address = serve_on_loopback(routes).await;
+    let channel = tonic::transport::Channel::from_shared(format!("http://{address}"))
+        .expect("the server's URL")
+        .connect()
+        .await
+        .expect("connect to the test server");
+    (
+        address,
+        ServiceBuilder::new()
+            .layer(RequestLoggerLayer {})
+            .service(channel),
+    )
 }
 
 /// An operation the remote answers is returned as-is, without reconnecting.
@@ -87,6 +122,34 @@ async fn attempts_are_bounded_when_the_channel_never_recovers() {
     );
     assert_eq!(attempts.load(Ordering::Relaxed), MAX_RECONNECTS_PER_OP);
     assert_eq!(rebuilds.load(Ordering::Relaxed), MAX_RECONNECTS_PER_OP);
+}
+
+/// A failed rebuild ends the call with its error, without another attempt.
+#[tokio::test]
+async fn a_failed_rebuild_returns_its_error() {
+    let connection = test_connection();
+    let attempts = AtomicUsize::new(0);
+    let rebuilds = AtomicUsize::new(0);
+
+    let result: Result<(), ProtocolError> = with_reconnect(
+        &connection,
+        || async {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Err(ProtocolError::from(lore_base::error::Disconnected))
+        },
+        |_| async {
+            rebuilds.fetch_add(1, Ordering::Relaxed);
+            Err(ProtocolError::from(lore_base::error::NotAuthenticated))
+        },
+    )
+    .await;
+
+    assert!(
+        matches!(&result, Err(err) if err.is_not_authenticated()),
+        "{result:?}"
+    );
+    assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    assert_eq!(rebuilds.load(Ordering::Relaxed), 1);
 }
 
 /// Each attempt reads the epoch afresh, so a later attempt still drives a real reconnect.

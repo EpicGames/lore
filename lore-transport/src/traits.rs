@@ -284,9 +284,9 @@ pub trait Storage: Send + Sync {
 /// Revision protocol
 #[async_trait]
 pub trait Revision: Send + Sync {
-    /// Create a branch with the given identifier and name (must match) and parent branch stack
-    /// Will return the current LATEST pointer to allow the caller to distinguish created branch
-    /// and an already existing branch.
+    /// Create a branch with the given identifier and name and parent branch stack.
+    /// Returns the branch's record, whose latest revision tells a created branch from one that
+    /// already existed.
     async fn branch_create(
         &self,
         branch: BranchId,
@@ -294,7 +294,7 @@ pub trait Revision: Send + Sync {
         category: &str,
         creator: &str,
         stack: &[BranchPoint],
-    ) -> Result<Hash, ProtocolError>;
+    ) -> Result<BranchRecord, ProtocolError>;
 
     /// Destroy the given branch
     async fn branch_delete(&self, branch: BranchId) -> Result<(), ProtocolError>;
@@ -317,8 +317,13 @@ pub trait Revision: Send + Sync {
         fast_forward_merge: bool,
     ) -> Result<BranchPushResponse, ProtocolError>;
 
-    /// List all branches
-    async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError>;
+    /// List the live branches, and the archived ones too with `include_deleted`; with `creator`,
+    /// only those it created.
+    async fn branch_list(
+        &self,
+        creator: Option<&str>,
+        include_deleted: bool,
+    ) -> Result<BranchListResponse, ProtocolError>;
 
     /// List at most `limit` branches. `None` means enumeration exceeded the limit.
     /// Implementations must stop consuming the stream when the limit is exceeded.

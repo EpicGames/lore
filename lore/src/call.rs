@@ -43,11 +43,21 @@ pub(crate) fn with_relayed_environment<F: Future>(
     RELAYED_ENVIRONMENT.scope(environment, call)
 }
 
+/// The client execution context for a call whose events all go to `callback`.
 pub fn setup_execution(
     globals: LoreGlobalArgs,
     callback: LoreEventCallback,
 ) -> Arc<ExecutionContext> {
-    let execution = ExecutionContext::new_client(globals, EventDispatcher::new(callback));
+    setup_execution_with(globals, EventDispatcher::new(callback))
+}
+
+/// The client execution context for a call whose events go through `dispatcher`. It reads the
+/// environment of the process the call was relayed from, if any, in place of this process's.
+pub fn setup_execution_with(
+    globals: LoreGlobalArgs,
+    dispatcher: EventDispatcher,
+) -> Arc<ExecutionContext> {
+    let execution = ExecutionContext::new_client(globals, dispatcher);
     Arc::new(match RELAYED_ENVIRONMENT.try_with(Clone::clone) {
         Ok(environment) => execution.with_environment(environment),
         Err(_) => execution,

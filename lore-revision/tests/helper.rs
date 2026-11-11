@@ -768,6 +768,30 @@ pub async fn committed_repository(
     (repository, tempdir)
 }
 
+/// Creates the branch `name` in `category` off the current branch of `repository`'s instance, as
+/// `lore_branch_create` does: under `id` where one is given, and forced where `force` is set.
+#[allow(dead_code)]
+pub async fn create_branch_on_instance(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    name: &str,
+    id: Option<lore_revision::lore::BranchId>,
+    category: &str,
+    force: bool,
+) -> Result<(), lore_revision::branch::create::CreateError> {
+    let token = repository
+        .try_write_token()
+        .expect("The repository was opened for writing");
+    lore_revision::branch::create::create(
+        repository.clone(),
+        token,
+        name.to_string(),
+        id,
+        category.to_string(),
+        force,
+    )
+    .await
+}
+
 /// `names`, relative to `root`, as the paths a command is given.
 #[allow(dead_code)]
 pub fn path_arguments(
@@ -1116,6 +1140,8 @@ pub mod in_memory {
     use lore_revision::state::State;
     use lore_storage::hash::hash_string;
 
+    use super::RepositoryContextCreationArgsExt;
+
     struct Marker;
     impl InMemoryContext for Marker {}
     const MARKER: Marker = Marker;
@@ -1129,9 +1155,20 @@ pub mod in_memory {
         immutable: Arc<dyn lore_storage::ImmutableStore>,
         mutable: Arc<dyn lore_storage::MutableStore>,
     ) -> Arc<RepositoryContext> {
+        repository_in(immutable, mutable, RepositoryId::from(uuid::Uuid::now_v7()))
+    }
+
+    /// [`repository`] as a new instance of the repository `id`.
+    pub fn repository_in(
+        immutable: Arc<dyn lore_storage::ImmutableStore>,
+        mutable: Arc<dyn lore_storage::MutableStore>,
+        id: RepositoryId,
+    ) -> Arc<RepositoryContext> {
         Arc::new(
-            RepositoryContext::new(super::default_repository_creation_args(immutable, mutable))
-                .with_write_token(token()),
+            RepositoryContext::new(
+                super::default_repository_creation_args(immutable, mutable).with_id(id),
+            )
+            .with_write_token(token()),
         )
     }
 

@@ -15,6 +15,7 @@ use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::BranchPoint;
+use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_error_set::FfiError;
@@ -34,9 +35,11 @@ use lore_revision::revision;
 use lore_revision::revision::DiffItem;
 use lore_revision::state;
 use lore_revision::state::State;
+use lore_revision::state::StateData;
 use lore_storage::KeyType;
 use lore_storage::MutableStore;
 use lore_storage::StoreError;
+use lore_storage::WriteOptions;
 use lore_transport::ProtocolError;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -48,10 +51,12 @@ use lore_revision::branch::*;
 use lore_revision::util::path::RelativePathBuf;
 
 use crate::helper::committed_repository;
+use crate::helper::create_branch_on_instance;
 use crate::helper::forced_execution;
 use crate::helper::in_memory;
 use crate::helper::setup_test_execution;
 use crate::helper::stage_paths;
+use crate::helper::test_execution_with;
 use crate::helper::test_file_write;
 use crate::hooked_store::Answered;
 use crate::hooked_store::HookedStore;
@@ -358,6 +363,20 @@ pub(crate) async fn write_line(
         line.push(parent);
     }
     line
+}
+
+/// Write a blob of a revision state's size that is not a revision state: zeroed, so its header
+/// lacks the state magic. Read as a state, it is a revision numbered 0 without parents.
+pub(crate) async fn write_not_a_state(repository: &Arc<RepositoryContext>) -> Hash {
+    lore_revision::immutable::write(
+        repository.clone(),
+        Context::default(),
+        Bytes::from(vec![0u8; size_of::<StateData>()]),
+        WriteOptions::default(),
+    )
+    .await
+    .expect("writes the blob")
+    .hash
 }
 
 /// The branch point of a branch that has not moved since it was created is
@@ -1142,6 +1161,36 @@ async fn history_line_of_an_unknown_revision_is_empty() {
     .await;
 }
 
+/// A line whose first batch holds the revisions the local store holds ends where
+/// it leaves the store, where the remote's list of the line from there is not
+/// found, though the remote serves the state there.
+#[tokio::test]
+async fn history_line_the_remote_cannot_list_ends_where_it_leaves_the_store() {
+    Box::pin(with_execution(async {
+        let source = null_repository().await;
+        let gap = write_line(&source, Hash::default(), 1, 1).await[0];
+        let stores = client_stores().await;
+        let line = write_line(&stores.writer, gap, 2, 2).await;
+        let remote = PagedRemote::new(branch_id(7), line[1]);
+        let storage = crate::immutable::serving::serving_remote(
+            &source,
+            crate::immutable::serving::Serving::default(),
+        );
+        let client =
+            crate::paged_remote::client_on_storage(&stores, Arc::new(remote), vec![storage]);
+
+        let history = load_history_line(client.clone(), line[1])
+            .await
+            .expect("a line the remote cannot list is not a failure");
+
+        assert_eq!(history, vec![(3, line[1]), (2, line[0])]);
+        State::deserialize(client, gap)
+            .await
+            .expect("the remote serves the state where the line leaves the store");
+    }))
+    .await;
+}
+
 /// Whether a line reached its floor is read from the number its oldest revision
 /// carries. An unreadable oldest revision numbered above the floor is not at it;
 /// the next batch, which cannot read it either, ends the line.
@@ -1236,6 +1285,29 @@ async fn extending_an_exhausted_line_reports_it_exhausted() {
             "There is nothing to extend an empty line from"
         );
         assert!(empty.is_empty());
+    }))
+    .await;
+}
+
+/// Extending a line that leaves the local store, with no remote to list it from
+/// there, adds the revisions the store holds below the line's oldest revision, and
+/// the next extension ends the line where it leaves the store.
+#[tokio::test]
+async fn extending_a_line_that_leaves_the_store_adds_the_revisions_it_holds() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let line = write_line(&repository, revision(200), 1, 3).await;
+        let mut history = vec![(3, line[2])];
+
+        let ended = load_additional_history(repository.clone(), &mut history)
+            .await
+            .expect("a line that leaves the store is not a failure");
+        let ended_again = load_additional_history(repository, &mut history)
+            .await
+            .expect("a line that leaves the store is not a failure");
+
+        assert_eq!((ended, ended_again), (false, true));
+        assert_eq!(history, vec![(3, line[2]), (2, line[1]), (1, line[0])]);
     }))
     .await;
 }
@@ -1459,16 +1531,16 @@ async fn name_entries(repository: &Arc<RepositoryContext>) -> Vec<BranchId> {
     entries
 }
 
-/// A repository on in-memory stores whose mutable store runs `hook` before each load, store and
-/// compare-and-swap it forwards.
+/// A repository on in-memory stores whose mutable store runs `hook` before each load, store,
+/// compare-and-swap and list it forwards.
 pub(crate) async fn hooked_repository(
     hook: impl Fn(StoreCall, Hash, KeyType) -> Result<(), StoreError> + Send + Sync + 'static,
 ) -> Arc<RepositoryContext> {
     answering_repository(hook, None).await
 }
 
-/// [`hooked_repository`] whose mutable store also runs `answered`, if any, after each call it
-/// forwards that the store answers without an error.
+/// [`hooked_repository`] whose mutable store also runs `answered`, if any, after each load, store
+/// and compare-and-swap it forwards that the store answers without an error.
 async fn answering_repository(
     hook: impl Fn(StoreCall, Hash, KeyType) -> Result<(), StoreError> + Send + Sync + 'static,
     answered: Option<Answered>,
@@ -1487,8 +1559,8 @@ async fn answering_repository(
 }
 
 /// A client that can write, on in-memory stores, with `remote` as its remote or none, whose mutable
-/// store runs `hook` before each load, store and compare-and-swap it forwards, and a context over
-/// the same stores with no remote.
+/// store runs `hook` before each load, store, compare-and-swap and list it forwards, and a context
+/// over the same stores with no remote.
 async fn hooked_client(
     remote: Option<Arc<PagedRemote>>,
     hook: impl Fn(StoreCall, Hash, KeyType) -> Result<(), StoreError> + Send + Sync + 'static,
@@ -1549,7 +1621,8 @@ fn recording_hook() -> (
 fn assert_metadata_stored_before_the_claim(calls: &RecordedCalls) {
     let calls = calls.lock().expect("the recorded calls");
     let metadata = calls.iter().position(|&(call, key_type)| {
-        call != StoreCall::Load && key_type == KeyType::BranchMetadata
+        matches!(call, StoreCall::Store | StoreCall::CompareAndSwap)
+            && key_type == KeyType::BranchMetadata
     });
     let claim = calls
         .iter()
@@ -2290,7 +2363,9 @@ async fn create_record_of_branch_zero_fails_and_writes_nothing() {
         );
         let calls = calls.lock().expect("the recorded calls");
         assert!(
-            calls.iter().all(|&(call, _)| call == StoreCall::Load),
+            calls
+                .iter()
+                .all(|&(call, _)| !matches!(call, StoreCall::Store | StoreCall::CompareAndSwap)),
             "got {calls:?}"
         );
     }))
@@ -2424,6 +2499,100 @@ async fn a_create_with_an_invalid_name_or_parent_fails_with_invalid_arguments() 
                 "{name:?} off {stack:?}"
             );
         }
+    }))
+    .await;
+}
+
+/// A create on an instance given a name that isn't valid, or run on a personal branch, fails with
+/// `InvalidArguments`.
+#[tokio::test]
+async fn an_instance_create_with_an_invalid_name_or_on_a_personal_branch_fails_with_invalid_arguments()
+ {
+    Box::pin(LORE_CONTEXT.scope(setup_test_execution(), async {
+        let (repository, _tempdir) = committed_repository("", &[]).await;
+
+        let invalid_name = create_branch_on_instance(&repository, "", None, "", false).await;
+        create_branch_on_instance(&repository, "personal", None, personal_category(), false)
+            .await
+            .expect("the personal branch is created and becomes current");
+        let on_personal =
+            create_branch_on_instance(&repository, CLAIMED_NAME, None, "", false).await;
+
+        let created = [
+            ("an invalid name", invalid_name),
+            ("on a personal branch", on_personal),
+        ];
+        assert!(
+            created.iter().all(|(_, result)| {
+                result.as_ref().is_err_and(|err| err.is_invalid_arguments())
+            }),
+            "{created:?}"
+        );
+    }))
+    .await;
+}
+
+/// A create on an instance given a zero id fails with `InvalidArguments`: in a dry run too, and
+/// over a branch an older version made with id zero, whose metadata it leaves as it is.
+#[tokio::test]
+async fn an_instance_create_with_a_zero_id_fails_with_invalid_arguments() {
+    Box::pin(LORE_CONTEXT.scope(setup_test_execution(), async {
+        let (repository, _tempdir) = committed_repository("", &[]).await;
+        let zero = BranchId::default();
+
+        let plain =
+            create_branch_on_instance(&repository, CLAIMED_NAME, Some(zero), "", false).await;
+        let dry_run = Box::pin(LORE_CONTEXT.scope(
+            test_execution_with(LoreGlobalArgs {
+                dry_run: 1,
+                ..Default::default()
+            }),
+            create_branch_on_instance(&repository, CLAIMED_NAME, Some(zero), "", false),
+        ))
+        .await;
+        let (restorable, _restorable_dir) = committed_repository("", &[]).await;
+        let mut metadata = lore_revision::metadata::Metadata::new();
+        metadata_populate(
+            &mut metadata,
+            zero,
+            CLAIMED_NAME,
+            default_category(),
+            "creator",
+            1,
+            Vec::new(),
+        )
+        .expect("populating the metadata");
+        let metadata = metadata
+            .serialize(restorable.clone())
+            .await
+            .expect("storing the metadata");
+        mutable_store_metadata(restorable.clone(), zero, metadata)
+            .await
+            .expect("storing the metadata hash");
+        mutable_try_store(
+            restorable.clone(),
+            LATEST,
+            zero,
+            Hash::default(),
+            revision(1),
+        )
+        .await
+        .expect("storing the latest revision");
+        let over_branch =
+            create_branch_on_instance(&restorable, CLAIMED_NAME, Some(zero), "", false).await;
+
+        let created = [
+            ("a zero id", plain),
+            ("a zero id in a dry run", dry_run),
+            ("a zero id over a branch", over_branch),
+        ];
+        let kept = metadata_hash(restorable.clone(), zero).await.ok() == Some(metadata);
+        assert!(
+            kept && created.iter().all(|(_, result)| {
+                result.as_ref().is_err_and(|err| err.is_invalid_arguments())
+            }),
+            "the branch with id zero keeps its metadata: {kept}, {created:?}"
+        );
     }))
     .await;
 }

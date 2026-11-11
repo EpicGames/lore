@@ -47,7 +47,6 @@ use lore_base::types::Partition;
 
 use crate::immutable_store::CopyBehavior;
 use crate::immutable_store::ImmutableStore;
-use crate::immutable_store::StoreError;
 use crate::immutable_store::query_one;
 use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
@@ -361,13 +360,6 @@ async fn store_content(
         .map_err(|err| format!("put failed: {err:?}"))
 }
 
-fn is_absent(err: &StoreError) -> bool {
-    matches!(
-        err,
-        StoreError::AddressNotFound(_) | StoreError::PayloadNotFound(_) | StoreError::NotFound(_)
-    )
-}
-
 /// A store may only report absence for content it does not hold — never a weak match, never a
 /// fragment, never bytes, and no claim about where a payload it did not match is kept.
 async fn assert_absent(
@@ -417,7 +409,7 @@ async fn assert_absent(
                 "{context}: get_metadata named a source partition for content it did not match"
             );
         }
-        Err(ref err) if is_absent(err) => {}
+        Err(ref err) if err.is_absent() => {}
         Err(err) => return Err(format!("{context}: get_metadata failed: {err:?}")),
     }
 
@@ -562,7 +554,7 @@ async fn another_context_in_the_same_partition_never_matches_fully(
                 "get_metadata reported nothing for content the store just served the payload of"
             );
         }
-        Err(ref err) if is_absent(err) => require!(
+        Err(ref err) if err.is_absent() => require!(
             !served,
             "get_metadata reported absence for content the store just served the payload of"
         ),

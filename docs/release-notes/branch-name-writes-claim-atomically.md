@@ -39,9 +39,7 @@ type: fix
   name now names another branch. It restores the branch under the new name. Fixed
   `lore branch create --force` of a name mapped to a branch that records neither the name nor a
   restore under it archiving that branch and then failing. It now takes the name and leaves the
-  branch as it was. A create given a name that isn't valid, or a parent that's zero, the branch
-  itself or a personal branch, or a zero parent revision on a branch other than the default branch,
-  now fails with `InvalidArguments` (3), where it failed with an internal error.
+  branch as it was.
 - `lore-server`: Fixed the branch delete, the branch list's repair of a missing default-branch
   mapping, and the repository delete changing name mappings other writers had made. A delete removed
   a mapping a concurrent writer had pointed at another branch, the repair overwrote a name another
@@ -53,5 +51,7 @@ type: fix
   still counted, notified and runs the post hook. Fixed the branch create answering a store failure,
   such as a failed read of the name's mapping or of a branch's metadata, as `INVALID_ARGUMENT`, and
   logging nothing. It now answers `INTERNAL` and logs a warning.
+- `lore-server`: Fixed the branch create making a branch with id zero for a request whose id is zero
+  or unset. It now answers `INVALID_ARGUMENT`.
 - `lore-server`: Fixed the deprecated `urc.rpc` `BranchProtect` and `BranchUnprotect` requests
   putting back branch metadata that a restore changed while they ran.

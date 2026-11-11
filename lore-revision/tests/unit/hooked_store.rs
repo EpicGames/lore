@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! A mutable store that forwards every call to the store it wraps, and shows each load, store and
-//! compare-and-swap to a hook first, so a test can fail or record them. A second hook, where given,
-//! sees each of those calls the store answers without an error, so a test can write between calls
-//! or fail a call that landed.
+//! A mutable store that forwards every call to the store it wraps, and shows each load, store,
+//! compare-and-swap and list to a hook first, so a test can fail or record them. A second hook,
+//! where given, sees each load, store and compare-and-swap the store answers without an error, so a
+//! test can write between calls or fail a call that landed.
 
 use std::sync::Arc;
 
@@ -24,15 +24,16 @@ pub(crate) enum StoreCall {
     Load,
     Store,
     CompareAndSwap,
+    List,
 }
 
-/// Runs before a [`HookedStore`] forwards a call, with the key and key type the call names. An
-/// error fails the call, which then reaches no store.
+/// Runs before a [`HookedStore`] forwards a call, with the key and key type the call names, and a
+/// zero key for a list. An error fails the call, which then reaches no store.
 type Hook = Box<dyn Fn(StoreCall, Hash, KeyType) -> Result<(), StoreError> + Send + Sync>;
 
-/// Awaited after a [`HookedStore`] forwards a call the store answers without an error, with the
-/// store it wraps, the partition, and the key and key type the call names. An error fails the call
-/// in place of the store's answer.
+/// Awaited after a [`HookedStore`] forwards a load, store or compare-and-swap that the store
+/// answers without an error, with the store it wraps, the partition, and the key and key type the
+/// call names. An error fails the call in place of the store's answer.
 pub(crate) type Answered = Box<
     dyn Fn(
             Arc<dyn MutableStore>,
@@ -45,9 +46,9 @@ pub(crate) type Answered = Box<
         + Sync,
 >;
 
-/// A mutable store that forwards every call to `inner`, after its hook sees each load, store and
-/// compare-and-swap, and before its `answered` hook, if any, sees each one the store answers
-/// without an error.
+/// A mutable store that forwards every call to `inner`, after its hook sees each load, store,
+/// compare-and-swap and list, and before its `answered` hook, if any, sees each load, store and
+/// compare-and-swap the store answers without an error.
 pub(crate) struct HookedStore {
     inner: Arc<dyn MutableStore>,
     hook: Hook,
@@ -55,8 +56,9 @@ pub(crate) struct HookedStore {
 }
 
 impl HookedStore {
-    /// `inner`, with `hook` run before each load, store and compare-and-swap it forwards, and
-    /// `answered`, if any, after each one the store answers without an error.
+    /// `inner`, with `hook` run before each load, store, compare-and-swap and list it forwards, and
+    /// `answered`, if any, after each load, store and compare-and-swap the store answers without an
+    /// error.
     pub(crate) fn wrap(
         inner: Arc<dyn MutableStore>,
         hook: impl Fn(StoreCall, Hash, KeyType) -> Result<(), StoreError> + Send + Sync + 'static,
@@ -169,6 +171,7 @@ impl MutableStore for HookedStore {
         partition: Partition,
         key_type: KeyType,
     ) -> Result<KeyValueStream, StoreError> {
+        (self.hook)(StoreCall::List, Hash::default(), key_type)?;
         self.inner.clone().list(partition, key_type).await
     }
 

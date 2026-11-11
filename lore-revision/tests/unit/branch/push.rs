@@ -281,6 +281,7 @@ mod offer {
     use lore_transport::BranchListResponse;
     use lore_transport::BranchPushResponse;
     use lore_transport::BranchQueryResponse;
+    use lore_transport::BranchRecord;
     use lore_transport::MetadataSetResult;
     use lore_transport::Revision;
     use lore_transport::RevisionListResponse;
@@ -306,9 +307,9 @@ mod offer {
             _: &str,
             _: &str,
             _: &[BranchPoint],
-        ) -> Result<Hash, ProtocolError> {
+        ) -> Result<BranchRecord, ProtocolError> {
             self.created.fetch_add(1, Ordering::Relaxed);
-            Ok(Hash::default())
+            Ok(BranchRecord::default())
         }
 
         async fn branch_delete(&self, _: BranchId) -> Result<(), ProtocolError> {
@@ -336,7 +337,11 @@ mod offer {
                 .expect("the peer was not offered more than it answers")
         }
 
-        async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError> {
+        async fn branch_list(
+            &self,
+            _: Option<&str>,
+            _: bool,
+        ) -> Result<BranchListResponse, ProtocolError> {
             unreachable!("an offer lists no branches")
         }
 

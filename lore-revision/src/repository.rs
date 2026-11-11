@@ -75,6 +75,7 @@ use crate::lore_debug;
 use crate::lore_warn;
 use crate::metadata::Metadata;
 use crate::protocol;
+use crate::protocol::RemoteEndpoint;
 use crate::protocol::RemoteFuture;
 use crate::revision;
 use crate::revision::sync;
@@ -675,6 +676,22 @@ pub enum MountKind {
     Layer,
 }
 
+/// How the reads that take their options from a [`RepositoryContext`]
+/// ([`read_options_from_repository`](crate::immutable::read_options_from_repository)) use the
+/// local store.
+#[lore_macro::test_pub]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalReads {
+    /// The local store first, a failed local read taken as a miss.
+    Probe,
+    /// Not the local store: nothing is read from it or stored in it
+    /// ([`RepositoryContext::reading_remote_only`]).
+    Skip,
+    /// The local store first, a failed local read reported as an error where no remote is in
+    /// reach ([`RepositoryContext::strict_local_reads`]).
+    Strict,
+}
+
 #[lore_macro::test_pub]
 pub struct RepositoryContext {
     /// Working-tree path for this repository. `None` for path-less contexts
@@ -713,9 +730,14 @@ pub struct RepositoryContext {
     /// once the pool is stale, as after a reconnect rotated the server's session map.
     session_pool: parking_lot::RwLock<Option<Arc<SessionPool>>>,
     /// Whether this context is the only holder of its session pool, so the pool's sessions
-    /// stop with the context, as a revision tree handle's do. Otherwise the connection pins
-    /// the pool as well, for later calls under the same correlation id to take.
+    /// stop with the context, as a revision tree handle's do. Otherwise, where no endpoint is set
+    /// ([`Self::with_remote_endpoint`]), the connection pins the pool as well, for later calls
+    /// under the same correlation id to take.
     holds_its_sessions: bool,
+    /// The endpoint the session pool is resolved through in place of the connection, if set.
+    endpoint: Option<Arc<RemoteEndpoint>>,
+    /// Set by [`Self::reading_remote_only()`] and [`Self::strict_local_reads()`].
+    pub(crate) local_reads: LocalReads,
     /// The lazy storage session this context's reads and writes carry, with the correlation id
     /// it was built for. Held strongly: a pending session re-resolves after invalidation, so one
     /// serves every operation against this context's partition under that correlation id, until
@@ -829,6 +851,8 @@ impl RepositoryContext {
             own_stores: None,
             session_pool: Default::default(),
             holds_its_sessions: false,
+            endpoint: None,
+            local_reads: LocalReads::Probe,
             lazy_session: Default::default(),
             file_system,
         }
@@ -842,7 +866,7 @@ impl RepositoryContext {
     /// across a mount doing two-view work for a view that has not changed.
     ///
     /// The session cells are the exception, starting empty rather than adopting sessions that
-    /// belong to another partition.
+    /// belong to another partition. The endpoint is kept, as it answers per partition.
     fn inherited(&self) -> Self {
         RepositoryContext {
             link_read: self.link_read.clone(),
@@ -861,6 +885,8 @@ impl RepositoryContext {
             own_stores: self.own_stores.clone(),
             session_pool: Default::default(),
             holds_its_sessions: self.holds_its_sessions,
+            endpoint: self.endpoint.clone(),
+            local_reads: self.local_reads,
             lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
@@ -1105,6 +1131,27 @@ impl RepositoryContext {
         self
     }
 
+    /// This context reading from the remote alone, in place of strict local reads: the reads that
+    /// take their options from it
+    /// ([`read_options_from_repository`](crate::immutable::read_options_from_repository)) skip the
+    /// local store and store nothing in it, whatever the cache setting or a fragment's local cache
+    /// priority asks.
+    #[must_use]
+    pub fn reading_remote_only(mut self) -> Self {
+        self.local_reads = LocalReads::Skip;
+        self
+    }
+
+    /// This context telling a failed local read from a miss, in place of reading from the remote
+    /// alone: in the reads that take their options from it, where no remote is in reach, a local
+    /// read that fails or finds a corrupt fragment reports an error, and only an address the local
+    /// store does not hold reports `AddressNotFound`.
+    #[must_use]
+    pub fn strict_local_reads(mut self) -> Self {
+        self.local_reads = LocalReads::Strict;
+        self
+    }
+
     /// Spawn a background task that flushes pending store writes to disk.
     /// Called by the client dispatcher after a command completes.
     ///
@@ -1279,6 +1326,8 @@ impl RepositoryContext {
             own_stores: None,
             session_pool: Default::default(),
             holds_its_sessions: false,
+            endpoint: None,
+            local_reads: LocalReads::Probe,
             lazy_session: Default::default(),
         }
     }
@@ -1502,31 +1551,67 @@ impl RepositoryContext {
     }
 
     /// The storage session pool for this repository under `correlation_id`, resolved once and
-    /// reused for as long as it [`serves`](SessionPool::serves) that correlation id.
+    /// reused for as long as it [`serves`](SessionPool::serves) that correlation id. Resolved
+    /// through the endpoint [`Self::with_remote_endpoint`] set where there is one, and through
+    /// the context's connection otherwise.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
     #[lore_macro::test_pub]
-    pub(crate) async fn session_pool(
-        &self,
-        correlation_id: &str,
-    ) -> Result<Arc<SessionPool>, ProtocolError> {
-        if let Some(pool) = self.cached_session_pool(correlation_id) {
-            return Ok(pool);
+    #[allow(clippy::manual_async_fn)]
+    pub(crate) fn session_pool<'a>(
+        &'a self,
+        correlation_id: &'a str,
+    ) -> impl Future<Output = Result<Arc<SessionPool>, ProtocolError>> + 'a {
+        async move {
+            if let Some(pool) = self.cached_session_pool(correlation_id) {
+                return Ok(pool);
+            }
+            let pool = if let Some(endpoint) = &self.endpoint {
+                endpoint.session_pool(&self.id, correlation_id).await?
+            } else {
+                self.connection_session_pool(correlation_id).await?
+            };
+            *self.session_pool.write() = Some(pool.clone());
+            Ok(pool)
         }
-        let remote = self.remote().await?;
-        let pool = if self.holds_its_sessions {
-            remote
-                .unpinned_session_pool(self.id, correlation_id)
-                .await?
-        } else {
-            remote.session_pool(self.id, correlation_id).await?
-        };
-        *self.session_pool.write() = Some(pool.clone());
-        Ok(pool)
+    }
+
+    /// The session pool for this repository under `correlation_id` from the context's connection:
+    /// one the connection does not pin where the context holds its sessions, and one it pins
+    /// otherwise.
+    ///
+    /// A future of its own, so that the connection, borrowed across either await, is held by this
+    /// future alone and not by every state of [`Self::session_pool`]'s. Not an `async fn`, which
+    /// would hold a second copy of its arguments.
+    #[allow(clippy::manual_async_fn)]
+    fn connection_session_pool<'a>(
+        &'a self,
+        correlation_id: &'a str,
+    ) -> impl Future<Output = Result<Arc<SessionPool>, ProtocolError>> + 'a {
+        async move {
+            let remote = self.remote().await?;
+            if self.holds_its_sessions {
+                remote.unpinned_session_pool(self.id, correlation_id).await
+            } else {
+                remote.session_pool(self.id, correlation_id).await
+            }
+        }
     }
 
     /// This context as the only holder of its session pools, so their sessions stop with it
     /// rather than stay pinned on the connection.
     pub fn holding_its_sessions(mut self) -> Self {
         self.holds_its_sessions = true;
+        self
+    }
+
+    /// This context taking its session pools from `endpoint` in place of its connection, so the
+    /// endpoint holds them and [`Self::holding_its_sessions`] does not apply. The endpoint is
+    /// asked only when a remote read or write needs a session under a correlation id that no pool
+    /// held here serves.
+    #[must_use]
+    pub fn with_remote_endpoint(mut self, endpoint: Arc<RemoteEndpoint>) -> Self {
+        self.endpoint = Some(endpoint);
         self
     }
 

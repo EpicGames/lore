@@ -399,7 +399,8 @@ pub async fn create_branch(
             &branch_stack,
         )
         .await
-        .forward::<LinkError>("Failed to create branch in linked repository")?;
+        .forward::<LinkError>("Failed to create branch in linked repository")?
+        .latest;
 
     Ok(LinkBranchOutcome {
         revision: latest,

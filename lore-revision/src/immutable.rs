@@ -30,6 +30,7 @@ use crate::lore::VecBytes;
 use crate::lore_debug;
 use crate::lore_trace;
 use crate::lore_warn;
+use crate::repository::LocalReads;
 use crate::repository::RepositoryContext;
 use crate::store::ImmutableStore;
 use crate::store::StoreError;
@@ -147,8 +148,12 @@ pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptio
             let globals = context.globals();
             (globals.sync_data(), globals.trust_remote())
         });
+    let local_reads = repository.local_reads;
     ReadOptions {
+        local: local_reads != LocalReads::Skip,
         cache: !repository.disable_cache(),
+        no_local_write: local_reads == LocalReads::Skip,
+        strict_local: local_reads == LocalReads::Strict,
         direct_write: repository.direct_file_write(),
         sync_data,
         trust_remote,
@@ -209,16 +214,18 @@ pub(crate) fn resolve_session(repository: &Arc<RepositoryContext>) -> Option<Arc
 ///
 /// Going through [`RepositoryContext::session_pool`] rather than the connection is
 /// the point: the context holds the pool it resolved, so a command's operations take it
-/// without a lookup on the connection, and the context decides whether the connection pins
-/// it as well.
+/// without a lookup on the connection. A context with an endpoint takes the endpoint's pool,
+/// which the connection does not pin; one without decides whether the connection pins it.
+///
+/// Returns the pool's future mapped, without a future of its own.
 #[lore_macro::test_pub]
-pub(crate) async fn pooled_session(
-    repository: &Arc<RepositoryContext>,
-    correlation_id: &str,
-) -> Result<Arc<StorageSession>, ProtocolError> {
-    Ok(Arc::new(StorageSession::pooled(
-        repository.session_pool(correlation_id).await?,
-    )))
+pub(crate) fn pooled_session<'a>(
+    repository: &'a Arc<RepositoryContext>,
+    correlation_id: &'a str,
+) -> impl Future<Output = Result<Arc<StorageSession>, ProtocolError>> + 'a {
+    futures::FutureExt::map(repository.session_pool(correlation_id), |pool| {
+        pool.map(|pool| Arc::new(StorageSession::pooled(pool)))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -989,7 +996,8 @@ async fn push_local_list_children(
 /// ([`fetch_to_cache`]). Once connected, every fragment that can be cached is, and the answer is
 /// the failure to connect, the first failure to query, fetch, check or store a fragment, or else
 /// how many fragments it fetched, by its own get or one it joined: a fragment found local after
-/// waiting for a cache get permit is not fetched.
+/// waiting for a cache get permit is not fetched. A context reading from the remote alone
+/// ([`RepositoryContext::reading_remote_only`]) cannot cache: its cache fails with `NotSupported`.
 pub async fn cache(
     repository: Arc<RepositoryContext>,
     address: Vec<Address>,
@@ -1025,8 +1033,8 @@ impl Cached {
 }
 
 /// [`cache`], answering everything it fetched ([`Cached`]) rather than its first failure; only a
-/// failure to connect to the remote is an error, and a session that cannot be started fails each
-/// fetch.
+/// failure to connect to the remote, or a context reading from the remote alone, is an error, and
+/// a session that cannot be started fails each fetch.
 pub async fn cache_counted(
     repository: Arc<RepositoryContext>,
     address: Vec<Address>,
@@ -1054,9 +1062,17 @@ pub async fn cache_counted(
 /// The session `repository`'s cache fetches go through, its lazy one ([`resolve_session`]), which
 /// starts its server-side sessions again once a fetch invalidates them, and the connection's cache
 /// get permits they take ([`cache_through`]).
+///
+/// Every cache takes its session here, so this refuses a context reading from the remote alone
+/// ([`RepositoryContext::reading_remote_only`]) before anything is asked of the remote.
 pub(crate) async fn cache_session(
     repository: &Arc<RepositoryContext>,
 ) -> Result<(Arc<StorageSession>, CacheGets), ImmutableError> {
+    if repository.local_reads == LocalReads::Skip {
+        return Err(ImmutableError::from(NotSupported {
+            operation: "caching on a context that reads from the remote alone".to_owned(),
+        }));
+    }
     let remote_result: Result<_, ImmutableError> = repository
         .remote()
         .await

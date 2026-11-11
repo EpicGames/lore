@@ -66,8 +66,8 @@ struct Holds {
 pub struct EventDispatcher {
     pub correlation_id: String,
     pub completed: CancellationToken,
-    pub weak_sender: Option<WeakUnboundedSender<DispatchedEvent>>,
-    pub strong_sender: Mutex<Option<UnboundedSender<DispatchedEvent>>>,
+    weak_sender: Option<WeakUnboundedSender<DispatchedEvent>>,
+    strong_sender: Mutex<Option<UnboundedSender<DispatchedEvent>>>,
     /// The [`KeepOpen`] holds on the channel. Counted here rather than read off
     /// the channel's strong count, which does not tell a hold apart from the
     /// upgrade a `send` takes for the length of its push.
@@ -77,6 +77,9 @@ pub struct EventDispatcher {
     /// call drops the task, which leaves the token uncancelled forever, but the
     /// join still resolves.
     forwarder: Mutex<Option<JoinHandle<()>>>,
+    /// The event filter set by [`with_event_filter`](Self::with_event_filter). `None` sends
+    /// every event.
+    pass: Option<fn(&LoreEvent) -> bool>,
 }
 
 impl Default for EventDispatcher {
@@ -88,6 +91,7 @@ impl Default for EventDispatcher {
             strong_sender: Mutex::new(None),
             holds: Arc::default(),
             forwarder: Mutex::new(None),
+            pass: None,
         }
     }
 }
@@ -130,17 +134,23 @@ impl EventDispatcher {
             strong_sender: Mutex::new(Some(sender)),
             holds: Arc::default(),
             forwarder: Mutex::new(forwarder),
+            pass: None,
         }
     }
 
+    /// A dispatcher without a channel, which drops every event it is sent.
     pub fn no_dispatch() -> Self {
+        Self::default()
+    }
+
+    /// This dispatcher, whose `send`, `send_with_bytes` and `send_error` send only the events for
+    /// which `pass` returns `true`, dropping any other before it reaches the channel. The
+    /// `Complete` that [`complete`](Self::complete) sends and the `End` the forwarder sends always
+    /// reach the callback.
+    pub fn with_event_filter(self, pass: fn(&LoreEvent) -> bool) -> Self {
         Self {
-            correlation_id: String::default(),
-            completed: CancellationToken::new(),
-            weak_sender: None,
-            strong_sender: Mutex::new(None),
-            holds: Arc::default(),
-            forwarder: Mutex::new(None),
+            pass: Some(pass),
+            ..self
         }
     }
 
@@ -195,16 +205,15 @@ impl EventDispatcher {
     }
 
     fn send_inner(&self, event: LoreEvent, keepalive: Option<Bytes>) {
-        if let Some(sender) = self.sender()
-            && let Err(_err) = sender.send((event, keepalive))
-        {
-            /*
-            generate_log(
-                self.correlation_id.as_str(),
-                LoreLogLevel::Trace,
-                format!("Failed to send event: {err}"),
-            );
-            */
+        if self.pass.is_none_or(|pass| pass(&event)) {
+            self.push(event, keepalive);
+        }
+    }
+
+    /// Puts `event` in the channel, where one is open, without consulting the filter.
+    fn push(&self, event: LoreEvent, keepalive: Option<Bytes>) {
+        if let Some(sender) = self.sender() {
+            drop(sender.send((event, keepalive)));
         }
     }
 
@@ -216,10 +225,8 @@ impl EventDispatcher {
     }
 
     /// Waits for every event sent so far to have been through the callback, so a
-    /// caller reading what its callback collected sees all of it.
-    ///
-    /// Called by [`complete`](Self::complete), and directly by a relayed call,
-    /// which the service completes instead.
+    /// caller reading what its callback collected sees all of it. Returns at once while a
+    /// [`KeepOpen`] holds the channel open.
     pub async fn drain(&self) {
         // Drop this strong reference, let the dispatcher task exit out and signal the end event
         // if this is the only strong reference to the event channel
@@ -241,17 +248,18 @@ impl EventDispatcher {
         }
     }
 
+    /// Sends `Complete` with `error` without consulting the event filter, then drains the channel
+    /// as [`drain`](Self::drain) does. A failing `error` is logged with its trace first. Returns
+    /// `error.error_code`, the status the event carries.
     pub async fn complete(&self, error: LoreErrorDetail) -> i32 {
-        // `status` is the detail's `error_code` so the two agree by
-        // construction: `0` with the empty default detail on success, the
-        // detail's `error_code` with that detail on failure.
         let status = error.error_code;
-        // Log a failing completion so consumers that surface log events (the
-        // CLI, the server) show the message and trace.
         if status != 0 {
             crate::lore_error!("{}", error.message_with_trace());
         }
-        self.send(LoreEvent::Complete(LoreCompleteEventData { status, error }));
+        self.push(
+            LoreEvent::Complete(LoreCompleteEventData { status, error }),
+            None,
+        );
         self.drain().await;
 
         status

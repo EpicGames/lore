@@ -18,10 +18,18 @@ use crate::repository::RepositoryContext;
 /// A path-less context on fresh in-memory stores whose remote is in `state`, so everything but
 /// the remote is valid.
 pub async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
+    context_built(state, |context| context).await
+}
+
+/// [`context_with_state`] with `build` applied, for a context set up through its builders.
+pub async fn context_built(
+    state: RemoteState,
+    build: impl FnOnce(RepositoryContext) -> RepositoryContext,
+) -> Arc<RepositoryContext> {
     let (immutable, mutable) = crate::repository::create_client_memory_stores()
         .await
         .expect("in-memory stores should be creatable");
-    Arc::new(RepositoryContext::new_with_state(
+    Arc::new(build(RepositoryContext::new_with_state(
         None,
         immutable,
         mutable,
@@ -30,7 +38,7 @@ pub async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
         state,
         Arc::default(),
         None,
-    ))
+    )))
 }
 
 /// The tasks one walk spawns: counts those live, for a test to read the peak, holds each one

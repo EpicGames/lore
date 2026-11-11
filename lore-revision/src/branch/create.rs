@@ -94,6 +94,10 @@ impl EventError for CreateError {
     }
 }
 
+/// Creates the branch `branch` off the instance's current branch and makes it current. Where
+/// [`branch::create_at`] fails with [`BranchAlreadyExists`], so does the create, unless `force`
+/// replaces the branch. Its refusals and [`InvalidArguments`] are forwarded, and its other failures
+/// are reported as `Internal`; the create a forced replace retries forwards every failure.
 pub async fn create(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -245,7 +249,9 @@ pub async fn create(
                 return Err(CreateError::from(BranchAlreadyExists { branch }));
             }
         }
-        Err(err) if is_refusal(&err) => return Err(err).forward::<CreateError>("creating branch"),
+        Err(err) if is_refusal(&err) || err.is_invalid_arguments() => {
+            return Err(err).forward::<CreateError>("creating branch");
+        }
         Err(err) => return Err(CreateError::internal_with_context(err, "creating branch")),
     };
 

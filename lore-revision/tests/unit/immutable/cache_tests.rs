@@ -17,6 +17,7 @@ use lore_revision::immutable::*;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::repository::RemoteState;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::test_util::context_built;
 use lore_revision::test_util::context_with_state;
 use lore_storage::options::ReadOptions;
 use lore_storage::options::WriteOptions;
@@ -425,6 +426,37 @@ async fn a_cache_starts_again_a_session_the_remote_forgot() {
     assert!(
         is_stored_local(context.clone(), address).await,
         "the payload is stored"
+    );
+}
+
+/// A context reading from the remote alone stores nothing locally, so its cache fails
+/// `NotSupported` before the remote is asked for anything, and leaves the fragment uncached.
+#[tokio::test]
+async fn a_cache_on_a_remote_only_context_is_refused() {
+    let (source, address, _) =
+        remote_copy(b"content a remote-only context never caches", 0x69, 0).await;
+    let remote = serving_remote(&source, Serving::default());
+    let connection = lore_transport::Connection::detached(vec![remote.clone()]);
+    let context = context_built(
+        RemoteState::Connected(connection),
+        RepositoryContext::reading_remote_only,
+    )
+    .await;
+
+    let cached = under_execution_context(|| cache(context.clone(), vec![address], false)).await;
+
+    assert!(
+        cached.as_ref().is_err_and(|err| err.is_not_supported()),
+        "got {cached:?}"
+    );
+    assert_eq!(remote.starts(), 0, "a session was started on the remote");
+    assert!(
+        remote.asked().is_empty(),
+        "the remote was asked for a fragment"
+    );
+    assert!(
+        !is_stored_local(context.clone(), address).await,
+        "the fragment is stored"
     );
 }
 

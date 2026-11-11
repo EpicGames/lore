@@ -20,6 +20,7 @@ use std::sync::atomic::Ordering;
 
 use lore_base::error::InvalidArguments;
 use lore_base::types::Partition;
+use lore_revision::protocol::RemoteEndpoint;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_storage::options::ReadOptions;
@@ -30,7 +31,6 @@ use tokio::sync::Notify;
 use crate::interface::LoreGlobalArgs;
 use crate::storage::handle;
 use crate::storage::handle::LoreStore;
-use crate::storage::remote::RemoteEndpoint;
 
 /// Bound mode set at `lore_storage_open` from `globals.{offline,local,remote}`.
 ///
@@ -293,7 +293,7 @@ impl StoreInternal {
             notified.await;
         }
         if let Some(remote) = &self.remote {
-            remote.pools.clear();
+            remote.clear_pools();
         }
     }
 }

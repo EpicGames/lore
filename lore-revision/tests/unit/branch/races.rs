@@ -29,6 +29,7 @@ use super::mapped;
 use super::null_repository;
 use super::with_execution;
 use crate::helper::committed_repository;
+use crate::helper::create_branch_on_instance;
 use crate::helper::in_memory;
 use crate::helper::setup_test_execution;
 
@@ -1484,34 +1485,18 @@ async fn a_forced_create_takes_over_the_name_a_stopped_restore_left() {
                 .expect("the branch is archived");
             leave_bee_mapped(&repository, left).await;
 
-            let token = repository
-                .try_write_token()
-                .expect("The repository was opened for writing");
-            let unforced = branch::create::create(
-                repository.clone(),
-                token,
-                BEE.to_string(),
-                None,
-                String::new(),
-                false,
-            )
-            .await;
+            let unforced = create_branch_on_instance(&repository, BEE, None, "", false).await;
             assert!(
                 unforced
                     .as_ref()
                     .is_err_and(|err| err.is_branch_already_exists()),
                 "{left:?}: got {unforced:?}"
             );
-            branch::create::create(
-                repository.clone(),
-                token,
-                BEE.to_string(),
-                None,
-                String::new(),
-                true,
-            )
-            .await
-            .unwrap_or_else(|err| panic!("{left:?}: a forced create takes the name over: {err:?}"));
+            create_branch_on_instance(&repository, BEE, None, "", true)
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("{left:?}: a forced create takes the name over: {err:?}")
+                });
 
             let holder = mapped(&repository, BEE).await;
             assert!(
@@ -1576,19 +1561,9 @@ async fn a_forced_create_takes_over_a_name_the_live_branch_holds_no_record_of() 
         drop(stalled);
         assert_eq!(mapped(&repository, BEE).await, Some(branch_id(RACED)));
 
-        let token = repository
-            .try_write_token()
-            .expect("The repository was opened for writing");
-        branch::create::create(
-            repository.clone(),
-            token,
-            BEE.to_string(),
-            None,
-            String::new(),
-            true,
-        )
-        .await
-        .expect("a forced create takes the name over");
+        create_branch_on_instance(&repository, BEE, None, "", true)
+            .await
+            .expect("a forced create takes the name over");
 
         let holder = mapped(&repository, BEE).await;
         assert!(
@@ -1647,21 +1622,11 @@ async fn a_forced_create_reads_a_name_in_another_case_as_its_holders() {
                 "{stopped}"
             );
 
-            let token = repository
-                .try_write_token()
-                .expect("The repository was opened for writing");
-            branch::create::create(
-                repository.clone(),
-                token,
-                BEE.to_string(),
-                None,
-                String::new(),
-                true,
-            )
-            .await
-            .unwrap_or_else(|err| {
-                panic!("{stopped}: a forced create takes the name over: {err:?}")
-            });
+            create_branch_on_instance(&repository, BEE, None, "", true)
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("{stopped}: a forced create takes the name over: {err:?}")
+                });
 
             let holder = mapped(&repository, BEE).await;
             assert!(
