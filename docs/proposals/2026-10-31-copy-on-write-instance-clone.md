@@ -5,7 +5,7 @@ authors:
   - Zack Neyland
 status: Draft
 created: 2026-10-31
-updated: 2026-11-09
+updated: 2026-11-10
 ---
 
 # Copy-on-write instance clone
@@ -138,8 +138,11 @@ next to `instance list`, `move`, `prune` and `delete`
   [ADR-00024](../developing/decisions/00024-store-locks-held-per-span-contain-the-repository-lock.md) with it
   the shared store's locks, from the first write to the registration. It also keeps out other commands in its
   own process, such as the Lore service, which otherwise share one acquisition of that lock
-  (`REPOSITORY_LOCK_CACHE` in `lore-revision/src/repository.rs`). So no Lore command changes the source, and
-  no sync starts in it, while it is cloned. See Lock hold.
+  (`REPOSITORY_LOCK_CACHE` in `lore-revision/src/repository.rs`). So no command that takes these locks changes
+  the source, and no sync starts in it, while it is cloned. `instance move` renames the source before it takes
+  any lock, so it can change the source mid-clone: on Unix the move makes the clone fail, and on Windows the
+  clone's open handles in the source refuse the rename. `instance delete` deregisters the source before it
+  removes any file, and the deregistration takes these locks, so a delete waits for the clone. See Lock hold.
 - **Writes into an in-progress directory** beside the destination, gives the copy the source's anchors,
   renames the directory to the destination, and then registers it. No registration names the destination
   before the clone is there; see Interrupted clones.
@@ -260,8 +263,10 @@ the clone first waits for the commands already holding the source's repository l
 more join them, so a stream of overlapping commands cannot keep it out; then commands on the source wait
 too, since the clone holds the repository lock alone there; commands on other
 instances share the process's hold of the store's locks and run. `instance delete` takes the
-source's repository lock to deregister it, so it waits too. `instance move` moves the directory before it takes
-any lock: one that moves the source during the clone makes the clone fail.
+source's repository lock to deregister it, before it removes any file, so it waits too. `instance move` renames
+the directory before it takes any lock. On Unix, one that moves the source during the clone makes the clone
+fail, and then waits for the clone to end to record the new path; on Windows the clone's open handles in the
+source refuse the rename.
 
 How long that is depends on the backend. Only the APFS row on the measured tree is measured; every other
 figure is an **estimate**. The ~1 TB tree is assumed to hold about 11 million entries, about 2.4 million
@@ -366,10 +371,14 @@ N/A — no breaking changes, no migration required.
 ## Security Considerations
 
 No change to the trust model. A clone is a copy of a working tree the user already has, written with the
-user's permissions. It copies symbolic links as links and never follows one, so a crafted tree cannot make
-the clone read or write outside the source and the destination, and the destination checks run on the
-destination's resolved parent. The probe writes one small file in the source's Lore directory and clones
-it into the destination's parent, with the same permissions, and removes both.
+user's permissions. It copies symbolic links as links and never follows one, and leaves out a directory
+replaced by a link after it was listed. Nor does a link swapped in above a directory while the clone lists it
+lead the clone out of the tree. On Unix the clone reads each entry through its directory's open handle. On
+Windows it reads each entry by path, and holds each directory it lists open without sharing delete access, so
+a rename or removal of that directory, or of one above it, is refused until the directory is listed. So a
+crafted tree cannot make the clone read or write outside the source and the destination, and the destination
+checks run on the destination's resolved parent. The probe writes one small file in the source's Lore
+directory and clones it into the destination's parent, with the same permissions, and removes both.
 
 ## Privacy Considerations
 
