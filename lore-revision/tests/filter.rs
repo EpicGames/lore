@@ -1837,6 +1837,25 @@ mod tests {
         }
     }
 
+    /// An instance's exclusion of a directory wins over a re-inclusion below it
+    /// in the repository's ignore file, though a rule there excluded the
+    /// directory first: `.lore/ignore`'s `/Game/Saved/` keeps
+    /// `Game/Saved/Config/game.ini` out under `Saved/` and `!/Game/Saved/Config/`.
+    #[test]
+    fn an_instance_exclusion_wins_over_a_reinclusion_below_it() {
+        let dir = TempDir::new("lore-filter-instance-ignore-wins-");
+        let filter = instance_filter(&dir, b"Saved/\n!/Game/Saved/Config/\n", b"/Game/Saved/\n")
+            .expect("load");
+        assert!(
+            filter.excludes(
+                &probe_path("Game/Saved/Config/game.ini"),
+                false,
+                FilterMode::Ignore
+            ),
+            "the repository's re-inclusion wins over the instance's exclusion"
+        );
+    }
+
     /// A `!` line in an instance's ignore file is skipped with a warning naming
     /// the file and the line, so it cannot bring back what the repository
     /// ignores; the lines around it still apply.

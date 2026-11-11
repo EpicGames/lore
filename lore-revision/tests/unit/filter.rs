@@ -371,6 +371,67 @@ fn the_floor_holds_for_every_list() {
     );
 }
 
+/// The floor below an excluded directory is the last line that excludes it,
+/// though an earlier line excludes it too. With `/**`, `!/a*`, `!*/d/y` and
+/// `/a/*`, `/a/*` is the last line to exclude `a/d`, so `!*/d/y`, authored
+/// before it, re-includes nothing below `a/d` and a walk does not enter it, as
+/// Git prunes there. Only `/**` excludes `ab/d`, so `!*/d/y` re-includes
+/// `ab/d/y`, which Git leaves out by pruning at `ab/d`. A view and an ignore
+/// file answer alike, folding a whole path and stepping down a walk, in every
+/// layout.
+///
+/// Where several exclusions follow the floor, the last of them floors the step
+/// below: `/a/d/` floors `a/d` past `!*/d/y*`, which follows `/a/*`. And a
+/// later rule excluding a directory on the way stops a deep re-inclusion that
+/// an earlier one would not.
+#[test]
+fn the_floor_is_the_last_line_that_excludes_a_directory() {
+    let rules = ["/**", "!/a*", "!*/d/y", "/a/*"];
+    assert_verdicts(&rules, &["a/d/y", "a/x"], &["ab/d/y"]);
+    assert_verdicts(
+        &["/**", "!/a*", "/a/*", "!*/d/y*", "/a/d/"],
+        &["a/d/y"],
+        &["ab/d/y"],
+    );
+    assert_verdicts(&["/*", "!/e/s/r/p/i", "/e/*/"], &["e/s/r/p/i"], &[]);
+    assert_verdicts(&["/*", "/e/*/", "!/e/s/r/p/i"], &[], &["e/s/r/p/i"]);
+    for mode in [FilterMode::View, FilterMode::Ignore] {
+        for (layout, instance) in layouts(|filter| add_rules(filter, &rules)) {
+            let mut filter = Filter::default();
+            if mode == FilterMode::View {
+                filter.view = instance;
+            } else {
+                filter.ignore = instance;
+            }
+            for (top, kept) in [("a", false), ("ab", true)] {
+                let file = format!("{top}/d/y");
+                assert_eq!(
+                    !filter.excludes(&path(&file), false, mode),
+                    kept,
+                    "{mode:?} {layout} folds {file}"
+                );
+                let (top_states, _) =
+                    filter.child_exclusion_states(FilterStates::ROOT, &path(top), true, mode);
+                assert!(!top_states.excluded(mode), "{mode:?} {layout} steps {top}");
+                let directory = path(&format!("{top}/d"));
+                let (states, _) = filter.child_exclusion_states(top_states, &directory, true, mode);
+                assert!(states.excluded(mode), "{mode:?} {layout} steps {top}/d");
+                assert_eq!(
+                    filter.should_descend(states, &directory, mode),
+                    kept,
+                    "{mode:?} {layout} descends into {top}/d"
+                );
+                let (states, _) = filter.child_exclusion_states(states, &path(&file), false, mode);
+                assert_eq!(
+                    !states.excluded(mode),
+                    kept,
+                    "{mode:?} {layout} steps {file}"
+                );
+            }
+        }
+    }
+}
+
 /// Re-inclusions added out of the order their text sorts in each reach their
 /// own directory, so a fold descends into it, and no other, at a node narrow
 /// enough to scan and at one wide enough to search.

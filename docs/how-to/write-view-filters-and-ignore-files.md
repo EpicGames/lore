@@ -64,7 +64,7 @@ Write `/a/` and `!/a/` for a directory.
 
 - **Only the root `.loreignore` counts.** One in a subdirectory has no effect.
 - **Matching ignores case**, and Lore trims spaces at both ends of a line. Git matches case on a case-sensitive file system, and keeps leading spaces.
-- **Re-inclusion works below an excluded directory**, as [Re-include one file deep inside an excluded tree](#re-include-one-file-deep-inside-an-excluded-tree) shows.
+- **Re-inclusion works below an excluded directory**, as [Re-include one file deep inside an excluded tree](#re-include-one-file-deep-inside-an-excluded-tree) shows, unless a later rule excludes a directory on the way: adding `/Engine/*/` to the end of that example leaves `impl.cpp` out, so put the re-inclusion after `/Engine/*/` to keep it.
 - **A path re-inclusion covers its subtree.** After `**`, `!/Engine/Config/` brings back `base.ini` too. One ending in `*`, such as `!/*`, re-includes only what it matches, so after `**` what lies below it stays excluded.
 - **A path re-inclusion that starts with `**`, such as `!**/Saved/Config/`, is refused.** `lore clone --view` and `lore sync --view` refuse a view holding one. Under a `.loreignore` holding one, every command in the instance fails until you remove the line:
 
