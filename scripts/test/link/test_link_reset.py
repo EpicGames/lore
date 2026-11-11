@@ -4,8 +4,14 @@ import json
 import os
 
 import pytest
-from error_types import LocalChanges, LoreException, NotSupportedError
-from link_helpers import assert_crr_clean, make_parent_with_link, make_repo
+from error_types import ImproperArgumentsError, LocalChanges, NotSupportedError
+from link_helpers import (
+    assert_crr_clean,
+    build_nested_link_repos_at,
+    make_parent_with_link,
+    make_repo,
+    make_repo_renumbering_folder,
+)
 from lore_parsers import parse_status_json
 from test_utils import has_staged_anchor, status_by_path
 
@@ -241,34 +247,53 @@ def test_link_reset(new_lore_repo):
 
 
 @pytest.mark.smoke
-@pytest.mark.xfail(
-    strict=True,
-    reason="reset of a staged file inside a link discards the staged edit instead "
-    "of refusing, as the same reset does outside a link",
-)
-def test_link_reset_refuses_a_staged_file_inside_a_link(new_lore_repo):
-    """`reset` refuses a file whose change is staged, inside a link as outside.
-
-    Outside a link the reset fails with `Failed to reset staged node` and leaves
-    the edit alone. Inside a link it currently restores the committed content and
-    reports success, which loses the staged edit.
+@pytest.mark.parametrize("layout", ["link", "nested", "repinned"])
+def test_link_reset_refuses_a_staged_file_inside_a_link(new_lore_repo, layout):
+    """`reset` refuses a staged file inside a link, and a directory holding one, as it
+    does outside a link, and keeps the staged edit. An unstaged edit beside it still
+    resets. That holds in a link inside a link, and in a link re-pinned and not yet
+    committed to a revision that numbers the file's nodes differently.
     """
-    link_path = "linked"
-    staged_file = f"{link_path}/file1.txt"
-    repo, _link_repo = make_parent_with_link(
-        new_lore_repo, link_path, {"file1.txt": "link file 1 original\n"}
-    )
-
-    repo.write_files({staged_file: "MODIFIED file 1 for staged test\n"})
-    repo.stage(staged_file)
-
-    with pytest.raises(LoreException):
-        repo.reset(staged_file)
-
-    with repo.open_file(staged_file) as f:
-        assert f.read() == "MODIFIED file 1 for staged test\n", (
-            "A refused reset must leave the staged edit on disk"
+    if layout == "nested":
+        repo, _, _, outer_mount, inner_mount = build_nested_link_repos_at(
+            new_lore_repo, "linked", "inner"
         )
+        staged_directory = f"{inner_mount}/c-data"
+        staged_file = f"{staged_directory}/inner.txt"
+        edited_file = f"{outer_mount}/b-root.txt"
+    elif layout == "repinned":
+        link_repo, first_pin, second_pin = make_repo_renumbering_folder(new_lore_repo)
+        repo = make_repo(new_lore_repo, {"parent.txt": "parent\n"})
+        repo.link_add("linked", link_repo.get_id(), "/", pin=first_pin)
+        repo.commit("Add link")
+        repo.push()
+        repo.link_update("linked", pin=second_pin)
+        staged_directory = "linked/sub"
+        staged_file = f"{staged_directory}/a.txt"
+        edited_file = "parent.txt"
+    else:
+        repo, _link_repo = make_parent_with_link(
+            new_lore_repo,
+            "linked",
+            {"dir/staged.txt": "original\n", "edited.txt": "original\n"},
+        )
+        staged_directory = "linked/dir"
+        staged_file = f"{staged_directory}/staged.txt"
+        edited_file = "linked/edited.txt"
+    files = repo.read_files()
+
+    repo.write_files({staged_file: "staged edit\n", edited_file: "unstaged edit\n"})
+    repo.stage(staged_file)
+    repo.reset(edited_file)
+    status = status_by_path(repo)
+
+    for path in (staged_file, staged_directory):
+        with pytest.raises(ImproperArgumentsError):
+            repo.reset(path)
+
+    assert repo.read_files() == {**files, staged_file: "staged edit\n"}
+    assert status_by_path(repo) == status
+    assert any(entry["flagStaged"] for entry in status.values())
 
 
 @pytest.mark.smoke

@@ -3776,6 +3776,8 @@ impl NodeLink {
         }
     }
 
+    /// Whether this node lies outside `state` of `repository`, in another repository or revision,
+    /// so a lookup crossed a link to reach it.
     pub fn crosses_link(&self, repository: &RepositoryContext, state: &State) -> bool {
         self.is_valid_or_root()
             && (repository.id != self.repository || state.revision() != self.revision)

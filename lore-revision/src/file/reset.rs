@@ -1381,25 +1381,18 @@ async fn reset_walk_named_path(
 
     let node_name = relative_path.name().to_string();
 
-    let node_link = state_target
-        .find_node_link(repository.clone(), state_path.as_str())
+    let found = state_target
+        .find_relative(repository.clone(), ROOT_NODE, state_path.as_str())
         .await;
 
-    match node_link {
-        Ok(node_link) => {
-            let (target_repository, target_state_current) = node_link
-                .resolve(repository.clone(), state_target.clone())
-                .await
-                .forward::<ResetError>("Failed to deserialize revision state")?;
-
-            // For staged state, only resolve through links (not for same-repo nodes)
-            // to avoid re-deserializing to the wrong revision, which loses dirty flags
-            let current_state_staged = if node_link.repository != repository.id {
-                let (_, resolved_staged) = node_link
-                    .resolve(repository.clone(), state_staged.clone())
-                    .await
-                    .forward::<ResetError>("Failed to deserialize revision state")?;
-                resolved_staged
+    match found {
+        Ok((node_link, held)) => {
+            let crosses_link = held.is_some();
+            let (target_repository, target_state_current) =
+                held.unwrap_or_else(|| (repository.clone(), state_target.clone()));
+            let current_state_staged = if crosses_link {
+                refuse_staged(&state_staged, &repository, &state_path).await?;
+                target_state_current.clone()
             } else {
                 state_staged.clone()
             };
@@ -1483,10 +1476,7 @@ async fn reset_walk_named_path(
                     return Ok(());
                 }
                 if staged {
-                    return Err(InvalidArguments {
-                        reason: "Failed to reset staged node".into(),
-                    }
-                    .into());
+                    return Err(staged_node_refusal());
                 }
 
                 if dirty_add {
@@ -1519,6 +1509,40 @@ async fn reset_walk_named_path(
         }
         Err(err) => Err(err).forward::<ResetError>("Failed to find node"),
     }
+}
+
+/// Refuses `state_path` where the staged tree holds it as staged, read through the staged tree's
+/// own links: inside a link, the staged revision can number its nodes other than the target's pin.
+async fn refuse_staged(
+    state_staged: &State,
+    repository: &Arc<RepositoryContext>,
+    state_path: &RelativePath,
+) -> Result<(), ResetError> {
+    let (staged_link, held) = match state_staged
+        .find_relative(repository.clone(), ROOT_NODE, state_path.as_str())
+        .await
+    {
+        Ok(found) => found,
+        Err(err) if err.is_node_not_found() => return Ok(()),
+        Err(err) => return Err(err).forward::<ResetError>("Failed to find staged node"),
+    };
+    let staged = state_staged
+        .found_node(repository.clone(), &staged_link, held)
+        .await
+        .forward::<ResetError>("Failed to find staged node")?
+        .is_staged();
+    if staged {
+        return Err(staged_node_refusal());
+    }
+    Ok(())
+}
+
+/// The refusal of a reset that would discard a staged change.
+fn staged_node_refusal() -> ResetError {
+    InvalidArguments {
+        reason: "Failed to reset staged node".into(),
+    }
+    .into()
 }
 
 /// The dirty add standing beside `node_id` in `state_staged` under the same name, which took its
@@ -1703,10 +1727,7 @@ async fn reset_walk_node(
         });
     if let Some((staged, dirty)) = staged_flags {
         if staged {
-            return Err(InvalidArguments {
-                reason: "Failed to reset staged node".into(),
-            }
-            .into());
+            return Err(staged_node_refusal());
         }
 
         // Clear Dirty flag if set (reset restores file to current revision), then a dirty clear's

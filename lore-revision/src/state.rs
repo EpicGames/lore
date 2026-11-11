@@ -4943,6 +4943,17 @@ impl State {
         let (found, held) = self
             .find_relative(repository.clone(), ROOT_NODE, path)
             .await?;
+        self.found_node(repository, &found, held).await
+    }
+
+    /// The node [`Self::find_relative`] found, read in the linked state it returned where it
+    /// crossed a link to reach the node.
+    pub(crate) async fn found_node(
+        &self,
+        repository: Arc<RepositoryContext>,
+        found: &NodeLink,
+        held: Option<LinkedState>,
+    ) -> Result<Node, StateError> {
         match held {
             Some((repository, state)) => state.node(repository, found.node).await,
             None => self.node(repository, found.node).await,
