@@ -225,20 +225,25 @@ struct CountingReadStore {
     inner: Arc<dyn ImmutableStore>,
     gets: Arc<std::sync::atomic::AtomicUsize>,
     gets_into: Arc<std::sync::atomic::AtomicUsize>,
+    puts: Arc<std::sync::atomic::AtomicUsize>,
     hooks: Arc<std::sync::Mutex<ReadHooks>>,
     /// Every payload it hands back carries a byte past the length its fragment gives, as a store
     /// that does not check a payload's length against its fragment could answer it.
     pad: bool,
 }
 
-/// What a [`CountingReadStore`] does around its first read: answer it `placement_error` where it is
-/// a placement and one is set, then notify `release`, and land `landing` by putting its payload and
-/// dropping its in-flight guard, as a tracker leader finishing during a reader's probe would.
+/// What a [`CountingReadStore`] does around its first read, answering it `placement_error` where it
+/// is a placement and one is set, then notifying `release`, and landing `landing` by putting its
+/// payload and dropping its in-flight guard, as a tracker leader finishing during a reader's probe
+/// would; and around its puts, holding the first until `put_held` is notified, and refusing every
+/// one where `put_refused`.
 #[derive(Default)]
 struct ReadHooks {
     release: Option<Arc<tokio::sync::Notify>>,
     landing: Option<Landing>,
     placement_error: Option<StoreError>,
+    put_held: Option<Arc<tokio::sync::Notify>>,
+    put_refused: bool,
 }
 
 type Landing = (
@@ -271,6 +276,7 @@ impl CountingReadStore {
             inner,
             gets: Arc::default(),
             gets_into: Arc::default(),
+            puts: Arc::default(),
             hooks: Arc::new(std::sync::Mutex::new(hooks)),
             pad: false,
         };
@@ -278,6 +284,7 @@ impl CountingReadStore {
             inner: counts.inner.clone(),
             gets: counts.gets.clone(),
             gets_into: counts.gets_into.clone(),
+            puts: counts.puts.clone(),
             hooks: counts.hooks.clone(),
             pad: false,
         });
@@ -285,9 +292,11 @@ impl CountingReadStore {
     }
 
     async fn after_read(&self) {
-        let ReadHooks {
-            release, landing, ..
-        } = std::mem::take(&mut *self.hooks.lock().expect("hooks"));
+        let (release, landing) = {
+            let mut hooks = self.hooks.lock().expect("hooks");
+            hooks.placement_error = None;
+            (hooks.release.take(), hooks.landing.take())
+        };
         if let Some(release) = release {
             release.notify_one();
         }
@@ -307,6 +316,11 @@ impl CountingReadStore {
 
     fn gets_into(&self) -> usize {
         self.gets_into.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Puts the store was asked for.
+    fn puts(&self) -> usize {
+        self.puts.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Every time the store was asked for the payload, by either read.
@@ -405,6 +419,14 @@ impl ImmutableStore for CountingReadStore {
         payload: Option<Bytes>,
         force: bool,
     ) -> Result<(), StoreError> {
+        self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.hooks.lock().expect("hooks").put_refused {
+            return Err(StoreError::internal("the store refuses puts"));
+        }
+        let held = self.hooks.lock().expect("hooks").put_held.take();
+        if let Some(held) = held {
+            held.notified().await;
+        }
         self.inner
             .clone()
             .put(partition, address, fragment, payload, force)
@@ -3254,6 +3276,7 @@ async fn followers_get_the_leaders_bytes_when_nothing_is_cached() {
                     partition,
                     address,
                     ReadOptions::default(),
+                    None,
                     || {
                         let fetches = fetches.clone();
                         let payload = payload.clone();
@@ -3321,6 +3344,7 @@ async fn concurrent_misses_of_one_content_under_different_addresses_fetch_once()
                     partition,
                     address,
                     ReadOptions::default(),
+                    None,
                     || {
                         let fetches = fetches.clone();
                         let payload = payload.clone();
@@ -3353,16 +3377,24 @@ async fn concurrent_misses_of_one_content_under_different_addresses_fetch_once()
 }
 
 /// A follower takes the leader's error only for the leader's own address: one under another
-/// context fetches for itself, and one under the same address answers the error.
+/// context fetches and stores for itself, and one under the same address answers the error.
 #[tokio::test(flavor = "multi_thread")]
 async fn only_a_follower_of_the_leaders_address_takes_its_error() {
+    use lore_storage::read_flight::FlightStore;
     use lore_storage::read_flight::ReadFlight;
     use lore_storage::read_flight::join_read_flight;
 
     let (_dir, store) = make_test_store().await;
     for (seed, same_address) in [(0xE9, false), (0xEA, true)] {
         let (partition, address, fragment, payload) = make_input(seed);
-        let ReadFlight::Leader(leader) = join_read_flight(partition, address, false, false) else {
+        let ReadFlight::Leader(leader) = join_read_flight(
+            FlightStore::of(store.as_ref()),
+            None,
+            partition,
+            address,
+            false,
+            false,
+        ) else {
             panic!("the first caller leads");
         };
         let follower_address = if same_address {
@@ -3383,6 +3415,7 @@ async fn only_a_follower_of_the_leaders_address_takes_its_error() {
                     partition,
                     follower_address,
                     ReadOptions::default(),
+                    Some(Keep::Store),
                     || {
                         fetches.fetch_add(1, Ordering::SeqCst);
                         let raw = raw.clone();
@@ -3421,6 +3454,10 @@ async fn only_a_follower_of_the_leaders_address_takes_its_error() {
             let (_, bytes) = read.expect("a follower of another address fetches itself");
             assert_eq!(bytes, payload);
             assert_eq!(fetches.load(Ordering::SeqCst), 1);
+            assert!(
+                holds(&store, partition, follower_address, &payload).await,
+                "a follower fetching for itself stores what it keeps"
+            );
         }
     }
 }
@@ -3429,12 +3466,20 @@ async fn only_a_follower_of_the_leaders_address_takes_its_error() {
 /// a payload checked less than it asks.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_untrusting_fetch_never_follows_a_trusting_flight() {
+    use lore_storage::read_flight::FlightStore;
     use lore_storage::read_flight::ReadFlight;
     use lore_storage::read_flight::join_read_flight;
 
     let (_dir, store) = make_test_store().await;
     let (partition, address, fragment, payload) = make_input(0xEC);
-    let ReadFlight::Leader(leader) = join_read_flight(partition, address, false, true) else {
+    let ReadFlight::Leader(leader) = join_read_flight(
+        FlightStore::of(store.as_ref()),
+        None,
+        partition,
+        address,
+        false,
+        true,
+    ) else {
         panic!("the first caller leads");
     };
     let fetches = Arc::new(AtomicU64::new(0));
@@ -3445,6 +3490,7 @@ async fn an_untrusting_fetch_never_follows_a_trusting_flight() {
             partition,
             address,
             ReadOptions::default(),
+            None,
             || {
                 fetches.fetch_add(1, Ordering::SeqCst);
                 let raw = (fragment, payload.clone());
@@ -3472,12 +3518,20 @@ async fn an_untrusting_fetch_never_follows_a_trusting_flight() {
 /// than following a flight for the same content held in another.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_isolating_store_never_shares_a_flight_across_partitions() {
+    use lore_storage::read_flight::FlightStore;
     use lore_storage::read_flight::ReadFlight;
     use lore_storage::read_flight::join_read_flight;
 
     let (_dir, store) = store_with_isolation(true).await;
     let (partition, address, fragment, payload) = make_input(0xEB);
-    let ReadFlight::Leader(leader) = join_read_flight(partition, address, true, false) else {
+    let ReadFlight::Leader(leader) = join_read_flight(
+        FlightStore::of(store.as_ref()),
+        None,
+        partition,
+        address,
+        true,
+        false,
+    ) else {
         panic!("the first caller leads");
     };
     let other_partition = lore_storage::Partition::from([!0xEBu8; 16]);
@@ -3489,6 +3543,7 @@ async fn an_isolating_store_never_shares_a_flight_across_partitions() {
             other_partition,
             address,
             ReadOptions::default(),
+            None,
             || {
                 fetches.fetch_add(1, Ordering::SeqCst);
                 let raw = (fragment, payload.clone());
@@ -3510,6 +3565,645 @@ async fn an_isolating_store_never_shares_a_flight_across_partitions() {
     assert_eq!(bytes, payload);
     assert_eq!(fetches.load(Ordering::SeqCst), 1);
     drop(leader);
+}
+
+/// Caching misses following a flight for the same content, one into `store` at each of
+/// `addresses`, joined while the leader's fetch is held: the leader, in `leader_store` keeping
+/// `leader_keep`, fetches `raw` at `leader_address` once released. Answers how many fetches the
+/// followers made.
+async fn follow_a_held_flight(
+    leader_store: &Arc<dyn ImmutableStore>,
+    leader_keep: Option<Keep>,
+    store: &Arc<dyn ImmutableStore>,
+    partition: Partition,
+    leader_address: Address,
+    addresses: &[Address],
+    raw: (Fragment, Bytes),
+) -> u64 {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let fetches = AtomicU64::new(0);
+    let leader = fetch_single_flight(
+        leader_store.clone(),
+        partition,
+        leader_address,
+        ReadOptions::default(),
+        leader_keep,
+        || {
+            let (gate, raw) = (gate.clone(), raw.clone());
+            async move {
+                gate.notified().await;
+                Ok(Loaded {
+                    content: Some(raw.clone()),
+                    raw,
+                })
+            }
+        },
+        || {},
+    );
+    let counted = &fetches;
+    let follower = |address: Address| {
+        fetch_single_flight(
+            store.clone(),
+            partition,
+            address,
+            ReadOptions::default(),
+            Some(Keep::Store),
+            move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    Err(StorageError::from(
+                        lore_storage::errors::AddressNotFound::from(address),
+                    ))
+                }
+            },
+            || {},
+        )
+    };
+    let joined = lore_storage::test_util::followers();
+    let release = async {
+        while lore_storage::test_util::followers() < joined + addresses.len() {
+            tokio::task::yield_now().await;
+        }
+        gate.notify_one();
+    };
+    let follow = futures::future::join_all(addresses.iter().map(|&address| follower(address)));
+    let (led, followed, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(leader, follow, release)
+    })
+    .await
+    .expect("the followers joined the held flight");
+    led.expect("the leader fetches");
+    for flown in followed {
+        flown.expect("the follower takes the leader's fetch");
+    }
+    fetches.load(Ordering::SeqCst)
+}
+
+/// Whether `store` holds `payload` at `address` in `partition`, read with no remote.
+async fn holds(
+    store: &Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    payload: &Bytes,
+) -> bool {
+    load_fragment(
+        store.clone(),
+        partition,
+        address,
+        ReadOptions::default().no_remote(),
+        None,
+    )
+    .await
+    .is_ok_and(|(_, local)| local == *payload)
+}
+
+/// A caching follower's store holds the fetch once the flight ends: stored by the follower in
+/// another store or at another address, and by the leader at its own address in its store, with
+/// what the follower keeps merged into what the leader keeps there, whether the leader keeps
+/// nothing, keeps only what the local cache priority asks, or caches.
+#[tokio::test]
+async fn a_followers_store_holds_the_fetch_once_the_flight_ends() {
+    let (_dir, store) = make_test_store().await;
+    let (_other_dir, other_store) = make_test_store().await;
+    let (_isolating_dir, isolating) = store_with_isolation(true).await;
+    for (seed, leader_store, leader_keep, store, other_address) in [
+        (0xF6, &other_store, Some(Keep::Store), &store, false),
+        (0xF7, &store, None, &store, false),
+        (0xF8, &store, Some(Keep::Priority), &store, false),
+        (0xF9, &store, Some(Keep::Priority), &store, true),
+        (0xFA, &isolating, Some(Keep::Store), &isolating, true),
+    ] {
+        let (partition, address, fragment, payload) = make_input(seed);
+        let follower_address = if other_address {
+            Address {
+                context: Context::from([!seed; 16]),
+                ..address
+            }
+        } else {
+            address
+        };
+        let fetches = follow_a_held_flight(
+            leader_store,
+            leader_keep,
+            store,
+            partition,
+            address,
+            &[follower_address],
+            (fragment, payload.clone()),
+        )
+        .await;
+
+        assert!(
+            holds(store, partition, follower_address, &payload).await,
+            "seed {seed:#x}: the follower's store lacks it"
+        );
+        assert_eq!(fetches, 0, "seed {seed:#x}: fetches");
+    }
+}
+
+/// A follower at another address of the leader's store stores the fetch at its own address, where
+/// a lookup by hash would not find the leader's: a tombstone of the content at an address between
+/// them is the entry the follower's lookup meets.
+#[tokio::test]
+async fn a_follower_at_another_address_of_the_leaders_store_stores_its_own() {
+    let (_dir, inner) = make_test_store().await;
+    let (store, counts) = CountingReadStore::wrap(inner);
+    let (partition, address, fragment, payload) = make_input(0xD6);
+    let at = |byte: u8| Address {
+        context: Context::from([byte; 16]),
+        ..address
+    };
+    store
+        .clone()
+        .put(partition, at(0x20), fragment, Some(payload.clone()), false)
+        .await
+        .expect("put the content");
+    store
+        .clone()
+        .obliterate(
+            partition,
+            at(0x20),
+            Arc::new(lore_storage::store_types::StoreObliterateStats::default()),
+        )
+        .await
+        .expect("obliterate the content at one address");
+    assert!(!holds(&store, partition, at(0x30), &payload).await);
+    let puts = counts.puts();
+
+    let fetches = follow_a_held_flight(
+        &store,
+        Some(Keep::Store),
+        &store,
+        partition,
+        at(0x10),
+        &[at(0x30)],
+        (fragment, payload.clone()),
+    )
+    .await;
+
+    assert_eq!(fetches, 0);
+    assert_eq!(
+        counts.puts() - puts,
+        2,
+        "the leader's put and the follower's own"
+    );
+    assert!(holds(&store, partition, at(0x30), &payload).await);
+}
+
+/// Followers at two addresses of the leader's store, which isolates partitions, neither the
+/// leader's address, each store the fetch at their own address.
+#[tokio::test]
+async fn followers_at_two_addresses_of_an_isolating_store_each_store_their_own() {
+    let (_dir, isolating) = store_with_isolation(true).await;
+    let (partition, address, fragment, payload) = make_input(0xFD);
+    let at = |byte: u8| Address {
+        context: Context::from([byte; 16]),
+        ..address
+    };
+
+    let fetches = follow_a_held_flight(
+        &isolating,
+        Some(Keep::Store),
+        &isolating,
+        partition,
+        address,
+        &[at(1), at(2)],
+        (fragment, payload.clone()),
+    )
+    .await;
+
+    assert!(holds(&isolating, partition, at(1), &payload).await);
+    assert!(holds(&isolating, partition, at(2), &payload).await);
+    assert_eq!(fetches, 0);
+}
+
+/// Followers in the leader's store merge what they keep into what the leader keeps there, so the
+/// store has one put made for all of them.
+#[tokio::test]
+async fn followers_in_the_leaders_store_have_one_put_made_for_them() {
+    let (_dir, inner) = make_test_store().await;
+    let (store, counts) = CountingReadStore::wrap(inner);
+    let (partition, address, fragment, payload) = make_input(0xFB);
+
+    let fetches = follow_a_held_flight(
+        &store,
+        None,
+        &store,
+        partition,
+        address,
+        &[address; 3],
+        (fragment, payload.clone()),
+    )
+    .await;
+
+    assert_eq!(fetches, 0);
+    assert_eq!(counts.puts(), 1, "puts in the store");
+    assert!(holds(&store, partition, address, &payload).await);
+}
+
+/// A leader whose put stores its fetch in its store answers so: a leader keeping nothing itself
+/// stores for a caching follower in its store, and with none stores nothing.
+#[tokio::test]
+async fn a_leader_answers_whether_its_flight_stored_the_fetch() {
+    for (seed, follows) in [(0xD4, true), (0xD5, false)] {
+        let (_dir, store) = make_test_store().await;
+        let (partition, address, fragment, payload) = make_input(seed);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let raw = (fragment, payload.clone());
+        let leader = fetch_single_flight(
+            store.clone(),
+            partition,
+            address,
+            ReadOptions::default(),
+            None,
+            || {
+                let (gate, raw) = (gate.clone(), raw.clone());
+                async move {
+                    gate.notified().await;
+                    Ok(Loaded {
+                        content: Some(raw.clone()),
+                        raw,
+                    })
+                }
+            },
+            || {},
+        );
+        let follower = async {
+            if !follows {
+                return None;
+            }
+            Some(
+                fetch_single_flight(
+                    store.clone(),
+                    partition,
+                    address,
+                    ReadOptions::default(),
+                    Some(Keep::Store),
+                    || async { panic!("a follower of a held flight fetches") },
+                    || {},
+                )
+                .await,
+            )
+        };
+        let joined = lore_storage::test_util::followers();
+        let release = async {
+            while follows && lore_storage::test_util::followers() == joined {
+                tokio::task::yield_now().await;
+            }
+            gate.notify_one();
+        };
+        let (led, followed, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(leader, follower, release)
+        })
+        .await
+        .expect("the flight ends");
+
+        let led = led.expect("the leader fetches");
+        assert_eq!(
+            matches!(led, Flown::Stored(_)),
+            follows,
+            "seed {seed:#x}: {led:?}"
+        );
+        if let Some(followed) = followed {
+            followed.expect("the follower takes the fetch");
+        }
+        assert_eq!(holds(&store, partition, address, &payload).await, follows);
+    }
+}
+
+/// A leader whose store refuses its put answers its fetch as fetched, not stored.
+#[tokio::test]
+async fn a_leader_whose_put_fails_answers_its_fetch_as_fetched() {
+    let (_dir, inner) = make_test_store().await;
+    let (store, _) = CountingReadStore::with_hooks(
+        inner,
+        ReadHooks {
+            put_refused: true,
+            ..ReadHooks::default()
+        },
+    );
+    let (partition, address, fragment, payload) = make_input(0xD9);
+    let raw = (fragment, payload);
+
+    let flown = fetch_single_flight(
+        store,
+        partition,
+        address,
+        ReadOptions::default(),
+        Some(Keep::Store),
+        || {
+            let raw = raw.clone();
+            async move {
+                Ok(Loaded {
+                    content: Some(raw.clone()),
+                    raw,
+                })
+            }
+        },
+        || {},
+    )
+    .await
+    .expect("the leader fetches");
+
+    assert!(matches!(flown, Flown::Fetched(_)), "{flown:?}");
+}
+
+/// A follower that replaces its local copy, which failed to load, in the leader's store has the
+/// leader overwrite that copy: what it keeps outranks what the leader and the other followers keep.
+#[tokio::test]
+async fn a_follower_replacing_its_local_copy_has_the_leader_overwrite_it() {
+    for (seed, leader_keep) in [(0xD2, None), (0xD3, Some(Keep::Store))] {
+        let (_dir, store) = make_test_store().await;
+        let (partition, address, fragment, payload) = make_input(seed);
+        lore_storage::test_util::accepting_unvalidated_puts(store.clone().put(
+            partition,
+            address,
+            Fragment {
+                size_payload: 8,
+                ..fragment
+            },
+            Some(Bytes::from(vec![0xff; 8])),
+            false,
+        ))
+        .await
+        .expect("put the broken copy");
+        assert!(!holds(&store, partition, address, &payload).await);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let raw = (fragment, payload.clone());
+        let leader = fetch_single_flight(
+            store.clone(),
+            partition,
+            address,
+            ReadOptions::default(),
+            leader_keep,
+            || {
+                let (gate, raw) = (gate.clone(), raw.clone());
+                async move {
+                    gate.notified().await;
+                    Ok(Loaded {
+                        content: Some(raw.clone()),
+                        raw,
+                    })
+                }
+            },
+            || {},
+        );
+        let follower = |keep| {
+            fetch_single_flight(
+                store.clone(),
+                partition,
+                address,
+                ReadOptions::default(),
+                Some(keep),
+                || async { panic!("a follower of a held flight fetches") },
+                || {},
+            )
+        };
+        let joined = lore_storage::test_util::followers();
+        let release = async {
+            while lore_storage::test_util::followers() < joined + 2 {
+                tokio::task::yield_now().await;
+            }
+            gate.notify_one();
+        };
+        let (led, replacing, storing, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                leader,
+                follower(Keep::Replace),
+                follower(Keep::Store),
+                release
+            )
+        })
+        .await
+        .expect("the followers joined the held flight");
+        led.expect("the leader fetches");
+        replacing.expect("the replacing follower takes the fetch");
+        storing.expect("the storing follower takes the fetch");
+
+        assert!(
+            holds(&store, partition, address, &payload).await,
+            "seed {seed:#x}: the broken copy is overwritten"
+        );
+    }
+}
+
+/// A follower of a leader dropped during its put rejoins, fetches, and stores the content itself.
+#[tokio::test]
+async fn a_follower_of_a_leader_dropped_during_its_put_stores_the_content_itself() {
+    let (_dir, store) = make_test_store().await;
+    let (_other_dir, other_inner) = make_test_store().await;
+    let (leader_store, _) = CountingReadStore::with_hooks(
+        other_inner,
+        ReadHooks {
+            put_held: Some(Arc::new(tokio::sync::Notify::new())),
+            ..ReadHooks::default()
+        },
+    );
+    let (partition, address, fragment, payload) = make_input(0xFE);
+    let raw = (fragment, payload.clone());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let fetches = AtomicU64::new(0);
+    let fetch = || {
+        let raw = raw.clone();
+        async move {
+            Ok(Loaded {
+                content: Some(raw.clone()),
+                raw,
+            })
+        }
+    };
+    let mut leader = Box::pin(fetch_single_flight(
+        leader_store.clone(),
+        partition,
+        address,
+        ReadOptions::default(),
+        Some(Keep::Store),
+        || {
+            let (gate, fetched) = (gate.clone(), fetch());
+            async move {
+                gate.notified().await;
+                fetched.await
+            }
+        },
+        || {},
+    ));
+    let follower = fetch_single_flight(
+        store.clone(),
+        partition,
+        address,
+        ReadOptions::default(),
+        Some(Keep::Store),
+        || {
+            fetches.fetch_add(1, Ordering::SeqCst);
+            fetch()
+        },
+        || {},
+    );
+    let mut follower = std::pin::pin!(follower);
+    assert!(
+        futures::poll!(leader.as_mut()).is_pending(),
+        "the leader's fetch is held"
+    );
+    assert!(
+        futures::poll!(follower.as_mut()).is_pending(),
+        "the follower follows"
+    );
+    gate.notify_one();
+    assert!(
+        futures::poll!(leader.as_mut()).is_pending(),
+        "the leader's put is held"
+    );
+    drop(leader);
+
+    tokio::time::timeout(Duration::from_secs(10), follower)
+        .await
+        .expect("the follower ends")
+        .expect("the follower fetches for itself");
+    assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    assert!(holds(&store, partition, address, &payload).await);
+}
+
+/// A follower in the leader's store joining once the leader took less than it keeps there stores
+/// the fetch itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follower_joining_once_the_leader_took_less_than_it_keeps_stores_its_own() {
+    use lore_storage::read_flight::FlightStore;
+    use lore_storage::read_flight::ReadFlight;
+    use lore_storage::read_flight::join_read_flight;
+
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, payload) = make_input(0xFC);
+    let ReadFlight::Leader(leader) = join_read_flight(
+        FlightStore::of(store.as_ref()),
+        None,
+        partition,
+        address,
+        false,
+        false,
+    ) else {
+        panic!("the first caller leads");
+    };
+    assert_eq!(leader.take_keep(), None);
+    let follower = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move {
+            fetch_single_flight(
+                store,
+                partition,
+                address,
+                ReadOptions::default(),
+                Some(Keep::Store),
+                || async move {
+                    Err(StorageError::from(
+                        lore_storage::errors::AddressNotFound::from(address),
+                    ))
+                },
+                || {},
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !leader.has_followers() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the follower joined");
+    let raw = (fragment, payload.clone());
+    leader.complete(&Ok(Loaded {
+        content: Some(raw.clone()),
+        raw,
+    }));
+    follower
+        .await
+        .expect("follower task")
+        .expect("the follower takes the leader's fetch");
+
+    let (_, local) = load_fragment(
+        store,
+        partition,
+        address,
+        ReadOptions::default().no_remote(),
+        None,
+    )
+    .await
+    .expect("the follower stored its own");
+    assert_eq!(local, payload);
+}
+
+/// A miss that follows a miss of the same content makes no fetch of its own, and stores the content
+/// where its read caches it or the fragment's local cache priority asks, though the leader does not
+/// store it in the follower's store: a leader reading into another store, and one in the same store
+/// storing nothing. The follower joins once the leader's fetch is under way.
+#[tokio::test]
+async fn a_miss_stores_the_content_it_follows_as_its_read_asks() {
+    let (_dir, store) = make_test_store().await;
+    let (_other_dir, other_store) = make_test_store().await;
+    let caching = ReadOptions::default().with_cache();
+    for (seed, leader_store, leader_options, options, priority) in [
+        (0x68, &other_store, caching, caching, false),
+        (0x69, &store, ReadOptions::default(), caching, false),
+        (0x6A, &other_store, caching, ReadOptions::default(), true),
+    ] {
+        let partition = Partition::from([seed; 16]);
+        let (address, content, session) = serve_compressed(Context::from([seed; 16]), 4096);
+        if priority {
+            let (mut fragment, payload) =
+                lore_storage::test_util::remote_payload(address).expect("the served payload");
+            fragment.flags |= FragmentFlags::PayloadLocalCachePriority.bits();
+            lore_storage::test_util::serve_remote(address, fragment, payload);
+            lore_storage::test_util::reset_counts();
+        }
+        let gate = Arc::new(tokio::sync::Notify::new());
+        lore_storage::test_util::hold_remote_fetches(gate.clone());
+        let followers = lore_storage::test_util::followers();
+        let follower = async {
+            while lore_storage::test_util::counts().0 == 0 {
+                tokio::task::yield_now().await;
+            }
+            load_fragment(store.clone(), partition, address, options, session.clone()).await
+        };
+        let release = async {
+            while lore_storage::test_util::followers() == followers {
+                tokio::task::yield_now().await;
+            }
+            gate.notify_one();
+        };
+        let (leader, follower, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                load_fragment(
+                    leader_store.clone(),
+                    partition,
+                    address,
+                    leader_options,
+                    session.clone(),
+                ),
+                follower,
+                release,
+            )
+        })
+        .await
+        .expect("the second miss followed the first");
+        let (_, local) = load_fragment(
+            store.clone(),
+            partition,
+            address,
+            ReadOptions::default().no_remote(),
+            None,
+        )
+        .await
+        .expect("the follower's store holds the content");
+
+        assert_eq!(leader.expect("leader").1.as_ref(), content.as_slice());
+        assert_eq!(follower.expect("follower").1.as_ref(), content.as_slice());
+        assert_eq!(local.as_ref(), content.as_slice(), "seed {seed:#x}");
+        assert_eq!(
+            lore_storage::test_util::counts().0,
+            1,
+            "seed {seed:#x}: fetches"
+        );
+    }
 }
 
 /// A local-only load that misses while a remote flight for the same address is held answers
@@ -3535,6 +4229,7 @@ async fn a_local_only_miss_never_follows_a_remote_flight() {
                     partition,
                     address,
                     ReadOptions::default(),
+                    None,
                     || {
                         let (started, released, payload) =
                             (started.clone(), released.clone(), payload.clone());
@@ -3729,6 +4424,7 @@ async fn never_wait_with_a_session_never_follows_a_flight() {
                 partition,
                 address,
                 ReadOptions::default(),
+                None,
                 || {
                     let (started, released, payload) =
                         (started.clone(), released.clone(), payload.clone());
@@ -3854,6 +4550,7 @@ async fn a_never_waiting_whole_read_into_a_buffer_never_follows_a_flight() {
                 partition,
                 address,
                 ReadOptions::default(),
+                None,
                 || {
                     let (started, released, payload) =
                         (started.clone(), released.clone(), payload.clone());

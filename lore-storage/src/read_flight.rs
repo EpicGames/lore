@@ -9,6 +9,8 @@ use dashmap::Entry;
 use tokio::sync::watch;
 
 use crate::error::StorageError;
+use crate::immutable_store::ImmutableStore;
+use crate::read::Keep;
 use crate::read::Loaded;
 use crate::types::Address;
 use crate::types::Hash;
@@ -27,11 +29,25 @@ type Channel = (
 );
 
 /// Reads in flight, keyed by content hash: an address's context does not change its content, so a
-/// read of the same content under any context joins the flight. The partition is part of the key
-/// only where the store isolates partitions, and whether the remote is trusted always is.
+/// read of the same content under any context, and into any store, joins the flight. The partition
+/// is part of the key only where the store isolates partitions, and whether the remote is trusted
+/// always is.
 static READ_IN_FLIGHT: OnceLock<
     DashMap<ReadFlightKey, ReadFlightEntry, BuildHasherDefault<PassThroughHasher>>,
 > = OnceLock::new();
+
+/// The store a read single-flight fetches into, by the address of the store object.
+#[lore_macro::test_pub]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct FlightStore(usize);
+
+impl FlightStore {
+    /// The identity of `store`.
+    #[lore_macro::test_pub]
+    pub(crate) fn of(store: &dyn ImmutableStore) -> Self {
+        Self(std::ptr::from_ref(store).cast::<()>().addr())
+    }
+}
 
 /// The content a read single-flight fetches: its hash, the partition where the store isolates
 /// partitions, and whether the remote it is fetched from is trusted.
@@ -60,17 +76,37 @@ fn leading_word(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(word)
 }
 
-/// A read in flight: the leader's partition and address, and the channel its outcome goes out on,
-/// which the first follower creates.
+/// A caller joining a read single-flight: the store it reads into, what it keeps there, and its
+/// partition and address.
+struct Joining {
+    store: FlightStore,
+    keep: Option<Keep>,
+    partition: Partition,
+    address: Address,
+}
+
+/// A read in flight: the leader's partition and address, its store, what is kept of the fetch in
+/// that store, whether the leader took it, and the channel its outcome goes out on, which the
+/// first follower creates.
 struct ReadFlightEntry {
     leader: StoreInFlightKey,
+    store: FlightStore,
+    keep: Option<Keep>,
+    taken: bool,
     sender: Option<watch::Sender<ReadFlightResult>>,
 }
 
 impl ReadFlightEntry {
-    /// Subscribes to this flight's outcome, installing `channel` where the flight has no channel
-    /// yet; `None` where it has none and `channel` holds none.
-    fn subscribe(&mut self, channel: &mut Option<Channel>) -> Option<ReadFlightFollower> {
+    /// Subscribes `joining` to this flight's outcome, installing `channel` where the flight has
+    /// no channel yet; `None` where it has none and `channel` holds none. A follower reading the
+    /// leader's partition and address in the leader's store, the association the leader's put
+    /// stores, merges what it keeps into what the leader keeps there until the leader takes it, and
+    /// once taken, is kept where what was taken covers what it keeps.
+    fn subscribe(
+        &mut self,
+        joining: &Joining,
+        channel: &mut Option<Channel>,
+    ) -> Option<ReadFlightFollower> {
         let receiver = if let Some(sender) = &self.sender {
             sender.subscribe()
         } else {
@@ -78,8 +114,20 @@ impl ReadFlightEntry {
             self.sender = Some(sender);
             receiver
         };
+        let here = joining.store == self.store
+            && joining.partition == self.leader.partition
+            && joining.address == self.leader.address;
+        let merged = joining
+            .keep
+            .filter(|&keep| here && (!self.taken || self.keep >= Some(keep)));
+        if let Some(keep) = merged
+            && !self.taken
+        {
+            self.keep = Some(self.keep.map_or(keep, |kept| kept.max(keep)));
+        }
         Some(ReadFlightFollower {
             leader: self.leader.clone(),
+            kept: joining.keep.is_none() || merged.is_some(),
             receiver,
         })
     }
@@ -94,11 +142,12 @@ pub(crate) enum ReadFlight {
     Follower(ReadFlightFollower),
 }
 
-/// A follower's view of a read single-flight: the leader's partition and address, and the
-/// receiver its outcome arrives on.
+/// A follower's view of a read single-flight: the leader's partition and address, what
+/// [`Self::kept`] answers, and the receiver its outcome arrives on.
 #[lore_macro::test_pub]
 pub(crate) struct ReadFlightFollower {
     leader: StoreInFlightKey,
+    kept: bool,
     receiver: watch::Receiver<ReadFlightResult>,
 }
 
@@ -107,6 +156,14 @@ impl ReadFlightFollower {
     #[lore_macro::test_pub]
     pub(crate) fn led_by(&self, partition: Partition, address: Address) -> bool {
         self.leader.partition == partition && self.leader.address == address
+    }
+
+    /// Whether the follower has nothing left to keep of the fetch: it keeps nothing, or the leader
+    /// keeps what it keeps, in its store before the flight ends, as [`ReadFlightEntry::subscribe`]
+    /// merges it. A follower with something left to keep stores the fetch itself.
+    #[lore_macro::test_pub]
+    pub(crate) fn kept(&self) -> bool {
+        self.kept
     }
 }
 
@@ -135,11 +192,31 @@ impl ReadFlightGuard {
             .unwrap_or(false)
     }
 
+    /// What the flight keeps of the fetch in the leader's store, its own and its followers' there,
+    /// which the leader must store before it completes the flight. A follower joining afterwards
+    /// keeps its own unless what was taken covers it ([`ReadFlightFollower::kept`]). One shard lock
+    /// serves it.
+    #[lore_macro::test_pub]
+    pub(crate) fn take_keep(&self) -> Option<Keep> {
+        let mut flight = self
+            .key
+            .and_then(|key| READ_IN_FLIGHT.get()?.get_mut(&key))?;
+        flight.taken = true;
+        flight.keep
+    }
+
     /// End the flight and publish `result` to the followers subscribed to it, cloned only where
     /// one is.
     #[lore_macro::test_pub]
     pub(crate) fn complete(mut self, result: &Result<Loaded, StorageError>) {
-        if let Some(sender) = self.key.take().and_then(close) {
+        let Some(flight) = self.key.take().and_then(close) else {
+            return;
+        };
+        debug_assert!(
+            result.is_err() || flight.taken || flight.keep.is_none(),
+            "a leader completed with a fetch without taking what its flight keeps"
+        );
+        if let Some(sender) = flight.sender.filter(|sender| sender.receiver_count() > 0) {
             sender.send_replace(Some(result.clone()));
         }
     }
@@ -153,26 +230,32 @@ impl Drop for ReadFlightGuard {
     }
 }
 
-/// Removes the flight for `key`, and answers its channel where a follower still listens on it.
-/// Removing the entry first closes the flight to further followers, so every follower that joined
-/// holds a receiver of what is sent. A flight ended without a result drops its channel, which tells
-/// its followers to join again.
-fn close(key: ReadFlightKey) -> Option<watch::Sender<ReadFlightResult>> {
-    let (_, flight) = READ_IN_FLIGHT.get()?.remove(&key)?;
-    flight.sender.filter(|sender| sender.receiver_count() > 0)
+/// Removes the flight for `key`, and answers its entry, whose channel a follower may still listen
+/// on. Removing the entry first closes the flight to further followers, so every follower that
+/// joined holds a receiver of what is sent. A flight ended without a result drops its channel,
+/// which tells its followers to join again.
+fn close(key: ReadFlightKey) -> Option<ReadFlightEntry> {
+    READ_IN_FLIGHT.get()?.remove(&key).map(|(_, flight)| flight)
 }
 
 /// Join the read single-flight for `address`'s content: its hash, `partition` where
-/// `isolate_partitions` says the store serves each partition only what it holds, and whether the
-/// remote is `trusted`. The first caller becomes the leader and must perform the read, then call
-/// `ReadFlightGuard::complete`. Later callers become followers, whatever their context, and should
-/// pass the follower to `await_flight`.
+/// `isolate_partitions` says the store serves each association only what it holds for it rather
+/// than whatever it holds for the hash ([`ImmutableStore::read_scope`]), and whether the
+/// remote is `trusted`. The first caller becomes the leader and must perform the read, store what
+/// [`ReadFlightGuard::take_keep`] answers where the read succeeded, then call
+/// `ReadFlightGuard::complete`. Later callers become followers, whatever their context and store,
+/// and should pass the follower to `await_flight`. `store` is the store the caller reads into, and
+/// `keep` what it keeps there of the fetch; the leader keeps a follower's as
+/// [`ReadFlightEntry::subscribe`] describes. The caller must hold `store` while it leads, so no
+/// other store takes its address while the flight is open.
 ///
 /// One shard lock serves each join, held only to insert the flight or subscribe to it, and nothing
 /// is allocated under it. A leader allocates nothing. The first follower of a flight creates its
 /// channel, outside the lock, and takes the lock again to install it.
 #[lore_macro::test_pub]
 pub(crate) fn join_read_flight(
+    store: FlightStore,
+    keep: Option<Keep>,
     partition: Partition,
     address: Address,
     isolate_partitions: bool,
@@ -185,6 +268,12 @@ pub(crate) fn join_read_flight(
     };
     let in_flight =
         READ_IN_FLIGHT.get_or_init(|| DashMap::with_hasher(BuildHasherDefault::default()));
+    let joining = Joining {
+        store,
+        keep,
+        partition,
+        address,
+    };
     let mut channel = None;
     loop {
         // `DashMap::entry` is safe here as it is not held across any awaits and no other locks are acquired while held
@@ -193,11 +282,14 @@ pub(crate) fn join_read_flight(
             Entry::Vacant(vacant) => {
                 vacant.insert(ReadFlightEntry {
                     leader: StoreInFlightKey { partition, address },
+                    store,
+                    keep,
+                    taken: false,
                     sender: None,
                 });
                 return ReadFlight::Leader(ReadFlightGuard { key: Some(key) });
             }
-            Entry::Occupied(mut occupied) => occupied.get_mut().subscribe(&mut channel),
+            Entry::Occupied(mut occupied) => occupied.get_mut().subscribe(&joining, &mut channel),
         };
         if let Some(follower) = follower {
             #[cfg(feature = "test-util")]

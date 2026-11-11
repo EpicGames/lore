@@ -802,14 +802,15 @@ pub(crate) type CacheGets = Option<Arc<tokio::sync::Semaphore>>;
 #[lore_macro::test_pub]
 enum Fetch {
     /// A payload fetched: its fragment, marked durable as the remote holds it, the payload as
-    /// fetched, for a fragment list the list it expands to, and whether it overwrites a corrupt
-    /// local copy.
+    /// fetched, for a fragment list the list it expands to, whether it overwrites a corrupt local
+    /// copy, and whether its flight stored it locally already, which leaves the cache no put.
     Fetched {
         address: Address,
         fragment: Fragment,
         payload: Bytes,
         list: Option<Bytes>,
         replace: bool,
+        stored: bool,
     },
     /// The fragment at this address turned local while the get waited for its permit, so nothing
     /// was fetched. With `cache_fragmented` the next round queries it again, which walks a list
@@ -869,7 +870,9 @@ fn push_subfragments(list: Bytes, context: Context, into: &mut Vec<Address>) {
 /// same content in flight shares one get, checked on receipt and healed once as a read's fetch is,
 /// unless the command trusts the remote ([`read_options_from_repository`]), and never decompressed
 /// beyond what that check or a fragment list's walk needs. It joins with the local probe off, as
-/// the cache looked locally already.
+/// the cache looked locally already, and keeping nothing, as [`cache_through`] stores every fetch
+/// itself, but one its flight stored for a read in its store that followed it, unless it is to
+/// `replace` the local copy, which that store may not have overwritten.
 ///
 /// The fetch holds one of `permits`, taken before it joins, so a read following it never waits for
 /// one, and gives it back on joining as a follower, which makes no get of its own; a follower whose
@@ -888,6 +891,7 @@ fn fetch_to_cache(
     replace: bool,
 ) -> impl Future<Output = Fetch> {
     async move {
+        let mut stored = false;
         let fetched = {
             let mut permit = match &permits {
                 None => None,
@@ -913,19 +917,17 @@ fn fetch_to_cache(
                 repository.id,
                 address,
                 options,
+                None,
                 || lore_storage::read::fetch_remote(&remote_storage, address, options),
                 || drop(permit.take()),
             )
             .await
             {
                 Ok(Flown::Local(_)) => return Fetch::Local(address),
-                Ok(Flown::Fetched(fetched)) => {
-                    if fetched.raw.0.flags & FragmentFlags::PayloadFragmented == 0 {
-                        Ok((fetched.raw, None))
-                    } else {
-                        let raw = fetched.raw.clone();
-                        fetched.take(true).map(|(_, list)| (raw, Some(list)))
-                    }
+                Ok(Flown::Fetched(fetched)) => raw_and_list(fetched),
+                Ok(Flown::Stored(fetched)) => {
+                    stored = !replace;
+                    raw_and_list(fetched)
                 }
                 Err(error) => Err(error),
             }
@@ -937,9 +939,22 @@ fn fetch_to_cache(
                 payload,
                 list,
                 replace,
+                stored,
             },
             Err(error) => Fetch::Failed(Box::new(error.forward("fetching fragment to cache"))),
         }
+    }
+}
+
+/// The payload of `fetched` as stored, and for a fragment list the list it expands to.
+fn raw_and_list(
+    fetched: lore_storage::read::Loaded,
+) -> Result<((Fragment, Bytes), Option<Bytes>), lore_storage::error::StorageError> {
+    if fetched.raw.0.flags & FragmentFlags::PayloadFragmented == 0 {
+        Ok((fetched.raw, None))
+    } else {
+        let raw = fetched.raw.clone();
+        fetched.take(true).map(|(_, list)| (raw, Some(list)))
     }
 }
 
@@ -1171,16 +1186,17 @@ pub(crate) async fn cache_through(
              store_tasks: &mut JoinSet<Result<(), StoreError>>,
              additional_address: &mut Vec<Address>,
              failure: &mut Option<Box<ImmutableError>>| {
-                let (address, fragment, payload, list, replace) = match result {
+                let (address, fragment, payload, list, replace, stored) = match result {
                     Ok(Fetch::Fetched {
                         address,
                         fragment,
                         payload,
                         list,
                         replace,
+                        stored,
                     }) => {
                         total_bytes += payload.len() as u64;
-                        (address, fragment, payload, list, replace)
+                        (address, fragment, payload, list, replace, stored)
                     }
                     Ok(Fetch::Local(address)) => {
                         total_already_local += 1;
@@ -1206,6 +1222,9 @@ pub(crate) async fn cache_through(
 
                 if cache_fragmented && let Some(list) = list {
                     push_subfragments(list, address.context, additional_address);
+                }
+                if stored {
+                    return;
                 }
 
                 let repository = repository.clone();

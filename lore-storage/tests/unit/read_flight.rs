@@ -6,7 +6,21 @@ use lore_storage::Hash;
 use lore_storage::Partition;
 use lore_storage::error::StorageError;
 use lore_storage::errors::AddressNotFound;
+use lore_storage::read::Keep;
 use lore_storage::read_flight::*;
+
+/// The store every flight here reads into.
+const STORE: FlightStore = FlightStore(1);
+
+/// Joins the read single-flight as a caller in [`STORE`] keeping nothing of the fetch.
+fn join(
+    partition: Partition,
+    address: Address,
+    isolate_partitions: bool,
+    trusted: bool,
+) -> ReadFlight {
+    join_read_flight(STORE, None, partition, address, isolate_partitions, trusted)
+}
 
 fn test_key(seed: u8) -> (Partition, Address) {
     let partition = Partition::from([seed; 16]);
@@ -20,12 +34,12 @@ fn test_key(seed: u8) -> (Partition, Address) {
 #[tokio::test]
 async fn first_caller_is_leader_rest_are_followers() {
     let (partition, address) = test_key(1);
-    let leader = match join_read_flight(partition, address, false, false) {
+    let leader = match join(partition, address, false, false) {
         ReadFlight::Leader(guard) => guard,
         ReadFlight::Follower(_) => panic!("first caller must be the leader"),
     };
     for _ in 0..3 {
-        match join_read_flight(partition, address, false, false) {
+        match join(partition, address, false, false) {
             ReadFlight::Follower(_) => {}
             ReadFlight::Leader(_) => {
                 panic!("caller joining an active flight must be a follower")
@@ -38,11 +52,11 @@ async fn first_caller_is_leader_rest_are_followers() {
 #[tokio::test]
 async fn followers_see_leader_error() {
     let (partition, address) = test_key(2);
-    let leader = match join_read_flight(partition, address, false, false) {
+    let leader = match join(partition, address, false, false) {
         ReadFlight::Leader(guard) => guard,
         ReadFlight::Follower(_) => panic!("first caller must be the leader"),
     };
-    let follower_rx = match join_read_flight(partition, address, false, false) {
+    let follower_rx = match join(partition, address, false, false) {
         ReadFlight::Follower(rx) => rx,
         ReadFlight::Leader(_) => panic!("second caller must be a follower"),
     };
@@ -60,11 +74,11 @@ async fn followers_see_leader_error() {
 #[tokio::test]
 async fn dropped_leader_without_result_promotes_a_follower() {
     let (partition, address) = test_key(3);
-    let leader = match join_read_flight(partition, address, false, false) {
+    let leader = match join(partition, address, false, false) {
         ReadFlight::Leader(guard) => guard,
         ReadFlight::Follower(_) => panic!("first caller must be the leader"),
     };
-    let follower_rx = match join_read_flight(partition, address, false, false) {
+    let follower_rx = match join(partition, address, false, false) {
         ReadFlight::Follower(rx) => rx,
         ReadFlight::Leader(_) => panic!("second caller must be a follower"),
     };
@@ -76,7 +90,7 @@ async fn dropped_leader_without_result_promotes_a_follower() {
         "a follower must see `None` when the leader vanishes without a result"
     );
 
-    match join_read_flight(partition, address, false, false) {
+    match join(partition, address, false, false) {
         ReadFlight::Leader(guard) => drop(guard),
         ReadFlight::Follower(_) => panic!("promoted caller must become the new leader"),
     }
@@ -85,11 +99,11 @@ async fn dropped_leader_without_result_promotes_a_follower() {
 #[tokio::test]
 async fn a_cancelled_follower_releases_its_receiver() {
     let (partition, address) = test_key(4);
-    let leader = match join_read_flight(partition, address, false, false) {
+    let leader = match join(partition, address, false, false) {
         ReadFlight::Leader(guard) => guard,
         ReadFlight::Follower(_) => panic!("first caller must be the leader"),
     };
-    let follower_rx = match join_read_flight(partition, address, false, false) {
+    let follower_rx = match join(partition, address, false, false) {
         ReadFlight::Follower(rx) => rx,
         ReadFlight::Leader(_) => panic!("second caller must be a follower"),
     };
@@ -111,7 +125,7 @@ async fn a_cancelled_follower_releases_its_receiver() {
 #[tokio::test]
 async fn a_read_of_the_same_content_under_another_address_follows() {
     let (partition, address) = test_key(5);
-    let leader = match join_read_flight(partition, address, false, false) {
+    let leader = match join(partition, address, false, false) {
         ReadFlight::Leader(guard) => guard,
         ReadFlight::Follower(_) => panic!("first caller must be the leader"),
     };
@@ -120,7 +134,7 @@ async fn a_read_of_the_same_content_under_another_address_follows() {
         context: Context::from([6; 16]),
         ..address
     };
-    match join_read_flight(other_partition, other_address, false, false) {
+    match join(other_partition, other_address, false, false) {
         ReadFlight::Follower(follower) => {
             assert!(!follower.led_by(other_partition, other_address));
             assert!(follower.led_by(partition, address));
@@ -135,12 +149,12 @@ async fn a_read_of_the_same_content_under_another_address_follows() {
 #[tokio::test]
 async fn an_isolating_store_keys_reads_by_partition() {
     let (partition, address) = test_key(7);
-    let leader = match join_read_flight(partition, address, true, false) {
+    let leader = match join(partition, address, true, false) {
         ReadFlight::Leader(guard) => guard,
         ReadFlight::Follower(_) => panic!("first caller must be the leader"),
     };
     let other_partition = Partition::from([8; 16]);
-    let other_leader = match join_read_flight(other_partition, address, true, false) {
+    let other_leader = match join(other_partition, address, true, false) {
         ReadFlight::Leader(guard) => guard,
         ReadFlight::Follower(_) => panic!("another partition must lead its own flight"),
     };
@@ -149,7 +163,7 @@ async fn an_isolating_store_keys_reads_by_partition() {
         ..address
     };
     assert!(matches!(
-        join_read_flight(partition, other_context, true, false),
+        join(partition, other_context, true, false),
         ReadFlight::Follower(_)
     ));
     drop(other_leader);
@@ -161,17 +175,17 @@ async fn an_isolating_store_keys_reads_by_partition() {
 #[tokio::test]
 async fn reads_are_keyed_by_trust() {
     let (partition, address) = test_key(31);
-    let untrusting = match join_read_flight(partition, address, false, false) {
+    let untrusting = match join(partition, address, false, false) {
         ReadFlight::Leader(guard) => guard,
         ReadFlight::Follower(_) => panic!("first caller must be the leader"),
     };
-    let trusting = match join_read_flight(partition, address, false, true) {
+    let trusting = match join(partition, address, false, true) {
         ReadFlight::Leader(guard) => guard,
         ReadFlight::Follower(_) => panic!("a trusting read must lead its own flight"),
     };
     for trusted in [false, true] {
         assert!(matches!(
-            join_read_flight(partition, address, false, trusted),
+            join(partition, address, false, trusted),
             ReadFlight::Follower(_)
         ));
     }
@@ -191,7 +205,7 @@ fn a_leader_without_followers_allocates_nothing() {
         })
         .collect();
     let failed = Err(StorageError::from(AddressNotFound::from(addresses[0])));
-    let lead = |address: Address| match join_read_flight(partition, address, false, false) {
+    let lead = |address: Address| match join(partition, address, false, false) {
         ReadFlight::Leader(guard) => guard.complete(&failed),
         ReadFlight::Follower(_) => panic!("no flight for this content is in flight"),
     };
@@ -210,11 +224,11 @@ fn a_leader_without_followers_allocates_nothing() {
 #[test]
 fn a_second_follower_subscribes_without_allocating() {
     let (partition, address) = test_key(10);
-    let leader = match join_read_flight(partition, address, false, false) {
+    let leader = match join(partition, address, false, false) {
         ReadFlight::Leader(guard) => guard,
         ReadFlight::Follower(_) => panic!("first caller must be the leader"),
     };
-    let first = match join_read_flight(partition, address, false, false) {
+    let first = match join(partition, address, false, false) {
         ReadFlight::Follower(follower) => follower,
         ReadFlight::Leader(_) => panic!("second caller must be a follower"),
     };
@@ -222,10 +236,59 @@ fn a_second_follower_subscribes_without_allocating() {
 
     lore_base::allocator::set_allocation_counting(true);
     let before = lore_base::allocator::thread_allocation_count();
-    let second = join_read_flight(partition, address, false, false);
+    let second = join(partition, address, false, false);
     let allocations = lore_base::allocator::thread_allocation_count() - before;
     lore_base::allocator::set_allocation_counting(false);
     assert!(matches!(second, ReadFlight::Follower(_)));
     assert_eq!(allocations, 0, "the second follower allocated");
     drop((first, second, leader));
+}
+
+/// A follower at the leader's address in the leader's store has the leader keep what it keeps,
+/// merged into what the leader keeps there with no allocation, and one at another address keeps
+/// its own; one joining once the leader took what it keeps is kept where that covers what it
+/// keeps, and keeps its own otherwise.
+#[test]
+fn a_follower_in_the_leaders_store_merges_what_it_keeps_until_the_leader_takes_it() {
+    let (partition, address) = test_key(11);
+    let other_address = Address {
+        context: Context::from([12; 16]),
+        ..address
+    };
+    let leader = match join_read_flight(STORE, None, partition, address, false, false) {
+        ReadFlight::Leader(guard) => guard,
+        ReadFlight::Follower(_) => panic!("first caller must be the leader"),
+    };
+    let follow =
+        |address, keep| match join_read_flight(STORE, Some(keep), partition, address, false, false)
+        {
+            ReadFlight::Follower(follower) => follower,
+            ReadFlight::Leader(_) => panic!("a read of the content in flight led"),
+        };
+    let elsewhere = follow(other_address, Keep::Store);
+    assert!(
+        !elsewhere.kept(),
+        "a follower at another address keeps its own"
+    );
+    let priority = follow(address, Keep::Priority);
+    lore_base::allocator::set_allocation_counting(true);
+    let before = lore_base::allocator::thread_allocation_count();
+    let storing = follow(address, Keep::Store);
+    let allocations = lore_base::allocator::thread_allocation_count() - before;
+    lore_base::allocator::set_allocation_counting(false);
+    assert_eq!(allocations, 0, "a follower merging what it keeps allocated");
+    assert!(priority.kept() && storing.kept());
+
+    assert_eq!(leader.take_keep(), Some(Keep::Store));
+    let covered = follow(address, Keep::Priority);
+    assert!(
+        covered.kept(),
+        "what the leader took covers a late follower keeping less"
+    );
+    let late = follow(address, Keep::Replace);
+    assert!(
+        !late.kept(),
+        "a follower joining once the leader took what it keeps, keeping more, keeps its own"
+    );
+    drop((elsewhere, priority, storing, covered, late, leader));
 }

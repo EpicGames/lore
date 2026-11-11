@@ -163,6 +163,72 @@ fn stored_fragment(payload: &Bytes, flags: FragmentFlags) -> Fragment {
     }
 }
 
+/// A put of the payload over an entry that lost it restores the payload of every entry of its hash,
+/// which compaction left without one, whichever of them the put lands on.
+#[tokio::test]
+async fn a_put_over_an_entry_without_its_payload_restores_every_entry_of_its_hash() {
+    let payload = Bytes::from_static(b"content two files hold, its payload compacted away");
+    let fragment = stored_fragment(&payload, FragmentFlags::PayloadStoredDurable);
+    let partition = Partition::from([0x5A; 16]);
+    let at = |byte: u8| Address {
+        hash: hash::hash_slice(&payload),
+        context: Context::from([byte; 16]),
+    };
+    for (first, second) in [(0x29, 0xD6), (0xD6, 0x29)] {
+        let dir = lore_base::test_util::TempDir::new("is_restore_siblings_");
+        let store: Arc<dyn lore_storage::immutable_store::ImmutableStore> =
+            LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+                .await
+                .expect("store opens");
+        for byte in [first, second] {
+            store
+                .clone()
+                .put(partition, at(byte), fragment, Some(payload.clone()), false)
+                .await
+                .expect("put the payload");
+        }
+        let mut resume = None;
+        loop {
+            resume = store
+                .clone()
+                .compact(0, resume, false, None)
+                .await
+                .expect("compact");
+            if resume.is_none() {
+                break;
+            }
+        }
+        for byte in [first, second] {
+            assert!(store.clone().get(partition, at(byte)).await.is_err());
+        }
+
+        store
+            .clone()
+            .put(
+                partition,
+                at(second),
+                fragment,
+                Some(payload.clone()),
+                false,
+            )
+            .await
+            .expect("put the payload again");
+
+        for byte in [first, second] {
+            let got = store
+                .clone()
+                .get(partition, at(byte))
+                .await
+                .unwrap_or_else(|err| panic!("{byte:#x} after {second:#x}: {err}"));
+            assert_eq!(
+                got.payload,
+                Some(payload.clone()),
+                "{byte:#x} after {second:#x}"
+            );
+        }
+    }
+}
+
 /// A durable write schedules the delayed flush only with `flush_background`, so only then does
 /// its entry reach the on-disk index without an explicit flush.
 #[tokio::test]

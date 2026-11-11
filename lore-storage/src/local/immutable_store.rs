@@ -3082,7 +3082,8 @@ impl LocalImmutableStore {
     /// payload, which the best match for its hash does not hold or `force` replaces, takes the one
     /// `payload` was written to, and is reported as [`StoreOutcome::NeedsPayload`] while it is
     /// unwritten. A written payload the entry does not take stays unreferenced. A store without a
-    /// payload over the tombstone of its association is refused with `PayloadNotFound`.
+    /// payload over the tombstone of its association is refused with `PayloadNotFound`. A payload
+    /// the entry takes is assigned to every other entry of its hash but a tombstone.
     async fn store_entry(
         &self,
         partition: &Partition,
@@ -3222,9 +3223,10 @@ impl LocalImmutableStore {
             last_access,
         };
 
-        if match_made == StoreMatch::MatchFull {
+        let stored_slot = if match_made == StoreMatch::MatchFull {
             let entry_index = bucket.sorted_index[match_slot] as usize;
             bucket.entry[entry_index].data = data;
+            match_slot
         } else {
             // inject new entry
             let count = bucket.entry.len();
@@ -3238,7 +3240,8 @@ impl LocalImmutableStore {
                 partition: *partition,
                 data,
             });
-        }
+            insert_slot
+        };
 
         // Ensure all other instances of this hash has the same payload associated - if storing
         // a payload for an already existing hash that had no payload we should upgrade those.
@@ -3262,7 +3265,7 @@ impl LocalImmutableStore {
                 true
             };
 
-            let mut loop_slot = insert_slot;
+            let mut loop_slot = stored_slot;
             while loop_slot > 0 {
                 loop_slot -= 1;
                 if !update_slot(loop_slot) {
@@ -3270,7 +3273,7 @@ impl LocalImmutableStore {
                 }
             }
 
-            loop_slot = insert_slot;
+            loop_slot = stored_slot;
             while loop_slot < last_slot {
                 loop_slot += 1;
                 if !update_slot(loop_slot) {

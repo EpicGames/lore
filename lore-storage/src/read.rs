@@ -31,6 +31,7 @@ use crate::immutable_store::claim_for_task;
 use crate::mutable_store::MutableStore;
 use crate::options::ReadOptions;
 use crate::store_types::PayloadRead;
+use crate::store_types::StoreMatch;
 use crate::types::Address;
 use crate::types::Fragment;
 use crate::types::Partition;
@@ -371,41 +372,62 @@ pub fn check_receipt(
     expand_payload(raw.0, raw.1.clone()).map(Some)
 }
 
-/// Fetches `address` from the remote through [`fetch_remote`], and stores it locally where
-/// `options.cache`, `local_replace` or the fragment's local cache priority asks. A read
-/// single-flight leader runs it for itself and its followers, and a follower whose leader failed on
-/// another address runs it for itself; it answers the flight's form, so the flight awaits its
-/// future directly rather than through a wrapper holding a second copy.
+/// What a read keeps locally of the content it fetches, each keeping what the one before keeps.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Keep {
+    /// Stores it where the fragment's local cache priority asks ([`fetch_is_stored`]).
+    Priority,
+    /// Stores it.
+    Store,
+    /// Stores it, overwriting the local copy, which failed to load.
+    Replace,
+}
+
+impl Keep {
+    /// What a read keeps that caches where `cache`, and replaces its local copy where `replace`.
+    pub fn of(cache: bool, replace: bool) -> Self {
+        match (cache, replace) {
+            (_, true) => Self::Replace,
+            (true, false) => Self::Store,
+            (false, false) => Self::Priority,
+        }
+    }
+}
+
+/// Whether a fetch of `fragment` is stored locally: where its read stores what it fetches
+/// (`stores`), or where the fragment's local cache priority asks.
+fn fetch_is_stored(stores: bool, fragment: &Fragment) -> bool {
+    stores || (fragment.flags & FragmentFlags::PayloadLocalCachePriority) != 0
+}
+
+/// Stores `raw`, the payload fetched for `address`, in `store` as `keep` asks, where
+/// [`fetch_is_stored`] says, and answers whether it stored it. A failed put fails nothing: the
+/// read holds the payload.
 ///
-/// Not an `async fn`, which would hold a second copy of its arguments.
-#[allow(clippy::manual_async_fn)]
-fn fetch_and_store(
-    store: Arc<dyn ImmutableStore>,
+/// Not an `async fn`, which would hold its arguments beside the put's future.
+fn store_fetched(
+    store: &Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
-    options: ReadOptions,
-    session: Arc<StorageSession>,
-    local_replace: bool,
-) -> impl Future<Output = Result<Loaded, StorageError>> {
+    raw: &(Fragment, Bytes),
+    keep: Option<Keep>,
+) -> impl Future<Output = bool> + use<> {
+    let put = keep
+        .filter(|keep| fetch_is_stored(*keep >= Keep::Store, &raw.0))
+        .map(|keep| {
+            store.clone().put(
+                partition,
+                address,
+                raw.0,
+                Some(raw.1.clone()),
+                keep == Keep::Replace,
+            )
+        });
     async move {
-        let fetched = fetch_remote(session.as_ref(), address, options).await?;
-        let (fragment, payload) = &fetched.raw;
-        if options.cache
-            || local_replace
-            || (fragment.flags & FragmentFlags::PayloadLocalCachePriority) != 0
-        {
-            let _ = store
-                .clone()
-                .put(
-                    partition,
-                    address,
-                    *fragment,
-                    Some(payload.clone()),
-                    local_replace,
-                )
-                .await;
+        match put {
+            Some(put) => put.await.is_ok(),
+            None => false,
         }
-        Ok(fetched)
     }
 }
 
@@ -507,14 +529,15 @@ pub fn fetch_remote(
 ///
 /// Concurrent misses of the same content join a read single-flight
 /// (`read_flight::join_read_flight`), keyed by the content hash, by the partition where the store
-/// isolates partitions, and by whether the remote is trusted, never by the context: the first
-/// caller becomes the leader and runs `fetch_and_store`, and later callers await its outcome rather
-/// than duplicating the remote fetch. A leader that vanishes without completing (e.g. its task is
-/// cancelled) leaves no result behind; the next follower observing that promotes itself to leader
-/// and retries. A local-only load (no session, or `options.remote` off) answers its miss with
-/// `AddressNotFound` and never joins: following would wait on a remote fetch it may not make. With
-/// `options.never_wait` a miss answers `AddressNotFound` at once, waiting neither for a store in
-/// flight nor a flight.
+/// isolates partitions and by whether the remote is trusted, never by the context or the store:
+/// the first caller becomes the leader and fetches, and later callers await its outcome rather than
+/// duplicating the remote fetch. The fetch is stored where each read caches it, replaces its local
+/// copy, or the fragment's local cache priority asks, as [`fetch_single_flight`] describes. A
+/// leader that vanishes without completing, such as one whose task is cancelled, leaves no result
+/// behind; the next follower observing that promotes itself to leader and retries. A local-only
+/// load (no session, or `options.remote` off) answers its miss with `AddressNotFound` and never
+/// joins: following would wait on a remote fetch it may not make. With `options.never_wait` a miss
+/// answers `AddressNotFound` at once, waiting neither for a store in flight nor a flight.
 ///
 /// The flight is boxed: only a miss reaching the remote takes it, and inline it would make the
 /// future of every load, and of every future awaiting one, as large as the fetch.
@@ -567,16 +590,8 @@ pub fn load_fragment(
             partition,
             address,
             options,
-            || {
-                fetch_and_store(
-                    store.clone(),
-                    partition,
-                    address,
-                    options,
-                    session.clone(),
-                    local_replace,
-                )
-            },
+            Some(Keep::of(options.cache, local_replace)),
+            || fetch_remote(session.as_ref(), address, options),
             || {},
         ))
         .await
@@ -616,6 +631,8 @@ impl Loaded {
 pub enum Flown {
     /// A fetch checked on receipt, the caller's own or the one it followed.
     Fetched(Loaded),
+    /// A fetch checked on receipt that the caller, leading its flight, stored in its store.
+    Stored(Loaded),
     /// The local store's copy, in the form `options` asks, found after the leader failed on another
     /// address.
     Local((Fragment, Bytes)),
@@ -625,67 +642,102 @@ impl Flown {
     /// The fetch taken as [`Loaded::take`] does, or the local copy as found.
     pub fn take(self, decompress: bool) -> Result<(Fragment, Bytes), StorageError> {
         match self {
-            Self::Fetched(fetched) => fetched.take(decompress),
+            Self::Fetched(fetched) | Self::Stored(fetched) => fetched.take(decompress),
             Self::Local(found) => Ok(found),
         }
     }
 }
 
-/// Runs `fetch` for concurrent callers missing the content `address` names: the first becomes the
-/// leader and fetches, and the rest follow its outcome, whatever their context, and whatever their
-/// partition where the store does not isolate partitions, but only where they trust the remote as
-/// the leader does ([`ReadOptions::trust_remote`]), so no caller takes a payload checked less than
-/// it asks. A follower takes the leader's error only where it asked for the leader's own partition
-/// and address; one whose leader failed on another address probes the local store, unless
-/// `options.local` is off, and fetches itself when nothing is there.
+/// Runs `fetch` for concurrent callers missing the content `address` names in `store`: the first
+/// becomes the leader and fetches, and the rest follow its outcome, whatever their context and
+/// store, and whatever their partition where the store does not isolate partitions, but only where
+/// they trust the remote as the leader does ([`ReadOptions::trust_remote`]), so no caller takes a
+/// payload checked less than it asks. `keep` is what the caller keeps of the fetch in `store`. The
+/// leader stores its fetch in its store as its own `keep` and those of its followers reading its
+/// partition and address there ask (`ReadFlightGuard::take_keep`), before it hands the fetch to
+/// them, with one put; any other follower stores the fetch itself, within its own use of its
+/// store. A caller with no `keep` has nothing stored for it by the flight. A follower takes the
+/// leader's error only where it asked for the leader's own partition and address; one whose leader
+/// failed on another address probes the local store, unless `options.local` is off, and fetches and
+/// stores itself when nothing is there.
 ///
 /// Followers share the leader's fetch rather than copy it, and the leader hands it over only when
 /// a follower is subscribed. `on_follow` runs when the caller first joins as a follower, before it
 /// waits, so a caller holding what only its own fetch needs gives it back there.
-pub async fn fetch_single_flight<F, Fut, G>(
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn fetch_single_flight<F, Fut, G>(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
     options: ReadOptions,
+    keep: Option<Keep>,
     fetch: F,
     on_follow: G,
-) -> Result<Flown, StorageError>
+) -> impl Future<Output = Result<Flown, StorageError>>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<Loaded, StorageError>>,
     G: FnOnce(),
 {
-    let isolate_partitions = store.isolates_partitions();
-    let mut on_follow = Some(on_follow);
-    loop {
-        match crate::read_flight::join_read_flight(
-            partition,
-            address,
-            isolate_partitions,
-            options.trust_remote,
-        ) {
-            crate::read_flight::ReadFlight::Leader(guard) => {
-                let result = fetch().await;
-                guard.complete(&result);
-                return result.map(Flown::Fetched);
-            }
-            crate::read_flight::ReadFlight::Follower(follower) => {
-                if let Some(on_follow) = on_follow.take() {
-                    on_follow();
-                }
-                let own = follower.led_by(partition, address);
-                match crate::read_flight::await_flight(follower).await {
-                    Some(Ok(fetched)) => return Ok(Flown::Fetched(fetched)),
-                    Some(Err(err)) if own => return Err(err),
-                    Some(Err(_)) => {
-                        if let Ok(found) =
-                            probe_local(store.clone(), partition, address, options).await
-                        {
-                            return Ok(Flown::Local(found));
+    async move {
+        let isolate_partitions = store.read_scope() != StoreMatch::MatchHash;
+        let mut on_follow = Some(on_follow);
+        loop {
+            match crate::read_flight::join_read_flight(
+                crate::read_flight::FlightStore::of(store.as_ref()),
+                keep,
+                partition,
+                address,
+                isolate_partitions,
+                options.trust_remote,
+            ) {
+                crate::read_flight::ReadFlight::Leader(guard) => {
+                    let result = fetch().await;
+                    let stored = match &result {
+                        Ok(fetched) => {
+                            let kept = guard.take_keep();
+                            store_fetched(&store, partition, address, &fetched.raw, kept).await
                         }
-                        return fetch().await.map(Flown::Fetched);
+                        Err(_) => false,
+                    };
+                    guard.complete(&result);
+                    return result.map(if stored {
+                        Flown::Stored
+                    } else {
+                        Flown::Fetched
+                    });
+                }
+                crate::read_flight::ReadFlight::Follower(follower) => {
+                    if let Some(on_follow) = on_follow.take() {
+                        on_follow();
                     }
-                    None => {}
+                    let own = follower.led_by(partition, address);
+                    let kept = follower.kept();
+                    match crate::read_flight::await_flight(follower).await {
+                        Some(Ok(fetched)) => {
+                            if !kept {
+                                let _ =
+                                    store_fetched(&store, partition, address, &fetched.raw, keep)
+                                        .await;
+                            }
+                            return Ok(Flown::Fetched(fetched));
+                        }
+                        Some(Err(err)) if own => return Err(err),
+                        Some(Err(_)) => {
+                            if let Ok(found) =
+                                probe_local(store.clone(), partition, address, options).await
+                            {
+                                return Ok(Flown::Local(found));
+                            }
+                            let fetched = fetch().await?;
+                            let _ =
+                                store_fetched(&store, partition, address, &fetched.raw, keep).await;
+                            return Ok(Flown::Fetched(fetched));
+                        }
+                        None => {}
+                    }
                 }
             }
         }
@@ -1953,10 +2005,7 @@ fn resolve_root(
             let raw = (fragment, buffer);
             match check_receipt(&raw, address, options) {
                 Ok(content) => {
-                    let should_store = options.cache
-                        || replace
-                        || (fragment.flags & FragmentFlags::PayloadLocalCachePriority) != 0;
-                    if should_store
+                    if fetch_is_stored(options.cache || replace, &fragment)
                         && store
                             .clone()
                             .put(partition, address, fragment, Some(raw.1.clone()), replace)
