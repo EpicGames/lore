@@ -25,7 +25,13 @@ from link_helpers import (
     make_repo_renumbering_folder,
 )
 from lore_parsers import parse_jsonl, parse_status_json
-from test_utils import has_staged_anchor, status_by_path, unstaged_entries
+from test_utils import (
+    get_unstage_counts,
+    has_staged_anchor,
+    registered_links,
+    status_by_path,
+    unstaged_entries,
+)
 
 from lore import Lore
 
@@ -1100,11 +1106,6 @@ def test_link_add_remove(new_lore_repo):
 
 
 @pytest.mark.smoke
-@pytest.mark.xfail(
-    strict=True,
-    reason="unstaging the removal of a link below a directory leaves the link staged as "
-    "deleted and dirty, where the same unstage of a top-level link restores it",
-)
 def test_link_unstage_of_a_nested_link_removal_leaves_nothing(new_lore_repo):
     """Unstaging the removal of a committed link below a directory restores the link and leaves
     no directory above it dirty, so no staged state is left."""
@@ -1118,6 +1119,32 @@ def test_link_unstage_of_a_nested_link_removal_leaves_nothing(new_lore_repo):
     assert not has_staged_anchor(parent_repo), (
         "Expected the unstaged removal to leave no staged state"
     )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("mount", ["lib", DEFAULT_LINK_MOUNT])
+def test_link_unstage_of_a_link_removal_beside_a_dirty_file_keeps_only_the_file(
+    new_lore_repo, mount
+):
+    """Unstaging the removal of a committed link while another file is dirty restores the link,
+    counts it as an unstaged directory, and stores the staged state, which then holds the dirty
+    file alone."""
+    parent_repo, _ = make_parent_with_link(new_lore_repo, link_path=mount)
+    parent_repo.write_files({DEFAULT_PARENT_FILE: "edited\n"})
+    parent_repo.dirty(DEFAULT_PARENT_FILE)
+    parent_repo.link_remove(mount)
+
+    counts = get_unstage_counts(parent_repo.unstage(mount, json=True))
+    assert counts["directoryUnstagedCount"] == 1, counts
+
+    entries = status_by_path(parent_repo)
+    assert entries.keys() == {DEFAULT_PARENT_FILE}, (
+        f"Expected only {DEFAULT_PARENT_FILE} left, got: {entries}"
+    )
+    assert entries[DEFAULT_PARENT_FILE]["flagDirty"], entries
+    assert not entries[DEFAULT_PARENT_FILE]["flagStaged"], entries
+    assert registered_links(parent_repo).keys() == {mount}
+    assert_mount_exposes(parent_repo, mount, "/", ["linked.txt"])
 
 
 @pytest.mark.smoke

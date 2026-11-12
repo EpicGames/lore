@@ -785,32 +785,36 @@ async fn report_staged_changes(
 /// Asked of the drawn subtree rather than the whole state, the same way `layer::list_staged`
 /// counts, because everything outside it belongs to the drawn-from repository and not the layer.
 /// Dirty flags propagate to a node's parents and clearing one propagates the clear back up, so
-/// the source node's children answer for the whole subtree. On any error the answer is "holds
-/// staging": dropping a pin on a question that could not be answered loses staged work.
+/// the source node's children answer for the whole subtree. They are read in the state holding
+/// the source node, a linked one where the source path crosses a link. On any error the answer is
+/// "holds staging": dropping a pin on a question that could not be answered loses staged work.
+#[lore_macro::test_pub]
 async fn layer_holds_staging(layer: &layer::Layer, layer_state: &layer::LayerState) -> bool {
-    let state = &layer_state.state_staged;
-    let repository = &layer_state.repository;
-
-    let Ok(source_node_link) = state
-        .find_node_link(repository.clone(), &layer.source_path)
+    let Ok((source, (repository, state))) = layer_state
+        .state_staged
+        .find_relative_held(
+            layer_state.repository.clone(),
+            ROOT_NODE,
+            &layer.source_path,
+        )
         .await
     else {
         return true;
     };
-    let source_node = source_node_link.node;
-    if !source_node.is_valid_or_root_node_id() {
+    if !source.node.is_valid_or_root_node_id() {
         return true;
     }
 
     if state
-        .node_has_dirty_children(repository.clone(), source_node)
+        .node_has_dirty_children(repository.clone(), source.node)
         .await
         .unwrap_or(true)
     {
         return true;
     }
 
-    state::count_staged_files(repository.clone(), state.clone(), source_node).await > 0
+    let staged = state::count_staged_files(repository, state, source.node).await;
+    staged.count > 0 || !staged.complete
 }
 
 /// Persist the markers `--check-dirty` cleared in the linked states `pending` names, for the links

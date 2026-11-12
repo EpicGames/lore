@@ -4803,16 +4803,48 @@ impl State {
 
     /// Collect the repository-relative paths of all dirty nodes at or under
     /// `root_node`, the set to stage. `base_path` is `root_node`'s path and the
-    /// prefix of every returned path. A dirty link is followed into the linked
-    /// state it pins, up to [`MAX_LINK_DEPTH`] links deep.
+    /// prefix of every returned path. A link at `root_node` and each dirty link
+    /// below it are followed into the linked state each pins, up to
+    /// [`MAX_LINK_DEPTH`] links deep.
     pub async fn collect_dirty_paths(
         &self,
         repository: Arc<RepositoryContext>,
         root_node: NodeID,
         base_path: RelativePath,
     ) -> Result<Vec<RelativePath>, StateError> {
+        if let Some(pin) = self.link_pin(repository.clone(), root_node).await? {
+            return Self::collect_pinned_dirty_paths(pin, &repository, base_path, 0).await;
+        }
         self.collect_dirty_paths_linked(repository, root_node, base_path, 0)
             .await
+    }
+
+    /// The pin of `node` where it is a link, and `None` for any other node.
+    async fn link_pin(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<Option<NodeLink>, StateError> {
+        let node = self.node(repository, node).await?;
+        Ok(node.is_link().then(|| node.linked_node()))
+    }
+
+    /// The dirty paths at or under the node `pin` names, in the state it opens, for the link at
+    /// `path` that lies below `link_depth` links.
+    async fn collect_pinned_dirty_paths(
+        pin: NodeLink,
+        repository: &Arc<RepositoryContext>,
+        path: RelativePath,
+        link_depth: usize,
+    ) -> Result<Vec<RelativePath>, StateError> {
+        let (linked_repository, linked_state) = pin.open(repository).await?;
+        Box::pin(linked_state.collect_dirty_paths_linked(
+            linked_repository,
+            pin.node,
+            path,
+            link_depth + 1,
+        ))
+        .await
     }
 
     async fn collect_dirty_paths_linked(
@@ -4919,14 +4951,12 @@ impl State {
                     result.push(child_path);
                 } else if child.is_link() {
                     if link_depth < MAX_LINK_DEPTH {
-                        let pin = child.linked_node();
-                        let (linked_repository, linked_state) = pin.open(&repository).await?;
-                        let linked_paths = Box::pin(linked_state.collect_dirty_paths_linked(
-                            linked_repository,
-                            pin.node,
+                        let linked_paths = Self::collect_pinned_dirty_paths(
+                            child.linked_node(),
+                            &repository,
                             child_path,
-                            link_depth + 1,
-                        ))
+                            link_depth,
+                        )
                         .await?;
                         result.extend(linked_paths);
                     }
@@ -5099,6 +5129,23 @@ impl State {
     ) -> impl Future<Output = Result<NodeLink, StateError>> + Send + 'a {
         futures::FutureExt::map(self.find_relative(repository, root, path), |found| {
             found.map(|(link, _)| link)
+        })
+    }
+
+    /// [`Self::find_relative`], with the repository and state holding the node: the linked ones
+    /// where a link was crossed to reach it, and `repository` and this state otherwise.
+    ///
+    /// Answers [`Self::find_relative`]'s future itself, mapped, so the caller's future holds no
+    /// second copy of the arguments.
+    pub(crate) fn find_relative_held<'a>(
+        self: &'a Arc<Self>,
+        repository: Arc<RepositoryContext>,
+        root: NodeID,
+        path: &'a str,
+    ) -> impl Future<Output = Result<(NodeLink, LinkedState), StateError>> + Send + 'a {
+        let own = (repository.clone(), self.clone());
+        futures::FutureExt::map(self.find_relative(repository, root, path), move |found| {
+            found.map(|(link, held)| (link, held.unwrap_or(own)))
         })
     }
 
@@ -9253,43 +9300,71 @@ enum StagedEntry {
 /// owns its own [`JoinSet`].
 static DIFF_FILESYSTEM_TASK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
+/// The files flagged staged in a subtree, as far as [`count_staged_files`] read it.
+#[derive(Clone, Copy, Debug)]
+pub struct StagedFileCount {
+    /// The staged files counted.
+    pub count: u64,
+    /// Whether every directory of the subtree was read: where one wasn't, `count` leaves out the
+    /// staged files it holds.
+    pub complete: bool,
+}
+
 /// Count the files flagged staged in the subtree rooted at `node_id`.
 ///
 /// An unreadable subtree is reported and counted as zero rather than raised:
 /// callers use this to describe staged work, and failing the whole operation
-/// because one directory would not load is worse than under-reporting it.
+/// because one directory would not load is worse than under-reporting it. The
+/// count is then not `complete`, for a caller that must not take it as the
+/// whole subtree's.
 pub async fn count_staged_files(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     node_id: NodeID,
-) -> u64 {
+) -> StagedFileCount {
     let mut iter =
         match StateNodeChildrenIterator::new(state.clone(), repository.clone(), node_id).await {
             Ok(iter) => iter,
             Err(err) => {
                 lore_warn!("Failed to iterate children for staged file count: {err}");
-                return 0;
+                return StagedFileCount {
+                    count: 0,
+                    complete: false,
+                };
             }
         };
 
-    let mut count = 0u64;
-    while let Ok(Some((child_id, child_node))) = iter.next().await {
+    let mut counted = StagedFileCount {
+        count: 0,
+        complete: true,
+    };
+    loop {
+        let (child_id, child_node) = match iter.next().await {
+            Ok(Some(child)) => child,
+            Ok(None) => break,
+            Err(_) => {
+                counted.complete = false;
+                break;
+            }
+        };
         if !child_node.is_staged() {
             continue;
         }
         if child_node.is_file() {
-            count += 1;
+            counted.count += 1;
         } else if child_node.is_directory() {
-            count += Box::pin(count_staged_files(
+            let below = Box::pin(count_staged_files(
                 repository.clone(),
                 state.clone(),
                 child_id,
             ))
             .await;
+            counted.count += below.count;
+            counted.complete &= below.complete;
         }
     }
 
-    count
+    counted
 }
 
 // TODO(UCS-13059): Extend with file mode check

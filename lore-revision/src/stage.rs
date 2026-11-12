@@ -5037,6 +5037,7 @@ async fn stage_realized_delete(
 /// with the directory tasks of [`stage_from_parent_revision_in_operation`]. A change runs inline
 /// when no permit is free, never waiting for one: this task holds a permit itself, and directory
 /// tasks each waiting for a permit a change needs would wait on each other.
+#[lore_macro::test_pub]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stage_from_parent_state(
     operation: Arc<InstanceOperationImpl>,

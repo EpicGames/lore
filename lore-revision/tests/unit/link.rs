@@ -577,3 +577,105 @@ async fn a_delete_takes_the_link_only_with_its_node_or_a_directory_above_it() {
         })
         .await;
 }
+
+/// A state holding the link `lib` to a new repository, which pins a state of that repository
+/// holding `d/f.txt`, staged and dirty as an add where `dirty` says and clean otherwise. Answers
+/// the repository, the state and the link.
+pub(crate) async fn state_linking_a_tree(
+    dirty: bool,
+) -> (Arc<RepositoryContext>, Arc<State>, NodeID) {
+    let (immutable, mutable, _execution) = test_store_create().await.expect("making test stores");
+    let repository = in_memory::repository(immutable, mutable);
+    let link_repository = RepositoryId::from(uuid::Uuid::now_v7());
+    let linked = repository.to_link_context(link_repository).await;
+    let linked_state = State::new();
+    let place = async |parent, node, name| {
+        if dirty {
+            add(&linked_state, linked.clone(), parent, node, name).await
+        } else {
+            linked_state
+                .node_add(linked.clone(), parent, node, name)
+                .await
+                .expect("adding the node")
+        }
+    };
+    let d = place(ROOT_NODE, directory("d"), "d").await;
+    place(d, in_memory::file("f.txt"), "f.txt").await;
+    let pin = linked_state
+        .serialize(linked, &in_memory::token())
+        .await
+        .expect("storing the linked state");
+    let state = State::new();
+    let link = add(
+        &state,
+        repository.clone(),
+        ROOT_NODE,
+        link_node("lib", link_repository, pin),
+        "lib",
+    )
+    .await;
+    (repository, state, link)
+}
+
+/// The dirty paths collected at a link are those of the state it pins, spelled from the link's
+/// path, as they are where the collection meets the link below the root.
+#[tokio::test]
+async fn the_dirty_paths_collected_at_a_link_are_those_of_the_state_it_pins() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (repository, state, link) = state_linking_a_tree(true).await;
+            let lib: RelativePath = "lib".parse().expect("a path");
+
+            let at_link = state
+                .collect_dirty_paths(repository.clone(), link, lib)
+                .await
+                .expect("collecting at the link");
+            let at_root = state
+                .collect_dirty_paths(repository, ROOT_NODE, RelativePath::new())
+                .await
+                .expect("collecting at the root");
+
+            let spelled = |paths: &[RelativePath]| {
+                paths
+                    .iter()
+                    .map(|path| path.as_str().to_string())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(spelled(&at_link), ["lib/d", "lib/d/f.txt"]);
+            assert_eq!(spelled(&at_root), spelled(&at_link));
+        })
+        .await;
+}
+
+/// A link has no child in the state holding it, however staged and dirty the tree it pins.
+#[tokio::test]
+async fn a_link_has_no_child_in_the_state_holding_it() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (repository, state, link) = state_linking_a_tree(true).await;
+
+            for (read, held) in [
+                (
+                    "staged",
+                    state
+                        .node_has_staged_children(repository.clone(), link)
+                        .await,
+                ),
+                (
+                    "dirty",
+                    state
+                        .node_has_dirty_children(repository.clone(), link)
+                        .await,
+                ),
+                (
+                    "staged or dirty",
+                    state
+                        .node_has_staged_or_dirty_children(repository.clone(), link)
+                        .await,
+                ),
+            ] {
+                assert!(!held.expect("reading the link"), "a {read} child");
+            }
+        })
+        .await;
+}

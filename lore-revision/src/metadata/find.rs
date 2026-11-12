@@ -47,16 +47,11 @@ async fn linked_file_node(
     path: &RelativePath,
 ) -> Result<Option<(NodeID, LinkedState)>, MetadataErrors> {
     let found = state
-        .find_relative(repository.clone(), ROOT_NODE, path.as_str())
+        .find_relative_held(repository.clone(), ROOT_NODE, path.as_str())
         .await
         .try_match("finding node")?;
     match found {
-        Ok((node_link, linked)) => Ok(node_link.is_valid().then(|| {
-            (
-                node_link.node,
-                linked.unwrap_or((repository.clone(), state)),
-            )
-        })),
+        Ok((node_link, linked)) => Ok(node_link.is_valid().then_some((node_link.node, linked))),
         Err(MatchedStateErrors::NodeNotFound(_)) => Ok(None),
         Err(other) => Err(other.forward("finding node")),
     }

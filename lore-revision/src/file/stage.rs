@@ -957,10 +957,10 @@ impl ResolvedTarget {
 /// when none); `scan`, single files, and paths with no node resolve to the path
 /// itself.
 ///
-/// `find_node_link` follows link mounts transparently — a crossed link is read
-/// from the state that owns it, otherwise a colliding block at the same
-/// coordinates in the parent state would misclassify the target. The returned
-/// paths stay parent-relative, since the filesystem walk traverses links itself.
+/// The lookup follows link mounts, and a node it reaches through a link is read
+/// in the state holding it, otherwise a colliding block at the same coordinates
+/// in the parent state would misclassify the target. The returned paths stay
+/// parent-relative, since the filesystem walk traverses links itself.
 async fn resolve_stage_target(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
@@ -976,23 +976,11 @@ async fn resolve_stage_target(
         )> = if relative_path.is_empty() {
             // Root path is always a directory in the main repository.
             Some((state.clone(), repository.clone(), ROOT_NODE, true))
-        } else if let Ok(node_link) = state
-            .find_node_link(repository.clone(), relative_path.as_str())
+        } else if let Ok((node_link, (resolved_repository, resolved_state))) = state
+            .find_relative_held(repository.clone(), ROOT_NODE, relative_path.as_str())
             .await
             && node_link.is_valid()
         {
-            let (resolved_repository, resolved_state) = if node_link.repository == repository.id {
-                (repository.clone(), state.clone())
-            } else {
-                let linked_repository = repository.to_link_context(node_link.repository).await;
-                let linked_state =
-                    State::deserialize(linked_repository.clone(), node_link.revision)
-                        .await
-                        .forward::<StageError>(
-                            "Failed to deserialize linked state for dirty staging",
-                        )?;
-                (linked_repository, linked_state)
-            };
             let node = resolved_state
                 .node(resolved_repository.clone(), node_link.node)
                 .await

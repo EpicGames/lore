@@ -4,7 +4,7 @@ import logging
 import os
 
 import pytest
-from test_utils import has_staged_anchor, to_posix
+from test_utils import get_unstage_counts, has_staged_anchor, to_posix
 from lore_parsers import parse_jsonl, parse_status_json
 
 from lore import Lore
@@ -142,13 +142,6 @@ def test_unstage_clears_stage_flags_keeps_dirty(new_lore_repo):
     )
 
     repo.branch_switch("main")
-
-
-def get_unstage_counts(output: str) -> dict:
-    """Extract the count object from the fileUnstageEnd event in JSON output."""
-    events = parse_jsonl(output, "fileUnstageEnd")
-    assert len(events) == 1, f"Expected 1 fileUnstageEnd event, got {len(events)}"
-    return events[0]["count"]
 
 
 def get_unstage_file_events(output: str) -> list[dict]:

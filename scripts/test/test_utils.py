@@ -93,6 +93,13 @@ def has_staged_anchor(repo: "Lore") -> bool:
     return False
 
 
+def get_unstage_counts(output: str) -> dict:
+    """Extract the count object from the fileUnstageEnd event in JSON output."""
+    events = parse_jsonl(output, "fileUnstageEnd")
+    assert len(events) == 1, f"Expected 1 fileUnstageEnd event, got {len(events)}"
+    return events[0]["count"]
+
+
 def revision_metadata_keys(repo: "Lore") -> set[str]:
     """The keys of the current revision's metadata."""
     events = parse_jsonl(repo.revision_metadata_get(json=True), "metadata")

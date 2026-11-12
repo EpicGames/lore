@@ -69,7 +69,7 @@ pub struct LoreFileUnstageBeginEventData {
 #[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileUnstageCountData {
-    /// Number of directories that were unstaged.
+    /// Number of directories and links that were unstaged.
     pub directory_unstaged_count: u64,
     /// Number of directories that were discarded.
     pub directory_discarded_count: u64,
@@ -1323,8 +1323,13 @@ async fn unstage_node(
             .await
             .forward::<UnstageError>("Failed to reset staged-remove link")?;
 
-            node.clear_dirty_flags();
-            state_staged.node_clear_own(&block, node_id, OwnFlags::Dirty);
+            state_staged
+                .node_clear(&repository, node_id, Clear::Dirty)
+                .await
+                .forward::<UnstageError>("Failed to clear the dirty parents")?;
+            stats
+                .directory_unstaged_count
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         if options.single_node {

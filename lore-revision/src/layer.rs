@@ -638,7 +638,8 @@ pub async fn remove(
         layer_state.clone(),
         source_node_link.node,
     )
-    .await;
+    .await
+    .count;
 
     let mut tracked_files: Vec<RelativePath> = Vec::new();
     let mut tracked_directories: Vec<RelativePath> = Vec::new();
@@ -900,7 +901,8 @@ pub(crate) async fn list_staged(
             staged_state,
             source_node_link.node,
         )
-        .await;
+        .await
+        .count;
 
         if staged_file_count == 0 {
             continue;

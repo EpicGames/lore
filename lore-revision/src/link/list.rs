@@ -199,7 +199,8 @@ async fn list_staged_recursive(
                 link_state.clone(),
                 node.child,
             )
-            .await;
+            .await
+            .count;
 
             event::LoreEvent::LinkStagedEntry(LoreLinkStagedEntryEventData {
                 path: LoreString::from_str(&full_path),

@@ -122,6 +122,7 @@ pub(crate) async fn info(
             link_node.child,
         )
         .await
+        .count
     } else {
         0
     };

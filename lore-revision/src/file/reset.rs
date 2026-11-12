@@ -1383,15 +1383,12 @@ async fn reset_walk_named_path(
     let node_name = relative_path.name().to_string();
 
     let found = state_target
-        .find_relative(repository.clone(), ROOT_NODE, state_path.as_str())
+        .find_relative_held(repository.clone(), ROOT_NODE, state_path.as_str())
         .await;
 
     match found {
-        Ok((node_link, held)) => {
-            let crosses_link = held.is_some();
-            let (target_repository, target_state_current) =
-                held.unwrap_or_else(|| (repository.clone(), state_target.clone()));
-            let current_state_staged = if crosses_link {
+        Ok((node_link, (target_repository, target_state_current))) => {
+            let current_state_staged = if !Arc::ptr_eq(&target_state_current, &state_target) {
                 refuse_staged(&state_staged, &repository, &state_path).await?;
                 target_state_current.clone()
             } else {

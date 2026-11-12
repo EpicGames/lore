@@ -1646,7 +1646,7 @@ typedef struct lore_file_unstage_begin_event_data_t {
 
 // Running counts of items processed during an unstage operation.
 typedef struct lore_file_unstage_count_data_t {
-  // Number of directories that were unstaged.
+  // Number of directories and links that were unstaged.
   uint64_t directory_unstaged_count;
   // Number of directories that were discarded.
   uint64_t directory_discarded_count;
