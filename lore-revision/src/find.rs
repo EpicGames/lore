@@ -157,6 +157,53 @@ where
     Err(FindError::internal("no revision found"))
 }
 
+/// Whether `ancestor`, numbered `ancestor_number`, is on the history of `revision`: `revision`
+/// itself, a revision its first parents lead back to, or the other parent of a merge on that line.
+/// A zero `ancestor` precedes every revision.
+///
+/// The walk stops at the first revision numbered at or below `ancestor_number`, so it reads at most
+/// one revision for each revision number between the two, and after `search_limit` revisions where
+/// one is given. A revision that cannot be read, or a spent limit, ends it, answering `false`.
+///
+/// The branch module's history-line search walks a line too, but over batches of revision numbers
+/// and hashes, which carry no other parent. This walk reads each revision's state for it.
+pub async fn is_on_history(
+    repository: Arc<RepositoryContext>,
+    revision: Hash,
+    ancestor: Hash,
+    ancestor_number: u64,
+    search_limit: Option<usize>,
+) -> bool {
+    if ancestor.is_zero() {
+        return true;
+    }
+    if revision.is_zero() {
+        return false;
+    }
+    // The branch names where a zero revision starts, so a walk from `revision` never reads it.
+    find_revision(
+        repository,
+        BranchId::default(),
+        revision,
+        false,
+        search_limit,
+        |state, _metadata| {
+            if state.revision() == ancestor || state.parent_other() == ancestor {
+                FindMatchResult::Match
+            } else if state.revision_number() <= ancestor_number {
+                FindMatchResult::Abort
+            } else {
+                FindMatchResult::Continue
+            }
+        },
+    )
+    .await
+    .inspect_err(|err| {
+        lore_debug!("Revision {ancestor} not found on the history of {revision}: {err}");
+    })
+    .is_ok()
+}
+
 /// Find revision in the current branch history which has a matching key-value pair in metadata
 pub async fn revision_by_metadata(
     repository: Arc<RepositoryContext>,

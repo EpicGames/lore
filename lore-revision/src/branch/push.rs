@@ -33,6 +33,7 @@ use crate::branch::BranchLatestStatus;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
+use crate::find;
 use crate::fragment;
 use crate::history;
 use crate::immutable;
@@ -1761,6 +1762,7 @@ async fn plan_target(
 }
 
 /// What a target's push keeps from one revision to the next.
+#[lore_macro::test_pub]
 struct TargetRun {
     revision_protocol: Arc<dyn Revision>,
     storage: Arc<StorageSession>,
@@ -1843,6 +1845,7 @@ async fn push_target(
 
 /// Start the push of `target`: announce it, and create its branch on the peer where the peer holds
 /// none, or holds it deleted. Returns what pushing its revisions keeps, or `None` when it has none.
+#[lore_macro::test_pub]
 async fn start_target(target: &PushTarget) -> Result<Option<TargetRun>, PushError> {
     let repository = &target.repository;
     let branch = target.branch;
@@ -1861,6 +1864,15 @@ async fn start_target(target: &PushTarget) -> Result<Option<TargetRun>, PushErro
         create_branch(revision_protocol.as_ref(), branch, &plan.branch_metadata).await?;
     }
     if plan.remote_latest == target.latest && plan.revisions.is_empty() {
+        if !target.latest.is_zero() {
+            Box::pin(record_pushed_latest(
+                repository,
+                branch,
+                target.latest,
+                dry_run,
+            ))
+            .await?;
+        }
         return Ok(None);
     }
 
@@ -2119,8 +2131,7 @@ async fn finish_target(target: &PushTarget, run: &TargetRun) -> Result<(), PushE
         run.current_latest
     );
     if run.current_latest.is_zero()
-        || repository.is_layer()
-        || repository.is_link()
+        || !records_branch_latest(repository)
         || run.fast_forward_merged
         || execution_context().globals().dry_run()
     {
@@ -2130,18 +2141,111 @@ async fn finish_target(target: &PushTarget, run: &TargetRun) -> Result<(), PushE
     let local_latest = branch::load_latest(repository.clone(), target.branch)
         .await
         .unwrap_or_default();
-    branch::store_latest(
+    branch::store_synced_latest(repository, target.branch, local_latest, run.current_latest)
+        .await
+        .forward::<PushError>("setting new latest revision for branch")?;
+    Ok(())
+}
+
+/// Whether a push records the local latest of the branch it pushes. A layer or a link records
+/// only the last synchronized revision.
+fn records_branch_latest(repository: &RepositoryContext) -> bool {
+    !repository.is_layer() && !repository.is_link()
+}
+
+/// Records `pushed`, a revision the peer holds on `branch`, as the branch's local latest and last
+/// synchronized revision where the local latest is `pushed` or on its history
+/// ([`find::is_on_history`]). Answers whether `pushed` is now, or was already, the recorded local
+/// latest. A dry run records nothing.
+///
+/// A layer or a link records `pushed` as the last synchronized revision alone, and answers `false`.
+/// A local latest that cannot be read, or that another command moves while this records, is left
+/// as it is.
+///
+/// Boxed by its callers as the cold path: most pushes have revisions to send.
+#[lore_macro::test_pub]
+async fn record_pushed_latest(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    pushed: Hash,
+    dry_run: bool,
+) -> Result<bool, PushError> {
+    if !records_branch_latest(repository) {
+        if !dry_run
+            && branch::load_last_sync(repository.clone(), branch)
+                .await
+                .unwrap_or_default()
+                != pushed
+        {
+            branch::store_last_sync(repository.clone(), branch, pushed).await;
+        }
+        return Ok(false);
+    }
+
+    let local_latest = match branch::load_latest(repository.clone(), branch).await {
+        Ok(local_latest) => local_latest,
+        Err(err) => {
+            lore_debug!(
+                "Not recording pushed revision {pushed}, the local latest is unread: {err}"
+            );
+            return Ok(false);
+        }
+    };
+    if local_latest == pushed {
+        let diverged = branch::load_latest_divergent(repository.clone(), branch)
+            .await
+            .unwrap_or(true);
+        let last_sync = branch::load_last_sync(repository.clone(), branch)
+            .await
+            .unwrap_or_default();
+        if !diverged && last_sync == pushed {
+            return Ok(true);
+        }
+    } else if !local_latest_on_history(repository, pushed, local_latest).await {
+        return Ok(false);
+    }
+    if dry_run {
+        return Ok(true);
+    }
+
+    lore_debug!("Recording pushed revision {pushed} as the local latest of branch {branch}");
+    match branch::store_synced_latest(repository, branch, local_latest, pushed).await {
+        Ok(()) => Ok(true),
+        Err(err) if err.is_branch_advanced() => {
+            lore_debug!("Not recording pushed revision {pushed}, the local latest moved on");
+            Ok(false)
+        }
+        Err(err) => Err(err).forward::<PushError>("setting new latest revision for branch"),
+    }
+}
+
+/// Whether `local_latest` is on the history of `pushed`, walked at most
+/// [`branch::MAX_DIVERGENT_HISTORY_LENGTH`] revisions. A revision that cannot be read answers
+/// `false`.
+async fn local_latest_on_history(
+    repository: &Arc<RepositoryContext>,
+    pushed: Hash,
+    local_latest: Hash,
+) -> bool {
+    let local_latest_number = if local_latest.is_zero() {
+        0
+    } else {
+        match State::deserialize(repository.clone(), local_latest).await {
+            Ok(state) => state.revision_number(),
+            Err(err) => {
+                lore_debug!("Local latest {local_latest} is unread: {err}");
+                return false;
+            }
+        }
+    };
+    find::is_on_history(
         repository.clone(),
-        target.branch,
+        pushed,
         local_latest,
-        run.current_latest,
-        BranchLatestStatus::Convergent,
+        local_latest_number,
+        Some(branch::MAX_DIVERGENT_HISTORY_LENGTH),
     )
     .await
-    .forward::<PushError>("setting new latest revision for branch")?;
-
-    branch::store_last_sync(repository.clone(), target.branch, run.current_latest).await;
-    Ok(())
 }
 
 /// The error of a revision offer that failed with `err`. The peer refuses an offer as an internal

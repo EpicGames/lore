@@ -21,6 +21,7 @@ use crate::fs::filesystem_provider::test_store_create;
 mod case_rename;
 mod diff;
 mod instance;
+mod interrupted_push;
 mod last_merged;
 mod merge_deletions;
 mod merge_local_work;

@@ -12,7 +12,6 @@ use lore_error_set::prelude::*;
 use serde::Serialize;
 
 use crate::branch;
-use crate::branch::BranchLatestStatus;
 use crate::branch::merge;
 use crate::branch::merge::MergeType;
 use crate::change::NodeChange;
@@ -350,18 +349,9 @@ async fn sync_store_branch_latest(
     let local_latest = branch::load_latest(repository.clone(), branch)
         .await
         .unwrap_or_default();
-    branch::store_latest(
-        repository.clone(),
-        branch,
-        local_latest,
-        revision,
-        BranchLatestStatus::Convergent,
-    )
-    .await
-    .forward::<SyncError>("Failed to store revision as current branch latest")?;
-
-    branch::store_last_sync(repository, branch, revision).await;
-    Ok(())
+    branch::store_synced_latest(&repository, branch, local_latest, revision)
+        .await
+        .forward::<SyncError>("Failed to store revision as current branch latest")
 }
 
 /// Where the branch being synced stands, for the branch latest decision.

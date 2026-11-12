@@ -1174,6 +1174,32 @@ pub async fn store_last_sync(repository: Arc<RepositoryContext>, branch: BranchI
     let _ = mutable_store(repository, LAST_SYNC, branch, revision).await;
 }
 
+/// Stores `latest`, a revision on the history the remote holds for `branch`, as the branch's local
+/// latest in place of `previous`, convergent, and as its last synchronized revision: what a sync, a
+/// clone and a push record once the remote answers for a revision.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn store_synced_latest(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    previous: Hash,
+    latest: Hash,
+) -> impl Future<Output = Result<(), BranchError>> + '_ {
+    async move {
+        store_latest(
+            repository.clone(),
+            branch,
+            previous,
+            latest,
+            BranchLatestStatus::Convergent,
+        )
+        .await?;
+        store_last_sync(repository.clone(), branch, latest).await;
+        Ok(())
+    }
+}
+
 pub async fn load_latest_history(
     repository: Arc<RepositoryContext>,
     branch: BranchId,

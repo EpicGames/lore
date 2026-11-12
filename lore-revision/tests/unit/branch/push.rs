@@ -678,6 +678,7 @@ mod place {
     use crate::paged_remote::PagedRemote;
     use crate::paged_remote::client_on;
     use crate::paged_remote::client_stores;
+    use crate::paged_remote::writing_client_on;
 
     fn branch() -> BranchId {
         BranchId::from([7; 16])
@@ -927,6 +928,34 @@ mod place {
                 .map(|order| (order.after, order.group))
                 .collect();
             assert_eq!(ordered, vec![(vec![1], 0), (vec![], 0), (vec![0], 0)]);
+        }))
+        .await;
+    }
+
+    /// A layer already at the peer's latest revision records it as its last synchronized
+    /// revision when its push starts, and pushes nothing.
+    #[tokio::test]
+    async fn a_layer_at_the_remote_latest_records_its_last_sync() {
+        Box::pin(with_execution(async {
+            let stores = client_stores().await;
+            let writer = &stores.writer;
+            let latest = write_on_branch(writer, Hash::default(), Hash::default(), 1, "base").await;
+            let client = writing_client_on(
+                &stores,
+                Some(Arc::new(PagedRemote::new(branch(), Hash::default()))),
+            );
+            let mut layer = target(client, latest, &[], vec![]).await;
+            layer.plan.remote_latest = latest;
+            layer.plan.remote_metadata = Hash::from([1; 32]);
+            layer.repository = layer.repository.to_layer_context(layer.repository.id).await;
+            layer.mount = Some(Mount::Layer("lay".into()));
+
+            let run = start_target(&layer).await.expect("starting the push");
+
+            let last_sync = lore_revision::branch::load_last_sync(writer.clone(), branch())
+                .await
+                .unwrap_or_default();
+            assert_eq!((run.is_none(), last_sync), (true, latest));
         }))
         .await;
     }

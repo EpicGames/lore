@@ -33,7 +33,6 @@ use super::SharedStoreToUseConfig;
 use super::VfsConfig;
 use super::get_dot_lore_path;
 use crate::branch;
-use crate::branch::BranchLatestStatus;
 use crate::dependency;
 use crate::errors::*;
 use crate::event;
@@ -1561,16 +1560,9 @@ fn store_cloned_branch(
             let local_latest = branch::load_latest(repository.clone(), branch_id)
                 .await
                 .unwrap_or_default();
-            branch::store_latest(
-                repository.clone(),
-                branch_id,
-                local_latest,
-                revision,
-                BranchLatestStatus::Convergent,
-            )
-            .await
-            .forward::<CloneError>("Failed to create local branch")?;
-            branch::store_last_sync(repository, branch_id, revision).await;
+            branch::store_synced_latest(&repository, branch_id, local_latest, revision)
+                .await
+                .forward::<CloneError>("Failed to create local branch")?;
         }
         Ok(())
     }
