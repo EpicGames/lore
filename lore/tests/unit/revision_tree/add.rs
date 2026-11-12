@@ -18,6 +18,7 @@ use lore::revision_tree::node_info::node_info;
 use lore::storage::handle as storage_handle;
 use lore::storage::store::in_memory_for_tests;
 use lore_base::error::InvalidArguments;
+use lore_base::error::Oversized;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
@@ -29,6 +30,7 @@ use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreNodeType;
 use lore_revision::interface::LoreString;
 use lore_revision::node::INVALID_NODE;
+use lore_revision::node::MAX_NODE_NAME_LEN;
 use lore_revision::node::Node;
 use lore_revision::node::NodeBlock;
 use lore_revision::node::NodeID;
@@ -344,6 +346,49 @@ async fn add_rejects_the_whole_batch_and_creates_nothing() {
         "a rejected batch must create nothing, got {listed:?}"
     );
 
+    release(handle, store_handle_id);
+}
+
+/// An entry whose name is over the length bound rejects the batch as oversized, the code a
+/// size bound fails with, where any other bad name rejects it as an invalid argument.
+#[tokio::test]
+async fn add_rejects_a_name_over_the_length_bound_as_oversized() {
+    let partition = Partition::from([0x3au8; 16]);
+    let (handle, store_handle_id) = load_handle("add-long-name", partition).await;
+
+    let long = "n".repeat(MAX_NODE_NAME_LEN + 1);
+    let (status, events) = run_add(
+        handle,
+        vec![
+            entry(1, ROOT_NODE, "good", LoreNodeType::File),
+            entry(2, ROOT_NODE, &long, LoreNodeType::File),
+        ],
+    )
+    .await;
+    assert_eq!(status, Oversized::FFI_CODE, "got {events:?}");
+    assert_eq!(
+        add_outcome(&events, 2).map(|(_, code)| code),
+        Some(LoreErrorCode::Oversized),
+        "got {events:?}"
+    );
+
+    let (status, events) = run_add(
+        handle,
+        vec![entry(3, ROOT_NODE, "with/slash", LoreNodeType::File)],
+    )
+    .await;
+    assert_eq!(status, InvalidArguments::FFI_CODE, "got {events:?}");
+    assert_eq!(
+        add_outcome(&events, 3).map(|(_, code)| code),
+        Some(LoreErrorCode::InvalidArguments),
+        "got {events:?}"
+    );
+
+    let listed = list(handle, 4, ROOT_NODE).await;
+    assert!(
+        child_names(&listed).is_empty(),
+        "a rejected batch must create nothing, got {listed:?}"
+    );
     release(handle, store_handle_id);
 }
 

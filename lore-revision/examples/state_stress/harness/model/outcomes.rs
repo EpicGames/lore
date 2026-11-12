@@ -70,6 +70,8 @@ use super::fields::Fields;
 use crate::harness::catalogue;
 use crate::harness::catalogue::call::Answer;
 use crate::harness::catalogue::call::Call;
+use crate::harness::catalogue::call::Failed;
+use crate::harness::catalogue::call::FailedRead;
 use crate::harness::catalogue::call::Leaves;
 use crate::harness::catalogue::call::Lookup;
 use crate::harness::catalogue::call::Outcome;
@@ -84,7 +86,6 @@ use crate::harness::catalogue::call::path_spelling;
 use crate::harness::catalogue::call::spelling;
 use crate::harness::catalogue::call::spelling_below;
 use crate::harness::catalogue::ops::Flagged;
-use crate::harness::faults::INJECTED_AS;
 
 /// What a call's records tell of its answer, as the replay goes.
 #[derive(Clone, Debug, Default)]
@@ -219,6 +220,33 @@ fn reads_names(call: &Call) -> bool {
 /// Whether `call` is a dirty-paths collection, its paths judged by its head and name records.
 fn collects(call: &Call) -> bool {
     std::ptr::eq(call.kind, &catalogue::DIRTY_PATHS)
+}
+
+/// Whether a failed read in `call` gives `failed`: any read, for most such errors, and a read of a
+/// revision's State only in a call loading one through a link ([`loads_linked`]).
+fn read_gives(call: &Call, failed: &Failed) -> bool {
+    match failed.read {
+        Some(FailedRead::Any) => true,
+        Some(FailedRead::RevisionState) => loads_linked(call),
+        None => false,
+    }
+}
+
+/// Whether `call` may load the revision a link pins: a listing or a collection of children
+/// following links, a resolution entering them, or a collection of dirty paths, which follows a
+/// dirty link.
+fn loads_linked(call: &Call) -> bool {
+    [
+        &catalogue::LISTED_CHILDREN,
+        &catalogue::LISTED_NAME_HASHES,
+        &catalogue::LISTED_MARKED,
+        &catalogue::COLLECTED_CHILDREN,
+        &catalogue::COLLECTED_VERSIONED_CHILDREN,
+        &catalogue::FIND_LINKED,
+        &catalogue::DIRTY_PATHS,
+    ]
+    .into_iter()
+    .any(|kind| std::ptr::eq(call.kind, kind))
 }
 
 /// Whether `call` resolves a path entering links on the way ([`Call::names`]).
@@ -2535,12 +2563,14 @@ fn answer_judged(
                 "a call of '{name}' answered {answer:?}, not what its last lookup found"
             ))
         }
-        Outcome::Failed(error) if call.failed_reads == 0 => Some(format!(
-            "a call of '{name}' failed with no read failing in its interval: {error}"
+        Outcome::Failed(failed) if call.failed_reads == 0 => Some(format!(
+            "a call of '{name}' failed with no read failing in its interval: {}",
+            failed.text
         )),
-        Outcome::Failed(error) if !INJECTED_AS.iter().any(|text| error.contains(text)) => Some(
-            format!("a call of '{name}' failed with an error no failed read gives: {error}"),
-        ),
+        Outcome::Failed(failed) if !read_gives(call, failed) => Some(format!(
+            "a call of '{name}' failed with an error no failed read gives: {}",
+            failed.text
+        )),
         Outcome::Dropped if !call.kind.cancellable && !admits.uncancellable_drops => Some(format!(
             "a call of '{name}' was dropped part way, which its production caller never drops"
         )),

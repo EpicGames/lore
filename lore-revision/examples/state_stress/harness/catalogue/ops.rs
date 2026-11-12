@@ -60,6 +60,7 @@ use lore_storage::hash::hash_string;
 
 use super::Kind;
 use super::call::Answer;
+use super::call::Failed;
 use super::call::Filter;
 use super::call::Leaves;
 use super::call::Lookup;
@@ -149,25 +150,16 @@ fn naming(dir: NodeID, name: &str) -> On {
 }
 
 /// The outcome of `error`, one a run can provoke: self-reported where the State asked its caller
-/// to slow down or a name table had no room, otherwise a failure, which only a failed read makes
-/// legal.
+/// to slow down, or refused a name as `Oversized`, a name table with no room for it or a name over
+/// `MAX_NODE_NAME_LEN`; otherwise a failure, which only a failed read makes legal.
 pub(crate) fn failed(error: &StateError) -> Outcome {
     if error.is_slow_down() {
-        return Outcome::SelfReported(SelfReported::SlowDown);
-    }
-    let text = error.to_string();
-    if names_full(&text) {
-        Outcome::SelfReported(SelfReported::NameTableFull)
+        Outcome::SelfReported(SelfReported::SlowDown)
+    } else if error.is_oversized() {
+        Outcome::SelfReported(SelfReported::Oversized)
     } else {
-        Outcome::Failed(text)
+        Outcome::Failed(Failed::of(error))
     }
-}
-
-/// Whether an error's `text` says a name table had no room: as the name store answers a table it
-/// cannot grow (state/block.rs, `node_name_store`), or the staged move one it found full before its
-/// marks (relocate.rs, `node_move_staged`).
-fn names_full(text: &str) -> bool {
-    text.contains("node name store would grow") || text.contains("name table has no room")
 }
 
 /// The outcome of a change answering done or `error`.
@@ -247,7 +239,10 @@ fn attach_answered(
         // Only a resident attach answers `None`.
         Ok(None) => (
             None,
-            Outcome::Failed("a fetching attach answered no node".into()),
+            Outcome::Failed(Failed {
+                text: "a fetching attach answered no node".into(),
+                read: None,
+            }),
         ),
         Err(error) => (None, gone_or_failed(&error)),
     }
@@ -2380,7 +2375,8 @@ pub async fn stage_claim_windowed<F: Future<Output = ()>>(
 /// entries: what it claimed, or the outcome of the step that stopped it, as the stage stops at an
 /// entry's error. Its directory gone, or a node it added taken
 /// before its mark, once an add of its own landed, the add stands: the directory or the node
-/// noted taken, the call done.
+/// noted taken, the call done; as it does where an entry's name is refused as `Oversized`
+/// ([`after_adds`]).
 async fn claims_in<F: Future<Output = ()>>(
     tree: &Tree,
     dir: NodeID,
@@ -2460,18 +2456,22 @@ async fn claims_in<F: Future<Output = ()>>(
     })
 }
 
-/// `step`'s answer in a stage's claims, passed on; panics where it self-reported once an add of the
+/// `step`'s answer in a stage's claims, passed on but where it self-reported once an add of the
 /// claims' own `landed`, as the model takes a call's self-report for one that changed nothing, the
-/// add another step's. No run reaches one: a `SlowDown` needs the chain to change at every attempt
-/// the product's retry bound allows, and no scenario fills a name table beside the kind.
+/// add another step's. A name refused as `Oversized` there stops the claims done, the adds
+/// standing, as a directory gone does; any other self-report there panics. No run reaches one: a
+/// `SlowDown` needs the chain to change at every attempt the product's retry bound allows.
 fn after_adds<T>(step: Result<T, Outcome>, landed: bool) -> Result<T, Outcome> {
-    if landed && let Err(Outcome::SelfReported(reported)) = &step {
-        panic!(
+    match step {
+        Err(Outcome::SelfReported(SelfReported::Oversized)) if landed => {
+            Err(Outcome::Done(Answer::None))
+        }
+        Err(Outcome::SelfReported(reported)) if landed => panic!(
             "a stage's claims self-reported {reported:?} after an add of their own landed, which \
              the model would take for a change of the self-reporting step's"
-        );
+        ),
+        step => step,
     }
-    step
 }
 
 /// Whether no two of `entries` carry one name hash, as the stage asks of a directory's entries
@@ -2972,10 +2972,7 @@ pub async fn staged_move_planned(
                 )
                 .await;
             let outcome = match moved {
-                // But a name table with no room, self-reported.
-                Err(error) if error.is_invalid_arguments() && !names_full(&error.to_string()) => {
-                    Outcome::Refused(Refusal::Move)
-                }
+                Err(error) if error.is_invalid_arguments() => Outcome::Refused(Refusal::Move),
                 moved => done_or_failed(moved),
             };
             ((), outcome)

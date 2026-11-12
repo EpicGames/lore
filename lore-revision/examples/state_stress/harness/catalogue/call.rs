@@ -33,6 +33,7 @@ use lore_revision::node::NodeID;
 use lore_revision::state::AddedSince;
 use lore_revision::state::Content;
 use lore_revision::state::State;
+use lore_revision::state::StateError;
 use lore_revision::state::diff;
 use lore_revision::state::node::hooks;
 use lore_revision::state::node::hooks::StateHooks;
@@ -40,6 +41,7 @@ use lore_revision::state::node::hooks::log::Effect;
 use lore_revision::state::node::hooks::log::Record;
 
 use super::Kind;
+use crate::harness::faults::failed_read_giving;
 use crate::harness::log::Collector;
 
 /// What an operation answered.
@@ -52,14 +54,41 @@ pub enum Outcome {
     /// A reader's answer.
     Answer(Answer),
     /// An answer the State reports of itself, legal where a run admits it but toward no verified
-    /// outcome: it asked its caller to slow down, a name table had no room, or a caller's check
-    /// loop spent its retries.
+    /// outcome: it asked its caller to slow down, refused a name as `Oversized`, or a caller's
+    /// check loop spent its retries.
     SelfReported(SelfReported),
-    /// An error a run may inject, legal only where a read failed during the call: a failing store,
-    /// an evicted block it could not load again.
-    Failed(String),
+    /// An error a run may inject, legal only where a read failed during the call and only one a
+    /// failed read gives ([`Failed::read`]): a failing store, an evicted block it could not load
+    /// again, a link's revision it could not read.
+    Failed(Failed),
     /// Dropped part way.
     Dropped,
+}
+
+/// A call's error: its text, and the read whose failure gives it, where one does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failed {
+    pub text: String,
+    pub read: Option<FailedRead>,
+}
+
+impl Failed {
+    /// The failure `error` makes: its text, and the read whose failure gives it
+    /// ([`failed_read_giving`]).
+    pub fn of(error: &StateError) -> Self {
+        let text = error.to_string();
+        let read = failed_read_giving(error, &text);
+        Self { text, read }
+    }
+}
+
+/// The reads whose failure gives an operation's error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailedRead {
+    /// Any read the call makes.
+    Any,
+    /// A read of a revision's State, which a call makes only to read through a link.
+    RevisionState,
 }
 
 impl Outcome {
@@ -316,8 +345,9 @@ fn spelled(hash: u64, bytes: &[u8]) -> u64 {
 pub enum SelfReported {
     /// `SlowDown`: a chain changed under the op at every attempt its bound allows.
     SlowDown,
-    /// A name table with no room for the op's name.
-    NameTableFull,
+    /// `Oversized`: a name table with no room for the op's name, or a name over
+    /// `MAX_NODE_NAME_LEN`.
+    Oversized,
     /// A caller's check loop spent its retries, as RMDIR answers `EAGAIN`.
     RetriesSpent,
     /// A resident op found a block it needed not in memory: `find_subnode_resident`'s `Ok(None)`.

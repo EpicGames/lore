@@ -468,7 +468,7 @@ impl core::fmt::Debug for LoreBytesMut {
 /// Small discriminator enum for the per-item terminal events of the revision-tree API.
 ///
 /// Narrower than the general library error code: an event embeds this so a caller can branch on
-/// the common cases cheaply, without reading a message. The cost is that it names only five
+/// the common cases cheaply, without reading a message. The cost is that it names only six
 /// outcomes, so errors outside them arrive as `Internal`. The storage API carries a full
 /// [`LoreErrorDetail`] on its per-item events instead, and no longer uses this enum.
 ///
@@ -495,6 +495,8 @@ pub enum LoreErrorCode {
     Internal = -1,
     /// The backing store is overloaded; the caller should retry later.
     SlowDown = 31,
+    /// A size bound refused the operation, such as a name over its length bound.
+    Oversized = 118,
 }
 
 // cbindgen cannot evaluate a const in a discriminant position — it drops the
@@ -508,6 +510,7 @@ const _: () =
 const _: () = assert!(LoreErrorCode::SlowDown as i32 == lore_base::error::SlowDown::FFI_CODE);
 const _: () =
     assert!(LoreErrorCode::AddressNotFound as i32 == lore_base::error::AddressNotFound::FFI_CODE);
+const _: () = assert!(LoreErrorCode::Oversized as i32 == lore_base::error::Oversized::FFI_CODE);
 
 /// Data for an error event.
 #[repr(C)]

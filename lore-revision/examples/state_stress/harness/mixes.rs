@@ -313,14 +313,6 @@ impl Op {
         self.holds_plan() || matches!(self, Self::Pend(..))
     }
 
-    /// Whether it reads a revision a link pins: the listings and resolutions through a link, and
-    /// the collections of `q`, which follow its dirty link. [`Variant::Fault`] runs none, as the
-    /// reads of a link's revision answer a failed read in the store's own words, which no rule of
-    /// the model's holds.
-    pub fn reads_links(self) -> bool {
-        matches!(self, Self::LinkReads(_) | Self::DirtyPaths("q"))
-    }
-
     /// Whether its production callers may drop it part way, so [`Variant::Drop`] may: each of its
     /// calls is of a cancellable kind ([`crate::harness::catalogue::Kind`]); not `lore dirty`'s
     /// add, nor the C API delete's levels and pends, which run in a task the call awaits.
@@ -413,7 +405,8 @@ pub enum Variant {
     /// The tree built in a repository over a store that fails reads on demand, which from the
     /// second burst on fails one read in [`FAIL_ONE_IN`], chosen from the run's seed: an
     /// operation's call meeting one answers it failed, and leaves what its records tell. The
-    /// store is mended before each checkpoint. Only the mixes [`Mix::runs`] names run it.
+    /// store is mended at each burst's end, before the model reads what the burst loaded and the
+    /// checkpoint. Only the mixes [`Mix::runs`] names run it.
     Fault,
 }
 
@@ -516,20 +509,16 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 /// `ops`, operations of `mix`, run on `settings.workers` workers from the mix's tree as
-/// `settings.variant` says, each in a task of its own, in its bursts, but those the variant runs
-/// none of ([`Op::reads_links`]), then the mix's task after them alone, and at each burst's end
-/// the reclaim ([`reclaim`]) alone, as the point between bursts is quiescent, recording still;
-/// each burst's log replayed through the model, started where the setup ended, the State
-/// checkpointed between bursts and at the run's end. Where a swap-plan
+/// `settings.variant` says, each in a task of its own, in its bursts, then the mix's task after
+/// them alone, and at each burst's end the reclaim ([`reclaim`]) alone, as the point between
+/// bursts is quiescent, recording still; each burst's log replayed through the model, started
+/// where the setup ended, the store mended first, as the model reads the revisions the burst
+/// loaded through it; the State checkpointed between bursts and at the run's end. Where a swap-plan
 /// holder is among them, the others wait for it to begin, so they run beside it however the
 /// workers are scheduled: the holder's own waits, the settle's window and the swap copy's, leave
 /// them room. Every task of a burst is joined before the burst ends, whatever failed.
 pub fn replayed_on_workers(mix: Mix, ops: &[Op], settings: Settings) -> Result<Run, Failure> {
     let variant = settings.variant;
-    let ops: Vec<Op> = (ops.iter().copied())
-        .filter(|op| variant != Variant::Fault || !op.reads_links())
-        .collect();
-    let ops = ops.as_slice();
     let (runtime, chaos) = chaos::runtime(settings.workers, settings.every, settings.seed);
     // The operations' tasks, then the task after them and the reclaim's.
     chaos.number_tasks(ops.len() + 2);
@@ -642,6 +631,7 @@ pub fn replayed_on_workers(mix: Mix, ops: &[Op], settings: Settings) -> Result<R
         }
         let (log, calls) = burst_taken(&chaos, run.state)?;
         let spawns = chaos.spawns();
+        context.mend();
         runtime.block_on(in_context(async {
             model.provide_needed(&context, &log).await;
             model.replay_called(&log, calls.clone(), spawns);

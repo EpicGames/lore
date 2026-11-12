@@ -166,7 +166,7 @@ typedef enum lore_revision_resolve_target_t {
 // Small discriminator enum for the per-item terminal events of the revision-tree API.
 //
 // Narrower than the general library error code: an event embeds this so a caller can branch on
-// the common cases cheaply, without reading a message. The cost is that it names only five
+// the common cases cheaply, without reading a message. The cost is that it names only six
 // outcomes, so errors outside them arrive as `Internal`. The storage API carries a full
 // [`LoreErrorDetail`] on its per-item events instead, and no longer uses this enum.
 //
@@ -186,6 +186,8 @@ typedef enum lore_error_code_t {
   LORE_ERROR_CODE_INTERNAL = -1,
   // The backing store is overloaded; the caller should retry later.
   LORE_ERROR_CODE_SLOW_DOWN = 31,
+  // A size bound refused the operation, such as a name over its length bound.
+  LORE_ERROR_CODE_OVERSIZED = 118,
 } lore_error_code_t;
 
 // What a range of lines resolved to, or why it did not resolve.
@@ -13195,7 +13197,9 @@ void lore_revision_tree_node_path_async(const struct lore_global_args_t *globals
 // existing node or onto an earlier entry, so one call builds a subtree. Every
 // entry is checked before any node is created, so one bad entry rejects the
 // call and creates nothing; the reason names the offending entry's batch index,
-// which a caller leaving `entry_id` at zero has no other way to identify. A failure
+// which a caller leaving `entry_id` at zero has no other way to identify. The entry
+// and the call report `LORE_ERROR_CODE_OVERSIZED` for a name longer than a node
+// name may be, and `LORE_ERROR_CODE_INVALID_ARGUMENTS` for any other bad entry. A failure
 // after those checks pass reports `LORE_ERROR_CODE_INTERNAL` and may leave part of
 // the batch created. An entry the tree gave up on under load, in its checks or
 // after, reports `LORE_ERROR_CODE_SLOW_DOWN` instead, and so do the entries parented
@@ -13316,7 +13320,9 @@ void lore_revision_tree_modify_async(const struct lore_global_args_t *globals,
 // entry naming the node's current parent renames it where it is. Every entry is checked
 // before any node is moved, so one bad entry rejects the call and leaves every node
 // where it was; the reason names the offending entry's batch index, which a caller
-// leaving `entry_id` at zero has no other way to identify. A failure after those checks
+// leaving `entry_id` at zero has no other way to identify. The entry and the call report
+// `LORE_ERROR_CODE_OVERSIZED` for a name longer than a node name may be, and
+// `LORE_ERROR_CODE_INVALID_ARGUMENTS` for any other bad entry. A failure after those checks
 // pass reports `LORE_ERROR_CODE_INTERNAL` and may leave earlier entries applied. An entry
 // the tree gave up on under load, in its checks or after, reports
 // `LORE_ERROR_CODE_SLOW_DOWN` instead. The load is heavy concurrent change on the handle,

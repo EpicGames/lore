@@ -30,6 +30,8 @@ use lore::revision_tree::node_info::LoreRevisionTreeNodeInfoArgs;
 use lore::revision_tree::node_info::node_info;
 use lore::storage::handle as storage_handle;
 use lore::storage::store::in_memory_for_tests;
+use lore_base::error::InvalidArguments;
+use lore_base::error::Oversized;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
@@ -46,6 +48,7 @@ use lore_revision::interface::LoreString;
 use lore_revision::metadata::BRANCH;
 use lore_revision::node::BLOCK_NODE_COUNT;
 use lore_revision::node::INVALID_NODE;
+use lore_revision::node::MAX_NODE_NAME_LEN;
 use lore_revision::node::NodeBlock;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
@@ -535,7 +538,8 @@ async fn move_rejects_a_link_destination() {
 }
 
 /// The name rules are the name table's own, applied here so a name it would refuse
-/// fails before the batch moves anything rather than part-way through.
+/// fails before the batch moves anything rather than part-way through: a name over the
+/// length bound as oversized, any other as an invalid argument.
 #[tokio::test]
 async fn move_rejects_a_name_the_name_table_would_refuse() {
     let partition = Partition::from([0x79u8; 16]);
@@ -552,16 +556,35 @@ async fn move_rejects_a_name_the_name_table_would_refuse() {
         "the empty name must be refused on its own terms"
     );
 
-    let (status, _events) =
+    let (status, events) =
         run_move(handle, vec![entry(11, node_id, destination, "with/slash")]).await;
-    assert_ne!(
-        status, 0,
+    assert_eq!(
+        (status, move_outcomes(&events)),
+        (
+            InvalidArguments::FFI_CODE,
+            vec![(11, INVALID_NODE, LoreErrorCode::InvalidArguments)]
+        ),
         "a name the name table would refuse must be refused"
+    );
+
+    let long = "n".repeat(MAX_NODE_NAME_LEN + 1);
+    let (status, events) = run_move(handle, vec![entry(12, node_id, destination, &long)]).await;
+    assert_eq!(
+        (status, move_outcomes(&events)),
+        (
+            Oversized::FFI_CODE,
+            vec![(12, INVALID_NODE, LoreErrorCode::Oversized)]
+        ),
+        "a name over the length bound must be refused as oversized"
+    );
+    assert!(
+        rejection_reason(&events).contains("entry 0"),
+        "the reason names the entry, got {events:?}"
     );
     assert_eq!(
         fetch_node_info(handle, node_id).await.parent_id,
         ROOT_NODE,
-        "neither rejection may move anything"
+        "no rejection may move anything"
     );
     release(handle, store_handle_id);
 }

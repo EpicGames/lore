@@ -31,6 +31,7 @@ use super::dirty;
 use super::grab;
 use super::guard;
 use super::initialized;
+use super::injected;
 use super::moved;
 use super::publish;
 use super::record;
@@ -136,7 +137,7 @@ fn a_dropped_call_excuses_the_breach_it_left() {
         &[dirtied(&made, F, (2, 0)), dirtied(&made, H, (3, 1))].concat(),
         vec![Call {
             failed_reads: 1,
-            ..mark(F, Outcome::Failed(crate::harness::faults::INJECTED.into()))
+            ..mark(F, injected())
         }],
     );
     assert_eq!(excused(&failed), BTreeSet::from([(F, A)]));
@@ -157,10 +158,7 @@ fn a_dropped_call_excuses_the_breach_it_left() {
         excused(&model)
     };
     assert!(holding(Outcome::Dropped, 0).is_empty());
-    assert_eq!(
-        holding(Outcome::Failed(crate::harness::faults::INJECTED.into()), 1),
-        BTreeSet::from([(F, A)])
-    );
+    assert_eq!(holding(injected(), 1), BTreeSet::from([(F, A)]));
 }
 
 /// A future spawned in a dropped mark's steps that dirties its node after the call ended, as a
@@ -408,7 +406,7 @@ fn a_task_dropped_outside_every_call_excuses_closure_on_the_whole_state() {
         call,
     };
     let answering = |outcome| vec![mark(F, outcome)];
-    let failed = || Outcome::Failed(crate::harness::faults::INJECTED.into());
+    let failed = injected;
     let done = || Outcome::Done(Answer::None);
     // The operation itself: in its call dropped with it alone.
     let spawns = [operation, operation];

@@ -32,6 +32,7 @@ use lore_revision::node::INVALID_NODE;
 use lore_revision::node::Node;
 use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
+use lore_revision::state::StateError;
 use lore_revision::state::node::hooks::log::Check;
 use lore_revision::state::node::hooks::log::Effect;
 use lore_revision::state::node::hooks::log::Expected;
@@ -46,12 +47,14 @@ use lore_storage::hash::hash_string;
 
 use crate::harness::catalogue::call::Answer;
 use crate::harness::catalogue::call::Call;
+use crate::harness::catalogue::call::Failed;
 use crate::harness::catalogue::call::Filter;
 use crate::harness::catalogue::call::Outcome;
 use crate::harness::catalogue::call::Over;
 use crate::harness::catalogue::call::Repeats;
 use crate::harness::catalogue::call::Walk;
 use crate::harness::catalogue::call::Yielded;
+use crate::harness::faults::INJECTED;
 use crate::harness::model::BlockSnapshot;
 use crate::harness::model::Model;
 use crate::harness::model::Snapshot;
@@ -159,6 +162,11 @@ fn replayed(snapshot: &Snapshot, records: &[Record]) -> Model {
     model.start(STATE, snapshot);
     model.replay(records);
     model
+}
+
+/// A call's outcome where a read the store failed reached it: failed, with the store's error.
+fn injected() -> Outcome {
+    Outcome::Failed(Failed::of(&StateError::internal(INJECTED)))
 }
 
 /// A call of `kind`, id 1, by task 0 over `[begin, end)` on the State made by hand, on no node,

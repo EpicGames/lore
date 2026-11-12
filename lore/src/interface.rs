@@ -8538,7 +8538,9 @@ pub type LoreRevisionTreeAddArgs = crate::revision_tree::add::LoreRevisionTreeAd
 /// existing node or onto an earlier entry, so one call builds a subtree. Every
 /// entry is checked before any node is created, so one bad entry rejects the
 /// call and creates nothing; the reason names the offending entry's batch index,
-/// which a caller leaving `entry_id` at zero has no other way to identify. A failure
+/// which a caller leaving `entry_id` at zero has no other way to identify. The entry
+/// and the call report `LORE_ERROR_CODE_OVERSIZED` for a name longer than a node
+/// name may be, and `LORE_ERROR_CODE_INVALID_ARGUMENTS` for any other bad entry. A failure
 /// after those checks pass reports `LORE_ERROR_CODE_INTERNAL` and may leave part of
 /// the batch created. An entry the tree gave up on under load, in its checks or
 /// after, reports `LORE_ERROR_CODE_SLOW_DOWN` instead, and so do the entries parented
@@ -8695,7 +8697,9 @@ pub type LoreRevisionTreeMoveArgs = crate::revision_tree::move_node::LoreRevisio
 /// entry naming the node's current parent renames it where it is. Every entry is checked
 /// before any node is moved, so one bad entry rejects the call and leaves every node
 /// where it was; the reason names the offending entry's batch index, which a caller
-/// leaving `entry_id` at zero has no other way to identify. A failure after those checks
+/// leaving `entry_id` at zero has no other way to identify. The entry and the call report
+/// `LORE_ERROR_CODE_OVERSIZED` for a name longer than a node name may be, and
+/// `LORE_ERROR_CODE_INVALID_ARGUMENTS` for any other bad entry. A failure after those checks
 /// pass reports `LORE_ERROR_CODE_INTERNAL` and may leave earlier entries applied. An entry
 /// the tree gave up on under load, in its checks or after, reports
 /// `LORE_ERROR_CODE_SLOW_DOWN` instead. The load is heavy concurrent change on the handle,

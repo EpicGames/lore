@@ -17,6 +17,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use lore_base::error::InvalidArguments;
+use lore_base::error::Oversized;
 use lore_base::error::SlowDown;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
@@ -32,6 +33,7 @@ use lore_revision::interface::LoreString;
 use lore_revision::node::INVALID_NODE;
 use lore_revision::node::NodeID;
 use lore_revision::node::NodeIDExt;
+use lore_revision::node::NodeNameError;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::node::SiblingCycleGuard;
 use lore_revision::node::validate_node_name_for_store;
@@ -82,6 +84,7 @@ pub struct LoreRevisionTreeMoveArgs {
 #[error_set]
 enum MoveError {
     InvalidArguments,
+    Oversized,
     SlowDown,
 }
 
@@ -99,6 +102,7 @@ impl EventError for MoveError {
     fn translated(&self) -> LoreError {
         match self {
             MoveError::InvalidArguments(_) => LoreError::InvalidArguments,
+            MoveError::Oversized(_) => LoreError::Oversized,
             MoveError::SlowDown(_) => LoreError::SlowDown,
             MoveError::Internal(_) => LoreError::Internal,
         }
@@ -140,6 +144,7 @@ fn batch_error_code(result: &Result<(), MoveError>) -> LoreErrorCode {
     match result {
         Ok(()) => LoreErrorCode::None,
         Err(MoveError::InvalidArguments(_)) => LoreErrorCode::InvalidArguments,
+        Err(MoveError::Oversized(_)) => LoreErrorCode::Oversized,
         Err(MoveError::SlowDown(_)) => LoreErrorCode::SlowDown,
         Err(MoveError::Internal(_)) => LoreErrorCode::Internal,
     }
@@ -153,6 +158,22 @@ fn batch_error_code(result: &Result<(), MoveError>) -> LoreErrorCode {
 fn reject(entry_id: u64, entry_index: usize, reason: &str) -> MoveError {
     emit_move_error(entry_id, LoreErrorCode::InvalidArguments);
     MoveError::invalid(format!("entry {entry_index}: {reason}"))
+}
+
+/// Reject the whole batch for an entry whose name the node name table refuses, as [`reject`]
+/// does: as `Oversized` where the name is over its length bound, the code a size bound fails
+/// with, and as an invalid argument otherwise.
+fn reject_name(entry_id: u64, entry_index: usize, error: NodeNameError) -> MoveError {
+    match error {
+        NodeNameError::Oversized(oversized) => {
+            emit_move_error(entry_id, LoreErrorCode::Oversized);
+            let context = format!("entry {entry_index}: {}", oversized.context);
+            MoveError::Oversized(
+                Oversized { context }.chain_err(oversized, "checking the entry's name"),
+            )
+        }
+        error => reject(entry_id, entry_index, &error.to_string()),
+    }
 }
 
 /// Reject the whole batch because the tree could not be read, keeping the underlying
@@ -376,7 +397,7 @@ async fn plan_entries(
             ));
         }
         if let Err(error) = validate_node_name_for_store(name) {
-            return Err(reject(entry_id, index, &error.to_string()));
+            return Err(reject_name(entry_id, index, error));
         }
         if entry.node_id == ROOT_NODE {
             return Err(reject(

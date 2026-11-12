@@ -630,6 +630,53 @@ async fn a_moves_destination_takes_the_base_bits_of_the_moves_halves() {
     .await;
 }
 
+/// A move, a rename, a reattach and a staged move to a name over `MAX_NODE_NAME_LEN` are refused
+/// as `Oversized`, the code a size bound fails with, before anything changes.
+#[tokio::test]
+async fn a_move_to_a_name_over_the_length_bound_is_refused_as_oversized() {
+    with_state(|repository, state| async move {
+        let destination = add(&state, &repository, ROOT_NODE, directory("dst"), "dst").await;
+        let node = add(&state, &repository, ROOT_NODE, file("f"), "f").await;
+        let long = "n".repeat(MAX_NODE_NAME_LEN + 1);
+        let own = Mark::staged(NodeFlags::StagedMove, true);
+
+        let moved = state
+            .node_move(
+                repository.clone(),
+                node,
+                destination,
+                NameChange::Rename(&long),
+                own,
+            )
+            .await;
+        assert!(moved.is_err_and(|error| error.is_oversized()));
+        let renamed = state
+            .node_rename(repository.clone(), node, NameChange::Rename(&long))
+            .await;
+        assert!(renamed.is_err_and(|error| error.is_oversized()));
+        let reattached = state
+            .node_reattach(repository.clone(), node, destination, &long)
+            .await;
+        assert!(reattached.is_err_and(|error| error.is_oversized()));
+        let permit = state.moves_permit().await.expect("the moves permit");
+        let staged = state
+            .node_move_staged(
+                repository.clone(),
+                node,
+                destination,
+                (&long, hash_string(&long)),
+                &permit,
+                false,
+            )
+            .await;
+        assert!(staged.is_err_and(|error| error.is_oversized()));
+
+        assert_eq!(name(&state, &repository, node).await, "f");
+        assert_eq!(record(&state, &repository, node).await.parent, ROOT_NODE);
+    })
+    .await;
+}
+
 /// A move or a rename of a node detached meanwhile is not found, and a name the name table would
 /// refuse is refused before anything is read; nothing changes.
 #[tokio::test]
@@ -1069,7 +1116,8 @@ async fn name_last(state: &State, repository: &Arc<RepositoryContext>, node: Nod
 }
 
 /// A staged move with no room for its name in the node's name table, one byte short, is refused
-/// before any mark, so neither directory is marked and no unfinished change is noted: a name one
+/// as `Oversized` before any mark, so neither directory is marked and no unfinished change is
+/// noted: a name one
 /// byte longer than the one the node holds, in a table with one byte of room; a name one byte
 /// longer than the table's room; and a name as long as the one the node holds where that one is
 /// the last of a full table, whose slot the store does not reuse.
@@ -1103,9 +1151,7 @@ async fn a_staged_move_with_no_room_for_its_name_marks_nothing() {
                 .await;
 
             assert!(
-                refused
-                    .as_ref()
-                    .is_err_and(|error| error.is_invalid_arguments()),
+                refused.as_ref().is_err_and(|error| error.is_oversized()),
                 "a {}-byte name is refused: {refused:?}",
                 new_name.len()
             );

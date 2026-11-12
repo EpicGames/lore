@@ -130,7 +130,6 @@ use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::hash;
 use crate::immutable;
 use crate::immutable::ImmutableError;
-use crate::immutable::ReadBoxFromImmutable;
 use crate::immutable::ReadFromImmutable;
 use crate::immutable::WriteToImmutable;
 use crate::immutable::read_options_from_repository;
@@ -162,8 +161,6 @@ use crate::node::INVALID_BLOCK;
 use crate::node::INVALID_NODE;
 use crate::node::Node;
 use crate::node::NodeBlock;
-use crate::node::NodeBlockData;
-use crate::node::NodeBlockDataV0;
 use crate::node::NodeDelta;
 use crate::node::NodeExtFlags;
 use crate::node::NodeFileMetadata;
@@ -176,7 +173,9 @@ use crate::node::NodeLink;
 use crate::node::NodeNameLock;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
+use crate::node::StoredNodeBlock;
 use crate::node::node_to_file_metadata;
+use crate::node::read_stored_node_block;
 use crate::records::InstanceRecords;
 use crate::records::Lookup;
 use crate::records::Record;
@@ -10535,29 +10534,23 @@ async fn collect_file_metadata_blocks(
     Ok(addresses)
 }
 
+/// The name tables of the node `blocks`, each read in the format its size names
+/// ([`read_stored_node_block`], [`stored_name_table`]). The first error a read meets, once every
+/// read has ended.
+#[lore_macro::test_pub]
 async fn collect_name_fragments(
     repository: Arc<RepositoryContext>,
     blocks: Vec<Address>,
 ) -> Result<Vec<Address>, StateError> {
     let mut tasks = JoinSet::new();
     for address in blocks {
-        lore_spawn!(tasks, {
-            let repository = repository.clone();
-            async move {
-                if let Ok(block_data) =
-                    NodeBlockData::read_box_from_immutable(repository.clone(), address, true).await
-                {
-                    Ok(block_data.name_table)
-                } else {
-                    // Make sure block can be read even though it has no local name table
-                    let _block_data =
-                        NodeBlockDataV0::read_box_from_immutable(repository.clone(), address, true)
-                            .await
-                            .forward::<StateError>("Failed to deserialize node block")?;
-                    Ok(Hash::default())
-                }
-            }
-        });
+        lore_spawn!(
+            tasks,
+            futures::FutureExt::map(
+                read_stored_node_block(repository.clone(), address),
+                stored_name_table,
+            )
+        );
     }
     let mut name = Vec::with_capacity(tasks.len());
     let mut failure = None;
@@ -10583,6 +10576,18 @@ async fn collect_name_fragments(
     }
 
     Ok(name)
+}
+
+/// The name table of the node block `stored` read: a current or V2 block's, and none for a V0
+/// block, whose names its State's name table holds.
+fn stored_name_table(stored: Result<StoredNodeBlock, ImmutableError>) -> Result<Hash, StateError> {
+    Ok(
+        match stored.forward::<StateError>("Failed to deserialize node block")? {
+            StoredNodeBlock::Current(block) => block.name_table,
+            StoredNodeBlock::V2(block) => block.name_table,
+            StoredNodeBlock::V0(_) => Hash::default(),
+        },
+    )
 }
 
 fn collect_diff_addresses(from: Vec<Address>, to: Vec<Address>) -> Vec<Address> {

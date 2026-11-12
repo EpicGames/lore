@@ -29,6 +29,7 @@ use super::word_records;
 use super::words_of;
 use crate::harness::catalogue;
 use crate::harness::catalogue::call::Answer;
+use crate::harness::catalogue::call::Failed;
 use crate::harness::catalogue::call::Outcome;
 use crate::harness::catalogue::call::Refusal;
 use crate::harness::catalogue::call::call;
@@ -238,7 +239,7 @@ fn a_served_detach_racing_a_reattach_logs_its_race_arms() {
                                 Err(error) if error.is_node_not_found() => {
                                     Outcome::Refused(Refusal::NotFound)
                                 }
-                                Err(error) => Outcome::Failed(error.to_string()),
+                                Err(error) => Outcome::Failed(Failed::of(&error)),
                             };
                             ((), outcome)
                         },

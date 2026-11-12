@@ -3648,7 +3648,7 @@ mod block_single_flight {
     }
 
     /// A node block read holds its read of the current format, and the fallback to the older
-    /// formats, which holds a read as large and the conversion, stays in a box of its own.
+    /// formats, which holds a read as large and the first read's error, stays in a box of its own.
     #[tokio::test]
     async fn a_node_block_read_keeps_the_older_formats_out_of_its_future() {
         LORE_CONTEXT
@@ -3662,8 +3662,11 @@ mod block_single_flight {
                 let state = State::new();
 
                 let read = NodeBlock::deserialize(repository.clone(), &state, Address::default());
-                let fallback =
-                    NodeBlock::deserialize_other_version(repository, &state, Address::default());
+                let fallback = lore_revision::node::read_older_node_block(
+                    repository,
+                    Address::default(),
+                    lore_revision::immutable::ImmutableError::internal("the current format's read"),
+                );
 
                 assert!(
                     size_of_val(&read) < size_of_val(&fallback),

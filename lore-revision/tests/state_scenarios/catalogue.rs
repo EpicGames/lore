@@ -7,6 +7,7 @@
 
 use std::collections::BTreeSet;
 
+use lore_base::error::Oversized;
 use lore_revision::node::MAX_NODE_NAME_LEN;
 use lore_revision::node::Node;
 use lore_revision::node::NodeFlags;
@@ -22,6 +23,8 @@ use crate::harness::catalogue::KINDS;
 use crate::harness::catalogue::Role;
 use crate::harness::catalogue::Runs;
 use crate::harness::catalogue::Tier;
+use crate::harness::catalogue::call::Outcome;
+use crate::harness::catalogue::call::SelfReported;
 use crate::harness::catalogue::ops;
 use crate::harness::fixtures::Tree;
 use crate::harness::invariants::Report;
@@ -561,6 +564,28 @@ async fn a_stage_claim_stops_at_an_add_that_fails() {
         assert!(report.at("d/o").is_none(), "'d/o' is not added");
     })
     .await;
+}
+
+/// An error refusing a name as `Oversized` self-reports by its variant, whatever its text: a name
+/// table with no room for the name, as the name store and the staged move answer one, or a name
+/// over `MAX_NODE_NAME_LEN`.
+#[test]
+fn an_oversized_name_self_reports_whatever_its_text() {
+    for context in [
+        "node name store would grow to 4194305 bytes",
+        "the node's name table has no room for the destination name",
+        "node name is 4097 bytes",
+        "",
+    ] {
+        let error = StateError::from(Oversized {
+            context: context.into(),
+        });
+        assert_eq!(
+            ops::failed(&error),
+            Outcome::SelfReported(SelfReported::Oversized),
+            "'{context}'"
+        );
+    }
 }
 
 /// Beyond the contract, the stage's claims of a name its listing holds under another, renamed in

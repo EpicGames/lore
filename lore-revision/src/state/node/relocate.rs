@@ -31,6 +31,7 @@ use super::locks::prepend_locked;
 use super::mark::UnfinishedChange;
 use crate::errors::InvalidArguments;
 use crate::errors::NodeNotFound;
+use crate::errors::Oversized;
 use crate::errors::SlowDown;
 use crate::hash;
 use crate::node::INVALID_NODE;
@@ -234,8 +235,9 @@ impl State {
     /// 1. The checks, reading copies. Rejected are the root, an unknown or discarded node, a node
     ///    staged for deletion, a destination that is not a directory or is itself staged for
     ///    deletion, a destination the node already sits under by the name it already has, a name
-    ///    the node name table would refuse or has no room for, and a destination inside the
-    ///    node's own subtree, walked here unless `walked`.
+    ///    the node name table would refuse or has no room for, `Oversized` where the name is over
+    ///    its length bound or the table full, and a destination inside the node's own subtree,
+    ///    walked here unless `walked`.
     /// 2. The directory the node leaves, then the destination, each with its ancestors, marked
     ///    staged and dirty (H8): a commit descends into and rehashes both whatever happens next.
     ///    Neither where it is the root, whose flags no mark changes.
@@ -307,11 +309,8 @@ impl State {
                 reason: "destination parent id does not name a node".into(),
             }));
         }
-        if let Err(error) = validate_node_name_for_store(dst_name) {
-            return Err(StateError::from(InvalidArguments {
-                reason: format!("destination name is not storable: {error}"),
-            }));
-        }
+        validate_node_name_for_store(dst_name)
+            .forward::<StateError>("destination name is not storable")?;
 
         // The checks read copies in scopes no await crosses, so the future holds none of them.
         let node_index = Node::index(node_id);
@@ -405,8 +404,8 @@ impl State {
         // Refused before any mark, so a full name table leaves nothing marked; one that fills
         // meanwhile fails the move's section instead.
         if renamed && !fits {
-            return Err(StateError::from(InvalidArguments {
-                reason: "the node's name table has no room for the destination name".into(),
+            return Err(StateError::from(Oversized {
+                context: "the node's name table has no room for the destination name".into(),
             }));
         }
         // Walked before any mark, rather than in the section's retry loop: under the permit no
@@ -557,11 +556,8 @@ impl State {
         let renamed = match name {
             NameChange::Keep => None,
             NameChange::Rename(new_name) => {
-                if let Err(error) = validate_node_name_for_store(new_name) {
-                    return Err(StateError::from(InvalidArguments {
-                        reason: format!("new name is not storable: {error}"),
-                    }));
-                }
+                validate_node_name_for_store(new_name)
+                    .forward::<StateError>("new name is not storable")?;
                 Some((new_name, hash::hash_string(new_name)))
             }
         };
@@ -754,11 +750,7 @@ impl State {
                 reason: "node id does not name a renamable node".into(),
             }));
         }
-        if let Err(error) = validate_node_name_for_store(new_name) {
-            return Err(StateError::from(InvalidArguments {
-                reason: format!("new name is not storable: {error}"),
-            }));
-        }
+        validate_node_name_for_store(new_name).forward::<StateError>("new name is not storable")?;
         let block = self
             .block_with_nametable(repository.clone(), NodeBlock::index(node_id))
             .await?;
@@ -1016,11 +1008,7 @@ impl State {
                 reason: "new parent id does not name a node".into(),
             }));
         }
-        if let Err(error) = validate_node_name_for_store(new_name) {
-            return Err(StateError::from(InvalidArguments {
-                reason: format!("new name is not storable: {error}"),
-            }));
-        }
+        validate_node_name_for_store(new_name).forward::<StateError>("new name is not storable")?;
 
         let name_hash = hash::hash_string(new_name);
         let block_index = NodeBlock::index(node_id);

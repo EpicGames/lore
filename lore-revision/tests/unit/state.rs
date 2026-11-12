@@ -6,10 +6,13 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::FutureExt;
 use lore_base::types::Address;
+use lore_base::types::Context;
 use lore_base::types::Hash;
+use lore_base::types::ZeroHeapAlloc;
 use lore_revision::change::FileAction;
 use lore_revision::filter::FilterMode;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
+use lore_revision::immutable::WriteToImmutable;
 use lore_revision::instance::InstanceId;
 use lore_revision::link::LinkFlags;
 use lore_revision::lore::*;
@@ -443,11 +446,14 @@ async fn a_block_added_after_a_serialize_reads_the_serialized_file_metadata_list
 }
 
 /// A store that holds every get of the hashes it is told to hold until released, answers every get
-/// of the hashes it is told to refuse as missing, and counts every get.
+/// of the hashes it is told to refuse as missing, and the next gets of those it is told to fail
+/// with the error it is given, and counts every get.
 pub(crate) struct HoldingStore {
     inner: Arc<dyn lore_storage::ImmutableStore>,
     held: std::sync::Mutex<Vec<Hash>>,
     refused: std::sync::Mutex<Vec<Hash>>,
+    /// Each hash whose next gets fail, how many more, and the error they answer.
+    failing: std::sync::Mutex<Vec<(Hash, usize, lore_storage::StoreError)>>,
     released: tokio::sync::Notify,
     gets: std::sync::atomic::AtomicUsize,
 }
@@ -456,6 +462,23 @@ pub(crate) struct HoldingStore {
 async fn holding_repository(
     backing: &Arc<RepositoryContext>,
 ) -> (Arc<HoldingStore>, Arc<RepositoryContext>) {
+    let (store, repository) = holding_context(backing).await;
+    (store, Arc::new(repository))
+}
+
+/// [`holding_repository`], its local reads telling a failed read apart from a miss
+/// ([`RepositoryContext::strict_local_reads`]).
+async fn strict_holding_repository(
+    backing: &Arc<RepositoryContext>,
+) -> (Arc<HoldingStore>, Arc<RepositoryContext>) {
+    let (store, repository) = holding_context(backing).await;
+    (store, Arc::new(repository.strict_local_reads()))
+}
+
+/// A store over `backing`'s holding nothing yet, and a context reading through it.
+async fn holding_context(
+    backing: &Arc<RepositoryContext>,
+) -> (Arc<HoldingStore>, RepositoryContext) {
     let store = HoldingStore::over(backing.immutable_store());
     let mutable = lore_storage::local::mutable_store::create(
         None::<&str>,
@@ -464,7 +487,7 @@ async fn holding_repository(
     )
     .await
     .expect("in-memory mutable store");
-    let repository = Arc::new(RepositoryContext::new_null_context(store.clone(), mutable));
+    let repository = RepositoryContext::new_null_context(store.clone(), mutable);
     (store, repository)
 }
 
@@ -475,6 +498,7 @@ impl HoldingStore {
             inner,
             held: std::sync::Mutex::new(Vec::new()),
             refused: std::sync::Mutex::new(Vec::new()),
+            failing: std::sync::Mutex::new(Vec::new()),
             released: tokio::sync::Notify::new(),
             gets: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -483,6 +507,26 @@ impl HoldingStore {
     /// Answers every later get of `hash` as missing.
     pub(crate) fn refuse(&self, hash: Hash) {
         self.refused.lock().expect("refused hashes").push(hash);
+    }
+
+    /// Answers the next `count` gets of `hash` with `error`, and those after them as the store it
+    /// wraps does.
+    fn fail_next(&self, hash: Hash, count: usize, error: lore_storage::StoreError) {
+        (self.failing.lock().expect("failing hashes")).push((hash, count, error));
+    }
+
+    /// The error a get of `hash` answers in place of the store it wraps, spending a failure of it
+    /// where it is told to fail: missing where it is refused.
+    fn failure(&self, hash: &Hash) -> Option<lore_storage::StoreError> {
+        if self.refused.lock().expect("refused hashes").contains(hash) {
+            return Some(lore_storage::StoreError::from(lore_base::error::NotFound));
+        }
+        let mut failing = self.failing.lock().expect("failing hashes");
+        let (_, left, error) = failing
+            .iter_mut()
+            .find(|(failing, left, _)| failing == hash && *left > 0)?;
+        *left -= 1;
+        Some(error.clone())
     }
 
     fn gets(&self) -> usize {
@@ -524,13 +568,8 @@ impl lore_storage::ImmutableStore for HoldingStore {
         address: Address,
     ) -> Result<lore_storage::StoreGetData, lore_storage::StoreError> {
         self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self
-            .refused
-            .lock()
-            .expect("refused hashes")
-            .contains(&address.hash)
-        {
-            return Err(lore_storage::StoreError::from(lore_base::error::NotFound));
+        if let Some(error) = self.failure(&address.hash) {
+            return Err(error);
         }
         self.wait_while_held(&address.hash).await;
         self.inner.clone().get(partition, address).await
@@ -679,6 +718,153 @@ async fn loading_a_node_block_leaves_no_task_holding_the_repository() {
     assert_eq!(
         holders, 1,
         "a task the block load started holds the repository"
+    );
+}
+
+/// A node block read the store fails, though it answers the reads after, fails with the store's
+/// answer: the block is in the current format, so no older format's read answers in its place.
+#[tokio::test]
+async fn a_node_block_read_the_store_fails_fails_with_the_stores_answer() {
+    let backing = null_repository().await;
+    let address = NodeBlockData::new_from_heap_zeroed()
+        .write_to_immutable(
+            backing.clone(),
+            Context::default(),
+            lore_storage::options::WriteOptions::default(),
+        )
+        .await
+        .expect("the block writes");
+    let (store, repository) = holding_repository(&backing).await;
+    let missing = lore_storage::StoreError::from(lore_base::error::NotFound);
+    store.fail_next(address.hash, 1, missing);
+
+    let state = State::new();
+    let failed = NodeBlock::deserialize(repository.clone(), &state, address)
+        .await
+        .map(|_| ())
+        .expect_err("the store fails the read");
+    assert!(
+        failed.is_address_not_found(),
+        "the store's answer: {failed}"
+    );
+    NodeBlock::deserialize(repository, &state, address)
+        .await
+        .expect("the block reads once the store answers");
+}
+
+/// A node block read the store fails as internal, through reads that report a failed local read,
+/// fails with the store's error, though the store answers the reads after: the read in the smaller
+/// format refuses the content as larger, so the block is of neither older format.
+#[tokio::test]
+async fn a_node_block_read_the_store_fails_as_internal_fails_with_the_stores_error() {
+    let backing = null_repository().await;
+    let address = NodeBlockData::new_from_heap_zeroed()
+        .write_to_immutable(
+            backing.clone(),
+            Context::default(),
+            lore_storage::options::WriteOptions::default(),
+        )
+        .await
+        .expect("the block writes");
+    let (store, repository) = strict_holding_repository(&backing).await;
+    let failure = lore_storage::StoreError::internal("a read the test fails");
+    store.fail_next(address.hash, 2, failure);
+    let gets = store.gets();
+
+    let state = State::new();
+    let failed = NodeBlock::deserialize(repository.clone(), &state, address)
+        .await
+        .map(|_| ())
+        .expect_err("the store fails the read");
+    assert!(failed.is_internal(), "the store's error: {failed}");
+    assert_eq!(
+        store.gets() - gets,
+        3,
+        "the strict read probes the store twice, then the smaller format's read reaches the block"
+    );
+    NodeBlock::deserialize(repository, &state, address)
+        .await
+        .expect("the block reads once the store answers");
+}
+
+/// A collection of the name tables of node blocks takes a V2-format block's, read in its own
+/// format.
+#[tokio::test]
+async fn a_name_table_collection_takes_a_v2_blocks_name_table() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let repository = null_repository().await;
+            let mut block = NodeBlockDataV2::new_from_heap_zeroed();
+            block.name_table = Hash::from([7u8; 32]);
+            let address = block
+                .write_to_immutable(
+                    repository.clone(),
+                    Context::default(),
+                    lore_storage::options::WriteOptions::default(),
+                )
+                .await
+                .expect("the block writes");
+
+            let collected = collect_name_fragments(repository, vec![address])
+                .await
+                .expect("the collection reads the block");
+            assert_eq!(collected, [Address::zero_context_hash(block.name_table)]);
+        })
+        .await;
+}
+
+/// A collection of the name tables of node blocks whose block read the store fails, through reads
+/// that report a failed local read, fails with the store's error, though the store answers the
+/// reads after.
+#[tokio::test]
+async fn a_name_table_collection_the_store_fails_fails_with_the_stores_error() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let backing = null_repository().await;
+            let address = NodeBlockData::new_from_heap_zeroed()
+                .write_to_immutable(
+                    backing.clone(),
+                    Context::default(),
+                    lore_storage::options::WriteOptions::default(),
+                )
+                .await
+                .expect("the block writes");
+            let (store, repository) = strict_holding_repository(&backing).await;
+            let failure = lore_storage::StoreError::from(lore_base::error::Disconnected);
+            store.fail_next(address.hash, 2, failure);
+
+            let failed = collect_name_fragments(repository.clone(), vec![address])
+                .await
+                .expect_err("the store fails the read");
+            assert!(failed.is_disconnected(), "the store's error: {failed}");
+            collect_name_fragments(repository, vec![address])
+                .await
+                .expect("the block reads once the store answers");
+        })
+        .await;
+}
+
+/// Content a byte short of a node block, the size of no block format, fails as the read in the
+/// current format fails it, not as the read in the smaller format refuses it.
+#[tokio::test]
+async fn content_of_no_node_block_format_fails_as_the_current_format_reads_it() {
+    let repository = null_repository().await;
+    let address = lore_revision::immutable::write(
+        repository.clone(),
+        Context::default(),
+        Bytes::from(vec![0u8; size_of::<NodeBlockData>() - 1]),
+        lore_storage::options::WriteOptions::default(),
+    )
+    .await
+    .expect("the content writes");
+
+    let failed = NodeBlock::deserialize(repository, &State::new(), address)
+        .await
+        .map(|_| ())
+        .expect_err("no block format reads it");
+    assert!(
+        failed.is_internal(),
+        "the current format's failure: {failed}"
     );
 }
 

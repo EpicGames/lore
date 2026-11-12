@@ -11,11 +11,13 @@ use std::sync::atomic::Ordering;
 use bytes::Bytes;
 use lore_base::types::Address;
 use lore_base::types::Partition;
+use lore_revision::state::StateError;
 use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
 use lore_storage::StoreGetData;
 
+use crate::harness::catalogue::call::FailedRead;
 use crate::harness::catalogue::call::failed_read;
 
 /// No countdown armed ([`FailingStore::fail_after`]).
@@ -24,15 +26,19 @@ const NO_COUNTDOWN: u64 = u64::MAX;
 /// The text of the error a failed read answers.
 pub const INJECTED: &str = "a read the test fails";
 
-/// The texts an operation's error carries where a failed read reached it: the store's own, the
-/// State's for a block whose fetch failed (`AddressNotFound`), or the storage's refusal of content
-/// larger than its reader's type, as a node block whose read failed falls back to the older block
-/// formats, whose reads of the block's content refuse it so (`NodeBlock::deserialize`).
-pub const INJECTED_AS: &[&str] = &[
-    INJECTED,
-    "Address not found: ",
-    "exceeds caller-supplied max",
-];
+/// The read whose failure gives `error`, which reads `text`: any, for the store's own error, an
+/// internal error told by its text ([`INJECTED`]), or `AddressNotFound`, as the State answers a
+/// block whose fetch failed; a read of a revision's State, for `NotFound`, as the State answers one
+/// it could not read; none for any other error.
+pub fn failed_read_giving(error: &StateError, text: &str) -> Option<FailedRead> {
+    if error.is_address_not_found() || (error.is_internal() && text.contains(INJECTED)) {
+        Some(FailedRead::Any)
+    } else if error.is_not_found() {
+        Some(FailedRead::RevisionState)
+    } else {
+        None
+    }
+}
 
 /// An immutable store over another, whose reads fail as it is told: all of them, all after a
 /// number more, or one in a number, chosen from a seed. The modes combine, a read failing where

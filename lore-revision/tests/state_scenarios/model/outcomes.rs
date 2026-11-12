@@ -10,6 +10,9 @@
 
 use std::collections::BTreeMap;
 
+use lore_base::error::AddressNotFound;
+use lore_base::error::NotFound;
+use lore_base::error::Oversized;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
@@ -19,6 +22,7 @@ use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::state::Content;
+use lore_revision::state::StateError;
 use lore_revision::state::node::hooks::log::Arm;
 use lore_revision::state::node::hooks::log::Effect;
 use lore_revision::state::node::hooks::log::GuardEvent;
@@ -47,6 +51,7 @@ use super::dirty;
 use super::free;
 use super::grab;
 use super::guard;
+use super::injected;
 use super::moved;
 use super::renamed;
 use super::section;
@@ -57,6 +62,7 @@ use super::word;
 use crate::harness::catalogue;
 use crate::harness::catalogue::call::Answer;
 use crate::harness::catalogue::call::Call;
+use crate::harness::catalogue::call::Failed;
 use crate::harness::catalogue::call::Leaves;
 use crate::harness::catalogue::call::Outcome;
 use crate::harness::catalogue::call::Refusal;
@@ -126,34 +132,52 @@ fn marked(made: &Snapshot, node: NodeID, flags: u16) -> Node {
 
 #[test]
 fn a_call_fails_only_where_a_read_failed_with_the_error_it_gives() {
-    let failed = |error: String| {
+    let failed = |error: StateError| {
         call(
             &catalogue::CHECKED_CREATE,
             (1, 2),
             Some(A),
-            Outcome::Failed(error),
+            Outcome::Failed(Failed::of(&error)),
         )
     };
-    let injected = || failed(format!("a block load: {INJECTED}"));
+    let stored = || failed(StateError::internal(format!("a block load: {INJECTED}")));
     caught(
-        &judged(&snapshot(), &[], vec![injected()], PLAIN),
+        &judged(&snapshot(), &[], vec![stored()], PLAIN),
         2,
         "failed with no read failing in its interval: a block load: a read the test fails",
     );
-    clean(&judged(&snapshot(), &[], vec![failing(injected())], PLAIN));
+    clean(&judged(&snapshot(), &[], vec![failing(stored())], PLAIN));
     // A block whose fetch the failed read failed.
-    let fetch = failing(failed("Address not found: 142a-0".into()));
-    clean(&judged(&snapshot(), &[], vec![fetch], PLAIN));
-    caught(
-        &judged(
-            &snapshot(),
-            &[],
-            vec![failing(failed("hierarchy broken".into()))],
-            PLAIN,
-        ),
-        2,
-        "failed with an error no failed read gives: hierarchy broken",
+    let fetch = StateError::from(AddressNotFound::from(Address::default()));
+    clean(&judged(
+        &snapshot(),
+        &[],
+        vec![failing(failed(fetch))],
+        PLAIN,
+    ));
+    // A revision whose State the failed read failed, which a listing through a link loads.
+    let through = call(
+        &catalogue::LISTED_CHILDREN,
+        (1, 2),
+        Some(L),
+        Outcome::Failed(Failed::of(&StateError::from(NotFound))),
     );
+    clean(&judged(&snapshot(), &[], vec![failing(through)], PLAIN));
+    for error in [
+        StateError::internal("hierarchy broken"),
+        StateError::from(Oversized {
+            context: "fragment size_content 49280 exceeds caller-supplied max 45184".into(),
+        }),
+        // A revision's State, which a create, reading through no link, loads none of.
+        StateError::from(NotFound),
+    ] {
+        let text = error.to_string();
+        caught(
+            &judged(&snapshot(), &[], vec![failing(failed(error))], PLAIN),
+            2,
+            &format!("failed with an error no failed read gives: {text}"),
+        );
+    }
 }
 
 #[test]
@@ -194,11 +218,11 @@ fn self_reported_outcomes_are_counted_by_what_they_reported() {
         &judged(
             &served(),
             &[],
-            vec![reported(1, SelfReported::NameTableFull)],
+            vec![reported(1, SelfReported::Oversized)],
             admitting,
         ),
         2,
-        "reported NameTableFull in a run admitting no such outcome",
+        "reported Oversized in a run admitting no such outcome",
     );
 }
 
@@ -364,7 +388,7 @@ fn a_calls_guards_close_within_it() {
         2,
         "a guard dropped armed in a call of 'checked create' that answered done",
     );
-    let failed = || vec![failing(create(Outcome::Failed(INJECTED.into())).remove(0))];
+    let failed = || vec![failing(create(injected()).remove(0))];
     for calls in [
         create(Outcome::Dropped),
         create(Outcome::Refused(Refusal::Exists)),
@@ -1778,7 +1802,7 @@ fn a_call_left_part_way_makes_no_more_than_its_done_answer() {
         &judged(
             &snapshot(),
             &there_and_back,
-            move_left(Outcome::Failed(INJECTED.into())),
+            move_left(injected()),
             DROPPING,
         ),
         4,
@@ -1792,7 +1816,7 @@ fn a_call_left_part_way_makes_no_more_than_its_done_answer() {
         DROPPING,
     ));
     // Its one move elsewhere than called.
-    for outcome in [Outcome::Dropped, Outcome::Failed(INJECTED.into())] {
+    for outcome in [Outcome::Dropped, injected()] {
         let elsewhere = vec![Call {
             destination: Some(A),
             ..move_left(outcome).remove(0)
@@ -1809,7 +1833,7 @@ fn a_call_left_part_way_makes_no_more_than_its_done_answer() {
             ..call(&catalogue::UNSERVED_DETACH, (1, 4), Some(target), outcome)
         }]
     };
-    let failed = || Outcome::Failed(INJECTED.into());
+    let failed = injected;
     let detached = section(2, Section::Detach, vec![unlink(F, A, How::Always)]);
     clean(&judged(
         &snapshot(),
