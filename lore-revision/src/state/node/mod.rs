@@ -86,12 +86,15 @@
 //!   meets carrying the name is the answer, whatever moved. A mark of another State's block, or of
 //!   a node no longer a directory, is stale. Staging counts its own adds into a marked directory
 //!   (`ChainMark::count_own_prepend`), so they never make its search stale nor show as moves.
-//!   Staging's claim of a child answers from its listing where that holds the name unclaimed, else
-//!   from the search. A checked attach or reattach whose publish found the chain changed searches
-//!   again with a mark read before its lookup that missed (`find_subnode_since`): on a served
-//!   State and under a shared claim C3 keeps the mark's head the same node; under an exclusive
-//!   claim the search rests on C9, no other writer adding the name, and on frees running where no
-//!   lookup does.
+//!   Staging's claim of a child answers from its listing where that holds the name unclaimed, or
+//!   where the chain changed since only by staging's own adds (`ChainMark::unchanged`, a read of
+//!   the count with no lock that the stress suite's model holds to the count, as it holds
+//!   `ChainMark::reattached`) and it made none or no two of the directory's entries carry one name
+//!   hash, else from the search. A checked attach or reattach whose publish found the chain
+//!   changed searches again with a mark read before its lookup that missed (`find_subnode_since`):
+//!   on a served State and under a shared claim C3 keeps the mark's head the same node; under an
+//!   exclusive claim the search rests on C9, no other writer adding the name, and on frees running
+//!   where no lookup does.
 //! - **C5. Counts and logs.** Every chain change but those this clause exempts is counted on its
 //!   directory and, where a listing watches the directory, logged; or the log is skipped forward.
 //!   Prepending or detaching a node counts 1, the discard tier's detach included. Moving a node

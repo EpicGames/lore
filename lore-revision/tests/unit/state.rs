@@ -270,7 +270,7 @@ where
 }
 
 /// Runs `body` against a fresh State over a [`null_repository`], as [`with_repository`] does.
-async fn with_state<F, Fut>(body: F)
+pub(crate) async fn with_state<F, Fut>(body: F)
 where
     F: FnOnce(Arc<RepositoryContext>, Arc<State>) -> Fut,
     Fut: std::future::Future<Output = ()>,
@@ -279,7 +279,7 @@ where
 }
 
 /// A directory record named `name`.
-fn directory(name: &str) -> Node {
+pub(crate) fn directory(name: &str) -> Node {
     Node {
         name_hash: hash::hash_string(name),
         ..Default::default()
@@ -287,7 +287,7 @@ fn directory(name: &str) -> Node {
 }
 
 /// A file record named `name`.
-fn file(name: &str) -> Node {
+pub(crate) fn file(name: &str) -> Node {
     Node {
         flags: NodeFlags::File.bits(),
         name_hash: hash::hash_string(name),
@@ -296,7 +296,7 @@ fn file(name: &str) -> Node {
 }
 
 /// Adds `node` under `parent` as `name`.
-async fn add(
+pub(crate) async fn add(
     state: &State,
     repository: &Arc<RepositoryContext>,
     parent: NodeID,

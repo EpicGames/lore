@@ -4,10 +4,11 @@
 //! replayed through the model, which holds each read by the call's own listing's mark within the
 //! read's interval, by the mark as the listing's head read made it and the prepends the call
 //! counted by then.
-//! - Alone: a search since the mark for what the listing lacks; a node created since the listing
-//!   found by it, and one renamed since found through the whole chain after a stale search, the
-//!   mark's reattach read for each node found; two missing names sharing a hash, the second's
-//!   search finding the first's add.
+//! - Alone: the listing's answer for what it lacks, the mark found unchanged but for the claims'
+//!   own adds; a node created since the listing found by a search since the mark, and one renamed
+//!   since found through the whole chain after a stale search, the mark found changed and its
+//!   reattach read for each node found; two missing names sharing a hash, the second's search
+//!   finding the first's add.
 //! - Within the contract: claims in sibling directories; a parent's claims of a listed directory
 //!   and of a missing one, each child's claims inline after its claim or add, as the stage
 //!   descends with no permit free, beside a sibling's; a respelling of a claimed node in the
@@ -92,10 +93,10 @@ fn answered_node(run: &Run<'_>, kind: &catalogue::Kind) -> NodeID {
 }
 
 /// Claims of a listed entry and of two missing ones: the listed one claimed from the listing
-/// alone, each missing one searched for since the mark, absent, the second with the first's add
-/// counted in the mark.
+/// alone, each missing one answered from it, the mark found unchanged but for the claims' own
+/// adds, the second with the first's add counted in the mark.
 #[test]
-fn a_stage_claim_searches_since_its_mark_for_what_its_listing_lacks() {
+fn a_stage_claim_answers_what_its_listing_lacks_from_it_where_only_its_adds_changed_the_chain() {
     explore(
         tree(&["d/f", "d/g"]),
         vec![Box::new(|tree: Arc<Tree>| {
@@ -106,21 +107,23 @@ fn a_stage_claim_searches_since_its_mark_for_what_its_listing_lacks() {
         })],
         vec![],
         |run| {
-            let searches: Vec<(AddedSince, u32)> = (the_done_claim(run).lookups.iter())
+            let reads: Vec<(bool, u32)> = (the_done_claim(run).lookups.iter())
                 .map(|lookup| match *lookup {
-                    Lookup::Since {
-                        searched, prepends, ..
-                    } => (searched, prepends),
-                    other => panic!("a search since the mark: {other:?}"),
+                    Lookup::Unchanged {
+                        unchanged,
+                        prepends,
+                        ..
+                    } => (unchanged, prepends),
+                    other => panic!("an unchanged read of the mark: {other:?}"),
                 })
                 .collect();
-            assert_eq!(searches, [(AddedSince::Absent, 0), (AddedSince::Absent, 1)]);
+            assert_eq!(reads, [(true, 0), (true, 1)]);
         },
     );
 }
 
-/// A claim of a name created in its window, after its listing: its search since the mark finds
-/// the node, and its read of the mark's reattach answers none.
+/// A claim of a name created in its window, after its listing: the mark found changed, its search
+/// since the mark finds the node, and its read of the mark's reattach answers none.
 #[test]
 fn a_stage_claim_finds_a_node_created_since_its_listing() {
     explore(
@@ -143,6 +146,11 @@ fn a_stage_claim_finds_a_node_created_since_its_listing() {
                 matches!(
                     lookups.as_slice(),
                     [
+                        Lookup::Unchanged {
+                            unchanged: false,
+                            prepends: 0,
+                            ..
+                        },
                         Lookup::Since {
                             searched: AddedSince::Found(found),
                             prepends: 0,
@@ -161,8 +169,8 @@ fn a_stage_claim_finds_a_node_created_since_its_listing() {
 }
 
 /// A claim of a name its listing holds under another, the node renamed in place in its window:
-/// its search since the mark stale, its find through the chain finding the node, and its read of
-/// the mark's reattach answering one. The rename changes the hash in place, which no caller does
+/// the mark found changed, its search since the mark stale, its find through the chain finding the
+/// node, and its read of the mark's reattach answering one. The rename changes the hash in place, which no caller does
 /// beside a stage, as the respellings keep it: it covers the mark, which counts such a rename as a
 /// reattach.
 #[test]
@@ -185,6 +193,10 @@ fn a_stage_claim_finds_a_node_renamed_since_its_listing_through_the_chain() {
                 matches!(
                     lookups.as_slice(),
                     [
+                        Lookup::Unchanged {
+                            unchanged: false,
+                            ..
+                        },
                         Lookup::Since {
                             searched: AddedSince::Stale,
                             ..
@@ -206,9 +218,11 @@ fn a_stage_claim_finds_a_node_renamed_since_its_listing_through_the_chain() {
 }
 
 /// Claims of two missing names sharing a hash, differing in case, as the file system can list
-/// beside each other: the first's search answers none and the claims add the name; the second's,
-/// that add counted in the mark, finds it, the mark's reattach read answering none, so both answer
-/// the node added. The stage's default case mode stops there with an error; the op goes on.
+/// beside each other: the first answered from the listing, the mark found unchanged with no add of
+/// the claims' own, and the claims add the name; the second, that add counted in the mark, the
+/// mark found unchanged but the entries sharing a hash, searches since the mark and finds it, the
+/// mark's reattach read answering none, so both answer the node added. The stage's default case
+/// mode stops there with an error; the op goes on.
 #[test]
 fn stage_claims_of_two_missing_names_sharing_a_hash_answer_the_first_ones_add_twice() {
     explore(
@@ -236,9 +250,14 @@ fn stage_claims_of_two_missing_names_sharing_a_hash_answer_the_first_ones_add_tw
                 matches!(
                     lookups.as_slice(),
                     [
-                        Lookup::Since {
-                            searched: AddedSince::Absent,
+                        Lookup::Unchanged {
+                            unchanged: true,
                             prepends: 0,
+                            ..
+                        },
+                        Lookup::Unchanged {
+                            unchanged: true,
+                            prepends: 1,
                             ..
                         },
                         Lookup::Since {
@@ -305,11 +324,13 @@ fn a_stage_claim_beside_a_detach_of_its_directory() {
     );
 }
 
-/// What a stage claim that answered done read: its directory, how many entries it searched for
-/// since its mark, and how many children its listing yielded.
+/// What a stage claim that answered done read: its directory, how many entries it answered from
+/// its listing by its mark found unchanged, how many it searched for since its mark, and how many
+/// children its listing yielded.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Reads {
     dir: NodeID,
+    unchanged: usize,
     searched: usize,
     listed: usize,
 }
@@ -319,6 +340,17 @@ impl Reads {
         assert_eq!(call.outcome, Outcome::Done(Answer::None), "{call:#?}");
         Self {
             dir: call.target.expect("a claim's directory"),
+            unchanged: (call.lookups.iter())
+                .filter(|lookup| {
+                    matches!(
+                        lookup,
+                        Lookup::Unchanged {
+                            unchanged: true,
+                            ..
+                        }
+                    )
+                })
+                .count(),
             searched: (call.lookups.iter())
                 .filter(|lookup| matches!(lookup, Lookup::Since { .. }))
                 .count(),
@@ -338,8 +370,9 @@ fn claimed_then_added(claimed: &ops::Claimed, listed: NodeID) {
 }
 
 /// Within the contract, the stage's claims in sibling directories, each a task of its own: each
-/// claims its listed entry and adds its missing one, every run replaying clean and leaving dirty
-/// closure and unique names. Every schedule: fourteen preemptions a run reach them all.
+/// claims its listed entry and adds its missing one, answered from its listing by its mark found
+/// unchanged, every run replaying clean and leaving dirty closure and unique names. Every
+/// schedule: fourteen preemptions a run reach them all.
 #[test]
 fn stage_claims_in_sibling_directories() {
     explore_with(
@@ -372,13 +405,14 @@ fn stage_claims_in_sibling_directories() {
             reads.sort_unstable();
             let mut expected = [d, e].map(|dir| Reads {
                 dir,
-                searched: 1,
+                unchanged: 1,
+                searched: 0,
                 listed: 1,
             });
             expected.sort_unstable();
             assert_eq!(
                 reads, expected,
-                "each claim searched for its missing entry alone"
+                "each claim answered its missing entry from its listing"
             );
         },
     );
@@ -458,8 +492,9 @@ fn a_stage_respelling_in_its_claims_window_beside_a_siblings_claims() {
 /// claims inline in the window after its claim or add, as the stage descends with no permit free,
 /// the added directory staged and dirty added by then, then the parent's next entry by its own
 /// mark, beside a sibling's claims: the listed child lists its file and adds its missing one, the
-/// added child lists none and adds both its entries, the parent's mark counting only its own adds;
-/// every run within four preemptions replays clean, leaving dirty closure and unique names.
+/// added child lists none and adds both its entries, each missing entry answered from its listing
+/// by its mark found unchanged, the parent's mark counting only its own adds; every run within
+/// four preemptions replays clean, leaving dirty closure and unique names.
 #[test]
 fn a_parents_add_then_its_childs_claims_beside_a_siblings() {
     explore_with(
@@ -515,23 +550,23 @@ fn a_parents_add_then_its_childs_claims_beside_a_siblings() {
             let child = |dir: &dyn Fn(NodeID) -> bool| {
                 let reads = (reads.iter()).find(|reads| dir(reads.dir));
                 let reads = reads.expect("the child's claims");
-                (reads.searched, reads.listed)
+                (reads.unchanged, reads.searched, reads.listed)
             };
             assert_eq!(
                 child(&|dir| dir == c),
-                (1, 1),
-                "the listed child lists its file, searches for the other"
+                (1, 0, 1),
+                "the listed child lists its file, answers the other from its listing"
             );
             assert_eq!(
                 child(&|dir| ![d, e, c].contains(&dir)),
-                (2, 0),
-                "the added child lists none, searches for both"
+                (2, 0, 0),
+                "the added child lists none, answers both from its listing"
             );
             let prepends: Vec<u32> = stage_claims(run)
                 .filter(|call| call.target == Some(d))
                 .flat_map(|call| call.lookups.iter())
                 .filter_map(|lookup| match *lookup {
-                    Lookup::Since { prepends, .. } => Some(prepends),
+                    Lookup::Unchanged { prepends, .. } => Some(prepends),
                     _ => None,
                 })
                 .collect();
@@ -546,11 +581,11 @@ fn a_parents_add_then_its_childs_claims_beside_a_siblings() {
 
 /// Beyond the contract, the stage's claims of a listed entry and of a name beside a served rename
 /// of the other listed child to that name: the listing holds the child under the name where the
-/// rename came first; where after the listing and before the search, the search finds the child
-/// ahead of the mark's head and the mark's reattach read claims it in the listing too; where after
-/// the search, it answers none and the claims add the name, the rename refused, or landing first
-/// beside the claims' add. Every schedule, within the thirteen preemptions that reach them all,
-/// replays clean with its calls.
+/// rename came first; where after the listing and before the mark's unchanged read, the mark found
+/// changed, the search finds the child ahead of the mark's head and the mark's reattach read claims
+/// it in the listing too; where after that read, the mark found unchanged, the listing answers none
+/// and the claims add the name, the rename refused, or landing first beside the claims' add. Every
+/// schedule, within the thirteen preemptions that reach them all, replays clean with its calls.
 #[test]
 fn a_stage_claim_beside_a_rename_into_an_entrys_name() {
     let counts: Rc<[Cell<usize>; 3]> = Rc::default();
@@ -589,6 +624,9 @@ fn a_stage_claim_beside_a_rename_into_an_entrys_name() {
             let class = match lookups.as_slice() {
                 [] => 0,
                 [
+                    Lookup::Unchanged {
+                        unchanged: false, ..
+                    },
                     Lookup::Since {
                         searched: AddedSince::Found(node),
                         prepends: 0,
@@ -599,9 +637,8 @@ fn a_stage_claim_beside_a_rename_into_an_entrys_name() {
                     },
                 ] if *node == f => 1,
                 [
-                    Lookup::Since {
-                        searched: AddedSince::Absent,
-                        ..
+                    Lookup::Unchanged {
+                        unchanged: true, ..
                     },
                 ] => 2,
                 other => panic!("the claim of 'n' read {other:?}"),
@@ -618,11 +655,11 @@ fn a_stage_claim_beside_a_rename_into_an_entrys_name() {
 
 /// Beyond the contract, the stage's claim of a missing name in a directory whose chain crosses
 /// blocks, beside a move out of it of the child behind the crossing: a move landing after the
-/// listing's head read and before the search's end turns the search stale, its find through the
-/// chain missing; one landing during the listing, at the crossing, leaves the child out of it too.
-/// Before the listing or after the search, the search answers none. The claims add the name in
-/// every run, and every schedule, within the thirteen preemptions that reach them all, replays
-/// clean with its calls.
+/// listing's head read and before the mark's unchanged read has the mark found changed and the
+/// search stale, its find through the chain missing; one landing during the listing, at the
+/// crossing, leaves the child out of it too. Before the listing or after that read, the mark found
+/// unchanged, the listing answers none. The claims add the name in every run, and every schedule,
+/// within the thirteen preemptions that reach them all, replays clean with its calls.
 #[test]
 fn a_stage_claim_beside_a_move_out_of_its_directory() {
     let counts: Rc<[Cell<usize>; 4]> = Rc::default();
@@ -658,6 +695,9 @@ fn a_stage_claim_beside_a_move_out_of_its_directory() {
             let left_out = !(claim.walks[0].yielded.iter()).any(|yielded| yielded.node == g);
             let stale = match claim.lookups.as_slice() {
                 [
+                    Lookup::Unchanged {
+                        unchanged: false, ..
+                    },
                     Lookup::Since {
                         searched: AddedSince::Stale,
                         ..
@@ -665,9 +705,8 @@ fn a_stage_claim_beside_a_move_out_of_its_directory() {
                     Lookup::Find { found: None, .. },
                 ] => true,
                 [
-                    Lookup::Since {
-                        searched: AddedSince::Absent,
-                        ..
+                    Lookup::Unchanged {
+                        unchanged: true, ..
                     },
                 ] => false,
                 other => panic!("the claim of 'n' read {other:?}"),
@@ -679,18 +718,19 @@ fn a_stage_claim_beside_a_move_out_of_its_directory() {
     let counts = counts.each_ref().map(|count| count.get());
     assert!(
         counts.iter().all(|&count| count > 0),
-        "runs moving g after the search, between the listing and the search's end, before the \
+        "runs moving g after the unchanged read, between the listing and that read, before the \
          listing, during it: {counts:?}"
     );
 }
 
 /// Beyond the contract, the stage's claim of a name beside a checked create of that name: the claim
 /// takes the create's node from its listing where the create published before it, or by its search
-/// since the mark where after the listing and before the search, the mark's reattach read answering
-/// none; where after the search, the claims add the name, the create finding it held where it
-/// checked after their add published, or adding the name a second time where before, which the node
-/// module's Limitations, "The stage's listing", keep from happening. Every schedule, within the
-/// thirteen preemptions that reach them all, replays clean with its calls.
+/// since the mark where after the listing and before the mark's unchanged read, the mark found
+/// changed and its reattach read answering none; where after that read, the mark found unchanged,
+/// the claims add the name, the create finding it held where it checked after their add
+/// published, or adding the name a second time where before, which the node module's Limitations,
+/// "The stage's listing", keep from happening. Every schedule, within the thirteen preemptions
+/// that reach them all, replays clean with its calls.
 #[test]
 fn a_stage_claim_beside_a_create_of_its_entrys_name() {
     let counts: Rc<[Cell<usize>; 4]> = Rc::default();
@@ -727,6 +767,9 @@ fn a_stage_claim_beside_a_create_of_its_entrys_name() {
                 ([], false, Some(_)) => 0,
                 (
                     [
+                        Lookup::Unchanged {
+                            unchanged: false, ..
+                        },
                         Lookup::Since {
                             searched: AddedSince::Found(found),
                             prepends: 0,
@@ -741,9 +784,8 @@ fn a_stage_claim_beside_a_create_of_its_entrys_name() {
                 ) if *found == node => 1,
                 (
                     [
-                        Lookup::Since {
-                            searched: AddedSince::Absent,
-                            ..
+                        Lookup::Unchanged {
+                            unchanged: true, ..
                         },
                     ],
                     true,
@@ -778,11 +820,13 @@ fn one_slot_left() -> Setup<Tree> {
     })
 }
 
-/// The stage's claims of `p`, `q` and `r` in `d` of the tree [`one_slot_left`] builds.
-fn three_claims() -> Op<Tree> {
+/// The stage's claims of `p`, `q`, `r` and `P` in `d` of the tree [`one_slot_left`] builds: `P`
+/// carries `p`'s hash, so every claim after the claims' first add searches since the mark, as the
+/// stage's do where two entries share a hash.
+fn four_claims() -> Op<Tree> {
     Box::new(|tree: Arc<Tree>| {
         Box::pin(async move {
-            let entries = [("p", true), ("q", true), ("r", true)];
+            let entries = [("p", true), ("q", true), ("r", true), ("P", true)];
             (ops::stage_claim(&tree, tree.id("d"), &entries).await).expect("the claims run");
         })
     })
@@ -821,14 +865,14 @@ fn landed_within(
         })
 }
 
-/// Beyond the contract, the stage's claims of three missing names in a directory holding one child,
-/// their first two adds spanning two blocks ahead of the mark's head, beside a find and a rename in
-/// place of the first add to the third's name: a rename landing inside the third's search, at its
-/// crossing of the blocks, has it find the node, which the model admits only within the read's own
-/// interval, to its end. The rename changes the hash in place, which no caller does beside a stage,
-/// as the respellings keep it: it covers the third entry's name it gives the node inside the
-/// search. Every schedule, within the seven preemptions that reach them all, replays clean with its
-/// calls.
+/// Beyond the contract, the stage's claims of four missing names, two of them sharing a hash, in a
+/// directory holding one child, their first two adds spanning two blocks ahead of the mark's head,
+/// beside a find and a rename in place of the first add to the third's name: a rename landing
+/// inside the third's search, at its crossing of the blocks, has it find the node, which the model
+/// admits only within the read's own interval, to its end. The rename changes the hash in place,
+/// which no caller does beside a stage, as the respellings keep it: it covers the third entry's
+/// name it gives the node inside the search. Every schedule, within the seven preemptions that
+/// reach them all, replays clean with its calls.
 #[test]
 fn a_stage_claim_beside_a_rename_landing_inside_its_search() {
     let inside: Rc<Cell<usize>> = Rc::default();
@@ -840,7 +884,7 @@ fn a_stage_claim_beside_a_rename_landing_inside_its_search() {
         },
         one_slot_left(),
         vec![
-            three_claims(),
+            four_claims(),
             Box::new(|tree: Arc<Tree>| {
                 Box::pin(async move {
                     if let Some(p) = ops::find(&tree, tree.id("d"), "p").await {
@@ -888,7 +932,7 @@ fn a_stage_claim_beside_a_create_landing_inside_its_search() {
         },
         one_slot_left(),
         vec![
-            three_claims(),
+            four_claims(),
             Box::new(|tree: Arc<Tree>| {
                 Box::pin(async move {
                     let _ = ops::checked_create(&tree, tree.id("d"), "r").await;

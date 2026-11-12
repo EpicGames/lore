@@ -1660,7 +1660,8 @@ pub struct ChainMark {
 impl ChainMark {
     /// Counts a prepend to the directory the mark's holder made itself, which the walks since
     /// the mark cover as they cover any other, so the holder's own adds never make a search
-    /// stale. A holder counting a prepend that did not land would hide a reattach.
+    /// stale. A holder counting a prepend that did not land would hide a reattach, or another
+    /// writer's add from [`Self::unchanged`].
     pub fn count_own_prepend(&mut self) {
         self.changes = self.changes.wrapping_add(1);
     }
@@ -1673,6 +1674,17 @@ impl ChainMark {
             .chain_changes(Node::index(self.parent))
             .wrapping_sub(self.changes)
             >= REATTACH_CHANGES
+    }
+
+    /// Whether the directory's count stands where the mark and the holder's own prepends
+    /// ([`Self::count_own_prepend`]) put it, with no sweep of `state`, the mark's State, freeing a
+    /// slot since: every child ahead of the mark's head is then one the holder prepended, since
+    /// every other change linking a child into a chain a listing reaches is counted (C5). The mark
+    /// holds its block, so the block stays the one `state` holds at its index, and the count read
+    /// is the directory's. Two Acquire loads, no lock.
+    pub fn unchanged(&self, state: &State) -> bool {
+        self.reclaims == state.reclaims()
+            && self.block.chain_changes(Node::index(self.parent)) == self.changes
     }
 }
 

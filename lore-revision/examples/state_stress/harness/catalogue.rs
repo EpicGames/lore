@@ -493,6 +493,19 @@ kinds! {
         sections: &[],
     }
 
+    /// The kind of [`ops::unchanged_since`].
+    UNCHANGED_SINCE {
+        name: "unchanged since",
+        primitive: "ChainMark::unchanged",
+        mode: "by a listing's mark",
+        tier: Tier::Any,
+        role: Role::Reader,
+        runs: Runs::Beside,
+        cancellable: true,
+        writes: &[],
+        sections: &[],
+    }
+
     /// The kind of [`ops::name_read`] by [`ops::NameRead::Clone`].
     NAME_CLONE {
         name: "name clone",
@@ -790,8 +803,9 @@ kinds! {
     STAGE_CLAIM {
         name: "stage claim",
         primitive: "State::node_add, State::node_mark",
-        mode: "a directory listed with its chain's mark, each entry claimed from the listing or \
-               searched for since the mark, a node found claimed in the listing too where the \
+        mode: "a directory listed with its chain's mark, each entry claimed from the listing, \
+               answered from it where the mark found the chain unchanged but for the claims' own \
+               adds, or searched for since the mark, a node found claimed in the listing too where the \
                mark found a reattach, a missing entry added clean and marked staged and dirty \
                added, forced, with its ancestors, counted in the mark once marked, in a call \
                nothing drops",

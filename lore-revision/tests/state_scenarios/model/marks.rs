@@ -8,9 +8,14 @@
 //! in the chain throughout; a stale search and a mark found reattached need the count moved by a
 //! reattach past the mark's, less the prepends its holder counted, or a stale search the directory
 //! no longer one; a mark found not reattached, under the gate, needs the count not moved so as the
-//! read began. A stage's claim reads by the mark of its own listing, each read held so within its
+//! read began; a mark found changed needs the count moved past the mark's with its holder's own
+//! prepends, and one found unchanged, under the gate, the count standing there as the read began
+//! (`ChainMark::unchanged`). A stage's claim reads by the mark of its own listing, each read held so within its
 //! own interval, by the prepends the call counted by then, and needing the call's own marked
-//! listing of the directory.
+//! listing of the directory; its read of whether its mark found the chain unchanged but for those
+//! prepends (`ChainMark::unchanged`) needs the count moved past the mark's with them where it
+//! answers changed, and, under the gate, standing there as the read began where it answers
+//! unchanged.
 
 use lore_revision::node::NodeFlags;
 use lore_revision::state::AddedSince;
@@ -102,12 +107,32 @@ fn reattached(span: (u64, u64), reattached: bool) -> Call {
     }
 }
 
+/// A read by task 0 over `[begin, end)` of whether the mark of [`marked`]'s call found `a/`'s
+/// chain changed only by the `prepends` its holder counted, answering `unchanged`.
+fn unchanged(span: (u64, u64), unchanged: bool, prepends: u32) -> Call {
+    Call {
+        id: 2,
+        target: Some(A),
+        listing: Some(1),
+        prepends,
+        ..base_call(
+            &catalogue::UNCHANGED_SINCE,
+            span,
+            Outcome::Answer(Answer::Unchanged(unchanged)),
+        )
+    }
+}
+
 const NOT_ADDED: &str = "a node that joined it since the mark carrying the name throughout";
 const NOT_MOVED: &str = "its count moving by less than a reattach past the mark's";
 const NOWHERE: &str = "carrying the name at no seq of its interval";
 const REATTACHED_BEFORE: &str =
     "answered not reattached, its count moved by a reattach past the mark's as it began";
 const HEAD_KEPT: &str = "the mark's head in its chain throughout";
+const UNCHANGED_BEFORE: &str =
+    "answered unchanged, its count moved past the mark's with the call's own prepends as it began";
+const CHANGED_STOOD: &str =
+    "answered changed, its count standing at the mark's with the call's own prepends throughout";
 const OWN_UNMARKED: &str = "read by its own mark of";
 
 /// A search since a mark answering a node holds it to carrying the name in the directory at some
@@ -278,6 +303,37 @@ fn a_mark_found_reattached_or_not_matches_the_count_since_it() {
         vec![marked((1, 3)), reattached((4, 7), false)],
     ));
 }
+
+/// A mark found changed needs the directory's count moved past the mark's with its holder's own
+/// prepends at some `seq` of the read; one found unchanged, under the gate, needs it standing there
+/// as the read began: another task's add before the read makes it changed, the holder's own add,
+/// counted, does not.
+#[test]
+fn a_mark_found_unchanged_or_not_matches_the_count_since_it() {
+    let made = snapshot();
+    let read = |records: &[Record], answer, prepends| {
+        let calls = vec![marked((1, 3)), unchanged((6, 8), answer, prepends)];
+        (
+            replayed_with(&made, records, calls.clone()),
+            gated(&made, records, calls),
+        )
+    };
+    let (plain, under_gate) = read(&head(1, 0), true, 0);
+    clean(&plain);
+    clean(&under_gate);
+    caught(&read(&head(1, 0), false, 0).0, 8, STANDING);
+    let added = [head(1, 0), published(3)].concat();
+    clean(&read(&added, false, 0).0);
+    let (plain, under_gate) = read(&added, true, 0);
+    clean(&plain);
+    caught(&under_gate, 8, MOVED_PAST);
+    let own = [head(1, 0), attach(3, A, "o")].concat();
+    clean(&read(&own, true, 1).1);
+    caught(&read(&own, false, 1).0, 8, STANDING);
+}
+
+const STANDING: &str = "answered changed, its count standing at the mark's";
+const MOVED_PAST: &str = "answered unchanged, its count moved past the mark's";
 
 const UNMARKED: &str = "read by a mark no marked listing of its directory made";
 
@@ -483,6 +539,19 @@ fn own_reattached(reattached: bool, prepends: u32, (from, to): (u64, u64)) -> Lo
     }
 }
 
+/// A read over `[from, to)` of whether the claim's own mark found `a/`'s chain changed only by the
+/// claim's own prepends, answering `unchanged`, with `prepends` of the claim's own counted in the
+/// mark by then.
+fn own_unchanged(unchanged: bool, prepends: u32, (from, to): (u64, u64)) -> Lookup {
+    Lookup::Unchanged {
+        dir: A,
+        unchanged,
+        prepends,
+        from,
+        to,
+    }
+}
+
 /// A search since the call's own mark answering a node holds it to carrying the name in the
 /// directory at some `seq` of the search's interval.
 #[test]
@@ -648,6 +717,43 @@ fn a_read_of_its_own_mark_found_reattached_or_not_matches_the_count_since_it() {
         &made,
         &[head(1, 0), moved_out(5)].concat(),
         vec![read(false, (4, 7))],
+    ));
+}
+
+/// A read of the call's own mark found unchanged needs, under the gate, the count standing at the
+/// mark's with the prepends the call counted by then as the read began; found changed, the count
+/// moved past that at some `seq` of the read's interval: another task's add before or within it,
+/// not the call's own add, counted.
+#[test]
+fn a_read_of_its_own_mark_found_unchanged_or_not_matches_the_count_since_it() {
+    let made = snapshot();
+    let read =
+        |unchanged, prepends, span| claim((1, 12), vec![own_unchanged(unchanged, prepends, span)]);
+    clean(&gated(&made, &head(1, 0), vec![read(true, 0, (4, 6))]));
+    caught(
+        &replayed_with(&made, &head(1, 0), vec![read(false, 0, (4, 6))]),
+        12,
+        CHANGED_STOOD,
+    );
+    let added = [head(1, 0), published(3)].concat();
+    clean(&replayed_with(&made, &added, vec![read(false, 0, (6, 8))]));
+    caught(
+        &gated(&made, &added, vec![read(true, 0, (6, 8))]),
+        12,
+        UNCHANGED_BEFORE,
+    );
+    clean(&replayed_with(&made, &added, vec![read(true, 0, (6, 8))]));
+    let own = [head(1, 0), attach(3, A, "o")].concat();
+    clean(&gated(&made, &own, vec![read(true, 1, (6, 8))]));
+    caught(
+        &replayed_with(&made, &own, vec![read(false, 1, (6, 8))]),
+        12,
+        CHANGED_STOOD,
+    );
+    clean(&replayed_with(
+        &made,
+        &[head(1, 0), published(4)].concat(),
+        vec![read(false, 0, (5, 8))],
     ));
 }
 

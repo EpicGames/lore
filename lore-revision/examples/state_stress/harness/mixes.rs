@@ -208,9 +208,10 @@ pub enum Op {
     /// A listing reader's rename of a file to a free name in a directory.
     ListingRename(&'static str, &'static str),
     /// A marked listing of a directory, as the stage lists one, then a served create of the task's
-    /// own there, counted in the mark, a wait, so other tasks' changes land after the mark, the
-    /// searches since the mark for the create's name and for the name the mix contends for, and
-    /// the mark's reattach read.
+    /// own there, counted in the mark, the mark's read of whether the chain changed but for that
+    /// create, a wait, so other tasks' changes land after the mark, the searches since the mark for
+    /// the create's name and for the name the mix contends for, the mark's reattach read, and its
+    /// read of whether the chain changed again.
     MarkedReads(&'static str),
     /// Each name read of a node, then a comparison of its name with the one it was built with: of a
     /// node the mix never frees, as a skip, which the model holds no fixture to make, could come
@@ -1054,11 +1055,13 @@ async fn run_op(tree: &Tree, task: usize, op: Op, published: &tokio::sync::watch
                 return;
             }
             marked.count_own_prepend();
+            let _ = ops::unchanged_since(tree, &marked).await;
             tokio::time::sleep(Duration::from_millis(2)).await;
             for searched in [name.as_str(), "same"] {
                 let _ = ops::added_since(tree, &marked, searched).await;
             }
             let _ = ops::reattached_since(tree, &marked).await;
+            let _ = ops::unchanged_since(tree, &marked).await;
         }
         Op::Names(path) => {
             for read in NameRead::EVERY {

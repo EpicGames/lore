@@ -1,7 +1,29 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::sync::Arc;
+
+use lore_base::runtime::LORE_CONTEXT;
+use lore_revision::fs::filesystem_provider::DirectoryEntry;
+use lore_revision::fs::filesystem_provider::FileInfo;
+use lore_revision::lore::RepositoryId;
 use lore_revision::node::NodeID;
+use lore_revision::node::ROOT_NODE;
+use lore_revision::repository::RepositoryContext;
 use lore_revision::stage::*;
+use lore_revision::state::NodeMapping;
+use lore_revision::state::State;
+use lore_revision::state::step_counting;
+use lore_revision::util::path::RelativePath;
+use lore_storage::hash::hash_string;
+
+use crate::fs::filesystem_provider::test_store_create;
+use crate::helper::test_commit_tree;
+use crate::helper::test_file_write;
+use crate::helper::test_repository_create;
+use crate::state::add;
+use crate::state::directory;
+use crate::state::file;
+use crate::state::with_state;
 
 /// The children in sibling order, as `stage_directory` indexes them.
 fn children(entries: &[(NodeID, u64)]) -> DirectoryChildren {
@@ -128,4 +150,220 @@ fn the_index_answers_exactly_as_a_scan_of_the_same_children_would() {
             .filter_map(|entry| entry.map(|(node, _)| node))
             .collect::<Vec<_>>()
     );
+}
+
+/// File system entries of files named `names`, as a directory's listing yields them.
+fn file_entries<S: AsRef<str>>(names: &[S]) -> Vec<DirectoryEntry> {
+    names
+        .iter()
+        .map(|name| DirectoryEntry {
+            name: name.as_ref().to_string(),
+            info: FileInfo::File {
+                executable: None,
+                size: 0,
+                mtime: 0,
+            },
+            name_hash: hash_string(name.as_ref()),
+        })
+        .collect()
+}
+
+/// The children of `dir` as `stage_directory` lists them, with the mark of its chain.
+async fn listed(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+    dir: NodeID,
+) -> DirectoryChildren {
+    let (listing, mark) = state
+        .node_children_with_name_hash_marked(repository.clone(), dir)
+        .await
+        .expect("the listing");
+    DirectoryChildren::new(listing, mark)
+}
+
+/// The stage's claim of `name_hash` in `dir`, as `stage_directory` makes it: from the listing
+/// where that answers alone, else by a search of the chain.
+async fn claim(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    dir: NodeID,
+    children: &mut DirectoryChildren,
+    entries: &[DirectoryEntry],
+    name_hash: u64,
+) -> Option<NodeID> {
+    match claim_from_listing(children, state, entries, name_hash) {
+        Some(claimed) => claimed,
+        None => claim_child(repository, state, dir, children, name_hash)
+            .await
+            .expect("the claim runs"),
+    }
+}
+
+/// Claims each of `entries` in `dir` in turn, as `stage_directory` does, and adds a file for each
+/// claim that found no child, counting the add as the stage's own. Each claim's answer with the
+/// child it leaves its entry.
+async fn claim_each(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    dir: NodeID,
+    entries: &[DirectoryEntry],
+) -> Vec<(Option<NodeID>, NodeID)> {
+    let mut children = listed(state, repository, dir).await;
+    let mut claims = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let claimed = claim(
+            state,
+            repository,
+            dir,
+            &mut children,
+            entries,
+            entry.name_hash,
+        )
+        .await;
+        let child = if let Some(child) = claimed {
+            child
+        } else {
+            let added = add(state, repository, dir, file(&entry.name), &entry.name).await;
+            children.count_own_add();
+            added
+        };
+        claims.push((claimed, child));
+    }
+    claims
+}
+
+/// Staging a directory the tree does not hold, holding 256 new files, through the stage's walk
+/// of the path on this thread: the listing and the claims step through no child, where searching
+/// what the stage prepended for each claim would step through 32,640.
+#[tokio::test]
+async fn staging_a_new_directory_of_new_files_steps_through_no_child() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let instance = test_repository_create(
+                immutable_store,
+                mutable_store,
+                RepositoryId::from(uuid::Uuid::now_v7()),
+            )
+            .await;
+            test_file_write(&instance.path.join("seed.txt"), b"seed");
+            let state = test_commit_tree(&instance, "First").await;
+            let repository = instance.repository.clone();
+            #[allow(clippy::disallowed_methods)]
+            std::fs::create_dir(instance.path.join("d")).expect("mkdir d");
+            for index in 0..256 {
+                test_file_write(&instance.path.join("d").join(format!("f{index}")), b"f");
+            }
+            let operation = repository
+                .file_system()
+                .begin_operation()
+                .await
+                .expect("a filesystem operation");
+            let before = walk_steps_on_this_thread();
+            let staged = stage_filesystem_path(
+                operation.clone(),
+                NodeMapping::root(repository.clone(), state.clone()),
+                RelativePath::new().join("d"),
+                Arc::default(),
+                StageOptions::default(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("the stage");
+            let walked = walk_steps_on_this_thread() - before;
+            operation.finalize().await.expect("the operation finishes");
+            assert!(staged.is_valid(), "d is staged");
+            let children = state
+                .node_children(repository.clone(), staged.node)
+                .await
+                .expect("d's children");
+            assert_eq!(children.len(), 256, "every file is staged");
+            assert_eq!(walked, 0, "the stage stepped through {walked} children");
+        })
+        .await;
+}
+
+/// The chain steps the calling thread's children walks have taken.
+fn walk_steps_on_this_thread() -> u64 {
+    step_counting::set_chain_step_counting(true);
+    step_counting::thread_walk_steps()
+}
+
+/// Claims missing the listing before the stage added a child answer from the listing, with no
+/// search and no check of the entries' name hashes, though two of them share one.
+#[tokio::test]
+async fn claims_before_the_stage_adds_answer_from_the_listing() {
+    with_state(|repository, state| async move {
+        let dir = add(&state, &repository, ROOT_NODE, directory("d"), "d").await;
+        let held = add(&state, &repository, dir, file("Rock.mesh"), "Rock.mesh").await;
+        let entries = file_entries(&["Rock.mesh", "rock.mesh", "new.file"]);
+        let mut children = listed(&state, &repository, dir).await;
+        let mut from_listing = |index: usize| {
+            claim_from_listing(&mut children, &state, &entries, entries[index].name_hash)
+        };
+        assert_eq!(from_listing(0), Some(Some(held)), "the listed child");
+        assert_eq!(
+            from_listing(1),
+            Some(Some(held)),
+            "the listed child, claimed"
+        );
+        assert_eq!(from_listing(2), Some(None), "no child");
+        assert_eq!(
+            children.entries_distinct, None,
+            "no claim checked the entries' name hashes"
+        );
+    })
+    .await;
+}
+
+/// Two entries of one name hash, as two names differing only in case are: the claim of the
+/// second searches what the stage prepended and finds the node it added for the first, among
+/// entries whose hashes sort on the stack and among more.
+#[tokio::test]
+async fn a_claim_finds_the_add_of_an_entry_of_its_name_hash() {
+    with_state(|repository, state| async move {
+        for count in [2, 300] {
+            let name = format!("d{count}");
+            let dir = add(&state, &repository, ROOT_NODE, directory(&name), &name).await;
+            let mut names = vec!["Rock.mesh".to_string()];
+            names.extend((2..count).map(|index| format!("f{index}")));
+            names.push("rock.mesh".to_string());
+            let claims = claim_each(&state, &repository, dir, &file_entries(&names)).await;
+            let (first, added) = claims[0];
+            assert_eq!(first, None, "{count}: the first is new");
+            assert_eq!(
+                claims[count - 1].0,
+                Some(added),
+                "{count}: the second finds the first one's add"
+            );
+        }
+    })
+    .await;
+}
+
+/// A child another writer linked into the chain since the listing, which the stage did not count,
+/// is found by the claim of its name, though the entries carry distinct name hashes.
+#[tokio::test]
+async fn a_claim_finds_a_child_another_writer_linked_in_since_the_listing() {
+    with_state(|repository, state| async move {
+        let dir = add(&state, &repository, ROOT_NODE, directory("d"), "d").await;
+        let entries = file_entries(&["x", "y"]);
+        let mut children = listed(&state, &repository, dir).await;
+        let linked = add(&state, &repository, dir, file("x"), "x").await;
+        let claimed = claim(
+            &state,
+            &repository,
+            dir,
+            &mut children,
+            &entries,
+            entries[0].name_hash,
+        )
+        .await;
+        assert_eq!(claimed, Some(linked));
+    })
+    .await;
 }

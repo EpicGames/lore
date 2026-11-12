@@ -58,6 +58,7 @@ const READERS: &[&str] = &[
     "StateNodeChildrenWithNameIterator",
     "ChainWalk",
     "ChainMark::reattached",
+    "ChainMark::unchanged",
     "State::walk_children",
     "State::collect_children_unsorted",
     "State::collect_named_children_unsorted",

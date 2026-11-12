@@ -387,7 +387,8 @@ fn listings_beside_served_changes_of_their_directories_replay_to_the_state() {
         "no listing reader's change was refused through its absence"
     );
     // A search since a mark that found a node, the task's own create among them, one made stale
-    // by a reattach since the mark, and a mark found reattached, which the model held to the count.
+    // by a reattach since the mark, a mark found reattached and one found changed, which the model
+    // held to the count.
     let answered = |answered: fn(&Answer) -> bool| {
         (runs.iter().flat_map(|run| &run.calls))
             .any(|call| matches!(&call.outcome, Outcome::Answer(answer) if answered(answer)))
@@ -403,6 +404,10 @@ fn listings_beside_served_changes_of_their_directories_replay_to_the_state() {
     assert!(
         answered(|answer| *answer == Answer::Reattached(true)),
         "no mark was found reattached"
+    );
+    assert!(
+        answered(|answer| *answer == Answer::Unchanged(false)),
+        "no mark was found changed"
     );
     // A name read, a comparison by name and a path read answered, each held to its records.
     assert!(

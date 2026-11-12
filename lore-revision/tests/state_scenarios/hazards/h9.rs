@@ -4,9 +4,10 @@
 //! chain's head to the head the listing saw, which holds while children are only prepended. A
 //! reattach re-prepends: a served rename putting the listing's head back in front leaves what was
 //! added since behind it, and the search answers that nothing was, so the stage adds the name
-//! again. The raw scenarios run the stage's own listing and claim (`claim_child`) beside served
-//! renames; their twins run the stage's claims as one modelled call (`STAGE_CLAIM`), which
-//! re-composes `claim_child` over the same State calls. What each catches:
+//! again. The raw scenarios run the stage's own listing and claim (`claim_from_listing`, then
+//! `claim_child`) beside served renames; their twins run the stage's claims as one modelled call
+//! (`STAGE_CLAIM`), which re-composes `claim_from_listing` and `claim_child` over the same State
+//! calls, the mark's unchanged read among them, each held to the model. What each catches:
 //! - the head scenario, a create and then a rename of the listing's head both landing between the
 //!   listing and the claim; with the claim
 //!   ignoring the listing's mark, or answering a stale search from its listing without the find
@@ -19,7 +20,7 @@
 //!   never made stale;
 //! - the listing scenario where the mark's count is read at the listing's end rather than with
 //!   its head: a create and a rename of the head landing while the listing walks block 0, after
-//!   it passed the head in block 1, are left out of the listing and hidden from the search;
+//!   it passed the head in block 1, are hidden from the claim;
 //! - the sequential second claim of a hash where a miss with nothing added since answers no
 //!   child rather than the listing's, with a mark and without one (a link's or a file's
 //!   listing); and the claim of a renamed listed child's new name where the search's answer is
@@ -38,6 +39,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use lore_revision::fs::filesystem_provider::DirectoryEntry;
+use lore_revision::fs::filesystem_provider::FileInfo;
 use lore_revision::node::BLOCK_NODE_COUNT;
 use lore_revision::node::Node;
 use lore_revision::node::NodeBlock;
@@ -45,6 +48,7 @@ use lore_revision::node::NodeID;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::stage::DirectoryChildren;
 use lore_revision::stage::claim_child;
+use lore_revision::stage::claim_from_listing;
 use lore_revision::state::ChainMark;
 use lore_revision::state::State;
 use lore_revision::state::node::hooks;
@@ -71,17 +75,38 @@ async fn listing(tree: &Tree) -> DirectoryChildren {
     DirectoryChildren::new(listing, since)
 }
 
-/// The stage's claim of `name` in `d`.
-async fn claim(tree: &Tree, children: &mut DirectoryChildren, name: &str) -> Option<NodeID> {
-    claim_child(
-        &tree.repository,
-        &tree.state,
-        tree.id("d"),
-        children,
-        hash_string(name),
-    )
-    .await
-    .expect("the claim")
+/// The stage's claim of `name` in `d`, one of the file system entries `entries` names.
+async fn claim(
+    tree: &Tree,
+    children: &mut DirectoryChildren,
+    entries: &[&str],
+    name: &str,
+) -> Option<NodeID> {
+    let entries: Vec<DirectoryEntry> = entries
+        .iter()
+        .map(|&entry| DirectoryEntry {
+            name: entry.to_string(),
+            info: FileInfo::File {
+                executable: None,
+                size: 0,
+                mtime: 0,
+            },
+            name_hash: hash_string(entry),
+        })
+        .collect();
+    let name_hash = hash_string(name);
+    match claim_from_listing(children, &tree.state, &entries, name_hash) {
+        Some(claimed) => claimed,
+        None => claim_child(
+            &tree.repository,
+            &tree.state,
+            tree.id("d"),
+            children,
+            name_hash,
+        )
+        .await
+        .expect("the claim"),
+    }
 }
 
 /// Explores `scenario`, whole or, where its whole space takes too long to run, to `preemptions`
@@ -234,7 +259,7 @@ fn a_claim_after_a_create_and_a_rename_of_the_listing_head_finds_the_created() {
                     c.raced
                         .set(created && renamed && head_first && !listed)
                         .expect("one claim");
-                    let claimed = claim(&c.tree, &mut children, "a").await;
+                    let claimed = claim(&c.tree, &mut children, &["a", "renamed"], "a").await;
                     if created {
                         assert_eq!(
                             claimed,
@@ -244,7 +269,7 @@ fn a_claim_after_a_create_and_a_rename_of_the_listing_head_finds_the_created() {
                     }
                     if renamed {
                         assert_eq!(
-                            claim(&c.tree, &mut children, "renamed").await,
+                            claim(&c.tree, &mut children, &["a", "renamed"], "renamed").await,
                             Some(c.head),
                             "a claim beginning after the rename answers the head"
                         );
@@ -354,7 +379,8 @@ fn respell_beside_a_claim(detach_listing_head: bool) {
                     let before = c.respelled.get();
                     let (listing, since) = c.listing.clone();
                     let mut children = DirectoryChildren::new(listing, since);
-                    let claimed = claim(&c.tree, &mut children, &c.moved.1).await;
+                    let claimed =
+                        claim(&c.tree, &mut children, &[c.moved.1.as_str()], &c.moved.1).await;
                     c.raced
                         .set(!before && c.respelled.get())
                         .expect("one claim");
@@ -444,7 +470,7 @@ fn a_claim_after_a_create_and_a_rename_landing_during_the_listing_finds_the_crea
                     let listed = children.holds(hash_string("a")).is_some();
                     let done = c.done.get();
                     c.raced.set(!before && done && !listed).expect("one claim");
-                    let claimed = claim(&c.tree, &mut children, "a").await;
+                    let claimed = claim(&c.tree, &mut children, &["a"], "a").await;
                     if done {
                         assert_eq!(
                             claimed,
@@ -503,9 +529,14 @@ async fn a_second_claim_of_a_hash_answers_the_listed_child_the_first_claimed() {
     crate::in_context(async {
         let (tree, _, (other, name)) = head_and_other().await;
         let mut children = listing(&tree).await;
-        assert_eq!(claim(&tree, &mut children, name).await, Some(other));
+        let upper = name.to_uppercase();
+        let entries = [name, upper.as_str()];
         assert_eq!(
-            claim(&tree, &mut children, &name.to_uppercase()).await,
+            claim(&tree, &mut children, &entries, name).await,
+            Some(other)
+        );
+        assert_eq!(
+            claim(&tree, &mut children, &entries, &upper).await,
             Some(other),
             "the listing answers the claimed child for the name's other case"
         );
@@ -525,7 +556,10 @@ async fn a_claim_of_a_renamed_listed_childs_new_name_claims_it_in_the_listing() 
             ops::served_rename(&tree, other, tree.id("d"), "renamed").await,
             "the rename moves the child"
         );
-        assert_eq!(claim(&tree, &mut children, "renamed").await, Some(other));
+        assert_eq!(
+            claim(&tree, &mut children, &["renamed"], "renamed").await,
+            Some(other)
+        );
         assert!(
             !children.unclaimed().any(|id| id == other),
             "the renamed child is claimed in the listing"
@@ -546,9 +580,14 @@ async fn a_listing_without_a_mark_answers_a_second_claim_from_itself() {
             .await
             .expect("the listing");
         let mut children = DirectoryChildren::new(listed, None);
-        assert_eq!(claim(&tree, &mut children, name).await, Some(other));
+        let upper = name.to_uppercase();
+        let entries = [name, upper.as_str()];
         assert_eq!(
-            claim(&tree, &mut children, &name.to_uppercase()).await,
+            claim(&tree, &mut children, &entries, name).await,
+            Some(other)
+        );
+        assert_eq!(
+            claim(&tree, &mut children, &entries, &upper).await,
             Some(other)
         );
     })

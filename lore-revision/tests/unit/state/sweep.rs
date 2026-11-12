@@ -477,6 +477,37 @@ async fn a_sweep_that_frees_makes_older_marks_and_absences_stale() {
     .await;
 }
 
+/// A mark stands unchanged while only the prepends its holder counted changed the chain, and not
+/// once an add it did not count landed, nor once a sweep freed a slot, though the slot was
+/// detached before the mark and the chain's count stands.
+#[tokio::test]
+async fn a_mark_is_unchanged_until_an_uncounted_add_or_a_freeing_sweep() {
+    with_state(|repository, state| async move {
+        let d = add(&state, &repository, ROOT_NODE, directory("d"), "d").await;
+        let a = add(&state, &repository, d, file("a"), "a").await;
+        detach(&state, &repository, a).await;
+        let (_, mark) = state
+            .node_children_with_name_hash_marked(repository.clone(), d)
+            .await
+            .expect("the listing");
+        let mut mark = mark.expect("a directory's listing is marked");
+        assert!(mark.unchanged(&state), "nothing changed since the mark");
+        add(&state, &repository, d, file("b"), "b").await;
+        assert!(!mark.unchanged(&state), "an add the holder did not count");
+        mark.count_own_prepend();
+        assert!(
+            mark.unchanged(&state),
+            "the add counted as the holder's own"
+        );
+        assert_eq!(sweep(&state, &repository).await.file_count, 1);
+        assert!(
+            !mark.unchanged(&state),
+            "a sweep freed a slot since the mark"
+        );
+    })
+    .await;
+}
+
 /// As a discard that failed after freeing the chain's head in place and an add that then took the
 /// slot under another parent: the sweep's walk from the detached directory meets a live node of
 /// another parent and stops, freeing nothing of the chain that node is in.

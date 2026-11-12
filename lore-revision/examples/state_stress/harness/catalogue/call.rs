@@ -101,15 +101,25 @@ pub enum Lookup {
         from: u64,
         to: u64,
     },
+    /// Whether the mark found `dir`'s chain changed since only by the `prepends` its holder
+    /// counted (`ChainMark::unchanged`).
+    Unchanged {
+        dir: NodeID,
+        unchanged: bool,
+        prepends: u32,
+        from: u64,
+        to: u64,
+    },
 }
 
 impl Lookup {
     /// The `seq` it began at.
     pub fn begun(&self) -> u64 {
         match *self {
-            Self::Find { from, .. } | Self::Since { from, .. } | Self::Reattached { from, .. } => {
-                from
-            }
+            Self::Find { from, .. }
+            | Self::Since { from, .. }
+            | Self::Reattached { from, .. }
+            | Self::Unchanged { from, .. } => from,
         }
     }
 
@@ -117,7 +127,9 @@ impl Lookup {
     pub fn ended(&self) -> Option<u64> {
         match *self {
             Self::Find { .. } => None,
-            Self::Since { to, .. } | Self::Reattached { to, .. } => Some(to),
+            Self::Since { to, .. } | Self::Reattached { to, .. } | Self::Unchanged { to, .. } => {
+                Some(to)
+            }
         }
     }
 }
@@ -340,6 +352,9 @@ pub enum Answer {
     Stale,
     /// Whether a listing's `ChainMark` found its directory reattached since.
     Reattached(bool),
+    /// Whether a listing's `ChainMark` found its directory's chain changed since only by the
+    /// prepends its holder counted.
+    Unchanged(bool),
     /// The spelling of the name a name read read, or none where it skipped a name the read path
     /// refuses.
     Name(Option<u64>),

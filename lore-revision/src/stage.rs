@@ -14,6 +14,7 @@ use std::sync::atomic::Ordering;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use serde::Serialize;
+use smallvec::SmallVec;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -345,9 +346,11 @@ pub(crate) async fn process_link_updates(
 /// caller that reconciles nothing against the file system: a boundary is still
 /// skipped and an absent entry is staged as a delete, only an entry this would
 /// drop is left in place.
+#[lore_macro::test_pub]
 pub(crate) type PendingDiscards = Option<Arc<DiscardQueue>>;
 
 /// See [`PendingDiscards`].
+#[lore_macro::test_pub]
 pub(crate) struct DiscardQueue {
     /// The revision the staged tree is based on, which holds every entry a
     /// commit covers.
@@ -557,6 +560,7 @@ async fn is_uncommitted_child(
 ///
 /// The filter is asked about the path as what the working tree holds there, else as the node the
 /// tree holds, a link as a directory, and as a directory where neither holds anything.
+#[lore_macro::test_pub]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stage_filesystem_path(
     operation: Arc<InstanceOperationImpl>,
@@ -2006,6 +2010,10 @@ async fn resolve_case_variant_collisions(
     Ok(())
 }
 
+/// Most entries whose name hashes [`DirectoryChildren::entries_distinct`] sorts on the stack; it
+/// allocates for a longer listing.
+const ENTRIES_SORTED_ON_STACK: usize = 256;
+
 /// The children of a directory node, indexed by name hash, and which of them a
 /// file system entry has claimed.
 ///
@@ -2023,6 +2031,11 @@ struct DirectoryChildren {
     /// The chain as the listing began it, which everything linked into it since
     /// sits ahead of while no reattach moves it; `None` for a link's or a file's.
     since: Option<ChainMark>,
+    /// Whether the file system entries claiming the children carry distinct name
+    /// hashes, once a claim has asked ([`Self::entries_distinct`]).
+    entries_distinct: Option<bool>,
+    /// Whether the stage added a child for one of the entries ([`Self::count_own_add`]).
+    own_added: bool,
 }
 
 impl DirectoryChildren {
@@ -2041,7 +2054,22 @@ impl DirectoryChildren {
             node,
             by_name_hash,
             since,
+            entries_distinct: None,
+            own_added: false,
         }
+    }
+
+    /// Whether no two of `entries`, the file system entries claiming the children, carry the
+    /// same name hash: found on the first call, and kept for the later ones, which give the same
+    /// entries. The entries come in the order the file system lists them, so the check sorts a
+    /// copy of their hashes, `O(n log n)` once per directory.
+    fn entries_distinct(&mut self, entries: &[DirectoryEntry]) -> bool {
+        *self.entries_distinct.get_or_insert_with(|| {
+            let mut name_hashes: SmallVec<[u64; ENTRIES_SORTED_ON_STACK]> =
+                entries.iter().map(|entry| entry.name_hash).collect();
+            name_hashes.sort_unstable();
+            name_hashes.windows(2).all(|pair| pair[0] != pair[1])
+        })
     }
 
     /// The entries of the index carrying `name_hash`, in sibling order.
@@ -2077,13 +2105,17 @@ impl DirectoryChildren {
         }
     }
 
-    /// Counts a node the stage itself added to the directory, prepending it, in the mark, so
-    /// the stage's own adds never make its searches stale nor show as a reattach. Only an add
-    /// that landed counts: counting one that did not could hide a reattach.
+    /// Counts a node the stage itself added to the directory for one of its file system entries,
+    /// prepending it, in the mark, so the stage's own adds never make its searches stale nor show
+    /// as a reattach, and notes that it added one. Only an add that landed counts: counting one
+    /// that did not could hide a reattach, or another writer's add from
+    /// [`ChainMark::unchanged`].
+    #[lore_macro::test_pub]
     fn count_own_add(&mut self) {
         if let Some(since) = self.since.as_mut() {
             since.count_own_prepend();
         }
+        self.own_added = true;
     }
 
     /// The first child the listing holds carrying `name_hash`, claimed or not,
@@ -2116,8 +2148,38 @@ pub(crate) enum KnownChild {
     Unresolved,
 }
 
-/// The child of `directory_node` that `name_hash` belongs to, claimed where the
-/// listing still holds it unclaimed.
+/// The listing's answer to the claim of `name_hash`, the name hash of one of `entries`, the
+/// directory's file system entries, where the listing answers alone; `None` where only a search
+/// of the chain does ([`claim_child`]).
+///
+/// The listing answers with the first listed child carrying `name_hash` that nothing claimed,
+/// claimed now. Failing that, it answers with the listed child carrying it, claimed or not, in two
+/// cases: it carries no mark, as a link's or a file's listing does; or the chain changed since the
+/// listing only by the stage's own adds, each for an entry claimed before, and the stage made none
+/// or no two of `entries` carry one name hash, so nothing linked in since carries `name_hash`.
+///
+/// The listing's own answers are taken as given: no writer but the stage's own tasks, each in its
+/// own directory, runs beside a stage (the node module's Limitations, "The stage's listing"), so no
+/// child the listing holds is renamed, moved or removed meanwhile.
+#[lore_macro::test_pub]
+fn claim_from_listing(
+    children: &mut DirectoryChildren,
+    state: &State,
+    entries: &[DirectoryEntry],
+    name_hash: u64,
+) -> Option<Option<NodeID>> {
+    if let Some(node) = children.claim(name_hash) {
+        return Some(Some(node));
+    }
+    let answers = match children.since.as_ref().map(|since| since.unchanged(state)) {
+        None => true,
+        Some(unchanged) => unchanged && (!children.own_added || children.entries_distinct(entries)),
+    };
+    answers.then(|| children.holds(name_hash))
+}
+
+/// The child of `directory_node` that `name_hash` belongs to, where its listing does not answer
+/// alone ([`claim_from_listing`]).
 ///
 /// A child is prepended, so whatever was linked into the chain since the listing
 /// was taken lies ahead of it. Only that much is walked; the listing answers from
@@ -2127,10 +2189,6 @@ pub(crate) enum KnownChild {
 /// after a reattach is claimed in the listing too, which may hold it under the name
 /// it had. A link's or a file's listing, which carries no mark, answers from the
 /// listing alone.
-///
-/// The listing's own answers are taken as given: no writer but the stage's own tasks, each in its
-/// own directory, runs beside a stage (the node module's Limitations, "The stage's listing"), so no
-/// child the listing holds is renamed, moved or removed meanwhile.
 #[lore_macro::test_pub]
 async fn claim_child(
     repository: &Arc<RepositoryContext>,
@@ -2139,9 +2197,6 @@ async fn claim_child(
     children: &mut DirectoryChildren,
     name_hash: u64,
 ) -> Result<Option<NodeID>, StageError> {
-    if let Some(node) = children.claim(name_hash) {
-        return Ok(Some(node));
-    }
     let Some(since) = children.since.as_ref() else {
         return Ok(children.holds(name_hash));
     };
@@ -2318,7 +2373,7 @@ pub(crate) async fn stage_directory(
         String::new()
     };
     let mut nested_probe: Option<PathBuf> = None;
-    for item in items {
+    for item in &items {
         if item.info.is_dir() {
             let directory = item;
 
@@ -2350,21 +2405,25 @@ pub(crate) async fn stage_directory(
                 relative_path.as_str()
             );
 
-            let claimed = match claim_child(
-                &repository,
-                &state,
-                directory_node,
-                &mut children,
-                directory.name_hash,
-            )
-            .await
-            {
-                Ok(claimed) => claimed,
-                Err(err) => {
-                    fold_child(Err(err), &mut outcome);
-                    break;
-                }
-            };
+            let claimed =
+                match claim_from_listing(&mut children, &state, &items, directory.name_hash) {
+                    Some(claimed) => claimed,
+                    None => match claim_child(
+                        &repository,
+                        &state,
+                        directory_node,
+                        &mut children,
+                        directory.name_hash,
+                    )
+                    .await
+                    {
+                        Ok(claimed) => claimed,
+                        Err(err) => {
+                            fold_child(Err(err), &mut outcome);
+                            break;
+                        }
+                    },
+                };
 
             let uncommitted = match is_uncommitted_child(&repository, &state, claimed).await {
                 Ok(uncommitted) => uncommitted,
@@ -2500,20 +2559,23 @@ pub(crate) async fn stage_directory(
                 relative_path.as_str()
             );
 
-            let claimed = match claim_child(
-                &repository,
-                &state,
-                directory_node,
-                &mut children,
-                file.name_hash,
-            )
-            .await
-            {
-                Ok(claimed) => claimed,
-                Err(err) => {
-                    fold_child(Err(err), &mut outcome);
-                    break;
-                }
+            let claimed = match claim_from_listing(&mut children, &state, &items, file.name_hash) {
+                Some(claimed) => claimed,
+                None => match claim_child(
+                    &repository,
+                    &state,
+                    directory_node,
+                    &mut children,
+                    file.name_hash,
+                )
+                .await
+                {
+                    Ok(claimed) => claimed,
+                    Err(err) => {
+                        fold_child(Err(err), &mut outcome);
+                        break;
+                    }
+                },
             };
 
             let result = stage_node_from_metadata(
@@ -2558,6 +2620,10 @@ pub(crate) async fn stage_directory(
             break;
         }
     }
+
+    // Nothing reads the entries past the claims: they go before the deletes and the subtree's
+    // tasks.
+    drop(items);
 
     let force = execution_context().globals().force();
     for child in children.unclaimed() {

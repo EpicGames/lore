@@ -22,9 +22,9 @@
 //! repeat; and each read by a listing's `ChainMark` held to the marked listing it names, from the
 //! listing's head read: a node a search found carrying the name, a miss over the nodes that joined
 //! since, and, under the gate, over a count moved past the mark's while its head stood, a stale
-//! search and a reattach found by the count, a reattach not found, under the gate, by it as the
-//! read began, a read by the mark of the call's own marked listing so within its own interval, by
-//! the prepends the call counted by then; each name read held to its one name record, a comparison
+//! search, a reattach and a change found by the count, a reattach not found and a chain found
+//! unchanged, under the gate, by it as the read began, a read by the mark of the call's own marked
+//! listing so within its own interval, by the prepends the call counted by then; each name read held to its one name record, a comparison
 //! by it, and a path read to its walk up its parents and the names it read; and each has-children
 //! read held to its directory from its listing's head read: a child found carrying the flags a
 //! node of the directory at some `seq` since, carrying them then or later, none found a violation
@@ -291,6 +291,7 @@ pub(super) fn hops_looked_up(calls: &mut [Call], records: &[Record], spawns: &[S
 fn reads_by_mark(call: &Call) -> bool {
     std::ptr::eq(call.kind, &catalogue::ADDED_SINCE)
         || std::ptr::eq(call.kind, &catalogue::REATTACHED_SINCE)
+        || std::ptr::eq(call.kind, &catalogue::UNCHANGED_SINCE)
 }
 
 /// Whether `call` lists with a mark, its head read keeping the chain's head as its `ChainMark`
@@ -304,9 +305,9 @@ fn lists_marked(call: &Call) -> bool {
 /// prepends to it the call counted in the mark by then; none for a find.
 fn own_mark_of(lookup: &Lookup) -> Option<(NodeID, u32)> {
     match *lookup {
-        Lookup::Since { dir, prepends, .. } | Lookup::Reattached { dir, prepends, .. } => {
-            Some((dir, prepends))
-        }
+        Lookup::Since { dir, prepends, .. }
+        | Lookup::Reattached { dir, prepends, .. }
+        | Lookup::Unchanged { dir, prepends, .. } => Some((dir, prepends)),
         Lookup::Find { .. } => None,
     }
 }
@@ -342,18 +343,23 @@ fn keeps_own_head(lookup: &Lookup) -> bool {
     )
 }
 
-/// Whether `past` is judged under the gate alone: a search's mark's head kept and a mark found not
-/// reattached, each by a count read with no lock, which is the model's as the read began only
-/// there.
+/// Whether `past` is judged under the gate alone: a search's mark's head kept, a mark found not
+/// reattached and a mark found unchanged, each by a count read with no lock, which is the model's
+/// as the read began only there.
 fn gated_only(past: Past) -> bool {
     matches!(
         past,
         Past::Kept
             | Past::OwnKept(_)
-            | Past::Lookup(Lookup::Reattached {
-                reattached: false,
-                ..
-            })
+            | Past::Lookup(
+                Lookup::Reattached {
+                    reattached: false,
+                    ..
+                } | Lookup::Unchanged {
+                    unchanged: true,
+                    ..
+                }
+            )
     )
 }
 
@@ -445,6 +451,13 @@ pub(super) enum Claim {
     /// The directory's count not moved by a reattach past `base`; as a count only grows, read so
     /// where it is read from or at no read.
     Unmoved { dir: NodeID, base: u32 },
+    /// The directory's count at `base`, its listing's mark's count with the prepends its holder
+    /// counted: no other change linked a child into the chain since the mark (C5). As a count only
+    /// grows, read so where it is read from or at no read. No sweep runs beside a reads' call,
+    /// sweeps running between bursts, so the mark's reclaim count stands throughout.
+    Unchanged { dir: NodeID, base: u32 },
+    /// The directory's count moved past `base`, or its slot freed.
+    Changed { dir: NodeID, base: u32 },
     /// A node of the directory at some read so far carrying the flags `flagged` names at a read
     /// since, both from the listing's head read: the nodes a has-children read's listing may have
     /// held, kept in the claim's reach, as it reads each child's words after its listing. By id, so
@@ -760,6 +773,9 @@ impl Claim {
             Lookup::Reattached {
                 dir, reattached, ..
             } => Self::answered_by_mark((dir, None), Answer::Reattached(reattached), mark),
+            Lookup::Unchanged { dir, unchanged, .. } => {
+                Self::answered_by_mark((dir, None), Answer::Unchanged(unchanged), mark)
+            }
             Lookup::Find { .. } => None,
         }
     }
@@ -794,6 +810,8 @@ impl Claim {
                 or_gone: false,
             },
             Answer::Reattached(false) => Self::Unmoved { dir, base },
+            Answer::Unchanged(true) => Self::Unchanged { dir, base },
+            Answer::Unchanged(false) => Self::Changed { dir, base },
             _ => return None,
         })
     }
@@ -819,7 +837,9 @@ impl Claim {
                 found: None,
                 ..
             } => Self::Missed { dir, name },
-            Lookup::Since { .. } | Lookup::Reattached { .. } => Self::OwnRead(lookup),
+            Lookup::Since { .. } | Lookup::Reattached { .. } | Lookup::Unchanged { .. } => {
+                Self::OwnRead(lookup)
+            }
         }
     }
 
@@ -995,6 +1015,10 @@ impl Claim {
                 moved_past(slot, base) || (or_gone && !slot.record.is_directory())
             }),
             Self::Unmoved { dir, base } => !moved(state, dir, base),
+            Self::Unchanged { dir, base } => {
+                state.slot(dir).is_some_and(|slot| slot.changes == base)
+            }
+            Self::Changed { dir, base } => state.slot(dir).is_none_or(|slot| slot.changes != base),
             Self::Kept { dir, head, base } => {
                 let chained = |head| {
                     (state.slot(head)).is_some_and(|slot| {
@@ -1668,6 +1692,23 @@ fn judged(
                     } else {
                         "not reattached, its count moved by a reattach past the mark's as it \
                          began"
+                    }
+                ),
+                Past::Lookup(Lookup::Unchanged {
+                    dir,
+                    unchanged,
+                    from,
+                    to,
+                    ..
+                }) => format!(
+                    "a read of its own listing's mark of {dir} in a call of '{name}' answered {}, \
+                     [{from}, {to})",
+                    if unchanged {
+                        "unchanged, its count moved past the mark's with the call's own prepends \
+                         as it began"
+                    } else {
+                        "changed, its count standing at the mark's with the call's own prepends \
+                         throughout its interval"
                     }
                 ),
                 Past::Walk(walk, check) => {
@@ -2603,8 +2644,9 @@ fn answer_judged(
                 )
             }),
         }),
-        // A read by a listing's mark, whose claim held at no `seq`; a mark found not reattached
-        // judged only under the gate, where the count it read lock-free is the model's as it began.
+        // A read by a listing's mark, whose claim held at no `seq`; a mark found not reattached or
+        // found unchanged judged only under the gate, where the count it read lock-free is the
+        // model's as it began.
         Outcome::Answer(Answer::Since(Some(node))) if answered.seen & 1 == 0 => Some(format!(
             "a search of {} since its listing's mark in a call of '{name}' answered {node}, \
              carrying the name at no seq of its interval",
@@ -2629,6 +2671,18 @@ fn answer_judged(
             Some(format!(
                 "a mark of {} in a call of '{name}' answered not reattached, its count moved by a \
                  reattach past the mark's as it began",
+                targeted(call)
+            ))
+        }
+        Outcome::Answer(Answer::Unchanged(false)) if answered.seen & 1 == 0 => Some(format!(
+            "a mark of {} in a call of '{name}' answered changed, its count standing at the \
+             mark's with its holder's own prepends",
+            targeted(call)
+        )),
+        Outcome::Answer(Answer::Unchanged(true)) if answered.seen & 1 == 0 && admits.gated => {
+            Some(format!(
+                "a mark of {} in a call of '{name}' answered unchanged, its count moved past the \
+                 mark's with its holder's own prepends as it began",
                 targeted(call)
             ))
         }
