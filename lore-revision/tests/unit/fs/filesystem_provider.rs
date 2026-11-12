@@ -60,6 +60,8 @@ pub struct TestFilesystemProvider {
     /// Paths each recursive removal was asked for.
     pub removed: Arc<Mutex<Vec<String>>>,
     identity: TestIdentity,
+    /// How many directories its operations read.
+    pub directory_reads: Arc<AtomicUsize>,
     begin_fails: bool,
     finalize_fails: bool,
     committed_fails: bool,
@@ -253,6 +255,8 @@ impl FilesystemProvider for TestFilesystemProvider {
                 stale_on_scan: self.stale_on_scan.clone(),
                 removed: self.removed.clone(),
                 identity: self.identity,
+                case_lookup: Default::default(),
+                directory_reads: self.directory_reads.clone(),
             }),
             self.holds_state,
         )))

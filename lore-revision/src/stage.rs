@@ -5216,7 +5216,7 @@ pub(crate) async fn stage_from_parent_state(
         &[],
         None,
         false, /* No dry run */
-        false, /* Not a merge */
+        None,  /* Not a merge */
         Arc::new(SyncRealizeStats::default()),
     )
     .await

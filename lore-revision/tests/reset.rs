@@ -12,8 +12,11 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::time::SystemTime;
 
+    use lore_base::log::LoreLogLevel;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Context;
@@ -23,13 +26,22 @@ mod tests {
     use lore_revision::file;
     use lore_revision::file::reset;
     use lore_revision::file::reset::LoreFileResetCountData;
+    use lore_revision::file::reset::ResetError;
     use lore_revision::file::reset::ResetOptions;
     use lore_revision::filter::FilterMode;
+    use lore_revision::fs::filesystem_provider::CaseLookup;
     use lore_revision::fs::filesystem_provider::FilesystemDiffIntent;
     use lore_revision::fs::filesystem_provider::FilesystemDiffTree;
+    use lore_revision::fs::filesystem_provider::FilesystemProvider;
+    use lore_revision::fs::filesystem_provider::FsError;
+    use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
+    use lore_revision::fs::filesystem_provider::StaticDispatchInstanceOperation;
+    use lore_revision::fs::filesystem_provider::test_util::TestOperation;
+    use lore_revision::fs::os::OsFilesystem;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreEvent;
+    use lore_revision::interface::LoreFileAction;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
     use lore_revision::lore::RepositoryId;
@@ -138,36 +150,6 @@ mod tests {
             .expect("Test task failed");
     }
 
-    /// Every path under `root` but the control directory, with a file's content and `None` for a
-    /// directory, which is what a dry run reset must leave as it found it.
-    fn working_tree(root: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
-        fn walk(root: &Path, directory: &Path, tree: &mut BTreeMap<String, Option<Vec<u8>>>) {
-            for entry in std::fs::read_dir(directory).expect("Failed to list directory") {
-                let path = entry.expect("Failed to read directory entry").path();
-                let relative = path
-                    .strip_prefix(root)
-                    .expect("Entry outside the root")
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                if relative == ".lore" {
-                    continue;
-                }
-                if path.is_dir() {
-                    tree.insert(relative, None);
-                    walk(root, &path, tree);
-                } else {
-                    tree.insert(
-                        relative,
-                        Some(std::fs::read(&path).expect("Failed to read file")),
-                    );
-                }
-            }
-        }
-        let mut tree = BTreeMap::new();
-        walk(root, root, &mut tree);
-        tree
-    }
-
     fn test_directory_create(path: &Path) {
         std::fs::create_dir_all(path)
             .unwrap_or_else(|_| panic!("Failed to create test directory at {}", path.display()));
@@ -177,6 +159,23 @@ mod tests {
     async fn reset_purging(
         fixture: &TestRepository,
         paths: &[&str],
+    ) -> Result<(), lore_revision::file::reset::ResetError> {
+        reset_paths(
+            fixture,
+            paths,
+            ResetOptions {
+                purge: true,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Resets `paths`, relative to the fixture's root, with `options`.
+    async fn reset_paths(
+        fixture: &TestRepository,
+        paths: &[&str],
+        options: ResetOptions,
     ) -> Result<(), lore_revision::file::reset::ResetError> {
         reset::reset(
             fixture.repository.clone(),
@@ -190,10 +189,7 @@ mod tests {
                     .collect(),
             ),
             LoreString::default(),
-            ResetOptions {
-                purge: true,
-                ..Default::default()
-            },
+            options,
         )
         .await
     }
@@ -655,6 +651,518 @@ mod tests {
                     ("dir/b.txt", None),
                 ],
             );
+        })
+        .await;
+    }
+
+    /// A reset puts back the spelling the revision holds an entry in where the working tree holds
+    /// it in another case: a file holding the committed content, an edited file, and a directory,
+    /// below which it restores what the revision holds. A reset of the root reaches them through
+    /// its walk, purging or not, and a reset naming each of them through the path it names, in
+    /// either spelling.
+    #[tokio::test]
+    async fn a_reset_puts_back_the_spelling_the_revision_holds() {
+        for (paths, purge) in [
+            (&[""][..], false),
+            (&[""], true),
+            (&["foo.txt", "Bar.txt", "dir"], false),
+        ] {
+            with_fixture(async move |fixture| {
+                let path = |relative: &str| fixture.path.join(relative);
+                std::fs::create_dir_all(path("Dir")).expect("Failed to create the directory");
+                for committed in ["Foo.txt", "Bar.txt", "Dir/a.txt"] {
+                    test_file_write(&path(committed), b"committed");
+                }
+                let state = test_commit_tree(&fixture, "Initial").await;
+                for (committed, variant) in [("Foo.txt", "foo.txt"), ("Bar.txt", "bar.txt")] {
+                    std::fs::rename(path(committed), path(variant))
+                        .expect("Failed to spell the file in another case");
+                }
+                std::fs::rename(path("Dir"), path("dir"))
+                    .expect("Failed to spell the directory in another case");
+                test_file_write(&path("bar.txt"), b"edited");
+                test_file_write(&path("dir/a.txt"), b"edited");
+
+                reset_paths(
+                    &fixture,
+                    paths,
+                    ResetOptions {
+                        purge,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("A reset must succeed");
+
+                let committed = Some(b"committed".to_vec());
+                assert_eq!(
+                    working_tree(&fixture.path),
+                    BTreeMap::from([
+                        ("Bar.txt".to_string(), committed.clone()),
+                        ("Dir".to_string(), None),
+                        ("Dir/a.txt".to_string(), committed.clone()),
+                        ("Foo.txt".to_string(), committed),
+                    ]),
+                    "a reset of {paths:?}, purging {purge}, left the working tree"
+                );
+                let changes = filesystem_changes(&fixture.repository, &state).await;
+                assert!(
+                    changes.is_empty(),
+                    "a reset of {paths:?}, purging {purge}, left changes: {:?}",
+                    test_reported(&changes)
+                );
+            })
+            .await;
+        }
+    }
+
+    /// A purging reset of a directory of many files the working tree holds in another case renames
+    /// each to the revision's spelling and keeps it, the purge of the directory removing none of
+    /// them however far the reset of each has got.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_purging_reset_keeps_every_file_it_renames_to_the_revision_spelling() {
+        const FILES: usize = 400;
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            for index in 0..FILES {
+                test_file_write(&path(&format!("File{index}.txt")), b"committed");
+            }
+            test_commit_tree(&fixture, "Initial").await;
+            for index in 0..FILES {
+                std::fs::rename(
+                    path(&format!("File{index}.txt")),
+                    path(&format!("file{index}.txt")),
+                )
+                .expect("Failed to spell the file in another case");
+            }
+
+            reset_purging(&fixture, &[""])
+                .await
+                .expect("A reset must succeed");
+
+            let expected: BTreeMap<String, Option<Vec<u8>>> = (0..FILES)
+                .map(|index| (format!("File{index}.txt"), Some(b"committed".to_vec())))
+                .collect();
+            assert_eq!(working_tree(&fixture.path), expected);
+        })
+        .await;
+    }
+
+    /// A reset takes an entry spelled in another case for a node only where it is the one entry of
+    /// the name and of the node's kind. It writes the node beside a directory spelled as a file the
+    /// revision holds, and beside two entries spelling the name otherwise, leaving them as they
+    /// stand, whether it reaches the node from the root or names it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_reset_renames_an_entry_spelled_in_another_case_only_where_it_is_the_one_of_its_kind()
+    {
+        for paths in [&[""][..], &["Kind", "Twice.txt"]] {
+            with_fixture(async move |fixture| {
+                let path = |relative: &str| fixture.path.join(relative);
+                for committed in ["Kind", "Twice.txt"] {
+                    test_file_write(&path(committed), b"committed");
+                }
+                test_commit_tree(&fixture, "Initial").await;
+                std::fs::remove_file(path("Kind")).expect("Failed to remove the file");
+                test_directory_create(&path("kind"));
+                test_file_write(&path("kind/x.txt"), b"untracked");
+                std::fs::rename(path("Twice.txt"), path("twice.txt"))
+                    .expect("Failed to spell the file in another case");
+                test_file_write(&path("TWICE.txt"), b"untracked");
+
+                reset_paths(&fixture, paths, ResetOptions::default())
+                    .await
+                    .expect("A reset must succeed");
+
+                let committed = Some(b"committed".to_vec());
+                let untracked = Some(b"untracked".to_vec());
+                assert_eq!(
+                    working_tree(&fixture.path),
+                    BTreeMap::from([
+                        ("Kind".to_string(), committed.clone()),
+                        ("kind".to_string(), None),
+                        ("kind/x.txt".to_string(), untracked.clone()),
+                        ("TWICE.txt".to_string(), untracked),
+                        ("Twice.txt".to_string(), committed.clone()),
+                        ("twice.txt".to_string(), committed),
+                    ]),
+                    "a reset of {paths:?} left the working tree"
+                );
+            })
+            .await;
+        }
+    }
+
+    /// A filesystem provider whose operations read, write and remove in the working tree at `root`,
+    /// refuse every rename, as a file system refuses one of an entry held open, find another case
+    /// of a name as `case_lookup` says, and record each recursive removal in `removed` without
+    /// removing anything, and each directory read in `directory_reads`.
+    struct RefusingRenames {
+        root: std::path::PathBuf,
+        removed: Arc<parking_lot::Mutex<Vec<String>>>,
+        case_lookup: CaseLookup,
+        directory_reads: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl FilesystemProvider for RefusingRenames {
+        async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
+            Ok(Arc::new(InstanceOperationImpl::new(
+                StaticDispatchInstanceOperation::Test(TestOperation {
+                    reads: Some(OsFilesystem::new(&self.root).begin_operation()),
+                    removed: self.removed.clone(),
+                    case_lookup: self.case_lookup,
+                    directory_reads: self.directory_reads.clone(),
+                    ..TestOperation::default()
+                }),
+                false,
+            )))
+        }
+    }
+
+    /// What [`reset_refusing_renames`] answers.
+    struct RefusedReset {
+        result: Result<(), ResetError>,
+        warnings: Vec<String>,
+        /// The paths the reset removed recursively.
+        removed: Vec<String>,
+        /// How many directories the reset read.
+        directory_reads: usize,
+    }
+
+    /// Resets the root of `fixture` with `options` through a context over [`RefusingRenames`],
+    /// which finds another case of a name as `case_lookup` says.
+    async fn reset_refusing_renames(
+        fixture: &TestRepository,
+        options: ResetOptions,
+        case_lookup: CaseLookup,
+    ) -> RefusedReset {
+        fn log_to_context(level: LoreLogLevel, _: &str, message: &str) {
+            if let Some(execution) = lore_revision::lore::try_execution_context() {
+                execution
+                    .dispatcher
+                    .send(LoreEvent::Log(EventDispatcher::make_log(
+                        level,
+                        message.to_string(),
+                    )));
+            }
+        }
+        let removed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let directory_reads = Arc::new(AtomicUsize::new(0));
+        let refusing = Arc::new(
+            RepositoryContext::new(
+                default_repository_creation_args(
+                    fixture.repository.immutable_store(),
+                    fixture.repository.mutable_store.clone(),
+                )
+                .with_path(&fixture.path)
+                .with_id(fixture.repository.id)
+                .with_instance_id(fixture.repository.instance_id)
+                .with_filesystem_provider(Arc::new(RefusingRenames {
+                    root: fixture.path.clone(),
+                    removed: removed.clone(),
+                    case_lookup,
+                    directory_reads: directory_reads.clone(),
+                })),
+            )
+            .with_write_token(fixture.write_token.share()),
+        );
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let logged = warnings.clone();
+        let execution = Arc::new(ExecutionContext::new_client(
+            LoreGlobalArgs::default(),
+            EventDispatcher::new(Some(Box::new(move |event: &LoreEvent| {
+                if let LoreEvent::Log(log) = event
+                    && log.level == LoreLogLevel::Warn
+                {
+                    logged
+                        .lock()
+                        .expect("Failed to record a warning")
+                        .push(log.message.to_string());
+                }
+            }))),
+        ));
+        static LOG_TO_CONTEXT: std::sync::Once = std::sync::Once::new();
+        LOG_TO_CONTEXT.call_once(|| lore_base::log::set_log_callback(Some(log_to_context)));
+        let result = LORE_CONTEXT
+            .scope(execution.clone(), async {
+                reset::reset(
+                    refusing,
+                    &fixture.write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&fixture.path)]),
+                    LoreString::default(),
+                    options,
+                )
+                .await
+            })
+            .await;
+        execution.dispatcher.drain().await;
+        let warnings = std::mem::take(&mut *warnings.lock().expect("Failed to read the warnings"));
+        let removed = std::mem::take(&mut *removed.lock());
+        RefusedReset {
+            result,
+            warnings,
+            removed,
+            directory_reads: directory_reads.load(Ordering::Relaxed),
+        }
+    }
+
+    /// A reset whose rename of an entry to the revision's spelling the file system refuses resets
+    /// the entry where it stands, a file and a directory with what it holds, an edited file to its
+    /// committed content, and warns once for every refusal, naming the first, whether it lists each
+    /// directory before its children or, where a stat misses another case, on a child's first miss.
+    #[tokio::test]
+    async fn a_reset_resets_an_entry_whose_rename_is_refused_where_it_stands() {
+        let on_miss = cfg!(target_os = "linux").then_some(CaseLookup::OnMiss);
+        for case_lookup in std::iter::once(CaseLookup::Listing).chain(on_miss) {
+            with_fixture(async move |fixture| {
+                let path = |relative: &str| fixture.path.join(relative);
+                std::fs::create_dir_all(path("Dir")).expect("Failed to create the directory");
+                for committed in ["Foo.txt", "Dir/a.txt"] {
+                    test_file_write(&path(committed), b"committed");
+                }
+                test_commit_tree(&fixture, "Initial").await;
+                for (from, to) in [("Foo.txt", "foo.txt"), ("Dir", "dir")] {
+                    std::fs::rename(path(from), path("spelling.tmp"))
+                        .expect("Failed to rename the entry");
+                    std::fs::rename(path("spelling.tmp"), path(to))
+                        .expect("Failed to rename the entry");
+                }
+                test_file_write(&path("foo.txt"), b"edited");
+
+                let reset =
+                    reset_refusing_renames(&fixture, ResetOptions::default(), case_lookup).await;
+
+                reset.result.expect("A reset must succeed");
+                let committed = Some(b"committed".to_vec());
+                assert_eq!(
+                    working_tree(&fixture.path),
+                    BTreeMap::from([
+                        ("dir".to_string(), None),
+                        ("dir/a.txt".to_string(), committed.clone()),
+                        ("foo.txt".to_string(), committed),
+                    ]),
+                    "{case_lookup:?}"
+                );
+                assert_eq!(
+                    reset.warnings.len(),
+                    1,
+                    "{case_lookup:?}: the reset warned {:?}",
+                    reset.warnings
+                );
+            })
+            .await;
+        }
+    }
+
+    /// A reset that reads a directory only once the stat of a child's spelling misses reads none
+    /// where every child stands in the revision's spelling, edited or not.
+    #[tokio::test]
+    async fn a_reset_reading_directories_on_a_miss_reads_none_without_one() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            std::fs::create_dir_all(path("Dir/Sub")).expect("Failed to create the directories");
+            for committed in ["Top.txt", "Dir/a.txt", "Dir/Sub/b.txt"] {
+                test_file_write(&path(committed), b"committed");
+            }
+            test_commit_tree(&fixture, "Initial").await;
+            test_file_write(&path("Dir/a.txt"), b"edited");
+
+            let reset =
+                reset_refusing_renames(&fixture, ResetOptions::default(), CaseLookup::OnMiss).await;
+
+            reset.result.expect("A reset must succeed");
+            assert_eq!(
+                std::fs::read(path("Dir/a.txt")).expect("Failed to read the file"),
+                b"committed"
+            );
+            assert_eq!(reset.directory_reads, 0);
+        })
+        .await;
+    }
+
+    /// A reset that reads a directory only once the stat of a child's spelling misses reads each
+    /// directory holding a miss once, whichever walk or file task misses first, and pairs every
+    /// missed child from that one listing: two files in one directory, and a directory in the root,
+    /// each held in another case. Their renames refused, each is reset where it stands, and what a
+    /// directory held there stands in the revision's spelling, read no further. Linux alone, where
+    /// a stat misses another case.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_reset_reading_directories_on_a_miss_reads_each_once() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            for directory in ["Dir", "Sub"] {
+                std::fs::create_dir_all(path(directory)).expect("Failed to create the directory");
+            }
+            for committed in ["Dir/a.txt", "Dir/b.txt", "Sub/c.txt"] {
+                test_file_write(&path(committed), b"committed");
+            }
+            test_commit_tree(&fixture, "Initial").await;
+            for (from, to) in [("Dir/a.txt", "Dir/A.txt"), ("Dir/b.txt", "Dir/B.txt")] {
+                std::fs::rename(path(from), path(to)).expect("Failed to rename the file");
+            }
+            std::fs::rename(path("Sub"), path("sub.tmp")).expect("Failed to rename the directory");
+            std::fs::rename(path("sub.tmp"), path("sub")).expect("Failed to rename the directory");
+            test_file_write(&path("Dir/A.txt"), b"edited");
+
+            let reset =
+                reset_refusing_renames(&fixture, ResetOptions::default(), CaseLookup::OnMiss).await;
+
+            reset.result.expect("A reset must succeed");
+            let committed = Some(b"committed".to_vec());
+            assert_eq!(
+                working_tree(&fixture.path),
+                BTreeMap::from([
+                    ("Dir".to_string(), None),
+                    ("Dir/A.txt".to_string(), committed.clone()),
+                    ("Dir/B.txt".to_string(), committed.clone()),
+                    ("sub".to_string(), None),
+                    ("sub/c.txt".to_string(), committed),
+                ])
+            );
+            assert_eq!(
+                reset.directory_reads, 2,
+                "the root, for the directory, and the directory holding the files"
+            );
+            assert_eq!(
+                reset.warnings.len(),
+                1,
+                "the reset warned {:?}",
+                reset.warnings
+            );
+        })
+        .await;
+    }
+
+    /// A purge whose walk could not read every entry of a directory lists the directory again, and
+    /// leaves the entries the walk paired with a child: an entry kept in another spelling, its
+    /// rename refused, is not purged as untracked. The purge then fails on the entry it cannot
+    /// read, as it fails wherever the reset's walk did not list it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_purge_listing_a_directory_again_leaves_the_entries_paired_with_a_child() {
+        use std::os::unix::ffi::OsStrExt;
+
+        const FILES: usize = 50;
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            for index in 0..FILES {
+                test_file_write(&path(&format!("File{index}.txt")), b"committed");
+            }
+            test_commit_tree(&fixture, "Initial").await;
+            test_file_write(
+                &fixture
+                    .path
+                    .join(std::ffi::OsStr::from_bytes(b"not-text-\xff.bin")),
+                b"untracked",
+            );
+            for index in 0..FILES {
+                std::fs::rename(
+                    path(&format!("File{index}.txt")),
+                    path(&format!("file{index}.txt")),
+                )
+                .expect("Failed to spell the file in another case");
+            }
+
+            let reset = reset_refusing_renames(
+                &fixture,
+                ResetOptions {
+                    purge: true,
+                    ..Default::default()
+                },
+                CaseLookup::OnMiss,
+            )
+            .await;
+
+            assert!(
+                reset.result.is_err(),
+                "the purge must fail on the entry it cannot read"
+            );
+            assert!(
+                reset.removed.is_empty(),
+                "the purge removed the entries the walk kept: {:?}",
+                reset.removed
+            );
+        })
+        .await;
+    }
+
+    /// Resets the root of `fixture` with `globals`, answering each path the reset reports and the
+    /// action it reports for it, by path.
+    async fn reset_reports(
+        fixture: &TestRepository,
+        globals: LoreGlobalArgs,
+    ) -> Vec<(String, LoreFileAction)> {
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let recorded = reported.clone();
+        let execution = Arc::new(ExecutionContext::new_client(
+            globals,
+            EventDispatcher::new(Some(Box::new(move |event: &LoreEvent| {
+                if let LoreEvent::FileResetFile(file) = event {
+                    recorded
+                        .lock()
+                        .expect("Failed to record a file")
+                        .push((file.path.to_string(), file.action));
+                }
+            }))),
+        ));
+        LORE_CONTEXT
+            .scope(
+                execution.clone(),
+                reset_paths(fixture, &[""], ResetOptions::default()),
+            )
+            .await
+            .expect("A reset must succeed");
+        execution.dispatcher.drain().await;
+        let mut reported = std::mem::take(&mut *reported.lock().expect("Failed to read the files"));
+        reported.sort_by(|a, b| a.0.cmp(&b.0));
+        reported
+    }
+
+    /// A dry run reset of entries the working tree holds in another case reports what the reset
+    /// itself does: the move of each, and the restore of an edited file at the revision's
+    /// spelling, whether the file is respelled or stands in a respelled directory. It leaves the
+    /// working tree as it found it.
+    #[tokio::test]
+    async fn a_dry_run_reset_reports_a_respelled_entry_as_the_reset_does() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            std::fs::create_dir_all(path("Dir")).expect("Failed to create the directory");
+            for committed in ["Dir/a.txt", "Dir/b.txt", "Dir/c.txt", "Foo.txt"] {
+                test_file_write(&path(committed), b"committed");
+            }
+            test_commit_tree(&fixture, "Initial").await;
+            std::fs::rename(path("Dir"), path("dir.tmp")).expect("Failed to rename the directory");
+            std::fs::rename(path("dir.tmp"), path("dir")).expect("Failed to rename the directory");
+            std::fs::rename(path("Foo.txt"), path("foo.tmp")).expect("Failed to rename the file");
+            std::fs::rename(path("foo.tmp"), path("foo.txt")).expect("Failed to rename the file");
+            for edited in ["dir/a.txt", "foo.txt"] {
+                test_file_write(&path(edited), b"edited");
+            }
+            let before = working_tree(&fixture.path);
+
+            let dry_run = reset_reports(
+                &fixture,
+                LoreGlobalArgs {
+                    dry_run: 1,
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(working_tree(&fixture.path), before);
+            let reset = reset_reports(&fixture, LoreGlobalArgs::default()).await;
+
+            assert_eq!(
+                reset,
+                [
+                    ("Dir".to_string(), LoreFileAction::Move),
+                    ("Dir/a.txt".to_string(), LoreFileAction::Keep),
+                    ("Foo.txt".to_string(), LoreFileAction::Move),
+                    ("Foo.txt".to_string(), LoreFileAction::Keep),
+                ]
+            );
+            assert_eq!(dry_run, reset);
         })
         .await;
     }

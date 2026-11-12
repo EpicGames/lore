@@ -82,6 +82,9 @@ mod tests {
     const NARROW_VIEW: &str = "narrow";
     /// A view file holding no rules, which puts the whole repository in view.
     const WIDE_VIEW: &str = "wide";
+    /// The instance's own spelling of [`MOUNTED_KEPT`], a path below the mount it tracks in another
+    /// case than the layer.
+    const OWN_BELOW_MOUNT: &str = "mount/Kept.txt";
     /// A mount two levels below a directory the instance's revision does not hold.
     const MOUNT_BELOW_UNTRACKED: &str = "a/b/mount";
     /// The name of a file no revision holds, written into each directory a purge is to empty.
@@ -144,14 +147,17 @@ mod tests {
             immutable_store: Arc<dyn lore_storage::ImmutableStore>,
             mutable_store: Arc<dyn lore_storage::MutableStore>,
         ) -> Self {
-            Self::create_mounted_at(immutable_store, mutable_store, MOUNT).await
+            Self::create_mounted_at(immutable_store, mutable_store, MOUNT, None).await
         }
 
-        /// [`Self::create`], with the layer mounted at `mount` in place of [`MOUNT`].
+        /// [`Self::create`], with the layer mounted at `mount` in place of [`MOUNT`], and the
+        /// instance's first revision holding `own_below_mount` as well where given, a file below
+        /// the mount the working tree does not hold.
         async fn create_mounted_at(
             immutable_store: Arc<dyn lore_storage::ImmutableStore>,
             mutable_store: Arc<dyn lore_storage::MutableStore>,
             mount: &'static str,
+            own_below_mount: Option<&str>,
         ) -> Self {
             let source = test_repository_create(
                 immutable_store.clone(),
@@ -172,7 +178,16 @@ mod tests {
             )
             .await;
             test_file_write(instance.path.join(OWN).as_path(), OWN_CONTENT);
+            let own_below_mount = own_below_mount.map(|path| instance.path.join(path));
+            if let Some(path) = &own_below_mount {
+                std::fs::create_dir_all(path.parent().expect("A path below the mount"))
+                    .expect("Create directory failed");
+                test_file_write(path.as_path(), KEPT_CONTENT);
+            }
             test_commit_tree(&instance, "First").await;
+            if let Some(path) = &own_below_mount {
+                std::fs::remove_file(path).expect("Failed to remove the file");
+            }
 
             // The layer repository's latest on the instance's branch, which is where a sync resolves
             // the revision to carry the layer to.
@@ -1088,6 +1103,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     MOUNT_BELOW_UNTRACKED,
+                    None,
                 )
                 .await;
                 fixture.materialize_mount();
@@ -1215,6 +1231,53 @@ mod tests {
                         written: 0,
                     },
                     "the purge deletes the one file the branch point lacks alone"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset to the point the root was last merged from a branch walks no layer, and the
+    /// instance's own walk renames nothing below the mount: where the instance tracks a path there
+    /// in another case than the layer, the layer's entry keeps the layer's spelling.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_last_merged_reset_keeps_the_layer_spelling_below_the_mount() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_mounted_at(
+                    immutable_store,
+                    mutable_store,
+                    MOUNT,
+                    Some(OWN_BELOW_MOUNT),
+                )
+                .await;
+                fixture.materialize_mount();
+                let default_branch = fixture.branch_off(&[SECOND]).await;
+
+                fixture
+                    .reset_reporting(&[""], Some(default_branch), false)
+                    .await;
+
+                let names: Vec<String> = std::fs::read_dir(fixture.working(MOUNT))
+                    .expect("Failed to list the mount")
+                    .map(|entry| {
+                        entry
+                            .expect("Failed to read an entry of the mount")
+                            .file_name()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect();
+                assert!(
+                    names.iter().any(|name| name == SOURCE_KEPT),
+                    "the reset renamed the layer's entry, leaving {names:?}"
+                );
+                assert_eq!(
+                    fixture.working_file(MOUNTED_KEPT).as_deref(),
+                    Some(KEPT_CONTENT)
                 );
             }))
             .await
@@ -1353,6 +1416,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     MOUNT_IN_BRANCH_DIRECTORY,
+                    None,
                 )
                 .await;
                 fixture.materialize_mount();
@@ -1422,6 +1486,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     MOUNT_IN_BRANCH_DIRECTORY,
+                    None,
                 )
                 .await;
                 fixture.mount_in_place_of_a_file(BRANCH_DIRECTORY).await;
@@ -1453,6 +1518,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     MOUNT_IN_BRANCH_DIRECTORY,
+                    None,
                 )
                 .await;
                 fixture.mount_in_place_of_a_file(BRANCH_DIRECTORY).await;
@@ -1497,6 +1563,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     MOUNT_IN_BRANCH_DIRECTORY,
+                    None,
                 )
                 .await;
                 let beside = fixture.commit_beside(4).await;
@@ -1539,6 +1606,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     MOUNT_IN_BRANCH_DIRECTORY,
+                    None,
                 )
                 .await;
                 fixture.mount_in_place_of_a_file(BRANCH_DIRECTORY).await;
@@ -1585,6 +1653,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     MOUNT_BELOW_ANCESTOR,
+                    None,
                 )
                 .await;
                 std::fs::create_dir_all(fixture.working(ANCESTOR))
@@ -1632,6 +1701,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     MOUNT_BELOW_ANCESTOR,
+                    None,
                 )
                 .await;
                 fixture.mount_in_place_of_a_file(FILE_BELOW_ANCESTOR).await;
@@ -1669,6 +1739,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     MOUNT_IN_BRANCH_DIRECTORY,
+                    None,
                 )
                 .await;
                 fixture
@@ -1695,7 +1766,8 @@ mod tests {
         runtime()
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let fixture =
-                    Fixture::create_mounted_at(immutable_store, mutable_store, MOUNT_IN_LINK).await;
+                    Fixture::create_mounted_at(immutable_store, mutable_store, MOUNT_IN_LINK, None)
+                        .await;
                 mount_intermediate_at(
                     &fixture.reopened(),
                     LINK,
@@ -1730,6 +1802,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     MOUNT_IN_BRANCH_DIRECTORY,
+                    None,
                 )
                 .await;
                 fixture.mount_in_place_of_a_file(BRANCH_DIRECTORY).await;
@@ -1775,6 +1848,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     MOUNT_IN_BRANCH_DIRECTORY,
+                    None,
                 )
                 .await;
                 fixture.mount_in_place_of_a_file(BRANCH_DIRECTORY).await;
@@ -1810,6 +1884,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     MOUNT_BELOW_ANCESTOR,
+                    None,
                 )
                 .await;
                 fixture.mount_in_place_of_a_file(FILE_BELOW_ANCESTOR).await;
@@ -1886,6 +1961,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     MOUNT_IN_BRANCH_DIRECTORY,
+                    None,
                 )
                 .await;
                 fixture.mount_in_place_of_a_file(BRANCH_DIRECTORY).await;
@@ -1916,6 +1992,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     MOUNT_IN_BRANCH_DIRECTORY,
+                    None,
                 )
                 .await;
                 let beside = fixture.commit_beside(1).await;
@@ -1970,6 +2047,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     MOUNT_IN_BRANCH_DIRECTORY,
+                    None,
                 )
                 .await;
                 fixture

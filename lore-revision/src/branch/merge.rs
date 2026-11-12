@@ -2828,7 +2828,7 @@ async fn restart_reset_conflicts(
         &[],
         None,
         dry_run,
-        false, /* is merge */
+        None, /* Not a merge */
         Arc::new(sync::SyncRealizeStats::default()),
     )
     .await
@@ -2866,7 +2866,7 @@ async fn realize_diff_over_filesystem(args: RealizeDiff<'_>) -> Result<(), Merge
         &[],
         Some(args.state_staged.clone()),
         args.skip_filesystem,
-        true, /* is merge */
+        Some(args.state_to.clone()), /* The merge applies to the target */
         args.stats.clone(),
     )
     .await
@@ -3807,7 +3807,7 @@ pub async fn merge_abort(
             &[],
             None,
             dry_run,
-            false, /* Not a merge */
+            None, /* Not a merge */
             Arc::new(sync::SyncRealizeStats::default()),
         )
         .await
@@ -5344,8 +5344,8 @@ pub async fn merge_into(
         repository.clone(),
         Arc::new(changes.clone()),
         Some(state_staged.clone()),
-        true, /* No changes on disk */
-        true, /* Merge */
+        true,                       /* No changes on disk */
+        Some(state_branch.clone()), /* The merge applies to the branch latest */
         stats,
     )
     .await

@@ -35,6 +35,7 @@ use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::filter::WalkPath;
 use crate::fs::filesystem_provider::ChainRoot;
+use crate::fs::filesystem_provider::DirectoryEntry;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::FilesystemDiffContext;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
@@ -1462,7 +1463,7 @@ async fn claim_named_child(
 
 /// Whether the tree and the file system agree on the type at a path. A type change replaces
 /// the node rather than settling it, so staging decides only where they agree.
-fn types_agree(from_node: &Node, is_file: bool, is_directory: bool) -> bool {
+pub(crate) fn types_agree(from_node: &Node, is_file: bool, is_directory: bool) -> bool {
     (from_node.is_file() && is_file)
         || ((from_node.is_directory() || from_node.is_link()) && is_directory)
 }
@@ -2628,6 +2629,129 @@ async fn spelled_as(
         .node_name_ref_or_skip(nodes.repository.clone(), node_id)
         .await?
         .is_some_and(|held| *held == *name))
+}
+
+/// An entry of a directory of the working tree, as a listing of it reads it.
+#[lore_macro::test_pub]
+pub(crate) struct ListedEntry {
+    /// The fold of its name, which [`InstanceOperation::read_directory`] carries, and which a
+    /// node's children are matched on.
+    pub(crate) folded: u64,
+    pub(crate) name: String,
+    /// Whether it is a file, and otherwise a directory.
+    pub(crate) file: bool,
+    /// Whether a child of the directory stands for it.
+    pub(crate) claimed: bool,
+}
+
+impl ListedEntry {
+    pub(crate) fn listed(entry: DirectoryEntry) -> Self {
+        Self {
+            folded: entry.name_hash,
+            file: entry.info.is_file(),
+            name: entry.name,
+            claimed: false,
+        }
+    }
+}
+
+/// The entries a directory of the working tree holds, read once, which are paired with the
+/// children of the directory's node as the filesystem diff pairs them ([`tracked_child`]): a
+/// reset's walk pairs its children and purges what none claims, and a realize pairs the source of
+/// each move whose rename the file system refused.
+#[lore_macro::test_pub]
+#[derive(Default)]
+pub(crate) struct ListedSpellings {
+    /// Sorted by fold.
+    pub(crate) entries: Vec<ListedEntry>,
+    /// Whether the listing read every entry. A directory that cannot be listed, as one the
+    /// working tree does not hold, and an entry that cannot be read leave it short.
+    pub(crate) complete: bool,
+}
+
+impl ListedSpellings {
+    /// Lists `directory`, holding nothing where it cannot be listed and skipping an entry that
+    /// cannot be read, which leaves the listing short.
+    pub(crate) async fn read(operation: &InstanceOperationImpl, directory: &RelativePath) -> Self {
+        let mut listed = Self::default();
+        if let Ok(mut listing) = operation.read_directory(directory).await {
+            listed.complete = true;
+            while let Some(entry) = listing.next().await {
+                match entry {
+                    Ok(entry) => listed.entries.push(ListedEntry::listed(entry)),
+                    Err(_) => listed.complete = false,
+                }
+            }
+        }
+        listed.entries.sort_unstable_by_key(|entry| entry.folded);
+        listed
+    }
+
+    /// The entries folding to `folded`.
+    fn run(&self, folded: u64) -> std::ops::Range<usize> {
+        let start = self.entries.partition_point(|entry| entry.folded < folded);
+        let end = self.entries[start..]
+            .iter()
+            .position(|entry| entry.folded != folded)
+            .map_or(self.entries.len(), |after| start + after);
+        start..end
+    }
+
+    /// The other spelling the directory holds the child `node` in, which the revision names
+    /// `name`: the one entry folding to its name, where it is spelled otherwise and of the child's
+    /// kind ([`types_agree`]), as [`tracked_child`] pairs an entry with the only child of its
+    /// name. That entry is claimed, and so is one spelled as the child whatever its kind, which the
+    /// walk replaces.
+    pub(crate) fn claim(&mut self, name: &str, node: &Node) -> Option<String> {
+        let run = self.run(node.name_hash);
+        let entries = &mut self.entries[run];
+        if let Some(spelled) = entries.iter_mut().find(|entry| entry.name == name) {
+            spelled.claimed = true;
+            return None;
+        }
+        match entries {
+            [entry] if !entry.claimed && types_agree(node, entry.file, !entry.file) => {
+                entry.claimed = true;
+                Some(entry.name.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Adds the entry `name`, folding to `folded`, a file where `file` says so, which a provider's
+    /// index answered for, where the listing holds no entry of that name yet.
+    pub(crate) fn add(&mut self, folded: u64, name: String, file: bool) {
+        let run = self.run(folded);
+        if self.entries[run.clone()]
+            .iter()
+            .any(|entry| entry.name == name)
+        {
+            return;
+        }
+        self.entries.insert(
+            run.start,
+            ListedEntry {
+                folded,
+                name,
+                file,
+                claimed: false,
+            },
+        );
+    }
+
+    /// Whether the one entry folding to `name` is spelled otherwise and claimed by no child, which
+    /// [`Self::claim`] then pairs with the child of that name where it is of the child's kind.
+    pub(crate) fn holds_another_spelling(&self, name: &str) -> bool {
+        let run = self.run(crate::hash::hash_string(name));
+        matches!(&self.entries[run], [entry] if !entry.claimed && entry.name != name)
+    }
+
+    /// Whether a child claimed the entry `name`, folding to `folded`.
+    pub(crate) fn claims(&self, name: &str, folded: u64) -> bool {
+        self.entries[self.run(folded)]
+            .iter()
+            .any(|entry| entry.claimed && entry.name == name)
+    }
 }
 
 /// Reports the entries no node matched, each with the filter's verdict for it, walking below new

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use lore_base::types::FragmentFlags;
 use lore_revision::change;
 use lore_revision::change::FileAction;
 use lore_revision::change::NodeChange;
@@ -41,6 +42,7 @@ use crate::helper::in_memory;
 use crate::helper::in_memory::directory;
 use crate::helper::in_memory::file;
 use crate::repository::test_helpers::file_node;
+use crate::repository::test_helpers::store_fragment;
 use crate::repository::test_helpers::stored_as_list;
 use crate::repository::test_helpers::working_tree_repository;
 use crate::repository::test_helpers::working_tree_repository_filtered;
@@ -1236,7 +1238,7 @@ async fn realize_verified(
         &[],
         None,
         false,
-        false,
+        None,
         Arc::default(),
     )
     .await
@@ -1892,7 +1894,7 @@ async fn a_deleted_link_keeps_a_file_already_holding_what_replaces_it() {
             &kept,
             None,
             false,
-            false,
+            None,
             Arc::default(),
         ))
         .await
@@ -1937,7 +1939,7 @@ async fn a_deleted_link_removes_a_wide_mount_around_the_files_it_keeps() {
             &[relative(TRACKED), relative(nested)],
             None,
             false,
-            false,
+            None,
             Arc::default(),
         ))
         .await
@@ -1983,7 +1985,7 @@ async fn a_deleted_link_removes_a_deep_mount_around_the_file_it_keeps() {
             &[relative(&kept)],
             None,
             false,
-            false,
+            None,
             Arc::default(),
         ))
         .await
@@ -2046,7 +2048,7 @@ async fn a_deleted_link_keeps_a_forwarded_local_edit() {
             &kept,
             None,
             false,
-            false,
+            None,
             Arc::default(),
         ))
         .await
@@ -2230,6 +2232,119 @@ async fn a_delete_leaves_a_second_tracked_spelling_alone() {
     .await;
 }
 
+/// A move whose destination the working tree holds already, an untracked file here, leaves the
+/// entry the working tree holds its source in under another spelling where it stands, and writes
+/// the destination over what stood there.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_move_onto_an_occupied_destination_leaves_the_other_spelling_of_its_source() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(1174, 0);
+        store_fragment(
+            &repository,
+            &content,
+            FragmentFlags::empty(),
+            content.len() as u64,
+        )
+        .await;
+        let state = plugin_tree(&repository, &[(TRACKED, &content)]).await;
+        let destination = "Plugin/Moved.cs";
+        write_working_files(
+            &repository,
+            &[(VARIANT, &content), (destination, b"untracked")],
+        )
+        .await;
+        let from = Staged {
+            state: state.clone(),
+            node: state
+                .find_node_link(repository.clone(), TRACKED)
+                .await
+                .unwrap()
+                .node,
+            address: file_node(&content).address,
+            mode: 0,
+        };
+        let to = state_holding(&repository, &relative(destination), file_node(&content), 2).await;
+        let moved = NodeChange {
+            action: FileAction::Move,
+            flags: change::Flags::None,
+            from: side(&repository, &from, relative(TRACKED)),
+            to: side(&repository, &to, relative(destination)),
+        };
+
+        Box::pin(realize_verified(&repository, &state, vec![moved], false))
+            .await
+            .expect("the move realizes");
+        assert_eq!(working_file(&repository, VARIANT).await, content);
+        assert_eq!(working_file(&repository, destination).await, content);
+    }))
+    .await;
+}
+
+/// A merge's move starts from the base revision, while the working tree stands on the revision
+/// the merge applies to. The entry the working tree holds the source in under another spelling
+/// is paired with the node that revision holds, and moved where it holds that node's content,
+/// edited since the base, with the merged content written over it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_merge_moves_the_other_spelling_of_a_source_edited_since_the_base() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let base_content = pseudo_random_bytes(1174, 0);
+        let current_content = pseudo_random_bytes(1174, 1);
+        let merged = pseudo_random_bytes(1174, 2);
+        store_fragment(
+            &repository,
+            &merged,
+            FragmentFlags::empty(),
+            merged.len() as u64,
+        )
+        .await;
+        let base = plugin_tree(&repository, &[(TRACKED, &base_content)]).await;
+        let current = plugin_tree(&repository, &[(TRACKED, &current_content)]).await;
+        current.set_revision(lore_base::types::Hash::from([3; 32]));
+        write_working_files(&repository, &[(VARIANT, &current_content)]).await;
+        let from = Staged {
+            state: base.clone(),
+            node: base
+                .find_node_link(repository.clone(), TRACKED)
+                .await
+                .unwrap()
+                .node,
+            address: file_node(&base_content).address,
+            mode: 0,
+        };
+        let destination = "Plugin/Moved.cs";
+        let to = state_holding(&repository, &relative(destination), file_node(&merged), 2).await;
+        let moved = NodeChange {
+            action: FileAction::Move,
+            flags: change::Flags::None,
+            from: side(&repository, &from, relative(TRACKED)),
+            to: side(&repository, &to, relative(destination)),
+        };
+
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        realize_changes(
+            repository.clone(),
+            operation,
+            Arc::new(vec![moved]),
+            &[],
+            None,
+            false,
+            Some(current),
+            Arc::default(),
+        )
+        .await
+        .expect("the merge realizes");
+        assert!(!working_path_exists(&repository, VARIANT).await);
+        assert_eq!(working_file(&repository, destination).await, merged);
+    }))
+    .await;
+}
+
 /// A file a move carries out of the deleted directory is judged against that move's target, not
 /// against the target of a move from another spelling of its name, whichever spelling the working
 /// tree holds and in either order of the moves.
@@ -2359,7 +2474,7 @@ async fn a_merge_deleting_a_directory_keeps_an_edited_case_variant_of_an_ignored
                 &[],
                 None,
                 false,
-                true,
+                Some(state.clone()),
                 Arc::default(),
             )
             .await
@@ -2459,7 +2574,7 @@ async fn sync_continues_after_a_materialization_error() {
             &[],
             None,
             false,
-            false,
+            None,
             Arc::default(),
         )
         .await;
@@ -2495,7 +2610,9 @@ async fn a_refused_move_removes_its_destination_unless_it_is_the_source() {
             (TestIdentity::Fails, "other", &[][..]),
         ];
         for (identity, to, removed) in cases {
-            let filesystem = Arc::new(TestFilesystemProvider::new().with_identity(identity));
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+            let filesystem =
+                Arc::new(TestFilesystemProvider::reading(dir.path()).with_identity(identity));
             let repository = test_repository_over(
                 immutable_store.clone(),
                 mutable_store.clone(),
@@ -2530,7 +2647,7 @@ async fn a_refused_move_removes_its_destination_unless_it_is_the_source() {
                 &[],
                 None,
                 false,
-                false,
+                None,
                 stats.clone(),
             )
             .await
@@ -2543,9 +2660,9 @@ async fn a_refused_move_removes_its_destination_unless_it_is_the_source() {
                 .then(|| ("Dir".to_string(), to.to_string()));
             assert_eq!(
                 (
-                    stats.kept_moves.count.load(Ordering::Relaxed),
+                    stats.kept_renames.count.load(Ordering::Relaxed),
                     stats
-                        .kept_moves
+                        .kept_renames
                         .first
                         .get()
                         .map(|kept| (kept.from.to_string(), kept.to.to_string())),

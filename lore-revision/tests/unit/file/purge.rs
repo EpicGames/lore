@@ -15,6 +15,8 @@ use lore_revision::fs::filesystem_provider::test_util::TestIdentity;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::state::State;
+use lore_revision::state::os_diff::ListedEntry;
+use lore_revision::state::os_diff::ListedSpellings;
 use lore_revision::util::path::RelativePath;
 use lore_storage::hash::hash_string;
 use lore_storage::hash::hash_string_bytes;
@@ -64,6 +66,7 @@ async fn purged(identity: TestIdentity, child: Option<NodeID>) -> Vec<String> {
         dir.path(),
         &RelativePath::new(),
         Some(held),
+        None,
         false,
     )
     .await
@@ -101,6 +104,53 @@ async fn a_folded_match_to_a_child_whose_name_cannot_be_read_is_held() {
     lore_base::runtime::LORE_CONTEXT
         .scope(setup_test_execution(), async {
             assert!(purged(TestIdentity::Exact, Some(UNREAD)).await.is_empty());
+        })
+        .await;
+}
+
+/// A purge handed a listing short of an entry lists the directory again and removes what it finds
+/// there, less the names a child claimed in the listing it was handed.
+#[tokio::test]
+async fn a_purge_listing_a_directory_again_leaves_the_claimed_names() {
+    lore_base::runtime::LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let dir = TempDir::new("lore-purge-test-");
+            for name in ["claimed.txt", "untracked.txt"] {
+                std::fs::write(dir.child(name), b"content").expect("write the entry");
+            }
+            let (immutable_store, mutable_store, _) =
+                test_store_create().await.expect("Making test stores");
+            let filesystem = Arc::new(TestFilesystemProvider::reading(dir.path()));
+            let repository =
+                test_repository_over(immutable_store, mutable_store, filesystem.clone());
+            let operation = repository
+                .file_system()
+                .begin_operation()
+                .await
+                .expect("an operation");
+            let listed = ListedSpellings {
+                entries: vec![ListedEntry {
+                    folded: hash_string("claimed.txt"),
+                    name: "claimed.txt".to_string(),
+                    file: true,
+                    claimed: true,
+                }],
+                complete: false,
+            };
+
+            purge_untracked_children(
+                &operation,
+                &Arc::new(ResetStats::default()),
+                dir.path(),
+                &RelativePath::new(),
+                None,
+                Some(listed),
+                false,
+            )
+            .await
+            .expect("the purge runs");
+
+            assert_eq!(*filesystem.removed.lock(), ["untracked.txt"]);
         })
         .await;
 }

@@ -375,8 +375,8 @@ pub(crate) async fn restore(
         repository.clone(),
         Arc::new(changes.clone()),
         Some(state_staged.clone()),
-        true,  /* No changes on disk */
-        false, /* No merge */
+        true, /* No changes on disk */
+        None, /* No merge */
         stats,
     )
     .await

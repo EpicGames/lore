@@ -1079,7 +1079,7 @@ pub(crate) async fn sync_in_operation(
         &kept,
         None,
         dry_run,
-        false, /* Not a merge */
+        None, /* Not a merge */
         stats.clone(),
     )
     .await

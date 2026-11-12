@@ -1957,7 +1957,7 @@ async fn realize_link_pin_diff(
         &kept,
         None,
         false, /* Not dry run */
-        false, /* Not a merge */
+        None,  /* Not a merge */
         stats,
     )
     .await

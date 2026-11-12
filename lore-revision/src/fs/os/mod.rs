@@ -27,6 +27,7 @@ use lore_error_set::prelude::*;
 use lore_io::StatKind;
 use lore_io::clone::CloneStats;
 
+use super::filesystem_provider::CaseLookup;
 use super::filesystem_provider::CloneAnswer;
 use super::filesystem_provider::CloneRun;
 use super::filesystem_provider::DirectoryEntry;
@@ -203,6 +204,16 @@ impl InstanceOperation for OsOperation {
 
     /// A path through a name no node may carry, which the root is refused for, is held in no
     /// spelling.
+    /// [`CaseLookup::OnMiss`] on Linux, whose file systems do not fold case, and
+    /// [`CaseLookup::Listing`] elsewhere.
+    fn case_lookup(&self) -> CaseLookup {
+        if cfg!(target_os = "linux") {
+            CaseLookup::OnMiss
+        } else {
+            CaseLookup::Listing
+        }
+    }
+
     async fn holds_name_exactly(&self, path: &RelativePath) -> Option<bool> {
         let Ok(path) = self.absolute(path) else {
             return Some(false);

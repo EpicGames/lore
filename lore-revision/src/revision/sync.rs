@@ -1372,20 +1372,20 @@ pub struct SyncCompleteStats {
 pub struct SyncRealizeStats {
     pub discovery: DiscoveryStats,
     pub complete: SyncCompleteStats,
-    pub kept_moves: KeptMoves,
+    pub kept_renames: KeptRenames,
 }
 
-/// The moves a realize carries out without their rename, leaving the source where it stands: the
-/// rename was refused, and the destination names the source's own entry or cannot be told apart
-/// from it. Counted, with the first, for the one warning the realize ends with.
+/// Renames left undone, which leave their source where it stands: ones the file system refused,
+/// and ones that would carry a layer's mount away from where the layer is mounted. Counted, with
+/// the first, for one warning.
 #[derive(Default)]
-pub struct KeptMoves {
+pub struct KeptRenames {
     pub count: AtomicUsize,
-    pub first: std::sync::OnceLock<KeptMove>,
+    pub first: std::sync::OnceLock<KeptRename>,
 }
 
-/// A move [`KeptMoves`] counts: where it is from and to, and why it was kept.
-pub struct KeptMove {
+/// A rename [`KeptRenames`] counts: where it is from and to, and why it was left undone.
+pub struct KeptRename {
     pub from: RelativePath,
     pub to: RelativePath,
     pub reason: String,
@@ -1417,7 +1417,7 @@ pub async fn realize_changes(
     changes: Arc<Vec<NodeChange>>,
     state_stage: Option<Arc<State>>,
     dry_run: bool,
-    is_merge: bool,
+    merge_current: Option<Arc<State>>,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
     shim_with_operation(repository.file_system(), async |operation| {
@@ -1428,7 +1428,7 @@ pub async fn realize_changes(
             &[],
             state_stage,
             dry_run,
-            is_merge,
+            merge_current,
             stats,
         )
         .await

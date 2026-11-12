@@ -389,6 +389,41 @@ pub fn test_file_write(path: &std::path::Path, contents: &[u8]) {
         .unwrap_or_else(|_| panic!("Failed to write test file at {}", path.display()));
 }
 
+/// Every path under `root` but the control directory, with a file's content and `None` for a
+/// directory.
+#[allow(dead_code)]
+pub fn working_tree(root: &std::path::Path) -> std::collections::BTreeMap<String, Option<Vec<u8>>> {
+    fn walk(
+        root: &std::path::Path,
+        directory: &std::path::Path,
+        tree: &mut std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    ) {
+        for entry in std::fs::read_dir(directory).expect("Failed to list directory") {
+            let path = entry.expect("Failed to read directory entry").path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("Entry outside the root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if relative == ".lore" {
+                continue;
+            }
+            if path.is_dir() {
+                tree.insert(relative, None);
+                walk(root, &path, tree);
+            } else {
+                // Test fixture reads; not subject to repository write-token discipline.
+                #[allow(clippy::disallowed_methods)]
+                let content = std::fs::read(&path).expect("Failed to read file");
+                tree.insert(relative, Some(content));
+            }
+        }
+    }
+    let mut tree = std::collections::BTreeMap::new();
+    walk(root, root, &mut tree);
+    tree
+}
+
 /// Whether the file system holding `dir` holds one spelling of a name and answers lookups in any
 /// other. Windows and macOS do by default and Linux does not, but a mount can be either on any of
 /// them, so a test asks rather than assumes.

@@ -3243,6 +3243,76 @@ def test_layer_reset_mount_path_differs_from_source_path(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_layer_reset_puts_back_the_layer_spelling_below_its_mount(new_lore_repo):
+    """`reset` of a layer file the working tree spells in another case puts back the
+    spelling the layer's revision holds, while a reset naming the mount keeps the mount's
+    own name, which the layer's source directory does not share.
+    """
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+
+    repo.write_commit_push(None, {MAIN_FILE: b"main content"})
+    layer_repo.make_dirs("src")
+    layer_repo.write_commit_push(
+        None, {os.path.join("src", "Nested.txt"): b"nested v1"}
+    )
+    repo.layer_add("mnt", layer_repo, "src/")
+
+    variant = os.path.join("mnt", "nested.txt")
+    repo.move(os.path.join("mnt", "Nested.txt"), os.path.join("mnt", "nested.tmp"))
+    repo.move(os.path.join("mnt", "nested.tmp"), variant)
+    with repo.open_file(variant, mode="wb") as out:
+        out.write(b"nested v2")
+
+    repo.reset(variant)
+
+    mount = Path(repo.path) / "mnt"
+    assert os.listdir(mount) == ["Nested.txt"], (
+        f"reset should put back the layer's spelling, left {os.listdir(mount)}"
+    )
+    assert (mount / "Nested.txt").read_bytes() == b"nested v1"
+
+    repo.reset("mnt")
+
+    entries = os.listdir(repo.path)
+    assert "mnt" in entries and "src" not in entries, (
+        f"a reset of the mount should keep its name, left {entries}"
+    )
+    assert os.listdir(mount) == ["Nested.txt"]
+
+
+@pytest.mark.smoke
+def test_layer_reset_keeps_the_spelling_of_a_directory_holding_a_mount(new_lore_repo):
+    """`reset` leaves a directory the working tree holds in another case than the
+    revision where a layer is mounted below it, as the rename would carry the mount away
+    from the path the layer names, and restores what the directory holds where it stands.
+    """
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+
+    repo.write_commit_push(None, {os.path.join("Dir", "a.txt"): b"committed"})
+    layer_repo.make_dirs("src")
+    layer_repo.write_commit_push(None, {os.path.join("src", "x.txt"): b"layer"})
+
+    repo.move("Dir", "dir.tmp")
+    repo.move("dir.tmp", "dir")
+    repo.layer_add(os.path.join("dir", "mnt"), layer_repo, "src/")
+    with repo.open_file(os.path.join("dir", "a.txt"), mode="wb") as out:
+        out.write(b"edited")
+
+    repo.reset(".")
+
+    entries = sorted(entry for entry in os.listdir(repo.path) if entry != ".lore")
+    assert entries == ["dir"], (
+        f"reset should keep the directory's spelling, left {entries}"
+    )
+    with repo.open_file(os.path.join("dir", "a.txt"), mode="rb") as f:
+        assert f.read() == b"committed"
+    with repo.open_file(os.path.join("dir", "mnt", "x.txt"), mode="rb") as f:
+        assert f.read() == b"layer"
+
+
+@pytest.mark.smoke
 def test_layer_unstage_and_reset_leave_a_clean_layer_unpinned(new_lore_repo):
     """`unstage .` and `reset .` still act on the parent's own files, and pin nothing.
 

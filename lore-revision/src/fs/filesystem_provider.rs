@@ -249,6 +249,29 @@ pub struct StageIntent {
     pub file_id: Option<Context>,
 }
 
+/// How a walk finds the entry a directory holds a name in under another case than the revision
+/// spells it, which turns on whether the file system folds case and on what answers for one name
+/// without a read of the whole directory. A purge reads every directory it purges whatever the
+/// answer, and pairs its children from that listing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CaseLookup {
+    /// A path names only the entry spelled as it, so the stat of each child at the revision's
+    /// spelling, which a walk makes anyway, misses where the working tree spells it otherwise, and
+    /// the directory is read on its first miss alone: the OS provider on Linux. On a Linux file
+    /// system that folds case every such stat hits, and the walk keeps the working tree's
+    /// spelling.
+    OnMiss,
+    /// The provider answers for each name from an index of its own
+    /// ([`InstanceOperation::holds_name_exactly`], then [`InstanceOperation::names_folding_to`])
+    /// without reading the directory: FUSE.
+    PerName,
+    /// A path names the entry whatever case it is spelled in, so only a read of the directory tells
+    /// a spelling apart, and the walk reads each directory once before its children: the OS
+    /// provider on Windows and macOS, and SWFS.
+    #[default]
+    Listing,
+}
+
 /// What a filesystem diff does with the differences it finds.
 #[derive(Debug, Clone, Copy)]
 pub enum FilesystemDiffIntent {
@@ -742,6 +765,12 @@ pub trait InstanceOperation: Send + Sync {
             }
             Ok(matches)
         }
+    }
+
+    /// How a walk finds the entry a directory holds a name in under another case than the one it
+    /// asks for ([`CaseLookup`]).
+    fn case_lookup(&self) -> CaseLookup {
+        CaseLookup::Listing
     }
 
     /// The children of the directory at `path`, described as the repository tracks them.
@@ -1406,6 +1435,17 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
+    fn case_lookup(&self) -> CaseLookup {
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(this) => this.case_lookup(),
+            StaticDispatchInstanceOperation::Os(this) => this.case_lookup(),
+            StaticDispatchInstanceOperation::Swfs(this) => this.case_lookup(),
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.case_lookup(),
+        }
+    }
+
     async fn names_folding_to(
         &self,
         path: &RelativePath,
@@ -1456,7 +1496,10 @@ impl InstanceOperation for InstanceOperationImpl {
     ) -> Result<NodeComparison, FsError> {
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => {
+                this.file_holds_content(repository, path, previous, previous_size, established)
+                    .await
+            }
             StaticDispatchInstanceOperation::Os(this) => {
                 this.file_holds_content(repository, path, previous, previous_size, established)
                     .await
@@ -1516,7 +1559,7 @@ impl InstanceOperation for InstanceOperationImpl {
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => this.write_file(path, contents).await,
             StaticDispatchInstanceOperation::Os(this) => this.write_file(path, contents).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.write_file(path, contents).await,
             #[cfg(target_os = "linux")]
@@ -1561,7 +1604,7 @@ impl InstanceOperation for InstanceOperationImpl {
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => this.remove(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.remove(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.remove(path).await,
             #[cfg(target_os = "linux")]
@@ -1611,7 +1654,9 @@ impl InstanceOperation for InstanceOperationImpl {
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => {
+                this.write_node(repository, node, path).await
+            }
             StaticDispatchInstanceOperation::Os(this) => {
                 this.write_node(repository, node, path).await
             }
@@ -1758,6 +1803,7 @@ pub mod test_util {
     use lore_error_set::prelude::*;
     use parking_lot::Mutex;
 
+    use crate::fs::filesystem_provider::CaseLookup;
     use crate::fs::filesystem_provider::DirectoryListing;
     use crate::fs::filesystem_provider::FileInfo;
     use crate::fs::filesystem_provider::FilesystemDiffContext;
@@ -1789,7 +1835,9 @@ pub mod test_util {
 
     /// Answers the reads and the directory create these tests make, refuses each rename, and
     /// records each finalize, `stored` and `committed` call, hold, warm-up of the held ignore file
-    /// and recursive removal. Every other member panics.
+    /// and recursive removal, which removes nothing. Where it reads from a directory, it also
+    /// writes and removes single entries there. `write_fails` fails only the directory create.
+    /// Every other member panics.
     #[derive(Default)]
     pub struct TestOperation {
         pub file_info_count: Arc<AtomicUsize>,
@@ -1829,6 +1877,10 @@ pub mod test_util {
         pub removed: Arc<Mutex<Vec<String>>>,
         /// How `names_one_entry` answers.
         pub identity: TestIdentity,
+        /// What `case_lookup` answers.
+        pub case_lookup: CaseLookup,
+        /// How many directories were read.
+        pub directory_reads: Arc<AtomicUsize>,
     }
 
     /// How a [`TestOperation`] answers `names_one_entry`.
@@ -1962,8 +2014,13 @@ pub mod test_util {
             })
         }
 
+        fn case_lookup(&self) -> CaseLookup {
+            self.case_lookup
+        }
+
         /// Lists the directory the provider reads from, and panics where it reads from none.
         async fn read_directory(&self, path: &RelativePath) -> Result<DirectoryListing, FsError> {
+            self.directory_reads.fetch_add(1, Ordering::AcqRel);
             match &self.reads {
                 Some(reads) => reads.read_directory(path).await,
                 None => panic!("Test operation reads no directory"),
@@ -1992,15 +2049,24 @@ pub mod test_util {
             }
         }
 
+        /// Compares the file under the directory the provider reads from, and panics where it
+        /// reads from none.
         async fn file_holds_content(
             &self,
-            _repository: Arc<RepositoryContext>,
-            _path: &RelativePath,
-            _previous: Address,
-            _previous_size: u64,
-            _established: &lore_storage::ContentHashes,
+            repository: Arc<RepositoryContext>,
+            path: &RelativePath,
+            previous: Address,
+            previous_size: u64,
+            established: &lore_storage::ContentHashes,
         ) -> Result<NodeComparison, FsError> {
-            panic!("Test operation unimplemented except finalize")
+            match &self.reads {
+                Some(reads) => {
+                    reads
+                        .file_holds_content(repository, path, previous, previous_size, established)
+                        .await
+                }
+                None => panic!("Test operation unimplemented except finalize"),
+            }
         }
 
         async fn make_executable(
@@ -2011,16 +2077,25 @@ pub mod test_util {
             panic!("Test operation unimplemented except finalize")
         }
 
-        /// Succeeds without a tree behind it, or fails where the provider was told writes fail.
-        async fn create_dir_all(&self, _path: &RelativePath) -> Result<(), FsError> {
+        /// Creates the directory under the directory the provider reads from, where it reads from
+        /// one, and otherwise succeeds without a tree behind it; fails where the provider was told
+        /// writes fail.
+        async fn create_dir_all(&self, path: &RelativePath) -> Result<(), FsError> {
             if self.write_fails {
                 return Err(FsError::internal("Write failed"));
             }
-            Ok(())
+            match &self.reads {
+                Some(reads) => reads.create_dir_all(path).await,
+                None => Ok(()),
+            }
         }
 
-        async fn write_file(&self, _path: &RelativePath, _contents: Bytes) -> Result<(), FsError> {
-            panic!("Test operation unimplemented except finalize")
+        /// Writes under the directory the provider reads from, and panics where it reads from none.
+        async fn write_file(&self, path: &RelativePath, contents: Bytes) -> Result<(), FsError> {
+            match &self.reads {
+                Some(reads) => reads.write_file(path, contents).await,
+                None => panic!("Test operation unimplemented except finalize"),
+            }
         }
 
         /// Refuses the rename, as a file system that cannot carry it does.
@@ -2042,8 +2117,13 @@ pub mod test_util {
             }
         }
 
-        async fn remove(&self, _path: &RelativePath) -> Result<(), FsError> {
-            panic!("Test operation unimplemented except finalize")
+        /// Removes under the directory the provider reads from, and panics where it reads from
+        /// none.
+        async fn remove(&self, path: &RelativePath) -> Result<(), FsError> {
+            match &self.reads {
+                Some(reads) => reads.remove(path).await,
+                None => panic!("Test operation unimplemented except finalize"),
+            }
         }
 
         async fn remove_empty_directory(&self, _path: &RelativePath) -> Result<(), FsError> {
@@ -2056,13 +2136,17 @@ pub mod test_util {
             Ok(())
         }
 
+        /// Writes under the directory the provider reads from, and panics where it reads from none.
         async fn write_node(
             &self,
-            _repository: Arc<RepositoryContext>,
-            _node: &Node,
-            _path: &RelativePath,
+            repository: Arc<RepositoryContext>,
+            node: &Node,
+            path: &RelativePath,
         ) -> Result<FileInfo, FsError> {
-            panic!("Test operation unimplemented except finalize")
+            match &self.reads {
+                Some(reads) => reads.write_node(repository, node, path).await,
+                None => panic!("Test operation unimplemented except finalize"),
+            }
         }
 
         async fn set_file_to_immutable_store_contents(

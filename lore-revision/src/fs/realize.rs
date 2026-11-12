@@ -60,8 +60,8 @@ use crate::repository::RepositoryContext;
 use crate::repository::THEIRS_SUFFIX;
 use crate::repository::clone;
 use crate::repository::clone::CloneContext;
-use crate::revision::sync::KeptMove;
-use crate::revision::sync::KeptMoves;
+use crate::revision::sync::KeptRename;
+use crate::revision::sync::KeptRenames;
 use crate::revision::sync::LoreRevisionSyncFileEventData;
 use crate::revision::sync::LoreRevisionSyncProgressEventData;
 use crate::revision::sync::SyncError;
@@ -76,6 +76,8 @@ use crate::state::NameChange;
 use crate::state::NodeComparison;
 use crate::state::NodeMapping;
 use crate::state::State;
+use crate::state::os_diff::ListedSpellings;
+use crate::state::os_diff::types_agree;
 use crate::util;
 use crate::util::path::RelativePath;
 use crate::util::path::expand_path_ancestors;
@@ -313,7 +315,7 @@ pub async fn realize_state(
         &kept,
         None,
         dry_run,
-        false, /* Not a merge */
+        None, /* Not a merge */
         stats,
     )
     .await?;
@@ -1156,28 +1158,218 @@ async fn remove_directory_of_case_variants<C: Borrow<NodeChange>>(
     let mut removed = false;
     for (name, size, change) in &variants {
         let path = directory.join(name);
-        let established = lore_storage::ContentHashes::default();
-        let carried = change.move_source().map(|_| &change.to);
-        for side in std::iter::once(&change.from).chain(carried) {
-            let Ok(node) = side.get_node().await else {
-                continue;
-            };
-            if let Ok(NodeComparison::Matches) = state::file_matches_node(
-                side.mapping.repository.clone(),
-                &node,
-                *size,
-                &path,
-                operation,
-                &established,
-            )
-            .await
-            {
-                removed |= operation.remove(&path).await.is_ok();
-                break;
-            }
+        if holds_the_tracked_content(operation, change, &path, *size).await {
+            removed |= operation.remove(&path).await.is_ok();
         }
     }
     removed && operation.remove(directory).await.is_ok()
+}
+
+/// Whether the file of `size` bytes at `path` holds the content `change` starts from, or the
+/// content it carries where it is a move, which makes it the file the change tracks wherever the
+/// working tree spells it. A side whose node cannot be read holds nothing.
+async fn holds_the_tracked_content(
+    operation: &InstanceOperationImpl,
+    change: &NodeChange,
+    path: &RelativePath,
+    size: u64,
+) -> bool {
+    let carried = change.move_source().map(|_| &change.to);
+    for side in std::iter::once(&change.from).chain(carried) {
+        let Ok(node) = side.get_node().await else {
+            continue;
+        };
+        if holds_content_of(
+            operation,
+            side.mapping.repository.clone(),
+            &node,
+            path,
+            size,
+        )
+        .await
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the file of `size` bytes at `path` holds the content of `node`, which `repository`
+/// holds. A comparison that fails holds nothing.
+async fn holds_content_of(
+    operation: &InstanceOperationImpl,
+    repository: Arc<RepositoryContext>,
+    node: &Node,
+    path: &RelativePath,
+    size: u64,
+) -> bool {
+    matches!(
+        state::file_matches_node(
+            repository,
+            node,
+            size,
+            path,
+            operation,
+            &lore_storage::ContentHashes::default(),
+        )
+        .await,
+        Ok(NodeComparison::Matches)
+    )
+}
+
+/// What a realize reads its moves against: the revision a merge applies to, where the realize is
+/// a merge's ([`tracked_source`]), and the listing of each directory it reads for another spelling
+/// of a move's source, held for the rest of the realize.
+struct RealizeMoves {
+    merge_current: Option<Arc<State>>,
+    listings: HeldSpellings,
+}
+
+/// The listing of each directory a realize reads for the spellings its entries hold
+/// ([`ListedSpellings`]), keyed by the directory's path, read once and dropped with the realize.
+#[derive(Default)]
+struct HeldSpellings(std::collections::HashMap<String, ListedSpellings>);
+
+impl HeldSpellings {
+    /// The listing of the directory holding `path`, read the first time it is asked for, boxed:
+    /// inline, the listing would make the future of every change realized as large as its own.
+    async fn of(
+        &mut self,
+        operation: &InstanceOperationImpl,
+        path: &RelativePath,
+    ) -> Option<&mut ListedSpellings> {
+        let directory = path.parent().unwrap_or_default();
+        if !self.0.contains_key(directory) {
+            let listed = Box::pin(ListedSpellings::read(operation, &path.parent_path())).await;
+            self.0.insert(directory.to_owned(), listed);
+        }
+        self.0.get_mut(directory)
+    }
+}
+
+/// The node the working tree holds at `from`, the source of `change`, a move, as the revision it
+/// stands on tracks it, with the repository holding its content. A merge's change starts from its
+/// base, so where `merge_current`, the revision the merge applies to, holds a node at `from`, that
+/// node is the one, as [`modification_against_measured_node`] takes it; otherwise it is the node
+/// the move starts from.
+async fn tracked_source(
+    change: &NodeChange,
+    merge_current: Option<&Arc<State>>,
+    from: &RelativePath,
+) -> Option<(Arc<RepositoryContext>, Node)> {
+    let repository = change.from.mapping.repository.clone();
+    if let Some(current) = merge_current {
+        let link = NodeMapping::root(repository.clone(), current.clone())
+            .node_at(from)
+            .await;
+        if link.node.is_valid_node_id() {
+            let (repository, state) = link.resolve(repository, current.clone()).await.ok()?;
+            let node = state.node(repository.clone(), link.node).await.ok()?;
+            return Some((repository, node));
+        }
+    }
+    let node = change.from.get_node().await.ok()?;
+    Some((repository, node))
+}
+
+/// Where the working tree holds no entry spelled as `from`, the source of a move, renames to `to`
+/// the entry its directory holds `from` as in another spelling, answering whether it did. The
+/// entry is the one [`ListedSpellings::claim`] pairs with the node the working tree holds at the
+/// source ([`tracked_source`]), from the listing of the directory `moves` holds for the realize.
+/// A file is moved only where it holds that node's content or the content the move carries: one
+/// holding other content is local work, and stays where it stands. A directory, or a link's mount,
+/// is moved with what it holds.
+///
+/// Nothing is renamed where the working tree holds an entry at `to` already, as one an earlier
+/// pass carried, an untracked one or one of another kind: the spelling the working tree holds the
+/// source in stays where it stands. Only where the listing holds another spelling of the source's
+/// name ([`ListedSpellings::holds_another_spelling`]) is `to` described, and the entry paired,
+/// boxed. Its caller leaves out a source the view excludes.
+async fn rename_held_spelling(
+    operation: &InstanceOperationImpl,
+    change: &NodeChange,
+    moves: &mut RealizeMoves,
+    from: &RelativePath,
+    to: &RelativePath,
+) -> bool {
+    let RealizeMoves {
+        merge_current,
+        listings,
+    } = moves;
+    let Some(listed) = listings.of(operation, from).await else {
+        return false;
+    };
+    listed.holds_another_spelling(from.name())
+        && !operation
+            .file_info(to)
+            .await
+            .is_ok_and(|info| info.exists())
+        && Box::pin(rename_paired_spelling(
+            operation,
+            change,
+            merge_current.as_ref(),
+            listed,
+            from,
+            to,
+        ))
+        .await
+}
+
+/// [`rename_held_spelling`] where `listed`, the listing of the directory holding `from`, holds
+/// another spelling of its name: pairs the entry with the source's node, compares its content, and
+/// renames it to `to`. A cold path, boxed by its caller.
+#[allow(clippy::manual_async_fn)]
+fn rename_paired_spelling<'a>(
+    operation: &'a InstanceOperationImpl,
+    change: &'a NodeChange,
+    merge_current: Option<&'a Arc<State>>,
+    listed: &'a mut ListedSpellings,
+    from: &'a RelativePath,
+    to: &'a RelativePath,
+) -> impl Future<Output = bool> + 'a {
+    async move {
+        let Some((repository, node)) = tracked_source(change, merge_current, from).await else {
+            return false;
+        };
+        let Some(name) = listed.claim(from.name(), &node) else {
+            return false;
+        };
+        let held = from.parent_path().join(&name);
+        let Ok(info) = operation.file_info(&held).await else {
+            return false;
+        };
+        if !types_agree(&node, info.is_file(), info.is_dir()) {
+            return false;
+        }
+        if info.is_file()
+            && !holds_content_of(operation, repository, &node, &held, info.size()).await
+            && !holds_the_carried_content(operation, change, &held, info.size()).await
+        {
+            return false;
+        }
+        lore_trace!("Moving {held}, which the working tree holds {from} as, to {to}");
+        operation.rename(&held, to).await.is_ok()
+    }
+}
+
+/// Whether the file of `size` bytes at `path` holds the content `change`, a move, carries.
+async fn holds_the_carried_content(
+    operation: &InstanceOperationImpl,
+    change: &NodeChange,
+    path: &RelativePath,
+    size: u64,
+) -> bool {
+    let Ok(node) = change.to.get_node().await else {
+        return false;
+    };
+    holds_content_of(
+        operation,
+        change.to.mapping.repository.clone(),
+        &node,
+        path,
+        size,
+    )
+    .await
 }
 
 /// What [`verify_filesystem`] leaves to do with a change.
@@ -1619,150 +1811,159 @@ pub async fn verify_filesystem(
     Ok(Verdict::Realize)
 }
 
-/// Realizes `changes` in the working tree, deletes first. A link delete removes its mount but for
-/// the files `kept` names below it ([`VerifiedChanges::kept`]).
-#[allow(clippy::too_many_arguments)]
-pub async fn realize_changes(
+/// Realizes `changes` in the working tree, deletes first, and stages them in `state_stage` where
+/// given. A link delete removes its mount but for the files `kept` names below it
+/// ([`VerifiedChanges::kept`]).
+///
+/// `merge_current` is, for a merge, the revision it applies to, which the working tree stands on,
+/// as a merge's changes start from its base; it is `None` for changes that start from the revision
+/// the working tree stands on.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn, clippy::too_many_arguments)]
+pub fn realize_changes<'a>(
     repository: Arc<RepositoryContext>,
     operation: Arc<InstanceOperationImpl>,
     changes: Arc<Vec<NodeChange>>,
-    kept: &[RelativePath],
+    kept: &'a [RelativePath],
     state_stage: Option<Arc<State>>,
     dry_run: bool,
-    is_merge: bool,
+    merge_current: Option<Arc<State>>,
     stats: Arc<SyncRealizeStats>,
-) -> Result<(), SyncError> {
-    let _ticker = progress_ticker(stats.clone());
+) -> impl Future<Output = Result<(), SyncError>> + 'a {
+    async move {
+        let _ticker = progress_ticker(stats.clone());
+        let is_merge = merge_current.is_some();
 
-    lore_debug!("Realize {} changes", changes.len());
+        lore_debug!("Realize {} changes", changes.len());
 
-    // Count delete total upfront (cheap iteration, no I/O)
-    let file_delete_total = changes
-        .iter()
-        .filter(|c| c.action == change::FileAction::Delete)
-        .count();
-    stats
-        .complete
-        .file_delete_total
-        .store(file_delete_total, Ordering::Relaxed);
-
-    // First perform all deletes in case of delete-add for going from/to file & directory
-    let kept_directories = realize_changes_delete(
-        repository.clone(),
-        operation.clone(),
-        changes.clone(),
-        kept,
-        state_stage.clone(),
-        dry_run,
-        is_merge,
-        stats.clone(),
-    )
-    .await?;
-    lore_debug!("Deleted paths realized");
-
-    // For an incoming change that introduces a destination path whose parent
-    // directory is absent from the staged Merkle state (e.g. the current
-    // branch deleted the parent), pre-stage the missing ancestors as
-    // directory nodes so `stage_single_node` for the change resolves its
-    // parent. Mirrors the ancestor staging done in `realize_conflicts`.
-    // Only Add, Move, and Copy need this: those actions introduce a
-    // destination path that the target snapshot need not contain. A Modify
-    // on a path beneath a target-deleted directory always pairs with the
-    // target's delete as a conflict and is routed through the conflict
-    // realization path instead. `change.path` is the destination for Move
-    // and Copy (the source location is irrelevant for ancestor staging).
-    if let Some(state_stage) = state_stage.as_ref() {
-        let mut parent_paths: Vec<RelativePath> = Vec::new();
-        for change in changes.iter() {
-            if !matches!(
-                change.action,
-                change::FileAction::Add | change::FileAction::Move | change::FileAction::Copy
-            ) {
-                continue;
-            }
-            if let Some(parent) = change.path().parent() {
-                parent_paths.push(
-                    RelativePath::new_from_initial_path(parent)
-                        .expect("parent derived from valid change path"),
-                );
-            }
-        }
-
-        let stage_flags = if is_merge {
-            NodeFlags::StagedMerge.bits()
-        } else {
-            NodeFlags::NoFlags.bits()
-        };
-        for stage_path in expand_path_ancestors(parent_paths) {
-            let node = Node {
-                flags: stage_flags,
-                ..Default::default()
-            };
-            stage::stage_single_node(
-                repository.clone(),
-                state_stage.clone(),
-                stage_path,
-                node,
-                Arc::default(),
-                None,
-                FilterMode::empty(),
-            )
-            .await
-            .forward::<SyncError>("Failed to stage change")?;
-        }
-    }
-
-    // Channel pipeline for add/modify changes
-    let (tx, rx) = mpsc::channel(DEFAULT_WORK_CHANNEL_CAPACITY);
-
-    let discover_stats = stats.clone();
-    let discover_changes = changes.clone();
-    let producer = lore_spawn!(async move {
-        let result = sync_discover_modify_add(discover_changes, discover_stats.clone(), tx).await;
-        discover_stats
-            .discovery
+        // Count delete total upfront (cheap iteration, no I/O)
+        let file_delete_total = changes
+            .iter()
+            .filter(|c| c.action == change::FileAction::Delete)
+            .count();
+        stats
             .complete
-            .store(true, Ordering::Relaxed);
-        // Send a progress event immediately when discovery finishes,
-        // ensuring at least one progress event has discoveryComplete=true
-        event::LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(
-            &discover_stats,
-        ))
-        .send();
-        result
-    });
+            .file_delete_total
+            .store(file_delete_total, Ordering::Relaxed);
 
-    let consumer_stats = stats.clone();
-    // A view-excluded path is staged into the tree but not written to disk.
-    let view_filter = repository.filter.clone();
-    let consumer_operation = operation.clone();
-    let consumer = lore_spawn!(async move {
-        sync_execute_modify_add(
+        // First perform all deletes in case of delete-add for going from/to file & directory
+        let kept_directories = realize_changes_delete(
+            repository.clone(),
+            operation.clone(),
+            changes.clone(),
+            kept,
+            state_stage.clone(),
+            dry_run,
+            is_merge,
+            stats.clone(),
+        )
+        .await?;
+        lore_debug!("Deleted paths realized");
+
+        // For an incoming change that introduces a destination path whose parent
+        // directory is absent from the staged Merkle state (e.g. the current
+        // branch deleted the parent), pre-stage the missing ancestors as
+        // directory nodes so `stage_single_node` for the change resolves its
+        // parent. Mirrors the ancestor staging done in `realize_conflicts`.
+        // Only Add, Move, and Copy need this: those actions introduce a
+        // destination path that the target snapshot need not contain. A Modify
+        // on a path beneath a target-deleted directory always pairs with the
+        // target's delete as a conflict and is routed through the conflict
+        // realization path instead. `change.path` is the destination for Move
+        // and Copy (the source location is irrelevant for ancestor staging).
+        if let Some(state_stage) = state_stage.as_ref() {
+            let mut parent_paths: Vec<RelativePath> = Vec::new();
+            for change in changes.iter() {
+                if !matches!(
+                    change.action,
+                    change::FileAction::Add | change::FileAction::Move | change::FileAction::Copy
+                ) {
+                    continue;
+                }
+                if let Some(parent) = change.path().parent() {
+                    parent_paths.push(
+                        RelativePath::new_from_initial_path(parent)
+                            .expect("parent derived from valid change path"),
+                    );
+                }
+            }
+
+            let stage_flags = if is_merge {
+                NodeFlags::StagedMerge.bits()
+            } else {
+                NodeFlags::NoFlags.bits()
+            };
+            for stage_path in expand_path_ancestors(parent_paths) {
+                let node = Node {
+                    flags: stage_flags,
+                    ..Default::default()
+                };
+                stage::stage_single_node(
+                    repository.clone(),
+                    state_stage.clone(),
+                    stage_path,
+                    node,
+                    Arc::default(),
+                    None,
+                    FilterMode::empty(),
+                )
+                .await
+                .forward::<SyncError>("Failed to stage change")?;
+            }
+        }
+
+        // Channel pipeline for add/modify changes
+        let (tx, rx) = mpsc::channel(DEFAULT_WORK_CHANNEL_CAPACITY);
+
+        let discover_stats = stats.clone();
+        let discover_changes = changes.clone();
+        let producer = lore_spawn!(async move {
+            let result =
+                sync_discover_modify_add(discover_changes, discover_stats.clone(), tx).await;
+            discover_stats
+                .discovery
+                .complete
+                .store(true, Ordering::Relaxed);
+            // Send a progress event immediately when discovery finishes,
+            // ensuring at least one progress event has discoveryComplete=true
+            event::LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(
+                &discover_stats,
+            ))
+            .send();
+            result
+        });
+
+        let consumer_stats = stats.clone();
+        // A view-excluded path is staged into the tree but not written to disk.
+        let view_filter = repository.filter.clone();
+        let consumer_operation = operation.clone();
+        let consumer = lore_spawn!(sync_execute_modify_add(
             rx,
             consumer_operation,
             state_stage,
             dry_run,
-            is_merge,
+            merge_current,
             view_filter,
             consumer_stats,
-        )
-        .await
-    });
+        ));
 
-    let (producer_result, consumer_result) = tokio::join!(producer, consumer);
-    lore_debug!("Modified/added paths realized");
-    report_kept_moves(&stats.kept_moves);
+        let (producer_result, consumer_result) = tokio::join!(producer, consumer);
+        lore_debug!("Modified/added paths realized");
+        report_kept_renames(&stats.kept_renames);
 
-    event::LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(&stats)).send();
+        event::LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(&stats))
+            .send();
 
-    let producer_result = producer_result.internal("Recursion task failed")?;
-    let consumer_result = consumer_result.internal("Recursion task failed")?;
-    consumer_result?;
-    producer_result?;
+        let producer_result = producer_result.internal("Recursion task failed")?;
+        let consumer_result = consumer_result.internal("Recursion task failed")?;
+        consumer_result?;
+        producer_result?;
 
-    remove_directories_moved_out_of(&operation, &changes, kept_directories).await;
+        remove_directories_moved_out_of(&operation, &changes, kept_directories).await;
 
-    Ok(())
+        Ok(())
+    }
 }
 
 /// Removes the directory `path` with everything below it, but for the files `kept` names,
@@ -2428,41 +2629,75 @@ async fn sync_discover_modify_add(
     Ok(())
 }
 
-async fn sync_execute_modify_add(
+/// Realizes each change `rx` hands over ([`realize_change_modify_add`]), one after another, and
+/// answers the first failure once every write it spawned has ended.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn sync_execute_modify_add(
     mut rx: mpsc::Receiver<SyncWorkItem>,
     operation: Arc<InstanceOperationImpl>,
     state_stage: Option<Arc<State>>,
     dry_run: bool,
-    is_merge: bool,
+    merge_current: Option<Arc<State>>,
     view_filter: Arc<crate::filter::Filter>,
     stats: Arc<SyncRealizeStats>,
-) -> Result<(), SyncError> {
+) -> impl Future<Output = Result<(), SyncError>> {
     const MAX_TASK_COUNT: usize = 10000;
-    let mut tasks = JoinSet::new();
-    // Finish independent changes even when one file cannot be written. The first
-    // failure remains the terminal result; warnings identify every failed attempt.
-    let mut sync_error = None;
+    let mut moves = RealizeMoves {
+        merge_current,
+        listings: HeldSpellings::default(),
+    };
+    async move {
+        let mut tasks = JoinSet::new();
+        // Finish independent changes even when one file cannot be written. The first
+        // failure remains the terminal result; warnings identify every failed attempt.
+        let mut sync_error = None;
 
-    while let Some(item) = rx.recv().await {
-        let result = realize_change_modify_add(
-            &mut tasks,
-            operation.clone(),
-            item.change,
-            item.node,
-            state_stage.clone(),
-            dry_run,
-            is_merge,
-            view_filter.clone(),
-            stats.clone(),
-        )
-        .await;
-        sync_error = sync_error.or(result
-            .inspect_err(|err| {
-                lore_warn!("Sync could not materialize content: {err}\n{}", err.trace());
-            })
-            .err());
+        while let Some(item) = rx.recv().await {
+            let result = realize_change_modify_add(
+                &mut tasks,
+                &mut moves,
+                operation.clone(),
+                item.change,
+                item.node,
+                state_stage.clone(),
+                dry_run,
+                view_filter.clone(),
+                stats.clone(),
+            )
+            .await;
+            sync_error = sync_error.or(result
+                .inspect_err(|err| {
+                    lore_warn!("Sync could not materialize content: {err}\n{}", err.trace());
+                })
+                .err());
 
-        while let Some(result) = tasks.try_join_next() {
+            while let Some(result) = tasks.try_join_next() {
+                sync_error = sync_error.or(result
+                    .internal("Recursion task failed")
+                    .map_err(SyncError::from)
+                    .flatten()
+                    .inspect_err(|err| {
+                        lore_warn!("Sync could not materialize content: {err}\n{}", err.trace());
+                    })
+                    .err());
+            }
+            while tasks.len() > MAX_TASK_COUNT
+                && let Some(result) = tasks.join_next().await
+            {
+                sync_error = sync_error.or(result
+                    .internal("Recursion task failed")
+                    .map_err(SyncError::from)
+                    .flatten()
+                    .inspect_err(|err| {
+                        lore_warn!("Sync could not materialize content: {err}\n{}", err.trace());
+                    })
+                    .err());
+            }
+        }
+
+        while let Some(result) = tasks.join_next().await {
             sync_error = sync_error.or(result
                 .internal("Recursion task failed")
                 .map_err(SyncError::from)
@@ -2472,35 +2707,12 @@ async fn sync_execute_modify_add(
                 })
                 .err());
         }
-        while tasks.len() > MAX_TASK_COUNT
-            && let Some(result) = tasks.join_next().await
-        {
-            sync_error = sync_error.or(result
-                .internal("Recursion task failed")
-                .map_err(SyncError::from)
-                .flatten()
-                .inspect_err(|err| {
-                    lore_warn!("Sync could not materialize content: {err}\n{}", err.trace());
-                })
-                .err());
+
+        if let Some(err) = sync_error {
+            Err(err)
+        } else {
+            Ok(())
         }
-    }
-
-    while let Some(result) = tasks.join_next().await {
-        sync_error = sync_error.or(result
-            .internal("Recursion task failed")
-            .map_err(SyncError::from)
-            .flatten()
-            .inspect_err(|err| {
-                lore_warn!("Sync could not materialize content: {err}\n{}", err.trace());
-            })
-            .err());
-    }
-
-    if let Some(err) = sync_error {
-        Err(err)
-    } else {
-        Ok(())
     }
 }
 
@@ -2758,7 +2970,7 @@ async fn recover_refused_move(
     from: &RelativePath,
     to: &RelativePath,
     refused: FsError,
-    kept: &KeptMoves,
+    kept: &KeptRenames,
 ) -> Result<(), SyncError> {
     let identity = operation.names_one_entry(from, to).await;
     if matches!(identity, Ok(Some(false) | None)) {
@@ -2778,7 +2990,7 @@ async fn recover_refused_move(
             }
             Ok(_) => refused.to_string(),
         };
-        KeptMove {
+        KeptRename {
             from: from.clone(),
             to: to.clone(),
             reason,
@@ -2787,15 +2999,15 @@ async fn recover_refused_move(
     Ok(())
 }
 
-/// Warns once for the moves a realize carried out without their rename, `kept`, with how many and
-/// the first, which the realize reports nothing else of.
-fn report_kept_moves(kept: &KeptMoves) {
-    if let Some(KeptMove { from, to, reason }) = kept.first.get() {
+/// Warns once for the renames left undone, `kept`, with how many and the first, which is all
+/// reported of them.
+pub(crate) fn report_kept_renames(kept: &KeptRenames) {
+    if let Some(KeptRename { from, to, reason }) = kept.first.get() {
         let count = kept.count.load(Ordering::Relaxed);
         lore_warn!(
-            "The file system refused the rename of {count} {}, which leaves the source in place; \
-             the first is {from} to {to}: {reason}",
-            if count == 1 { "move" } else { "moves" }
+            "Left {count} {} undone, which leaves the source in place; the first is {from} to \
+             {to}: {reason}",
+            if count == 1 { "rename" } else { "renames" }
         );
     }
 }
@@ -2803,7 +3015,10 @@ fn report_kept_moves(kept: &KeptMoves) {
 /// Realizes on disk a node a change adds, modifies or moves, and stages it in `state_stage` when
 /// given.
 ///
-/// A move whose rename fails is realized as [`recover_refused_move`] describes. A move is staged
+/// A move whose rename fails takes the entry the working tree holds its source in under another
+/// spelling, where the view holds the source ([`rename_held_spelling`]), against what `moves`
+/// holds for the realize, and otherwise recovers as [`recover_refused_move`] describes. A move is
+/// staged
 /// by moving the node the staged tree holds, which keeps the bit that node held, so a moved file
 /// is given the change's bit ([`carry_staged_mode`]): a commit records the staged bit where it
 /// reads none from the working tree.
@@ -2814,17 +3029,17 @@ fn report_kept_moves(kept: &KeptMoves) {
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
-fn realize_change_modify_add(
-    tasks: &mut JoinSet<Result<(), SyncError>>,
+fn realize_change_modify_add<'a>(
+    tasks: &'a mut JoinSet<Result<(), SyncError>>,
+    moves: &'a mut RealizeMoves,
     operation: Arc<InstanceOperationImpl>,
     change: NodeChange,
     node: Node,
     state_stage: Option<Arc<State>>,
     dry_run: bool,
-    is_merge: bool,
     view_filter: Arc<crate::filter::Filter>,
     stats: Arc<SyncRealizeStats>,
-) -> impl Future<Output = Result<(), SyncError>> + '_ {
+) -> impl Future<Output = Result<(), SyncError>> + 'a {
     async move {
         // During a merge this is the filter-free walk context, not the instance's.
         // The instance's view arrives separately as `view_filter`. The staging
@@ -2865,15 +3080,24 @@ fn realize_change_modify_add(
             match operation.rename(from_path, &to_path).await {
                 Ok(()) => true,
                 Err(refused) => {
-                    recover_refused_move(
-                        &operation,
-                        from_path,
-                        &to_path,
-                        refused,
-                        &stats.kept_moves,
-                    )
-                    .await?;
-                    false
+                    let respelled =
+                        !view_filter.excludes(
+                            from_path,
+                            !change.from.flags.contains(NodeFlags::File),
+                            FilterMode::View,
+                        ) && rename_held_spelling(&operation, &change, moves, from_path, &to_path)
+                            .await;
+                    if !respelled {
+                        recover_refused_move(
+                            &operation,
+                            from_path,
+                            &to_path,
+                            refused,
+                            &stats.kept_renames,
+                        )
+                        .await?;
+                    }
+                    respelled
                 }
             }
         } else {
@@ -2934,7 +3158,7 @@ fn realize_change_modify_add(
                     from_path,
                     from_node,
                     path,
-                    is_merge,
+                    moves.merge_current.is_some(),
                 )
                 .await?;
                 if node.is_file() {
@@ -2944,7 +3168,7 @@ fn realize_change_modify_add(
                 }
             } else {
                 let mut node = node;
-                if is_merge {
+                if moves.merge_current.is_some() {
                     node.flags |= NodeFlags::StagedMerge;
                     // A directory the incoming side adds is staged as an add, including one
                     // that already stands in the staged tree as the parent of an add below it.

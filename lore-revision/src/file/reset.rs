@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use futures::FutureExt;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use serde::Serialize;
@@ -25,6 +26,9 @@ use crate::file::unstage;
 use crate::file::unstage::UnstageOptions;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::fs::filesystem_provider::CaseLookup;
+use crate::fs::filesystem_provider::DirectoryListing;
+use crate::fs::filesystem_provider::FsError;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::create_empty_directory;
@@ -55,11 +59,15 @@ use crate::repository::RepositoryWriteToken;
 use crate::repository::TEMP_FILE_EXTENSION;
 use crate::repository::is_reserved_node_name;
 use crate::revision;
+use crate::revision::sync::KeptRename;
+use crate::revision::sync::KeptRenames;
 use crate::revision::sync::SyncRealizeStats;
 use crate::runtime::execution_context;
 use crate::state;
 use crate::state::Clear;
 use crate::state::State;
+use crate::state::os_diff::ListedEntry;
+use crate::state::os_diff::ListedSpellings;
 use crate::util;
 use crate::util::path::RelativePath;
 
@@ -198,12 +206,22 @@ pub struct ResetStats {
     file_inflight_count: AtomicU64,
     directory_inflight: AtomicU64,
 
-    /// The mount of each layer, which the reset deletes around and leaves to the layer.
+    /// The mount of each layer, which the reset leaves to the layer: it deletes around a mount,
+    /// and renames to the revision's spelling no entry a mount is at or below, nor, in the parent's
+    /// walk, one below a mount.
     layer_mounts: Vec<RelativePath>,
 
     /// The dirty adds the walks drop, discarded once every walk has drained, each with the
     /// directories marked dirty as added it leaves empty.
     discards: state::WalkDiscards,
+
+    /// The entries held in another case than the revision's that the walks reset where they stand,
+    /// their rename to its spelling left undone.
+    kept_spellings: KeptRenames,
+
+    /// In a dry run, which renames nothing, each entry the walks report moving to the revision's
+    /// spelling: the path the working tree holds it at, and the path the move is reported to.
+    dry_run_moves: parking_lot::RwLock<Vec<(RelativePath, RelativePath)>>,
 }
 
 impl Default for ResetStats {
@@ -218,11 +236,29 @@ impl Default for ResetStats {
             directory_inflight: AtomicU64::new(0),
             layer_mounts: Vec::new(),
             discards: state::WalkDiscards::emptying_adds(),
+            kept_spellings: KeptRenames::default(),
+            dry_run_moves: parking_lot::RwLock::default(),
         }
     }
 }
 
 impl ResetStats {
+    /// The path the reset reports what the working tree holds at `relative_path` at: below the
+    /// deepest entry a dry run reports moving ([`Self::dry_run_moves`]), spelled as the move would
+    /// leave it, and otherwise `relative_path`.
+    fn reported(&self, relative_path: &RelativePath) -> RelativePath {
+        let moves = self.dry_run_moves.read();
+        let moved = moves
+            .iter()
+            .rev()
+            .find_map(|(held, reported)| Some((reported, relative_path.below(held)?)));
+        match moved {
+            Some((reported, "")) => reported.clone(),
+            Some((reported, below)) => reported.join(below),
+            None => relative_path.clone(),
+        }
+    }
+
     /// The tally a removed path counts against, the two being reported apart.
     fn delete_count(&self, is_directory: bool) -> &AtomicU64 {
         if is_directory {
@@ -325,6 +361,7 @@ async fn reset_walk_paths(walk: &ResetWalk) -> Option<ResetError> {
             },
             relative_path.clone(),
             relative_path.clone(),
+            false,
         )
         .await;
 
@@ -354,6 +391,7 @@ async fn reset_walk_paths(walk: &ResetWalk) -> Option<ResetError> {
                 },
                 mount_path.clone(),
                 state_path.clone(),
+                mount_path.as_str() == layer.mount.as_str(),
             )
             .await;
 
@@ -369,18 +407,21 @@ async fn reset_walk_paths(walk: &ResetWalk) -> Option<ResetError> {
 }
 
 /// Deletes what stands at `path` where it is no directory, so the walk can put a directory back
-/// there, as a reset deletes a directory standing where it restores a file. The delete is boxed: a
-/// walk meets it only where the working tree replaced a directory.
+/// there, as a reset deletes a directory standing where it restores a file, and answers whether
+/// the stat of `path` missed, nothing standing there. The delete is boxed: a walk meets it only
+/// where the working tree replaced a directory.
 async fn clear_for_directory(
     operation: &InstanceOperationImpl,
     stats: &Arc<ResetStats>,
     path: &RelativePath,
-) -> Result<(), ResetError> {
+) -> Result<bool, ResetError> {
     match operation.file_info(path).await {
         Ok(info) if info.exists() && !info.is_dir() => {
-            Box::pin(reset_delete_path(operation, stats, path, false, false)).await
+            Box::pin(reset_delete_path(operation, stats, path, false, false)).await?;
+            Ok(false)
         }
-        _ => Ok(()),
+        Ok(info) => Ok(!info.exists()),
+        Err(_) => Ok(false),
     }
 }
 
@@ -494,11 +535,13 @@ async fn store_layer_walk_states(
 /// the `file_inflight` semaphore.
 struct ResetFileWorkItem {
     repository: Arc<RepositoryContext>,
-    state_target: Arc<State>,
     relative_path: RelativePath,
-    name: String,
-    node_id: u32,
+    /// Whether the walk renamed the file to the spelling the revision holds.
+    respelled: bool,
     node: Node,
+    /// The entries of the file's directory, which a miss of its spelling reads
+    /// ([`CaseLookup::OnMiss`]).
+    missed: Option<Arc<MissedSpellings>>,
 }
 
 /// Resets one or more files to a specified revision, optionally purging untracked files.
@@ -666,6 +709,7 @@ pub async fn reset(
     })
     .await;
 
+    crate::fs::realize::report_kept_renames(&outer_stats.kept_spellings);
     let counts = count_data(&outer_stats);
     lore_debug!(
         "Reset complete: {} reset ({} directories, {} files), {} deleted ({} directories, {} files)",
@@ -873,6 +917,7 @@ pub async fn reset_to_last_merged(
     })
     .await;
 
+    crate::fs::realize::report_kept_renames(&outer_stats.kept_spellings);
     event::LoreEvent::FileResetEnd(LoreFileResetEndEventData {
         count: count_data(&outer_stats),
     })
@@ -1322,6 +1367,7 @@ fn reset_walk_directory_recurse(
     node: Node,
     node_id: NodeID,
     states: FilterStates,
+    missed: Option<Arc<MissedSpellings>>,
 ) -> Pin<Box<dyn Future<Output = Result<(), ResetError>> + Send>> {
     Box::pin(reset_walk_directory(
         ctx,
@@ -1329,6 +1375,7 @@ fn reset_walk_directory_recurse(
         node,
         node_id,
         states,
+        missed,
     ))
 }
 
@@ -1343,63 +1390,84 @@ fn reset_walk_directory_recurse(
 /// it on disk. The two differ only for a layer mounted somewhere other than the path it
 /// occupies in its own repository. Only the entry lookup needs `state_path`: the walk
 /// proceeds by node id from there and builds every path below it from `relative_path`.
-async fn reset_walk_path(
+/// `at_mount` says `relative_path` is the mount of a layer, whose spelling is the mount's.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn reset_walk_path(
     ctx: ResetContext,
-    relative_path: RelativePath,
-    state_path: RelativePath,
-) -> Result<(), ResetError> {
-    lore_debug!(
-        "Reset path: {}/{} to revision {} -> {}",
-        ctx.repository.path_for_display(),
-        relative_path.as_str(),
-        ctx.state_target.revision(),
-        ctx.state_target.revision_number()
-    );
+    mut relative_path: RelativePath,
+    mut state_path: RelativePath,
+    at_mount: bool,
+) -> impl Future<Output = Result<(), ResetError>> {
+    async move {
+        lore_debug!(
+            "Reset path: {}/{} to revision {} -> {}",
+            ctx.repository.path_for_display(),
+            relative_path.as_str(),
+            ctx.state_target.revision(),
+            ctx.state_target.revision_number()
+        );
 
-    let (relative_path, state_path) = if relative_path.is_empty() {
-        (relative_path, state_path)
-    } else {
-        let resolved = util::fs::filesystem_path(&ctx.operation, "", &relative_path, None).await;
-        match resolved {
-            // The case the filesystem reports is the case the state holds too, unless the
-            // two paths were already distinct.
-            Ok(resolved) if state_path.as_str() == relative_path.as_str() => {
-                (resolved.clone(), resolved)
+        if !relative_path.is_empty() {
+            match util::fs::filesystem_path(&ctx.operation, "", &relative_path, None).await {
+                // The case the filesystem reports is the case the state holds too, unless the
+                // two paths were already distinct.
+                Ok(resolved) if state_path.as_str() == relative_path.as_str() => {
+                    state_path = resolved.clone();
+                    relative_path = resolved;
+                }
+                Ok(resolved) => relative_path = resolved,
+                Err(_) => {}
             }
-            Ok(resolved) => (resolved, state_path),
-            Err(_) => (relative_path, state_path),
-        }
-    };
-
-    if relative_path.is_empty() {
-        if ctx.options.single_node {
-            return Ok(());
         }
 
-        lore_debug!("Resetting the repository from root");
+        if relative_path.is_empty() {
+            if ctx.options.single_node {
+                return Ok(());
+            }
 
-        let node = ctx
-            .state_target
-            .node(ctx.repository.clone(), ROOT_NODE)
-            .await
-            .forward::<ResetError>("Failed to find node")?;
+            lore_debug!("Resetting the repository from root");
 
-        return reset_walk_directory(ctx, relative_path, node, ROOT_NODE, FilterStates::ROOT).await;
+            let node = ctx
+                .state_target
+                .node(ctx.repository.clone(), ROOT_NODE)
+                .await
+                .forward::<ResetError>("Failed to find node")?;
+
+            return reset_walk_directory(
+                ctx,
+                relative_path,
+                node,
+                ROOT_NODE,
+                FilterStates::ROOT,
+                None,
+            )
+            .await;
+        }
+
+        reset_walk_named_path(ctx, relative_path, state_path, at_mount).await
     }
-
-    reset_walk_named_path(ctx, relative_path, state_path).await
 }
 
 /// Resolves a path below the root to a node and walks it through `reset_walk_node`, or settles
 /// a path the target revision does not hold against the staged state and the working tree.
 ///
+/// The node is reset in the spelling the revision holds its name in, taking the entry the
+/// working tree holds it in as [`ListedSpellings::claim`] pairs them, except at the mount of a
+/// layer, as `at_mount` says, which keeps the mount's spelling.
+///
 /// Its own future: inline, what it holds across its lookups would be reserved in the root
 /// walk's state of [`reset_walk_path`].
-async fn reset_walk_named_path(
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn reset_walk_named_path(
     ctx: ResetContext,
-    relative_path: RelativePath,
+    mut relative_path: RelativePath,
     state_path: RelativePath,
-) -> Result<(), ResetError> {
+    at_mount: bool,
+) -> impl Future<Output = Result<(), ResetError>> {
     let ResetContext {
         operation,
         repository,
@@ -1409,136 +1477,151 @@ async fn reset_walk_named_path(
         stats,
         file_tx,
     } = ctx;
+    async move {
+        let parent_states = repository.filter.parent_exclusion_states(&relative_path);
 
-    let parent_states = repository.filter.parent_exclusion_states(&relative_path);
+        let found = state_target
+            .find_relative_held(repository.clone(), ROOT_NODE, state_path.as_str())
+            .await;
 
-    let node_name = relative_path.name().to_string();
+        match found {
+            Ok((node_link, (target_repository, target_state_current))) => {
+                let current_state_staged = if !Arc::ptr_eq(&target_state_current, &state_target) {
+                    refuse_staged(&state_staged, &repository, &state_path).await?;
+                    target_state_current.clone()
+                } else {
+                    state_staged.clone()
+                };
 
-    let found = state_target
-        .find_relative_held(repository.clone(), ROOT_NODE, state_path.as_str())
-        .await;
+                let node = target_state_current
+                    .node(target_repository.clone(), node_link.node)
+                    .await
+                    .forward::<ResetError>("Failed to find node")?;
+                let node_name = if at_mount {
+                    relative_path.name().to_string()
+                } else {
+                    target_state_current
+                        .node_name_clone(target_repository.clone(), node_link.node)
+                        .await
+                        .forward::<ResetError>("Failed to get node name")?
+                };
+                if relative_path.name() != node_name {
+                    relative_path =
+                        Box::pin(path_held_for(&operation, &relative_path, &node_name, &node))
+                            .await;
+                }
 
-    match found {
-        Ok((node_link, (target_repository, target_state_current))) => {
-            let current_state_staged = if !Arc::ptr_eq(&target_state_current, &state_target) {
-                refuse_staged(&state_staged, &repository, &state_path).await?;
-                target_state_current.clone()
-            } else {
-                state_staged.clone()
-            };
+                let replacement = replacing_dirty_add(
+                    &current_state_staged,
+                    &target_repository,
+                    node_link.node,
+                    node.name_hash,
+                )
+                .await?;
 
-            let node = target_state_current
-                .node(target_repository.clone(), node_link.node)
-                .await
-                .forward::<ResetError>("Failed to find node")?;
+                reset_walk_node(
+                    ResetContext {
+                        operation: operation.clone(),
+                        repository: target_repository.clone(),
+                        state_target: target_state_current,
+                        state_staged: current_state_staged.clone(),
+                        options,
+                        stats: stats.clone(),
+                        file_tx,
+                    },
+                    relative_path,
+                    node_name,
+                    node_link.node,
+                    node,
+                    parent_states,
+                    None,
+                )
+                .await?;
 
-            let replacement = replacing_dirty_add(
-                &current_state_staged,
-                &target_repository,
-                node_link.node,
-                node.name_hash,
-            )
-            .await?;
-
-            reset_walk_node(
-                ResetContext {
-                    operation: operation.clone(),
-                    repository: target_repository.clone(),
-                    state_target: target_state_current,
-                    state_staged: current_state_staged.clone(),
-                    options,
-                    stats: stats.clone(),
-                    file_tx,
-                },
-                relative_path,
-                node_name,
-                node_link.node,
-                node,
-                parent_states,
-            )
-            .await?;
-
-            if let Some(replacement) = replacement {
-                stats
-                    .discards
-                    .queue(current_state_staged, target_repository, vec![replacement]);
+                if let Some(replacement) = replacement {
+                    stats.discards.queue(
+                        current_state_staged,
+                        target_repository,
+                        vec![replacement],
+                    );
+                }
+                Ok(())
             }
-            Ok(())
-        }
-        Err(e) if e.is_node_not_found() => {
-            // A path absent from the target revision is one of: a file committed
-            // in the current revision but added after the target (delete it so the
-            // working tree matches the target, unless the view excludes it, which
-            // only --purge deletes), a pending dirty-add, or an untracked file (keep
-            // on disk unless --purge, discarding add tracking). A path inside a link is refused,
-            // since its node is numbered in the linked tree, not in `state_staged`.
-            let mut delete_path = options.purge;
-            if let Ok(staged_link) = state_staged
-                .find_node_link(repository.clone(), state_path.as_str())
-                .await
-            {
-                if staged_link.crosses_link(&repository, &state_staged) {
-                    return Err(NotSupported {
+            Err(e) if e.is_node_not_found() => {
+                // A path absent from the target revision is one of: a file committed
+                // in the current revision but added after the target (delete it so the
+                // working tree matches the target, unless the view excludes it, which
+                // only --purge deletes), a pending dirty-add, or an untracked file (keep
+                // on disk unless --purge, discarding add tracking). A path inside a link is refused,
+                // since its node is numbered in the linked tree, not in `state_staged`.
+                let mut delete_path = options.purge;
+                if let Ok(staged_link) = state_staged
+                    .find_node_link(repository.clone(), state_path.as_str())
+                    .await
+                {
+                    if staged_link.crosses_link(&repository, &state_staged) {
+                        return Err(NotSupported {
                         operation: format!(
                             "Resetting {relative_path} inside a link, which the target revision \
                              does not hold"
                         ),
                     }
                     .into());
-                }
-                // The flags alone, so the record is not held across the awaits below.
-                let (staged, dirty_add, link, directory) = state_staged
-                    .node(repository.clone(), staged_link.node)
-                    .await
-                    .forward::<ResetError>("Failed to find staged node")
-                    .map(|node| {
-                        (
-                            node.is_staged(),
-                            node.is_dirty_add(),
-                            node.is_link(),
-                            node.is_directory(),
-                        )
-                    })?;
+                    }
+                    // The flags alone, so the record is not held across the awaits below.
+                    let (staged, dirty_add, link, directory) = state_staged
+                        .node(repository.clone(), staged_link.node)
+                        .await
+                        .forward::<ResetError>("Failed to find staged node")
+                        .map(|node| {
+                            (
+                                node.is_staged(),
+                                node.is_dirty_add(),
+                                node.is_link(),
+                                node.is_directory(),
+                            )
+                        })?;
 
-                // `reset_staged_links_under_paths` unstaged this link, which a dry run does not
-                // store, so the link is still staged here.
-                if link && execution_context().globals().dry_run() {
-                    return Ok(());
-                }
-                if staged {
-                    return Err(staged_node_refusal());
+                    // `reset_staged_links_under_paths` unstaged this link, which a dry run does not
+                    // store, so the link is still staged here.
+                    if link && execution_context().globals().dry_run() {
+                        return Ok(());
+                    }
+                    if staged {
+                        return Err(staged_node_refusal());
+                    }
+
+                    if dirty_add {
+                        lore_trace!(
+                            "Reset dirty add {}, discarding staged node and keeping the file",
+                            relative_path.as_str()
+                        );
+                        stats.discards.queue(
+                            state_staged.clone(),
+                            repository.clone(),
+                            vec![staged_link.node],
+                        );
+                    } else if !delete_path {
+                        let (_, excluded) = repository.filter.child_emit_unless_forced(
+                            execution_context().globals().force(),
+                            FilterMode::empty(),
+                            parent_states,
+                            &relative_path,
+                            directory,
+                            FilterMode::View,
+                        );
+                        delete_path = !excluded;
+                    }
                 }
 
-                if dirty_add {
-                    lore_trace!(
-                        "Reset dirty add {}, discarding staged node and keeping the file",
-                        relative_path.as_str()
-                    );
-                    stats.discards.queue(
-                        state_staged.clone(),
-                        repository.clone(),
-                        vec![staged_link.node],
-                    );
-                } else if !delete_path {
-                    let (_, excluded) = repository.filter.child_emit_unless_forced(
-                        execution_context().globals().force(),
-                        FilterMode::empty(),
-                        parent_states,
-                        &relative_path,
-                        directory,
-                        FilterMode::View,
-                    );
-                    delete_path = !excluded;
+                if delete_path {
+                    Box::pin(purge_path(&operation, &stats, &repository, &relative_path)).await?;
                 }
+
+                Ok(())
             }
-
-            if delete_path {
-                Box::pin(purge_path(&operation, &stats, &repository, &relative_path)).await?;
-            }
-
-            Ok(())
+            Err(err) => Err(err).forward::<ResetError>("Failed to find node"),
         }
-        Err(err) => Err(err).forward::<ResetError>("Failed to find node"),
     }
 }
 
@@ -1633,7 +1716,7 @@ async fn reset_delete_path(
     stats
         .delete_count(is_directory)
         .fetch_add(1, Ordering::Relaxed);
-    send_delete(relative_path);
+    send_delete(stats, relative_path);
 
     let removed = if keep_repositories {
         operation
@@ -1646,10 +1729,271 @@ async fn reset_delete_path(
     Ok(())
 }
 
-/// Sends the Delete event of `relative_path`, which the reset removes from the working tree.
-fn send_delete(relative_path: &RelativePath) {
+/// Renames the entry at `relative_path` to `name`, the revision's spelling, and answers the path
+/// the node is reset at and whether it is renamed, which is reported as the node's move. A dry run
+/// reports the move and resets the node where it stands, which is where the entry is, reporting
+/// what it finds below as the move would leave it ([`ResetStats::reported`]). An entry is reset
+/// where it stands, too, where a layer is mounted at or below it, as the rename would carry the
+/// mount away from the path the layer names, and where the file system refuses the rename; either
+/// is counted in the reset's `kept_spellings` for the warning it ends with. In the walk of a
+/// repository other than a layer, an entry below a mount is the layer's, and the node is reset at
+/// the revision's spelling, as it is where the rename leaves no entry at `relative_path`.
+///
+/// A cold path, boxed by its caller: only a node the working tree holds in another case reaches
+/// it.
+async fn respell(
+    operation: &InstanceOperationImpl,
+    stats: &ResetStats,
+    repository: &RepositoryContext,
+    relative_path: &RelativePath,
+    name: &str,
+) -> (RelativePath, bool) {
+    let to_path = relative_path.parent_path().join(name);
+    let kept = |reason: String| {
+        stats.kept_spellings.count.fetch_add(1, Ordering::Relaxed);
+        stats.kept_spellings.first.get_or_init(|| KeptRename {
+            from: relative_path.clone(),
+            to: to_path.clone(),
+            reason,
+        });
+        (relative_path.clone(), false)
+    };
+    if stats
+        .layer_mounts
+        .iter()
+        .any(|mount| relative_path.covers_ignore_case(mount))
+    {
+        return kept("a layer is mounted at or below it".to_string());
+    }
+    if !repository.is_layer()
+        && stats
+            .layer_mounts
+            .iter()
+            .any(|mount| mount.covers_ignore_case(relative_path))
+    {
+        return (to_path, false);
+    }
+    let moved = |to: &RelativePath, from: &RelativePath| {
+        event::LoreEvent::FileResetFile(LoreFileResetFileEventData {
+            path: to.as_str().into(),
+            action: LoreFileAction::Move,
+            from_path: from.as_str().into(),
+        })
+        .send();
+    };
+    if execution_context().globals().dry_run() {
+        let reported = stats.reported(&to_path);
+        moved(&reported, &stats.reported(relative_path));
+        stats
+            .dry_run_moves
+            .write()
+            .push((relative_path.clone(), reported));
+        return (relative_path.clone(), true);
+    }
+    match operation.rename(relative_path, &to_path).await {
+        Ok(()) => {
+            lore_trace!("Renamed {relative_path} to the spelling the revision holds, {to_path}");
+            moved(&to_path, relative_path);
+            (to_path, true)
+        }
+        Err(refused)
+            if operation
+                .file_info(relative_path)
+                .await
+                .is_ok_and(|info| info.exists()) =>
+        {
+            kept(refused.to_string())
+        }
+        Err(_) => (to_path, false),
+    }
+}
+
+/// The path the working tree holds the node `node`, which the revision names `name`, at in the
+/// directory holding `relative_path`: the entry [`ListedSpellings::claim`] pairs with it, and
+/// otherwise its name in the revision's spelling, no entry standing for it.
+///
+/// A cold path, boxed by its caller: only a path resolved to another spelling than the revision's
+/// reaches it.
+async fn path_held_for(
+    operation: &InstanceOperationImpl,
+    relative_path: &RelativePath,
+    name: &str,
+    node: &Node,
+) -> RelativePath {
+    let directory = relative_path.parent_path();
+    let held_as = ListedSpellings::read(operation, &directory)
+        .await
+        .claim(name, node);
+    directory.join(held_as.as_deref().unwrap_or(name))
+}
+
+/// The entries of a directory a walk pairs its children with, found as the provider's
+/// [`CaseLookup`] says, or listed before the children for a purge whatever it says.
+///
+/// A listing is boxed, so the walk holds a pointer for each kind: on Linux, which reads on a miss,
+/// the walk holds no listing.
+enum DirectorySpellings {
+    /// Read before the children are walked.
+    Listed(Box<ListedSpellings>),
+    /// The spellings of the names the provider's index holds otherwise than a child, as the walk
+    /// asks for each, gathered from the first child it holds in another spelling.
+    PerName(Option<Box<ListedSpellings>>),
+    /// Read on the first miss of a child's spelling, by whichever walk or file task meets it.
+    OnMiss(Arc<MissedSpellings>),
+    /// Released before a walk that does not purge waits on the subdirectories it spawned.
+    Released,
+}
+
+impl DirectorySpellings {
+    /// The entries of `directory` where `operation`'s [`CaseLookup`] finds them without a read of
+    /// the directory before its children, and `None` where the walk lists it first, as it does
+    /// where it purges.
+    fn unlisted(
+        operation: &InstanceOperationImpl,
+        directory: &RelativePath,
+        purge: bool,
+    ) -> Option<Self> {
+        if purge {
+            return None;
+        }
+        match operation.case_lookup() {
+            CaseLookup::Listing => None,
+            CaseLookup::PerName => Some(Self::PerName(None)),
+            CaseLookup::OnMiss => Some(Self::OnMiss(Arc::new(MissedSpellings {
+                directory: directory.clone(),
+                listed: tokio::sync::Mutex::default(),
+            }))),
+        }
+    }
+
+    /// The path the walk takes the child `node` from, which the revision names `name`: the entry
+    /// the working tree holds it in under another spelling, of its kind, and otherwise its name in
+    /// the revision, which a miss settles later where the directory is read on one.
+    async fn child_path(
+        &mut self,
+        operation: &InstanceOperationImpl,
+        directory: &RelativePath,
+        name: &str,
+        node: &Node,
+    ) -> RelativePath {
+        let spelled = directory.join(name);
+        let held = match self {
+            Self::Listed(listed) => listed.claim(name, node),
+            Self::PerName(listed) => {
+                if operation.holds_name_exactly(&spelled).await != Some(false) {
+                    return spelled;
+                }
+                let listed = listed.get_or_insert_with(Box::default);
+                Box::pin(claim_by_name(listed, operation, directory, name, node)).await
+            }
+            Self::OnMiss(_) | Self::Released => None,
+        };
+        held.map_or(spelled, |held| directory.join(held))
+    }
+
+    /// The entries a child's walk or file task reads on a miss, where the directory is read on
+    /// one.
+    fn missed(&self) -> Option<Arc<MissedSpellings>> {
+        match self {
+            Self::OnMiss(missed) => Some(missed.clone()),
+            Self::Listed(_) | Self::PerName(_) | Self::Released => None,
+        }
+    }
+
+    /// The listing read before the children, which a purge removes the unclaimed entries of.
+    fn into_listed(self) -> Option<ListedSpellings> {
+        match self {
+            Self::Listed(listed) => Some(*listed),
+            Self::PerName(_) | Self::OnMiss(_) | Self::Released => None,
+        }
+    }
+}
+
+/// [`ListedSpellings::claim`] of the child of a directory whose provider answers per name, where
+/// it holds no entry spelled as the child: each spelling of the name its index holds
+/// ([`InstanceOperation::names_folding_to`]) is added to `listed`, of the kind the working tree
+/// holds it as, and the child claims among them. A cold path, boxed by its caller.
+#[allow(clippy::manual_async_fn)]
+fn claim_by_name<'a>(
+    listed: &'a mut ListedSpellings,
+    operation: &'a InstanceOperationImpl,
+    directory: &'a RelativePath,
+    name: &'a str,
+    node: &'a Node,
+) -> impl Future<Output = Option<String>> + 'a {
+    async move {
+        let Ok(names) = operation.names_folding_to(directory, name).await else {
+            return None;
+        };
+        for spelled in names {
+            let file = operation
+                .file_info(&directory.join(&spelled))
+                .await
+                .is_ok_and(|info| info.is_file());
+            listed.add(node.name_hash, spelled, file);
+        }
+        listed.claim(name, node)
+    }
+}
+
+/// The entries of a directory a walk reads only once the stat of a child's spelling misses
+/// ([`CaseLookup::OnMiss`]), shared by the walks and file tasks of its children: the first miss
+/// lists the directory, and every miss claims among its entries.
+struct MissedSpellings {
+    directory: RelativePath,
+    listed: tokio::sync::Mutex<Option<ListedSpellings>>,
+}
+
+/// Where the stat of `relative_path` missed, renames the entry the working tree holds the node
+/// `node` in under another spelling, the one `missed` pairs with it, to the revision's spelling
+/// ([`respell`]), and answers the path the node is reset at and whether it is renamed. `None`
+/// where no entry pairs with the node. A cold path, boxed by its callers.
+async fn respell_missed(
+    operation: &InstanceOperationImpl,
+    stats: &ResetStats,
+    repository: &RepositoryContext,
+    missed: &MissedSpellings,
+    relative_path: &RelativePath,
+    node: &Node,
+) -> Option<(RelativePath, bool)> {
+    let name = relative_path.name();
+    let held = {
+        let mut listed = missed.listed.lock().await;
+        match &mut *listed {
+            Some(listed) => listed,
+            None => listed.insert(ListedSpellings::read(operation, &missed.directory).await),
+        }
+        .claim(name, node)?
+    };
+    let held = relative_path.parent_path().join(held);
+    Some(respell(operation, stats, repository, &held, name).await)
+}
+
+/// [`respell_missed`] for a link's mount, which the walk stats here, as no other stat of the walk
+/// reaches it before the linked walk does. A cold path, boxed by its caller.
+async fn respell_mount_missed(
+    operation: &InstanceOperationImpl,
+    stats: &ResetStats,
+    repository: &RepositoryContext,
+    missed: &MissedSpellings,
+    relative_path: &RelativePath,
+    node: &Node,
+) -> Option<(RelativePath, bool)> {
+    if !operation
+        .file_info(relative_path)
+        .await
+        .is_ok_and(|info| !info.exists())
+    {
+        return None;
+    }
+    respell_missed(operation, stats, repository, missed, relative_path, node).await
+}
+
+/// Sends the Delete event of `relative_path`, which the reset removes from the working tree, at
+/// the path the reset reports it at ([`ResetStats::reported`]).
+fn send_delete(stats: &ResetStats, relative_path: &RelativePath) {
     event::LoreEvent::FileResetFile(LoreFileResetFileEventData {
-        path: LoreString::from(relative_path),
+        path: LoreString::from(&stats.reported(relative_path)),
         action: LoreFileAction::Delete,
         from_path: LoreString::default(),
     })
@@ -1691,6 +2035,7 @@ async fn purge_path(
                 stats,
                 repository_root,
                 relative_path,
+                None,
                 None,
                 true,
             ))
@@ -1935,14 +2280,25 @@ async fn refuse_files_over_mounts_before_reset(
 /// `relative_path`, which this node's own query steps from. A reset asks the view
 /// alone, and a purge deletes a node the view excludes, boxed, so a walk that does
 /// not purge holds no room for it.
-async fn reset_walk_node(
+///
+/// `relative_path` names the node as the working tree holds it, and `name` is its name as the
+/// revision spells it. A node held in another case, which its caller has found of the node's kind,
+/// is renamed to that spelling ([`respell`]) before it is walked or its file is handed off. Where
+/// the caller reads its directory only on a miss, `missed` holds that directory's entries, and the
+/// node is renamed where the stat of its spelling misses: in [`reset_file_realize`] for a file, in
+/// [`reset_walk_directory`] for a directory, and here for a link's mount.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn reset_walk_node(
     ctx: ResetContext,
-    relative_path: RelativePath,
+    mut relative_path: RelativePath,
     name: String,
     node_id: u32,
     node: Node,
     parent_states: FilterStates,
-) -> Result<(), ResetError> {
+    missed: Option<Arc<MissedSpellings>>,
+) -> impl Future<Output = Result<(), ResetError>> {
     let ResetContext {
         operation,
         repository,
@@ -1952,145 +2308,172 @@ async fn reset_walk_node(
         stats,
         file_tx,
     } = ctx;
-
-    let force = execution_context().globals().force();
-    let (states, excluded) = repository.filter.child_emit_unless_forced(
-        force,
-        FilterMode::empty(),
-        parent_states,
-        &relative_path,
-        node.is_directory(),
-        FilterMode::View,
-    );
-    if excluded {
-        lore_trace!("Path excluded by filter: {}", relative_path.as_str());
-        if options.purge {
-            Box::pin(purge_path(&operation, &stats, &repository, &relative_path)).await?;
-        }
-        return Ok(());
-    }
-
-    // Check whether the node is staged (applies to all kinds: file/dir/link)
-    let block_index = NodeBlock::index(node_id);
-    let node_index = Node::index(node_id);
-
-    // The flags alone, so neither the block nor the record is held across the clear below.
-    let staged_flags = state_staged
-        .block(repository.clone(), block_index)
-        .await
-        .ok()
-        .map(|staged_block| {
-            let staged_node = staged_block.node(node_index);
-            (staged_node.is_staged(), staged_node.is_dirty())
-        });
-    if let Some((staged, dirty)) = staged_flags {
-        if staged {
-            return Err(staged_node_refusal());
-        }
-
-        // Clear Dirty flag if set (reset restores file to current revision), then a dirty clear's
-        // climb clears each parent that nothing below keeps dirty, up to one already clean.
-        if dirty {
-            state_staged
-                .node_clear(&repository, node_id, Clear::Dirty)
-                .await
-                .forward::<ResetError>("Failed to clear the dirty flags")?;
-        }
-    }
-
-    // If the node is a link, traverse into the linked repository
-    if node.is_link() {
-        if options.single_node {
+    async move {
+        let force = execution_context().globals().force();
+        let (states, excluded) = repository.filter.child_emit_unless_forced(
+            force,
+            FilterMode::empty(),
+            parent_states,
+            &relative_path,
+            node.is_directory(),
+            FilterMode::View,
+        );
+        if excluded {
+            lore_trace!("Path excluded by filter: {}", relative_path.as_str());
+            if options.purge {
+                Box::pin(purge_path(&operation, &stats, &repository, &relative_path)).await?;
+            }
             return Ok(());
         }
 
-        let link = node.linked_node();
-        let linked_repository = repository.to_link_context(link.repository).await;
-        let linked_state_current =
-            state::State::deserialize(linked_repository.clone(), link.revision)
+        // Check whether the node is staged (applies to all kinds: file/dir/link)
+        let block_index = NodeBlock::index(node_id);
+        let node_index = Node::index(node_id);
+
+        // The flags alone, so neither the block nor the record is held across the clear below.
+        let staged_flags = state_staged
+            .block(repository.clone(), block_index)
+            .await
+            .ok()
+            .map(|staged_block| {
+                let staged_node = staged_block.node(node_index);
+                (staged_node.is_staged(), staged_node.is_dirty())
+            });
+        if let Some((staged, dirty)) = staged_flags {
+            if staged {
+                return Err(staged_node_refusal());
+            }
+
+            // Clear Dirty flag if set (reset restores file to current revision), then a dirty clear's
+            // climb clears each parent that nothing below keeps dirty, up to one already clean.
+            if dirty {
+                state_staged
+                    .node_clear(&repository, node_id, Clear::Dirty)
+                    .await
+                    .forward::<ResetError>("Failed to clear the dirty flags")?;
+            }
+        }
+
+        let mut respelled = false;
+        if relative_path.name() != name {
+            (relative_path, respelled) = Box::pin(respell(
+                &operation,
+                &stats,
+                &repository,
+                &relative_path,
+                &name,
+            ))
+            .await;
+        }
+
+        // If the node is a link, traverse into the linked repository
+        if node.is_link() {
+            if options.single_node {
+                return Ok(());
+            }
+            if let Some(missed) = &missed
+                && let Some((held, _)) = Box::pin(respell_mount_missed(
+                    &operation,
+                    &stats,
+                    &repository,
+                    missed,
+                    &relative_path,
+                    &node,
+                ))
+                .await
+            {
+                relative_path = held;
+            }
+
+            let link = node.linked_node();
+            let linked_repository = repository.to_link_context(link.repository).await;
+            let linked_state_current =
+                state::State::deserialize(linked_repository.clone(), link.revision)
+                    .await
+                    .forward::<ResetError>("Failed to deserialize revision state")?;
+
+            let linked_state_staged = match state_staged
+                .find_node_link(repository.clone(), relative_path.as_str())
+                .await
+            {
+                Ok(staged_link) if staged_link.repository == link.repository => {
+                    state::State::deserialize(linked_repository.clone(), staged_link.revision)
+                        .await
+                        .forward::<ResetError>("Failed to deserialize revision state")?
+                }
+                _ => linked_state_current.clone(),
+            };
+
+            stats.directory_reset_count.fetch_add(1, Ordering::Relaxed);
+
+            let linked_root_node = linked_state_current
+                .node(linked_repository.clone(), link.node)
                 .await
                 .forward::<ResetError>("Failed to deserialize revision state")?;
 
-        let linked_state_staged = match state_staged
-            .find_node_link(repository.clone(), relative_path.as_str())
-            .await
-        {
-            Ok(staged_link) if staged_link.repository == link.repository => {
-                state::State::deserialize(linked_repository.clone(), staged_link.revision)
-                    .await
-                    .forward::<ResetError>("Failed to deserialize revision state")?
-            }
-            _ => linked_state_current.clone(),
-        };
+            let link_states = linked_repository.filter.mount_states(&relative_path);
 
-        stats.directory_reset_count.fetch_add(1, Ordering::Relaxed);
-
-        let linked_root_node = linked_state_current
-            .node(linked_repository.clone(), link.node)
-            .await
-            .forward::<ResetError>("Failed to deserialize revision state")?;
-
-        let link_states = linked_repository.filter.mount_states(&relative_path);
-
-        return reset_walk_directory_recurse(
-            ResetContext {
-                operation: operation.clone(),
-                repository: linked_repository,
-                state_target: linked_state_current,
-                state_staged: linked_state_staged,
-                options,
-                stats,
-                file_tx,
-            },
-            relative_path,
-            linked_root_node,
-            link.node,
-            link_states,
-        )
-        .await;
-    }
-
-    // If the node is a directory, recurse
-    if node.is_directory() {
-        if options.single_node {
-            return Ok(());
+            return reset_walk_directory_recurse(
+                ResetContext {
+                    operation: operation.clone(),
+                    repository: linked_repository,
+                    state_target: linked_state_current,
+                    state_staged: linked_state_staged,
+                    options,
+                    stats,
+                    file_tx,
+                },
+                relative_path,
+                linked_root_node,
+                link.node,
+                link_states,
+                None,
+            )
+            .await;
         }
 
-        stats.directory_reset_count.fetch_add(1, Ordering::Relaxed);
+        // If the node is a directory, recurse
+        if node.is_directory() {
+            if options.single_node {
+                return Ok(());
+            }
 
-        return reset_walk_directory_recurse(
-            ResetContext {
-                operation: operation.clone(),
-                repository,
-                state_target,
-                state_staged,
-                options,
-                stats,
-                file_tx,
-            },
+            stats.directory_reset_count.fetch_add(1, Ordering::Relaxed);
+
+            return reset_walk_directory_recurse(
+                ResetContext {
+                    operation: operation.clone(),
+                    repository,
+                    state_target,
+                    state_staged,
+                    options,
+                    stats,
+                    file_tx,
+                },
+                relative_path,
+                node,
+                node_id,
+                states,
+                missed,
+            )
+            .await;
+        }
+
+        // File: hand off to the consumer
+        let permit = file_tx
+            .reserve()
+            .await
+            .map_err(|_closed| ResetError::internal("File consumer dropped"))?;
+        permit.send(ResetFileWorkItem {
+            repository,
             relative_path,
+            respelled,
             node,
-            node_id,
-            states,
-        )
-        .await;
+            missed,
+        });
+
+        Ok(())
     }
-
-    // File: hand off to the consumer
-    let permit = file_tx
-        .reserve()
-        .await
-        .map_err(|_closed| ResetError::internal("File consumer dropped"))?;
-    permit.send(ResetFileWorkItem {
-        repository,
-        state_target,
-        relative_path,
-        name,
-        node_id,
-        node,
-    });
-
-    Ok(())
 }
 
 /// Walk the children of a directory node, dispatching each to
@@ -2101,13 +2484,31 @@ async fn reset_walk_node(
 /// here unless the view excludes it, and purge (when enabled) runs for every
 /// directory once its child walks have completed. The purge is boxed, so a walk
 /// that does not purge holds no room for it.
-async fn reset_walk_directory(
+///
+/// A child the working tree holds in another spelling, of its kind, is walked from the entry
+/// paired with it, and every other child from its name in the revision. The directory's entries
+/// are found as the provider's [`CaseLookup`] says ([`DirectorySpellings`]): listed before the
+/// children are walked, and held while they are, a subdirectory walked in place included; asked
+/// of the provider's index per child; or listed on a child's first miss. A purge lists the
+/// directory before its children whatever the provider, and removes the entries no child claimed
+/// from that same listing, held until then; a listing short of an entry leaves the purge to list
+/// the directory again, the claimed names still left. A reset that does not purge releases the
+/// listing before it waits on the subdirectories it spawned.
+///
+/// `missed` holds the entries of the parent directory where it is read on a miss: where the stat of
+/// `directory_path` misses, the directory is walked from the entry paired with it there, renamed to
+/// the revision's spelling ([`respell_missed`]).
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn reset_walk_directory(
     ctx: ResetContext,
-    directory_path: RelativePath,
+    mut directory_path: RelativePath,
     node: Node,
     node_id: NodeID,
     states: FilterStates,
-) -> Result<(), ResetError> {
+    missed: Option<Arc<MissedSpellings>>,
+) -> impl Future<Output = Result<(), ResetError>> {
     let ResetContext {
         operation,
         repository,
@@ -2117,190 +2518,216 @@ async fn reset_walk_directory(
         stats,
         file_tx,
     } = ctx;
-    lore_trace!("Resetting directory: {}", directory_path.as_str());
+    async move {
+        lore_trace!("Resetting directory: {}", directory_path.as_str());
 
-    if !directory_path.is_empty() {
-        clear_for_directory(&operation, &stats, &directory_path).await?;
-    }
-
-    let mut child_node_iter = node.child();
-
-    if child_node_iter.is_none() {
-        if !directory_path.is_empty() && !states.excluded(FilterMode::View) {
-            create_empty_directory::<ResetError>(&operation, &directory_path).await?;
+        if !directory_path.is_empty()
+            && clear_for_directory(&operation, &stats, &directory_path).await?
+            && let Some(missed) = &missed
+            && let Some((held, _)) = Box::pin(respell_missed(
+                &operation,
+                &stats,
+                &repository,
+                missed,
+                &directory_path,
+                &node,
+            ))
+            .await
+        {
+            directory_path = held;
         }
+
+        let mut child_node_iter = node.child();
+
+        if child_node_iter.is_none() {
+            if !directory_path.is_empty() && !states.excluded(FilterMode::View) {
+                create_empty_directory::<ResetError>(&operation, &directory_path).await?;
+            }
+            if !options.purge {
+                return Ok(());
+            }
+            return Box::pin(purge_untracked_children(
+                &operation,
+                &stats,
+                repository.require_path()?,
+                &directory_path,
+                None,
+                None,
+                false,
+            ))
+            .await;
+        }
+
+        let mut child_dirs: JoinSet<Result<(), ResetError>> = JoinSet::new();
+        let mut held: Vec<HeldChild> = vec![];
+        let mut failure: Option<ResetError> = None;
+        let mut cycle = SiblingCycleGuard::new(node_id);
+        let mut dirty_adds = state_staged
+            .node_dirty_add_children(repository.clone(), node_id)
+            .await
+            .forward::<ResetError>("Listing the staged children")?;
+        dirty_adds.sort_unstable_by_key(|&(_, name_hash)| name_hash);
+        let mut replaced = Vec::new();
+        let mut spellings =
+            match DirectorySpellings::unlisted(&operation, &directory_path, options.purge) {
+                Some(spellings) => spellings,
+                None => DirectorySpellings::Listed(Box::new(
+                    ListedSpellings::read(&operation, &directory_path).await,
+                )),
+            };
+
+        while let Some(child_node_id) = child_node_iter {
+            let child_node = match state_target.node(repository.clone(), child_node_id).await {
+                Ok(child_node) => child_node,
+                Err(err) => {
+                    failure = Some(forward_refusal_or(err, "reading a node block", |err| {
+                        ResetError::internal_with_context(
+                            err,
+                            "Failed deserializing state node block",
+                        )
+                    }));
+                    break;
+                }
+            };
+
+            if let Err(err) = child_node
+                .walk_step(child_node_id, node_id, &mut cycle)
+                .forward::<ResetError>("Invalid node hierarchy in reset walk")
+            {
+                failure = Some(err);
+                break;
+            }
+
+            let child_node_name = match state_target
+                .node_name_clone_or_skip(repository.clone(), child_node_id)
+                .await
+                .forward::<ResetError>("Failed to get node name")
+            {
+                Ok(Some(name)) => name,
+                Ok(None) => {
+                    child_node_iter = child_node.sibling();
+                    continue;
+                }
+                Err(err) => {
+                    failure = Some(err);
+                    break;
+                }
+            };
+
+            let child_node_path = spellings
+                .child_path(&operation, &directory_path, &child_node_name, &child_node)
+                .await;
+            if options.purge {
+                held.push(HeldChild {
+                    folded: child_node.name_hash,
+                    exact: hash_string_bytes(child_node_name.as_bytes()),
+                    node: child_node_id,
+                });
+            }
+            replaced.extend(replaced_dirty_adds(
+                &dirty_adds,
+                child_node_id,
+                child_node.name_hash,
+            ));
+
+            if child_node.is_directory() || child_node.is_link() {
+                // Directory/link work recurses; gate via directory_inflight.
+                let inflight = stats.directory_inflight.fetch_add(1, Ordering::Relaxed);
+
+                let walk = reset_walk_node(
+                    ResetContext {
+                        operation: operation.clone(),
+                        repository: repository.clone(),
+                        state_target: state_target.clone(),
+                        state_staged: state_staged.clone(),
+                        options,
+                        stats: stats.clone(),
+                        file_tx: file_tx.clone(),
+                    },
+                    child_node_path,
+                    child_node_name,
+                    child_node_id,
+                    child_node,
+                    states,
+                    spellings.missed(),
+                );
+                let task_stats = stats.clone();
+                let future = walk.inspect(move |_| {
+                    task_stats
+                        .directory_inflight
+                        .fetch_sub(1, Ordering::Relaxed);
+                });
+
+                if inflight as usize > RESET_DIRECTORY_MAX {
+                    if let Err(err) = future.await {
+                        failure = Some(err);
+                        break;
+                    }
+                } else {
+                    lore_spawn!(child_dirs, future);
+                }
+            } else {
+                // File / other leaf: walking is cheap (filter + staged + push to channel).
+                let result = reset_walk_node(
+                    ResetContext {
+                        operation: operation.clone(),
+                        repository: repository.clone(),
+                        state_target: state_target.clone(),
+                        state_staged: state_staged.clone(),
+                        options,
+                        stats: stats.clone(),
+                        file_tx: file_tx.clone(),
+                    },
+                    child_node_path,
+                    child_node_name,
+                    child_node_id,
+                    child_node,
+                    states,
+                    spellings.missed(),
+                )
+                .await;
+                if let Err(err) = result {
+                    failure = Some(err);
+                    break;
+                }
+            }
+
+            child_node_iter = child_node.sibling();
+        }
+        if !options.purge {
+            spellings = DirectorySpellings::Released;
+        }
+
+        while let Some(result) = child_dirs.join_next().await {
+            let inner = result
+                .internal("Recursion task failed")
+                .map_err(ResetError::from)
+                .flatten();
+            failure = failure.or(inner.err());
+        }
+        if let Some(err) = failure {
+            return Err(err);
+        }
+        stats
+            .discards
+            .queue(state_staged, repository.clone(), replaced);
+
         if !options.purge {
             return Ok(());
         }
-        return Box::pin(purge_untracked_children(
+
+        let held = HeldChildren::new(state_target, repository.clone(), held);
+        Box::pin(purge_untracked_children(
             &operation,
             &stats,
             repository.require_path()?,
             &directory_path,
-            None,
+            Some(held),
+            spellings.into_listed(),
             false,
         ))
-        .await;
-    }
-
-    let mut child_dirs: JoinSet<Result<(), ResetError>> = JoinSet::new();
-    let mut held: Vec<HeldChild> = vec![];
-    let mut failure: Option<ResetError> = None;
-    let mut cycle = SiblingCycleGuard::new(node_id);
-    let mut dirty_adds = state_staged
-        .node_dirty_add_children(repository.clone(), node_id)
         .await
-        .forward::<ResetError>("Listing the staged children")?;
-    dirty_adds.sort_unstable_by_key(|&(_, name_hash)| name_hash);
-    let mut replaced = Vec::new();
-
-    while let Some(child_node_id) = child_node_iter {
-        let child_node = match state_target.node(repository.clone(), child_node_id).await {
-            Ok(child_node) => child_node,
-            Err(err) => {
-                failure = Some(forward_refusal_or(err, "reading a node block", |err| {
-                    ResetError::internal_with_context(err, "Failed deserializing state node block")
-                }));
-                break;
-            }
-        };
-
-        if let Err(err) = child_node
-            .walk_step(child_node_id, node_id, &mut cycle)
-            .forward::<ResetError>("Invalid node hierarchy in reset walk")
-        {
-            failure = Some(err);
-            break;
-        }
-
-        let child_node_name = match state_target
-            .node_name_clone_or_skip(repository.clone(), child_node_id)
-            .await
-            .forward::<ResetError>("Failed to get node name")
-        {
-            Ok(Some(name)) => name,
-            Ok(None) => {
-                child_node_iter = child_node.sibling();
-                continue;
-            }
-            Err(err) => {
-                failure = Some(err);
-                break;
-            }
-        };
-
-        let child_node_path = directory_path.join(&child_node_name);
-        if options.purge {
-            held.push(HeldChild {
-                folded: child_node.name_hash,
-                exact: hash_string_bytes(child_node_name.as_bytes()),
-                node: child_node_id,
-            });
-        }
-        replaced.extend(replaced_dirty_adds(
-            &dirty_adds,
-            child_node_id,
-            child_node.name_hash,
-        ));
-
-        if child_node.is_directory() || child_node.is_link() {
-            // Directory/link work recurses; gate via directory_inflight.
-            let inflight = stats.directory_inflight.fetch_add(1, Ordering::Relaxed);
-
-            let task_ctx = ResetContext {
-                operation: operation.clone(),
-                repository: repository.clone(),
-                state_target: state_target.clone(),
-                state_staged: state_staged.clone(),
-                options,
-                stats: stats.clone(),
-                file_tx: file_tx.clone(),
-            };
-            let task_path = child_node_path;
-            let task_name = child_node_name;
-            let task_node = child_node;
-
-            let future = async move {
-                let task_stats = task_ctx.stats.clone();
-                let result = reset_walk_node(
-                    task_ctx,
-                    task_path,
-                    task_name,
-                    child_node_id,
-                    task_node,
-                    states,
-                )
-                .await;
-                task_stats
-                    .directory_inflight
-                    .fetch_sub(1, Ordering::Relaxed);
-                result
-            };
-
-            if inflight as usize > RESET_DIRECTORY_MAX {
-                if let Err(err) = future.await {
-                    failure = Some(err);
-                    break;
-                }
-            } else {
-                lore_spawn!(child_dirs, future);
-            }
-        } else {
-            // File / other leaf: walking is cheap (filter + staged + push to channel).
-            let result = reset_walk_node(
-                ResetContext {
-                    operation: operation.clone(),
-                    repository: repository.clone(),
-                    state_target: state_target.clone(),
-                    state_staged: state_staged.clone(),
-                    options,
-                    stats: stats.clone(),
-                    file_tx: file_tx.clone(),
-                },
-                child_node_path,
-                child_node_name,
-                child_node_id,
-                child_node,
-                states,
-            )
-            .await;
-            if let Err(err) = result {
-                failure = Some(err);
-                break;
-            }
-        }
-
-        child_node_iter = child_node.sibling();
     }
-
-    while let Some(result) = child_dirs.join_next().await {
-        let inner = result
-            .internal("Recursion task failed")
-            .map_err(ResetError::from)
-            .flatten();
-        failure = failure.or(inner.err());
-    }
-    if let Some(err) = failure {
-        return Err(err);
-    }
-    stats
-        .discards
-        .queue(state_staged, repository.clone(), replaced);
-
-    if !options.purge {
-        return Ok(());
-    }
-
-    let held = HeldChildren::new(state_target, repository.clone(), held);
-    Box::pin(purge_untracked_children(
-        &operation,
-        &stats,
-        repository.require_path()?,
-        &directory_path,
-        Some(held),
-        false,
-    ))
-    .await
 }
 
 /// Removes the children the working tree holds under `directory_path` that the target revision
@@ -2320,140 +2747,149 @@ async fn reset_walk_directory(
 /// each spawn. The first failure, of the listing, a removal or a purge around a mount, ends the
 /// listing, and it is answered once the tasks still live have been awaited.
 ///
-/// A directory the working tree does not hold has nothing to purge.
+/// The entries are those of `listed`, the listing the walk of the directory paired with its
+/// children, less the ones a child claimed. Where that listing is short of an entry, or there is
+/// none, a listing of the directory read here takes its place, still less the names a child
+/// claimed in `listed`. A directory the working tree does not hold has nothing to purge.
+///
+/// Not an `async fn`, which would hold `listed` twice across the directory's description.
 #[lore_macro::test_pub]
-async fn purge_untracked_children(
-    operation: &Arc<InstanceOperationImpl>,
-    stats: &Arc<ResetStats>,
-    repository_root: &Path,
-    directory_path: &RelativePath,
+#[allow(clippy::manual_async_fn)]
+fn purge_untracked_children<'a>(
+    operation: &'a Arc<InstanceOperationImpl>,
+    stats: &'a Arc<ResetStats>,
+    repository_root: &'a Path,
+    directory_path: &'a RelativePath,
     held: Option<HeldChildren>,
+    listed: Option<ListedSpellings>,
     report: bool,
-) -> Result<(), ResetError> {
-    if !operation
-        .file_info(directory_path)
-        .await
-        .forward_any::<ResetError>("Failed to describe a directory to purge")?
-        .is_dir()
-    {
-        return Ok(());
-    }
+) -> impl Future<Output = Result<(), ResetError>> + 'a {
+    let mut filesystem_children = match listed {
+        Some(listed) if listed.complete => PurgeEntries::Listed(listed.entries.into_iter()),
+        claimed => PurgeEntries::Unread(claimed.unwrap_or_default()),
+    };
+    async move {
+        if matches!(filesystem_children, PurgeEntries::Unread(_))
+            && !operation
+                .file_info(directory_path)
+                .await
+                .forward_any::<ResetError>("Failed to describe a directory to purge")?
+                .is_dir()
+        {
+            return Ok(());
+        }
 
-    let mut filesystem_children = operation
-        .read_directory(directory_path)
-        .await
-        .forward_any_with::<ResetError, _>(|| {
-            format!("Failed to list directory files in {directory_path}")
-        })?;
+        let mut probe: Option<PathBuf> = None;
+        let mut tasks = JoinSet::new();
+        let mut failure = None;
+        while let Some(filesystem_child) = filesystem_children.next(operation, directory_path).await
+        {
+            #[cfg(feature = "test-util")]
+            let filesystem_child = PURGE_TASKS.entry(filesystem_child);
+            let filesystem_child =
+                match filesystem_child.forward_any::<ResetError>("Unusable directory entry") {
+                    Ok(filesystem_child) => filesystem_child,
+                    Err(err) => {
+                        failure = Some(err);
+                        break;
+                    }
+                };
+            let name = filesystem_child.name.as_str();
+            if is_reserved_node_name(name) {
+                continue;
+            }
+            if let Some(held) = held.as_ref()
+                && held
+                    .leaves(operation, directory_path, name, filesystem_child.folded)
+                    .await
+            {
+                continue;
+            }
 
-    let mut probe: Option<PathBuf> = None;
-    let mut tasks = JoinSet::new();
-    let mut failure = None;
-    while let Some(filesystem_child) = filesystem_children.next().await {
-        #[cfg(feature = "test-util")]
-        let filesystem_child = PURGE_TASKS.entry(filesystem_child);
-        let filesystem_child =
-            match filesystem_child.forward_any::<ResetError>("Unusable directory entry") {
-                Ok(filesystem_child) => filesystem_child,
-                Err(err) => {
+            let child_path = directory_path.join(name);
+            let is_directory = !filesystem_child.file;
+            if let Some(mount) = stats
+                .layer_mounts
+                .iter()
+                .find(|mount| child_path.covers_ignore_case(mount))
+                && (is_directory || mount.len() == child_path.len())
+            {
+                if mount.len() != child_path.len()
+                    && let Err(err) = Box::pin(purge_untracked_children(
+                        operation,
+                        stats,
+                        repository_root,
+                        &child_path,
+                        None,
+                        None,
+                        report,
+                    ))
+                    .await
+                {
                     failure = Some(err);
                     break;
                 }
-            };
-        let name = filesystem_child.name.as_str();
-        if is_reserved_node_name(name) {
-            continue;
-        }
-        if let Some(held) = held.as_ref()
-            && held
-                .leaves(operation, directory_path, name, filesystem_child.name_hash)
-                .await
-        {
-            continue;
-        }
+                continue;
+            }
+            if is_directory {
+                let probe = match directory_path
+                    .to_absolute_path_cached(repository_root, &mut probe)
+                    .forward::<ResetError>("placing the purged directory below the root")
+                {
+                    Ok(probe) => probe,
+                    Err(err) => {
+                        failure = Some(err);
+                        break;
+                    }
+                };
+                if state::is_nested_repository_root(probe, name).await {
+                    lore_trace!("Leaving nested repository {child_path} in place");
+                    continue;
+                }
+            }
 
-        let child_path = directory_path.join(name);
-        let is_directory = filesystem_child.info.is_dir();
-        if let Some(mount) = stats
-            .layer_mounts
-            .iter()
-            .find(|mount| child_path.covers_ignore_case(mount))
-            && (is_directory || mount.len() == child_path.len())
-        {
-            if mount.len() != child_path.len()
-                && let Err(err) = Box::pin(purge_untracked_children(
-                    operation,
-                    stats,
-                    repository_root,
-                    &child_path,
-                    None,
-                    report,
-                ))
-                .await
-            {
+            lore_trace!("Child node {name} not found, removing path from disk");
+
+            stats
+                .delete_count(is_directory)
+                .fetch_add(1, Ordering::Relaxed);
+            if report {
+                send_delete(stats, &child_path);
+            }
+
+            let child_operation = operation.clone();
+            #[cfg(feature = "test-util")]
+            let live = PURGE_TASKS.enter();
+            lore_spawn!(tasks, async move {
+                #[cfg(feature = "test-util")]
+                let _live = live;
+                #[cfg(feature = "test-util")]
+                PURGE_TASKS.wait_if_held().await;
+                child_operation
+                    .remove_recursive_keeping_repositories(&child_path)
+                    .await
+                    .forward::<ResetError>("Failed to remove invalid node")
+            });
+            if let Err(err) = lore_limit_drain_tasks!(
+                tasks,
+                MAX_CONCURRENT_TREE_TASKS,
+                ResetError::internal("Recursion task failed")
+            ) {
                 failure = Some(err);
                 break;
             }
-            continue;
-        }
-        if is_directory {
-            let probe = match directory_path
-                .to_absolute_path_cached(repository_root, &mut probe)
-                .forward::<ResetError>("placing the purged directory below the root")
-            {
-                Ok(probe) => probe,
-                Err(err) => {
-                    failure = Some(err);
-                    break;
-                }
-            };
-            if state::is_nested_repository_root(probe, name).await {
-                lore_trace!("Leaving nested repository {child_path} in place");
-                continue;
-            }
         }
 
-        lore_trace!("Child node {name} not found, removing path from disk");
-
-        stats
-            .delete_count(is_directory)
-            .fetch_add(1, Ordering::Relaxed);
-        if report {
-            send_delete(&child_path);
+        while let Some(result) = tasks.join_next().await {
+            let result = result
+                .internal("Recursion task failed")
+                .map_err(ResetError::from)
+                .flatten();
+            failure = failure.or(result.err());
         }
 
-        let child_operation = operation.clone();
-        #[cfg(feature = "test-util")]
-        let live = PURGE_TASKS.enter();
-        lore_spawn!(tasks, async move {
-            #[cfg(feature = "test-util")]
-            let _live = live;
-            #[cfg(feature = "test-util")]
-            PURGE_TASKS.wait_if_held().await;
-            child_operation
-                .remove_recursive_keeping_repositories(&child_path)
-                .await
-                .forward::<ResetError>("Failed to remove invalid node")
-        });
-        if let Err(err) = lore_limit_drain_tasks!(
-            tasks,
-            MAX_CONCURRENT_TREE_TASKS,
-            ResetError::internal("Recursion task failed")
-        ) {
-            failure = Some(err);
-            break;
-        }
+        failure.map_or(Ok(()), Err)
     }
-
-    while let Some(result) = tasks.join_next().await {
-        let result = result
-            .internal("Recursion task failed")
-            .map_err(ResetError::from)
-            .flatten();
-        failure = failure.or(result.err());
-    }
-
-    failure.map_or(Ok(()), Err)
 }
 
 /// Counts and holds the removal tasks purges spawn, and fails a purge's listing, for a test.
@@ -2590,6 +3026,45 @@ impl HeldChildren {
     }
 }
 
+/// The entries a purge reads: those of the walk's listing, or those of a listing it reads itself
+/// on its first [`Self::next`], less the ones a child claimed in the walk's.
+enum PurgeEntries {
+    Listed(std::vec::IntoIter<ListedEntry>),
+    Unread(ListedSpellings),
+    Listing {
+        listing: DirectoryListing,
+        claimed: ListedSpellings,
+    },
+}
+
+impl PurgeEntries {
+    async fn next(
+        &mut self,
+        operation: &InstanceOperationImpl,
+        directory: &RelativePath,
+    ) -> Option<Result<ListedEntry, FsError>> {
+        loop {
+            match self {
+                Self::Listed(entries) => return entries.find(|entry| !entry.claimed).map(Ok),
+                Self::Unread(claimed) => {
+                    let claimed = std::mem::take(claimed);
+                    match operation.read_directory(directory).await {
+                        Ok(listing) => *self = Self::Listing { listing, claimed },
+                        Err(err) => {
+                            *self = Self::Listed(Vec::new().into_iter());
+                            return Some(Err(err));
+                        }
+                    }
+                }
+                Self::Listing { listing, claimed } => match listing.next().await? {
+                    Ok(entry) if claimed.claims(&entry.name, entry.name_hash) => {}
+                    entry => return Some(entry.map(ListedEntry::listed)),
+                },
+            }
+        }
+    }
+}
+
 /// Drain the file work channel and run per-file reset work. Each task
 /// `acquire_owned()`s a permit from `file_inflight` before being spawned;
 /// the permit is dropped when the task completes, which back-pressures the
@@ -2617,19 +3092,17 @@ async fn reset_file_consume(
             .await
             .expect("file_inflight semaphore closed unexpectedly");
 
+        stats.file_inflight_count.fetch_add(1, Ordering::Relaxed);
         let task_stats = stats.clone();
-        let task_operation = operation.clone();
-        lore_spawn!(tasks, async move {
-            let _permit = permit;
-            task_stats
-                .file_inflight_count
-                .fetch_add(1, Ordering::Relaxed);
-            let result = reset_file_realize(task_operation, item, task_stats.clone()).await;
-            task_stats
-                .file_inflight_count
-                .fetch_sub(1, Ordering::Relaxed);
-            result
-        });
+        lore_spawn!(
+            tasks,
+            reset_file_realize(operation.clone(), item, stats.clone()).inspect(move |_| {
+                drop(permit);
+                task_stats
+                    .file_inflight_count
+                    .fetch_sub(1, Ordering::Relaxed);
+            })
+        );
 
         while let Some(result) = tasks.try_join_next() {
             let inner = result
@@ -2659,111 +3132,95 @@ async fn reset_file_consume(
     Ok(())
 }
 
-/// Per-file reset work: stat, modified-check (vs. node hash), case-rename if
-/// needed, otherwise realize through the operation the reset holds. Filter and staged
-/// checks were already done by the walker.
-async fn reset_file_realize(
+/// Per-file reset work: stat, modified-check (vs. node hash), otherwise realize through the
+/// operation the reset holds. Filter and staged checks, and the rename to the spelling the
+/// revision holds, were already done by the walker, but where the stat of a file whose directory
+/// is read on a miss misses, which renames it here ([`respell_missed`]); a renamed file counts as
+/// reset.
+///
+/// Not an `async fn`, which would hold the work item as well as what it holds.
+#[allow(clippy::manual_async_fn)]
+fn reset_file_realize(
     operation: Arc<InstanceOperationImpl>,
     item: ResetFileWorkItem,
     stats: Arc<ResetStats>,
-) -> Result<(), ResetError> {
+) -> impl Future<Output = Result<(), ResetError>> {
     let ResetFileWorkItem {
         repository,
-        state_target,
-        relative_path,
-        name,
-        node_id,
+        mut relative_path,
+        mut respelled,
         node,
+        missed,
     } = item;
+    async move {
+        let mut info = operation.file_info(&relative_path).await;
+        if let Some(missed) = missed
+            && info.as_ref().is_ok_and(|info| !info.exists())
+            && let Some((held, renamed)) = Box::pin(respell_missed(
+                &operation,
+                &stats,
+                &repository,
+                &missed,
+                &relative_path,
+                &node,
+            ))
+            .await
+        {
+            info = operation.file_info(&held).await;
+            (relative_path, respelled) = (held, renamed);
+        }
 
-    let info = operation.file_info(&relative_path).await;
-
-    let force = execution_context().globals().force();
-
-    let block_index = NodeBlock::index(node_id);
-    let node_index = Node::index(node_id);
-
-    if !force
-        && let Ok(info) = info.as_ref()
-        && info.is_file()
-    {
-        let file_modified = state::file_modification(
-            repository.clone(),
-            &node,
-            info.mtime(),
-            info.size(),
-            &relative_path,
-            true, /* Force hash check */
-            &operation,
-            &lore_storage::ContentHashes::default(),
-        )
-        .await
-        .forward::<ResetError>("Failed to check whether file changed")?
-        .is_modified();
-
-        if !file_modified {
-            let block = state_target
-                .block_with_nametable(repository.clone(), block_index)
+        let modified = match info.as_ref() {
+            Ok(info) if info.is_file() && !execution_context().globals().force() => {
+                state::file_modification(
+                    repository.clone(),
+                    &node,
+                    info.mtime(),
+                    info.size(),
+                    &relative_path,
+                    true, /* Force hash check */
+                    &operation,
+                    &lore_storage::ContentHashes::default(),
+                )
                 .await
-                .forward::<ResetError>("Failed deserializing state node block")?;
-            let node_name = block
-                .node_name_ref(node_index)
-                .forward::<ResetError>("Failed to get node name")?;
-            if *name != *node_name {
-                lore_trace!(
-                    "Node case variation in file system detected renaming, {} -> {}",
-                    name,
-                    node_name
-                );
-                let mut buf = relative_path.clone().into_buf();
-                buf.pop();
-                let to_path = buf.push_and_freeze(node_name);
-
+                .forward::<ResetError>("Failed to check whether file changed")?
+                .is_modified()
+            }
+            _ => true,
+        };
+        if !modified {
+            if respelled {
                 stats.file_reset_count.fetch_add(1, Ordering::Relaxed);
-                event::LoreEvent::FileResetFile(LoreFileResetFileEventData {
-                    path: to_path.as_str().into(),
-                    action: LoreFileAction::Move,
-                    from_path: relative_path.as_str().into(),
-                })
-                .send();
-
-                operation
-                    .rename(&relative_path, &to_path)
-                    .await
-                    .forward::<ResetError>("Failed renaming file")?;
             } else {
                 lore_trace!("File {relative_path} is not modified, no reset");
             }
             return Ok(());
         }
+
+        lore_trace!("Recovering node with path {}", relative_path.as_str());
+
+        // If being reset from a directory to a file the directory must be deleted before the file
+        // is created.
+        if info.is_ok_and(|info| info.is_dir()) {
+            reset_delete_path(&operation, &stats, &relative_path, true, false).await?;
+        }
+
+        stats.file_reset_count.fetch_add(1, Ordering::Relaxed);
+        event::LoreEvent::FileResetFile(LoreFileResetFileEventData {
+            path: stats.reported(&relative_path).as_str().into(),
+            action: LoreFileAction::Keep,
+            from_path: LoreString::default(),
+        })
+        .send();
+
+        crate::fs::realize::realize_file(
+            repository.clone(),
+            operation,
+            relative_path,
+            node,
+            Arc::new(SyncRealizeStats::default()),
+        )
+        .await
+        .forward::<ResetError>("Unable to restore path to selected state")
     }
-
-    lore_trace!(
-        "Recovering node {name} with path {}",
-        relative_path.as_str()
-    );
-
-    // If being reset from a directory to a file the directory must be deleted before the file is
-    // created.
-    if info.is_ok_and(|info| info.is_dir()) {
-        reset_delete_path(&operation, &stats, &relative_path, true, false).await?;
-    }
-
-    stats.file_reset_count.fetch_add(1, Ordering::Relaxed);
-    event::LoreEvent::FileResetFile(LoreFileResetFileEventData {
-        path: relative_path.as_str().into(),
-        action: LoreFileAction::Keep,
-        from_path: LoreString::default(),
-    })
-    .send();
-
-    crate::fs::realize::realize_file(
-        repository.clone(),
-        operation,
-        relative_path,
-        node,
-        Arc::new(SyncRealizeStats::default()),
-    )
-    .await
-    .forward::<ResetError>("Unable to restore path to selected state")
 }

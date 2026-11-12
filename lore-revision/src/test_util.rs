@@ -10,7 +10,6 @@ use std::sync::atomic::Ordering;
 
 use tokio::sync::Notify;
 
-use crate::fs::filesystem_provider::DirectoryEntry;
 use crate::fs::filesystem_provider::FsError;
 use crate::repository::RemoteState;
 use crate::repository::RepositoryContext;
@@ -99,10 +98,7 @@ impl TaskProbe {
 
     /// `entry`, or the failure [`Self::fail_entry_after`] armed in its place, which it answers
     /// once.
-    pub(crate) fn entry(
-        &self,
-        entry: Result<DirectoryEntry, FsError>,
-    ) -> Result<DirectoryEntry, FsError> {
+    pub(crate) fn entry<T>(&self, entry: Result<T, FsError>) -> Result<T, FsError> {
         let armed = self.fail_after.load(Ordering::Acquire);
         if self.spawned.load(Ordering::Acquire) >= armed
             && self

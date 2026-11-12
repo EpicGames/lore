@@ -31,6 +31,7 @@ use lore_storage::ContentSource;
 use smallvec::SmallVec;
 
 use crate::errors::NotSupported;
+use crate::fs::filesystem_provider::CaseLookup;
 use crate::fs::filesystem_provider::DirectoryEntry;
 use crate::fs::filesystem_provider::DirectoryListing;
 use crate::fs::filesystem_provider::FileInfo;
@@ -1181,6 +1182,11 @@ impl InstanceOperation for FuseOperation {
 
     async fn untracked_file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
         Ok(self.local_info(path).await?.unwrap_or(FileInfo::NotExist))
+    }
+
+    /// [`CaseLookup::PerName`]: the served State's index answers for a name.
+    fn case_lookup(&self) -> CaseLookup {
+        CaseLookup::PerName
     }
 
     async fn holds_name_exactly(&self, path: &RelativePath) -> Option<bool> {

@@ -422,6 +422,68 @@ def test_link_reset_purge_ignores_a_directory_rule_naming_the_mount(new_lore_rep
         assert not repo.file_exists(path), f"The purge kept the untracked {path}"
 
 
+@pytest.mark.smoke
+def test_link_reset_puts_back_the_spelling_of_a_mount(new_lore_repo):
+    """`lore reset .` renames a link's mount the working tree holds in another case
+    back to the spelling the revision holds, with the linked content in it."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push(None, {"outside.txt": b"outside"})
+
+    link_repo = new_lore_repo()
+    link_repo.write_commit_push(None, {"inside.txt": b"inside"})
+
+    repo.link_add("Linked", link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+
+    repo.move("Linked", "linked.tmp")
+    repo.move("linked.tmp", "linked")
+
+    repo.reset(".")
+
+    entries = sorted(entry for entry in os.listdir(repo.path) if entry != ".lore")
+    assert entries == ["Linked", "outside.txt"], (
+        f"reset should put back the mount's spelling, left {entries}"
+    )
+    assert os.listdir(os.path.join(repo.path, "Linked")) == ["inside.txt"]
+    with repo.open_file("Linked/inside.txt", "rb") as f:
+        assert f.read() == b"inside"
+
+
+@pytest.mark.smoke
+def test_link_sync_moves_a_mount_held_in_another_case(new_lore_repo):
+    """A sync of a link's mount renamed in case alone renames the mount a working tree
+    holds in a third spelling, with the linked content in it, rather than mounting it
+    beside."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push(None, {"outside.txt": b"outside"})
+
+    link_repo = new_lore_repo()
+    link_repo.write_commit_push(None, {"inside.txt": b"inside"})
+
+    repo.link_add("Linked", link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+    other: Lore = repo.clone()
+
+    repo.move("Linked", "linked.tmp")
+    repo.move("linked.tmp", "LINKED")
+    repo.stage(scan=True, case="rename")
+    repo.commit()
+    repo.push()
+
+    other.move("Linked", "linked.tmp")
+    other.move("linked.tmp", "linked")
+
+    other.sync()
+
+    entries = sorted(entry for entry in os.listdir(other.path) if entry != ".lore")
+    assert entries == ["LINKED", "outside.txt"], (
+        f"the sync should move the mount to the revision's spelling, left {entries}"
+    )
+    assert os.listdir(os.path.join(other.path, "LINKED")) == ["inside.txt"]
+
+
 # ---------------------------------------------------------------------------
 # Reset for added/removed/updated links.
 # ---------------------------------------------------------------------------

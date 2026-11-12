@@ -135,6 +135,28 @@ def test_clone_vfs_fuse_lists_and_reads(new_lore_repo, fuse_mounts):
     assert cat(os.path.join(fuse.path, "added.txt")) == added
 
 
+@pytest.mark.smoke
+def test_reset_through_fuse_puts_back_the_spelling_the_revision_holds(
+    new_lore_repo, fuse_mounts
+):
+    """A FUSE mount folds case, so a rename through it in case alone holds a file or a
+    directory in another spelling than its revision; a reset renames each back to the
+    revision's spelling."""
+    repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    repo.write_commit_push("initial", {"Foo.txt": b"foo", "Dir/a.txt": b"a"})
+
+    fuse = fuse_clone(repo, fuse_mounts)
+    os.rename(os.path.join(fuse.path, "Foo.txt"), os.path.join(fuse.path, "foo.txt"))
+    os.rename(os.path.join(fuse.path, "Dir"), os.path.join(fuse.path, "dir"))
+    assert listing(fuse.path) == ["dir", "foo.txt"]
+
+    fuse.reset(".")
+
+    assert listing(fuse.path) == ["Dir", "Foo.txt"]
+    assert listing(os.path.join(fuse.path, "Dir")) == ["a.txt"]
+    assert cat(os.path.join(fuse.path, "Foo.txt")) == b"foo"
+
+
 def store_holding(repo: Lore, instance: Lore) -> str | None:
     """The path of the shared store whose registry lists `instance`, read through
     `repo`, an ordinary clone, or `None` where none lists it."""
