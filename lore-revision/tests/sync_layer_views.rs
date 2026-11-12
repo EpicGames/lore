@@ -8,8 +8,8 @@
 //! the revision the layer already holds, and a mount is carried the way the tree is: the old view on
 //! the from side of the diff and the new one on the to side.
 //!
-//! A reset that purges leaves a mount to the layer's own walk in the same way: the instance's walk
-//! deletes what its revision lacks around a mount and nothing inside it.
+//! A reset leaves a mount to the layer in the same way: the instance's walk deletes what its
+//! revision lacks around a mount and nothing inside it, and puts no file in place of one.
 
 #[cfg(test)]
 mod tests {
@@ -27,7 +27,9 @@ mod tests {
     use lore_base::types::Hash;
     use lore_revision::branch;
     use lore_revision::branch::BranchLatestStatus;
+    use lore_revision::change::FileAction;
     use lore_revision::file::reset;
+    use lore_revision::file::reset::ResetError;
     use lore_revision::file::reset::ResetMergeSide;
     use lore_revision::file::reset::ResetOptions;
     use lore_revision::interface::ExecutionContext;
@@ -40,11 +42,14 @@ mod tests {
     use lore_revision::layer::Layer;
     use lore_revision::lore::BranchId;
     use lore_revision::lore::RepositoryId;
+    use lore_revision::node::ROOT_NODE;
     use lore_revision::relay::EventDispatcher;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::revision::sync;
     use lore_revision::revision::sync::SyncError;
     use lore_revision::revision::sync::SyncOptions;
+    use lore_revision::state::LayerMountInfo;
+    use lore_revision::state::State;
     use serde::Serialize;
 
     include!("helper.rs");
@@ -82,11 +87,33 @@ mod tests {
     /// The name of a file no revision holds, written into each directory a purge is to empty.
     const UNTRACKED: &str = "junk.txt";
     const UNTRACKED_CONTENT: &[u8] = b"untracked";
+    /// A directory holding a mount, the file a branch commits beside the mount, and the mount.
+    const BRANCH_DIRECTORY: &str = "tools";
+    const BRANCH_FILE: &str = "tools/own.txt";
+    const MOUNT_IN_BRANCH_DIRECTORY: &str = "tools/sdk";
+    /// What a local edit writes over a layer's file in its mount.
+    const EDITED_CONTENT: &[u8] = b"edited in the mount";
+    /// A directory a level below the root, a file below it, and a mount below where the file stands.
+    const ANCESTOR: &str = "a";
+    const FILE_BELOW_ANCESTOR: &str = "a/tools";
+    const MOUNT_BELOW_ANCESTOR: &str = "a/tools/sdk";
+    /// A file the instance commits beside [`FILE_BELOW_ANCESTOR`].
+    const BESIDE_BELOW_ANCESTOR: &str = "a/beside.txt";
+    /// A directory beside [`BRANCH_DIRECTORY`], holding files the instance commits.
+    const BESIDE: &str = "after";
+    /// Where the instance commits a link whose tree holds the file `src/Intermediate`, and a mount
+    /// in place of that file.
+    const LINK: &str = "lib";
+    const MOUNT_IN_LINK: &str = "lib/src/Intermediate/sdk";
+    /// A file the layer repository commits, and a second layer's mount in place of it.
+    const SOURCE_INNER: &str = "inner";
+    const NESTED_MOUNT: &str = "mount/inner/sdk";
 
     /// What a reset reports deleting and writing.
     ///
     /// The reset sends a Delete event for each path it is asked to reset that the revision lacks,
-    /// and counts each untracked child it purges from a directory it lists without one.
+    /// or, deleting such a path around a mount, for each path it removes there. It counts each
+    /// untracked child it purges from a directory it lists without one.
     #[derive(Debug, Default, PartialEq)]
     struct Purged {
         /// The paths of the reset's Delete events, sorted.
@@ -181,22 +208,49 @@ mod tests {
         /// Written rather than added through [`layer::add`], which resolves the layer repository
         /// through the instance's remote and these fixtures have none.
         async fn write_layer_config(&self, staged: Hash) {
+            self.save_layers(vec![self.mounted_layer(self.layer_revision, staged)])
+                .await;
+        }
+
+        /// Writes the instance's layer set as [`Self::write_layer_config`] does, the layer at
+        /// `current`, with a second layer mounted at `nested`, of a repository the store holds
+        /// nothing of.
+        async fn write_layer_config_nesting(&self, current: Hash, nested: &str) {
+            self.save_layers(vec![
+                self.mounted_layer(current, Hash::default()),
+                Layer {
+                    target_path: nested.to_string(),
+                    source_path: String::new(),
+                    repository: RepositoryId::from(uuid::Uuid::now_v7()),
+                    metadata: None,
+                    current: Hash::default(),
+                    staged: Hash::default(),
+                },
+            ])
+            .await;
+        }
+
+        /// The layer these tests mount, at `current` and `staged`.
+        fn mounted_layer(&self, current: Hash, staged: Hash) -> Layer {
+            Layer {
+                target_path: self.mount.to_string(),
+                source_path: String::new(),
+                repository: self.source.repository.id,
+                metadata: None,
+                current,
+                staged,
+            }
+        }
+
+        /// Writes `layers` as the instance's layer set.
+        async fn save_layers(&self, layers: Vec<Layer>) {
             #[derive(Serialize)]
             struct LayerConfig {
                 layers: Vec<Layer>,
             }
 
             lore_revision::util::config::save(
-                &LayerConfig {
-                    layers: vec![Layer {
-                        target_path: self.mount.to_string(),
-                        source_path: String::new(),
-                        repository: self.source.repository.id,
-                        metadata: None,
-                        current: self.layer_revision,
-                        staged,
-                    }],
-                },
+                &LayerConfig { layers },
                 layer::layer_config_path(&self.instance.repository).expect("Layer config path"),
             )
             .await
@@ -275,13 +329,14 @@ mod tests {
         }
 
         /// Creates a branch off the revision the instance is on, moves the instance onto it and
-        /// commits [`SECOND`] there, answering the branch it was created from. That branch was last
-        /// merged into the new one at its branch point, a revision that lacks the file.
+        /// commits `added` there, each file holding [`SECOND_CONTENT`], answering the branch it was
+        /// created from. That branch was last merged into the new one at its branch point, a
+        /// revision that lacks the files.
         ///
         /// Created through [`branch::create`], since [`branch::create::create`] creates the branch
         /// in the layer repository as well, which needs branch metadata for the layer's branch that
         /// the instance does not hold.
-        async fn branch_off(&self) -> BranchId {
+        async fn branch_off(&self, added: &[&str]) -> BranchId {
             let (revision, default_branch) =
                 lore_revision::instance::load_current_anchor_boxed(&self.instance.repository)
                     .await
@@ -311,18 +366,162 @@ mod tests {
             .await
             .expect("Failed to move the instance onto the branch");
 
-            let second = self.working(SECOND);
-            test_file_write(second.as_path(), SECOND_CONTENT);
+            self.commit_added(added).await;
+            default_branch
+        }
+
+        /// Writes `added`, each file holding [`SECOND_CONTENT`], and commits them on the branch the
+        /// instance is on.
+        async fn commit_added(&self, added: &[&str]) {
+            let added: Vec<PathBuf> = added.iter().map(|path| self.working(path)).collect();
+            for path in &added {
+                test_file_write(path.as_path(), SECOND_CONTENT);
+            }
             lore_revision::file::stage::stage(
                 self.instance.repository.clone(),
                 &self.instance.write_token,
-                LoreArray::from_vec(vec![LoreString::from(&second)]),
+                LoreArray::from_vec(added.iter().map(LoreString::from).collect()),
                 lore_revision::stage::StageOptions::default(),
             )
             .await
-            .expect("Failed to stage the branch's file");
+            .expect("Failed to stage the added files");
             test_commit(&self.instance, "Second").await;
-            default_branch
+        }
+
+        /// [`Self::commit_added`] with the layer set put aside, for a file standing where the layer
+        /// is later mounted below it: staging a path above the mount stages the layer as well.
+        async fn commit_added_without_the_layer(&self, added: &[&str]) {
+            std::fs::remove_file(
+                layer::layer_config_path(&self.instance.repository).expect("Layer config path"),
+            )
+            .expect("Failed to put the layer set aside");
+            self.commit_added(added).await;
+            self.write_layer_config(Hash::default()).await;
+        }
+
+        /// Commits a file at `path`, at or above the mount, then stands the mount's directory in
+        /// its place in the working tree, holding the layer's files with [`SOURCE_KEPT`] edited.
+        async fn mount_in_place_of_a_file(&self, path: &str) {
+            if let Some(parent) = self.working(path).parent() {
+                std::fs::create_dir_all(parent).expect("Failed to create the file's directory");
+            }
+            self.commit_added_without_the_layer(&[path]).await;
+            std::fs::remove_file(self.working(path)).expect("Failed to delete the file");
+            self.materialize_edited_mount();
+        }
+
+        /// [`Self::materialize_mount`], with [`SOURCE_KEPT`] edited.
+        fn materialize_edited_mount(&self) {
+            self.materialize_mount();
+            test_file_write(
+                self.working(&format!("{}/{SOURCE_KEPT}", self.mount))
+                    .as_path(),
+                EDITED_CONTENT,
+            );
+        }
+
+        /// Asserts that the scan's `marked` changes are `expected`, in any order.
+        fn assert_marked(marked: Vec<(String, FileAction)>, expected: &[(&str, FileAction)]) {
+            let mut marked: Vec<(String, u16)> = marked
+                .into_iter()
+                .map(|(path, action)| (path, action as u16))
+                .collect();
+            let mut expected: Vec<(String, u16)> = expected
+                .iter()
+                .map(|(path, action)| (path.to_string(), *action as u16))
+                .collect();
+            marked.sort();
+            expected.sort();
+            assert_eq!(marked, expected, "the scan marks what the test edits");
+        }
+
+        /// Marks what the working tree changes against the revision the instance is on, leaving the
+        /// mount to the layer, and stores the marks, as `lore status --scan` does, answering each
+        /// change's path and action.
+        async fn scan_and_store(&self) -> Vec<(String, FileAction)> {
+            let repository = self.reopened();
+            let (current, staged) = test_anchor_states(&repository).await;
+            let layer = repository.to_layer_context(self.source.repository.id).await;
+            let mounts = Arc::new(vec![LayerMountInfo {
+                mount_path: self.mount.to_string(),
+                state: State::deserialize(layer.clone(), self.layer_revision)
+                    .await
+                    .expect("Failed to deserialize the layer's state"),
+                repository: layer,
+                source_node: ROOT_NODE,
+            }]);
+            let changes = test_scan_mounting(
+                repository.clone(),
+                staged.clone(),
+                current.clone(),
+                None,
+                lore_revision::fs::filesystem_provider::FilesystemDiffIntent::MarkDirty,
+                mounts,
+            )
+            .await
+            .expect("Failed to diff filesystem");
+            staged.reparent_onto(current.revision());
+            let marked = staged
+                .serialize(repository.clone(), &self.instance.write_token)
+                .await
+                .expect("Failed to serialize the marked state");
+            lore_revision::instance::store_staged_anchor(&repository, marked)
+                .await
+                .expect("Failed to store the staged anchor");
+            changes
+                .iter()
+                .map(|change| (change.path().to_string(), change.action))
+                .collect()
+        }
+
+        /// Writes [`EDITED_CONTENT`] over each of `paths`.
+        fn edit(&self, paths: &[&str]) {
+            for path in paths {
+                test_file_write(self.working(path).as_path(), EDITED_CONTENT);
+            }
+        }
+
+        /// Asserts that each of `paths` holds what [`Self::edit`] wrote.
+        fn assert_edited(&self, paths: &[&str], context: &str) {
+            for path in paths {
+                assert_eq!(
+                    self.working_file(path).as_deref(),
+                    Some(EDITED_CONTENT),
+                    "{context}: the edit to {path} is kept"
+                );
+            }
+        }
+
+        /// Commits `count` files in [`BESIDE`], answering their paths.
+        async fn commit_beside(&self, count: usize) -> Vec<String> {
+            std::fs::create_dir_all(self.working(BESIDE)).expect("Failed to create the directory");
+            let beside: Vec<String> = (0..count)
+                .map(|index| format!("{BESIDE}/{index}.txt"))
+                .collect();
+            self.commit_added(&beside.iter().map(String::as_str).collect::<Vec<_>>())
+                .await;
+            beside
+        }
+
+        /// The staged anchor of the instance, which a refused reset leaves as it is.
+        async fn staged_anchor(&self) -> Option<Hash> {
+            lore_revision::instance::load_staged_revision(&self.instance.repository)
+                .await
+                .expect("Failed to load the staged anchor")
+        }
+
+        /// Asserts that the mount holds what [`Self::mount_in_place_of_a_file`] left there, the edit
+        /// included.
+        fn assert_mount_left(&self, context: &str) {
+            let mounted = |source: &str| self.working_file(&format!("{}/{source}", self.mount));
+            assert_eq!(
+                (
+                    mounted(SOURCE_KEPT).as_deref(),
+                    mounted(SOURCE_DROPPED).as_deref()
+                ),
+                (Some(EDITED_CONTENT), Some(DROPPED_CONTENT)),
+                "{context}: the mount's content is left as it is, the local edit included"
+            );
         }
 
         /// Resets `paths`, relative to the working tree's root, with a purge: to the revision the
@@ -345,16 +544,44 @@ mod tests {
             last_merged_from: Option<BranchId>,
             purge: bool,
         ) -> Purged {
+            self.try_reset(paths, last_merged_from, purge)
+                .await
+                .expect("Failed to reset")
+        }
+
+        /// Resets `paths` as [`Self::reset_reporting`] does, answering the reset's failure.
+        async fn try_reset(
+            &self,
+            paths: &[&str],
+            last_merged_from: Option<BranchId>,
+            purge: bool,
+        ) -> Result<Purged, ResetError> {
+            self.try_reset_with(
+                paths,
+                last_merged_from,
+                ResetOptions {
+                    purge,
+                    ..Default::default()
+                },
+            )
+            .await
+        }
+
+        /// Resets `paths` as [`Self::try_reset`] does, under `options`, in the instance as
+        /// [`Self::reopened`] opens it, under the view it holds.
+        async fn try_reset_with(
+            &self,
+            paths: &[&str],
+            last_merged_from: Option<BranchId>,
+            options: ResetOptions,
+        ) -> Result<Purged, ResetError> {
+            let repository = self.reopened();
             let paths = LoreArray::from_vec(
                 paths
                     .iter()
                     .map(|path| LoreString::from(&self.working(path)))
                     .collect(),
             );
-            let options = ResetOptions {
-                purge,
-                ..Default::default()
-            };
             let purged = Arc::new(Mutex::new(Purged::default()));
             let recorded = purged.clone();
             let execution = Arc::new(ExecutionContext::new_client_with_user_id(
@@ -377,12 +604,12 @@ mod tests {
                 }))),
                 "test-user".to_string(),
             ));
-            LORE_CONTEXT
+            let reset = LORE_CONTEXT
                 .scope(execution.clone(), async {
-                    match last_merged_from {
+                    let reset = match last_merged_from {
                         Some(branch_id) => {
                             reset::reset_to_last_merged(
-                                self.instance.repository.clone(),
+                                repository.clone(),
                                 paths,
                                 LoreString::from(branch_id.to_string().as_str()),
                                 ResetMergeSide::Resolved,
@@ -392,7 +619,7 @@ mod tests {
                         }
                         None => {
                             reset::reset(
-                                self.instance.repository.clone(),
+                                repository.clone(),
                                 &self.instance.write_token,
                                 paths,
                                 LoreString::default(),
@@ -400,15 +627,16 @@ mod tests {
                             )
                             .await
                         }
-                    }
-                    .expect("Failed to reset");
+                    };
                     execution.dispatcher.drain().await;
+                    reset
                 })
                 .await;
+            reset?;
 
             let mut purged = std::mem::take(&mut *purged.lock().expect("Failed to read the reset"));
             purged.deleted.sort();
-            purged
+            Ok(purged)
         }
 
         /// Writes the view the instance holds, which the next [`Self::reopened`] reads.
@@ -845,7 +1073,8 @@ mod tests {
 
     /// Purges `named` in an instance mounting the layer at [`MOUNT_BELOW_UNTRACKED`], with an
     /// untracked file in each directory on the way to the mount and in it, and asserts that the
-    /// purge deletes those files alone and leaves the layer's file in place.
+    /// purge deletes those files alone and leaves the layer's file in place. A named path the
+    /// revision lacks is deleted around the mount, which reports the files it removes on the way.
     async fn assert_a_purge_around_a_mount_below_an_untracked_directory(named: &'static str) {
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
@@ -867,6 +1096,12 @@ mod tests {
                 }
 
                 let purged = fixture.reset_purging(&[named], None).await;
+                let mut around = if named.is_empty() {
+                    Vec::new()
+                } else {
+                    untracked[..2].to_vec()
+                };
+                around.sort();
 
                 let untracked_left: Vec<&String> = untracked
                     .iter()
@@ -881,7 +1116,7 @@ mod tests {
                 assert_eq!(
                     purged,
                     Purged {
-                        deleted: Vec::new(),
+                        deleted: around,
                         deletes: (0, untracked.len() as u64),
                         written: 0,
                     },
@@ -918,7 +1153,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let fixture = Fixture::create(immutable_store, mutable_store).await;
                 fixture.materialize_mount();
-                let default_branch = fixture.branch_off().await;
+                let default_branch = fixture.branch_off(&[SECOND]).await;
                 test_file_write(fixture.working(UNTRACKED).as_path(), UNTRACKED_CONTENT);
 
                 let purged = fixture.reset_purging(&[""], Some(default_branch)).await;
@@ -958,7 +1193,7 @@ mod tests {
         runtime()
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let fixture = Fixture::create(immutable_store, mutable_store).await;
-                let default_branch = fixture.branch_off().await;
+                let default_branch = fixture.branch_off(&[SECOND]).await;
                 test_file_write(fixture.working(MOUNT).as_path(), UNTRACKED_CONTENT);
 
                 let purged = fixture.reset_purging(&[""], Some(default_branch)).await;
@@ -1049,7 +1284,7 @@ mod tests {
                 let untracked = format!("{MOUNT}/{UNTRACKED}");
                 let fixture = Fixture::create(immutable_store, mutable_store).await;
                 fixture.materialize_mount();
-                let default_branch = fixture.branch_off().await;
+                let default_branch = fixture.branch_off(&[SECOND]).await;
                 test_file_write(fixture.working(&untracked).as_path(), UNTRACKED_CONTENT);
 
                 let purged = fixture
@@ -1100,5 +1335,668 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_purge_of_paths_in_a_mount_deletes_only_the_untracked_one() {
         assert_a_purge_of_paths_in_a_mount(false).await;
+    }
+
+    /// Resets [`BRANCH_DIRECTORY`], which a branch adds with a mount inside it, to the point it was
+    /// last merged from the branch it came off, purging where `purge` says so, with a local edit
+    /// to a layer's file. Asserts that the reset deletes and reports the branch's file, and leaves
+    /// the mount's content as it is, the edit included, since such a reset walks no layer.
+    async fn assert_a_last_merged_reset_of_a_directory_holding_a_mount(purge: bool) {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let edited = format!("{MOUNT_IN_BRANCH_DIRECTORY}/{SOURCE_KEPT}");
+                let dropped = format!("{MOUNT_IN_BRANCH_DIRECTORY}/{SOURCE_DROPPED}");
+                let fixture = Fixture::create_mounted_at(
+                    immutable_store,
+                    mutable_store,
+                    MOUNT_IN_BRANCH_DIRECTORY,
+                )
+                .await;
+                fixture.materialize_mount();
+                let default_branch = fixture.branch_off(&[BRANCH_FILE]).await;
+                test_file_write(fixture.working(&edited).as_path(), EDITED_CONTENT);
+
+                let reset = fixture
+                    .reset_reporting(&[BRANCH_DIRECTORY], Some(default_branch), purge)
+                    .await;
+                assert_eq!(
+                    (
+                        fixture.working(BRANCH_FILE).exists(),
+                        fixture.working_file(&edited).as_deref(),
+                        fixture.working_file(&dropped).as_deref(),
+                    ),
+                    (false, Some(EDITED_CONTENT), Some(DROPPED_CONTENT)),
+                    "purge {purge}: the reset deletes the branch's file and leaves the mount's \
+                     content, the local edit included"
+                );
+                assert_eq!(
+                    reset,
+                    Purged {
+                        deleted: vec![BRANCH_FILE.to_string()],
+                        deletes: (0, 1),
+                        written: 0,
+                    },
+                    "purge {purge}: the reset deletes the branch's file alone"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset to the point a directory was last merged from a branch that predates it deletes the
+    /// directory around a mount inside it, and leaves the mount's content as it is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_last_merged_reset_deletes_a_directory_around_a_mount_in_it() {
+        assert_a_last_merged_reset_of_a_directory_holding_a_mount(false).await;
+    }
+
+    /// A purge to the point a directory was last merged from a branch that predates it deletes the
+    /// directory around a mount inside it, and leaves the mount's content as it is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_last_merged_purge_deletes_a_directory_around_a_mount_in_it() {
+        assert_a_last_merged_reset_of_a_directory_holding_a_mount(true).await;
+    }
+
+    /// Asserts that `reset` failed with the refusal of a file in place of the mount.
+    fn assert_refused(reset: &Result<Purged, ResetError>, context: &str) {
+        assert!(
+            reset.as_ref().is_err_and(ResetError::is_not_supported),
+            "{context}: the reset refuses the file in place of the mount, got {reset:?}"
+        );
+    }
+
+    /// A reset to the point a directory holding a mount was last merged from a branch, which holds
+    /// a file at the directory's path, refuses to put the file back in place of the mount, and
+    /// leaves the mount's content as it is, a local edit included.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_last_merged_reset_refuses_a_file_in_place_of_a_directory_holding_a_mount() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_mounted_at(
+                    immutable_store,
+                    mutable_store,
+                    MOUNT_IN_BRANCH_DIRECTORY,
+                )
+                .await;
+                fixture.mount_in_place_of_a_file(BRANCH_DIRECTORY).await;
+                let default_branch = fixture.branch_off(&[SECOND]).await;
+
+                let reset = fixture
+                    .try_reset(&[BRANCH_DIRECTORY], Some(default_branch), false)
+                    .await;
+
+                assert_refused(&reset, "last merged");
+                fixture.assert_mount_left("last merged");
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset of [`BRANCH_DIRECTORY`] to the revision the instance is on, which holds a file
+    /// there, where the working tree holds a directory there with a mount below it and a scan has
+    /// marked the file deleted and the directory added, refuses the file before it changes
+    /// anything: the directory, the mount's content and both marks are left as they are.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_refuses_a_file_in_place_of_a_mount_before_it_changes_the_marks() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_mounted_at(
+                    immutable_store,
+                    mutable_store,
+                    MOUNT_IN_BRANCH_DIRECTORY,
+                )
+                .await;
+                fixture.mount_in_place_of_a_file(BRANCH_DIRECTORY).await;
+                Fixture::assert_marked(
+                    fixture.scan_and_store().await,
+                    &[
+                        (BRANCH_DIRECTORY, FileAction::Delete),
+                        (BRANCH_DIRECTORY, FileAction::Add),
+                    ],
+                );
+                let anchor = fixture.staged_anchor().await;
+
+                let reset = fixture.try_reset(&[BRANCH_DIRECTORY], None, false).await;
+
+                assert_refused(&reset, "marked");
+                fixture.assert_mount_left("marked");
+                assert_eq!(
+                    (
+                        fixture.working(BRANCH_DIRECTORY).is_dir(),
+                        fixture.staged_anchor().await,
+                    ),
+                    (true, anchor),
+                    "the refused reset leaves the directory, and the staged marks as the scan \
+                     stored them"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset naming a file in place of a directory holding a mount, then a directory of files the
+    /// walk would hand over after it, two of them edited and marked, fails with the refusal and keeps
+    /// the edits: the reset refuses before it walks any of its paths.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_refusing_a_file_in_place_of_a_mount_hands_over_nothing_after_it() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_mounted_at(
+                    immutable_store,
+                    mutable_store,
+                    MOUNT_IN_BRANCH_DIRECTORY,
+                )
+                .await;
+                let beside = fixture.commit_beside(4).await;
+                fixture.mount_in_place_of_a_file(BRANCH_DIRECTORY).await;
+                let edited = [beside[0].as_str(), beside[1].as_str()];
+                fixture.edit(&edited);
+                Fixture::assert_marked(
+                    fixture.scan_and_store().await,
+                    &[
+                        (BRANCH_DIRECTORY, FileAction::Delete),
+                        (BRANCH_DIRECTORY, FileAction::Add),
+                        (edited[0], FileAction::Keep),
+                        (edited[1], FileAction::Keep),
+                    ],
+                );
+
+                let reset = fixture
+                    .try_reset(&[BRANCH_DIRECTORY, BESIDE], None, false)
+                    .await;
+
+                assert_refused(&reset, "files after it");
+                fixture.assert_edited(&edited, "files after it");
+                fixture.assert_mount_left("files after it");
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset of the root, which holds a file at [`BRANCH_DIRECTORY`] in place of a directory
+    /// holding a mount, refuses before it walks anything: the edited and marked files beside it, in
+    /// the root and in a directory beside it, the marks and the mount's content are left as they are.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_of_the_root_refuses_a_file_over_a_mount_before_it_walks_anything() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_mounted_at(
+                    immutable_store,
+                    mutable_store,
+                    MOUNT_IN_BRANCH_DIRECTORY,
+                )
+                .await;
+                fixture.mount_in_place_of_a_file(BRANCH_DIRECTORY).await;
+                let beside = fixture.commit_beside(1).await;
+                let edited = [OWN, beside[0].as_str()];
+                fixture.edit(&edited);
+                Fixture::assert_marked(
+                    fixture.scan_and_store().await,
+                    &[
+                        (BRANCH_DIRECTORY, FileAction::Delete),
+                        (BRANCH_DIRECTORY, FileAction::Add),
+                        (edited[0], FileAction::Keep),
+                        (edited[1], FileAction::Keep),
+                    ],
+                );
+                let anchor = fixture.staged_anchor().await;
+
+                let reset = fixture.try_reset(&[""], None, false).await;
+
+                assert_refused(&reset, "root");
+                fixture.assert_edited(&edited, "root");
+                fixture.assert_mount_left("root");
+                assert_eq!(
+                    fixture.staged_anchor().await,
+                    anchor,
+                    "the refused reset leaves the staged marks as the scan stored them"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset of [`ANCESTOR`], which holds a file below it in place of a directory holding a
+    /// mount and a file beside it, edited, where a scan has marked the ancestor, refuses before it
+    /// changes anything: the marks, the edit and the mount's content are left as they are.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_of_an_ancestor_refuses_a_file_over_a_mount_before_it_changes_the_marks() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_mounted_at(
+                    immutable_store,
+                    mutable_store,
+                    MOUNT_BELOW_ANCESTOR,
+                )
+                .await;
+                std::fs::create_dir_all(fixture.working(ANCESTOR))
+                    .expect("Failed to create the directory");
+                fixture.commit_added(&[BESIDE_BELOW_ANCESTOR]).await;
+                fixture.mount_in_place_of_a_file(FILE_BELOW_ANCESTOR).await;
+                fixture.edit(&[BESIDE_BELOW_ANCESTOR]);
+                Fixture::assert_marked(
+                    fixture.scan_and_store().await,
+                    &[
+                        (FILE_BELOW_ANCESTOR, FileAction::Delete),
+                        (FILE_BELOW_ANCESTOR, FileAction::Add),
+                        (BESIDE_BELOW_ANCESTOR, FileAction::Keep),
+                    ],
+                );
+                let anchor = fixture.staged_anchor().await;
+
+                let reset = fixture.try_reset(&[ANCESTOR], None, false).await;
+
+                assert_refused(&reset, "ancestor");
+                fixture.assert_edited(&[BESIDE_BELOW_ANCESTOR], "ancestor");
+                fixture.assert_mount_left("ancestor");
+                assert_eq!(
+                    fixture.staged_anchor().await,
+                    anchor,
+                    "the refused reset leaves the staged marks as the scan stored them"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset of [`ANCESTOR`], which holds a file below it in place of a directory holding a
+    /// mount, where the staged tree holds a link added below the path, refuses before it resets the
+    /// link: the link stays staged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_refusing_a_file_over_a_mount_keeps_a_staged_link_below_the_path() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let linked = format!("{ANCESTOR}/lib");
+                let fixture = Fixture::create_mounted_at(
+                    immutable_store,
+                    mutable_store,
+                    MOUNT_BELOW_ANCESTOR,
+                )
+                .await;
+                fixture.mount_in_place_of_a_file(FILE_BELOW_ANCESTOR).await;
+                let repository = fixture.reopened();
+                mount_intermediate_at(
+                    &repository,
+                    &linked,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                    true,
+                )
+                .await;
+
+                let reset = fixture.try_reset(&[ANCESTOR], None, false).await;
+
+                assert_refused(&reset, "staged link");
+                assert!(
+                    holds(&repository, &next_tree(&repository).await, &linked).await,
+                    "the refused reset keeps the link staged at {linked}"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset of a directory whose revision holds a file at the mount path itself, where the
+    /// working tree holds the mount, refuses the file and leaves the mount's content as it is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_refuses_a_file_at_the_mount_path() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_mounted_at(
+                    immutable_store,
+                    mutable_store,
+                    MOUNT_IN_BRANCH_DIRECTORY,
+                )
+                .await;
+                fixture
+                    .mount_in_place_of_a_file(MOUNT_IN_BRANCH_DIRECTORY)
+                    .await;
+
+                let reset = fixture.try_reset(&[BRANCH_DIRECTORY], None, false).await;
+
+                assert_refused(&reset, "at the mount path");
+                fixture.assert_mount_left("at the mount path");
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset of [`LINK`], where the instance commits a link whose tree holds the file
+    /// `src/Intermediate` and the working tree holds the mount [`MOUNT_IN_LINK`] in place of it,
+    /// refuses the file it finds through the link, as a reset of the root does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_refuses_a_file_over_a_mount_through_a_link() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture =
+                    Fixture::create_mounted_at(immutable_store, mutable_store, MOUNT_IN_LINK).await;
+                mount_intermediate_at(
+                    &fixture.reopened(),
+                    LINK,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                    true,
+                )
+                .await;
+                test_commit(&fixture.instance, "Link").await;
+                fixture.materialize_edited_mount();
+
+                for named in [LINK, ""] {
+                    let reset = fixture.try_reset(&[named], None, false).await;
+                    assert_refused(&reset, &format!("{named:?} through the link"));
+                }
+                fixture.assert_mount_left("through the link");
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Resets [`BRANCH_DIRECTORY`] to the point it was last merged from a branch, which holds a file
+    /// there that the view excludes, in place of a directory holding a mount the view keeps,
+    /// purging where `purge` says so. Asserts that the reset lets the file through, since the walk
+    /// does not realize it, and leaves the mount's content as it is.
+    async fn assert_a_reset_lets_a_file_the_view_excludes_through(purge: bool) {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_mounted_at(
+                    immutable_store,
+                    mutable_store,
+                    MOUNT_IN_BRANCH_DIRECTORY,
+                )
+                .await;
+                fixture.mount_in_place_of_a_file(BRANCH_DIRECTORY).await;
+                let default_branch = fixture.branch_off(&[SECOND]).await;
+                fixture.set_view(&["/tools", "!/tools/sdk/"]);
+
+                let reset = fixture
+                    .try_reset(&[BRANCH_DIRECTORY], Some(default_branch), purge)
+                    .await;
+
+                assert!(
+                    reset.is_ok(),
+                    "purge {purge}: the reset lets the excluded file through, got {reset:?}"
+                );
+                fixture.assert_mount_left(&format!("purge {purge}"));
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset lets a file the view excludes through, over a mount the view keeps.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_lets_a_file_the_view_excludes_through() {
+        assert_a_reset_lets_a_file_the_view_excludes_through(false).await;
+    }
+
+    /// A purge lets a file the view excludes through, over a mount the view keeps, and purges
+    /// around the mount.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_purge_lets_a_file_the_view_excludes_through() {
+        assert_a_reset_lets_a_file_the_view_excludes_through(true).await;
+    }
+
+    /// A single node reset of a file in place of a directory holding a mount refuses it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_single_node_reset_refuses_a_file_over_a_mount() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_mounted_at(
+                    immutable_store,
+                    mutable_store,
+                    MOUNT_IN_BRANCH_DIRECTORY,
+                )
+                .await;
+                fixture.mount_in_place_of_a_file(BRANCH_DIRECTORY).await;
+
+                let reset = fixture
+                    .try_reset_with(
+                        &[BRANCH_DIRECTORY],
+                        None,
+                        ResetOptions {
+                            single_node: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+
+                assert_refused(&reset, "single node");
+                fixture.assert_mount_left("single node");
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A single node reset of a directory above a file in place of a directory holding a mount
+    /// resets the directory alone, which holds no file of its own, and so refuses nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_single_node_reset_of_a_directory_above_a_file_over_a_mount_refuses_nothing() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_mounted_at(
+                    immutable_store,
+                    mutable_store,
+                    MOUNT_BELOW_ANCESTOR,
+                )
+                .await;
+                fixture.mount_in_place_of_a_file(FILE_BELOW_ANCESTOR).await;
+
+                let reset = fixture
+                    .try_reset_with(
+                        &[ANCESTOR],
+                        None,
+                        ResetOptions {
+                            single_node: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+
+                assert!(
+                    reset.is_ok(),
+                    "the single node reset of the directory refuses nothing, got {reset:?}"
+                );
+                fixture.assert_mount_left("single node directory");
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset of the layer's mount, where the layer's revision holds the file [`SOURCE_INNER`] and
+    /// the working tree holds a second layer's mount, [`NESTED_MOUNT`], in place of it, refuses the
+    /// file the first layer's walk would realize, and leaves the second layer's file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_of_a_layer_refuses_a_file_over_a_nested_layer_mount() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let nested = format!("{NESTED_MOUNT}/{SOURCE_KEPT}");
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                test_file_write(
+                    fixture.source.path.join(SOURCE_INNER).as_path(),
+                    SECOND_CONTENT,
+                );
+                let current = test_commit_tree(&fixture.source, "Inner").await.revision();
+                fixture
+                    .write_layer_config_nesting(current, NESTED_MOUNT)
+                    .await;
+                fixture.materialize_mount();
+                std::fs::create_dir_all(fixture.working(NESTED_MOUNT))
+                    .expect("Failed to create the nested mount");
+                test_file_write(fixture.working(&nested).as_path(), EDITED_CONTENT);
+
+                let reset = fixture.try_reset(&[MOUNT], None, false).await;
+
+                assert_refused(&reset, "nested layer");
+                assert_eq!(
+                    fixture.working_file(&nested).as_deref(),
+                    Some(EDITED_CONTENT),
+                    "the refused reset leaves the nested layer's file"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset naming [`BRANCH_DIRECTORY`] in another case, which the walk resolves to the
+    /// directory the working tree holds, refuses the file over the mount there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_naming_a_file_over_a_mount_in_another_case_refuses_it() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_mounted_at(
+                    immutable_store,
+                    mutable_store,
+                    MOUNT_IN_BRANCH_DIRECTORY,
+                )
+                .await;
+                fixture.mount_in_place_of_a_file(BRANCH_DIRECTORY).await;
+
+                let reset = fixture
+                    .try_reset(&[&BRANCH_DIRECTORY.to_uppercase()], None, false)
+                    .await;
+
+                assert_refused(&reset, "another case");
+                fixture.assert_mount_left("another case");
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Resets a directory beside [`BRANCH_DIRECTORY`] first, with a file in it edited and marked,
+    /// and the file in place of a directory holding a mount second: to the point they were last
+    /// merged from the branch the instance came off where `last_merged` says so, and to the
+    /// revision the instance is on otherwise. Asserts that the reset refuses before it resets
+    /// either, so the edit is kept.
+    async fn assert_a_reset_refusing_its_second_path_resets_neither(last_merged: bool) {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_mounted_at(
+                    immutable_store,
+                    mutable_store,
+                    MOUNT_IN_BRANCH_DIRECTORY,
+                )
+                .await;
+                let beside = fixture.commit_beside(1).await;
+                fixture.mount_in_place_of_a_file(BRANCH_DIRECTORY).await;
+                let default_branch = fixture.branch_off(&[SECOND]).await;
+                let edited = [beside[0].as_str()];
+                fixture.edit(&edited);
+                fixture.scan_and_store().await;
+
+                let reset = fixture
+                    .try_reset(
+                        &[BESIDE, BRANCH_DIRECTORY],
+                        last_merged.then_some(default_branch),
+                        false,
+                    )
+                    .await;
+
+                let context = format!("last merged {last_merged}");
+                assert_refused(&reset, &context);
+                fixture.assert_edited(&edited, &context);
+                fixture.assert_mount_left(&context);
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset refusing the second path it names resets neither.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_refusing_its_second_path_resets_neither() {
+        assert_a_reset_refusing_its_second_path_resets_neither(false).await;
+    }
+
+    /// A reset to the point the paths were last merged from a branch, refusing the second path it
+    /// names, resets neither: every path's point is resolved, and refused, before it resets any.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_last_merged_reset_refusing_its_second_path_resets_neither() {
+        assert_a_reset_refusing_its_second_path_resets_neither(true).await;
+    }
+
+    /// A reset to the point a directory was last merged from a branch, which holds a file there,
+    /// where the working tree holds a directory with no mount in it, the layer's mount configured
+    /// but absent, puts the file back: nothing of the layer stands there to lose.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_puts_a_file_back_where_the_mount_below_is_absent() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let untracked = format!("{BRANCH_DIRECTORY}/{UNTRACKED}");
+                let fixture = Fixture::create_mounted_at(
+                    immutable_store,
+                    mutable_store,
+                    MOUNT_IN_BRANCH_DIRECTORY,
+                )
+                .await;
+                fixture
+                    .commit_added_without_the_layer(&[BRANCH_DIRECTORY])
+                    .await;
+                let default_branch = fixture.branch_off(&[SECOND]).await;
+                std::fs::remove_file(fixture.working(BRANCH_DIRECTORY))
+                    .expect("Failed to delete the file");
+                std::fs::create_dir_all(fixture.working(BRANCH_DIRECTORY))
+                    .expect("Failed to create the directory");
+                test_file_write(fixture.working(&untracked).as_path(), UNTRACKED_CONTENT);
+
+                let reset = fixture
+                    .try_reset(&[BRANCH_DIRECTORY], Some(default_branch), false)
+                    .await;
+
+                assert!(
+                    reset.is_ok(),
+                    "the reset refuses nothing where the mount is absent, got {reset:?}"
+                );
+                assert_eq!(
+                    fixture.working_file(BRANCH_DIRECTORY).as_deref(),
+                    Some(SECOND_CONTENT),
+                    "the reset puts the file back in place of the directory"
+                );
+            }))
+            .await
+            .expect("Test task failed");
     }
 }

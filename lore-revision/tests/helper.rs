@@ -456,6 +456,28 @@ pub async fn test_scan_path_result(
     path: Option<lore_revision::util::path::RelativePath>,
     intent: lore_revision::fs::filesystem_provider::FilesystemDiffIntent,
 ) -> Result<Vec<lore_revision::change::NodeChange>, lore_revision::state::StateError> {
+    test_scan_mounting(
+        repository,
+        state_staged,
+        state_current,
+        path,
+        intent,
+        std::sync::Arc::new(Vec::new()),
+    )
+    .await
+}
+
+/// [`test_scan_path_result`] in an instance mounting `layer_mounts`, whose content the walk leaves
+/// to each layer, as a status of the instance does.
+#[allow(dead_code)]
+pub async fn test_scan_mounting(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state_staged: std::sync::Arc<lore_revision::state::State>,
+    state_current: std::sync::Arc<lore_revision::state::State>,
+    path: Option<lore_revision::util::path::RelativePath>,
+    intent: lore_revision::fs::filesystem_provider::FilesystemDiffIntent,
+    layer_mounts: std::sync::Arc<Vec<lore_revision::state::LayerMountInfo>>,
+) -> Result<Vec<lore_revision::change::NodeChange>, lore_revision::state::StateError> {
     let operation = lore_revision::fs::filesystem_provider::FilesystemProvider::begin_operation(
         repository.file_system().as_ref(),
     )
@@ -474,7 +496,7 @@ pub async fn test_scan_path_result(
         path,
         lore_revision::filter::FilterMode::Full,
         intent,
-        std::sync::Arc::new(Vec::new()),
+        layer_mounts,
     )
     .await
     {
@@ -921,6 +943,19 @@ pub async fn mount_intermediate(
     mount: &str,
     linked_id: lore_revision::lore::RepositoryId,
 ) {
+    mount_intermediate_at(repository, mount, linked_id, false).await;
+}
+
+/// [`mount_intermediate`] at `mount` in the root or in a directory the staged tree holds, the link
+/// staged for the next commit where `staged` says so. The tree is stored as staged on the revision
+/// the instance is on.
+#[allow(dead_code)]
+pub async fn mount_intermediate_at(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    mount: &str,
+    linked_id: lore_revision::lore::RepositoryId,
+    staged: bool,
+) {
     let linked = repository.to_link_context(linked_id).await;
     let token = repository
         .try_write_token()
@@ -957,37 +992,46 @@ pub async fn mount_intermediate(
         .await
         .expect("Serializing the linked tree failed");
 
-    let staged = next_tree(repository).await;
-    let link = staged
-        .node_add(
-            repository.clone(),
-            lore_revision::node::ROOT_NODE,
-            lore_revision::node::Node {
-                flags: lore_revision::node::NodeFlags::Link.bits(),
-                name_hash: lore_storage::hash::hash_string(mount),
-                child: lore_revision::node::ROOT_NODE,
-                address: lore_base::types::Address {
-                    hash: revision,
-                    context: linked_id.into(),
-                },
-                ..Default::default()
-            },
-            mount,
-        )
+    let tree = next_tree(repository).await;
+    let (directory, name) = mount.rsplit_once('/').unwrap_or(("", mount));
+    let directory = tree
+        .find_node_link(repository.clone(), directory)
         .await
-        .expect("Adding the link failed");
-    staged
-        .link_add(
-            repository.clone(),
-            linked_id,
-            lore_revision::lore::BranchId::default(),
-            revision,
-            link,
-            lore_revision::link::LinkFlags::NoFlags,
-        )
+        .expect("Finding the link's directory failed")
+        .node;
+    let node = lore_revision::node::Node {
+        flags: lore_revision::node::NodeFlags::Link.bits(),
+        name_hash: lore_storage::hash::hash_string(name),
+        child: lore_revision::node::ROOT_NODE,
+        address: lore_base::types::Address {
+            hash: revision,
+            context: linked_id.into(),
+        },
+        ..Default::default()
+    };
+    let link = if staged {
+        tree.node_add_staged(repository.clone(), directory, node, name)
+            .await
+    } else {
+        tree.node_add(repository.clone(), directory, node, name)
+            .await
+    }
+    .expect("Adding the link failed");
+    tree.link_add(
+        repository.clone(),
+        linked_id,
+        lore_revision::lore::BranchId::default(),
+        revision,
+        link,
+        lore_revision::link::LinkFlags::NoFlags,
+    )
+    .await
+    .expect("Registering the link failed");
+    let (current, _branch) = lore_revision::instance::load_current_anchor_boxed(repository)
         .await
-        .expect("Registering the link failed");
-    let signature = staged
+        .expect("Failed to load current anchor");
+    tree.reparent_onto(current);
+    let signature = tree
         .serialize(repository.clone(), token)
         .await
         .expect("Serializing the staged tree failed");

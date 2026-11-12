@@ -198,7 +198,7 @@ pub struct ResetStats {
     file_inflight_count: AtomicU64,
     directory_inflight: AtomicU64,
 
-    /// The mounts a purge leaves to each layer's own walk, none where the reset does not purge.
+    /// The mount of each layer, which the reset deletes around and leaves to the layer.
     layer_mounts: Vec<RelativePath>,
 
     /// The dirty adds the walks drop, discarded once every walk has drained, each with the
@@ -281,56 +281,13 @@ struct ResetContext {
     file_tx: mpsc::Sender<ResetFileWorkItem>,
 }
 
-/// The revision a reset takes each path back to: one for every path, or the point each path
-/// was last merged from a branch, which is resolved per path.
-enum ResetTarget {
-    Revision(Arc<State>),
-    LastMergedFrom {
-        state_current: Arc<State>,
-        branch: BranchId,
-        branch_point: Hash,
-        merge_side: ResetMergeSide,
-    },
-}
-
-impl ResetTarget {
-    /// The tree `path` is reset against.
-    async fn state_for(
-        &self,
-        repository: &Arc<RepositoryContext>,
-        path: &RelativePath,
-    ) -> Result<Arc<State>, ResetError> {
-        match self {
-            ResetTarget::Revision(state) => Ok(state.clone()),
-            // Find the start state where the node exists, then iterate its history back from
-            // there to the last point it was merged from the branch.
-            ResetTarget::LastMergedFrom {
-                state_current,
-                branch,
-                branch_point,
-                merge_side,
-            } => {
-                resolve_last_merged_target(
-                    repository.clone(),
-                    state_current.clone(),
-                    *branch,
-                    *branch_point,
-                    *merge_side,
-                    path,
-                )
-                .await
-            }
-        }
-    }
-}
-
 /// What walking every path a reset names needs.
 struct ResetWalk {
     operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
-    target: ResetTarget,
     state_staged: Arc<State>,
-    paths: Vec<RelativePath>,
+    /// Each path the reset names, with the tree it is reset to.
+    paths: Vec<(RelativePath, Arc<State>)>,
     layer_walks: Vec<ResetLayerWalk>,
     options: ResetOptions,
     stats: Arc<ResetStats>,
@@ -351,31 +308,25 @@ async fn reset_walk_each_path(walk: ResetWalk) -> Option<ResetError> {
     failure.or(discarded)
 }
 
-/// Walk each path in turn, reporting the first failure, having stopped at it: a path the user
-/// named and a target that cannot be resolved are both refusals, and the paths after one are
-/// left alone rather than half-applied. A path that does not name anything inside the
+/// Walk each path in turn, reporting the first failure, having stopped at it: the paths after one
+/// are left alone rather than half-applied. A path that does not name anything inside the
 /// repository is reported ignored and skipped.
 async fn reset_walk_paths(walk: &ResetWalk) -> Option<ResetError> {
-    for relative_path in walk.paths.iter() {
-        let walked = match walk.target.state_for(&walk.repository, relative_path).await {
-            Ok(state_target) => {
-                reset_walk_path(
-                    ResetContext {
-                        operation: walk.operation.clone(),
-                        repository: walk.repository.clone(),
-                        state_target,
-                        state_staged: walk.state_staged.clone(),
-                        options: walk.options,
-                        stats: walk.stats.clone(),
-                        file_tx: walk.file_tx.clone(),
-                    },
-                    relative_path.clone(),
-                    relative_path.clone(),
-                )
-                .await
-            }
-            Err(err) => Err(err),
-        };
+    for (relative_path, state_target) in walk.paths.iter() {
+        let walked = reset_walk_path(
+            ResetContext {
+                operation: walk.operation.clone(),
+                repository: walk.repository.clone(),
+                state_target: state_target.clone(),
+                state_staged: walk.state_staged.clone(),
+                options: walk.options,
+                stats: walk.stats.clone(),
+                file_tx: walk.file_tx.clone(),
+            },
+            relative_path.clone(),
+            relative_path.clone(),
+        )
+        .await;
 
         if let Err(err) = walked {
             return wrap_path_error(&walk.operation, relative_path, err)
@@ -452,21 +403,16 @@ struct ResetLayerWalk {
     paths: Vec<(RelativePath, RelativePath)>,
 }
 
-/// The shared state of a reset over `layers`, holding their mounts where the reset purges.
-fn reset_stats(layers: &[layer::Layer], options: ResetOptions) -> Result<ResetStats, ResetError> {
-    let layer_mounts = if options.purge {
-        layers
-            .iter()
-            .map(|layer| {
-                RelativePath::new_from_initial_path(&layer.target_path)
-                    .forward_with::<ResetError, _>(|| {
-                        format!("Invalid layer target path {}", layer.target_path)
-                    })
-            })
-            .collect::<Result<_, _>>()?
-    } else {
-        Vec::new()
-    };
+/// The shared state of a reset over `layers`, holding their mounts.
+fn reset_stats(layers: &[layer::Layer]) -> Result<ResetStats, ResetError> {
+    let layer_mounts = layers
+        .iter()
+        .map(|layer| {
+            RelativePath::new_from_initial_path(&layer.target_path).forward_with::<ResetError, _>(
+                || format!("Invalid layer target path {}", layer.target_path),
+            )
+        })
+        .collect::<Result<_, _>>()?;
     Ok(ResetStats {
         layer_mounts,
         ..Default::default()
@@ -610,18 +556,14 @@ pub async fn reset(
         .into());
     }
 
-    let reset_link_count =
-        reset_staged_links_under_paths(repository.clone(), token, &paths).await?;
-
     let (state_current, state_staged, _branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await
             .forward::<ResetError>("Failed to deserialize revision state")?;
-    let state_staged = state_staged.unwrap_or_else(|| state_current.clone());
     let state_current_revision = state_current.revision();
 
     let state_target = if revision.is_empty() {
-        state_current
+        state_current.clone()
     } else {
         let revision_spec = revision.to_string();
         let resolved = revision::resolve(
@@ -645,14 +587,45 @@ pub async fn reset(
             .forward::<ResetError>("Failed to deserialize revision state")?
     };
 
+    let layer_walks = resolve_layer_walks(repository.clone(), &layers, &layer_jobs).await?;
+    let stats = Arc::new(reset_stats(&layers)?);
+    // Before the link prelude, which stores the staged links it resets, so a refusal changes
+    // nothing.
+    if !stats.layer_mounts.is_empty() {
+        Box::pin(refuse_files_over_mounts_before_reset(
+            &repository,
+            &state_target,
+            &parent_paths,
+            &layer_walks,
+            &stats.layer_mounts,
+            options.single_node,
+        ))
+        .await?;
+    }
+
+    let reset_link_count = reset_staged_links_under_paths(
+        repository.clone(),
+        token,
+        &paths,
+        &state_current,
+        state_staged.as_ref().unwrap_or(&state_current),
+    )
+    .await?;
+    let state_staged = if reset_link_count == 0 {
+        state_staged
+    } else {
+        State::deserialize_current_and_staged(repository.clone())
+            .await
+            .forward::<ResetError>("Failed to deserialize revision state")?
+            .1
+    };
+    let state_staged = state_staged.unwrap_or(state_current);
+
     event::LoreEvent::FileResetBegin(LoreFileResetBeginEventData {
         path_count: paths.len(),
     })
     .send();
 
-    let layer_walks = resolve_layer_walks(repository.clone(), &layers, &layer_jobs).await?;
-
-    let stats = Arc::new(reset_stats(&layers, options)?);
     // Staged link nodes are reset by the prelude above, before the walk runs;
     // count them here so the summary reflects the work done. Links are
     // directory-shaped nodes, so they count as directories like the walk does.
@@ -675,9 +648,11 @@ pub async fn reset(
             reset_walk_each_path(ResetWalk {
                 operation: producer_operation,
                 repository: producer_repository,
-                target: ResetTarget::Revision(state_target),
                 state_staged,
-                paths: parent_paths,
+                paths: parent_paths
+                    .into_iter()
+                    .map(|path| (path, state_target.clone()))
+                    .collect(),
                 layer_walks: producer_layer_walks,
                 options,
                 stats: producer_stats,
@@ -849,7 +824,6 @@ pub async fn reset_to_last_merged(
         &layer::list(repository.clone())
             .await
             .forward::<ResetError>("Failed to list layers")?,
-        options,
     )?);
 
     event::LoreEvent::FileResetBegin(LoreFileResetBeginEventData {
@@ -865,17 +839,25 @@ pub async fn reset_to_last_merged(
     let modified_times = Arc::new(crate::state::RecordedModifiedTimes::default());
     // One operation covers the whole reset, as it does for a reset to a named revision.
     let result = with_operation(repository.file_system(), async |operation| {
+        let paths = Box::pin(last_merged_targets(
+            &operation,
+            &repository,
+            LastMerge {
+                state_current,
+                branch: branch_id,
+                branch_point,
+                merge_side,
+            },
+            paths,
+            &stats.layer_mounts,
+            options.single_node,
+        ))
+        .await?;
         let producer_operation = operation.clone();
         let walked = run_reset_pipeline(operation.clone(), stats.clone(), |file_tx| async move {
             reset_walk_each_path(ResetWalk {
                 operation: producer_operation,
                 repository: producer_repository,
-                target: ResetTarget::LastMergedFrom {
-                    state_current,
-                    branch: branch_id,
-                    branch_point,
-                    merge_side,
-                },
                 state_staged,
                 paths,
                 layer_walks: Vec::new(),
@@ -903,19 +885,16 @@ pub async fn reset_to_last_merged(
 /// to `unstage`, which holds the add/remove/pin-change rollbacks. No-op when no
 /// staged links overlap the given paths. Returns the number of staged link
 /// nodes that were reset so the caller can count them in the reset summary.
+/// The staged links are listed from `state_current` and `state_staged`.
 async fn reset_staged_links_under_paths(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     paths: &LoreArray<LoreString>,
+    state_current: &Arc<State>,
+    state_staged: &Arc<State>,
 ) -> Result<usize, ResetError> {
-    let (state_current, state_staged, _branch) =
-        State::deserialize_current_and_staged(repository.clone())
-            .await
-            .forward::<ResetError>("Failed to deserialize revision state")?;
-    let state_staged = state_staged.unwrap_or_else(|| state_current.clone());
-
     let staged_link_paths =
-        link::list_staged_node_paths(&state_current, &state_staged, repository.clone())
+        link::list_staged_node_paths(state_current, state_staged, repository.clone())
             .await
             .map_err(|err| {
                 forward_refusal_or(err, "listing staged link nodes", |err| {
@@ -996,6 +975,59 @@ async fn wrap_path_error(
     Err::<(), ResetError>(err).forward_with::<ResetError, _>(|| {
         format!("Failed resetting {existence} path: {relative_path}")
     })
+}
+
+/// The point each path of a reset is taken back to: the last merge from `branch` into the branch
+/// the instance is on, whose tree `state_current` is, after `branch_point`.
+struct LastMerge {
+    state_current: Arc<State>,
+    branch: BranchId,
+    branch_point: Hash,
+    merge_side: ResetMergeSide,
+}
+
+/// Each of `paths` with the tree [`resolve_last_merged_target`] resets it to, all resolved, and
+/// refused as [`refuse_files_over_mounts`] refuses them, before the reset changes anything. A path
+/// whose tree cannot be resolved fails the reset, named as a walk's failure names it.
+async fn last_merged_targets(
+    operation: &InstanceOperationImpl,
+    repository: &Arc<RepositoryContext>,
+    last_merge: LastMerge,
+    paths: Vec<RelativePath>,
+    layer_mounts: &[RelativePath],
+    single_node: bool,
+) -> Result<Vec<(RelativePath, Arc<State>)>, ResetError> {
+    let mut targets = Vec::with_capacity(paths.len());
+    for path in paths {
+        match resolve_last_merged_target(
+            repository.clone(),
+            last_merge.state_current.clone(),
+            last_merge.branch,
+            last_merge.branch_point,
+            last_merge.merge_side,
+            &path,
+        )
+        .await
+        {
+            Ok(state) => targets.push((path, state)),
+            Err(err) => wrap_path_error(operation, &path, err).await?,
+        }
+    }
+    let mut hits = Vec::new();
+    for (path, state) in &targets {
+        files_over_mounts(
+            &mut hits,
+            repository,
+            state,
+            path,
+            path,
+            layer_mounts,
+            single_node,
+        )
+        .await?;
+    }
+    refuse_files_over_mounts(operation, &hits).await?;
+    Ok(targets)
 }
 
 async fn resolve_last_merged_target(
@@ -1601,12 +1633,7 @@ async fn reset_delete_path(
     stats
         .delete_count(is_directory)
         .fetch_add(1, Ordering::Relaxed);
-    event::LoreEvent::FileResetFile(LoreFileResetFileEventData {
-        path: LoreString::from(relative_path),
-        action: LoreFileAction::Delete,
-        from_path: LoreString::default(),
-    })
-    .send();
+    send_delete(relative_path);
 
     let removed = if keep_repositories {
         operation
@@ -1619,12 +1646,22 @@ async fn reset_delete_path(
     Ok(())
 }
 
+/// Sends the Delete event of `relative_path`, which the reset removes from the working tree.
+fn send_delete(relative_path: &RelativePath) {
+    event::LoreEvent::FileResetFile(LoreFileResetFileEventData {
+        path: LoreString::from(relative_path),
+        action: LoreFileAction::Delete,
+        from_path: LoreString::default(),
+    })
+    .send();
+}
+
 /// Removes what the working tree holds at `relative_path`, as [`reset_delete_path`] does, but
 /// for a nested repository, which is left in place at any depth with the directories leading to
-/// it, and a layer mount: a mount is left to the layer's own walk, and a directory on the way to
-/// one is purged around it. A path below a mount is left as it is where `repository` is not a
-/// layer, as a walk of the parent repository judges nothing the layer holds; the layer's own walk
-/// purges it. A path the working tree does not hold is left as it is.
+/// it, and a layer mount: a mount is left to the layer, and a directory on the way to one is
+/// purged around it. A path below a mount is left as it is where `repository` is not a layer, as
+/// a walk of the parent repository judges nothing the layer holds. A path the working tree does
+/// not hold is left as it is. Each path removed, whole or around a mount, sends a Delete event.
 async fn purge_path(
     operation: &Arc<InstanceOperationImpl>,
     stats: &Arc<ResetStats>,
@@ -1655,6 +1692,7 @@ async fn purge_path(
                 repository_root,
                 relative_path,
                 None,
+                true,
             ))
             .await;
         }
@@ -1668,6 +1706,226 @@ async fn purge_path(
         }
     }
     reset_delete_path(operation, stats, relative_path, info.is_dir(), true).await
+}
+
+/// Whether `mount` lies at or below `relative_path`, compared as
+/// [`RelativePath::covers_ignore_case`] does: every mount does, where the path is the root.
+#[lore_macro::test_pub]
+fn mount_at_or_below(relative_path: &RelativePath, mount: &RelativePath) -> bool {
+    relative_path.is_empty() || relative_path.covers_ignore_case(mount)
+}
+
+/// A file a target holds on the way down from a path a reset names to a layer mount at or below it.
+struct FileOverMount<'a> {
+    /// The path the reset names, as it names it.
+    named: &'a RelativePath,
+    mount: &'a RelativePath,
+    /// The file's path, each name below `named` spelled as the target spells it.
+    file: RelativePath,
+}
+
+/// Appends to `hits` the file `state_target` holds on the way down from `relative_path`, which
+/// `state_path` names there, to each layer mount at or below it, as [`file_on_the_way`] finds it.
+/// Reads the tree alone.
+async fn files_over_mounts<'a>(
+    hits: &mut Vec<FileOverMount<'a>>,
+    repository: &Arc<RepositoryContext>,
+    state_target: &Arc<State>,
+    relative_path: &'a RelativePath,
+    state_path: &RelativePath,
+    layer_mounts: &'a [RelativePath],
+    single_node: bool,
+) -> Result<(), ResetError> {
+    for mount in layer_mounts {
+        if !mount_at_or_below(relative_path, mount) {
+            continue;
+        }
+        if let Some(file) = file_on_the_way(
+            repository,
+            state_target,
+            relative_path,
+            state_path,
+            mount,
+            single_node,
+        )
+        .await?
+        {
+            hits.push(FileOverMount {
+                named: relative_path,
+                mount,
+                file,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The first file `state_target` holds on the way down from `relative_path` to `mount`, the path
+/// itself included, as a working tree path: each name below `relative_path` spelled as the target
+/// spells it. `None` where a name on the way is missing before a file is reached, where the view
+/// excludes a node on the way, asked as the walk asks it, or where `single_node` stops the way at
+/// the path. A link on the way is crossed, as [`State::find_relative`] crosses one.
+async fn file_on_the_way(
+    repository: &Arc<RepositoryContext>,
+    state_target: &Arc<State>,
+    relative_path: &RelativePath,
+    state_path: &RelativePath,
+    mount: &RelativePath,
+    single_node: bool,
+) -> Result<Option<RelativePath>, ResetError> {
+    let force = execution_context().globals().force();
+    let mut states = repository.filter.parent_exclusion_states(relative_path);
+    let (found, (mut repository, mut state)) = match state_target
+        .find_relative_held(repository.clone(), ROOT_NODE, state_path.as_str())
+        .await
+    {
+        Ok(found) => found,
+        Err(err) if err.is_node_not_found() => return Ok(None),
+        Err(err) => return Err(err).forward::<ResetError>("Failed to find node"),
+    };
+    let mut node_id = found.node;
+    let mut path = relative_path.clone();
+    let depth = if relative_path.is_empty() {
+        0
+    } else {
+        relative_path.as_str().split('/').count()
+    };
+    let mut names = mount.as_str().split('/').skip(depth);
+    loop {
+        let node = state
+            .node(repository.clone(), node_id)
+            .await
+            .forward::<ResetError>("Failed to find node")?;
+        let (child_states, excluded) = repository.filter.child_emit_unless_forced(
+            force,
+            FilterMode::empty(),
+            states,
+            &path,
+            node.is_directory(),
+            FilterMode::View,
+        );
+        if excluded {
+            return Ok(None);
+        }
+        if node.is_file() {
+            return Ok(Some(path));
+        }
+        let Some(name) = names.next().filter(|_| !single_node) else {
+            return Ok(None);
+        };
+        states = child_states;
+        if node.is_link() {
+            let linked = node.linked_node();
+            repository = repository.to_link_context(linked.repository).await;
+            state = State::deserialize(repository.clone(), linked.revision)
+                .await
+                .forward::<ResetError>("Failed to deserialize revision state")?;
+            node_id = linked.node;
+            states = repository.filter.mount_states(&path);
+        }
+        node_id = match state.find_relative(repository.clone(), node_id, name).await {
+            Ok((found, _)) => found.node,
+            Err(err) if err.is_node_not_found() => return Ok(None),
+            Err(err) => return Err(err).forward::<ResetError>("Failed to find node"),
+        };
+        let Some(name) = state
+            .node_name_clone_or_skip(repository.clone(), node_id)
+            .await
+            .forward::<ResetError>("Failed to get node name")?
+        else {
+            return Ok(None);
+        };
+        path = path.join(&name);
+    }
+}
+
+/// Refuses the first of `hits` where the working tree holds a directory at the file, and the layer
+/// at its mount: realizing the file would delete the directory, and the layer's files with it. The
+/// path a hit names is spelled as the working tree spells it, as the walk spells it, and the
+/// refusal names that path as a walk's failure does. Cold.
+async fn refuse_files_over_mounts(
+    operation: &InstanceOperationImpl,
+    hits: &[FileOverMount<'_>],
+) -> Result<(), ResetError> {
+    for hit in hits {
+        let named = if hit.named.is_empty() {
+            hit.named.clone()
+        } else {
+            util::fs::filesystem_path(operation, "", hit.named, None)
+                .await
+                .unwrap_or_else(|_| hit.named.clone())
+        };
+        let file = match hit.file.below(hit.named) {
+            Some(below) if !below.is_empty() => named.join(below),
+            _ => named,
+        };
+        if operation
+            .file_info(&file)
+            .await
+            .is_ok_and(|info| info.is_dir())
+            && operation
+                .file_info(hit.mount)
+                .await
+                .is_ok_and(|info| info.is_dir())
+        {
+            let refusal = NotSupported {
+                operation: format!(
+                    "Resetting {file} to a file would delete the layer mounted at {}",
+                    hit.mount
+                ),
+            };
+            return wrap_path_error(operation, hit.named, refusal.into()).await;
+        }
+    }
+    Ok(())
+}
+
+/// Refuses, as [`refuse_files_over_mounts`] does, a reset to `state_target` of the parent's
+/// `parent_paths` and of each layer walk's paths, reading the tree for each and the working tree,
+/// in an operation of its own, only for the files found over a mount: an operation freezes a
+/// virtual filesystem.
+async fn refuse_files_over_mounts_before_reset(
+    repository: &Arc<RepositoryContext>,
+    state_target: &Arc<State>,
+    parent_paths: &[RelativePath],
+    layer_walks: &[ResetLayerWalk],
+    layer_mounts: &[RelativePath],
+    single_node: bool,
+) -> Result<(), ResetError> {
+    let mut hits = Vec::new();
+    for path in parent_paths {
+        files_over_mounts(
+            &mut hits,
+            repository,
+            state_target,
+            path,
+            path,
+            layer_mounts,
+            single_node,
+        )
+        .await?;
+    }
+    for walk in layer_walks {
+        for (mount_path, state_path) in &walk.paths {
+            files_over_mounts(
+                &mut hits,
+                &walk.state.repository,
+                &walk.state.state_current,
+                mount_path,
+                state_path,
+                layer_mounts,
+                single_node,
+            )
+            .await?;
+        }
+    }
+    if hits.is_empty() {
+        return Ok(());
+    }
+    with_operation(repository.file_system(), async |operation| {
+        refuse_files_over_mounts(&operation, &hits).await
+    })
+    .await
 }
 
 /// Apply the view filter, staged check, and dispatch a single child node
@@ -1880,6 +2138,7 @@ async fn reset_walk_directory(
             repository.require_path()?,
             &directory_path,
             None,
+            false,
         ))
         .await;
     }
@@ -2039,20 +2298,23 @@ async fn reset_walk_directory(
         repository.require_path()?,
         &directory_path,
         Some(held),
+        false,
     ))
     .await
 }
 
 /// Removes the children the working tree holds under `directory_path` that the target revision
-/// does not, which is what `--purge` adds to restoring the ones it does. No filter is asked:
-/// an untracked path is removed whether an ignore rule or the view matches it or not.
+/// does not, which is what `--purge` adds to restoring the ones it does, and how a reset deletes a
+/// directory around a layer mount. No filter is asked: an untracked path is removed whether an
+/// ignore rule or the view matches it or not. Each removal is counted, and sends a Delete event
+/// where `report` says so, as a delete around a mount does and a purge does not.
 ///
 /// `held` holds the children the revision holds, each of them settled by the walk already,
 /// restored or, where the view excludes it, removed, and an entry [`HeldChildren::leaves`] answers
 /// for is left in place. An entry [`is_reserved_node_name`] answers for, such as `.lore` or
 /// `.urc`, and a nested repository, a directory holding `.lore`, are left in place at any depth,
-/// with the directories leading to them. What stands at a layer mount is left to the layer's own
-/// walk, whatever its kind, and a directory on the way to one is purged around it.
+/// with the directories leading to them. What stands at a layer mount is left to the layer,
+/// whatever its kind, and a directory on the way to one is purged around it.
 ///
 /// Each removal runs in a task, and the tasks are drained to [`MAX_CONCURRENT_TREE_TASKS`] after
 /// each spawn. The first failure, of the listing, a removal or a purge around a mount, ends the
@@ -2066,6 +2328,7 @@ async fn purge_untracked_children(
     repository_root: &Path,
     directory_path: &RelativePath,
     held: Option<HeldChildren>,
+    report: bool,
 ) -> Result<(), ResetError> {
     if !operation
         .file_info(directory_path)
@@ -2124,6 +2387,7 @@ async fn purge_untracked_children(
                     repository_root,
                     &child_path,
                     None,
+                    report,
                 ))
                 .await
             {
@@ -2154,6 +2418,9 @@ async fn purge_untracked_children(
         stats
             .delete_count(is_directory)
             .fetch_add(1, Ordering::Relaxed);
+        if report {
+            send_delete(&child_path);
+        }
 
         let child_operation = operation.clone();
         #[cfg(feature = "test-util")]

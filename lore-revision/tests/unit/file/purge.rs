@@ -64,6 +64,7 @@ async fn purged(identity: TestIdentity, child: Option<NodeID>) -> Vec<String> {
         dir.path(),
         &RelativePath::new(),
         Some(held),
+        false,
     )
     .await
     .expect("the purge runs");
