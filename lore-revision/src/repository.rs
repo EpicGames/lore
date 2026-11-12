@@ -2042,6 +2042,17 @@ pub fn load_repository_config(path: impl AsRef<Path>) -> Result<RepositoryConfig
     load_repository_config_from_dot_dir(&get_dot_lore_path(path.as_ref())?)
 }
 
+/// Whether the repository at `path`, whose Lore directory [`get_dot_lore_path`] finds at
+/// `dot_path`, may be removed to put a new one in its place. Only an ordinary repository may. A
+/// Lore directory outside `path` belongs to a mounted virtual clone whatever its config holds, and
+/// a config that names a VFS marks one inside it.
+#[lore_macro::test_pub]
+pub(crate) fn force_may_replace(path: &Path, dot_path: &Path) -> bool {
+    dot_path.parent() == Some(path)
+        && !load_repository_config_from_dot_dir(dot_path)
+            .is_ok_and(|config| config.vfs_type().is_virtual())
+}
+
 /// Process-local holder for the repository directory `FSLock`. Lifetime is managed via an `Arc`
 /// and a weak-ref cache, so overlapping commands that share the lock take one acquisition between
 /// them, and an exclusive holder is shared with none; the underlying flock drops when the last

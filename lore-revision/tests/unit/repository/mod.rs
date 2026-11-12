@@ -15,9 +15,13 @@ mod store_config_tests;
 pub(crate) mod test_helpers;
 mod write_token_tests;
 
+use lore_base::test_util::TempDir;
+use lore_revision::repository::CONFIG;
+use lore_revision::repository::DOT_LORE;
 use lore_revision::repository::RepositoryConfig;
 use lore_revision::repository::VfsConfig;
 use lore_revision::repository::VfsType;
+use lore_revision::repository::force_may_replace;
 
 #[test]
 fn vfs_type_fuse_roundtrips_serde() {
@@ -59,6 +63,60 @@ fn repository_config_names_its_vfs_type() {
         VfsType::None,
         "a config without a [vfs] section names no VFS"
     );
+}
+
+/// `--force` replaces an ordinary repository in the path, and one whose config is missing or
+/// unreadable there, but never a virtual clone: neither one whose config names a VFS, nor one
+/// whose Lore directory lies outside the path, whatever its config holds.
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn force_replaces_only_an_ordinary_repository() {
+    const ORDINARY: &[u8] = b"[vfs]\nvfs_type = \"None\"\n";
+    const UNREADABLE: &[u8] = b"[vfs\n";
+    let cases: [(&str, bool, Option<&[u8]>, bool); 8] = [
+        ("no config", true, None, true),
+        ("an ordinary repository", true, Some(ORDINARY), true),
+        ("an unreadable config", true, Some(UNREADABLE), true),
+        (
+            "a FUSE config",
+            true,
+            Some(b"[vfs]\nvfs_type = \"Fuse\"\n"),
+            false,
+        ),
+        (
+            "an SWFS config",
+            true,
+            Some(b"[vfs]\nvfs_type = \"Swfs\"\n"),
+            false,
+        ),
+        ("no config outside the path", false, None, false),
+        (
+            "an ordinary config outside the path",
+            false,
+            Some(ORDINARY),
+            false,
+        ),
+        (
+            "an unreadable config outside the path",
+            false,
+            Some(UNREADABLE),
+            false,
+        ),
+    ];
+    for (name, inside, config, replaceable) in cases {
+        let path = TempDir::new("force-replaces-only-an-ordinary-repository-");
+        let external = TempDir::new("force-replaces-only-an-ordinary-repository-external-");
+        let dot_lore = if inside { &path } else { &external }.child(DOT_LORE);
+        std::fs::create_dir(&dot_lore).expect("making the Lore directory");
+        if let Some(config) = config {
+            std::fs::write(dot_lore.join(CONFIG), config).expect("writing the config");
+        }
+        assert_eq!(
+            force_may_replace(path.path(), &dot_lore),
+            replaceable,
+            "{name}"
+        );
+    }
 }
 
 /// A virtual VFS always uses a shared store: one that inherits the machine's setting gets one,

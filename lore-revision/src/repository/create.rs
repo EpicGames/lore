@@ -14,7 +14,6 @@ use super::StoreConfig;
 use super::VfsConfig;
 use super::VfsType;
 use super::get_dot_lore_path;
-use super::load_repository_config_from_dot_dir;
 use crate::branch;
 use crate::errors::*;
 use crate::event;
@@ -223,10 +222,7 @@ pub(crate) async fn create_with_metadata(
     }
     let existing_dot_dir = get_dot_lore_path(path)?;
     if existing_dot_dir.exists() {
-        let existing_repository_is_swfs =
-            load_repository_config_from_dot_dir(existing_dot_dir.as_path())
-                .is_ok_and(|config| config.vfs_type() == VfsType::Swfs);
-        if call.force() && !existing_repository_is_swfs {
+        if call.force() && repository::force_may_replace(path, &existing_dot_dir) {
             if call.dry_run() {
                 dry_run_created(id_or_new(&options), name, path);
                 return Ok(());

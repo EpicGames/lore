@@ -18,7 +18,7 @@ from pathlib import Path
 from time import monotonic, sleep
 
 import pytest
-from error_types import MountsBusyError, RevisionNotFound
+from error_types import MountsBusyError, RepositoryAlreadyExistsError, RevisionNotFound
 from service_util import (
     LORE_NO_SERVICE_MESSAGE,
     LORE_SERVICE_CLAIM_REFUSED_MESSAGE,
@@ -962,6 +962,36 @@ def test_instance_delete_of_a_busy_fuse_instance_changes_nothing(
     fuse.repository_instance_delete(cwd=outside)
     assert not is_mounted(fuse.path), "once nothing holds it, the delete goes ahead"
     assert not os.path.exists(external)
+
+
+@pytest.mark.smoke
+def test_forced_create_and_clone_refuse_to_replace_a_fuse_instance(
+    new_lore_repo, fuse_mounts, global_dir_name
+):
+    repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    repo.write_commit_push("initial", {"readme.txt": b"hello\n"})
+    fuse = fuse_clone(repo, fuse_mounts)
+    [external] = external_dirs(global_dir_name)
+    dot_lore = os.path.join(external, ".lore")
+    tree = sorted(os.listdir(fuse.path))
+
+    with pytest.raises(RepositoryAlreadyExistsError):
+        fuse.run(
+            [
+                "repository",
+                "create",
+                repo.remote + Lore.generate_random_name(),
+                "--force",
+            ]
+        )
+    for destination in [fuse.path, os.path.join(fuse.path, "nested")]:
+        with pytest.raises(RepositoryAlreadyExistsError):
+            repo.run(["repository", "clone", repo.remote_path, destination, "--force"])
+
+    assert os.path.isdir(dot_lore), "the instance's Lore directory stays"
+    assert is_mounted(fuse.path), "the instance stays mounted"
+    assert sorted(os.listdir(fuse.path)) == tree, "and nothing is written through it"
+    assert fuse.path in fuse.repository_instance_list(), "and it stays registered"
 
 
 @pytest.mark.smoke

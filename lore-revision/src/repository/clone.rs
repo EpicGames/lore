@@ -32,7 +32,6 @@ use super::RepositoryWriteToken;
 use super::SharedStoreToUseConfig;
 use super::VfsConfig;
 use super::get_dot_lore_path;
-use super::load_repository_config_from_dot_dir;
 use crate::branch;
 use crate::branch::BranchLatestStatus;
 use crate::dependency;
@@ -1028,10 +1027,7 @@ pub async fn clone(
 
     let existing_dot_dir = get_dot_lore_path(path)?;
     if existing_dot_dir.exists() {
-        let existing_repository_is_swfs =
-            load_repository_config_from_dot_dir(existing_dot_dir.as_path())
-                .is_ok_and(|config| config.vfs_type() == VfsType::Swfs);
-        if call.force() && !existing_repository_is_swfs {
+        if call.force() && repository::force_may_replace(path, &existing_dot_dir) {
             // A dry run could not set up the clone without replacing the repository it would
             // only report on, and a repository it removed cannot be restored afterwards.
             if call.dry_run() {
