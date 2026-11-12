@@ -1635,11 +1635,11 @@ mod tests {
         assert!(failures.is_empty(), "{failures:#?}");
     }
 
-    /// Removes `path` below the fixture, a file or a whole directory.
+    /// Removes `path` below `root`, a file or a whole directory.
     // Test fixture writes; not subject to repository write-token discipline.
     #[allow(clippy::disallowed_methods)]
-    fn remove_path(fixture: &TestRepository, path: &str) {
-        let path = fixture.path.join(path);
+    fn remove_path(root: &std::path::Path, path: &str) {
+        let path = root.join(path);
         if path.is_dir() {
             std::fs::remove_dir_all(path).expect("Delete failed");
         } else {
@@ -1724,7 +1724,7 @@ mod tests {
 
                     write_path(&fixture, added, b"temporary");
                     stage_target(&fixture, added, false).await;
-                    remove_path(&fixture, removed);
+                    remove_path(&fixture.path, removed);
                     stage_target(&fixture, target, scan).await;
                     staged_marks_left(&fixture, case).await
                 }))
@@ -1753,7 +1753,7 @@ mod tests {
 
                 write_path(&fixture, "dir/temp", b"temporary");
                 stage_target(&fixture, "dir/temp", false).await;
-                remove_path(&fixture, "dir/temp");
+                remove_path(&fixture.path, "dir/temp");
                 dirty_paths(&fixture, &["dir/temp"]).await;
                 staged_marks_left(&fixture, "marked dirty").await
             }))
@@ -1795,7 +1795,7 @@ mod tests {
                     }
                     write_path(&fixture, added, b"temporary");
                     stage_target(&fixture, added, false).await;
-                    remove_path(&fixture, added);
+                    remove_path(&fixture.path, added);
                     stage_target(&fixture, "", false).await;
 
                     let (_, state_staged, _) =
@@ -1855,7 +1855,7 @@ mod tests {
                     .expect("Committed tree")
                     .hash_node;
 
-                remove_path(&fixture, "item.txt");
+                remove_path(&fixture.path, "item.txt");
                 dirty_paths(&fixture, &["item.txt"]).await;
 
                 let block_hashes = immutable::read(
@@ -1917,7 +1917,7 @@ mod tests {
                 write_path(&fixture, "Assets/a.txt", b"kept");
                 write_path(&fixture, "Assets/b.txt", b"removed");
                 stage_target(&fixture, "Assets", false).await;
-                remove_path(&fixture, "Assets/b.txt");
+                remove_path(&fixture.path, "Assets/b.txt");
                 stage_target(&fixture, "assets/b.txt", false).await;
 
                 let (_, state_staged, _) =
@@ -1965,7 +1965,7 @@ mod tests {
                 write_path(&fixture, "dir/a.txt", b"modified");
                 write_path(&fixture, "dir/phantom.txt", b"temporary");
                 dirty_paths(&fixture, &["dir/a.txt", "dir/phantom.txt"]).await;
-                remove_path(&fixture, "dir/phantom.txt");
+                remove_path(&fixture.path, "dir/phantom.txt");
 
                 file::stage::stage(
                     repository.clone(),
@@ -2035,7 +2035,7 @@ mod tests {
                 )
                 .await
                 .expect("Stage of the move failed");
-                remove_path(&fixture, "new");
+                remove_path(&fixture.path, "new");
                 stage_target(&fixture, "new/keep.txt", false).await;
 
                 let (_, state_staged, _) =
@@ -4240,23 +4240,104 @@ mod tests {
         }
     }
 
-    /// A dirty mark of a sparse tree marks no deletion of the files its view leaves out of the
-    /// working tree.
+    /// Marks `names` below `root` dirty, under force where `forced` says so.
+    async fn mark_dirty(
+        repository: &Arc<lore_revision::repository::RepositoryContext>,
+        root: &std::path::Path,
+        names: &[&str],
+        forced: bool,
+    ) {
+        let marking = file::dirty::dirty(repository.clone(), path_arguments(root, names));
+        if forced {
+            LORE_CONTEXT.scope(forced_execution(), marking).await
+        } else {
+            marking.await
+        }
+        .expect("Dirty failed");
+    }
+
+    /// A dirty mark of a sparse tree, forced or not, marks the deletion of the file in view the
+    /// working tree lacks and of no file the view leaves out, below a removed directory too, and
+    /// status lists only that deletion.
     #[tokio::test]
-    async fn a_dirty_mark_of_a_sparse_tree_marks_no_deletion() {
-        in_execution(async {
-            let (repository, tempdir) = sparse_repository().await;
-            file::dirty::dirty(repository.clone(), path_arguments(&tempdir, &["."]))
-                .await
-                .expect("Dirty failed");
-            let deleted = sparse_files_marked(&repository, Node::is_dirty_delete).await;
-            assert!(
-                deleted.is_empty(),
-                "a dirty mark of the tree marked the deletion of files the view excludes: \
-                 {deleted:?}"
-            );
-        })
-        .await;
+    async fn a_dirty_mark_of_a_sparse_tree_marks_no_deletion_the_view_excludes() {
+        const IN_VIEW: &str = "Game/Saved/Config/a.ini";
+        let cases: [(&[&str], &[&str], &[&str]); 5] = [
+            (&[IN_VIEW], &["."], &["D Game/Saved/Config/a.ini"]),
+            (&[IN_VIEW], &["Game"], &["D Game/Saved/Config/a.ini"]),
+            (
+                &[IN_VIEW],
+                &["top.txt", "Engine/Build/b.txt", IN_VIEW],
+                &["D Game/Saved/Config/a.ini"],
+            ),
+            (&["Game/Saved"], &["."], &["D Game/Saved/"]),
+            (
+                &["Engine/Build", IN_VIEW],
+                &["."],
+                &["D Game/Saved/Config/a.ini"],
+            ),
+        ];
+        for force in [false, true] {
+            for (removed, names, listed) in cases {
+                in_execution(async move {
+                    let (repository, tempdir) = sparse_repository().await;
+                    for path in removed {
+                        remove_path(&tempdir, path);
+                    }
+                    mark_dirty(&repository, &tempdir, names, force).await;
+                    let deleted = sparse_files_marked(&repository, Node::is_dirty_delete).await;
+                    assert_eq!(
+                        deleted,
+                        [IN_VIEW],
+                        "a dirty mark of {names:?}, forced {force}, with {removed:?} removed, \
+                         marked other deletions than of the file in view"
+                    );
+                    let deletions: Vec<String> = status_reported(&repository, None, false)
+                        .await
+                        .into_iter()
+                        .map(|(entry, _)| entry)
+                        .filter(|entry| entry.starts_with("D "))
+                        .collect();
+                    assert_eq!(
+                        deletions, listed,
+                        "status after a dirty mark of {names:?}, forced {force}, with \
+                         {removed:?} removed"
+                    );
+                })
+                .await;
+            }
+        }
+    }
+
+    /// A dirty mark of a path the view leaves out, forced or not, keeps the add a forced dirty
+    /// mark marked there after the working tree loses the file: a deletion driven by absence asks
+    /// the view, as a forced stage does.
+    #[tokio::test]
+    async fn a_dirty_mark_keeps_an_add_past_the_view_the_working_tree_lost() {
+        const ADDED: &str = "Engine/Build/new.txt";
+        for force in [false, true] {
+            in_execution(async move {
+                let (repository, tempdir) = sparse_repository().await;
+                test_file_write(tempdir.join(ADDED).as_path(), b"new");
+                mark_dirty(&repository, &tempdir, &[ADDED], true).await;
+                assert!(
+                    next_node(&repository, ADDED).await.is_dirty_add(),
+                    "the forced dirty mark marked no add of {ADDED}"
+                );
+                remove_path(&tempdir, ADDED);
+                mark_dirty(&repository, &tempdir, &[ADDED], force).await;
+                let kept = next_tree(&repository)
+                    .await
+                    .find_node(repository.clone(), ADDED)
+                    .await
+                    .is_ok_and(|node| node.is_dirty_add());
+                assert!(
+                    kept,
+                    "a dirty mark, forced {force}, took back the add of {ADDED}"
+                );
+            })
+            .await;
+        }
     }
 
     /// A status scan of untracked files a directory-only rule names asks about each as the file it

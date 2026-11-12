@@ -1488,8 +1488,9 @@ async fn reset_walk_named_path(
                         vec![staged_link.node],
                     );
                 } else if !delete_path {
-                    let (_, excluded) = repository.filter.child_emit_excludes_unless_forced(
+                    let (_, excluded) = repository.filter.child_emit_unless_forced(
                         execution_context().globals().force(),
+                        FilterMode::empty(),
                         parent_states,
                         &relative_path,
                         directory,
@@ -1695,8 +1696,9 @@ async fn reset_walk_node(
     } = ctx;
 
     let force = execution_context().globals().force();
-    let (states, excluded) = repository.filter.child_emit_excludes_unless_forced(
+    let (states, excluded) = repository.filter.child_emit_unless_forced(
         force,
+        FilterMode::empty(),
         parent_states,
         &relative_path,
         node.is_directory(),

@@ -757,7 +757,7 @@ pub(crate) async fn stage_filesystem_path(
     // The tree is searched before the filter is asked, since a path the tree tracks is past the
     // ignore slot.
     let filter = &repository.filter;
-    let mode = absence_mode(force, FilterMode::Full);
+    let mode = FilterMode::Full.absence(force);
     let parent_states = filter.parent_exclusion_states(&full_relative_path);
 
     let Ok((node_link, linked)) = state
@@ -904,7 +904,7 @@ async fn absent_named_node(
             parent,
             path,
             is_directory,
-            absence_mode(force, FilterMode::TRACKED),
+            FilterMode::TRACKED.absence(force),
             async || state.tracks(repository, id, flags).await,
         )
         .await
@@ -1641,33 +1641,6 @@ fn stage_delete_recurse(
     ))
 }
 
-/// The filter slots asked about a deletion that a path missing from the working tree drives: the
-/// view alone where the stage is forced, since a forced stage passes the ignore file and the
-/// working tree lacks what the view excludes without its having been deleted, and `unforced`
-/// otherwise.
-fn absence_mode(force: bool, unforced: FilterMode) -> FilterMode {
-    if force { FilterMode::View } else { unforced }
-}
-
-/// The filter verdict a staging walk carries from `parent` to `path`, and whether it leaves `path`
-/// out, asking the slots in `unforced`. A forced stage leaves out nothing, and still steps the view
-/// for the deletions below that ask it.
-fn stage_step(
-    filter: &Filter,
-    force: bool,
-    parent: FilterStates,
-    path: &RelativePath,
-    is_directory: bool,
-    unforced: FilterMode,
-) -> (FilterStates, bool) {
-    if force {
-        let (states, _) = filter.child_excludes_tree(parent, path, is_directory, FilterMode::View);
-        (states, false)
-    } else {
-        filter.child_emit_excludes(parent, path, is_directory, unforced)
-    }
-}
-
 /// Stages the deletion of the node the tree holds at `path` where it is of the kind the working
 /// tree does not hold there, `replaced_directory` saying whether that kind is a directory. The
 /// filter leaves out what the working tree holds and keeps a node of the other kind, whose
@@ -1801,7 +1774,7 @@ async fn stage_absent_delete(
                 states,
                 &child_path,
                 is_directory,
-                absence_mode(force, FilterMode::TRACKED),
+                FilterMode::TRACKED.absence(force),
                 async || state.tracks(&repository, child_node_id, child_held).await,
             )
             .await
@@ -2219,7 +2192,7 @@ async fn unclaimed_child(
             states,
             &filter_path,
             !node.is_file(),
-            absence_mode(force, FilterMode::TRACKED),
+            FilterMode::TRACKED.absence(force),
             async || state.tracks(repository, child, held).await,
         )
         .await
@@ -2999,9 +2972,9 @@ pub(crate) async fn stage_node_from_metadata(
         Ok(Some(_)) => true,
         _ => false,
     };
-    let (states, excluded) = stage_step(
-        &repository.filter,
+    let (states, excluded) = repository.filter.child_emit_unless_forced(
         force,
+        FilterMode::View,
         parent_states,
         &filter_path,
         info.is_dir(),

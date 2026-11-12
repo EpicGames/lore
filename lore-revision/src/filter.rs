@@ -1903,6 +1903,14 @@ impl FilterMode {
         }
     }
 
+    /// The slots a walk through `self` asks about a deletion that a path missing from the working
+    /// tree drives: the view alone where the walk is forced, since a forced walk passes the ignore
+    /// file and the working tree lacks what the view excludes without its having been deleted, and
+    /// `self` otherwise.
+    pub fn absence(self, force: bool) -> Self {
+        if force { Self::View } else { self }
+    }
+
     /// The slots that exclude.
     fn excluding(self) -> Self {
         let mut slots = self;
@@ -1942,6 +1950,22 @@ impl FilterStates {
         ignore: FilterState::ROOT,
         view: FilterState::ROOT,
     };
+
+    /// These states with each slot outside `mode` at its root state.
+    fn only(self, mode: FilterMode) -> Self {
+        Self {
+            ignore: if mode.contains(FilterMode::Ignore) {
+                self.ignore
+            } else {
+                FilterState::ROOT
+            },
+            view: if mode.contains(FilterMode::View) {
+                self.view
+            } else {
+                FilterState::ROOT
+            },
+        }
+    }
 
     /// Whether the path these states describe is itself excluded, for the slots in `mode`.
     pub fn excluded(self, mode: FilterMode) -> bool {
@@ -2176,11 +2200,9 @@ impl Filter {
         (states, Self::emit(path, reason))
     }
 
-    /// [`child_excludes_tree`](Self::child_excludes_tree) unless `force` puts
-    /// the walk past the filter.
-    ///
-    /// See [`child_emit_excludes_unless_forced`](Self::child_emit_excludes_unless_forced)
-    /// for why a forced walk is answered without asking the filter.
+    /// [`child_excludes_tree`](Self::child_excludes_tree) unless `force` puts the walk past the
+    /// filter, where it leaves out nothing and hands back [`FilterStates::ROOT`] without reading
+    /// the lines.
     pub fn child_excludes_tree_unless_forced(
         &self,
         force: bool,
@@ -2195,27 +2217,29 @@ impl Filter {
         self.child_excludes_tree(parent, path, is_directory, mode)
     }
 
-    /// [`child_emit_excludes`](Self::child_emit_excludes) unless `force` puts
-    /// the walk past the filter.
-    ///
-    /// A forced operation drops nothing, so it must report nothing as excluded
-    /// either, and it needs no verdict at all: `force` is one flag on the
-    /// operation -- `ExecutionContext::globals` or `DirtyWalkOptions` -- so
-    /// every step below is forced too and none of them reads one. The walk is
-    /// answered without touching the lines, and the state handed back is
-    /// [`FilterStates::ROOT`] rather than a verdict nothing will consult.
-    pub fn child_emit_excludes_unless_forced(
+    /// [`child_emit_excludes`](Self::child_emit_excludes) for the slots in `mode`, unless `force`
+    /// puts the walk past the filter. A forced step leaves out nothing and emits nothing, and the
+    /// states it hands back step only the slots in `stepped`, at a directory, with every other
+    /// slot at its root state. A file, which has nothing below it, takes [`FilterStates::ROOT`].
+    /// With `stepped` empty, a forced step reads none of the lines.
+    pub fn child_emit_unless_forced(
         &self,
         force: bool,
+        stepped: FilterMode,
         parent: FilterStates,
         path: &impl FilterPath,
         is_directory: bool,
         mode: FilterMode,
     ) -> (FilterStates, bool) {
-        if force {
+        if !force {
+            return self.child_emit_excludes(parent, path, is_directory, mode);
+        }
+        if !is_directory {
             return (FilterStates::ROOT, false);
         }
-        self.child_emit_excludes(parent, path, is_directory, mode)
+        let (states, _) =
+            self.child_exclude_reason(parent.only(stepped), path, true, stepped, Scope::Node);
+        (states, false)
     }
 
     /// The folded verdicts at the directory `path`, seeding a walk that starts

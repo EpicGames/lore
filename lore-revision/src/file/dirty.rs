@@ -651,9 +651,11 @@ async fn staged_node(walk: &DirtyWalk, nodes: DirtyNodes) -> Option<Node> {
 /// The filter is asked about the path once it is resolved, entering each link on the way: as what
 /// the working tree holds there, else as the node the staged tree holds, a link as a directory, and
 /// as a directory where neither holds anything. A path the trees track is past the ignore slot. A
-/// path the filter leaves out whatever it holds is answered before the working tree is read where
-/// the trees do not track it. A path the operation cannot describe is an error and not an absent
-/// path: reading it as absent would mark a file that is there as deleted.
+/// path the working tree lacks is asked about as a deletion, which asks the view where the walk is
+/// forced too ([`FilterMode::absence`]). A path the filter leaves out whatever it holds is answered
+/// before the working tree is read where the trees do not track it. A path the operation cannot
+/// describe is an error and not an absent path: reading it as absent would mark a file that is
+/// there as deleted.
 #[lore_macro::test_pub]
 async fn dirty_named_path(
     walk: &DirtyWalk,
@@ -724,13 +726,19 @@ async fn dirty_resolved_path(
                 .child_excludes_tree(parent, path, is_directory, FilterMode::Full)
                 .1
             && tracks(walk, nodes, Some(is_directory)).await?;
-        let (states, excluded) = filter.child_emit_excludes_unless_forced(
-            force,
-            parent,
-            path,
-            is_directory,
-            FilterMode::TRACKED.at(tracked),
-        );
+        let mode = FilterMode::TRACKED.at(tracked);
+        let (states, excluded) = if info.exists() {
+            filter.child_emit_unless_forced(
+                force,
+                FilterMode::View,
+                parent,
+                path,
+                is_directory,
+                mode,
+            )
+        } else {
+            filter.child_emit_excludes(parent, path, is_directory, mode.absence(force))
+        };
         if excluded {
             lore_trace!("Path excluded by filter: {}", path.as_str());
             return Ok(());
@@ -1241,11 +1249,12 @@ async fn file_matches_current(
 /// directory whose contents are excluded — e.g. a view-only path like
 /// `Templates` where `/Templates/*` filters the contents but not the directory
 /// node itself — must not re-mark its entire filtered subtree as deleted. The
-/// directory node passed in is always marked; only its excluded children are
-/// skipped. The non-emitting `child_excludes_tree_unless_forced` is used so a
-/// large pruned subtree does not produce a `FilterExclude` event per node. The
-/// ignore slot is not asked: every descendant is a node the tree holds, which
-/// is past it.
+/// directory node passed in is always marked; only the children the view
+/// excludes are skipped, forced or not: the working tree lacks what the view
+/// excludes without its having been deleted. The non-emitting
+/// `child_excludes_tree` is used so a large pruned subtree does not produce a
+/// `FilterExclude` event per node. The ignore slot is not asked: every
+/// descendant is a node the tree holds, which is past it.
 async fn dirty_delete(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
@@ -1284,7 +1293,6 @@ async fn dirty_delete(
 
     // Recurse into directory children
     if node.is_directory() {
-        let force = execution_context().globals().force();
         let mut child_node_iter = node.child();
         let mut cycle = SiblingCycleGuard::new(node_id);
         while let Some(child_node_id) = child_node_iter {
@@ -1306,8 +1314,7 @@ async fn dirty_delete(
             };
             let child_path = path.push_into_buf(&child_name).freeze();
 
-            let (child_states, excluded) = repository.filter.child_excludes_tree_unless_forced(
-                force,
+            let (child_states, excluded) = repository.filter.child_excludes_tree(
                 states,
                 &child_path,
                 child_node.is_directory(),
@@ -1648,14 +1655,14 @@ fn dirty_directory<'a>(
                     .child_excludes_tree(states, &child_path, is_directory, FilterMode::Full)
                     .1
                 && tracks(walk, child_nodes, Some(is_directory)).await?;
-            let (child_states, excluded) =
-                walk.repository.filter.child_emit_excludes_unless_forced(
-                    force,
-                    states,
-                    &child_path,
-                    is_directory,
-                    FilterMode::TRACKED.at(tracked),
-                );
+            let (child_states, excluded) = walk.repository.filter.child_emit_unless_forced(
+                force,
+                FilterMode::View,
+                states,
+                &child_path,
+                is_directory,
+                FilterMode::TRACKED.at(tracked),
+            );
             if excluded {
                 continue;
             }
@@ -1696,8 +1703,7 @@ fn dirty_directory<'a>(
                 let child_rel = dir_path.push_into_buf(&child_name).freeze();
                 drop(child_name);
 
-                let Some(child_states) =
-                    absent_child_states(walk, states, &child_rel, &current, force)
+                let Some(child_states) = absent_child_states(walk, states, &child_rel, &current)
                 else {
                     continue;
                 };
@@ -1750,31 +1756,23 @@ async fn held_elsewhere(
         .forward::<DirtyError>("Failed to read a node the staged tree may hold elsewhere")
 }
 
-/// The filter verdict a child the working tree lacks carries into its marking, the current
-/// revision holding it as `current`, or `None` where the view leaves it out: the working tree lacks
-/// what the view excludes without its having been deleted. The ignore file has no say over a
-/// deletion.
+/// The view's verdict a child the working tree lacks carries into its marking, the current
+/// revision holding it as `current`, or `None` where the view leaves it out, forced or not: the
+/// working tree lacks what the view excludes without its having been deleted. The ignore file has
+/// no say over a deletion.
 fn absent_child_states(
     walk: &DirtyWalk,
     states: FilterStates,
     path: &RelativePath,
     current: &Node,
-    force: bool,
 ) -> Option<FilterStates> {
-    let filter = &walk.repository.filter;
-    let is_directory = !current.is_file();
-    let (_, out_of_view) = filter.child_excludes_tree_unless_forced(
-        force,
+    let (child_states, out_of_view) = walk.repository.filter.child_excludes_tree(
         states,
         path,
-        is_directory,
+        !current.is_file(),
         FilterMode::View,
     );
-    (!out_of_view).then(|| {
-        filter
-            .child_excludes_tree(states, path, is_directory, FilterMode::Full)
-            .0
-    })
+    (!out_of_view).then_some(child_states)
 }
 
 /// Mark a file as dirty-moved. Relocates the node in the staged tree from source to destination.

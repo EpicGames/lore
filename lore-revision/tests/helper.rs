@@ -1064,8 +1064,9 @@ pub const SPARSE_FILES: [&str; 6] = [
 ];
 
 /// A committed repository read through the view `/*`, `!*/Saved/Config/`, whose working tree
-/// holds `Game/Saved/Config/a.ini` and the directories of every file, as a clone under that
-/// view leaves it, and no other file.
+/// holds `Game/Saved/Config/a.ini`, `seed.txt`, `.loreignore` and the directories of every file,
+/// and no other file. Unlike a clone under that view, it holds the directories the view keeps
+/// nothing in.
 #[allow(dead_code)]
 pub async fn sparse_repository() -> (
     std::sync::Arc<lore_revision::repository::RepositoryContext>,

@@ -1626,7 +1626,7 @@ fn a_threaded_walk_agrees_with_a_whole_path_query_across_both_slots() {
     );
 }
 
-/// A forced walk is answered without consulting the filter.
+/// A forced walk that steps no slot is answered without consulting the filter.
 ///
 /// `--force` drops nothing, so it must report nothing excluded and emit no
 /// event. It also reads no verdict -- every step below a forced one is forced
@@ -1658,8 +1658,9 @@ fn a_forced_step_excludes_nothing_and_carries_no_verdict() {
             is_directory,
             FilterMode::Full,
         );
-        let (forced_states, forced) = filter.child_emit_excludes_unless_forced(
+        let (forced_states, forced) = filter.child_emit_unless_forced(
             true,
+            FilterMode::empty(),
             FilterStates::ROOT,
             &subject,
             is_directory,
@@ -1689,6 +1690,59 @@ fn a_forced_step_excludes_nothing_and_carries_no_verdict() {
             assert!(unforced, "{name} should be excluded when not forced");
             assert_ne!(unforced_states, FilterStates::ROOT);
         }
+    }
+}
+
+/// A forced step that steps the view leaves out nothing, and hands back the view's step at a
+/// directory with the ignore slot at its root state, and the root states at a file.
+#[test]
+fn a_forced_step_steps_only_the_slots_asked_for_at_a_directory() {
+    use lore_revision::filter::Filter;
+    use lore_revision::filter::FilterMode;
+
+    let mut filter = Filter::default();
+    filter
+        .ignore
+        .add_exclusion("intermediate")
+        .expect("exclusion");
+    filter.view.add_exclusion("binaries").expect("exclusion");
+
+    for (name, is_directory) in [
+        ("intermediate", true),
+        ("binaries", true),
+        ("binaries", false),
+    ] {
+        let subject = path(name);
+        let (unforced_states, _) = filter.child_excludes_tree(
+            FilterStates::ROOT,
+            &subject,
+            is_directory,
+            FilterMode::Full,
+        );
+        let (forced_states, forced) = filter.child_emit_unless_forced(
+            true,
+            FilterMode::View,
+            FilterStates::ROOT,
+            &subject,
+            is_directory,
+            FilterMode::Full,
+        );
+        assert!(
+            !forced,
+            "a forced step excludes nothing, {name} was dropped"
+        );
+        let expected = if is_directory {
+            FilterStates {
+                ignore: FilterStates::ROOT.ignore,
+                view: unforced_states.view,
+            }
+        } else {
+            FilterStates::ROOT
+        };
+        assert_eq!(
+            forced_states, expected,
+            "a forced step of {name}, a directory {is_directory}, stepped other than the view"
+        );
     }
 }
 

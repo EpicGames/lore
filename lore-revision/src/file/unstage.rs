@@ -1064,8 +1064,9 @@ async fn unstage_node(
             .await
             .forward::<UnstageError>("Failed to read the revision the staged tree was built on")?
     };
-    let (child_states, excluded) = repository.filter.child_emit_excludes_unless_forced(
+    let (child_states, excluded) = repository.filter.child_emit_unless_forced(
         force,
+        FilterMode::empty(),
         states,
         &node_path,
         !node.is_file(),
