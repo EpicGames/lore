@@ -35,7 +35,7 @@ Mixing moods within one doc is fine when it serves the reader.
 
 ## Tense
 
-Use present tense for descriptive prose: `lore push uploads commits to the remote.`
+Use present tense for descriptive prose: `lore push uploads revisions to the remote.`
 
 Past or future tense is acceptable when sequence matters (a condition and its consequence). Restrict yourself to past simple and future simple: `If you choose the wrong remote, lore push will fail.`
 
@@ -73,7 +73,7 @@ We chose content-addressed fragments to support offline-first workflows.
 We ship a Rust API and a C API as the integration surfaces; integrators choose the one that matches their host language.
 
 <!-- correct, project history -->
-In v0.5, we added support for sparse clones.
+In v0.5, we added support for sparse working trees.
 ```
 
 The exception is the **instructional voice** in Tutorials and How-Tos — never write `we` when you mean the reader. Rewrite to imperative or to second person.
@@ -112,14 +112,14 @@ Lore-native primitives. Use as written; define inline on first use.
 
 | Term | Meaning |
 | --- | --- |
-| `commit` | The act of recording a snapshot, and the resulting record. Same word as Git, distinct mechanics. |
+| `commit` | To record the staged changes as a new revision (`lore commit`). A verb only; what committing creates is a revision. Same word as Git, distinct mechanics. |
 | `revision` | An entry in a branch's history. Lore-distinctive — don't collapse into "commit." |
 | `branch` | First-class. Branches in Lore are full citizens, not pointers. |
 | `latest` | The local pointer to the most recent revision on a branch. Lore's analog to Git's `HEAD`, but per-branch and not exposed as a roving pointer. |
 | `working tree` | The on-disk state of a repository instance. |
-| `stage` | The set of changes recorded for the next commit. The verb (`lore stage`) and the noun. |
+| `stage` | To mark a file's change for inclusion in the next revision (`lore stage`). A verb only, like `commit` and `merge`; say "the staged changes" for what is staged. |
 | `repository instance` | An addressable copy of a repository on a peer. Created by `lore clone`, or by `lore repository instance clone` from another instance. |
-| `clone` | The act (`lore clone`) and the resulting repository instance; `lore repository instance clone` makes one from an instance already on the machine. Lore-native — not a Git-ism. |
+| `clone` | To create a repository instance from a repository (`lore clone`) or from another instance (`lore repository instance clone`). A verb only; what cloning creates is an instance. |
 | `fragment` | Lore's content-addressed unit of storage. |
 | `sync` | Lore's analog to Git's `pull`. |
 | `view filter` | Client-side glob-based path include/exclude, user-defined per instance and changeable in place (`lore clone --view`, `lore sync --view`). Close to a P4 stream view, but per-instance rather than server-side. Closest Git analog: sparse-checkout. |
@@ -220,7 +220,7 @@ Lore is a product made up of three named parts:
 The canonical rules:
 
 - **Lore** (capital `L`, unqualified) when referring to the product as a whole, the project, or the open-source project, and the meaning is clear from context. Example: `Lore is a version control system.`
-- **`lore`** (lowercase, in a code span) when referring to the CLI **binary** or a specific command. Example: `Run lore stage to add files to the next commit.`
+- **`lore`** (lowercase, in a code span) when referring to the CLI **binary** or a specific command. Example: `Run lore stage to add files to the next revision.`
 - **Lore CLI** / **Lore Server** / **Lore library** when you need to disambiguate which part of the product you mean. Example: `The Lore CLI is bundled with every release; the Lore Server is shipped separately.` Don't capitalize `library`.
 
 Don't write *the Lore tool*, *the Lore software*, *the Lore application*, *the Lore product*, or *the Lore system* — these are generic qualifiers and `Lore` already covers them. Use one of the three named parts above when you need to be specific, otherwise just write `Lore`. Vale `Lore.ProductNaming` enforces the generic-qualifier ban.

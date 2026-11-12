@@ -9,7 +9,7 @@ Voice and word-choice rules live in [`../canon/language.md`](../canon/language.m
 Add a term to the glossary when at least one of the following is true:
 
 - It's **specialized** to Lore or to version control, and a generalist reader won't know it. *(Examples: `revision`, `working tree`.)*
-- It has **multiple senses** that need disambiguation. *(Example: `stage` (verb, the act) vs `stage` (noun, the object).)*
+- It has **multiple senses** that need disambiguation. *(Example: `lock` (noun, the claim) vs `lock` (verb, the act).)*
 - It's an **acronym or abbreviation** whose expansion is load-bearing in Lore docs. *(Examples: `CR`, `URL`.)*
 - It's a **product, feature, or tool name** with fixed capitalization the project has decided on. *(Examples: `Lore`.)*
 
@@ -32,11 +32,11 @@ Write the headword exactly as it should appear in prose: correct capitalization,
 When the form depends on usage, add a part-of-speech tag in parentheses and list each form as its own entry on consecutive lines:
 
 ```markdown
-### Stage (n)
-The set of file paths marked...
+### Lock (n)
+An exclusive claim on a file...
 
-### Stage (v)
-To record the intent to include...
+### Lock (v)
+To claim a file on a branch...
 ```
 
 Within each letter section, sort entries alphabetically, case-insensitive. Acronyms sort by their letters, not their expansion. Part-of-speech tags don't affect sort order.
@@ -83,11 +83,11 @@ A change request (CR) is a proposed set of revisions submitted for review before
 If a term has two senses (verb vs noun, lowercase generic vs uppercase named feature), give each sense its own entry on consecutive lines.
 
 ```markdown
-### Stage (v)
-To record the intent to include a file's change in the next revision (`lore stage <path>`).
+### Lock (n)
+An exclusive claim on a file on a branch.
 
-### Stage (n)
-The set of file paths marked for inclusion in the next revision.
+### Lock (v)
+To claim a file on a branch so others know not to edit it (`lore lock`).
 ```
 
 ### Cite authority for contested rules
