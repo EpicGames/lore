@@ -362,10 +362,6 @@ impl CountingReadStore {
         self.gets() + self.gets_into()
     }
 
-    fn puts(&self) -> usize {
-        self.puts.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
     /// `payload`, padded where the store pads ([`Self::pad`]).
     fn padded(&self, payload: Bytes) -> Bytes {
         if !self.pad {
