@@ -11,7 +11,6 @@
 #[cfg(all(test, feature = "integration_tests", target_os = "linux"))]
 mod fuse_remote_tests {
     use std::collections::HashMap;
-    use std::net::SocketAddr;
     use std::os::fd::AsRawFd as _;
     use std::path::Path;
     use std::path::PathBuf;
@@ -401,14 +400,15 @@ mod fuse_remote_tests {
     /// A `lore://` server over `store`: storage on QUIC, everything else on gRPC, one port.
     struct Server {
         url: String,
-        addr: SocketAddr,
         quic: Option<QuinnServer>,
         grpc_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-        grpc_stopped: Option<tokio::sync::oneshot::Receiver<String>>,
+        grpc_stopped: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
     }
 
     impl Server {
-        /// Stops serving and waits until the port no longer accepts.
+        /// Stops serving: closes the QUIC endpoints and waits until they are idle, then stops the
+        /// gRPC server and waits for its report of a clean stop, sent once the serve task holding
+        /// the TCP listener has returned.
         async fn shutdown(&mut self) {
             if let Some(quic) = self.quic.take() {
                 quic.close().await;
@@ -418,12 +418,9 @@ mod fuse_remote_tests {
                 tokio::time::timeout(Duration::from_secs(10), stopped)
                     .await
                     .expect("the gRPC server stops")
-                    .ok();
+                    .expect("the gRPC server reports how it stopped")
+                    .expect("the gRPC server stops cleanly");
             }
-            assert!(
-                tokio::net::TcpStream::connect(self.addr).await.is_err(),
-                "the port is closed"
-            );
         }
     }
 
@@ -465,7 +462,7 @@ mod fuse_remote_tests {
         .expect("quinn server start");
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel::<String>();
+        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         let notification_sender: Arc<dyn lore_revision::notification::NotificationSender> =
             Arc::new(lore_server::notification::local::NotificationSender::default());
         #[allow(clippy::disallowed_methods)]
@@ -507,19 +504,15 @@ mod fuse_remote_tests {
                     shutdown_rx.await.ok();
                 })
                 .await;
-            let _ = stopped_tx.send(match outcome {
-                Ok(()) => "stopped".to_string(),
-                Err(error) => format!("failed: {error}"),
-            });
+            let _ = stopped_tx.send(outcome.map_err(|error| error.to_string()));
         });
         for _ in 0..100 {
-            if let Ok(reason) = stopped_rx.try_recv() {
-                panic!("test server on {addr} {reason}");
+            if let Ok(outcome) = stopped_rx.try_recv() {
+                panic!("test server on {addr} stopped while starting: {outcome:?}");
             }
             if tokio::net::TcpStream::connect(addr).await.is_ok() {
                 return Server {
                     url: format!("lore://127.0.0.1:{}", addr.port()),
-                    addr,
                     quic: Some(quic),
                     grpc_shutdown: Some(shutdown_tx),
                     grpc_stopped: Some(stopped_rx),
@@ -1088,12 +1081,13 @@ mod fuse_remote_tests {
                     panic!("an offline fetch fails");
                 };
                 assert_eq!(error.raw_os_error(), Some(libc::EIO), "{error}");
-                // The kernel retries a failed page read once; the retry of an address whose
-                // fetch just missed its deadline fails at once, so one deadline bounds both.
+                // Nothing answers, so the first READ fails at its deadline. The kernel retries a
+                // failed page read once; the retry of an address whose fetch just missed its
+                // deadline fails at once, so one deadline bounds both.
                 let reads = fixture.reads() - reads_before;
                 assert!(reads >= 1, "the read reached the service");
                 assert!(
-                    elapsed < deadline + Duration::from_millis(1500),
+                    elapsed >= deadline && elapsed < deadline + Duration::from_millis(1500),
                     "failed after {elapsed:?} over {reads} READs, deadline {deadline:?}"
                 );
                 assert_eq!(fixture.store.content_gets(), 0);
