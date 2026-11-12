@@ -169,9 +169,26 @@ pub fn identity_from_token(token: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The claims Lore reads from `token`, decoded without verifying its signature.
+/// A token without `exp` fails to decode.
 pub fn insecure_decode_token(
     token: &str,
 ) -> Result<TokenData<JWTUserInfo>, jsonwebtoken::errors::Error> {
+    insecure_decode(token, true)
+}
+
+/// Every claim of `token`, decoded without verifying its signature. Unlike
+/// [`insecure_decode_token`], a token without `exp` decodes.
+pub fn insecure_decode_claims(
+    token: &str,
+) -> Result<serde_json::Value, jsonwebtoken::errors::Error> {
+    insecure_decode(token, false).map(|data| data.claims)
+}
+
+fn insecure_decode<T: serde::de::DeserializeOwned>(
+    token: &str,
+    require_exp: bool,
+) -> Result<TokenData<T>, jsonwebtoken::errors::Error> {
     let header = jsonwebtoken::decode_header(token)?;
     let key = jsonwebtoken::DecodingKey::from_secret(&[]);
     let mut validation = jsonwebtoken::Validation::new(header.alg);
@@ -179,7 +196,10 @@ pub fn insecure_decode_token(
     validation.validate_aud = false;
     validation.validate_exp = false;
     validation.validate_nbf = false;
-    jsonwebtoken::decode::<JWTUserInfo>(token, &key, &validation)
+    if !require_exp {
+        validation.required_spec_claims.clear();
+    }
+    jsonwebtoken::decode::<T>(token, &key, &validation)
 }
 
 /// The `iss` and `aud` of an [`unsigned_identity_token`].

@@ -93,6 +93,7 @@ fn async_failure_delivers_code_only_through_complete_status() {
         user_ids: lore_revision::interface::LoreArray::default(),
         with_identity_token: 0,
         with_access_token: 0,
+        with_claims: 0,
     };
 
     // The async entry point returns `()`; the failing handler's code can

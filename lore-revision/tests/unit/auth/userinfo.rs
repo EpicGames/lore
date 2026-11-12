@@ -159,3 +159,79 @@ fn session_without_token_is_expired() {
     };
     assert!(!resolved.session_valid());
 }
+
+/// `{"iss":"lore","sub":"alice","name":"Alice","exp":2000000000,"aud":["example.com"]}`
+const ALICE_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
+
+fn alice_access_token_event(
+    with_token: bool,
+    with_claims: bool,
+) -> Result<LoreAuthIdentityEventData, UserInfoError> {
+    access_token_event(
+        "https://auth.example.com".to_string(),
+        lore_revision::lore::RepositoryId::default(),
+        "alice".to_string(),
+        ALICE_TOKEN.to_string(),
+        with_token,
+        with_claims,
+    )
+}
+
+#[test]
+fn access_token_event_carries_the_token_and_the_claims_only_as_asked() {
+    let alice_claims = serde_json::json!({
+        "iss": "lore",
+        "sub": "alice",
+        "name": "Alice",
+        "exp": 2000000000,
+        "aud": ["example.com"],
+    });
+    for (with_token, with_claims) in [(false, false), (true, false), (false, true), (true, true)] {
+        let event = alice_access_token_event(with_token, with_claims).expect("the token decodes");
+
+        let expected_token = if with_token { ALICE_TOKEN } else { "" };
+        assert_eq!(
+            event.token.as_str(),
+            expected_token,
+            "with_token {with_token}"
+        );
+        if with_claims {
+            let claims: serde_json::Value =
+                serde_json::from_str(event.claims.as_str()).expect("the claims are JSON");
+            assert_eq!(claims, alice_claims);
+        } else {
+            assert!(event.claims.is_empty(), "with_claims {with_claims}");
+        }
+        assert_eq!(event.expires, 2_000_000_000_000);
+    }
+}
+
+#[test]
+fn access_token_event_with_claims_of_a_token_that_is_not_a_jwt_fails() {
+    let event = access_token_event(
+        String::new(),
+        lore_revision::lore::RepositoryId::default(),
+        "alice".to_string(),
+        "not-a-jwt".to_string(),
+        true,
+        true,
+    );
+
+    assert!(event.is_err_and(|err| err.is_not_supported()));
+}
+
+/// The JSON form of an event keeps the types `lore.h` declares, from which
+/// TypeScript types are generated, so `claims` is a string even though it
+/// holds JSON.
+#[test]
+fn access_token_event_json_holds_the_claims_as_a_string() {
+    let with_claims = alice_access_token_event(false, true).expect("the token decodes");
+    let without_claims = alice_access_token_event(false, false).expect("the token decodes");
+
+    let json = serde_json::to_value(&with_claims).expect("the event serializes");
+    let claims = json["claims"].as_str().expect("the claims are a string");
+    let claims: serde_json::Value = serde_json::from_str(claims).expect("the claims are JSON");
+    assert_eq!(claims["sub"], "alice");
+    let json = serde_json::to_value(&without_claims).expect("the event serializes");
+    assert_eq!(json["claims"], "");
+}

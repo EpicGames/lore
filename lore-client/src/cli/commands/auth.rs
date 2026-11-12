@@ -114,6 +114,9 @@ pub struct AuthInfoCliArgs {
     /// Include the current repository's access token in the output
     #[clap(long = "with-access-token")]
     with_access_token: bool,
+    /// Include the claims of the current repository's access token in the output
+    #[clap(long = "with-claims")]
+    with_claims: bool,
 }
 
 #[derive(Subcommand)]
@@ -262,6 +265,7 @@ fn resolve_identity_names(
             ),
             with_identity_token: 0,
             with_access_token: 0,
+            with_claims: 0,
         };
 
         run_command(globals.clone(), args.into(), callback);
@@ -505,12 +509,22 @@ pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u
                 }
             }
             LoreEvent::AuthIdentity(data) => {
-                println!(
-                    "{}Access Token:{} {}",
-                    CommonStyles::HEADERS,
-                    anstyle::Reset,
-                    data.token.as_str()
-                );
+                if !data.token.is_empty() {
+                    println!(
+                        "{}Access Token:{} {}",
+                        CommonStyles::HEADERS,
+                        anstyle::Reset,
+                        data.token.as_str()
+                    );
+                }
+                if !data.claims.is_empty() {
+                    println!(
+                        "{}Access Token Claims:{}\n{}",
+                        CommonStyles::HEADERS,
+                        anstyle::Reset,
+                        pretty_json(data.claims.as_str())
+                    );
+                }
             }
             LoreEvent::Complete(_) => {}
             LoreEvent::Maintenance(data) => {
@@ -531,9 +545,17 @@ pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u
         ),
         with_identity_token: u8::from(args.with_identity_token),
         with_access_token: u8::from(args.with_access_token),
+        with_claims: u8::from(args.with_claims),
     };
 
     run_command(globals, api_args.into(), callback) as u8
+}
+
+/// `json` indented for reading, or as given when it does not parse.
+fn pretty_json(json: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(json)
+        .and_then(|value| serde_json::to_string_pretty(&value))
+        .unwrap_or_else(|_| json.to_string())
 }
 
 pub fn handle_auth_commands(cmd: &AuthCommands, globals: LoreGlobalArgs) -> u8 {

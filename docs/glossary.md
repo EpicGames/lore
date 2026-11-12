@@ -135,6 +135,12 @@ Splitting a file into a sequence of smaller fragments, each addressed independen
 
 Also see: fragment, content-defined chunking, fixed-size chunking.
 
+### Claim
+
+A name and value in the payload of a JWT, such as the subject, the expiry or a role list. The server reads the identity and the permissions of a token from its claims.
+
+Also see: JWT, access token.
+
 ### CLI
 
 A command-line interface (CLI) is the text-based way to drive Lore, through the `lore` binary and its subcommands.

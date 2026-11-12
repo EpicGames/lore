@@ -288,6 +288,7 @@ mod tests {
                 user_ids: LoreArray::default(),
                 with_identity_token: 0,
                 with_access_token: 0,
+                with_claims: 0,
             },
             callback_capturing(outcome.clone()),
         )

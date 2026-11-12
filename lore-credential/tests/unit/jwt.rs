@@ -57,6 +57,30 @@ fn an_expired_nameless_token_still_reports_its_expiry() {
     assert!(info.expires < now_ms, "the token reads as expired");
 }
 
+#[test]
+fn claims_decode_with_every_claim_the_token_carries() {
+    let claims = r#"{"iss":"i","sub":"alice","exp":1,"realm_access":{"roles":["write","push-protected"]},"resources":[{"resource_id":"urc-*","permission":["read"]}]}"#;
+
+    let decoded = lore_credential::insecure_decode_claims(&token_with_claims(claims))
+        .expect("the token decodes");
+    assert_eq!(
+        decoded,
+        serde_json::from_str::<serde_json::Value>(claims).unwrap()
+    );
+}
+
+#[test]
+fn claims_of_a_token_without_an_expiry_decode() {
+    let claims = r#"{"iss":"i","sub":"alice"}"#;
+
+    let decoded = lore_credential::insecure_decode_claims(&token_with_claims(claims))
+        .expect("the token decodes");
+    assert_eq!(
+        decoded,
+        serde_json::from_str::<serde_json::Value>(claims).unwrap()
+    );
+}
+
 fn domains_of(claims: &str) -> Vec<String> {
     let token = token_with_claims(claims);
     lore_credential::insecure_decode_token(&token)

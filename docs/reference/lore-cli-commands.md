@@ -1983,6 +1983,7 @@ Display identity information for the current user or specified user IDs
 
 * `--with-identity-token` — Include cached identity tokens in the output
 * `--with-access-token` — Include the current repository's access token in the output
+* `--with-claims` — Include the claims of the current repository's access token in the output
 
 ## `lore auth list`
 

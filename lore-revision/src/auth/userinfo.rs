@@ -76,6 +76,8 @@ pub struct LoreAuthIdentityEventData {
     pub expires: u64,
     /// Cached token (only populated when requested)
     pub token: LoreString,
+    /// The token's claims as a JSON object (only populated when requested)
+    pub claims: LoreString,
 }
 
 struct UserServiceAccess {
@@ -282,9 +284,11 @@ pub fn resolve_user_info_boxed(
 }
 
 /// Emits the authorization (access) token for the repository as an
-/// [`LoreEvent::AuthIdentity`] event.
+/// [`LoreEvent::AuthIdentity`] event, as [`access_token_event`] describes.
 pub async fn repository_access_token(
     repository: Arc<RepositoryContext>,
+    with_token: bool,
+    with_claims: bool,
 ) -> Result<(), UserInfoError> {
     let remote = repository
         .remote()
@@ -309,6 +313,32 @@ pub async fn repository_access_token(
     .await
     .forward::<UserInfoError>("Failed authorization token exchange")?;
 
+    LoreEvent::AuthIdentity(access_token_event(
+        auth_url,
+        repository.id,
+        user_id,
+        token,
+        with_token,
+        with_claims,
+    )?)
+    .send();
+
+    Ok(())
+}
+
+/// The [`LoreEvent::AuthIdentity`] data for the authorization `token` of
+/// `user_id` on `repository`. It carries the token only with `with_token`, and
+/// the token's claims as compact JSON only with `with_claims`, which fails with
+/// `NotSupported` when `token` is not a JWT.
+#[lore_macro::test_pub]
+fn access_token_event(
+    auth_url: String,
+    repository: RepositoryId,
+    user_id: String,
+    token: String,
+    with_token: bool,
+    with_claims: bool,
+) -> Result<LoreAuthIdentityEventData, UserInfoError> {
     // Expiry and authorized domains come from the token itself, matching what
     // `auth list` reports for stored authorization entries.
     let (authorized_domains, expires) = match lore_credential::insecure_decode_token(&token) {
@@ -318,18 +348,26 @@ pub async fn repository_access_token(
         ),
         Err(_) => (String::new(), 0),
     };
+    let claims = if with_claims {
+        lore_credential::insecure_decode_claims(&token)
+            .map_err(|err| NotSupported {
+                operation: format!("showing the claims of a token that is not a JWT: {err}"),
+            })?
+            .to_string()
+    } else {
+        String::new()
+    };
+    let token = if with_token { token } else { String::new() };
 
-    LoreEvent::AuthIdentity(LoreAuthIdentityEventData {
+    Ok(LoreAuthIdentityEventData {
         auth_url: auth_url.into(),
-        resource: repository.id.to_string().into(),
+        resource: repository.to_string().into(),
         user_id: user_id.into(),
         authorized_domains: authorized_domains.into(),
         expires,
         token: token.into(),
+        claims: claims.into(),
     })
-    .send();
-
-    Ok(())
 }
 
 /// Strip every occurrence of the current-user id from the input list.

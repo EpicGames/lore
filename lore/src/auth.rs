@@ -129,6 +129,7 @@ async fn resolve_user_info_local(
             user_ids: LoreArray::default(),
             with_identity_token: 0,
             with_access_token: 0,
+            with_claims: 0,
         };
         let execution = setup_execution(globals, callback);
         return LORE_CONTEXT
@@ -512,6 +513,7 @@ async fn list_local(
                         authorized_domains: identity.acceptable_root_domains.join(", ").into(),
                         expires: identity.expires_ms,
                         token: identity.token.into(),
+                        claims: LoreString::default(),
                     })
                     .send();
                 }
@@ -688,6 +690,9 @@ pub struct LoreAuthLocalUserInfoArgs {
     /// Emit the repository's authorization (access) token. Requires running
     /// inside a repository
     pub with_access_token: u8,
+    /// Emit the claims of the repository's authorization (access) token.
+    /// Requires running inside a repository
+    pub with_claims: u8,
 }
 
 /// Resolves user identities to user information using locally stored JWT tokens.
@@ -705,10 +710,13 @@ pub struct LoreAuthLocalUserInfoArgs {
 /// event carries the cached token when `with_identity_token` is set, and an
 /// empty `token` otherwise.
 ///
-/// When `with_access_token` is set, the call requires a repository and
-/// additionally emits an `AuthIdentity` event carrying the repository-scoped
-/// authorization (access) token for the current user, performing a token
-/// exchange when no valid cached token exists.
+/// When `with_access_token` or `with_claims` is set, the call requires a
+/// repository and additionally emits an `AuthIdentity` event for the
+/// repository-scoped authorization (access) token of the current user,
+/// performing a token exchange when no valid cached token exists. The event
+/// carries the token with `with_access_token`, and its claims as a JSON object
+/// with `with_claims`. With `with_claims`, the call fails with `NotSupported`
+/// when the token is not a JWT.
 ///
 /// For remote resolution of user IDs with proper authorization, use
 /// [`resolve_user_info`] which queries the remote user service.
@@ -732,7 +740,7 @@ pub struct LoreAuthLocalUserInfoArgs {
 /// |-------|-------------|
 /// | [`LoreEvent::AuthUserInfo`](crate::interface::LoreEvent::AuthUserInfo) | Emitted once per resolved identity with user id and display name |
 /// | [`LoreEvent::AuthUserToken`](crate::interface::LoreEvent::AuthUserToken) | Emitted for each identity with a cached token, with the token details. `token` is empty unless `with_identity_token` is set |
-/// | [`LoreEvent::AuthIdentity`](crate::interface::LoreEvent::AuthIdentity) | Emitted when `with_access_token` is set, carries the repository-scoped authorization token for the current user |
+/// | [`LoreEvent::AuthIdentity`](crate::interface::LoreEvent::AuthIdentity) | Emitted when `with_access_token` or `with_claims` is set, with the repository-scoped authorization token and its claims as requested |
 pub async fn local_user_info(
     globals: LoreGlobalArgs,
     args: LoreAuthLocalUserInfoArgs,
@@ -854,7 +862,7 @@ async fn local_user_info_impl(
 ) -> i32 {
     // The access token is scoped to a repository, so that variant runs as a
     // repository call. Plain identity resolution stays repository-free.
-    if args.with_access_token != 0 {
+    if args.with_access_token != 0 || args.with_claims != 0 {
         return repository_call_no_store(
             globals,
             callback,
@@ -862,9 +870,13 @@ async fn local_user_info_impl(
             local_user_info,
             |repository, args| async move {
                 emit_local_user_info(&args, true).await?;
-                auth::userinfo::repository_access_token(repository)
-                    .await
-                    .forward::<AuthStoreError>("resolving the repository access token")
+                auth::userinfo::repository_access_token(
+                    repository,
+                    args.with_access_token != 0,
+                    args.with_claims != 0,
+                )
+                .await
+                .forward::<AuthStoreError>("resolving the repository access token")
             },
         )
         .await;

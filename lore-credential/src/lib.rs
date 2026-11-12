@@ -12,6 +12,7 @@ pub use jwt::JwtUsageError;
 pub use jwt::UserInfo;
 pub use jwt::domain_in_root_domains;
 pub use jwt::identity_from_token;
+pub use jwt::insecure_decode_claims;
 pub use jwt::insecure_decode_token;
 pub use jwt::unsigned_identity_token;
 pub use jwt::user_info;

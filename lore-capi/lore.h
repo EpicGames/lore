@@ -598,6 +598,8 @@ typedef struct lore_auth_identity_event_data_t {
   uint64_t expires;
   // Cached token (only populated when requested)
   struct lore_string_t token;
+  // The token's claims as a JSON object (only populated when requested)
+  struct lore_string_t claims;
 } lore_auth_identity_event_data_t;
 
 // Event data reported when a branch is created.
@@ -4511,6 +4513,9 @@ typedef struct lore_auth_local_user_info_args_t {
   // Emit the repository's authorization (access) token. Requires running
   // inside a repository
   uint8_t with_access_token;
+  // Emit the claims of the repository's authorization (access) token.
+  // Requires running inside a repository
+  uint8_t with_claims;
 } lore_auth_local_user_info_args_t;
 
 // Arguments for authenticating interactively via browser-based login flow.
@@ -6757,11 +6762,15 @@ void lore_auth_clear_async(const struct lore_global_args_t *globals,
 // `token` holds the cached identity token when `with_identity_token` is set,
 // and is empty otherwise.
 //
-// When `with_access_token` is set, the call requires a repository and
-// additionally emits one `AUTH_IDENTITY` event carrying the
-// repository-scoped authorization (access) token for the current user. A
+// When `with_access_token` or `with_claims` is set, the call requires a
+// repository and additionally emits one `AUTH_IDENTITY` event for the
+// repository-scoped authorization (access) token of the current user. A
 // valid cached token is reused. Otherwise a token exchange is performed
-// against the auth service.
+// against the auth service. The event's `token` holds the token when
+// `with_access_token` is set, and its `claims` hold the token's claims as a
+// JSON object when `with_claims` is set. Each is empty otherwise. With
+// `with_claims`, the call fails with `NotSupported` when the token is not a
+// JWT.
 //
 // # Events
 //
@@ -6784,7 +6793,7 @@ void lore_auth_clear_async(const struct lore_global_args_t *globals,
 // |-----|-----------|-------------|
 // | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with the resolved user id and display name |
 // | `LORE_EVENT_AUTH_USER_TOKEN` | `lore_auth_user_token_event_data_t` | Emitted before `AUTH_USER_INFO` for an identity with a cached token, with the token details; `token` is empty unless `with_identity_token` is set |
-// | `LORE_EVENT_AUTH_IDENTITY` | `lore_auth_identity_event_data_t` | Emitted when `with_access_token` is set, carries the repository-scoped authorization token for the current user |
+// | `LORE_EVENT_AUTH_IDENTITY` | `lore_auth_identity_event_data_t` | Emitted when `with_access_token` or `with_claims` is set, with the repository-scoped authorization token and its claims as requested |
 int32_t lore_auth_local_user_info(const struct lore_global_args_t *globals,
                                   const struct lore_auth_local_user_info_args_t *args,
                                   struct lore_event_callback_config_t callback);
