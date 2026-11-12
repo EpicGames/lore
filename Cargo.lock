@@ -2737,6 +2737,7 @@ dependencies = [
 name = "lore-revision"
 version = "0.13.1-nightly"
 dependencies = [
+ "arc-swap",
  "async-stream",
  "async-trait",
  "base64 0.22.1",

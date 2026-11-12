@@ -336,8 +336,9 @@ first, lose the socket and leave dead endpoints.
 ### The served State and swaps
 
 - Every request reads what is served: the one filesystem `State`, the `RepositoryContext` (and so
-  the view filter) and the listing cache (`fs/fuse/served.rs`). It sits in a
-  `parking_lot::RwLock<Arc<Served>>`; a load is a read lock and a refcount increment.
+  the view filter) and the listing cache (`fs/fuse/served.rs`). It sits in an
+  `ArcSwap<Served>`: a load takes no lock, increments the refcount and writes only slots its own
+  thread owns, and a publish returns once no load can still be taking what it replaced.
 - Clone, sync and branch switch hand the provider the target revision alone
   (`InstanceOperationImpl::hold_state`, `fs/filesystem_provider.rs`; `realize_state`,
   `fs/realize.rs`), with `HoldOptions`: `--force` overwrites local changes, forwarding local
@@ -1791,9 +1792,6 @@ Reads, listings and prefetch:
 
 Service, stores and platform:
 
-- **Served lock** (lore-kve). Every request loads what is served under a `parking_lot::RwLock` read lock
-  (`ServedCell::load`, `fs/fuse/served.rs`). An atomically swapped pointer would make the
-  load lock-free.
 - **Test sandboxes and the global registry** (lore-rtz). The unit binary and `fuse_mount` point
   `LORE_GLOBAL_PATH` at a temporary directory held in a static, which is never removed, and
   `lore-integration-tests` makes one with no cleanup. Test binaries that set no

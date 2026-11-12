@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use arc_swap::ArcSwap;
 use lore_base::types::Hash;
 
 use crate::fs::fuse::listing_cache::ListingCache;
@@ -55,24 +56,26 @@ impl Served {
 /// The current [`Served`]: `load` is the hot path every request takes once, `publish` the cold
 /// path a sync takes once.
 pub struct ServedCell {
-    current: parking_lot::RwLock<Arc<Served>>,
+    current: ArcSwap<Served>,
 }
 
 impl ServedCell {
     pub fn new(first: Arc<Served>) -> Self {
         Self {
-            current: parking_lot::RwLock::new(first),
+            current: ArcSwap::new(first),
         }
     }
 
-    /// One atomic increment under an uncontended read lock; never allocates.
+    /// Lock-free: increments the count of what is served and writes only slots the calling
+    /// thread owns. Only a thread's first load may allocate.
     pub fn load(&self) -> Arc<Served> {
-        self.current.read().clone()
+        self.current.load_full()
     }
 
-    /// Installs `next`, marks the outgoing one superseded and hands it back.
+    /// Installs `next`, marks the outgoing one superseded and hands it back. It returns once no
+    /// load can still be taking the outgoing one, so the cell holds no reference to it.
     pub fn publish(&self, next: Arc<Served>) -> Arc<Served> {
-        let previous = std::mem::replace(&mut *self.current.write(), next);
+        let previous = self.current.swap(next);
         previous.superseded.store(true, Ordering::Release);
         previous
     }

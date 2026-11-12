@@ -119,6 +119,7 @@ lore-transport = { path = "lore-transport" }
 anstyle = "1.0.11"
 anstream = "1.0.0"
 anyhow = "1.0.103"
+arc-swap = "1.9.3"
 async-channel = "2.5.0"
 async-stream = "0.3.6"
 async-trait = "0.1.92"
