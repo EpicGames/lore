@@ -5,6 +5,7 @@ pub(crate) mod net_common {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -100,35 +101,28 @@ pub(crate) mod net_common {
     }
 
     /// Binds a port on the loopback interface and serves gRPC on it as [`spawn_grpc_server`]
-    /// does. Returns the server's `grpc://` URL, and the sender and receiver `spawn_grpc_server`
-    /// returns.
+    /// does. Returns the server's `grpc://` URL, and what stops it.
     pub(crate) fn start_grpc_server(
         backend_immutable: Arc<dyn lore_storage::ImmutableStore>,
         backend_mutable: Arc<dyn lore_storage::MutableStore>,
-    ) -> (
-        String,
-        tokio::sync::oneshot::Sender<()>,
-        tokio::sync::oneshot::Receiver<String>,
-    ) {
+    ) -> (String, TestServerStop) {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("binds a port to serve on");
         let addr = listener.local_addr().expect("the listener has an address");
-        let (shutdown, stopped) = spawn_grpc_server(listener, backend_immutable, backend_mutable);
-        (format!("grpc://{addr}"), shutdown, stopped)
+        let stop = spawn_grpc_server(listener, backend_immutable, backend_mutable);
+        (format!("grpc://{addr}"), stop)
     }
 
-    /// Serves gRPC on `listener` until the returned sender is dropped, and reports through the
-    /// returned receiver once the serve task has returned.
+    /// Serves gRPC on `listener` until the returned [`TestServerStop`] stops it or is dropped.
     pub(crate) fn spawn_grpc_server(
         listener: std::net::TcpListener,
         backend_immutable: Arc<dyn lore_storage::ImmutableStore>,
         backend_mutable: Arc<dyn lore_storage::MutableStore>,
-    ) -> (
-        tokio::sync::oneshot::Sender<()>,
-        tokio::sync::oneshot::Receiver<String>,
-    ) {
+    ) -> TestServerStop {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel::<String>();
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        let serve_ended = Arc::new(AtomicBool::new(false));
+        let ended = serve_ended.clone();
 
         let notification_sender: Arc<dyn lore_revision::notification::NotificationSender> =
             Arc::new(lore_server::notification::local::NotificationSender::default());
@@ -173,13 +167,63 @@ pub(crate) mod net_common {
                     shutdown_rx.await.ok();
                 })
                 .await;
-            let _ = stopped_tx.send(match outcome {
-                Ok(()) => "stopped before the test finished".to_string(),
-                Err(error) => format!("failed: {error}"),
-            });
+            ended.store(true, Ordering::Release);
+            let _ = stopped_tx.send(outcome.map_err(|error| format!("{error:#}")));
         });
 
-        (shutdown_tx, stopped_rx)
+        TestServerStop {
+            quic: None,
+            shutdown: Some(shutdown_tx),
+            stopped: Some(stopped_rx),
+            serve_ended,
+        }
+    }
+
+    /// Bound on the wait for a test gRPC server's stop report.
+    const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
+
+    /// What stops a test server: the QUIC server of a `lore://` server, the sender whose drop
+    /// stops the gRPC server [`spawn_grpc_server`] started, and the receiver of its stop report.
+    /// Dropped, it signals the stop and waits for none of it.
+    pub(crate) struct TestServerStop {
+        quic: Option<lore_server::quic::quinn::QuinnServer>,
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        stopped: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+        /// Set by the gRPC serve task once it has returned, and with it dropped its listener,
+        /// before it reports how it stopped.
+        serve_ended: Arc<AtomicBool>,
+    }
+
+    impl TestServerStop {
+        /// Adds `quic`, the QUIC server of a `lore://` server, to what [`Self::stop`] stops.
+        pub(crate) fn with_quic(mut self, quic: lore_server::quic::quinn::QuinnServer) -> Self {
+            self.quic = Some(quic);
+            self
+        }
+
+        /// Whether the gRPC serve task has returned, and with it dropped its listener, so the
+        /// server accepts no connection.
+        pub(crate) fn serve_ended(&self) -> bool {
+            self.serve_ended.load(Ordering::Acquire)
+        }
+
+        /// Closes the QUIC server's endpoints and waits until they are idle, then stops the
+        /// gRPC server and waits for its report of a clean stop, sent once the serve task holding
+        /// the TCP listener has returned. Panics unless the report comes within
+        /// [`SHUTDOWN_WAIT`]. A part already stopped is skipped.
+        pub(crate) async fn stop(&mut self) {
+            if let Some(quic) = self.quic.take() {
+                quic.close().await;
+            }
+            drop(self.shutdown.take());
+            if let Some(stopped) = self.stopped.take() {
+                tokio::time::timeout(SHUTDOWN_WAIT, stopped)
+                    .await
+                    .expect("the gRPC server stops")
+                    .expect("the gRPC server reports how it stopped")
+                    .expect("the gRPC server stops cleanly");
+            }
+        }
     }
 
     /// Whether a test server's immutable store serves a payload under a partition it doesn't hold

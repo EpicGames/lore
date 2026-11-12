@@ -25,6 +25,7 @@ mod storage_copy_on_write_tests {
 
     use crate::common::net_common::CountingStore;
     use crate::common::net_common::Partitions;
+    use crate::common::net_common::TestServerStop;
     use crate::common::net_common::Traffic;
     use crate::common::net_common::close_handle;
     use crate::common::net_common::make_backends;
@@ -38,7 +39,7 @@ mod storage_copy_on_write_tests {
     struct TestServer {
         url: String,
         counted: Arc<CountingStore>,
-        _shutdown: tokio::sync::oneshot::Sender<()>,
+        _stop: TestServerStop,
     }
 
     async fn start_server() -> TestServer {
@@ -56,12 +57,12 @@ mod storage_copy_on_write_tests {
         // content it did not store itself.
         let (backend, mutable) = make_backends(Partitions::Isolated).await;
         let counted = wrap(backend);
-        let (url, shutdown, _stopped) = start_grpc_server(counted.clone(), mutable);
+        let (url, stop) = start_grpc_server(counted.clone(), mutable);
 
         TestServer {
             url,
             counted,
-            _shutdown: shutdown,
+            _stop: stop,
         }
     }
 

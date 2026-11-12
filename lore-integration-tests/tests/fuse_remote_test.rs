@@ -10,7 +10,6 @@
 
 #[cfg(all(test, feature = "integration_tests", target_os = "linux"))]
 mod fuse_remote_tests {
-    use std::collections::HashMap;
     use std::os::fd::AsRawFd as _;
     use std::path::Path;
     use std::path::PathBuf;
@@ -29,7 +28,6 @@ mod fuse_remote_tests {
     use lore_fuse::abi::Opcode;
     use lore_fuse::mount::unmount_path;
     use lore_fuse::skip_without_fuse;
-    use lore_revision::environment::EnvironmentConfig;
     use lore_revision::fs::fuse::inode::InodeKind;
     use lore_revision::fs::fuse::listing_cache::LISTING_BLOCK_BYTES;
     use lore_revision::fs::fuse::listing_cache::LISTING_CACHE_BYTES;
@@ -53,22 +51,17 @@ mod fuse_remote_tests {
     use lore_revision::repository::VfsConfig;
     use lore_revision::repository::VfsType;
     use lore_revision::repository::load_repository_config_from_dot_dir;
-    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
-    use lore_server::authnz::repository_catalog::BaselineRepositoryCatalog;
-    use lore_server::grpc::server::FeatureSettings;
-    use lore_server::grpc::server::GrpcServerBuilder;
-    use lore_server::grpc::server::GrpcTimeouts;
-    use lore_server::hooks::HookDispatcher;
     use lore_server::quic::quinn::QuinnConfigBuilder;
     use lore_server::quic::quinn::QuinnServer;
     use lore_server::quic::tests::TestHandlerFactory;
-    use lore_server::settings::BaselineAccess;
     use lore_storage::ImmutableStore;
     use lore_storage::MutableStore;
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
 
+    use crate::common::net_common::TestServerStop;
     use crate::common::net_common::bind_matched_pair;
+    use crate::common::net_common::spawn_grpc_server;
     use crate::setup_execution;
 
     /// One fragment (under 256 KiB), and a size no tree block has, so fetches of it are
@@ -400,44 +393,26 @@ mod fuse_remote_tests {
     /// A `lore://` server over `store`: storage on QUIC, everything else on gRPC, one port.
     struct Server {
         url: String,
-        quic: Option<QuinnServer>,
-        grpc_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-        grpc_stopped: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+        stop: TestServerStop,
     }
 
     impl Server {
-        /// Stops serving: closes the QUIC endpoints and waits until they are idle, then stops the
-        /// gRPC server and waits for its report of a clean stop, sent once the serve task holding
-        /// the TCP listener has returned.
+        /// Stops serving, as [`TestServerStop::stop`] does.
         async fn shutdown(&mut self) {
-            if let Some(quic) = self.quic.take() {
-                quic.close().await;
-            }
-            drop(self.grpc_shutdown.take());
-            if let Some(stopped) = self.grpc_stopped.take() {
-                tokio::time::timeout(Duration::from_secs(10), stopped)
-                    .await
-                    .expect("the gRPC server stops")
-                    .expect("the gRPC server reports how it stopped")
-                    .expect("the gRPC server stops cleanly");
-            }
+            self.stop.stop().await;
         }
     }
 
-    async fn start_server(
-        immutable: Arc<dyn ImmutableStore>,
-        mutable: Arc<dyn MutableStore>,
-    ) -> Server {
+    fn start_server(immutable: Arc<dyn ImmutableStore>, mutable: Arc<dyn MutableStore>) -> Server {
         start_server_with_process_limit(
             immutable,
             mutable,
             lore_server::quic::tests::TEST_PROCESS_LIMIT,
         )
-        .await
     }
 
     /// [`start_server`], handling `process_limit` requests on each stream at once.
-    async fn start_server_with_process_limit(
+    fn start_server_with_process_limit(
         immutable: Arc<dyn ImmutableStore>,
         mutable: Arc<dyn MutableStore>,
         process_limit: usize,
@@ -461,66 +436,10 @@ mod fuse_remote_tests {
         )
         .expect("quinn server start");
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-        let notification_sender: Arc<dyn lore_revision::notification::NotificationSender> =
-            Arc::new(lore_server::notification::local::NotificationSender::default());
-        #[allow(clippy::disallowed_methods)]
-        tokio::spawn(async move {
-            let catalog = Arc::new(BaselineRepositoryCatalog::new(
-                BaselineAccess::Reachable,
-                immutable.clone(),
-                mutable.clone(),
-            ));
-            let outcome = GrpcServerBuilder::new()
-                .with_environment(EnvironmentConfig::default())
-                .with_feature(FeatureSettings::default())
-                .with_immutable_store(immutable.clone(), immutable)
-                .with_mutable_store(mutable)
-                .with_lock_store(None)
-                .with_notification(notification_sender, None)
-                .with_hook_dispatcher(Arc::new(HookDispatcher::empty()))
-                .with_tls_config(None, None, None)
-                .unwrap()
-                .with_admin_endpoints(HashMap::new(), vec![])
-                .with_http2_config(
-                    None,
-                    None,
-                    GrpcTimeouts {
-                        request_handler: Duration::from_secs(30),
-                        authorization: Duration::from_secs(30),
-                    },
-                    Default::default(),
-                    Default::default(),
-                    None,
-                )
-                .with_token_verification(
-                    lore_server::auth::jwt::TokenVerification::Ignore,
-                    Arc::new(AllowAllRepositoryAuthorizer),
-                    catalog,
-                )
-                .unwrap()
-                .serve_with_listener(listener, async {
-                    shutdown_rx.await.ok();
-                })
-                .await;
-            let _ = stopped_tx.send(outcome.map_err(|error| error.to_string()));
-        });
-        for _ in 0..100 {
-            if let Ok(outcome) = stopped_rx.try_recv() {
-                panic!("test server on {addr} stopped while starting: {outcome:?}");
-            }
-            if tokio::net::TcpStream::connect(addr).await.is_ok() {
-                return Server {
-                    url: format!("lore://127.0.0.1:{}", addr.port()),
-                    quic: Some(quic),
-                    grpc_shutdown: Some(shutdown_tx),
-                    grpc_stopped: Some(stopped_rx),
-                };
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        Server {
+            url: format!("lore://{addr}"),
+            stop: spawn_grpc_server(listener, immutable, mutable).with_quic(quic),
         }
-        panic!("server at {addr} never started listening");
     }
 
     fn creation_args(
@@ -772,7 +691,7 @@ mod fuse_remote_tests {
         let store = Arc::new(CountingStore::new(backend_immutable.clone()));
         let served: Arc<dyn ImmutableStore> = store.clone();
         let server =
-            start_server_with_process_limit(served, backend_mutable.clone(), process_limit).await;
+            start_server_with_process_limit(served, backend_mutable.clone(), process_limit);
 
         let id = RepositoryId::from(uuid::Uuid::now_v7());
         let revision = commit_to_server(backend_immutable, backend_mutable, id, files).await;
@@ -2875,7 +2794,7 @@ mod fuse_remote_tests {
         let (backend_immutable, backend_mutable) = memory_stores().await;
         let store = Arc::new(CountingStore::new(backend_immutable.clone()));
         let served: Arc<dyn ImmutableStore> = store.clone();
-        let server = start_server(served, backend_mutable.clone()).await;
+        let server = start_server(served, backend_mutable.clone());
 
         let id = RepositoryId::from(uuid::Uuid::now_v7());
         let borrowed: Vec<Vec<(&str, &[u8])>> = steps

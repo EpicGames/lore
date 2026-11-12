@@ -32,6 +32,7 @@ mod storage_remote_tests {
     use lore_storage::immutable_store::CopyBehavior;
 
     use crate::common::net_common::Partitions;
+    use crate::common::net_common::TestServerStop;
     use crate::common::net_common::bind_matched_pair;
     use crate::common::net_common::close_handle;
     use crate::common::net_common::make_backends;
@@ -66,37 +67,21 @@ mod storage_remote_tests {
         url: String,
         backend_immutable: Arc<dyn lore_storage::ImmutableStore>,
         backend_mutable: Arc<dyn lore_storage::MutableStore>,
-        /// Signals the gRPC server to stop serving. Dropping it starts the shutdown.
-        grpc_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-        /// Fires when the gRPC serve task returns, which is when its listener is closed.
-        grpc_stopped: Option<tokio::sync::oneshot::Receiver<String>>,
-        /// The QUIC endpoint, on a `lore://` server.
-        quic: Option<QuinnServer>,
+        /// Stops the server. Dropping it starts the shutdown.
+        stop: TestServerStop,
     }
 
     impl TestServer {
-        /// Stop serving and wait until this server is unreachable.
+        /// Stop serving and wait until this server accepts and answers nothing.
         ///
         /// Dropping a `TestServer` only *signals* the stop: the gRPC listener closes when its
         /// serve task returns, and QUIC keeps accepting until its endpoint does. A test that
         /// needs the peer gone rather than going has to wait for both, or the request it expects
         /// to fail can still be answered.
         async fn shutdown(mut self) {
-            if let Some(quic) = self.quic.take() {
-                quic.close().await;
-            }
-            drop(self.grpc_shutdown.take());
-            if let Some(stopped) = self.grpc_stopped.take()
-                && tokio::time::timeout(SHUTDOWN_WAIT, stopped).await.is_err()
-            {
-                panic!("test server at {} did not stop serving", self.url);
-            }
+            self.stop.stop().await;
         }
     }
-
-    /// Bound on a test server's shutdown. Long enough that a loaded runner is not mistaken for a
-    /// server that will not stop.
-    const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 
     /// A server-side store that refuses to store exactly one leaf fragment.
     ///
@@ -306,8 +291,19 @@ mod storage_remote_tests {
     /// Start a server speaking `transport`, backed by fresh in-memory stores.
     async fn start_server(transport: Transport) -> TestServer {
         match transport {
-            Transport::Grpc => start_test_server().await,
-            Transport::Quic => start_quic_test_server().await,
+            Transport::Grpc => {
+                start_server_on(
+                    std::net::TcpListener::bind("127.0.0.1:0").expect("binds a port to serve on"),
+                    None,
+                )
+                .await
+            }
+            Transport::Quic => {
+                // Both legs serve on one number: gRPC on its TCP half, QUIC on its UDP half. Both
+                // are bound before either server starts, so neither has a port to lose.
+                let (listener, udp) = bind_matched_pair();
+                start_server_on(listener, Some(udp)).await
+            }
         }
     }
 
@@ -324,15 +320,13 @@ mod storage_remote_tests {
     ) -> TestServer {
         let backend_for_test = backend_immutable.clone();
         let backend_mutable_for_test: Arc<dyn lore_storage::MutableStore> = backend_mutable.clone();
-        let (url, shutdown_tx, stopped_rx) = start_grpc_server(backend_immutable, backend_mutable);
+        let (url, stop) = start_grpc_server(backend_immutable, backend_mutable);
 
         TestServer {
             url,
             backend_immutable: backend_for_test,
             backend_mutable: backend_mutable_for_test,
-            grpc_shutdown: Some(shutdown_tx),
-            grpc_stopped: Some(stopped_rx),
-            quic: None,
+            stop,
         }
     }
 
@@ -362,62 +356,59 @@ mod storage_remote_tests {
         let intercept_for_test = intercept.clone();
         let backend_immutable: Arc<dyn lore_storage::ImmutableStore> = intercept;
         let backend_mutable_for_test: Arc<dyn lore_storage::MutableStore> = backend_mutable.clone();
-        let (url, shutdown_tx, stopped_rx) = start_grpc_server(backend_immutable, backend_mutable);
+        let (url, stop) = start_grpc_server(backend_immutable, backend_mutable);
 
         (
             TestServer {
                 url,
                 backend_immutable: backend_for_test,
                 backend_mutable: backend_mutable_for_test,
-                grpc_shutdown: Some(shutdown_tx),
-                grpc_stopped: Some(stopped_rx),
-                quic: None,
+                stop,
             },
             intercept_for_test,
         )
     }
 
-    /// A `lore://` server: QUIC for storage, gRPC for everything else.
+    /// A server on `listener`, backed by fresh in-memory stores: gRPC only, or with `udp`, bound
+    /// to the listener's port, a `lore://` server, QUIC for storage and gRPC for everything else.
     ///
     /// `LoreProtocol` routes storage over QUIC but revision, repository, admin and environment
     /// over gRPC, and `Connection::connect` fetches the environment config before anything else —
     /// so a `lore://` peer must serve both. QUIC is UDP and gRPC is TCP, so they share one port
     /// number. Both are backed by the same stores, as a real deployment has them.
-    async fn start_quic_test_server() -> TestServer {
+    async fn start_server_on(
+        listener: std::net::TcpListener,
+        udp: Option<std::net::UdpSocket>,
+    ) -> TestServer {
         let (backend_immutable, backend_mutable) = make_backends(Partitions::Shared).await;
-        let backend_for_test = backend_immutable.clone();
-        let backend_mutable_for_test: Arc<dyn lore_storage::MutableStore> = backend_mutable.clone();
-
-        // Both legs serve on one number: gRPC on its TCP half, QUIC on its UDP half. Both are bound
-        // before either server starts, so neither has a port to lose.
-        let (listener, udp) = bind_matched_pair();
         let addr: SocketAddr = listener.local_addr().expect("tcp local addr");
-
-        let (cert_path, key_path, _ca) = server_certs().expect("test certs");
-        let quic = QuinnServer::start(
-            QuinnConfigBuilder::new()
-                .socket(udp)
-                .cert_file(cert_path)
-                .pkey_file(key_path)
-                .stream_handler_factory(Box::new(TestHandlerFactory::new(
-                    backend_immutable.clone(),
-                    backend_mutable.clone(),
-                )))
-                .build()
-                .expect("quinn config"),
-        )
-        .expect("quinn server start");
-
-        let (shutdown_tx, stopped_rx) =
-            spawn_grpc_server(listener, backend_immutable, backend_mutable);
+        let quic = udp.map(|udp| {
+            let (cert_path, key_path, _ca) = server_certs().expect("test certs");
+            QuinnServer::start(
+                QuinnConfigBuilder::new()
+                    .socket(udp)
+                    .cert_file(cert_path)
+                    .pkey_file(key_path)
+                    .stream_handler_factory(Box::new(TestHandlerFactory::new(
+                        backend_immutable.clone(),
+                        backend_mutable.clone(),
+                    )))
+                    .build()
+                    .expect("quinn config"),
+            )
+            .expect("quinn server start")
+        });
+        let scheme = if quic.is_some() { "lore" } else { "grpc" };
+        let stop = spawn_grpc_server(listener, backend_immutable.clone(), backend_mutable.clone());
 
         TestServer {
-            url: format!("lore://127.0.0.1:{}", addr.port()),
-            backend_immutable: backend_for_test,
-            backend_mutable: backend_mutable_for_test,
-            grpc_shutdown: Some(shutdown_tx),
-            grpc_stopped: Some(stopped_rx),
-            quic: Some(quic),
+            url: format!("{scheme}://{addr}"),
+            backend_immutable,
+            backend_mutable,
+            stop: match quic {
+                Some(quic) => stop.with_quic(quic),
+                None => stop,
+            },
         }
     }
 
@@ -426,31 +417,68 @@ mod storage_remote_tests {
     /// asynchronously, so a dropped server keeps accepting. Measured before this barrier
     /// existed, a dropped server was still accepting on every attempt.
     ///
+    /// Once the server is stopped, as [`TestServer::shutdown`] stops it, its gRPC serve task must
+    /// have returned, which it does only after dropping its listener. On Linux the server's own
+    /// fd must no longer refer to the socket either. The test holds a copy of the listener, so a
+    /// connection made after the stop waits in the socket's accept queue, which the copy keeps
+    /// open, and the copy must accept it. A probe for a refused connect fails whenever another
+    /// copy keeps the socket listening, as a child process that another test spawns holds a copy
+    /// of every fd until it execs.
+    ///
     /// TCP covers the gRPC leg on both server kinds, `lore://` included, since both serve gRPC
     /// on the port's TCP half. The QUIC half has no equivalent probe and rests on
     /// `Endpoint::close` plus `wait_idle`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_awaited_shutdown_leaves_the_port_closed() {
+    async fn an_awaited_shutdown_leaves_the_server_accepting_nothing() {
         let execution = setup_execution("storage-remote-shutdown-barrier".to_string());
         LORE_CONTEXT
             .scope(execution, async move {
                 for transport in TRANSPORTS {
-                    let server = start_server(transport).await;
-                    let addr: SocketAddr = server
-                        .url
-                        .rsplit_once('/')
-                        .expect("url carries a scheme")
-                        .1
-                        .parse()
-                        .expect("url carries a socket address");
+                    let (listener, udp) = bind_matched_pair();
+                    let addr = listener.local_addr().expect("tcp local addr");
+                    #[cfg(target_os = "linux")]
+                    let server_fd = std::os::fd::AsRawFd::as_raw_fd(&listener);
+                    let held = listener.try_clone().expect("the listener copies");
+                    held.set_nonblocking(true)
+                        .expect("the copy is made non-blocking");
+                    let mut server =
+                        start_server_on(listener, (transport == Transport::Quic).then_some(udp))
+                            .await;
 
-                    server.shutdown().await;
+                    server.stop.stop().await;
 
                     assert!(
-                        tokio::net::TcpStream::connect(addr).await.is_err(),
-                        "{transport:?}: the port must refuse a connection once the server has \
-                         stopped, or a test that needs an unreachable peer does not have one"
+                        server.stop.serve_ended(),
+                        "{transport:?}: the stop returned before the gRPC serve task did"
                     );
+                    #[cfg(target_os = "linux")]
+                    {
+                        let socket_of = |fd: i32| std::fs::read_link(format!("/proc/self/fd/{fd}"));
+                        let held_fd = std::os::fd::AsRawFd::as_raw_fd(&held);
+                        assert_ne!(
+                            socket_of(server_fd).ok(),
+                            Some(socket_of(held_fd).expect("the held copy is open")),
+                            "{transport:?}: the server still holds its listener after its stop"
+                        );
+                    }
+                    let _client = tokio::net::TcpStream::connect(addr)
+                        .await
+                        .expect("the held copy queues a connection");
+                    // The handshake can reach the accept queue after the connect returns.
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    loop {
+                        match held.accept() {
+                            Ok(_) => break,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "{transport:?}: the connection never reached the held copy"
+                                );
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                            Err(error) => panic!("{transport:?}: the held copy accepts: {error}"),
+                        }
+                    }
                 }
             })
             .await;
@@ -7708,7 +7736,7 @@ mod storage_remote_tests {
         let execution = setup_execution("storage-remote-lost-connections".to_string());
         LORE_CONTEXT
             .scope(execution, async move {
-                let server = start_quic_test_server().await;
+                let server = start_server(Transport::Quic).await;
                 let partition = lore_base::types::Partition::from([0xc1u8; 16]);
                 let seeded = seed_payloads(&server, partition, "lost-connections", 16).await;
                 let addresses: Vec<_> = seeded.iter().map(|(address, _)| *address).collect();
@@ -7760,7 +7788,7 @@ mod storage_remote_tests {
         let execution = setup_execution("storage-remote-lost-connection-partitions".to_string());
         LORE_CONTEXT
             .scope(execution, async move {
-                let server = start_quic_test_server().await;
+                let server = start_server(Transport::Quic).await;
                 let connection = connect_quic(&server, 1).await;
                 let first = lore_base::types::Partition::from([0xc3u8; 16]);
                 let second = lore_base::types::Partition::from([0xc4u8; 16]);
@@ -7814,7 +7842,7 @@ mod storage_remote_tests {
         let execution = setup_execution("storage-remote-lost-connections-in-flight".to_string());
         LORE_CONTEXT
             .scope(execution, async move {
-                let server = start_quic_test_server().await;
+                let server = start_server(Transport::Quic).await;
                 let partition = lore_base::types::Partition::from([0xc5u8; 16]);
                 let seeded = seed_payloads(&server, partition, "in-flight", 64).await;
                 let connection = connect_quic(&server, 4).await;

@@ -56,10 +56,10 @@ use lore_storage::MutableStore;
 use lore_storage::StoreMatch;
 use lore_storage::immutable_store::query_one;
 use lore_transport::Connection;
-use tokio::sync::oneshot;
 
 use crate::common::net_common::CountingStore;
 use crate::common::net_common::Partitions;
+use crate::common::net_common::TestServerStop;
 use crate::common::net_common::close_handle;
 use crate::common::net_common::make_backends;
 use crate::common::net_common::open_handle;
@@ -102,7 +102,7 @@ pub(crate) struct Fixture {
     /// The store [`server_immutable`](Self::server_immutable) wraps, which [`on_server`] reads
     /// through.
     uncounted_immutable: Arc<dyn ImmutableStore>,
-    _shutdown: oneshot::Sender<()>,
+    _stop: TestServerStop,
 }
 
 impl Fixture {
@@ -143,8 +143,7 @@ async fn set_up(with_remote: bool) -> Fixture {
     let server_gets = counting.gets();
     let server_immutable: Arc<dyn ImmutableStore> = counting;
 
-    let (url, shutdown, _stopped) =
-        start_grpc_server(server_immutable.clone(), server_mutable.clone());
+    let (url, stop) = start_grpc_server(server_immutable.clone(), server_mutable.clone());
     let store = open_handle(with_remote.then_some(url.as_str())).await;
 
     let default_branch = BranchId::from(uuid::Uuid::now_v7());
@@ -157,7 +156,7 @@ async fn set_up(with_remote: bool) -> Fixture {
         server_mutable,
         server_gets,
         uncounted_immutable,
-        _shutdown: shutdown,
+        _stop: stop,
     };
     on_server(&fixture, async |context| {
         create_repository(context, default_branch).await;
