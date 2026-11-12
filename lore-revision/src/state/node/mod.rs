@@ -243,13 +243,18 @@
 //! - **Staging's listings.** No one else writes a directory staging holds a listing of: a
 //!   precondition, not a check. Staging deserializes a State of its own under the instance's
 //!   per-path write lock, its tasks each list and write their own directory, and the C API writes
-//!   an in-memory State of its own. One exception is reachable: a repository linked at two mount
-//!   paths gives two staging tasks the one linked State, so both may add the same name. No writer
-//!   runs beside a listing of staging's, so staging leaves four races open: it takes a child its
-//!   listing answered as given though the child was renamed, moved or removed since; its update's
-//!   reads of the child race a rename, where the case-mismatch path renames the child back or moves
-//!   the file; its branch for a nested repository's root queues the claim's answer unchecked; and
-//!   its unclaimed pass takes a child moved out for absent.
+//!   an in-memory State of its own. A `lore dirty` walk lists each directory it walks the same
+//!   way, one task under the exclusive claim. The task spawning a stage's walks lists a directory
+//!   its targets share while the walks it spawned write into it, which holds since the targets are
+//!   disjoint once their case is unified, and two below one child of the directory start their
+//!   walks below that child: no walk writes the child another target names. One exception is
+//!   reachable: a repository linked at two mount paths gives two staging tasks the one linked
+//!   State, so both may add the same name.
+//!   No writer runs beside a listing of staging's, so staging leaves four races open: it takes a
+//!   child its listing answered as given though the child was renamed, moved or removed since; its
+//!   update's reads of the child race a rename, where the case-mismatch path renames the child back
+//!   or moves the file; its branch for a nested repository's root queues the claim's answer
+//!   unchecked; and its unclaimed pass takes a child moved out for absent.
 //! - **Unserved climbs.** An unserved mark dropped between levels, a clear dropped between clearing
 //!   an ancestor and marking it again, and an add dropped between publishing its node and marking
 //!   the parent leave a dirty node below a clean directory. A climb that fails midway, on a block

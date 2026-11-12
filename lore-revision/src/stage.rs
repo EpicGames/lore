@@ -78,6 +78,7 @@ use crate::state::NameChange;
 use crate::state::NodeMapping;
 use crate::state::OwnFlags;
 use crate::state::State;
+use crate::state::StateError;
 use crate::state::StateNodeChildrenIterator;
 use crate::state::StateNodeChildrenWithNameIterator;
 use crate::state::file_modified_against_node;
@@ -560,12 +561,18 @@ async fn is_uncommitted_child(
 ///
 /// The filter is asked about the path as what the working tree holds there, else as the node the
 /// tree holds, a link as a directory, and as a directory where neither holds anything.
+///
+/// `known` answers which child of `base`'s node the first component of `remainder_path` names,
+/// where the caller established it ([`KnownChild`]). The walk takes it as given, and searches from
+/// it for the rest of the path, but for a path the filter leaves out, whose replaced node it
+/// searches for from `base`.
 #[lore_macro::test_pub]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stage_filesystem_path(
     operation: Arc<InstanceOperationImpl>,
     base: NodeMapping,
     remainder_path: RelativePath,
+    known: KnownChild,
     stats: Arc<StageStats>,
     options: StageOptions,
     link_tracker: Option<Arc<crate::link::LinkTracker>>,
@@ -573,6 +580,10 @@ pub(crate) async fn stage_filesystem_path(
     prefixes: Option<Arc<util::fs::ResolvedPrefixes>>,
     discards: PendingDiscards,
 ) -> Result<NodeLink, StageError> {
+    debug_assert!(
+        matches!(known, KnownChild::Unresolved) || !remainder_path.is_empty(),
+        "a known child for an empty path"
+    );
     let repository = base.repository.clone();
     let state = base.state.clone();
 
@@ -694,6 +705,7 @@ pub(crate) async fn stage_filesystem_path(
             .descend(
                 &operation,
                 remainder_path,
+                known,
                 info,
                 options,
                 &stats,
@@ -766,9 +778,14 @@ pub(crate) async fn stage_filesystem_path(
     let mode = FilterMode::Full.absence(force);
     let parent_states = filter.parent_exclusion_states(&full_relative_path);
 
-    let Ok((node_link, linked)) = state
-        .find_relative(repository.clone(), base.node, remainder_path.as_str())
-        .await
+    let Ok((node_link, linked)) = find_known_relative(
+        &repository,
+        &state,
+        base.node,
+        remainder_path.as_str(),
+        known,
+    )
+    .await
     else {
         if filter
             .child_emit_excludes(parent_states, &full_relative_path, true, mode)
@@ -943,6 +960,44 @@ async fn discard_unkept(
     Ok(())
 }
 
+/// The node `path` names below `base`, as [`State::find_relative`] finds it, with `known` the child
+/// of `base` its first component names where the caller established it: that child for a path
+/// of one component, else a search from it for the rest of the path. A known child that is a link
+/// leaves the search to start at `base`, which crosses the link. `Err` where the tree holds no
+/// node at `path`.
+async fn find_known_relative(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    base: NodeID,
+    path: &str,
+    known: KnownChild,
+) -> Result<(NodeLink, Option<crate::link::LinkedState>), ()> {
+    let (start, rest) = match (known, path.split_once('/')) {
+        (KnownChild::Unresolved, _) => (base, path),
+        (KnownChild::Resolved(None), _) => return Err(()),
+        (KnownChild::Resolved(Some(node)), None) => {
+            let link = NodeLink {
+                node,
+                repository: repository.id,
+                revision: state.revision(),
+            };
+            return Ok((link, None));
+        }
+        (KnownChild::Resolved(Some(node)), Some((_, rest))) => {
+            let is_link = state
+                .node(repository.clone(), node)
+                .await
+                .map_err(drop)?
+                .is_link();
+            if is_link { (base, path) } else { (node, rest) }
+        }
+    };
+    state
+        .find_relative(repository.clone(), start, rest)
+        .await
+        .map_err(drop)
+}
+
 /// The node a staged path's descent has reached, in the repository and state holding it past
 /// any link crossed, with the paths and the filter verdict naming it.
 struct StageDescent {
@@ -988,16 +1043,20 @@ impl StageDescent {
     ///
     /// Each component is staged under the name `remainder_path` spells it with, which the caller
     /// resolves against the file system, so `stage_node_from_metadata` does not look up its case
-    /// again. The final component is the staged path, staged as `info`; every other one is staged
-    /// as a directory. `Some` is the link of a component that was not staged, which ends the
-    /// descent.
+    /// again. The first component is the child `known` answers where the caller established it,
+    /// and every later one is looked up in its directory, once: the search a directory takes for
+    /// the nested repository check answers its stage as well. The final component is the staged
+    /// path, staged as `info`; every other one is staged as a directory. `Some` is the link of a
+    /// component that was not staged, which ends the descent.
     ///
     /// Its own future: inline, what a step holds across its awaits would be reserved in the
     /// directory walk's state of [`stage_filesystem_path`].
+    #[allow(clippy::too_many_arguments)]
     async fn descend(
         &mut self,
         operation: &Arc<InstanceOperationImpl>,
         mut remainder_path: RelativePath,
+        mut known: KnownChild,
         info: FileInfo,
         options: StageOptions,
         stats: &Arc<StageStats>,
@@ -1006,6 +1065,7 @@ impl StageDescent {
         while !remainder_path.is_empty() {
             let is_final_component = remainder_path.parent().is_none();
             let current_name = remainder_path.pop_root();
+            let mut current_known = std::mem::replace(&mut known, KnownChild::Unresolved);
             if current_name == "." {
                 continue;
             }
@@ -1020,16 +1080,26 @@ impl StageDescent {
             // this path specifically, and staging it into the parent would take
             // content the nested repository owns.
             if current_info.is_dir() {
-                let held = self
-                    .state
-                    .find_subnode(
-                        self.repository.clone(),
-                        self.node,
-                        hash::hash_string(current_name),
-                    )
-                    .await
-                    .ok()
-                    .filter(|node| node.is_valid_node_id());
+                if matches!(current_known, KnownChild::Unresolved) {
+                    current_known = match self
+                        .state
+                        .find_subnode(
+                            self.repository.clone(),
+                            self.node,
+                            hash::hash_string(current_name),
+                        )
+                        .await
+                    {
+                        Ok(node) => KnownChild::Resolved(Some(node)),
+                        Err(error) if error.is_node_not_found() => KnownChild::Resolved(None),
+                        Err(_) => KnownChild::Unresolved,
+                    };
+                }
+                let held = match current_known {
+                    KnownChild::Resolved(held) => held,
+                    KnownChild::Unresolved => None,
+                }
+                .filter(|node| node.is_valid_node_id());
                 if is_uncommitted_child(&self.repository, &self.state, held).await?
                     && state::is_nested_repository_root(&mut self.absolute_path, current_name).await
                 {
@@ -1058,7 +1128,7 @@ impl StageDescent {
                 options,
                 stats.clone(),
                 link_tracker.cloned(),
-                KnownChild::Unresolved,
+                current_known,
                 self.states,
             )
             .await?;
@@ -2010,9 +2080,42 @@ async fn resolve_case_variant_collisions(
     Ok(())
 }
 
-/// Most entries whose name hashes [`DirectoryChildren::entries_distinct`] sorts on the stack; it
+/// Most entries whose name hashes [`DirectoryChildren::shared_by_entries`] sorts on the stack; it
 /// allocates for a longer listing.
 const ENTRIES_SORTED_ON_STACK: usize = 256;
+
+/// The children of a directory node by name hash: `(name hash, sibling index, child node id)`,
+/// ordered by the first two, so the children carrying one hash come in sibling order.
+#[lore_macro::test_pub]
+pub(crate) struct NameHashIndex(Vec<(u64, u32, NodeID)>);
+
+impl NameHashIndex {
+    /// The index of a directory's children in sibling order, each with the name hash it carries,
+    /// built in the listing's allocation.
+    pub(crate) fn new(child: Vec<(NodeID, u64)>) -> Self {
+        let mut by_name_hash: Vec<(u64, u32, NodeID)> = child
+            .into_iter()
+            .enumerate()
+            .map(|(index, (node, name_hash))| (name_hash, index as u32, node))
+            .collect();
+        by_name_hash.sort_unstable();
+        Self(by_name_hash)
+    }
+
+    /// The children carrying `name_hash`, in sibling order, each with its sibling index.
+    fn matching(&self, name_hash: u64) -> impl Iterator<Item = (u32, NodeID)> + '_ {
+        let start = self.0.partition_point(|&(hash, _, _)| hash < name_hash);
+        self.0[start..]
+            .iter()
+            .take_while(move |&&(hash, _, _)| hash == name_hash)
+            .map(|&(_, index, node)| (index, node))
+    }
+
+    /// The first child carrying `name_hash`, in sibling order.
+    pub(crate) fn first(&self, name_hash: u64) -> Option<NodeID> {
+        self.matching(name_hash).next().map(|(_, node)| node)
+    }
+}
 
 /// The children of a directory node, indexed by name hash, and which of them a
 /// file system entry has claimed.
@@ -2020,21 +2123,20 @@ const ENTRIES_SORTED_ON_STACK: usize = 256;
 /// Ties are held in sibling order: two names differing only in case hash the
 /// same, and a claim takes the first child not already claimed.
 #[lore_macro::test_pub]
-struct DirectoryChildren {
+pub(crate) struct DirectoryChildren {
     /// Child node ids in sibling order, [`INVALID_NODE`] where a file system
     /// entry has claimed the child.
     node: Vec<NodeID>,
-    /// `(name hash, index into `node`, child node id)` for every child, ordered
-    /// by the first two, so a tie on the hash is claimed in sibling order. The
-    /// id is held here as well, where a claim has taken it out of `node`.
-    by_name_hash: Vec<(u64, u32, NodeID)>,
+    /// Every child, by name hash. The id is held here as well, where a claim has
+    /// taken it out of `node`.
+    by_name_hash: NameHashIndex,
     /// The chain as the listing began it, which everything linked into it since
     /// sits ahead of while no reattach moves it; `None` for a link's or a file's.
     since: Option<ChainMark>,
-    /// Whether the file system entries claiming the children carry distinct name
-    /// hashes, once a claim has asked ([`Self::entries_distinct`]).
-    entries_distinct: Option<bool>,
-    /// Whether the stage added a child for one of the entries ([`Self::count_own_add`]).
+    /// The name hashes two or more of the file system entries claiming the
+    /// children carry, once a claim has asked ([`Self::shared_by_entries`]).
+    shared_hashes: Option<Box<[u64]>>,
+    /// Whether the walk added a child for one of the entries ([`Self::count_own_add`]).
     own_added: bool,
 }
 
@@ -2042,45 +2144,53 @@ impl DirectoryChildren {
     /// The children of a directory node in sibling order, with the name hash
     /// each of them carries, and the mark of the chain the listing began from.
     #[lore_macro::test_pub]
-    fn new(child: Vec<(NodeID, u64)>, since: Option<ChainMark>) -> Self {
-        let mut by_name_hash: Vec<(u64, u32, NodeID)> = child
-            .iter()
-            .enumerate()
-            .map(|(index, &(node, name_hash))| (name_hash, index as u32, node))
-            .collect();
-        by_name_hash.sort_unstable();
-        let node = child.into_iter().map(|(node, _)| node).collect();
+    pub(crate) fn new(child: Vec<(NodeID, u64)>, since: Option<ChainMark>) -> Self {
         Self {
-            node,
-            by_name_hash,
+            node: child.iter().map(|&(node, _)| node).collect(),
+            by_name_hash: NameHashIndex::new(child),
             since,
-            entries_distinct: None,
+            shared_hashes: None,
             own_added: false,
         }
     }
 
-    /// Whether no two of `entries`, the file system entries claiming the children, carry the
-    /// same name hash: found on the first call, and kept for the later ones, which give the same
-    /// entries. The entries come in the order the file system lists them, so the check sorts a
-    /// copy of their hashes, `O(n log n)` once per directory.
-    fn entries_distinct(&mut self, entries: &[DirectoryEntry]) -> bool {
-        *self.entries_distinct.get_or_insert_with(|| {
+    /// The name hashes two or more of `entries`, the file system entries claiming the children,
+    /// carry, sorted: found on the first call, and kept for the later ones, which give the same
+    /// entries. The entries come in the order the file system lists them, so the call sorts a copy
+    /// of their hashes, `O(n log n)` once per directory, and allocates only for a hash two of them
+    /// share or for more than [`ENTRIES_SORTED_ON_STACK`] entries.
+    fn shared_by_entries(&mut self, entries: &[DirectoryEntry]) -> &[u64] {
+        self.shared_hashes.get_or_insert_with(|| {
             let mut name_hashes: SmallVec<[u64; ENTRIES_SORTED_ON_STACK]> =
                 entries.iter().map(|entry| entry.name_hash).collect();
             name_hashes.sort_unstable();
-            name_hashes.windows(2).all(|pair| pair[0] != pair[1])
+            let mut shared = Vec::new();
+            for pair in name_hashes.windows(2) {
+                if pair[0] == pair[1] && shared.last() != Some(&pair[0]) {
+                    shared.push(pair[0]);
+                }
+            }
+            shared.into_boxed_slice()
         })
     }
 
-    /// The entries of the index carrying `name_hash`, in sibling order.
-    fn matching(&self, name_hash: u64) -> impl Iterator<Item = (u32, NodeID)> + '_ {
-        let start = self
-            .by_name_hash
-            .partition_point(|&(hash, _, _)| hash < name_hash);
-        self.by_name_hash[start..]
-            .iter()
-            .take_while(move |&&(hash, _, _)| hash == name_hash)
-            .map(|&(_, index, node)| (index, node))
+    /// Whether nothing linked into the chain since the listing carries `name_hash`, the name hash
+    /// of one of `entries` or of a child none of them names, so the listing answers for it alone:
+    /// it carries no mark, as a link's or a file's listing does; or the chain changed since the
+    /// listing only by the walk's own adds, each for an entry no listed child answered, and the
+    /// walk made none or no other entry carries `name_hash`.
+    fn answers_alone(&mut self, state: &State, entries: &[DirectoryEntry], name_hash: u64) -> bool {
+        match self.since.as_ref().map(|since| since.unchanged(state)) {
+            None => true,
+            Some(unchanged) => {
+                unchanged
+                    && (!self.own_added
+                        || self
+                            .shared_by_entries(entries)
+                            .binary_search(&name_hash)
+                            .is_err())
+            }
+        }
     }
 
     /// The first child carrying `name_hash` that nothing has claimed yet, marked
@@ -2089,10 +2199,24 @@ impl DirectoryChildren {
     #[lore_macro::test_pub]
     fn claim(&mut self, name_hash: u64) -> Option<NodeID> {
         let (index, node) = self
+            .by_name_hash
             .matching(name_hash)
             .find(|&(index, _)| self.node[index as usize] != INVALID_NODE)?;
         self.node[index as usize] = INVALID_NODE;
         Some(node)
+    }
+
+    /// The first child carrying `name_hash`, claimed or not, with every child carrying it marked
+    /// claimed, so the pass over what nothing claimed leaves each of them. `None` where the
+    /// directory holds no such child.
+    #[lore_macro::test_pub]
+    fn claim_every(&mut self, name_hash: u64) -> Option<NodeID> {
+        let mut first = None;
+        for (index, node) in self.by_name_hash.matching(name_hash) {
+            self.node[index as usize] = INVALID_NODE;
+            first.get_or_insert(node);
+        }
+        first
     }
 
     /// Marks `node` claimed where the listing holds it: a child a search of the chain
@@ -2105,25 +2229,32 @@ impl DirectoryChildren {
         }
     }
 
-    /// Counts a node the stage itself added to the directory for one of its file system entries,
-    /// prepending it, in the mark, so the stage's own adds never make its searches stale nor show
+    /// Counts a node the walk itself added to the directory for one of its file system entries,
+    /// prepending it, in the mark, so the walk's own adds never make its searches stale nor show
     /// as a reattach, and notes that it added one. Only an add that landed counts: counting one
     /// that did not could hide a reattach, or another writer's add from
     /// [`ChainMark::unchanged`].
     #[lore_macro::test_pub]
-    fn count_own_add(&mut self) {
+    pub(crate) fn count_own_add(&mut self) {
         if let Some(since) = self.since.as_mut() {
             since.count_own_prepend();
         }
         self.own_added = true;
     }
 
+    /// Drops the mark of the chain the listing began from, ahead of a pass that may free a slot of
+    /// the chain, since no slot may be freed while a mark lives ([`ChainMark`]). The listing
+    /// answers alone from then on.
+    pub(crate) fn drop_mark(&mut self) {
+        self.since = None;
+    }
+
     /// The first child the listing holds carrying `name_hash`, claimed or not,
     /// which is the one a search of the chain reaches once past what was linked
     /// into it since.
     #[lore_macro::test_pub]
-    fn holds(&self, name_hash: u64) -> Option<NodeID> {
-        self.matching(name_hash).next().map(|(_, node)| node)
+    pub(crate) fn holds(&self, name_hash: u64) -> Option<NodeID> {
+        self.by_name_hash.first(name_hash)
     }
 
     /// The children no file system entry claimed, in sibling order. Each one is a
@@ -2135,6 +2266,34 @@ impl DirectoryChildren {
             .copied()
             .filter(|&node| node != INVALID_NODE)
     }
+
+    /// [`Self::unclaimed`], each child with its name hash, in name hash order.
+    #[lore_macro::test_pub]
+    pub(crate) fn unclaimed_by_name_hash(&self) -> impl Iterator<Item = (NodeID, u64)> + '_ {
+        self.by_name_hash
+            .0
+            .iter()
+            .filter(|&&(_, index, _)| self.node[index as usize] != INVALID_NODE)
+            .map(|&(name_hash, _, node)| (node, name_hash))
+    }
+}
+
+/// The children of `node`, each with the name hash it carries, and the mark of the chain the
+/// listing began from, where `node` is a directory; `None` for any other node, which holds no
+/// children of its own: a link's listing would follow it into the State it names.
+#[lore_macro::test_pub]
+pub(crate) async fn directory_children(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    node: NodeID,
+) -> Result<Option<(Vec<(NodeID, u64)>, ChainMark)>, StateError> {
+    if !state.node(repository.clone(), node).await?.is_directory() {
+        return Ok(None);
+    }
+    let (listed, mark) = state
+        .node_children_with_name_hash_marked(repository.clone(), node)
+        .await?;
+    Ok(mark.map(|mark| (listed, mark)))
 }
 
 /// Whether the caller has established which child of a directory a name belongs
@@ -2149,20 +2308,20 @@ pub(crate) enum KnownChild {
 }
 
 /// The listing's answer to the claim of `name_hash`, the name hash of one of `entries`, the
-/// directory's file system entries, where the listing answers alone; `None` where only a search
-/// of the chain does ([`claim_child`]).
+/// directory's file system entries, or of a child none of them names, where the listing answers
+/// alone; `None` where only a search of the chain does ([`claim_child`]).
 ///
 /// The listing answers with the first listed child carrying `name_hash` that nothing claimed,
-/// claimed now. Failing that, it answers with the listed child carrying it, claimed or not, in two
-/// cases: it carries no mark, as a link's or a file's listing does; or the chain changed since the
-/// listing only by the stage's own adds, each for an entry claimed before, and the stage made none
-/// or no two of `entries` carry one name hash, so nothing linked in since carries `name_hash`.
+/// claimed now. Failing that, it answers with the listed child carrying it, claimed or not, where
+/// nothing linked into the chain since the listing carries it
+/// ([`DirectoryChildren::answers_alone`]).
 ///
-/// The listing's own answers are taken as given: no writer but the stage's own tasks, each in its
-/// own directory, runs beside a stage (the node module's Limitations, "The stage's listing"), so no
-/// child the listing holds is renamed, moved or removed meanwhile.
+/// The listing's own answers are taken as given: no writer but the walk's own tasks, each in its
+/// own directory, runs beside a stage's walk or a `lore dirty` walk (the node module's
+/// Limitations, "Staging's listings"), so no child the listing holds is renamed, moved or removed
+/// meanwhile.
 #[lore_macro::test_pub]
-fn claim_from_listing(
+pub(crate) fn claim_from_listing(
     children: &mut DirectoryChildren,
     state: &State,
     entries: &[DirectoryEntry],
@@ -2171,15 +2330,38 @@ fn claim_from_listing(
     if let Some(node) = children.claim(name_hash) {
         return Some(Some(node));
     }
-    let answers = match children.since.as_ref().map(|since| since.unchanged(state)) {
-        None => true,
-        Some(unchanged) => unchanged && (!children.own_added || children.entries_distinct(entries)),
-    };
-    answers.then(|| children.holds(name_hash))
+    children
+        .answers_alone(state, entries, name_hash)
+        .then(|| children.holds(name_hash))
+}
+
+/// The child carrying `name_hash`, the name hash of one of `entries`, the directory's file system
+/// entries, or of a child none of them names, as a search of the whole chain finds it, where the
+/// listing answers alone; `None` where only a search of the chain does ([`claim_child`]).
+///
+/// The listing answers with the first listed child carrying `name_hash`, claimed or not, and
+/// claims every child carrying it ([`DirectoryChildren::claim_every`]). That is the child a search
+/// reaches: the walk adds a child only for a name hash the listing holds none of, and no other
+/// writer runs beside it, as [`claim_from_listing`] has it. Failing that, it answers that the
+/// directory holds none, where nothing linked into the chain since the listing carries
+/// `name_hash` ([`DirectoryChildren::answers_alone`]).
+#[lore_macro::test_pub]
+pub(crate) fn find_from_listing(
+    children: &mut DirectoryChildren,
+    state: &State,
+    entries: &[DirectoryEntry],
+    name_hash: u64,
+) -> Option<Option<NodeID>> {
+    if let Some(node) = children.claim_every(name_hash) {
+        return Some(Some(node));
+    }
+    children
+        .answers_alone(state, entries, name_hash)
+        .then_some(None)
 }
 
 /// The child of `directory_node` that `name_hash` belongs to, where its listing does not answer
-/// alone ([`claim_from_listing`]).
+/// alone ([`claim_from_listing`], [`find_from_listing`]).
 ///
 /// A child is prepended, so whatever was linked into the chain since the listing
 /// was taken lies ahead of it. Only that much is walked; the listing answers from
@@ -2190,7 +2372,7 @@ fn claim_from_listing(
 /// it had. A link's or a file's listing, which carries no mark, answers from the
 /// listing alone.
 #[lore_macro::test_pub]
-async fn claim_child(
+pub(crate) async fn claim_child(
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
     directory_node: NodeID,
@@ -4005,6 +4187,7 @@ async fn unlink_and_stage(
         operation.clone(),
         NodeMapping::root(repository.clone(), state.clone()),
         relative_path.clone(),
+        KnownChild::Unresolved,
         stats.clone(),
         options,
         None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
@@ -4087,6 +4270,7 @@ pub(crate) async fn stage_emptied_ancestors(
             operation.clone(),
             NodeMapping::root(repository.clone(), state.clone()),
             search_path.clone(),
+            KnownChild::Unresolved,
             stats.clone(),
             options,
             None,
@@ -4543,6 +4727,7 @@ async fn stage_from_parent_revision_in_operation(
                     operation.clone(),
                     NodeMapping::root(repository.clone(), state.clone()),
                     relative_path.clone(),
+                    KnownChild::Unresolved,
                     stats.clone(),
                     options,
                     None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
@@ -4994,6 +5179,7 @@ async fn stage_link_groups(
                         node: group.mounted,
                     },
                     below_mount.clone(),
+                    KnownChild::Unresolved,
                     stats.clone(),
                     options,
                     None,
@@ -5041,6 +5227,7 @@ async fn stage_link_groups(
                         node: group.mounted,
                     },
                     below_mount.clone(),
+                    KnownChild::Unresolved,
                     stats.clone(),
                     options,
                     None,

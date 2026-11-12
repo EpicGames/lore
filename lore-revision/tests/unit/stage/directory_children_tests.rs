@@ -3,9 +3,13 @@
 use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::Address;
+use lore_base::types::Hash;
 use lore_revision::fs::filesystem_provider::DirectoryEntry;
 use lore_revision::fs::filesystem_provider::FileInfo;
 use lore_revision::lore::RepositoryId;
+use lore_revision::node::Node;
+use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
@@ -77,10 +81,11 @@ fn the_index_leaves_no_ties_among_equal_hashes() {
     assert!(
         children
             .by_name_hash
+            .0
             .windows(2)
             .all(|pair| pair[0] < pair[1]),
         "the index must be strictly ordered: {:?}",
-        children.by_name_hash
+        children.by_name_hash.0
     );
 }
 
@@ -265,6 +270,7 @@ async fn staging_a_new_directory_of_new_files_steps_through_no_child() {
                 operation.clone(),
                 NodeMapping::root(repository.clone(), state.clone()),
                 RelativePath::new().join("d"),
+                KnownChild::Unresolved,
                 Arc::default(),
                 StageOptions::default(),
                 None,
@@ -313,7 +319,7 @@ async fn claims_before_the_stage_adds_answer_from_the_listing() {
         );
         assert_eq!(from_listing(2), Some(None), "no child");
         assert_eq!(
-            children.entries_distinct, None,
+            children.shared_hashes, None,
             "no claim checked the entries' name hashes"
         );
     })
@@ -364,6 +370,102 @@ async fn a_claim_finds_a_child_another_writer_linked_in_since_the_listing() {
         )
         .await;
         assert_eq!(claimed, Some(linked));
+    })
+    .await;
+}
+
+/// After the stage's own add, the claim of an entry whose name hash no other entry carries answers
+/// from the listing, though two other entries share one: only the second of those searches.
+#[tokio::test]
+async fn an_own_add_leaves_the_claims_of_unshared_names_to_the_listing() {
+    with_state(|repository, state| async move {
+        let dir = add(&state, &repository, ROOT_NODE, directory("d"), "d").await;
+        let entries = file_entries(&["Rock.mesh", "rock.mesh", "new.file"]);
+        let mut children = listed(&state, &repository, dir).await;
+        let from_listing = |children: &mut DirectoryChildren, index: usize| {
+            claim_from_listing(children, &state, &entries, entries[index].name_hash)
+        };
+        assert_eq!(
+            from_listing(&mut children, 0),
+            Some(None),
+            "the first is new"
+        );
+        add(&state, &repository, dir, file("Rock.mesh"), "Rock.mesh").await;
+        children.count_own_add();
+        assert_eq!(
+            from_listing(&mut children, 2),
+            Some(None),
+            "no child, from the listing"
+        );
+        assert_eq!(from_listing(&mut children, 1), None, "its variant searches");
+    })
+    .await;
+}
+
+/// Each entry of a name hash two listed children carry finds the first of them, the child a search
+/// of the chain reaches, and leaves neither to the pass over what nothing claimed.
+#[tokio::test]
+async fn a_find_answers_each_entry_with_the_first_child_of_its_name_hash() {
+    with_state(|repository, state| async move {
+        let dir = add(&state, &repository, ROOT_NODE, directory("d"), "d").await;
+        add(&state, &repository, dir, file("x"), "x").await;
+        let first = add(&state, &repository, dir, directory("x"), "x").await;
+        let other = add(&state, &repository, dir, file("other"), "other").await;
+        let entries = file_entries(&["X", "x"]);
+        let mut children = listed(&state, &repository, dir).await;
+        for entry in &entries {
+            assert_eq!(
+                find_from_listing(&mut children, &state, &entries, entry.name_hash),
+                Some(Some(first)),
+                "{}",
+                entry.name
+            );
+            assert_eq!(
+                state
+                    .find_subnode(repository.clone(), dir, entry.name_hash)
+                    .await
+                    .ok(),
+                Some(first),
+                "{}",
+                entry.name
+            );
+        }
+        assert_eq!(children.unclaimed().collect::<Vec<_>>(), vec![other]);
+    })
+    .await;
+}
+
+/// A directory lists its children with the mark of its chain; a file, and a link to a revision the
+/// store lacks, list none, the link without its State.
+#[tokio::test]
+async fn only_a_directory_lists_children() {
+    with_state(|repository, state| async move {
+        let dir = add(&state, &repository, ROOT_NODE, directory("d"), "d").await;
+        let child = add(&state, &repository, dir, file("f"), "f").await;
+        let link = Node {
+            flags: NodeFlags::Link.bits(),
+            name_hash: hash_string("link"),
+            child: ROOT_NODE,
+            address: Address {
+                hash: Hash::from_u64(0x11b),
+                context: uuid::Uuid::now_v7().into(),
+            },
+            ..Default::default()
+        };
+        let link = add(&state, &repository, ROOT_NODE, link, "link").await;
+        let listed = directory_children(&repository, &state, dir)
+            .await
+            .expect("the directory's listing")
+            .map(|(listed, _)| listed);
+        assert_eq!(listed, Some(vec![(child, hash_string("f"))]));
+        for node in [child, link] {
+            assert!(
+                directory_children(&repository, &state, node)
+                    .await
+                    .expect("the listing")
+                    .is_none()
+            );
+        }
     })
     .await;
 }

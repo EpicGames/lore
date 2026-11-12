@@ -4311,6 +4311,7 @@ async fn stage_resolved_from_working_tree(
         operation.clone(),
         mapping.clone(),
         below,
+        stage::KnownChild::Unresolved,
         stats.clone(),
         options,
         None,

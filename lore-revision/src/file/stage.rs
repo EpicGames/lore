@@ -32,11 +32,13 @@ use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::repository::status;
 use crate::stage;
+use crate::stage::KnownChild;
 use crate::stage::LoreFileStageBeginEventData;
 use crate::stage::LoreFileStageCountData;
 use crate::stage::LoreFileStageEndEventData;
 use crate::stage::LoreFileStageProgressEventData;
 use crate::stage::LoreFileStageRevisionEventData;
+use crate::stage::NameHashIndex;
 use crate::stage::StageError;
 use crate::stage::StageOptions;
 use crate::stage::StageStats;
@@ -167,6 +169,7 @@ async fn stage_into_single_layer(
                 node: layer_staged_node.node,
             },
             remain,
+            KnownChild::Unresolved,
             stats,
             options,
             None, // No link tracking in layer staging
@@ -273,19 +276,25 @@ async fn precreate_shared_ancestors<'a>(
             let resolved = resolved_or_given(&given, walk.prefixes.as_deref());
             let walk_path = walk.walk(given, nodes);
             let start = walk_path.at.clone();
-            let staged = stage::stage_filesystem_path(
-                walk.operation.clone(),
-                walk_path.at,
-                walk_path.remainder,
-                walk.stats.clone(),
-                options,
-                Some(walk.link_tracker.clone()),
-                walk.global_mask.clone(),
-                walk_path.prefixes,
-                Some(discards.clone()),
-            );
+            let operation = walk.operation.clone();
+            let stats = walk.stats.clone();
+            let link_tracker = walk.link_tracker.clone();
+            let global_mask = walk.global_mask.clone();
+            let discards = discards.clone();
             async move {
-                let link = staged.await?;
+                let link = stage::stage_filesystem_path(
+                    operation,
+                    walk_path.at,
+                    walk_path.remainder,
+                    KnownChild::Unresolved,
+                    stats,
+                    options,
+                    Some(link_tracker),
+                    global_mask,
+                    walk_path.prefixes,
+                    Some(discards),
+                )
+                .await?;
                 if !link.is_valid() {
                     return Ok(None);
                 }
@@ -345,6 +354,100 @@ async fn created_path(
     }))
 }
 
+/// What a stage's targets name a child of, in a directory enclosing the current target.
+enum TargetDirectory {
+    /// A directory no target names a child of yet.
+    Unnamed,
+    /// A directory one target names a child of.
+    NamedOnce,
+    /// The directory's children, listed once a second target names a child of it.
+    Listed(NameHashIndex),
+    /// A node of the walk's State that is not a directory, such as a link, which lists none.
+    Unlisted,
+}
+
+impl TargetDirectory {
+    /// The child of `directory` carrying `name_hash`, which a target names: from the directory's
+    /// listing, listed once a second target names a child of it; unresolved for the first, and
+    /// below a node that is not a directory.
+    async fn known(
+        &mut self,
+        repository: &Arc<RepositoryContext>,
+        state: &State,
+        directory: NodeID,
+        name_hash: u64,
+    ) -> Result<KnownChild, StageError> {
+        match self {
+            Self::Unnamed => {
+                *self = Self::NamedOnce;
+                return Ok(KnownChild::Unresolved);
+            }
+            Self::NamedOnce => {
+                *self = match stage::directory_children(repository, state, directory)
+                    .await
+                    .forward::<StageError>("Failed to list a directory the targets share")?
+                {
+                    Some((listed, _)) => Self::Listed(NameHashIndex::new(listed)),
+                    None => Self::Unlisted,
+                };
+            }
+            Self::Listed(_) | Self::Unlisted => {}
+        }
+        Ok(match self {
+            Self::Listed(children) => KnownChild::Resolved(children.first(name_hash)),
+            _ => KnownChild::Unresolved,
+        })
+    }
+}
+
+/// The directories enclosing a stage's current target that its targets name a child of, the
+/// innermost last, with their paths, so the walk of a target below a directory several of them
+/// name a child of takes the child its first component names from the directory's listing, as
+/// given ([`KnownChild`]), rather than searching its chain, which N targets below one directory
+/// would search N times. The targets come in subtree order, so those below a directory follow each
+/// other, and a directory is dropped once a target leaves it. The targets are disjoint, and two
+/// of them below one child of a directory start their walks below that child, which the stage
+/// creates first, so no target's walk adds or moves the child another target names.
+#[derive(Default)]
+struct TargetDirectories(Vec<(RelativePath, NodeID, TargetDirectory)>);
+
+impl TargetDirectories {
+    /// The child of `at`, the node a target's walk starts at, that the first component of
+    /// `remainder` names, as [`TargetDirectory::known`] answers it; unresolved for an empty
+    /// remainder.
+    async fn known(
+        &mut self,
+        at: &NodeMapping,
+        remainder: &RelativePath,
+    ) -> Result<KnownChild, StageError> {
+        while self
+            .0
+            .last()
+            .is_some_and(|(path, _, _)| !path.is_empty() && !path.covers_ignore_case(&at.path))
+        {
+            self.0.pop();
+        }
+        if remainder.is_empty() {
+            return Ok(KnownChild::Unresolved);
+        }
+        if self.0.last().is_none_or(|(_, node, _)| *node != at.node) {
+            self.0
+                .push((at.path.clone(), at.node, TargetDirectory::Unnamed));
+        }
+        let Some((_, _, named)) = self.0.last_mut() else {
+            return Ok(KnownChild::Unresolved);
+        };
+        named
+            .known(
+                &at.repository,
+                &at.state,
+                at.node,
+                crate::hash::hash_string(remainder.root()),
+            )
+            .await
+    }
+}
+
 /// Spawn a walk per target into `tasks`.
 ///
 /// The shared ancestors exist by now and the targets are disjoint, so every remaining
@@ -359,14 +462,23 @@ async fn spawn_target_walks(
     tasks: &mut JoinSet<Result<crate::node::NodeLink, StageError>>,
 ) -> Option<StageError> {
     let mut failure = None;
+    let mut directories = TargetDirectories::default();
     for target in antichain {
         let walk_path = walk.walk(target, ancestors);
+        let known = match directories.known(&walk_path.at, &walk_path.remainder).await {
+            Ok(known) => known,
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        };
         lore_spawn!(
             tasks,
             stage::stage_filesystem_path(
                 walk.operation.clone(),
                 walk_path.at,
                 walk_path.remainder,
+                known,
                 walk.stats.clone(),
                 walk.options,
                 Some(walk.link_tracker.clone()),
@@ -652,9 +764,7 @@ pub async fn stage(
             .await
             .forward::<StageError>("Failed reading the children of the staged tree's root")?
         {
-            for path in &antichain {
-                dirty_moves_above(&repository, &state, path, &mut moved_above).await?;
-            }
+            dirty_moves_above(&repository, &state, &antichain, &mut moved_above).await?;
         }
 
         let ancestors = precreate_shared_ancestors(&walk, &shared_ancestors, &discards).await?;
@@ -1007,40 +1117,64 @@ async fn resolve_stage_target(
     Ok(ResolvedTarget::Single(relative_path))
 }
 
-/// Adds to `moved` each directory above `path` that is marked dirty as moved, the outermost first,
-/// once, as a stage of a node inside such a directory stages the directory's whole move once the
-/// walks are done ([`stage_directory_moves`]). A staged node below one gives it the bare staged
-/// bit, which its move bit then reads as a staged move beside, so the staged bit decides nothing.
-/// The lookup stops at the first name `state` lacks and at a link, whose nodes another state
-/// numbers.
+/// Adds to `moved` each directory above a path of `targets` that is marked dirty as moved, the
+/// outermost first, once, as a stage of a node inside such a directory stages the directory's whole
+/// move once the walks are done ([`stage_directory_moves`]). A staged node below one gives it the
+/// bare staged bit, which its move bit then reads as a staged move beside, so the staged bit decides
+/// nothing. The lookup of a path stops at the first name `state` lacks and at a link, whose nodes
+/// another state numbers.
+///
+/// The targets come in subtree order, so a target's directories are taken from the one before it
+/// as far as their paths share them, and a directory above several targets answers its children
+/// from one listing ([`TargetDirectory`]), rather than a search of its chain for each.
 async fn dirty_moves_above(
     repository: &Arc<RepositoryContext>,
     state: &State,
-    path: &RelativePath,
+    targets: &[RelativePath],
     moved: &mut Vec<NodeID>,
 ) -> Result<(), StageError> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    let mut at = ROOT_NODE;
-    for segment in parent.split('/').filter(|segment| !segment.is_empty()) {
-        let Ok(child) = state
-            .find_subnode(repository.clone(), at, crate::hash::hash_string(segment))
-            .await
-        else {
-            return Ok(());
+    let mut above = vec![(ROOT_NODE, TargetDirectory::Unnamed)];
+    let mut previous = "";
+    for path in targets {
+        let parent = path.parent().unwrap_or("");
+        let shared = if parent.is_empty() || previous.is_empty() {
+            0
+        } else {
+            crate::util::path::shared_component_depth(previous, parent)
         };
-        let node = state
-            .node(repository.clone(), child)
-            .await
-            .forward::<StageError>("Failed to read a directory above a staged path")?;
-        if node.is_link() || !node.is_directory() {
-            return Ok(());
+        above.truncate(shared + 1);
+        previous = parent;
+        let segments = parent.split('/').filter(|segment| !segment.is_empty());
+        for segment in segments.skip(above.len() - 1) {
+            let Some((directory, children)) = above.last_mut() else {
+                break;
+            };
+            let name_hash = crate::hash::hash_string(segment);
+            let child = match children
+                .known(repository, state, *directory, name_hash)
+                .await?
+            {
+                KnownChild::Resolved(child) => child,
+                KnownChild::Unresolved => state
+                    .find_subnode(repository.clone(), *directory, name_hash)
+                    .await
+                    .ok(),
+            };
+            let Some(child) = child else {
+                break;
+            };
+            let node = state
+                .node(repository.clone(), child)
+                .await
+                .forward::<StageError>("Failed to read a directory above a staged path")?;
+            if node.is_link() || !node.is_directory() {
+                break;
+            }
+            if node.is_dirty_move() && !moved.contains(&child) {
+                moved.push(child);
+            }
+            above.push((child, TargetDirectory::Unnamed));
         }
-        if node.is_dirty_move() && !moved.contains(&child) {
-            moved.push(child);
-        }
-        at = child;
     }
     Ok(())
 }
@@ -1453,6 +1587,7 @@ pub async fn stage_move(
             operation,
             NodeMapping::root(repository.clone(), state.clone()),
             parent_path,
+            KnownChild::Unresolved,
             stats.clone(),
             parent_options,
             None, // TODO(vri): UCS-18009 - Implement stage move for linked changes

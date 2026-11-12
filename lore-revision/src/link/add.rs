@@ -33,6 +33,7 @@ use crate::repository::clone::LoreRepositoryCloneBeginEventData;
 use crate::repository::clone::LoreRepositoryCloneCountData;
 use crate::repository::clone::LoreRepositoryCloneEndEventData;
 use crate::stage;
+use crate::stage::KnownChild;
 use crate::stage::StageOptions;
 use crate::state::NodeMapping;
 use crate::state::State;
@@ -517,6 +518,7 @@ async fn create_link_mount(
             operation.clone(),
             innermost,
             remainder_parent.freeze(),
+            KnownChild::Unresolved,
             Arc::default(),
             StageOptions {
                 no_children: true,

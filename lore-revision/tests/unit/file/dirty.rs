@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::Hash;
 use lore_revision::file::dirty::*;
 use lore_revision::filter::Filter;
 use lore_revision::filter::FilterStates;
@@ -17,18 +18,26 @@ use lore_revision::node::NodeFlags;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
+use lore_revision::state::step_counting;
 use lore_revision::util::path::RelativePath;
 use lore_revision::util::path::RelativePathBuf;
+use lore_storage::hash::hash_string;
 
+use crate::dirty_move_fixture::children_named;
 use crate::dirty_move_fixture::committed;
 use crate::dirty_move_fixture::dirtied;
 use crate::dirty_move_fixture::dirty_moved;
+use crate::dirty_move_fixture::holds as fixture_holds;
+use crate::dirty_move_fixture::made_directory;
 use crate::dirty_move_fixture::node_at;
+use crate::dirty_move_fixture::node_id_at;
+use crate::dirty_move_fixture::stage_path;
 use crate::dirty_move_fixture::with_instance;
 use crate::dirty_move_fixture::written;
 use crate::fs::filesystem_provider::TestFilesystemProvider;
 use crate::fs::filesystem_provider::test_store_create;
 use crate::helper::RepositoryContextCreationArgsExt;
+use crate::helper::TestRepository;
 use crate::helper::default_repository_creation_args;
 
 /// Every path a call names is read through the one operation it opens, whatever the call
@@ -539,4 +548,279 @@ async fn holds(state: &Arc<State>, repository: &Arc<RepositoryContext>, path: &s
         .find_node_link(repository.clone(), path)
         .await
         .is_ok_and(|link| link.is_valid())
+}
+
+/// The chain steps the calling thread's finds and children walks have taken.
+fn steps_on_this_thread() -> u64 {
+    step_counting::set_chain_step_counting(true);
+    step_counting::thread_chain_steps() + step_counting::thread_walk_steps()
+}
+
+/// Marks `path` below `instance` dirty, answering with the staged revision and the chain steps
+/// the call took on this thread.
+async fn dirtied_counting(instance: &TestRepository, path: &str) -> (Hash, u64) {
+    let before = steps_on_this_thread();
+    let signature = dirty(
+        instance.repository.clone(),
+        LoreArray::from_vec(vec![LoreString::from(&instance.path.join(path))]),
+    )
+    .await
+    .expect("the dirty marks");
+    (signature, steps_on_this_thread() - before)
+}
+
+/// `count` file paths in `dir`.
+fn files_in(dir: &str, count: usize) -> Vec<String> {
+    (0..count).map(|index| format!("{dir}/f{index}")).collect()
+}
+
+/// How many children of the directory at `path` in the staged revision `signature` `marked` holds
+/// for.
+async fn children_marked(
+    instance: &TestRepository,
+    signature: Hash,
+    path: &str,
+    marked: impl Fn(&Node) -> bool,
+) -> usize {
+    let staged = State::deserialize(instance.repository.clone(), signature)
+        .await
+        .expect("the staged state");
+    let dir = node_id_at(instance, &staged, path).await;
+    let children = staged
+        .node_children(instance.repository.clone(), dir)
+        .await
+        .expect("the directory's children");
+    let mut count = 0;
+    for child in children {
+        let node = staged
+            .node(instance.repository.clone(), child)
+            .await
+            .expect("the child's record");
+        count += usize::from(marked(&node));
+    }
+    count
+}
+
+/// Marking a wide directory dirty resolves each entry of the working tree's listing from one
+/// listing of the directory in each tree, and each child the working tree lacks from those too:
+/// its new files, with nothing staged, where the trees share one State; then its unchanged files
+/// and its deleted files, with a staged tree of its own. Each costs the walk a few steps per child
+/// at most, where a search of the chain for each name costs N(N-1)/2 steps for N, and marks each
+/// child. The deleted files cost a step each in each tree's listing and none more: the children
+/// the working tree lacks come from the current tree's listing.
+#[tokio::test]
+async fn dirtying_a_wide_directory_steps_through_each_child_a_few_times_at_most() {
+    with_instance(|instance| async move {
+        const N: usize = 256;
+        let kept = files_in("kept", N);
+        let committing: Vec<&str> = ["new/seed"]
+            .into_iter()
+            .chain(kept.iter().map(String::as_str))
+            .collect();
+        committed(&instance, &committing).await;
+        let added = files_in("new", N);
+        written(
+            &instance,
+            &added.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let (signature, steps) = dirtied_counting(&instance, "new").await;
+        assert!(steps < 4 * N as u64, "the new files took {steps} steps");
+        let adds = children_marked(&instance, signature, "new", Node::is_dirty_add).await;
+        assert_eq!(adds, N, "the new files are marked added");
+        let (signature, steps) = dirtied_counting(&instance, "kept").await;
+        assert!(
+            steps < 4 * N as u64,
+            "the unchanged files took {steps} steps"
+        );
+        let modifies = children_marked(&instance, signature, "kept", Node::is_dirty_modify).await;
+        assert_eq!(modifies, N, "the unchanged files are marked");
+        for file in &kept {
+            std::fs::remove_file(instance.path.join(file)).expect("the delete on disk");
+        }
+        let (signature, steps) = dirtied_counting(&instance, "kept").await;
+        assert!(steps < 3 * N as u64, "the deleted files took {steps} steps");
+        let deletes = children_marked(&instance, signature, "kept", Node::is_dirty_delete).await;
+        assert_eq!(deletes, N, "the deleted files are marked deleted");
+    })
+    .await;
+}
+
+/// Marking dirty a directory of new subdirectories, half of them empty and half holding a new file,
+/// adds a node for each, counted as the walk's own add, so the walk steps through each child a few
+/// times at most and marks each subdirectory added.
+#[tokio::test]
+async fn dirtying_a_directory_of_new_directories_steps_through_each_a_few_times_at_most() {
+    with_instance(|instance| async move {
+        const N: usize = 256;
+        committed(&instance, &["wide/seed"]).await;
+        for index in 0..N {
+            made_directory(&instance, &format!("wide/d{index}"));
+            if index % 2 == 0 {
+                written(&instance, &[&format!("wide/d{index}/file")]);
+            }
+        }
+        let (signature, steps) = dirtied_counting(&instance, "wide").await;
+        assert!(
+            steps < 4 * N as u64,
+            "the new directories took {steps} steps"
+        );
+        let adds = children_marked(&instance, signature, "wide", |node| {
+            node.is_directory() && node.is_dirty_add()
+        })
+        .await;
+        assert_eq!(adds, N, "the new directories are marked added");
+    })
+    .await;
+}
+
+/// Two new names in one directory differing only in case, as a case-sensitive file system holds
+/// them side by side, take one node: the second finds the node added for the first, which the
+/// directory's listing, taken before that add, lacks. A case-insensitive file system holds one of
+/// the names, which takes one node all the same.
+#[tokio::test]
+async fn two_new_case_variants_in_one_directory_take_one_node() {
+    with_instance(|instance| async move {
+        committed(&instance, &["d/seed"]).await;
+        written(&instance, &["d/Rock.mesh", "d/rock.mesh"]);
+        let (signature, _) = dirtied_counting(&instance, "d").await;
+        let staged = State::deserialize(instance.repository.clone(), signature)
+            .await
+            .expect("the staged state");
+        let d = staged
+            .find_node_link(instance.repository.clone(), "d")
+            .await
+            .expect("d")
+            .node;
+        let children = staged
+            .node_children_with_name_hash(instance.repository.clone(), d)
+            .await
+            .expect("d's children");
+        let variants = children
+            .iter()
+            .filter(|&&(_, name_hash)| name_hash == hash_string("rock.mesh"))
+            .count();
+        assert_eq!(variants, 1, "d's children: {children:?}");
+    })
+    .await;
+}
+
+/// Two new directories differing only in case, as a case-sensitive file system holds them side by
+/// side, where the staged tree holds their name twice, as a committed file staged for delete and
+/// as the directory staged in its place: each takes the directory, as a search of the chain does,
+/// whichever the file system lists first, so the file new in each is added below the directory.
+/// The directory holds more entries than the walk searches for, so it is listed. A
+/// case-insensitive file system holds one of the names, so the test has nothing to check there.
+#[tokio::test]
+async fn case_variants_of_a_staged_type_change_each_take_the_directory() {
+    with_instance(|instance| async move {
+        if crate::helper::case_insensitive(&instance.path) {
+            return;
+        }
+        let seeds = files_in("d", SEARCHED_CHILDREN);
+        let committing: Vec<&str> = ["d/x"]
+            .into_iter()
+            .chain(seeds.iter().map(String::as_str))
+            .collect();
+        let first = committed(&instance, &committing).await;
+        let d = node_id_at(&instance, &first, "d").await;
+        std::fs::remove_file(instance.path.join("d/x")).expect("the delete on disk");
+        made_directory(&instance, "d/x");
+        let typed = stage_path(&instance, "d").await;
+        assert_eq!(
+            children_named(&instance, &typed, d, "x").await,
+            2,
+            "the type change holds the name twice"
+        );
+        written(&instance, &["d/x/lower", "d/X/upper"]);
+        let staged = dirtied(&instance, "d").await;
+        for path in ["d/x/lower", "d/x/upper"] {
+            assert!(
+                fixture_holds(&instance, &staged, path).await,
+                "{path} is added below the directory"
+            );
+        }
+    })
+    .await;
+}
+
+/// A directory the staged tree holds as a directory and the current tree as a link, to a revision
+/// the store lacks, is walked without the linked State: a node that is not a directory lists no
+/// children, as a search of it finds none, so the walk marks the new files below the directory.
+/// One new file the walk searches for, and more it lists the directory for.
+#[tokio::test]
+async fn a_directory_the_current_tree_holds_as_a_link_is_walked_without_the_linked_state() {
+    for count in [1, SEARCHED_CHILDREN + 1] {
+        a_directory_held_as_a_link_is_walked(count).await;
+    }
+}
+
+/// The walk of [`a_directory_the_current_tree_holds_as_a_link_is_walked_without_the_linked_state`]
+/// with `count` new files.
+async fn a_directory_held_as_a_link_is_walked(count: usize) {
+    with_instance(|instance| async move {
+        let added = files_in("lib", count);
+        written(
+            &instance,
+            &added.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let repository = instance.repository.clone();
+        let current = State::new();
+        let link = Node {
+            flags: NodeFlags::Link.bits(),
+            name_hash: hash_string("lib"),
+            child: ROOT_NODE,
+            address: lore_base::types::Address {
+                hash: Hash::from_u64(0x11b),
+                context: uuid::Uuid::now_v7().into(),
+            },
+            ..Default::default()
+        };
+        current
+            .node_add(repository.clone(), ROOT_NODE, link, "lib")
+            .await
+            .expect("the link");
+        let staged = State::new();
+        staged
+            .node_add(
+                repository.clone(),
+                ROOT_NODE,
+                Node {
+                    name_hash: hash_string("lib"),
+                    ..Default::default()
+                },
+                "lib",
+            )
+            .await
+            .expect("the directory");
+        let walk = DirtyWalk::new(
+            repository
+                .file_system()
+                .begin_operation()
+                .await
+                .expect("beginning an operation"),
+            repository.clone(),
+            current,
+            staged.clone(),
+            Arc::new(DirtyStats::default()),
+            None,
+        )
+        .await
+        .expect("reading the link registry");
+        let root = DirtyNodes {
+            current: ROOT_NODE,
+            staged: ROOT_NODE,
+        };
+
+        dirty_directory(&walk, root, &RelativePath::new(), FilterStates::ROOT)
+            .await
+            .expect("the walk reads no linked State");
+
+        for path in &added {
+            assert!(
+                fixture_holds(&instance, &staged, path).await,
+                "{count}: {path}"
+            );
+        }
+    })
+    .await;
 }

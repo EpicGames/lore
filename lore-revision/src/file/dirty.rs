@@ -13,6 +13,7 @@ use crate::file::stage::is_path_under_layer_mask;
 use crate::file::stage::route_layer_paths;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::fs::filesystem_provider::DirectoryEntry;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
@@ -41,6 +42,11 @@ use crate::node::SiblingCycleGuard;
 use crate::path::emit_path_ignore;
 use crate::repository::RepositoryContext;
 use crate::repository::is_reserved_node_name;
+use crate::stage::DirectoryChildren;
+use crate::stage::NameHashIndex;
+use crate::stage::claim_child;
+use crate::stage::directory_children;
+use crate::stage::find_from_listing;
 use crate::state::Ext;
 use crate::state::LinkReference;
 use crate::state::Mark;
@@ -753,7 +759,7 @@ async fn dirty_resolved_path(
             states,
         )
     };
-    marking.await
+    marking.await.map(drop)
 }
 
 /// Whether the trees track what `nodes` names as a directory where `is_directory` says, or as either
@@ -997,6 +1003,8 @@ async fn dirty_directory_node(
 ///
 /// `states` is the filter verdict the caller reached for `relative_path`, which
 /// the recursions below inherit instead of folding the path again per node.
+///
+/// Answers whether it added a node to the staged directory `parent` reaches, prepending it there.
 #[allow(clippy::too_many_arguments)]
 async fn dirty_path(
     walk: &DirtyWalk,
@@ -1006,7 +1014,7 @@ async fn dirty_path(
     relative_path: &RelativePath,
     info: FileInfo,
     states: FilterStates,
-) -> Result<(), DirtyError> {
+) -> Result<bool, DirtyError> {
     let DirtyWalk {
         repository,
         state_staged,
@@ -1019,7 +1027,7 @@ async fn dirty_path(
         && is_path_under_layer_mask(relative_path.as_str(), mask)
     {
         lore_trace!("Path inside layer mount, not a parent path: {relative_path}");
-        return Ok(());
+        return Ok(false);
     }
 
     let (exists_on_disk, is_dir) = (info.exists(), info.is_dir());
@@ -1029,10 +1037,10 @@ async fn dirty_path(
     {
         if !exists_on_disk {
             lore_trace!("Link mount absent from the working tree, not marked: {relative_path}");
-            return Ok(());
+            return Ok(false);
         }
         let (linked, base) = linked_walk(walk, reference, link.linked_node()).await?;
-        return Box::pin(dirty_path(
+        Box::pin(dirty_path(
             &linked,
             base,
             staged_node(&linked, base).await,
@@ -1041,7 +1049,8 @@ async fn dirty_path(
             info,
             states,
         ))
-        .await;
+        .await?;
+        return Ok(false);
     }
 
     let nodes = apart_from_moved(nodes, staged.is_some_and(|node| node.is_dirty_move()));
@@ -1063,8 +1072,9 @@ async fn dirty_path(
         let Some(staged_node) =
             dirty_directory_node(walk, nodes, parent, in_current_revision, relative_path).await?
         else {
-            return Ok(());
+            return Ok(false);
         };
+        let added = !nodes.staged.is_valid_or_root_node_id();
         // Directory on disk -> recurse children
         lore_trace!("Dirty directory recurse: {}", relative_path.as_str());
         dirty_directory(
@@ -1077,13 +1087,14 @@ async fn dirty_path(
             states,
         )
         .await?;
+        return Ok(added);
     } else if exists_on_disk && in_current_revision {
         let Some(action) = content_change(staged) else {
             lore_trace!("Dirty move kept: {}", relative_path.as_str());
-            return Ok(());
+            return Ok(false);
         };
         if walk.compare && file_matches_current(walk, nodes.current, relative_path, &info).await? {
-            return Ok(());
+            return Ok(false);
         }
 
         // File on disk + in revision -> Modify
@@ -1108,6 +1119,7 @@ async fn dirty_path(
             match parent.resolve(walk).await? {
                 ParentChain::Reached(parent) => {
                     dirty_add(walk, parent, relative_path.name()).await?;
+                    return Ok(true);
                 }
                 ParentChain::Through(below) => {
                     skip_through_no_directory(walk, relative_path, below + 1);
@@ -1162,7 +1174,7 @@ async fn dirty_path(
         );
     }
 
-    Ok(())
+    Ok(false)
 }
 
 /// The dirty action that marks a change to the content of the file the staged tree holds as
@@ -1605,6 +1617,13 @@ async fn mark_children_dirty_moved(
     mark_children_dirty_moved_recursive(repository, state, parent_node, undelete).await
 }
 
+/// Most entries of a working tree's directory whose children a dirty walk finds by a search of
+/// each tree's chain, and most children the working tree lacks there whose staged side it finds so:
+/// a few searches cost less than a listing, and allocate nothing. Past either, the walk lists the
+/// directory once.
+#[lore_macro::test_pub]
+const SEARCHED_CHILDREN: usize = 8;
+
 /// Recursively process a directory, marking each child as dirty based on filesystem state.
 ///
 /// `nodes` names the directory in each tree, and every child is reached from it rather than
@@ -1612,11 +1631,15 @@ async fn mark_children_dirty_moved(
 ///
 /// `states` is the filter verdict for `dir_path`, which each child steps from.
 ///
-/// The listing names everything the working tree holds here, so the pass that follows settles
-/// which of the current revision's children are deletes from those names rather than by reading
-/// the working tree a second time. The names are collected ahead of the filter, a child the
-/// filter leaves out standing on disk all the same. A child the staged tree holds elsewhere is
-/// no delete ([`held_elsewhere`]).
+/// Each entry of the working tree's directory takes its child in each tree from one listing of
+/// the directory in each tree ([`ListedChildren`]), or by a search of each tree's chain where the
+/// directory holds no more than [`SEARCHED_CHILDREN`] entries.
+///
+/// The entries name everything the working tree holds here, so the pass that follows settles
+/// which of the current revision's children are deletes from those names, rather than by reading
+/// the working tree a second time. The names count ahead of the filter, a child the filter leaves
+/// out standing on disk all the same. A child the staged tree holds elsewhere is no delete
+/// ([`held_elsewhere`]).
 #[lore_macro::test_pub]
 fn dirty_directory<'a>(
     walk: &'a DirtyWalk,
@@ -1625,28 +1648,23 @@ fn dirty_directory<'a>(
     states: FilterStates,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DirtyError>> + Send + 'a>> {
     Box::pin(async move {
-        let mut entries = walk
-            .operation
-            .read_directory(dir_path)
-            .await
-            .forward_with::<DirtyError, _>(|| format!("Failed to read directory {dir_path}"))?;
+        let entries = directory_entries(walk, dir_path).await?;
+        let mut listed = if entries.len() > SEARCHED_CHILDREN {
+            Some(ListedChildren::list(walk, nodes).await?)
+        } else {
+            None
+        };
 
-        let deletes_to_find = nodes.current.is_valid_or_root_node_id();
-        let mut present = Vec::new();
         let force = execution_context().globals().force();
-        while let Some(entry) = entries.next().await {
-            let entry = entry.forward::<DirtyError>("Failed to read directory entry")?;
-            if is_reserved_node_name(&entry.name) {
-                continue;
-            }
-            if deletes_to_find {
-                present.push(entry.name_hash);
-            }
+        for entry in &entries {
             let child_path = dir_path.push_into_buf(&entry.name).freeze();
 
             // Looked up before the filter is asked: a node the tree tracks as the kind the entry is
             // is past the ignore slot. The trees are searched only where the filter would drop it.
-            let child_nodes = nodes.child(walk, entry.name_hash).await;
+            let child_nodes = match listed.as_mut() {
+                Some(listed) => listed.child(walk, &entries, entry.name_hash).await?,
+                None => nodes.child(walk, entry.name_hash).await,
+            };
             let is_directory = entry.info.is_dir();
             let tracked = !force
                 && walk
@@ -1667,7 +1685,7 @@ fn dirty_directory<'a>(
                 continue;
             }
 
-            dirty_path(
+            if dirty_path(
                 walk,
                 child_nodes,
                 staged_node(walk, child_nodes).await,
@@ -1676,70 +1694,260 @@ fn dirty_directory<'a>(
                 entry.info,
                 child_states,
             )
-            .await?;
+            .await?
+                && let Some(listed) = listed.as_mut()
+            {
+                listed.staged.count_own_add();
+            }
         }
 
-        if deletes_to_find {
-            present.sort_unstable();
-            let children = walk
-                .state_current
-                .node_children(walk.repository.clone(), nodes.current)
-                .await
-                .forward::<DirtyError>("Failed to get directory children")?;
+        match listed.as_mut() {
+            Some(listed) => dirty_unclaimed(walk, nodes, dir_path, states, listed).await,
+            None => dirty_unnamed(walk, nodes, dir_path, states, &entries).await,
+        }
+    })
+}
 
-            for &child_id in &children {
-                let Some((current, child_name)) = walk
-                    .state_current
-                    .node_and_name_or_skip(walk.repository.clone(), child_id)
-                    .await
-                    .forward::<DirtyError>("Failed to get child name")?
-                else {
-                    continue;
-                };
-                let name_hash = crate::hash::hash_string(&child_name);
-                if present.binary_search(&name_hash).is_ok() {
-                    continue;
-                }
-                let child_rel = dir_path.push_into_buf(&child_name).freeze();
-                drop(child_name);
+/// Marks the children of the current directory `nodes` names that no entry of the working tree's
+/// directory `dir_path` claimed in `listed`, the listings the entries took their children from.
+/// Each one's staged side comes from the staged listing alone: no entry carries its name hash, so
+/// no node the walk added does. The staged listing's mark is dropped first, since the pass may
+/// discard a child ([`DirectoryChildren::drop_mark`]).
+async fn dirty_unclaimed(
+    walk: &DirtyWalk,
+    nodes: DirtyNodes,
+    dir_path: &RelativePath,
+    states: FilterStates,
+    listed: &mut ListedChildren,
+) -> Result<(), DirtyError> {
+    listed.staged.drop_mark();
+    let Some(current) = listed.current() else {
+        return Ok(());
+    };
+    for (child, name_hash) in current.unclaimed_by_name_hash() {
+        let staged = listed.staged.holds(name_hash).unwrap_or(INVALID_NODE);
+        dirty_absent_child(walk, nodes.staged, dir_path, states, child, staged).await?;
+    }
+    Ok(())
+}
 
-                let Some(child_states) = absent_child_states(walk, states, &child_rel, &current)
-                else {
-                    continue;
-                };
-                // The current side is the child being enumerated, so only the staged side
-                // is looked up.
-                let staged = subnode(
+/// Marks the children of the current directory `nodes` names that no entry of `entries`, the
+/// working tree's directory `dir_path`, carries the name hash of, where the walk listed neither
+/// tree: from a listing of the current directory, with each one's staged side found by a search
+/// of the staged chain, or from a listing of the staged directory for more than
+/// [`SEARCHED_CHILDREN`] of them.
+async fn dirty_unnamed(
+    walk: &DirtyWalk,
+    nodes: DirtyNodes,
+    dir_path: &RelativePath,
+    states: FilterStates,
+    entries: &[DirectoryEntry],
+) -> Result<(), DirtyError> {
+    if !nodes.current.is_valid_or_root_node_id() {
+        return Ok(());
+    }
+    let Some((mut absent, _)) =
+        directory_children(&walk.repository, &walk.state_current, nodes.current)
+            .await
+            .forward::<DirtyError>("Failed to list the current directory's children")?
+    else {
+        return Ok(());
+    };
+    absent.retain(|&(_, name_hash)| entries.iter().all(|entry| entry.name_hash != name_hash));
+    let staged = if absent.len() > SEARCHED_CHILDREN {
+        let listed = directory_children(&walk.repository, &walk.state_staged, nodes.staged)
+            .await
+            .forward::<DirtyError>("Failed to list the staged directory's children")?
+            .map_or_else(Vec::new, |(listed, _)| listed);
+        Some(NameHashIndex::new(listed))
+    } else {
+        None
+    };
+    for &(child, name_hash) in &absent {
+        let staged = match &staged {
+            Some(listed) => listed.first(name_hash).unwrap_or(INVALID_NODE),
+            None => {
+                subnode(
                     &walk.state_staged,
                     &walk.repository,
                     nodes.staged,
                     name_hash,
                 )
-                .await;
-                if !staged.is_valid_or_root_node_id()
-                    && held_elsewhere(walk, child_id, current.node_type()).await?
-                {
-                    continue;
-                }
-                let child_nodes = DirtyNodes {
-                    current: child_id,
-                    staged,
-                };
-                dirty_path(
-                    walk,
-                    child_nodes,
-                    staged_node(walk, child_nodes).await,
-                    StagedParent::node(nodes.staged),
-                    &child_rel,
-                    FileInfo::NotExist,
-                    child_states,
-                )
-                .await?;
+                .await
             }
-        }
+        };
+        dirty_absent_child(walk, nodes.staged, dir_path, states, child, staged).await?;
+    }
+    Ok(())
+}
 
-        Ok(())
-    })
+/// Marks `child`, a child of the current directory that the working tree lacks below `dir_path`,
+/// whose verdict is `states`, with `staged` the child of the staged directory `parent` carrying
+/// its name: deleted, unless the filter leaves it out or the staged tree holds it elsewhere
+/// ([`held_elsewhere`]).
+///
+/// A function of its own, so the child's path sits in the directory's future only while it runs.
+/// The child's node is read in a block of its own, so the future holds only its type across the
+/// marking.
+async fn dirty_absent_child(
+    walk: &DirtyWalk,
+    parent: NodeID,
+    dir_path: &RelativePath,
+    states: FilterStates,
+    child: NodeID,
+    staged: NodeID,
+) -> Result<(), DirtyError> {
+    let (child_rel, child_states, node_type) = {
+        let Some((current, child_name)) = walk
+            .state_current
+            .node_and_name_or_skip(walk.repository.clone(), child)
+            .await
+            .forward::<DirtyError>("Failed to get child name")?
+        else {
+            return Ok(());
+        };
+        let child_rel = dir_path.push_into_buf(&child_name).freeze();
+        drop(child_name);
+        let Some(child_states) = absent_child_states(walk, states, &child_rel, &current) else {
+            return Ok(());
+        };
+        (child_rel, child_states, current.node_type())
+    };
+    if !staged.is_valid_or_root_node_id() && held_elsewhere(walk, child, node_type).await? {
+        return Ok(());
+    }
+    let child_nodes = DirtyNodes {
+        current: child,
+        staged,
+    };
+    dirty_path(
+        walk,
+        child_nodes,
+        staged_node(walk, child_nodes).await,
+        StagedParent::node(parent),
+        &child_rel,
+        FileInfo::NotExist,
+        child_states,
+    )
+    .await
+    .map(drop)
+}
+
+/// The entries of the working tree's directory `dir_path`, leaving out the repository's own
+/// directory.
+async fn directory_entries(
+    walk: &DirtyWalk,
+    dir_path: &RelativePath,
+) -> Result<Vec<DirectoryEntry>, DirtyError> {
+    let mut listing = walk
+        .operation
+        .read_directory(dir_path)
+        .await
+        .forward_with::<DirtyError, _>(|| format!("Failed to read directory {dir_path}"))?;
+    let mut entries = Vec::new();
+    while let Some(entry) = listing.next().await {
+        let entry = entry.forward::<DirtyError>("Failed to read directory entry")?;
+        if !is_reserved_node_name(&entry.name) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+/// What the current tree holds of a directory a dirty walk descends.
+enum CurrentChildren {
+    /// The staged directory, in the one State the trees share, which answers for both.
+    Shared,
+    /// The directory's children, listed once.
+    Listed(DirectoryChildren),
+    /// No directory.
+    Absent,
+}
+
+/// The children of a directory a dirty walk descends, listed once in each tree, from which each
+/// entry of the working tree's directory takes its child by name hash ([`find_from_listing`]).
+struct ListedChildren {
+    /// The staged directory's children, with the mark of the chain their listing began from.
+    staged: DirectoryChildren,
+    /// The staged directory.
+    staged_directory: NodeID,
+    current: CurrentChildren,
+}
+
+impl ListedChildren {
+    /// The children of the directory `nodes` names, in each tree, the staged one holding it. A node
+    /// that is not a directory, a link included, lists none.
+    async fn list(walk: &DirtyWalk, nodes: DirtyNodes) -> Result<Self, DirtyError> {
+        let staged = match directory_children(&walk.repository, &walk.state_staged, nodes.staged)
+            .await
+            .forward::<DirtyError>("Failed to list the staged directory's children")?
+        {
+            Some((listed, mark)) => DirectoryChildren::new(listed, Some(mark)),
+            None => DirectoryChildren::new(Vec::new(), None),
+        };
+        let current = if nodes.current == nodes.staged
+            && Arc::ptr_eq(&walk.state_current, &walk.state_staged)
+        {
+            CurrentChildren::Shared
+        } else if nodes.current.is_valid_or_root_node_id() {
+            let listed = directory_children(&walk.repository, &walk.state_current, nodes.current)
+                .await
+                .forward::<DirtyError>("Failed to list the current directory's children")?
+                .map_or_else(Vec::new, |(listed, _)| listed);
+            CurrentChildren::Listed(DirectoryChildren::new(listed, None))
+        } else {
+            CurrentChildren::Absent
+        };
+        Ok(Self {
+            staged,
+            staged_directory: nodes.staged,
+            current,
+        })
+    }
+
+    /// The child the entry of `entries` carrying `name_hash` names in each tree, as
+    /// [`DirtyNodes::child`] finds it.
+    async fn child(
+        &mut self,
+        walk: &DirtyWalk,
+        entries: &[DirectoryEntry],
+        name_hash: u64,
+    ) -> Result<DirtyNodes, DirtyError> {
+        let staged =
+            match find_from_listing(&mut self.staged, &walk.state_staged, entries, name_hash) {
+                Some(found) => found,
+                None => claim_child(
+                    &walk.repository,
+                    &walk.state_staged,
+                    self.staged_directory,
+                    &mut self.staged,
+                    name_hash,
+                )
+                .await
+                .forward_any::<DirtyError>("Failed to search the staged directory's children")?,
+            }
+            .unwrap_or(INVALID_NODE);
+        let current = match &mut self.current {
+            CurrentChildren::Shared => staged,
+            CurrentChildren::Listed(children) => {
+                find_from_listing(children, &walk.state_current, entries, name_hash)
+                    .flatten()
+                    .unwrap_or(INVALID_NODE)
+            }
+            CurrentChildren::Absent => INVALID_NODE,
+        };
+        Ok(DirtyNodes { current, staged })
+    }
+
+    /// The current directory's children, which the staged listing holds where the trees share
+    /// their State; `None` where the current tree holds no directory.
+    fn current(&self) -> Option<&DirectoryChildren> {
+        match &self.current {
+            CurrentChildren::Shared => Some(&self.staged),
+            CurrentChildren::Listed(children) => Some(children),
+            CurrentChildren::Absent => None,
+        }
+    }
 }
 
 /// Whether the staged tree holds `node`, of `node_type`, a child of the current revision's
