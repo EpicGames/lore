@@ -328,8 +328,9 @@ first, lose the socket and leave dead endpoints.
   a reconnect or a new storage session does (`in_serving_context`,
   `ExecutionContext::serving`). A mount restored at service start has no caller and reads the
   service's own.
-- With debug assertions, a plain unmount first invalidates the root's children and waits up to
-  2 s for the kernel's FORGETs, and after it warns about inodes still holding lookups
+- With debug assertions, a plain unmount first invalidates the root's children, again every
+  50 ms while the inode table counts lookups, until it has counted none for 100 ms or 2 s have
+  passed. After it, the unmount warns about inodes still holding lookups
   (`drain_kernel_lookups`, `check_leaks`, `fs/fuse/mount.rs`).
 
 ### The served State and swaps
@@ -727,7 +728,8 @@ State is rebuilt at every mount.
   `write/` answers `NotSupported` (`FuseOperation::writable`, `operation.rs`).
 - **Desktop trash.** GNOME's `gvfsd-trash` treats every lore mount as a volume of its own and
   looks up `.Trash` and `.Trash-<uid>` in its root
-  (`loading_a_fuse_instance_never_enters_the_mount`, `lore-revision/tests/fuse_mount.rs`). A
+  (`loading_a_fuse_instance_never_enters_the_mount`, `lore-revision/tests/fuse_mount.rs`), and
+  any file created there, which a debug build's unmount invalidates again. A
   file-manager delete in a virtual clone may therefore create `.Trash-<uid>` at the repository
   root, where status shows it; an ordinary clone uses `~/.local/share/Trash`. The `x-gvfs-notrash`
   mount option would opt out, but `fusermount3` fails to set it (lore-9fr).
@@ -1164,6 +1166,7 @@ in the code.
 | `MAX_READ` | constant (`fs/fuse/mount.rs`) | 1 MiB | `max_read` and `st_blksize`. |
 | `UNMOUNT_BUSY_RETRIES`, `UNMOUNT_BUSY_BACKOFF` | constants (`src/mount.rs`) | 5, 20 ms | Busy-unmount retries. |
 | `DRAIN_WAIT` | constant (`fs/fuse/mount.rs`) | 2 s | Debug-build FORGET drain on plain unmount. |
+| `DRAIN_RESEND`, `DRAIN_SETTLE` | constants (`fs/fuse/mount.rs`) | 50 ms, 100 ms | The drain's interval between invalidations, and how long the table must count no lookups before it ends. |
 | `vfs.base_time` | instance config (`VfsConfig::base_time`, `lore-revision/src/repository.rs`) | clone time | Time every path reports until a swap records one. |
 | `LORE_IMMUTABLE_STORE_VERIFY_WRITE` | env (`LocalImmutableStore::new_claimed`, `lore-storage/src/local/immutable_store.rs`) | off | `1` or `true` verifies each local store write by read-back and rehash. |
 | `LORE_MAX_CONNECTIONS` | env of the service process, or `--max-connections` (`lore_globals_from_args`, `lore-client/src/cli/cli.rs`) | 1, at most 10 (`storage_connection_count`, `connect_impl`, `lore-transport/src/connection.rs`) | Storage connections the process opens; remote fetches spread over them. The first connection a process makes to a remote fixes the count for its lifetime. Throughput from a distant remote scales with the count ("Remote fetch throughput"). |
@@ -1804,8 +1807,8 @@ Service, stores and platform:
   it goes; the kernel's `fuse.enable_uring` parameter is off by default.
 - **CI** (lore-57l). No workflow installs fuse3 or checks `/dev/fuse`; mount tests skip through
   `skip_without_fuse!` when FUSE is unusable, so a green run does not show they ran.
-- **Debug unmount time** (lore-70p). A plain unmount in a debug build waits up to 2 s (`DRAIN_WAIT`) for
-  FORGETs before unmounting.
+- **Debug unmount time** (lore-70p). A plain unmount in a debug build waits at least 100 ms
+  (`DRAIN_SETTLE`) and up to 2 s (`DRAIN_WAIT`) for FORGETs before unmounting.
 - **Automatic open-mode fallback** (lore-kqn). The service mount always answers OPEN with `ENOSYS`; no code
   selects `KeepCache` for a kernel that lacks `NO_OPEN_SUPPORT`.
 - **Expire-only invalidation** (lore-3fw). `HAS_EXPIRE_ONLY` is negotiated, but swaps send `inval_entry` with

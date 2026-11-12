@@ -32,6 +32,7 @@ use crate::fs::filesystem_provider::StaticDispatchInstanceOperation;
 use crate::fs::fuse::access_recorder::AccessRecorder;
 use crate::fs::fuse::attr::AttrContext;
 use crate::fs::fuse::filesystem::FuseFilesystem;
+use crate::fs::fuse::inode::Name;
 use crate::fs::fuse::inode::ROOT_INO;
 use crate::fs::fuse::notifications::Invalidations;
 use crate::fs::fuse::operation::FuseOperation;
@@ -48,6 +49,13 @@ const MAX_READ: u32 = 1 << 20;
 
 /// How long an unmount checking for leaks waits for the kernel's FORGETs.
 const DRAIN_WAIT: Duration = Duration::from_secs(2);
+
+/// How long an unmount checking for leaks waits for the kernel's FORGETs before it invalidates
+/// the root's children again.
+const DRAIN_RESEND: Duration = Duration::from_millis(50);
+
+/// How long the inode table must count no lookups before an unmount checking for leaks goes on.
+const DRAIN_SETTLE: Duration = Duration::from_millis(100);
 
 /// Leaked inode numbers named in the warning; the full list is in `leaked_lookups`.
 const LEAKS_LOGGED: usize = 32;
@@ -262,18 +270,66 @@ impl FuseMount {
     /// Makes the kernel forget every inode it holds, so the table can be checked against it:
     /// once the superblock is torn down the kernel sends no FORGET for what it still holds.
     /// Invalidating the root's children, by every spelling the kernel may cache them under,
-    /// prunes every dentry beneath them.
+    /// prunes every dentry beneath them. Another process, such as a desktop's file monitor, can
+    /// look a name up again after that, so the invalidations go out again every [`DRAIN_RESEND`]
+    /// while the table counts lookups. The drain ends once the table has counted none for
+    /// [`DRAIN_SETTLE`], or [`DRAIN_WAIT`] after its first invalidations. A lookup made after it
+    /// ends and before the umount still counts as leaked.
     async fn drain_kernel_lookups(&self) {
         let Some(queue) = self.filesystem.notifications() else {
             return;
         };
-        let mut names = Vec::new();
+        let (mut entries, mut names, mut live) = (Vec::new(), Vec::new(), Vec::new());
+        let mut deadline = None;
+        let mut resend = Instant::now();
+        let mut drained_since = None;
+        loop {
+            let now = Instant::now();
+            if self.filesystem.inodes().check_all_zero().is_ok() {
+                if drained_since.is_none() {
+                    #[cfg(feature = "test-util")]
+                    crate::test_util::unmount_drain_emptied().await;
+                }
+                if now - *drained_since.get_or_insert(now) >= DRAIN_SETTLE {
+                    return;
+                }
+            } else {
+                drained_since = None;
+            }
+            if deadline.is_some_and(|deadline| now >= deadline) {
+                return;
+            }
+            if drained_since.is_none() && now >= resend {
+                self.root_child_names(&mut entries, &mut names, &mut live);
+                entries = queue
+                    .send(Invalidations {
+                        entries,
+                        inodes: Vec::new(),
+                    })
+                    .await
+                    .entries;
+                resend = Instant::now() + DRAIN_RESEND;
+                deadline.get_or_insert_with(|| Instant::now() + DRAIN_WAIT);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Fills `entries` with the root's children by every spelling the kernel may cache them
+    /// under, each paired with the root. `names` and `live` are scratch.
+    fn root_child_names(
+        &self,
+        entries: &mut Vec<(u64, Name)>,
+        names: &mut Vec<Name>,
+        live: &mut Vec<u64>,
+    ) {
+        names.clear();
         self.filesystem
             .spellings()
-            .copy_children_of(ROOT_INO, &mut names);
-        let mut live = Vec::new();
-        self.filesystem.inodes().live(&mut live);
-        for ino in live {
+            .copy_children_of(ROOT_INO, names);
+        live.clear();
+        self.filesystem.inodes().live(live);
+        for &ino in live.iter() {
             if let Some(entry) = self.filesystem.inodes().get(ino)
                 && entry.ino != ROOT_INO
                 && entry.parent == ROOT_INO
@@ -283,16 +339,8 @@ impl FuseMount {
         }
         names.sort_unstable();
         names.dedup();
-        queue
-            .send(Invalidations {
-                entries: names.into_iter().map(|name| (ROOT_INO, name)).collect(),
-                inodes: Vec::new(),
-            })
-            .await;
-        let deadline = Instant::now() + DRAIN_WAIT;
-        while self.filesystem.inodes().check_all_zero().is_err() && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        entries.clear();
+        entries.extend(names.drain(..).map(|name| (ROOT_INO, name)));
     }
 
     fn check_leaks(&self) {

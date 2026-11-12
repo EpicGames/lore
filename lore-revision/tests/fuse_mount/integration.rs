@@ -450,6 +450,44 @@ async fn unicode_names_resolve_as_spelled_and_collide_as_they_fold() {
     assert_no_lore_mounts();
 }
 
+/// A name looked up again once the unmount's drain has emptied the table, as a desktop's file
+/// monitor does on a create, is invalidated again before the unmount goes on, so it finds no
+/// lookup left.
+#[tokio::test(flavor = "multi_thread")]
+async fn unmount_drains_a_lookup_made_after_its_invalidations() {
+    skip_without_fuse!();
+    in_service(async {
+        let mounted = Mounted::new(&[("file.txt", b"tracked")]).await;
+        let path = mounted.path.join("file.txt");
+        assert_eq!(read_file(path.clone()).await, b"tracked");
+        let (reached, mut emptied) = tokio::sync::mpsc::unbounded_channel();
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let look_up = async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), emptied.recv())
+                .await
+                .expect("the drain empties the table")
+                .expect("the drain reports it");
+            blocking(move || std::fs::metadata(path))
+                .await
+                .expect("the file is looked up after the invalidations");
+            resume.notify_one();
+            while emptied.recv().await.is_some() {
+                resume.notify_one();
+            }
+        };
+        tokio::join!(
+            lore_revision::test_util::hold_unmount_drains(
+                reached,
+                resume.clone(),
+                mounted.unmount()
+            ),
+            look_up
+        );
+    })
+    .await;
+    assert_no_lore_mounts();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn create_chmod_rename_truncate_and_unlink_succeed() {
     skip_without_fuse!();
