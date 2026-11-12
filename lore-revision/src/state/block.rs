@@ -228,6 +228,13 @@ impl NodeFlags {
             LoreNodeType::Directory
         }
     }
+
+    /// Whether the flags hold a merge conflict not resolved, as [`Node::is_staged_merge_unresolved`]
+    /// reads a node's.
+    pub fn is_staged_merge_unresolved(&self) -> bool {
+        self.contains(NodeFlags::StagedMergeConflict)
+            && !self.contains(NodeFlags::StagedMergeResolved)
+    }
 }
 
 bitflags! {
@@ -547,7 +554,8 @@ impl Node {
     }
 
     /// Check if node carries the add action, staged or dirty: the two halves share their action
-    /// bits, which hold one change at a time
+    /// bits, which hold one change at a time, but for an add taken back, which a merge stages at a
+    /// path this branch lacks: it carries the add and the deletion
     pub fn is_added(&self) -> bool {
         self.is_staged_add() || self.is_dirty_add()
     }

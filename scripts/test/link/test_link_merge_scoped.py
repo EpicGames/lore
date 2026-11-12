@@ -6,6 +6,7 @@ import stat
 import sys
 
 import pytest
+from error_types import UnresolvedConflictError
 from link_helpers import (
     assert_mount_exposes,
     link_pin,
@@ -13,6 +14,7 @@ from link_helpers import (
     make_parent_with_remount,
     setup_link_merge_conflict,
 )
+from lore_parsers import find_status_entry, parse_status_json
 
 pytestmark = pytest.mark.own_vfs(
     "links a repository, which a virtual clone does not hold"
@@ -470,6 +472,98 @@ def test_link_merge_resolve_keeps_the_merged_executable_bit(new_lore_repo, side)
         assert mode & stat.S_IXUSR, f"{instance.path}: {mode:o}"
         with instance.open_file(conflict_file, "r") as f:
             assert f.read() == f"{side}\n"
+
+
+@pytest.mark.smoke
+def test_link_merge_resolve_of_a_recreated_deletion_commits_the_file(new_lore_repo):
+    """A file the current branch deleted inside a linked repository and the incoming branch
+    changed, written again in the working tree and resolved, is committed with its content to
+    the linked repository, and the parent's pin moves to the revision holding it."""
+    link_path = "linked/repo"
+    conflict_file = f"{link_path}/data.txt"
+    urc, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {"data.txt": "base\n"},
+        {"main-file.txt": "main repo content\n"},
+    )
+
+    urc.branch_create("feature-branch")
+    urc.write_commit_push("Feature branch changes", {conflict_file: "theirs\n"})
+
+    urc.branch_switch("main")
+    urc.remove_file(conflict_file)
+    urc.stage(conflict_file)
+    urc.commit("Main branch deletes the file")
+    urc.push()
+    pin_before = link_pin(urc, link_repo.get_id())
+
+    urc.branch_merge_start("feature-branch", link=link_path, no_commit=True)
+    status = parse_status_json(urc.status(json=True))
+    entry = find_status_entry(status, conflict_file)
+    assert entry and entry["action"] == "delete" and entry["flagConflictUnresolved"], (
+        status
+    )
+    urc.write_files({conflict_file: "recreated\n"})
+    urc.branch_merge_resolve(conflict_file)
+    urc.commit("Merge with the deletion resolved")
+    urc.push()
+
+    assert link_pin(urc, link_repo.get_id()) != pin_before
+    clone = urc.clone()
+    with clone.open_file(conflict_file, "r") as f:
+        assert f.read() == "recreated\n"
+
+
+@pytest.mark.smoke
+def test_link_merge_resolve_of_a_removed_conflict_commits_the_deletion(new_lore_repo):
+    """A conflict inside a linked repository whose file the working tree lacks, resolved,
+    commits the file's deletion to the linked repository and leaves no copy the merge wrote
+    beside the path."""
+    urc, link_repo, link_path = setup_link_merge_conflict(new_lore_repo)
+    conflict_file = f"{link_path}/data.txt"
+    pin_before = link_pin(urc, link_repo.get_id())
+
+    urc.branch_merge_start("feature-branch", link=link_path, no_commit=True)
+    urc.remove_file(conflict_file)
+    urc.branch_merge_resolve(conflict_file)
+    urc.commit("Merge with the file removed")
+    urc.push()
+
+    assert link_pin(urc, link_repo.get_id()) != pin_before
+    left = [
+        name
+        for name in os.listdir(os.path.join(urc.path, link_path))
+        if name.startswith("data.txt")
+    ]
+    assert left == [], left
+    assert not urc.clone().file_exists(conflict_file)
+
+
+@pytest.mark.smoke
+def test_link_commit_refuses_a_conflict_below_a_deleted_directory_by_its_path(
+    new_lore_repo,
+):
+    """A commit refuses an unresolved conflict inside a linked repository below a directory
+    staged for deletion, naming it by its path in the working tree."""
+    urc, _link_repo, link_path = setup_link_merge_conflict(
+        new_lore_repo,
+        files=[
+            {
+                "path": "Sub/data.txt",
+                "base": "base\n",
+                "mine": "mine\n",
+                "theirs": "theirs\n",
+            }
+        ],
+    )
+    urc.branch_merge_start("feature-branch", link=link_path, no_commit=True)
+    urc.rmtree(f"{link_path}/Sub")
+    urc.stage([f"{link_path}/Sub"], scan=True)
+
+    with pytest.raises(UnresolvedConflictError) as refused:
+        urc.commit("Merge with the directory removed")
+    assert f"{link_path}/Sub/data.txt" in str(refused.value), refused.value
 
 
 @pytest.mark.smoke

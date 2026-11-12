@@ -41,6 +41,7 @@ use crate::fs::os::OsDirectoryListing;
 use crate::fs::os::OsOperation;
 use crate::fs::swfs::filesystem::SwfsOperation;
 use crate::hash::hash_string;
+use crate::infer::ConflictMarkers;
 use crate::lore::Address;
 use crate::lore::Context;
 use crate::lore_debug;
@@ -946,10 +947,10 @@ pub trait InstanceOperation: Send + Sync {
         }
     }
 
-    /// Whether the content at `path` holds conflict markers.
+    /// Whether the content at `path` holds conflict markers, or the path holds no file.
     ///
-    /// Content that cannot be opened or read holds none, a failed read logged at debug, and neither
-    /// does a path holding no file. A provider that cannot name the content of a file reports why
+    /// Content that cannot be opened or read holds none, a failed read logged at debug. A provider
+    /// that cannot name the content of a file reports why
     /// ([`content_source`](Self::content_source)).
     ///
     /// Derived from [`content_source`](Self::content_source). A provider that answers without
@@ -957,18 +958,18 @@ pub trait InstanceOperation: Send + Sync {
     fn infer_is_conflicted(
         &self,
         path: &RelativePath,
-    ) -> impl Future<Output = Result<bool, FsError>> + Send {
+    ) -> impl Future<Output = Result<ConflictMarkers, FsError>> + Send {
         async move {
             let source = match self.content_source(path).await {
                 Ok(source) => source,
-                Err(FsError::FileNotFound(_)) => return Ok(false),
+                Err(FsError::FileNotFound(_)) => return Ok(ConflictMarkers::NoFile),
                 Err(err) => return Err(err),
             };
             Ok(crate::infer::infer_is_conflicted(&source)
                 .await
                 .unwrap_or_else(|err| {
                     lore_debug!("Conflict check cannot read {path}: {err}");
-                    false
+                    ConflictMarkers::Absent
                 }))
         }
     }
@@ -1689,7 +1690,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn infer_is_conflicted(&self, path: &RelativePath) -> Result<bool, FsError> {
+    async fn infer_is_conflicted(&self, path: &RelativePath) -> Result<ConflictMarkers, FsError> {
         match &self.dispatch {
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.infer_is_conflicted(path).await,

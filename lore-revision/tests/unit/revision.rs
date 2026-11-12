@@ -22,6 +22,7 @@ mod case_rename;
 mod diff;
 mod instance;
 mod last_merged;
+mod merge_deletions;
 mod merge_local_work;
 #[cfg(unix)]
 mod merge_modes;

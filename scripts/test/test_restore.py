@@ -205,3 +205,23 @@ def test_restore_records_no_time_a_later_write_could_share(new_lore_repo):
     assert (summary["hashChecks"], summary["mtimeMatches"]) == (1, 0), (
         f"the restore recorded a time a later write could share, got {summary}"
     )
+
+
+@pytest.mark.smoke
+def test_restore_records_the_deletion_of_a_file_the_latest_added(new_lore_repo):
+    """Restoring the revision before the latest, which added a file, deletes the file, and the
+    restored revision's delta records the deletion."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"base.txt": "base\n"})
+    first = repo.revision_info().signature
+    repo.write_commit_push("Add a file", {"added.txt": "added\n"})
+
+    repo.sync(first)
+    repo.revision_restore("Restore the base")
+
+    deltas = parse_jsonl(
+        repo.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
+    )
+    assert [(delta["action"], delta["path"]) for delta in deltas] == [
+        ("delete", "added.txt")
+    ], deltas

@@ -12,6 +12,8 @@ from dataclasses import field as dc_field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from lore import GlobalOptions
 
 logger = logging.getLogger(__name__)
@@ -197,9 +199,28 @@ def parse_jsonl(output: str, tag_name: str) -> list[dict]:
     return entries
 
 
+def to_posix(path: str | Path) -> str:
+    """Normalize a path to forward slashes for comparison against Lore output.
+
+    Lore JSON output always uses forward slashes regardless of platform.
+    Use this to normalize os.path.join results before comparing against
+    paths extracted from Lore status, unstage events, etc.
+    """
+    return str(path).replace("\\", "/")
+
+
 def parse_status_json(status_output: str) -> list[dict]:
     """Parse JSON status output into a list of status entry dictionaries."""
     return parse_jsonl(status_output, "repositoryStatusFile")
+
+
+def find_status_entry(entries: list[dict], path: str | Path) -> dict | None:
+    """Find a status entry by path (posix-normalized)."""
+    target = to_posix(path)
+    for entry in entries:
+        if to_posix(entry.get("path", "")) == target:
+            return entry
+    return None
 
 
 def parse_status_count_json(status_output: str) -> dict | None:

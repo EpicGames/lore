@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from lore_parsers import parse_jsonl, parse_status_json
+from lore_parsers import parse_jsonl, parse_status_json, to_posix
 
 if TYPE_CHECKING:
     from lore import Lore
@@ -23,16 +23,6 @@ def posix_join(*parts: str) -> str:
     mismatches in path comparisons and regex patterns against Lore output.
     """
     return "/".join(parts)
-
-
-def to_posix(path: str | Path) -> str:
-    """Normalize a path to forward slashes for comparison against Lore output.
-
-    Lore JSON output always uses forward slashes regardless of platform.
-    Use this to normalize os.path.join results before comparing against
-    paths extracted from Lore status, unstage events, etc.
-    """
-    return str(path).replace("\\", "/")
 
 
 def working_tree_files(

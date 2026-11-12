@@ -934,3 +934,60 @@ def test_merge_out_of_view_conflict_takes_theirs(new_lore_repo, scratch_dir):
             assert input_file.read() == "main\n", (
                 "expected the incoming side to be adopted for " + path
             )
+
+
+@pytest.mark.smoke
+def test_merge_out_of_view_conflict_takes_an_incoming_delete(
+    new_lore_repo, scratch_dir
+):
+    """A conflict at an out-of-view path where the incoming side deleted the file
+    adopts the deletion: the merge stages the path deleted, and the merge revision
+    holds no file there.
+    """
+    repo: Lore = new_lore_repo()
+    out_of_view_file = "hidden/x.txt"
+    repo.write_files({out_of_view_file: "base\n", "shown/y.txt": "base\n"})
+    repo.stage(scan=True)
+    repo.commit()
+    repo.branch_push()
+
+    repo.branch_create("other")
+    repo.write_files({out_of_view_file: "other\n"})
+    repo.stage(scan=True)
+    repo.commit("other changes the out-of-view file")
+    repo.branch_push()
+    repo.branch_switch("main")
+
+    view_filter = _write_view_filter(scratch_dir, "/hidden\n")
+    clone = repo.clone(view=view_filter)
+    clone.branch_create("feature-branch")
+    clone.revision_sync()
+    clone.branch_merge_start("other")
+    clone.branch_push()
+
+    os.remove(os.path.join(repo.path, out_of_view_file))
+    repo.stage(scan=True)
+    repo.commit("main deletes the out-of-view file")
+    repo.branch_push()
+
+    clone.revision_sync()
+    clone.branch_merge_start("main", no_commit=True)
+    status = {
+        entry["path"]: entry
+        for entry in parse_status_json(clone.status(json=True, offline=True))
+    }
+    adopted = status.get(out_of_view_file, {})
+    assert (
+        adopted.get("action") == "delete"
+        and adopted.get("flagStaged") is True
+        and adopted.get("flagConflictTheirs") is True
+    ), status
+
+    clone.commit("merge main")
+    clone.branch_push()
+
+    verify = repo.clone(branch="feature-branch")
+    assert not verify.file_exists(out_of_view_file), (
+        "the incoming delete did not reach the tree: " + out_of_view_file
+    )
+    assert verify.file_exists("shown/y.txt")

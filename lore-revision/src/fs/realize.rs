@@ -3264,6 +3264,10 @@ async fn merge_file_in_view(
 /// conflict on `state_stage` where one is left. Removes the file where the conflict deletes it.
 /// Returns the node's size.
 ///
+/// A deletion at a path this branch lacks is staged as an add taken back: the node is added
+/// staged for deletion, carrying `StagedAdd` beside `StagedDelete`, so that staging the file the
+/// working tree holds there restores the add.
+///
 /// A function of its own, so that the node is not reserved in the states of the other cases of
 /// [`realize_file_merge`].
 #[allow(clippy::too_many_arguments)]
@@ -3320,6 +3324,10 @@ async fn stage_merged_file(
     if let Some(mode) = change::merged_mode(change_from, change_to) {
         node.mode = mode;
     }
+    node.flags = NodeFlags::from_bits_truncate(node.flags)
+        .bitand(NodeFlags::File | NodeFlags::Link)
+        .bits();
+
     if take_theirs && !change_from.to.mapping.node.is_valid_node_id() {
         // The incoming side deleted the path, so adopting it deletes.
         node.flags |= NodeFlags::StagedDelete;
@@ -3327,11 +3335,9 @@ async fn stage_merged_file(
         node.flags |= NodeFlags::StagedDelete;
 
         operation.remove(change_to.path()).await?;
+    } else if change_to.action == change::FileAction::Move {
+        node.flags |= NodeFlags::StagedMove;
     }
-
-    node.flags = NodeFlags::from_bits_truncate(node.flags)
-        .bitand(NodeFlags::File | NodeFlags::Link)
-        .bits();
 
     node.flags |= NodeFlags::StagedMerge;
     if take_theirs {
@@ -3342,10 +3348,6 @@ async fn stage_merged_file(
     }
     if resolved {
         node.flags |= NodeFlags::StagedMergeResolved;
-    }
-    if change_to.action == change::FileAction::Move {
-        node.flags &= !NodeFlags::StagedAdd;
-        node.flags |= NodeFlags::StagedMove;
     }
 
     lore_trace!(

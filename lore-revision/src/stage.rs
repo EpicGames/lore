@@ -32,6 +32,7 @@ use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::hash;
+use crate::infer::ConflictMarkers;
 use crate::interface::LoreArray;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
@@ -1404,7 +1405,8 @@ pub(crate) async fn stage_merge_path(
                     .await
                     .forward_with::<StageError, _>(|| {
                         format!("checking {} for conflict markers", change.path())
-                    })?)
+                    })?
+                    == ConflictMarkers::Present)
         {
             lore_debug!(
                 "Merge change filesystem state is conflicted: {}",
@@ -1475,8 +1477,19 @@ pub(crate) fn staged_change(staged: NodeFlags, dirty: NodeFlags, node_flags: Nod
     }
 }
 
+/// Whether staging the deletion of a node held as `held`, with the stage's own `node_flags`, leaves
+/// the node as it is: it holds the staged deletion and every staged flag the stage sets, as a node
+/// holding them is left by [`State::node_mark`]'s unforced mark. A merge's flags the node lacks
+/// mark it again.
+pub(crate) fn deletion_staged_already(held: NodeFlags, node_flags: NodeFlags) -> bool {
+    held.contains(NodeFlags::StagedDelete | (node_flags & NodeFlags::StagedBits))
+}
+
 /// Mark `node_id` staged for deletion, reporting the node when this call is the one that
-/// marked it so a caller walking the subtree knows whether it still has work below.
+/// marked it so a caller walking the subtree knows whether it still has work below. The staged
+/// half keeps an add the node holds beside the deletion, an add taken back, as the revision it
+/// was staged on lacks the node; a mark that sets a dirty action too records the deletion alone,
+/// the two halves sharing their action bits.
 async fn stage_delete_node(
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
@@ -1494,7 +1507,7 @@ async fn stage_delete_node(
         .forward::<StageError>("Failed deserializing state node block")?;
 
     let node = block.node(node_index);
-    if node.is_staged_delete() {
+    if deletion_staged_already(NodeFlags::from_bits_retain(node.flags), node_flags) {
         return Ok(None);
     }
 
@@ -1520,7 +1533,12 @@ async fn stage_delete_node(
         stats.file_checked_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    let mark = staged_change(NodeFlags::StagedDelete, NodeFlags::DirtyDelete, node_flags);
+    let held_add = NodeFlags::from_bits_retain(node.flags) & NodeFlags::StagedAdd;
+    let mark = staged_change(
+        NodeFlags::StagedDelete | held_add,
+        NodeFlags::DirtyDelete,
+        node_flags,
+    );
     state
         .node_mark(repository, node_id, mark)
         .await
@@ -1565,6 +1583,9 @@ async fn stage_delete_replaced(
     .await
 }
 
+/// Stages the deletion of the node `node_id` at `relative_path`, and of everything below a
+/// directory this call marks, with the stage's own `node_flags`.
+#[lore_macro::test_pub]
 pub(crate) async fn stage_delete(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
@@ -1711,7 +1732,8 @@ async fn stage_replaced_node(
 /// path, as a view leaves the files it excludes out of the working tree. So does a directory the
 /// view excludes that holds no children, which nothing materializes. The ignore file has no say
 /// over a node the tree tracks, so a deletion of one is staged as any other; it leaves out only an
-/// add marked dirty, which was never staged. A node already staged for deletion keeps nothing.
+/// add marked dirty, which was never staged. A node already staged for deletion keeps nothing,
+/// and is marked again only as [`deletion_staged_already`] says.
 ///
 /// `held` is what the tree holds `node_id` as: its type and what is staged on it. `states` is the
 /// filter verdict at `relative_path`, which each child steps from, and `force` whether the stage
@@ -1729,7 +1751,7 @@ async fn stage_absent_delete(
     states: FilterStates,
     force: bool,
 ) -> Result<bool, StageError> {
-    if held.contains(NodeFlags::StagedDelete) {
+    if deletion_staged_already(held, node_flags) {
         return Ok(false);
     }
 
@@ -3911,6 +3933,145 @@ pub(crate) async fn stage_from_parent_revision(
     .await
 }
 
+/// Removes `relative_path` from the working tree with what it holds, stages it from there with
+/// `options`, a deletion where nothing is left, and removes the copies a merge wrote beside it
+/// unless `preserve_conflict_files` keeps them for an unresolve.
+async fn unlink_and_stage(
+    operation: Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    relative_path: RelativePath,
+    state: Arc<State>,
+    stats: Arc<StageStats>,
+    options: StageOptions,
+    preserve_conflict_files: bool,
+) -> Result<(), StageError> {
+    let _ = operation.remove_recursive(&relative_path).await;
+
+    Box::pin(stage_filesystem_path(
+        operation.clone(),
+        NodeMapping::root(repository.clone(), state.clone()),
+        relative_path.clone(),
+        stats.clone(),
+        options,
+        None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
+        None, // No layer mask
+        None, // No prefix map for a path resolved on its own
+        None, // No discard queue
+    ))
+    .await?;
+
+    if !preserve_conflict_files {
+        sync::unlink_merge_artifacts(&operation, &relative_path).await;
+    }
+    Ok(())
+}
+
+/// Stages the deletion of each directory above `relative_path`, a file whose deletion `state`
+/// stages and the working tree lacks, nearest first, that `side` lacks and that holds no child in
+/// `state` but nodes staged for deletion: a merge resolution keeping the deletion leaves no
+/// directory only the merge's change of the file kept. Each is removed from the working tree as an
+/// empty directory before its deletion is staged, the copies a merge wrote beside the file removed
+/// before the first; the walk stops at one that still holds entries, such as an untracked or
+/// ignored file, which stays with its node, as it does at one `side` holds or a live child keeps.
+/// Where the walk removes nothing, the copies stay until the commit.
+pub(crate) async fn stage_emptied_ancestors(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    side: &State,
+    relative_path: &RelativePath,
+    stats: &Arc<StageStats>,
+    options: StageOptions,
+) -> Result<(), StageError> {
+    let mut search_path = relative_path.clone();
+    search_path.pop();
+    let mut unlinked = false;
+    while !search_path.is_empty() {
+        match side
+            .find_node_link(repository.clone(), search_path.as_str())
+            .await
+        {
+            Ok(in_side) if in_side.is_valid() => break,
+            Ok(_) => {}
+            Err(err) if err.is_node_not_found() => {}
+            Err(err) => {
+                return Err(err).forward::<StageError>("Failed to find the directory in the side");
+            }
+        }
+        let staged = state
+            .find_node_link(repository.clone(), search_path.as_str())
+            .await
+            .forward::<StageError>("Failed to find subnode")?;
+        let children = state
+            .node_children(repository.clone(), staged.node)
+            .await
+            .forward::<StageError>("Failed to find subnode")?;
+        let mut live = false;
+        for child in children.iter() {
+            if !state
+                .node(repository.clone(), *child)
+                .await
+                .forward::<StageError>("Failed to read a child of a directory left by a merge")?
+                .is_staged_delete()
+            {
+                live = true;
+                break;
+            }
+        }
+        if live {
+            break;
+        }
+        if !unlinked {
+            sync::unlink_merge_artifacts(operation, relative_path).await;
+            unlinked = true;
+        }
+        if !removed_empty_directory(operation, &search_path).await? {
+            break;
+        }
+        lore_debug!("Stage {search_path} deleted, as nothing in it stays");
+        Box::pin(stage_filesystem_path(
+            operation.clone(),
+            NodeMapping::root(repository.clone(), state.clone()),
+            search_path.clone(),
+            stats.clone(),
+            options,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await?;
+        search_path.pop();
+    }
+    Ok(())
+}
+
+/// Removes the directory at `path` where it holds no entries, and answers whether the working tree
+/// then lacks it, as it lacks one it never held. A dry run removes nothing, and answers whether
+/// the working tree lacks it already.
+async fn removed_empty_directory(
+    operation: &Arc<InstanceOperationImpl>,
+    path: &RelativePath,
+) -> Result<bool, StageError> {
+    let removal = if execution_context().globals().dry_run() {
+        None
+    } else {
+        match operation.remove_empty_directory(path).await {
+            Ok(()) => return Ok(true),
+            Err(err) => Some(err),
+        }
+    };
+    let held = operation
+        .file_info(path)
+        .await
+        .forward_any::<StageError>("Failed to describe a directory left by a merge")?
+        .exists();
+    if held && let Some(err) = removal {
+        lore_debug!("Directory {path} left by a merge stays: {err}");
+    }
+    Ok(!held)
+}
+
 /// Gives the staged file `node` the executable bit `mode`, which a resolve realized it with:
 /// staging it from the working tree records no bit, and a commit records the staged bit where it
 /// reads none from the working tree. Does nothing for an invalid `node`.
@@ -4222,36 +4383,6 @@ async fn stage_from_parent_revision_in_operation(
             // preserve them for potential unresolve. Commit and abort clean them up.
             let had_conflict_files = sync::exist_merge_artifacts(&operation, &relative_path).await;
 
-            async fn unlink_and_stage(
-                operation: Arc<InstanceOperationImpl>,
-                repository: Arc<RepositoryContext>,
-                relative_path: RelativePath,
-                state: Arc<State>,
-                stats: Arc<StageStats>,
-                options: StageOptions,
-                preserve_conflict_files: bool,
-            ) -> Result<(), StageError> {
-                let _ = operation.remove_recursive(&relative_path).await;
-
-                Box::pin(stage_filesystem_path(
-                    operation.clone(),
-                    NodeMapping::root(repository.clone(), state.clone()),
-                    relative_path.clone(),
-                    stats.clone(),
-                    options,
-                    None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
-                    None, // No layer mask
-                    None, // No prefix map for a path resolved on its own
-                    None, // No discard queue
-                ))
-                .await?;
-
-                if !preserve_conflict_files {
-                    sync::unlink_merge_artifacts(&operation, &relative_path).await;
-                }
-                Ok(())
-            }
-
             if !target_node_link.is_valid() {
                 // At this point it's known that the node exist in the merged revision and it's known
                 // that it's a staged merge. If the path does not exist in the target state, the merge
@@ -4276,81 +4407,16 @@ async fn stage_from_parent_revision_in_operation(
                     false,
                 ))
                 .await?;
-
-                // If we stage a delete, check parents. If they are also empty in the current state,
-                // and missing in the parent we are staging from, unlink them too.
-                let mut search_path = relative_path.clone();
-                search_path.pop();
-
-                while !search_path.is_empty() {
-                    lore_debug!(
-                        "Searching parent directory {} after staging a delete",
-                        search_path.as_str()
-                    );
-
-                    let parent_node_link = state_target
-                        .find_node_link(repository.clone(), search_path.as_str())
-                        .await
-                        .unwrap_or_default();
-
-                    if parent_node_link.is_valid() {
-                        // If parent is present in the target state, nothing more to do
-                        break;
-                    }
-
-                    // Find the count of the still valid child nodes in the currently staged state
-                    let current_node_link = state
-                        .find_node_link(repository.clone(), search_path.as_str())
-                        .await
-                        .forward::<StageError>("Failed to find subnode")?;
-                    let children = state
-                        .node_children(repository.clone(), current_node_link.node)
-                        .await
-                        .forward::<StageError>("Failed to find subnode")?;
-
-                    let mut valid_children = 0;
-
-                    for child in children.iter() {
-                        let valid = match state.node(repository.clone(), *child).await {
-                            Ok(node) => !node.is_staged_delete(),
-                            Err(_) => false,
-                        };
-
-                        if valid {
-                            valid_children += 1;
-                        }
-                    }
-
-                    lore_debug!("Found {} valid children in parent", valid_children);
-                    if valid_children != 0 {
-                        break;
-                    }
-
-                    // No valid children in the currently staged state so remove unlink the parent directory
-                    // and stage delete since we also know at this point the parent is missing in the target state
-                    lore_debug!(
-                        "Stage {} from {} deleted node",
-                        search_path.as_str(),
-                        if matches!(merge_parent, MergeParent::Mine) {
-                            "self"
-                        } else {
-                            "other"
-                        },
-                    );
-                    Box::pin(unlink_and_stage(
-                        operation.clone(),
-                        repository.clone(),
-                        search_path.clone(),
-                        state.clone(),
-                        stats.clone(),
-                        options,
-                        false,
-                    ))
-                    .await?;
-
-                    // Check parent
-                    search_path.pop();
-                }
+                stage_emptied_ancestors(
+                    &operation,
+                    &repository,
+                    &state,
+                    &state_target,
+                    &relative_path,
+                    &stats,
+                    options,
+                )
+                .await?;
                 continue;
             }
 

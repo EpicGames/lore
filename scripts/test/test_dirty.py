@@ -12,7 +12,12 @@ import os
 import shutil
 
 import pytest
-from lore_parsers import parse_jsonl, parse_status_json, parse_status_summary_json
+from lore_parsers import (
+    find_status_entry,
+    parse_jsonl,
+    parse_status_json,
+    parse_status_summary_json,
+)
 from test_utils import has_staged_anchor, to_posix
 
 from lore import Lore
@@ -52,15 +57,6 @@ def get_status_files_twice(repo: Lore, **kwargs) -> list[dict]:
         f"second: {second_fp}"
     )
     return second
-
-
-def find_status_entry(entries: list[dict], path: str) -> dict | None:
-    """Find a status entry by path (posix-normalized)."""
-    target = to_posix(path)
-    for entry in entries:
-        if to_posix(entry.get("path", "")) == target:
-            return entry
-    return None
 
 
 # ===========================================================================

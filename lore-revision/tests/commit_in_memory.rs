@@ -12,7 +12,9 @@ mod tests {
     use lore_base::types::BranchPoint;
     use lore_base::types::Context;
     use lore_base::types::Hash;
+    use lore_base::types::TypedBytes as _;
     use lore_revision::branch;
+    use lore_revision::change::FileAction;
     use lore_revision::commit::commit_in_memory_revision;
     use lore_revision::commit::resolve_commit_branch;
     use lore_revision::metadata::CREATED_BY;
@@ -606,6 +608,82 @@ mod tests {
                         .is_err(),
                     "the deleted node must not survive the commit"
                 );
+            }))
+            .await
+            .expect("Task failed");
+    }
+
+    /// The delta of a revision committed in memory records the deletion of a node its parent
+    /// holds, and none of a node added and deleted since, which the parent lacks.
+    #[tokio::test]
+    async fn commit_in_memory_revision_records_the_deletions_its_parent_holds() {
+        let (_immutable, mutable, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(mutable).await;
+                let branch = branch_id();
+                let state = State::new();
+                let going = add(
+                    &state,
+                    repository.clone(),
+                    ROOT_NODE,
+                    file("go.bin"),
+                    "go.bin",
+                )
+                .await;
+                let first = commit_in_memory_revision(
+                    repository.clone(),
+                    &token(),
+                    state.clone(),
+                    metadata_on(branch),
+                    Hash::default(),
+                    branch,
+                )
+                .await
+                .expect("the first revision must commit");
+
+                let added = add(
+                    &state,
+                    repository.clone(),
+                    ROOT_NODE,
+                    file("added.bin"),
+                    "added.bin",
+                )
+                .await;
+                for node in [added, going] {
+                    state
+                        .node_delete(repository.clone(), node)
+                        .await
+                        .expect("staging the deletion must succeed");
+                }
+
+                let second = commit_in_memory_revision(
+                    repository.clone(),
+                    &token(),
+                    state,
+                    metadata_on(branch),
+                    first,
+                    branch,
+                )
+                .await
+                .expect("the deletions must commit");
+
+                let published = State::deserialize(repository.clone(), second)
+                    .await
+                    .expect("the committed revision must deserialize");
+                let delta = published
+                    .delta_block(repository)
+                    .await
+                    .expect("the delta must read back")
+                    .to_aligned::<NodeDelta>();
+                let deleted: Vec<NodeID> = delta
+                    .as_type_slice::<NodeDelta>()
+                    .iter()
+                    .filter(|entry| entry.action == FileAction::Delete as u16)
+                    .map(|entry| entry.node)
+                    .collect();
+                assert_eq!(deleted, [going], "only the parent's node is recorded");
             }))
             .await
             .expect("Task failed");

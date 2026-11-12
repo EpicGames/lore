@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from error_types import ImproperArgumentsError, NotALinkError, NothingStagedError
 from link_helpers import make_parent_with_link, make_repo
-from lore_parsers import parse_commit_stats_json, parse_status_json
+from lore_parsers import parse_commit_stats_json, parse_jsonl, parse_status_json
 from service_util import LORE_SERVICE_ENVIRONMENT, SERVICE_UNAVAILABLE
 
 from lore import Lore
@@ -813,6 +813,40 @@ def test_link_scoped_commit_consecutive(new_lore_repo):
     # Finalize parent
     output = repo.commit("Update link pin")
     assert "Commit succeeded" in output
+
+
+@pytest.mark.smoke
+def test_link_scoped_commit_onto_an_advanced_link_branch_records_its_deletions(
+    new_lore_repo,
+):
+    """A link-scoped commit through one mount of a linked repository, after commits through
+    another mount advanced the link branch, records a deletion only where the branch's latest
+    holds the deleted file: not that of a file the latest deleted already, whose slot it reuses
+    for a file it adds."""
+    parent = make_repo(new_lore_repo, {"parent-file.txt": "parent content\n"})
+    link_repo = make_repo(new_lore_repo, {"g.txt": "g\n", "keep.txt": "keep\n"})
+    for mount in ("a", "b"):
+        parent.link_add(mount, link_repo.get_id(), "/")
+    parent.commit("Mount the linked repository twice")
+    parent.push()
+
+    parent.remove_file("a/g.txt")
+    parent.stage("a/g.txt")
+    parent.commit("Delete g through a", link="a")
+    parent.write_files({"a/h.txt": "h\n"})
+    parent.stage("a/h.txt")
+    parent.commit("Add h through a", link="a")
+    parent.remove_file("b/g.txt")
+    parent.stage("b/g.txt")
+    parent.commit("Delete g through b", link="b")
+    parent.commit("Pin the link commits")
+    parent.push()
+
+    link_repo.sync()
+    deltas = parse_jsonl(
+        link_repo.revision_info(delta=True, json=True), "revisionInfoDelta"
+    )
+    assert [delta for delta in deltas if delta["action"] == "delete"] == [], deltas
 
 
 @pytest.mark.smoke

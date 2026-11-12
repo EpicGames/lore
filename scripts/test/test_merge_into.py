@@ -6,6 +6,7 @@ import shutil
 
 import pytest
 from error_types import MergeRequired
+from lore_parsers import parse_jsonl
 
 from lore import Lore, verify_signatures
 
@@ -119,3 +120,28 @@ def test_merge_into(new_lore_repo):
     repo.revision_sync()
     output = repo.revision_history()
     verify_signatures(output, 5)
+
+
+@pytest.mark.smoke
+def test_merge_into_records_the_deletion_of_a_file_the_target_added(new_lore_repo):
+    """A branch deleting a file the target's latest revision added, merged into the target,
+    deletes the file there, and the merge revision's delta records the deletion."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"base.txt": "base\n"})
+    repo.write_commit_push("Add a file", {"added.txt": "added\n"})
+
+    repo.branch_create("feature")
+    repo.remove_file("added.txt")
+    repo.stage(["added.txt"])
+    repo.commit("Delete the file")
+    repo.push()
+
+    repo.branch_merge_into("main", "Merge the deletion")
+    repo.branch_switch("main")
+    deltas = parse_jsonl(
+        repo.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
+    )
+    assert [(delta["action"], delta["path"]) for delta in deltas] == [
+        ("delete", "added.txt")
+    ], deltas
+    assert not repo.file_exists("added.txt")

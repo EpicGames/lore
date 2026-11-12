@@ -70,7 +70,8 @@ fn moving(moved: &Moved, content: Option<&'static str>) -> Vec<Edit> {
     edits
 }
 
-/// The paths the staged revision marks as in conflict, and the paths of the files it holds.
+/// The paths the staged revision marks as in conflict, a deletion's included, and the paths of the
+/// files it holds.
 async fn staged(instance: &Instance) -> (Vec<String>, Vec<String>) {
     let revision = lore_revision::instance::load_staged_revision(&instance.repository)
         .await
@@ -89,9 +90,6 @@ async fn staged(instance: &Instance) -> (Vec<String>, Vec<String>) {
                 .node(instance.repository.clone(), child)
                 .await
                 .expect("Failed to read a node");
-            if node.is_staged_delete() {
-                continue;
-            }
             let name = state
                 .node_name_clone(instance.repository.clone(), child)
                 .await
@@ -103,6 +101,9 @@ async fn staged(instance: &Instance) -> (Vec<String>, Vec<String>) {
             };
             if node.is_staged_merge_conflict() {
                 conflicts.push(path.clone());
+            }
+            if node.is_staged_delete() {
+                continue;
             }
             if node.is_directory() {
                 pending.push((child, path));
@@ -935,7 +936,7 @@ async fn edits_at_both_ends_of_a_move_conflict_at_both() {
                 staged(&instance).await,
                 (
                     vec!["Dir/a.txt".to_string(), "Dir/b.txt".to_string()],
-                    ["Dir/Sub/c.txt", "Dir/a.txt", "Dir/b.txt", "Top.txt"]
+                    ["Dir/Sub/c.txt", "Dir/b.txt", "Top.txt"]
                         .iter()
                         .map(|path| path.to_string())
                         .collect()

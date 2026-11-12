@@ -5,7 +5,8 @@ import logging
 from pathlib import Path
 
 import pytest
-from lore_parsers import parse_status_json
+from error_types import UnresolvedConflictError
+from lore_parsers import find_status_entry, parse_jsonl, parse_status_json
 
 from lore import Lore
 
@@ -736,3 +737,121 @@ def test_stage_merge_and_resolve_of_a_deleted_file_find_no_markers(new_lore_repo
     assert "a.txt" in get_merged_paths(repo), "a.txt must be staged as merged"
 
     repo.branch_merge_abort(offline=True)
+
+
+@pytest.mark.own_vfs(
+    "stages the deletion of a conflicted file it removes, which a stage on a virtual clone does not see"
+)
+@pytest.mark.smoke
+def test_commit_refuses_an_unresolved_conflict_staged_for_deletion(new_lore_repo):
+    """A conflicted file the user deleted and staged for deletion is still an unresolved
+    conflict, which the commit refuses."""
+    repo: Lore = new_lore_repo()
+    setup_merge_conflict(
+        repo,
+        {"a.txt": (STAGE_MERGE_BASE, STAGE_MERGE_CURRENT, STAGE_MERGE_INCOMING)},
+    )
+    (Path(repo.path) / "a.txt").unlink()
+    repo.stage(["a.txt"], offline=True)
+    status = parse_status_json(repo.status(offline=True, json=True))
+    entry = find_status_entry(status, "a.txt")
+    assert entry and entry["action"] == "delete" and entry["flagConflictUnresolved"], (
+        status
+    )
+
+    with pytest.raises(UnresolvedConflictError):
+        repo.commit("Merge incoming", offline=True)
+    assert "a.txt" in repo.unresolved_paths(offline=True)
+
+    repo.branch_merge_abort(offline=True)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("resolution", ["mine", "theirs", "resolved", "recreated"])
+def test_merge_of_a_file_deleted_here_and_changed_there_stages_the_deletion(
+    new_lore_repo, resolution
+):
+    """A file this branch deleted and the incoming branch changed conflicts as a deletion: the
+    commit refuses it unresolved, and once resolved commits the side taken, or what the working
+    tree holds there for a plain resolve, and leaves no copy the merge wrote beside the path. The
+    merge revision's delta lists a change only where the file is added back."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base commit", {"a.txt": STAGE_MERGE_BASE}, offline=True)
+    repo.branch_create("incoming", offline=True)
+    repo.write_commit_push(
+        "Incoming changes", {"a.txt": STAGE_MERGE_INCOMING}, offline=True
+    )
+    repo.branch_switch("main", offline=True)
+    repo.branch_create("current", offline=True)
+    repo.remove_file("a.txt")
+    repo.stage(["a.txt"], offline=True)
+    repo.commit("Current deletes a.txt", offline=True)
+    repo.branch_merge_start("incoming", no_commit=True, check=False, offline=True)
+
+    status = parse_status_json(repo.status(offline=True, json=True))
+    entry = find_status_entry(status, "a.txt")
+    assert entry and entry["action"] == "delete" and entry["flagConflictUnresolved"], (
+        status
+    )
+    with pytest.raises(UnresolvedConflictError):
+        repo.commit("Merge incoming", offline=True)
+
+    expected = {}
+    if resolution == "mine":
+        repo.branch_merge_resolve_mine(["a.txt"], offline=True)
+    elif resolution == "theirs":
+        repo.branch_merge_resolve_theirs(["a.txt"], offline=True)
+        expected = {"a.txt": "".join(STAGE_MERGE_INCOMING)}
+    else:
+        if resolution == "recreated":
+            expected = {"a.txt": "recreated\n"}
+            repo.write_files(expected)
+        repo.branch_merge_resolve(["a.txt"], offline=True)
+    repo.commit("Merge incoming", offline=True)
+
+    assert repo.read_files() == expected
+    assert not parse_status_json(repo.status(scan=True, json=True, offline=True))
+    deltas = parse_jsonl(
+        repo.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
+    )
+    added = [("add", "a.txt")] if expected else []
+    assert [(delta["action"], delta["path"]) for delta in deltas] == added, deltas
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("resolution", ["mine", "resolved"])
+def test_merge_resolve_of_a_deletion_removes_the_directories_only_the_merge_kept(
+    new_lore_repo, resolution
+):
+    """A file this branch deleted with the directories above it, which the incoming branch
+    changed, resolved as the deletion, leaves neither the file nor a directory only the merge
+    kept, and the merge revision records no change there."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push(
+        "Base commit",
+        {"Dir/Sub/a.txt": STAGE_MERGE_BASE, "top.txt": "top\n"},
+        offline=True,
+    )
+    repo.branch_create("incoming", offline=True)
+    repo.write_commit_push(
+        "Incoming changes", {"Dir/Sub/a.txt": STAGE_MERGE_INCOMING}, offline=True
+    )
+    repo.branch_switch("main", offline=True)
+    repo.branch_create("current", offline=True)
+    repo.rmtree("Dir")
+    repo.stage(["Dir"], scan=True, offline=True)
+    repo.commit("Current deletes Dir", offline=True)
+    repo.branch_merge_start("incoming", no_commit=True, check=False, offline=True)
+
+    if resolution == "mine":
+        repo.branch_merge_resolve_mine(["Dir/Sub/a.txt"], offline=True)
+    else:
+        repo.branch_merge_resolve(["Dir/Sub/a.txt"], offline=True)
+    repo.commit("Merge incoming", offline=True)
+
+    assert repo.read_files() == {"top.txt": "top\n"}
+    assert not repo.path_exists("Dir")
+    deltas = parse_jsonl(
+        repo.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
+    )
+    assert deltas == [], deltas

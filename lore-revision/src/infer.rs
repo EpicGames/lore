@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use lore_storage::ContentHandle;
 use lore_storage::ContentSource;
 use lore_storage::WindowRead;
 use tokio::io;
@@ -123,6 +124,17 @@ pub fn infer_is_conflicted_by_str(text: &str) -> bool {
     false
 }
 
+/// What [`infer_is_conflicted`] reads at a path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictMarkers {
+    /// A file holding conflict markers.
+    Present,
+    /// A file holding none, or one that cannot be opened for another reason than its absence.
+    Absent,
+    /// No file.
+    NoFile,
+}
+
 /// Window size for the streaming line scan in [`infer_is_conflicted`].
 #[lore_macro::test_pub]
 const SCAN_WINDOW: usize = 64 * 1024;
@@ -135,9 +147,10 @@ const SCAN_WINDOW: usize = 64 * 1024;
 ///
 /// # Return value
 ///
-/// * `Ok(true)` if there are conflict markers in `source`.
-/// * `Ok(false)` if there are no conflict markers in `source`.
-/// * `Ok(false)` if `source` cannot be opened, which a path holding nothing answers.
+/// * `Ok(ConflictMarkers::Present)` if there are conflict markers in `source`.
+/// * `Ok(ConflictMarkers::Absent)` if there are none, or `source` cannot be opened for another
+///   reason than its absence.
+/// * `Ok(ConflictMarkers::NoFile)` if `source` holds no file to open.
 /// * `Error()` if an I/O error occurs.
 ///
 /// # Notes
@@ -148,7 +161,25 @@ const SCAN_WINDOW: usize = 64 * 1024;
 ///
 /// Reads through the source rather than a host path, so content a provider serves rather than
 /// the filesystem is scanned where it is held.
-pub async fn infer_is_conflicted(source: &ContentSource<'_>) -> Result<bool, std::io::Error> {
+pub async fn infer_is_conflicted(
+    source: &ContentSource<'_>,
+) -> Result<ConflictMarkers, std::io::Error> {
+    // TODO(mjansson): Fuse the open and the first window read through an `open_read_head` on
+    // `ContentSource`, which naming a host path did in one dispatch.
+    let (handle, file_size) = match source.open_once().await {
+        Ok(opened) => opened,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(ConflictMarkers::NoFile),
+        Err(_) => return Ok(ConflictMarkers::Absent),
+    };
+    Ok(if holds_conflict_markers(&handle, file_size).await? {
+        ConflictMarkers::Present
+    } else {
+        ConflictMarkers::Absent
+    })
+}
+
+/// Whether the `file_size` bytes `handle` reads hold conflict markers.
+async fn holds_conflict_markers(handle: &ContentHandle, file_size: u64) -> io::Result<bool> {
     /// Mirrors the previous line reader: a line that is not valid UTF-8
     /// ends the scan as not-conflicted.
     enum LineScan {
@@ -164,12 +195,6 @@ pub async fn infer_is_conflicted(source: &ContentSource<'_>) -> Result<bool, std
             Err(_) => LineScan::NotText,
         }
     }
-
-    // TODO(mjansson): Fuse the open and the first window read through an `open_read_head` on
-    // `ContentSource`, which naming a host path did in one dispatch.
-    let Ok((handle, file_size)) = source.open_once().await else {
-        return Ok(false);
-    };
 
     // One buffer for every window: the scan carries its trailing partial line in `carry`, so a
     // window is scanned and refilled rather than held. Sized to the first window, the largest

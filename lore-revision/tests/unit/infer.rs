@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::path::PathBuf;
 
+use lore_revision::infer::ConflictMarkers;
 use lore_revision::infer::SCAN_WINDOW;
 use lore_revision::infer::infer_is_conflicted;
 use lore_revision::infer::infer_is_diffable_by_slice;
@@ -102,10 +103,11 @@ fn upackage_swapped_tag_is_detected() {
 #[tokio::test]
 async fn marker_within_one_window_is_conflicted() {
     let (_dir, path) = file_holding(b"clean line\n<<<<<<< ours\nmore\n");
-    assert!(
+    assert_eq!(
         infer_is_conflicted(&ContentSource::file(&path))
             .await
-            .unwrap()
+            .unwrap(),
+        ConflictMarkers::Present
     );
 }
 
@@ -118,10 +120,11 @@ async fn marker_split_across_a_window_boundary_is_conflicted() {
     contents.extend_from_slice(b"<<<<<<< ours\n");
 
     let (_dir, path) = file_holding(&contents);
-    assert!(
+    assert_eq!(
         infer_is_conflicted(&ContentSource::file(&path))
             .await
-            .unwrap()
+            .unwrap(),
+        ConflictMarkers::Present
     );
 }
 
@@ -138,10 +141,11 @@ async fn crlf_split_across_a_window_boundary_is_conflicted() {
     assert_eq!(contents[SCAN_WINDOW], b'\n');
 
     let (_dir, path) = file_holding(&contents);
-    assert!(
+    assert_eq!(
         infer_is_conflicted(&ContentSource::file(&path))
             .await
-            .unwrap()
+            .unwrap(),
+        ConflictMarkers::Present
     );
 }
 
@@ -150,20 +154,22 @@ async fn crlf_split_across_a_window_boundary_is_conflicted() {
 #[tokio::test]
 async fn marker_on_an_unterminated_final_line_is_conflicted() {
     let (_dir, path) = file_holding(b"clean line\n>>>>>>> theirs");
-    assert!(
+    assert_eq!(
         infer_is_conflicted(&ContentSource::file(&path))
             .await
-            .unwrap()
+            .unwrap(),
+        ConflictMarkers::Present
     );
 }
 
 #[tokio::test]
 async fn unterminated_final_line_without_a_marker_is_clean() {
     let (_dir, path) = file_holding(b"clean line\nalso clean");
-    assert!(
-        !infer_is_conflicted(&ContentSource::file(&path))
+    assert_eq!(
+        infer_is_conflicted(&ContentSource::file(&path))
             .await
-            .unwrap()
+            .unwrap(),
+        ConflictMarkers::Absent
     );
 }
 
@@ -177,10 +183,11 @@ async fn utf16_larger_than_one_window_is_conflicted() {
     assert!(contents.len() > SCAN_WINDOW);
 
     let (_dir, path) = file_holding(&contents);
-    assert!(
+    assert_eq!(
         infer_is_conflicted(&ContentSource::file(&path))
             .await
-            .unwrap()
+            .unwrap(),
+        ConflictMarkers::Present
     );
 }
 
@@ -189,10 +196,11 @@ async fn utf16_larger_than_one_window_is_conflicted() {
 #[tokio::test]
 async fn empty_file_is_clean() {
     let (_dir, path) = file_holding(b"");
-    assert!(
-        !infer_is_conflicted(&ContentSource::file(&path))
+    assert_eq!(
+        infer_is_conflicted(&ContentSource::file(&path))
             .await
-            .unwrap()
+            .unwrap(),
+        ConflictMarkers::Absent
     );
 }
 
@@ -201,20 +209,22 @@ async fn empty_file_is_clean() {
 #[tokio::test]
 async fn a_line_that_is_not_utf8_ends_the_scan() {
     let (_dir, path) = file_holding(b"clean line\n\xC3\x28 broken\n<<<<<<< ours\n");
-    assert!(
-        !infer_is_conflicted(&ContentSource::file(&path))
+    assert_eq!(
+        infer_is_conflicted(&ContentSource::file(&path))
             .await
-            .unwrap()
+            .unwrap(),
+        ConflictMarkers::Absent
     );
 }
 
 #[tokio::test]
-async fn a_missing_file_is_clean() {
+async fn a_missing_file_holds_no_file() {
     let dir = lore_base::test_util::TempDir::new("lore-infer-test-");
     let path = dir.path().join("absent");
-    assert!(
-        !infer_is_conflicted(&ContentSource::file(&path))
+    assert_eq!(
+        infer_is_conflicted(&ContentSource::file(&path))
             .await
-            .unwrap()
+            .unwrap(),
+        ConflictMarkers::NoFile
     );
 }

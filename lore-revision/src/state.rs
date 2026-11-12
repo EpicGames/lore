@@ -3627,6 +3627,61 @@ impl State {
             .await
     }
 
+    /// The nodes of `nodes`, each with the flags this tree holds it with, that `base`, a revision
+    /// this tree shares its node IDs with, does not hold live as a node of the same type, sorted.
+    ///
+    /// [`Self::base_holds`] for many nodes at once: it reads the base and its block count once for
+    /// the run, and keeps the block of the node last asked about with the slots on its free list
+    /// ([`node::discard::free_list_slots`]), read again where the next node lies in another block.
+    /// A slot holds a node only where it is in use, below the block's node count and off its free
+    /// list, and the node is not `Discarded`, as [`Self::holds_node`] answers: a freed slot's flags
+    /// are exactly `Discarded`, which reads as a directory, and a directory a discard detaches
+    /// keeps its type with `Discarded` set. Only the read of `base` is boxed, as only it can load
+    /// the revision.
+    pub(crate) async fn base_lacks(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        base: Hash,
+        nodes: impl IntoIterator<Item = (NodeID, NodeFlags)>,
+    ) -> Result<Vec<NodeID>, StateError> {
+        let held = Box::pin(self.base(repository, base)).await?;
+        let block_count = held.tree(repository.clone()).await?.block_count as usize;
+        let mut last: Option<(usize, Arc<NodeBlock>, [u64; node::discard::SLOT_WORDS])> = None;
+        let mut lacking = Vec::new();
+        for (id, flags) in nodes {
+            if id == ROOT_NODE {
+                continue;
+            }
+            let block_index = NodeBlock::index(id);
+            if block_index >= block_count {
+                lacking.push(id);
+                continue;
+            }
+            let (block, free) = match &last {
+                Some((index, block, free)) if *index == block_index => (block, free),
+                _ => {
+                    let block = held.block(repository.clone(), block_index).await?;
+                    let free = node::discard::free_list_slots(block.read().node_block());
+                    let (_, block, free) = last.insert((block_index, block, free));
+                    (&*block, &*free)
+                }
+            };
+            let index = Node::index(id);
+            let holds = free[index / 64] & 1 << (index % 64) == 0 && {
+                let reader = block.read();
+                index < reader.node_block().node_count as usize && {
+                    let node = reader.node(index);
+                    !node.is_discarded() && node.node_type() == flags.node_type()
+                }
+            };
+            if !holds {
+                lacking.push(id);
+            }
+        }
+        lacking.sort_unstable();
+        Ok(lacking)
+    }
+
     /// The parent `base`, a revision this tree shares its node IDs with, holds a node at `id` under;
     /// `None` where it holds none there. Only the first read of `base` is boxed, as only it loads
     /// the revision.
@@ -3707,7 +3762,7 @@ impl State {
         Ok(base)
     }
 
-    /// Whether this tree holds a node of `node_type` at `id`.
+    /// Whether this tree holds a live node of `node_type` at `id`: one in use and not `Discarded`.
     pub(crate) async fn holds_node(
         &self,
         repository: &Arc<RepositoryContext>,
@@ -3720,7 +3775,7 @@ impl State {
         Ok(self
             .node_in_use(repository, id)
             .await?
-            .is_some_and(|(node, _)| node.node_type() == node_type))
+            .is_some_and(|(node, _)| !node.is_discarded() && node.node_type() == node_type))
     }
 
     /// The record this tree holds at `id`, with its block; `None` where the slot holds no node.

@@ -12,6 +12,7 @@ use lore_revision::state::NodeMapping;
 use lore_revision::util::path::RelativePath;
 
 mod content_tests;
+mod deletion_tests;
 mod directory_children_tests;
 mod move_tests;
 mod parent_restore_tests;

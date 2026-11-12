@@ -29,6 +29,7 @@ use lore_revision::fs::filesystem_provider::test_util::TestOperation;
 use lore_revision::fs::filesystem_provider::with_operation;
 use lore_revision::fs::filesystem_provider::with_operation_if;
 use lore_revision::fs::os::OsFilesystem;
+use lore_revision::infer::ConflictMarkers;
 use lore_revision::lore::RepositoryId;
 use lore_revision::node::NodeID;
 use lore_revision::repository::RepositoryContext;
@@ -829,11 +830,12 @@ async fn content_reported_not_found_is_neither_diffable_nor_conflicted() {
                     .await
                     .expect("a path holding no file is an answer")
             );
-            assert!(
-                !operation
+            assert_eq!(
+                operation
                     .infer_is_conflicted(&path)
                     .await
-                    .expect("a path holding no file is an answer")
+                    .expect("a path holding no file is an answer"),
+                ConflictMarkers::NoFile
             );
         })
         .await;

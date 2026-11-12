@@ -14,6 +14,7 @@ use lore_revision::fs::filesystem_provider::FilesystemProvider;
 use lore_revision::fs::filesystem_provider::InstanceOperation;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
 use lore_revision::fs::os::*;
+use lore_revision::infer::ConflictMarkers;
 use lore_revision::node::Node;
 use lore_revision::node::NodeFileMode;
 use lore_revision::repository::RepositoryContext;
@@ -436,23 +437,26 @@ async fn infer_is_conflicted_reads_the_content_at_the_path() {
             std::fs::write(dir.path().join("clean"), b"one\ntwo\n").expect("write clean");
             let operation = os_operation(dir.path()).await;
 
-            assert!(
+            assert_eq!(
                 operation
                     .infer_is_conflicted(&relative("marked"))
                     .await
-                    .expect("reading the content must succeed")
+                    .expect("reading the content must succeed"),
+                ConflictMarkers::Present
             );
-            assert!(
-                !operation
+            assert_eq!(
+                operation
                     .infer_is_conflicted(&relative("clean"))
                     .await
-                    .expect("reading the content must succeed")
+                    .expect("reading the content must succeed"),
+                ConflictMarkers::Absent
             );
-            assert!(
-                !operation
+            assert_eq!(
+                operation
                     .infer_is_conflicted(&relative("absent"))
                     .await
-                    .expect("a path holding no file is an answer, not a failure")
+                    .expect("a path holding no file is an answer, not a failure"),
+                ConflictMarkers::NoFile
             );
         })
         .await;

@@ -1474,9 +1474,10 @@ fn types_agree(from_node: &Node, is_file: bool, is_directory: bool) -> bool {
 /// reports the second pass as staging nothing. Force and a merge both ask for the action
 /// again regardless, a merge because its own flags have to reach the node.
 ///
-/// Taking back a delete clears the staged flags before marking, which is what drops a merge's
-/// own flags: [`State::node_mark`] preserves those, and a node whose delete was taken back
-/// carries no merge.
+/// Taking back a delete marks the node as the stage's undelete does, replacing the staged
+/// action: the merge flags stand, as [`State::node_mark`] keeps them, and under the intent's own
+/// merge flags a conflict stands. An add taken back, a node holding `StagedAdd` beside the
+/// deletion, is settled as the add it was.
 async fn staged_entry(
     state: &Arc<State>,
     repository: &Arc<RepositoryContext>,
@@ -1489,12 +1490,16 @@ async fn staged_entry(
         || stage.node_flags.contains(NodeFlags::StagedMerge)
         || node.is_staged_merge_unresolved();
     if node.is_staged_delete() {
-        state.node_clear(repository, node_id, Clear::Staged).await?;
+        let action = if node.is_staged_add() {
+            SettledAction::Add
+        } else {
+            SettledAction::Modify
+        };
         mark_settled(
             state,
             repository,
             node_id,
-            SettledAction::Modify,
+            action,
             FilesystemDiffIntent::Stage(stage),
         )
         .await?;
@@ -1818,7 +1823,6 @@ async fn diff_filesystem_directory_walk(
         node_list,
         current_node_list,
         node_list_found,
-        staging,
         changes,
         pending_discards,
     )
@@ -2345,7 +2349,6 @@ async fn diff_filesystem_missing_nodes(
     node_list: &StateChildrenNodes,
     current_node_list: &StateChildrenNodes,
     node_list_found: &[bool],
-    staging: bool,
     changes: &ChangeSender,
     pending_discards: &mut Vec<NodeID>,
 ) -> Result<(), StateError> {
@@ -2394,9 +2397,14 @@ async fn diff_filesystem_missing_nodes(
             continue;
         };
 
-        // A staging walk sees the nodes already staged for delete, and the file system
-        // still not holding one says nothing new about it.
-        if staging && from_node.node.is_staged_delete() {
+        // A staging walk sees the nodes already staged for delete, and the file system still not
+        // holding one says nothing new about it, but for staged flags the walk sets and it lacks.
+        if let Some(stage) = ctx.intent.stage()
+            && crate::stage::deletion_staged_already(
+                NodeFlags::from_bits_retain(from_node.node.flags),
+                stage.node_flags,
+            )
+        {
             continue;
         }
 

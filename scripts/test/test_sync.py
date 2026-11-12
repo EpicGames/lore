@@ -16,21 +16,17 @@ from error_types import (
     ProtectedError,
     UnknownLoreError,
 )
-from lore_parsers import parse_jsonl, parse_status_json, parse_status_summary_json
+from lore_parsers import (
+    find_status_entry,
+    parse_jsonl,
+    parse_status_json,
+    parse_status_summary_json,
+)
 from test_utils import to_posix
 
 from lore import Lore
 
 logger = logging.getLogger(__name__)
-
-
-def find_status_entry(entries: list[dict], path: str) -> dict | None:
-    """Find a status entry by path (posix-normalized)."""
-    target = to_posix(path)
-    for entry in entries:
-        if to_posix(entry.get("path", "")) == target:
-            return entry
-    return None
 
 
 @pytest.mark.own_vfs("re-clones over the files an ordinary clone leaves on disk")
@@ -1722,3 +1718,29 @@ def test_sync_merge_of_divergent_history_keeps_the_remote_change_before_its_late
         remote_change,
         base,
     ]
+
+
+@pytest.mark.smoke
+def test_sync_of_diverged_history_records_no_deletion_the_remote_made(new_lore_repo):
+    """A sync merging the remote latest into diverged local history records no deletion the
+    remote made, though the remote's tree reuses the deleted file's slot for a file it adds:
+    the merge revision holds that file."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"gone.txt": "gone\n", "kept.txt": "kept\n"})
+    clone = repo.clone()
+
+    repo.remove_file("gone.txt")
+    repo.stage(["gone.txt"])
+    repo.commit("Delete a file")
+    repo.write_commit_push("Add a file", {"added.txt": "added\n"})
+
+    clone.write_files({"local.txt": "local\n"})
+    clone.stage(scan=True)
+    clone.commit("Add a local file")
+    clone.sync()
+
+    deltas = parse_jsonl(
+        clone.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
+    )
+    assert [delta for delta in deltas if delta["action"] == "delete"] == [], deltas
+    assert clone.file_exists("added.txt") and not clone.file_exists("gone.txt")
