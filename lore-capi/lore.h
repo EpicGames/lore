@@ -66,7 +66,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define LORE_INTERFACE_VERSION "0.13.1-nightly"
+#define LORE_INTERFACE_VERSION "0.14.1-nightly"
 
 // The kind of value held by a metadata entry.
 //
