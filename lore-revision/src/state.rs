@@ -1256,6 +1256,10 @@ pub struct State {
     /// began, so a directory may be staged with no change below it
     /// ([`Self::has_unfinished_change`]).
     unfinished_change: AtomicBool,
+    /// A C API move of a node not staged for addition into a directory staged for addition
+    /// checked its destination since this State was built or last committed through the C API
+    /// ([`Self::may_hold_tracked_below_added`]).
+    tracked_below_added: AtomicBool,
     /// Deserializing semaphore
     deserialize: tokio::sync::Semaphore,
     /// Unused node/block semaphore
@@ -1856,6 +1860,36 @@ impl State {
         );
     }
 
+    /// Notes that a C API move takes a node not staged for addition into a directory staged for
+    /// addition ([`Self::node_move_staged`]), before the move lands.
+    ///
+    /// Relaxed, as the moves permit orders it: the move notes it under the permit, and a C API
+    /// delete reads it under the permit; the C API commit clears it under its exclusive claim.
+    pub fn note_tracked_below_added(&self) {
+        self.tracked_below_added.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a node not staged for addition may stand below a directory staged for addition. On
+    /// a State only the C API's verbs change, unset means none does: such a node stands there only
+    /// where a C API move put it, into the directory or into a node below it that one put there,
+    /// or where a restore took it back after one put it there and a delete staged it, and the move
+    /// that first put one there noted it ([`Self::note_tracked_below_added`]), before any mark.
+    /// Set from that move until the C API commit, which leaves no node staged for addition.
+    ///
+    /// A C API delete checks a subtree for a tracked node below an added directory only while it
+    /// is set, and then walks every directory of it. Neither rests on the staged marks of the
+    /// directories above an added node, which a climb that failed or was dropped leaves incomplete
+    /// (C12): unset, no subtree can hold one whatever those marks.
+    pub fn may_hold_tracked_below_added(&self) -> bool {
+        self.tracked_below_added.load(Ordering::Relaxed)
+    }
+
+    /// Forgets the moves below added directories noted, for the C API commit once its in-memory
+    /// commit published the tree it froze, which holds no node staged for addition.
+    pub fn clear_tracked_below_added(&self) {
+        self.tracked_below_added.store(false, Ordering::Relaxed);
+    }
+
     /// For a `writer` changing chains or names past the primitives, which neither count nor log,
     /// so a served State's listings would never see the change.
     #[track_caller]
@@ -1910,6 +1944,7 @@ impl State {
                 runtime: _,
                 served: _,
                 unfinished_change: _,
+                tracked_below_added: _,
                 unused: _,
                 moves: _,
                 pending: _,
@@ -1943,6 +1978,7 @@ impl State {
             )));
             (&raw mut (*fields).served).write(AtomicBool::new(false));
             (&raw mut (*fields).unfinished_change).write(AtomicBool::new(false));
+            (&raw mut (*fields).tracked_below_added).write(AtomicBool::new(false));
             (&raw mut (*fields).unused).write(tokio::sync::Semaphore::new(1));
             (&raw mut (*fields).moves).write(tokio::sync::Semaphore::new(1));
             (&raw mut (*fields).pending).write(std::sync::OnceLock::new());

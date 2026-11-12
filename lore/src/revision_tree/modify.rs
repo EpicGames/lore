@@ -317,8 +317,9 @@ async fn apply_plan(
 /// derived at commit and a link's address is its target, so neither holds
 /// content to rewrite. A zero `address.context` preserves the node's existing
 /// file id — unlike `add`, which generates one — because the node already
-/// carries an identity and replacing it would record the edit as a move. An
-/// empty batch succeeds.
+/// carries an identity and replacing it would record the edit as a move. A file
+/// added or moved through this handle stays an addition or a move, which the
+/// commit records with the new content. An empty batch succeeds.
 ///
 /// The call as a whole reports on `RevisionTreeBatchComplete`, carrying the
 /// call's own `batch_id` and firing exactly once — after any per-entry

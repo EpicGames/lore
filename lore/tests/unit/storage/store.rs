@@ -121,6 +121,24 @@ async fn concurrent_ops_and_close_converge_cleanly() {
     handle::unregister(store_handle);
 }
 
+/// A close racing an enter either waits for the op that entered or refuses it: the two never
+/// both miss each other, with the close returning while the op runs.
+#[tokio::test]
+async fn a_close_racing_an_enter_waits_for_it_or_refuses_it() {
+    use futures::FutureExt;
+
+    use crate::close_race;
+
+    let (store, store_handle) = register_store().await;
+    let missed = close_race::rounds_missing_each_other(
+        || OpGuard::enter(store_handle),
+        || store.mark_invalid_and_await().now_or_never().is_some(),
+        || store.invalid.store(false, Ordering::SeqCst),
+    );
+    handle::unregister(store_handle);
+    assert_eq!(missed, 0, "a close returned while an op it admitted ran");
+}
+
 #[tokio::test]
 async fn mark_invalid_and_await_does_not_deadlock_on_already_invalid() {
     let (store, store_handle) = register_store().await;

@@ -362,14 +362,16 @@ impl Halves {
 }
 
 impl State {
-    /// The staged and dirty flags an edit to `node` should record.
-    ///
-    /// A node staged for addition stays staged for addition however it is edited
-    /// afterwards: it is in no revision yet, so there is nothing for a commit to
-    /// record a modification against.
+    /// The staged and dirty flags an edit to `node` records, for the working-tree staging path
+    /// staging a node again and for the C API's modify: a node staged for addition stays an
+    /// addition, as it is in no revision yet for a commit to record a modification against; one
+    /// staged as moved stays a move, which carries the new content; and any other, one staged as
+    /// copied among them, is staged as modified.
     pub fn staged_edit_flags(node: &Node) -> (NodeFlags, NodeFlags) {
         if node.is_staged_add() {
             (NodeFlags::StagedAdd, NodeFlags::DirtyAdd)
+        } else if node.is_staged_move() {
+            (NodeFlags::StagedMove, NodeFlags::DirtyMove)
         } else {
             (NodeFlags::StagedModify, NodeFlags::DirtyModify)
         }

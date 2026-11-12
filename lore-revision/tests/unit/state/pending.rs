@@ -336,6 +336,44 @@ async fn a_staged_modify_records_the_edit_with_the_content() {
     .await;
 }
 
+/// A C API modify keeps a file staged as moved a move, as the working-tree staging path does, and
+/// takes a file staged as copied as a modification, as that path does too.
+#[tokio::test]
+async fn a_staged_modify_keeps_a_move_and_takes_a_copy_as_a_modification() {
+    with_state(|repository, state| async move {
+        let t = add(&state, &repository, ROOT_NODE, directory("t"), "t").await;
+        let moved = add(&state, &repository, t, file("m"), "m").await;
+        let copied = add(&state, &repository, t, file("c"), "c").await;
+        for (node, staged, dirty) in [
+            (moved, NodeFlags::StagedMove, NodeFlags::DirtyMove),
+            (copied, NodeFlags::StagedCopy, NodeFlags::DirtyCopy),
+        ] {
+            state
+                .node_mark(&repository, node, Mark::staged_and_dirty(staged, dirty))
+                .await
+                .expect("the mark");
+            state
+                .node_modify_staged(&repository, node, &Content::default())
+                .await
+                .expect("the modify");
+        }
+
+        let node = record(&state, &repository, moved).await;
+        assert!(
+            node.is_staged_move() && node.is_dirty_move() && !node.is_staged_modify(),
+            "{:x}",
+            node.flags
+        );
+        let node = record(&state, &repository, copied).await;
+        assert!(
+            node.is_staged_modify() && node.is_dirty_modify() && !node.is_staged_copy(),
+            "{:x}",
+            node.flags
+        );
+    })
+    .await;
+}
+
 /// A C API add, a modify and a delete each climb from a directory that is dirty but not staged,
 /// as a working-tree edit leaves one, and stage it: only a directory holding both base bits
 /// stops the climb.

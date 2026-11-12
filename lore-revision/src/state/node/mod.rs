@@ -255,7 +255,9 @@
 //!   but for a restore, which climbs right after it changes its node, so dropping them once the
 //!   climb is done leaves none of this, though a climb of theirs dropped while it loads a block, or
 //!   failing on one it cannot load, still can; the delete's batch runs in a task a dropped call
-//!   does not stop.
+//!   does not stop. The C API delete's check for a tracked node below an added directory does not
+//!   depend on these marks: it runs only once a move noted such a node, before any mark
+//!   ([`State::may_hold_tracked_below_added`]), and then walks every directory of the subtree.
 //! - **Clearing above a discarded node.** `clear_propagation` reads an ancestor's children and then
 //!   clears the ancestor with nothing held between (H21's pattern), so it runs only with no mark
 //!   beside it: after a walk's tasks drain (`apply_pending_discards`), and in `lore dirty`'s loop

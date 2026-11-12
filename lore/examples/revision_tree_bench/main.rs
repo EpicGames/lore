@@ -71,6 +71,9 @@ const WORKLOADS: &[&str] = &[
     "capi-modify",
     "capi-delete-added",
     "capi-delete-tracked",
+    "capi-delete-moved",
+    "capi-delete-checked",
+    "capi-delete-restructured",
     "capi-commit",
     "capi-delete-readd-commit",
 ];
@@ -553,6 +556,90 @@ async fn run(name: &str, n: usize) -> Outcome {
                     dirs.push(directory_of_files(tree, ROOT_NODE, &format!("y{i}")).await);
                 }
                 commit_tree(tree).await;
+                dirs
+            })
+            .await;
+            for dir in dirs {
+                let began = Instant::now();
+                delete_one(tree, dir).await;
+                latencies.push(nanos(began));
+            }
+        }
+        // Deletes of a committed directory of BATCH files, made, committed and renamed outside the
+        // count, so every node below it is staged as moved.
+        "capi-delete-moved" => {
+            ops = n.min(500);
+            let dirs = untimed(async {
+                let mut dirs = Vec::with_capacity(ops);
+                for i in 0..ops {
+                    dirs.push(directory_of_files(tree, ROOT_NODE, &format!("v{i}")).await);
+                }
+                commit_tree(tree).await;
+                for (i, dir) in dirs.iter().enumerate() {
+                    move_one(tree, *dir, ROOT_NODE, &format!("u{i}")).await;
+                }
+                dirs
+            })
+            .await;
+            for dir in dirs {
+                let began = Instant::now();
+                delete_one(tree, dir).await;
+                latencies.push(nanos(began));
+            }
+        }
+        // Deletes of a committed directory of BATCH files, as `capi-delete-tracked`, after a
+        // committed file moved into an added directory, outside the count, so each delete checks
+        // its subtree for a tracked node below an added directory.
+        "capi-delete-checked" => {
+            ops = n.min(500);
+            let dirs = untimed(async {
+                let mut dirs = Vec::with_capacity(ops);
+                for i in 0..ops {
+                    dirs.push(directory_of_files(tree, ROOT_NODE, &format!("c{i}")).await);
+                }
+                let file =
+                    add_batch(tree, vec![entry(0, ROOT_NODE, "f", LoreNodeType::File)]).await[0];
+                commit_tree(tree).await;
+                let added = add_batch(
+                    tree,
+                    vec![entry(0, ROOT_NODE, "a", LoreNodeType::Directory)],
+                )
+                .await[0];
+                move_one(tree, file, added, "f").await;
+                dirs
+            })
+            .await;
+            for dir in dirs {
+                let began = Instant::now();
+                delete_one(tree, dir).await;
+                latencies.push(nanos(began));
+            }
+        }
+        // Deletes of a committed directory of BATCH files and a subdirectory of BATCH files, made
+        // and committed outside the count, after another file of each moved into an added
+        // directory, as a restructuring moves files out of the directories it then deletes.
+        "capi-delete-restructured" => {
+            ops = n.min(500);
+            let dirs = untimed(async {
+                let mut dirs = Vec::with_capacity(ops);
+                let mut moved = Vec::with_capacity(ops);
+                for i in 0..ops {
+                    let dir = directory_of_files(tree, ROOT_NODE, &format!("o{i}")).await;
+                    directory_of_files(tree, dir, "sub").await;
+                    moved.push(
+                        add_batch(tree, vec![entry(0, dir, "x", LoreNodeType::File)]).await[0],
+                    );
+                    dirs.push(dir);
+                }
+                commit_tree(tree).await;
+                let added = add_batch(
+                    tree,
+                    vec![entry(0, ROOT_NODE, "n", LoreNodeType::Directory)],
+                )
+                .await[0];
+                for (i, file) in moved.iter().enumerate() {
+                    move_one(tree, *file, added, &format!("x{i}")).await;
+                }
                 dirs
             })
             .await;

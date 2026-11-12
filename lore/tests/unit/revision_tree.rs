@@ -152,6 +152,30 @@ async fn guard_enter_after_mark_invalid_returns_none() {
     handle::unregister(handle_value);
 }
 
+/// A close racing an enter either waits for the op that entered or refuses it: the two never
+/// both miss each other, with the close returning while the op runs.
+#[tokio::test]
+async fn a_close_racing_an_enter_waits_for_it_or_refuses_it() {
+    use std::sync::atomic::Ordering;
+
+    use futures::FutureExt;
+    use lore::revision_tree::handle;
+    use lore::revision_tree::handle::RevisionTreeGuard;
+
+    use crate::close_race;
+    use crate::revision_tree::handle::test_support;
+
+    let internal = test_support::new_for_testing().await;
+    let handle_value = handle::register(internal.clone());
+    let missed = close_race::rounds_missing_each_other(
+        || RevisionTreeGuard::enter(handle_value),
+        || internal.mark_invalid_and_await().now_or_never().is_some(),
+        || internal.invalid.store(false, Ordering::SeqCst),
+    );
+    handle::unregister(handle_value);
+    assert_eq!(missed, 0, "a close returned while an op it admitted ran");
+}
+
 /// `RevisionTreeGuard::enter` returns `None` when the handle is
 /// unknown (never registered or already unregistered).
 #[tokio::test]

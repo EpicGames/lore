@@ -982,6 +982,50 @@ async fn a_staged_move_marks_both_directories_and_their_ancestors() {
     .await;
 }
 
+/// A staged move notes a node not staged for addition moved into a directory staged for addition,
+/// before which a tracked node moved into a tracked directory and an added node moved into an
+/// added one note nothing.
+#[tokio::test]
+async fn a_staged_move_notes_a_tracked_node_moved_into_an_added_directory() {
+    with_state(|repository, state| async move {
+        let tracked = add(&state, &repository, ROOT_NODE, directory("t"), "t").await;
+        let added = add(&state, &repository, ROOT_NODE, directory("n"), "n").await;
+        let x = add(&state, &repository, ROOT_NODE, file("x"), "x").await;
+        let y = add(&state, &repository, ROOT_NODE, file("y"), "y").await;
+        let addition = Mark::staged_and_dirty(NodeFlags::StagedAdd, NodeFlags::DirtyAdd);
+        for node in [added, y] {
+            state
+                .node_mark(&repository, node, addition)
+                .await
+                .expect("the mark");
+        }
+
+        let permit = state.moves_permit().await.expect("the moves permit");
+        for (node, destination, name) in [(x, tracked, "x"), (y, added, "y"), (x, added, "x")] {
+            assert!(
+                !state.may_hold_tracked_below_added(),
+                "nothing is noted before {name} moves into {destination}"
+            );
+            state
+                .node_move_staged(
+                    repository.clone(),
+                    node,
+                    destination,
+                    (name, hash_string(name)),
+                    &permit,
+                    false,
+                )
+                .await
+                .expect("the move");
+        }
+        assert!(
+            state.may_hold_tracked_below_added(),
+            "the tracked x moved into the added n is noted"
+        );
+    })
+    .await;
+}
+
 /// Grows the name table of `node`'s block until it holds `room` bytes fewer than
 /// [`NODE_NAME_MAX_SIZE`].
 async fn fill_name_table(

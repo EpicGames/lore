@@ -272,7 +272,10 @@ impl State {
     /// API restore of a node below an added directory, which waits for the permit. A C API delete
     /// holds the permit for its whole batch too, so moves and deletes apply one after the other
     /// (H18). No clear runs alongside: one between a mark and the move could clean a directory the
-    /// move then fills, which the clear's contract excludes (C9).
+    /// move then fills, which the clear's contract excludes (C9). A node not staged for addition
+    /// moving into a directory staged for addition is noted as the destination is checked, before
+    /// any mark ([`Self::note_tracked_below_added`]), under the permit, which a C API delete reads
+    /// it under; a move refused after leaves the note, which costs a delete's check a walk.
     pub async fn node_move_staged(
         self: &Arc<Self>,
         repository: Arc<RepositoryContext>,
@@ -388,6 +391,9 @@ impl State {
                 return Err(StateError::from(InvalidArguments {
                     reason: "destination parent id does not resolve to a named node".into(),
                 }));
+            }
+            if destination.is_staged_add() && own.staged != Some((NodeFlags::StagedAdd, true)) {
+                self.note_tracked_below_added();
             }
         }
         let reparented = source_parent_id != destination_parent_id;

@@ -10,6 +10,7 @@ mod auth;
 mod branch;
 mod call;
 mod call_delegation;
+mod close_race;
 mod file;
 mod log;
 mod remote;

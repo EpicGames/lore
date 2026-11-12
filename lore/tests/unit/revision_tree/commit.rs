@@ -1398,6 +1398,41 @@ async fn marks_alone_commit_with_no_unfinished_change() {
     release(handle, store_handle_id);
 }
 
+/// A commit that fails after its snapshot replaces the State with the snapshot's, which keeps a
+/// move below an added directory the State it replaces noted; the commit that then succeeds clears
+/// it.
+#[tokio::test]
+async fn a_restored_tree_keeps_a_move_below_an_added_directory() {
+    let partition = Partition::from([0xeau8; 16]);
+    let (handle, store_handle_id) = load_handle("commit-restore-below-added", partition).await;
+    let branch = Context::from(uuid::Uuid::now_v7());
+    add_node(handle, 1, ROOT_NODE, "dir", LoreNodeType::Directory).await;
+    set_branch(handle, branch).await;
+    let (status, events) = run_commit(handle, 91).await;
+    assert_eq!(status, 0, "the first revision must commit, got {events:?}");
+
+    handle_state(handle).note_tracked_below_added();
+    let refused = add_file(handle, 2, "b.bin", 0).await;
+    let (status, events) = run_commit(handle, 92).await;
+    assert_eq!(
+        status, -1,
+        "a zero content hash fails the freeze, got {events:?}"
+    );
+    assert!(
+        handle_state(handle).may_hold_tracked_below_added(),
+        "the restored State keeps the note"
+    );
+
+    modify_file(handle, 3, refused, 0x22).await;
+    let (status, events) = run_commit(handle, 93).await;
+    assert_eq!(status, 0, "the corrected tree commits, got {events:?}");
+    assert!(
+        !handle_state(handle).may_hold_tracked_below_added(),
+        "the commit clears the note"
+    );
+    release(handle, store_handle_id);
+}
+
 /// A commit that fails after its snapshot replaces the State with the snapshot's, which keeps an
 /// unfinished change the State it replaces noted; the commit that then succeeds clears it.
 #[tokio::test]

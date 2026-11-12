@@ -13241,14 +13241,16 @@ void lore_revision_tree_add_async(const struct lore_global_args_t *globals,
 // be added back in turn. An added node that left the tree is not restorable:
 // adding its name again creates a new node.
 //
-// Staging fans out one depth level at a time over at most one task per
-// processor. Each added subtree is checked whole, then detached from its
-// directory in one step; detaches from one directory run one after another. An
-// added subtree holding a live node the loaded revision holds, moved there, fails
-// its entry with nothing detached. Memory while the call runs is proportional to
+// Each entry's subtree is checked before any of it is staged: an added directory
+// in it holding a live node the loaded revision holds, moved there, fails the
+// entry with `LORE_ERROR_CODE_INTERNAL`, and the entry changes nothing. Staging
+// fans out one depth level at a time over at most one task per processor. Each
+// added subtree is then detached from its directory in one step; detaches from
+// one directory run one after another. Memory while the call runs is proportional to
 // the entry count times the tasks the work spreads over, plus two adjacent depth
 // levels of the tracked subtrees being removed, plus one record per added subtree
-// root found. Entries report in entry order once the whole batch has been walked.
+// root found, plus, while an entry's subtree is checked, its directories still to
+// walk. Entries report in entry order once the whole batch has been walked.
 // The root cannot be deleted, and an entry whose ancestor another entry deletes
 // is rejected rather than removed twice.
 //
@@ -13283,8 +13285,10 @@ void lore_revision_tree_delete_async(const struct lore_global_args_t *globals,
 // commit and a link's address is its target. A zero `address.context` preserves
 // the node's existing file id rather than generating one, which is the opposite
 // of `lore_revision_tree_add` — the node already has an identity, and replacing
-// it would record the edit as a move. Entries touch no parent or sibling chain,
-// so the whole batch applies concurrently.
+// it would record the edit as a move. A file added or moved through this handle
+// stays an addition or a move, which the commit records with the new content.
+// Entries touch no parent or sibling chain, so the whole batch applies
+// concurrently.
 //
 // | Terminal event                              | Payload                                           | Notes                                                    |
 // |---------------------------------------------|---------------------------------------------------|----------------------------------------------------------|

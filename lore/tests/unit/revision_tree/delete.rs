@@ -835,6 +835,31 @@ async fn modify_keeps_an_added_node_staged_as_an_addition() {
     release(handle, store_handle_id);
 }
 
+/// A node staged as moved stays a move however it is rewritten, the move carrying its new
+/// content: a modification in its place records no move at the commit.
+#[tokio::test]
+async fn modify_keeps_a_moved_node_staged_as_a_move() {
+    let partition = Partition::from([0xe0u8; 16]);
+    let (handle, store_handle_id) = load_handle("mark-move-modify", partition).await;
+
+    let directory = seed(handle, ROOT_NODE, "dir", LoreNodeType::Directory).await;
+    let node_id = seed(handle, ROOT_NODE, "a.bin", LoreNodeType::File).await;
+    settle(handle, &[directory, node_id]).await;
+    move_into(handle, node_id, directory, "a.bin").await;
+
+    let (status, _) = run_modify(handle, vec![modify_entry(10, node_id)]).await;
+    assert_eq!(status, 0, "modifying a moved node must succeed");
+    assert_eq!(
+        marks_of(handle, node_id).await,
+        (
+            LoreNodeStagedAction::Move as u32,
+            NodeFlags::DirtyMove.bits()
+        ),
+        "a rewritten moved node must still read as a move"
+    );
+    release(handle, store_handle_id);
+}
+
 /// Deleting after modifying replaces the modification: the node goes either
 /// way, so what was rewritten no longer matters.
 #[tokio::test]
@@ -1795,6 +1820,87 @@ async fn an_added_directory_holding_a_moved_tracked_node_fails_its_entry() {
     release(handle, store_handle_id);
 }
 
+/// A tracked directory holding an added directory that a moved tracked node makes mixed fails its
+/// entry with nothing staged, the directory itself included, so no added node is left below a
+/// directory staged for deletion. The entry beside it, a tracked directory holding a clean added
+/// directory two staged levels down, goes whole.
+#[tokio::test]
+async fn a_tracked_directory_holding_a_mixed_added_directory_fails_its_entry_unchanged() {
+    let partition = Partition::from([0xe7u8; 16]);
+    let (handle, store_handle_id) = load_handle("delete-mixed-below-tracked", partition).await;
+    let d = seed(handle, ROOT_NODE, "d", LoreNodeType::Directory).await;
+    let sub = seed(handle, d, "sub", LoreNodeType::Directory).await;
+    let kept = seed(handle, d, "kept.bin", LoreNodeType::File).await;
+    let y = seed(handle, ROOT_NODE, "y.bin", LoreNodeType::File).await;
+    let e = seed(handle, ROOT_NODE, "e", LoreNodeType::Directory).await;
+    let s = seed(handle, e, "s", LoreNodeType::Directory).await;
+    settle(handle, &[d, sub, kept, y, e, s]).await;
+    let n = seed(handle, d, "n", LoreNodeType::Directory).await;
+    move_into(handle, y, n, "y.bin").await;
+    let m = seed(handle, s, "m", LoreNodeType::Directory).await;
+    let f = seed(handle, m, "f.bin", LoreNodeType::File).await;
+    let before = [
+        marks_of(handle, d).await,
+        marks_of(handle, sub).await,
+        marks_of(handle, kept).await,
+    ];
+
+    let (status, events) = run_delete(handle, vec![entry(10, d), entry(11, e)]).await;
+    assert_ne!(status, 0, "the mixed subtree fails the call: {events:?}");
+    assert_eq!(
+        delete_outcomes(&events),
+        vec![
+            (10, 0, LoreErrorCode::Internal),
+            (11, 4, LoreErrorCode::None)
+        ],
+        "the mixed entry fails alone, the clean one counting its tracked and added nodes"
+    );
+    assert_eq!(
+        batch_outcomes(&events),
+        vec![(CALL_ID, LoreErrorCode::Internal)],
+        "the call reports the failure for the batch"
+    );
+    assert_eq!(
+        [
+            marks_of(handle, d).await,
+            marks_of(handle, sub).await,
+            marks_of(handle, kept).await,
+        ],
+        before,
+        "the failed entry stages nothing"
+    );
+    assert!(
+        children_of(handle, d)
+            .await
+            .contains(&(n, LoreNodeStagedAction::Add as u32)),
+        "the added directory stays below the directory"
+    );
+    assert_eq!(
+        children_of(handle, n).await,
+        vec![(y, LoreNodeStagedAction::Move as u32)],
+        "the moved node stays below the added directory"
+    );
+    for node in [e, s] {
+        assert_eq!(
+            marks_of(handle, node).await.0,
+            LoreNodeStagedAction::Delete as u32,
+            "{node} of the clean entry is staged for deletion"
+        );
+    }
+    for node in [m, f] {
+        assert_eq!(
+            fetch_node_info(handle, node).await,
+            (
+                node,
+                LoreNodeType::Directory as u32,
+                LoreNodeStagedAction::None as u32
+            ),
+            "{node} of the clean entry reads as a freed id does"
+        );
+    }
+    release(handle, store_handle_id);
+}
+
 /// Plans `entries`, runs `between` on the tree, then applies the plan, all inside one call, as
 /// [`a_target_discarded_after_validation_fails_only_its_own_entry`] does; answers the call's
 /// status and events.
@@ -1827,6 +1933,209 @@ async fn plan_change_apply(
     .await;
     let events = sink.lock().unwrap().clone();
     (status, events)
+}
+
+/// A tracked `t` holding the staged `t/sub`, with an added file below it, and the tracked `t/a`;
+/// a tracked `intact.bin` beside it; and `y` moved into an added `n`, so a delete walks tracked
+/// subtrees. Answers `(t, sub, a, intact)`.
+async fn subtree_beside_a_move_below_an_added_directory(
+    handle: LoreRevisionTree,
+) -> (NodeID, NodeID, NodeID, NodeID) {
+    let t = seed(handle, ROOT_NODE, "t", LoreNodeType::Directory).await;
+    let sub = seed(handle, t, "sub", LoreNodeType::Directory).await;
+    let a = seed(handle, t, "a.bin", LoreNodeType::File).await;
+    let intact = seed(handle, ROOT_NODE, "intact.bin", LoreNodeType::File).await;
+    let y = seed(handle, ROOT_NODE, "y.bin", LoreNodeType::File).await;
+    settle(handle, &[t, sub, a, intact, y]).await;
+    seed(handle, sub, "x.bin", LoreNodeType::File).await;
+    let n = seed(handle, ROOT_NODE, "n", LoreNodeType::Directory).await;
+    move_into(handle, y, n, "y.bin").await;
+    (t, sub, a, intact)
+}
+
+/// Breaks the child link of `directory`, naming a block the tree does not have, as a block that
+/// cannot be read leaves a walk of it.
+async fn break_child_link(
+    state: Arc<lore_revision::state::State>,
+    repository: Arc<lore_revision::repository::RepositoryContext>,
+    directory: NodeID,
+) {
+    let block = state
+        .block(repository, lore_revision::node::NodeBlock::index(directory))
+        .await
+        .expect("the directory's block");
+    block
+        .write_for_tests()
+        .node(lore_revision::node::Node::index(directory))
+        .child = 0x00ff_ff00;
+}
+
+/// An entry whose check cannot read a directory of its subtree, here a staged `t/sub` whose child
+/// link names a block the tree does not have, fails with nothing staged, its nodes keeping their
+/// marks; the entry beside it reports what it removed.
+#[tokio::test]
+async fn an_entry_whose_check_cannot_read_its_subtree_fails_unchanged() {
+    let partition = Partition::from([0xe8u8; 16]);
+    let (handle, store_handle_id) = load_handle("delete-check-unreadable", partition).await;
+    let (t, sub, a, intact) = subtree_beside_a_move_below_an_added_directory(handle).await;
+    let before = [
+        marks_of(handle, t).await,
+        marks_of(handle, sub).await,
+        marks_of(handle, a).await,
+    ];
+
+    let (status, events) = plan_change_apply(
+        handle,
+        vec![entry(10, t), entry(11, intact)],
+        async move |state, repository| break_child_link(state, repository, sub).await,
+    )
+    .await;
+
+    assert_ne!(status, 0, "the unreadable subtree fails the call");
+    assert_eq!(
+        delete_outcomes(&events),
+        vec![
+            (10, 0, LoreErrorCode::Internal),
+            (11, 1, LoreErrorCode::None)
+        ],
+        "the entry whose check failed fails alone"
+    );
+    assert_eq!(
+        [
+            marks_of(handle, t).await,
+            marks_of(handle, sub).await,
+            marks_of(handle, a).await,
+        ],
+        before,
+        "the failed entry stages nothing"
+    );
+    release(handle, store_handle_id);
+}
+
+/// Until a move puts a tracked node below an added directory, a delete does not walk a tracked
+/// subtree before it stages it: the same unreadable `t/sub` fails the entry only once the marks
+/// reach it, `t` staged for deletion by then.
+#[tokio::test]
+async fn a_tracked_subtree_is_not_checked_before_a_move_below_an_added_directory() {
+    let partition = Partition::from([0xe9u8; 16]);
+    let (handle, store_handle_id) = load_handle("delete-check-skipped", partition).await;
+    let t = seed(handle, ROOT_NODE, "t", LoreNodeType::Directory).await;
+    let sub = seed(handle, t, "sub", LoreNodeType::Directory).await;
+    settle(handle, &[t, sub]).await;
+    seed(handle, sub, "x.bin", LoreNodeType::File).await;
+
+    let (status, events) = plan_change_apply(
+        handle,
+        vec![entry(10, t)],
+        async move |state, repository| break_child_link(state, repository, sub).await,
+    )
+    .await;
+
+    assert_ne!(status, 0, "the unreadable subtree fails the call");
+    assert_eq!(
+        delete_outcomes(&events),
+        vec![(10, 0, LoreErrorCode::Internal)],
+        "the entry fails"
+    );
+    assert_eq!(
+        marks_of(handle, t).await.0,
+        LoreNodeStagedAction::Delete as u32,
+        "the marks ran before any walk of the subtree"
+    );
+    release(handle, store_handle_id);
+}
+
+/// Until a move puts a tracked node below an added directory, a delete does not walk an added
+/// subtree before it detaches it either: an unreadable `n/m` fails the entry only once the detach
+/// reaches it, `n` detached by then.
+#[tokio::test]
+async fn an_added_subtree_is_not_checked_before_a_move_below_an_added_directory() {
+    let partition = Partition::from([0xebu8; 16]);
+    let (handle, store_handle_id) = load_handle("delete-added-check-skipped", partition).await;
+    let n = seed(handle, ROOT_NODE, "n", LoreNodeType::Directory).await;
+    let m = seed(handle, n, "m", LoreNodeType::Directory).await;
+    seed(handle, m, "x.bin", LoreNodeType::File).await;
+
+    let (status, events) = plan_change_apply(
+        handle,
+        vec![entry(10, n)],
+        async move |state, repository| break_child_link(state, repository, m).await,
+    )
+    .await;
+
+    assert_ne!(status, 0, "the unreadable subtree fails the call");
+    assert_eq!(
+        delete_outcomes(&events),
+        vec![(10, 0, LoreErrorCode::Internal)],
+        "the entry fails"
+    );
+    assert!(
+        children_of(handle, ROOT_NODE).await.is_empty(),
+        "the detach ran before any walk of the subtree"
+    );
+    release(handle, store_handle_id);
+}
+
+/// Sets the parent link of `node` to `parent`.
+async fn set_parent_link(handle: LoreRevisionTree, node: NodeID, parent: NodeID) {
+    let internal = rt_handle::lookup(handle).expect("the handle must resolve");
+    let block = internal
+        .state_for_tests()
+        .block(
+            internal.repository_context.clone(),
+            lore_revision::node::NodeBlock::index(node),
+        )
+        .await
+        .expect("the node's block");
+    block
+        .write_for_tests()
+        .node(lore_revision::node::Node::index(node))
+        .parent = parent;
+}
+
+/// A tracked `d` left unmarked above the staged `d/s`, as an add's climb that failed on a block
+/// leaves it and the add retried then, holding an added `d/s/n` that a moved tracked `y` makes
+/// mixed: the delete of `d` fails with nothing staged and `y` still held, though the staged bits
+/// that a check below a tracked directory follows stop at `d`.
+#[tokio::test]
+async fn a_mixed_directory_below_a_climb_that_failed_fails_its_entry_unchanged() {
+    let partition = Partition::from([0xecu8; 16]);
+    let (handle, store_handle_id) = load_handle("delete-mixed-broken-climb", partition).await;
+    let d = seed(handle, ROOT_NODE, "d", LoreNodeType::Directory).await;
+    let s = seed(handle, d, "s", LoreNodeType::Directory).await;
+    let y = seed(handle, ROOT_NODE, "y.bin", LoreNodeType::File).await;
+    settle(handle, &[d, s, y]).await;
+    set_parent_link(handle, s, 0x00ff_ff00).await;
+    let (status, _) = run_add(handle, vec![add_entry(1, s, "n", LoreNodeType::Directory)]).await;
+    assert_ne!(status, 0, "the add's climb fails above 's'");
+    set_parent_link(handle, s, d).await;
+    let n = seed(handle, s, "n", LoreNodeType::Directory).await;
+    move_into(handle, y, n, "y.bin").await;
+    let before = [marks_of(handle, d).await, marks_of(handle, s).await];
+    assert_eq!(
+        before[0],
+        (0, 0),
+        "'d' is left unmarked above the staged 's'"
+    );
+
+    let (status, events) = run_delete(handle, vec![entry(10, d)]).await;
+    assert_ne!(status, 0, "the mixed subtree fails the call: {events:?}");
+    assert_eq!(
+        delete_outcomes(&events),
+        vec![(10, 0, LoreErrorCode::Internal)],
+        "the entry fails, reporting nothing removed"
+    );
+    assert_eq!(
+        [marks_of(handle, d).await, marks_of(handle, s).await],
+        before,
+        "the failed entry stages nothing"
+    );
+    assert_eq!(
+        children_of(handle, n).await,
+        vec![(y, LoreNodeStagedAction::Move as u32)],
+        "'y' is still held below 'n'"
+    );
+    release(handle, store_handle_id);
 }
 
 /// An entry whose marks of the directories above it fail, here at an ancestor whose parent link

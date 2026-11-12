@@ -273,6 +273,31 @@ async fn run_move(
     (status, events)
 }
 
+/// Rewrites file `node_id` to `size` bytes at content `hash`, in a call that must succeed.
+async fn run_modify(handle: LoreRevisionTree, node_id: NodeID, size: u64, hash: u64) {
+    use lore::revision_tree::modify::LoreRevisionTreeModifyArgs;
+    use lore::revision_tree::modify::LoreRevisionTreeModifyEntry;
+    use lore::revision_tree::modify::modify;
+
+    let status = modify(
+        LoreGlobalArgs::default(),
+        LoreRevisionTreeModifyArgs {
+            batch_id: CALL_ID,
+            handle,
+            entries: LoreArray::from_vec(vec![LoreRevisionTreeModifyEntry {
+                entry_id: 1,
+                node_id,
+                mode: 0o644,
+                size,
+                address: address(hash, Context::default()),
+            }]),
+        },
+        None,
+    )
+    .await;
+    assert_eq!(status, 0, "modifying {node_id} must succeed");
+}
+
 async fn run_delete(handle: LoreRevisionTree, node_id: NodeID) {
     let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let status = delete(
@@ -850,6 +875,50 @@ async fn a_committed_move_is_recorded_as_a_move_in_the_revision_delta() {
         delta.action,
         FileAction::Move as u16,
         "the delta must record a move, not a deletion and an addition"
+    );
+    release(handle, store_handle_id);
+}
+
+/// A moved file rewritten before the commit is recorded as a move with its new content, as the
+/// working-tree staging path records an edited moved file: the history carries the move.
+#[tokio::test]
+async fn a_moved_file_modified_before_the_commit_is_recorded_as_a_move() {
+    let partition = Partition::from([0xe6u8; 16]);
+    let (handle, store_handle_id) = load_handle("move-modify-delta", partition).await;
+
+    let destination = seed(handle, ROOT_NODE, "dst", LoreNodeType::Directory).await;
+    let node_id = seed(handle, ROOT_NODE, "data.bin", LoreNodeType::File).await;
+    set_branch(handle, Context::from(uuid::Uuid::now_v7())).await;
+    run_commit(handle, 1).await;
+
+    let (status, _events) =
+        run_move(handle, vec![entry(10, node_id, destination, "data.bin")]).await;
+    assert_eq!(status, 0, "moving a committed file must succeed");
+    run_modify(handle, node_id, 20, 2).await;
+    run_commit(handle, 2).await;
+
+    let internal = rt_handle::lookup(handle).expect("the handle must resolve");
+    let execution = lore::call::setup_execution(LoreGlobalArgs::default(), None);
+    let delta = lore_base::runtime::LORE_CONTEXT
+        .scope(execution, async move {
+            internal
+                .state_for_tests()
+                .node_delta(internal.repository_context.clone(), node_id)
+                .await
+        })
+        .await
+        .expect("the published revision must carry a delta")
+        .expect("the moved file must be named in it");
+    assert_eq!(
+        delta.action,
+        FileAction::Move as u16,
+        "the delta must record the move, not a modification"
+    );
+    let info = fetch_node_info(handle, node_id).await;
+    assert_eq!(
+        (info.parent_id, info.size, info.address.hash),
+        (destination, 20, Hash::from_u64(2)),
+        "the file is committed at its new place with its new content"
     );
     release(handle, store_handle_id);
 }

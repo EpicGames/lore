@@ -11,7 +11,11 @@
 //! `invalid`; a true `invalid` flag triggers immediate decrement and
 //! rejection. Close sets `invalid`, then awaits `in_flight -> 0` before
 //! proceeding to teardown. The [`OpGuard`] RAII wrapper enforces this
-//! pairing for callers.
+//! pairing for callers. Each side stores and then reads what the other stores,
+//! so the op's increment and read of `invalid`, and the close's store of
+//! `invalid` and first read of `in_flight`, are `SeqCst`: with any weaker order
+//! both can read the value from before the other's store, and the close returns
+//! while the op runs.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -277,9 +281,9 @@ impl StoreInternal {
     /// proceeding.
     #[lore_macro::test_pub]
     pub(crate) async fn mark_invalid_and_await(&self) {
-        self.invalid.store(true, Ordering::Release);
+        self.invalid.store(true, Ordering::SeqCst);
         loop {
-            if self.in_flight.load(Ordering::Acquire) == 0 {
+            if self.in_flight.load(Ordering::SeqCst) == 0 {
                 break;
             }
             let mut notified = std::pin::pin!(self.drained.notified());
@@ -347,8 +351,8 @@ impl OpGuard {
     #[lore_macro::test_pub]
     pub(crate) fn enter(store_handle: LoreStore) -> Option<Self> {
         let store = handle::lookup(store_handle)?;
-        store.in_flight.fetch_add(1, Ordering::AcqRel);
-        if store.invalid.load(Ordering::Acquire) {
+        store.in_flight.fetch_add(1, Ordering::SeqCst);
+        if store.invalid.load(Ordering::SeqCst) {
             Self::release(&store);
             return None;
         }

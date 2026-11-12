@@ -233,13 +233,19 @@ impl RevisionTreeInternal {
     /// race in between increment-and-check self-abort because they see
     /// `invalid=true` before proceeding.
     ///
+    /// Each side stores and then reads what the other stores, so the store of `invalid` and the
+    /// first read of `in_flight` are `SeqCst`, as are an op's increment and its read of `invalid`
+    /// ([`RevisionTreeGuard::join`]): with any weaker order both can read the value from before
+    /// the other's store, and the close returns while the op runs.
+    ///
     /// The waiter is registered before the re-check, because `notified()` alone
     /// stays unregistered until first poll and would miss a decrement firing
     /// between the check and the await.
+    #[lore_macro::test_pub]
     pub(crate) async fn mark_invalid_and_await(&self) {
-        self.invalid.store(true, Ordering::Release);
+        self.invalid.store(true, Ordering::SeqCst);
         loop {
-            if self.in_flight.load(Ordering::Acquire) == 0 {
+            if self.in_flight.load(Ordering::SeqCst) == 0 {
                 return;
             }
             let mut notified = std::pin::pin!(self.drained.notified());
@@ -404,8 +410,8 @@ impl RevisionTreeGuard {
     /// does to outlive it: no second registry lookup. Returns `None` when the tree has been
     /// marked invalid since.
     pub(crate) fn join(internal: Arc<RevisionTreeInternal>) -> Option<Self> {
-        internal.in_flight.fetch_add(1, Ordering::AcqRel);
-        if internal.invalid.load(Ordering::Acquire) {
+        internal.in_flight.fetch_add(1, Ordering::SeqCst);
+        if internal.invalid.load(Ordering::SeqCst) {
             Self::release(&internal);
             return None;
         }

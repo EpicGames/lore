@@ -109,7 +109,7 @@ fn rewrite_record(node: &mut Node, content: &Content, rewrite: Rewrite) -> Resul
 
 /// [`State::node_modify_staged`] under the node's block write lock: a live file's content, and
 /// the staged and dirty flags an edit records in the same write, staged and dirty modified, or
-/// added still where the file is staged for addition ([`State::staged_edit_flags`]); else the
+/// added or moved still where the file is staged so ([`State::staged_edit_flags`]); else the
 /// node's flags, the error built off the lock.
 #[inline]
 fn edit_record(node: &mut Node, content: &Content) -> Result<(), u16> {
@@ -536,7 +536,7 @@ impl State {
 
     /// Rewrites file `node`'s content as an edit records it, for the C API's modify: the content,
     /// and the staged and dirty flags of an edit in the same write, staged and dirty modified, or
-    /// added still where the file is staged for addition ([`State::staged_edit_flags`]). Before
+    /// added or moved still where the file is staged so ([`State::staged_edit_flags`]). Before
     /// the rewrite, its parent and their ancestors are marked staged and dirty with the base bits,
     /// each up to the first holding them (H8), and a modify that fails or is dropped after the
     /// climb began and before the rewrite notes an unfinished change

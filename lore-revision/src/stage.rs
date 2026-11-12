@@ -20,6 +20,7 @@ use tokio::task::JoinSet;
 use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::branch;
 use crate::change;
+use crate::change::FileAction;
 use crate::errors::*;
 use crate::event;
 use crate::filter::Filter;
@@ -3384,25 +3385,12 @@ pub(crate) async fn stage_node_from_metadata(
                 debug_assert!(changed, "the staged node left its place");
             }
 
-            let (staged_flag, dirty_flag, action) = if was_dirty_add || node.is_staged_add() {
-                (
-                    NodeFlags::StagedAdd,
-                    NodeFlags::DirtyAdd,
-                    LoreFileAction::Add,
-                )
-            } else if node.is_staged_move() {
-                (
-                    NodeFlags::StagedMove,
-                    NodeFlags::DirtyMove,
-                    LoreFileAction::Move,
-                )
+            let (staged_flag, dirty_flag) = if was_dirty_add {
+                (NodeFlags::StagedAdd, NodeFlags::DirtyAdd)
             } else {
-                (
-                    NodeFlags::StagedModify,
-                    NodeFlags::DirtyModify,
-                    LoreFileAction::Keep,
-                )
+                State::staged_edit_flags(&node)
             };
+            let action = LoreFileAction::from(FileAction::from_node_flags(staged_flag.bits()));
 
             let mark = staged_change(staged_flag, dirty_flag, options.node_flags);
             state

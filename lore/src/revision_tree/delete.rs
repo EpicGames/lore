@@ -309,8 +309,6 @@ struct AddedRoot {
     parent: NodeID,
     name_hash: u64,
     entry_index: usize,
-    /// Whether it is a directory, as the delete read it: a file or a link holds nothing below.
-    directory: bool,
 }
 
 /// What a group of a level found: its nodes staged and its failures per entry, in `T`, the
@@ -640,7 +638,6 @@ async fn sort_children<T>(
                 parent: item.node_id,
                 name_hash: child.name_hash,
                 entry_index: item.entry_index,
-                directory: child.is_directory(),
             });
         } else {
             found.next.push(Tracked {
@@ -653,33 +650,36 @@ async fn sort_children<T>(
     Ok(())
 }
 
-/// Whether the subtree below added node `root` holds a node that is not added: a tracked node moved
-/// into it, which a detach of the subtree would take along. A node staged for deletion is passed
-/// over with all below it: the commit frees it with the subtree. Links are leaves. `pending` is the
-/// caller's buffer for the directories still to walk, cleared on entry.
+/// Whether the subtree of `item` holds an added directory holding a node that is not added: a
+/// tracked node moved into it, which a detach of the directory would take along. Every directory
+/// is walked, not only those holding the staged bit, so the answer does not rest on the staged
+/// marks of the directories above an added node, which a climb that failed or was dropped leaves
+/// incomplete. A node staged for deletion is passed over with all below it: the commit frees it
+/// with the subtree. Links are leaves. `pending` is the caller's buffer for the directories still
+/// to walk, each with whether it is added, cleared on entry.
 async fn mixed(
     state: &Arc<State>,
     context: &Arc<RepositoryContext>,
-    root: &AddedRoot,
-    pending: &mut Vec<NodeID>,
+    item: &Planned,
+    pending: &mut Vec<(NodeID, bool)>,
 ) -> Result<bool, StateError> {
-    if !root.directory {
+    if !item.directory {
         return Ok(false);
     }
     pending.clear();
-    pending.push(root.node_id);
-    while let Some(directory) = pending.pop() {
+    pending.push((item.node_id, item.staged_add));
+    while let Some((directory, added)) = pending.pop() {
         let mut children =
             StateNodeChildrenIterator::new(state.clone(), context.clone(), directory).await?;
         while let Some((child_id, child)) = children.next().await? {
             if child.is_staged_delete() {
                 continue;
             }
-            if !child.is_staged_add() {
+            if added && !child.is_staged_add() {
                 return Ok(true);
             }
             if child.is_directory() {
-                pending.push(child_id);
+                pending.push((child_id, child.is_staged_add()));
             }
         }
     }
@@ -766,11 +766,18 @@ pub async fn apply_plan(
 /// finish. An entry that failed reports nothing removed, since part of its subtree is in whichever
 /// state the failure left it.
 ///
-/// Tracked nodes are staged for deletion a level at a time, top-down, each level read from the
-/// chain heads the level above read under its marks' locks, so a child added or restored meanwhile
-/// is reached, staged and counted, or refused under the lock. Then every added subtree an entry
-/// reached is checked whole, one holding a tracked node failing its entry with nothing detached,
-/// and the subtrees of the entries left are detached onto the pending queue.
+/// Each entry's subtree is checked first ([`check_entries`]). Then tracked nodes are staged for
+/// deletion a level at a time, top-down, each level read from the chain heads the level above read
+/// under its marks' locks, so a child added or restored meanwhile is reached, staged and counted,
+/// or refused under the lock, and the added subtrees the entries that have not failed reached are
+/// detached onto the pending queue.
+///
+/// No added subtree is checked again after the marks: an added directory the check did not see,
+/// added since, holds only added nodes. A tracked node stands below an added directory only where
+/// a move put it or a restore took it back, and each takes the State's moves permit (C10): a move
+/// in `move_batch` (`move_node.rs`) before its plan, and a restore below an added directory in
+/// `State::restore_ordered` (lore-revision's `state/node/rewrite.rs`). This call holds the permit
+/// from before its plan to after its last change ([`delete_batch`]).
 async fn apply(
     state: &Arc<State>,
     context: &Arc<RepositoryContext>,
@@ -781,24 +788,7 @@ async fn apply(
         next: Vec::new(),
         added: Vec::new(),
     };
-    let mut level: Vec<Tracked> = Vec::new();
-    for (entry_index, item) in planned.iter().enumerate() {
-        if item.staged_add {
-            found.added.push(AddedRoot {
-                node_id: item.node_id,
-                parent: item.parent,
-                name_hash: item.name_hash,
-                entry_index,
-                directory: item.directory,
-            });
-        } else {
-            level.push(Tracked {
-                node_id: item.node_id,
-                parent: item.parent,
-                entry_index,
-            });
-        }
-    }
+    let mut level = check_entries(state, context, planned, &mut found).await;
     while !level.is_empty() {
         mark_level(state, context, level, &mut found).await;
         level = std::mem::take(&mut found.next);
@@ -809,19 +799,55 @@ async fn apply(
         added,
         ..
     } = found;
-    let mut pending = Vec::new();
-    for root in &added {
-        if applied.failed[root.entry_index].failed() {
-            continue;
-        }
-        match mixed(state, context, root, &mut pending).await {
-            Ok(false) => {}
-            Ok(true) => applied.fail(root.entry_index, EntryFailure::Internal),
-            Err(error) => applied.fail(root.entry_index, EntryFailure::of(&error)),
-        }
-    }
     detach_added(state, context, added, &mut applied).await;
     applied
+}
+
+/// Checks each entry's subtree ([`mixed`]), failing in `found` an entry whose subtree holds a
+/// tracked node below an added directory, or cannot be read, with nothing staged or detached, and
+/// sorts the entries left: an added root into `found`, a tracked one into the level answered, the
+/// first to stage. A subtree is walked only while the State may hold a tracked node below an added
+/// directory ([`State::may_hold_tracked_below_added`]): unset, no subtree can be mixed, whatever
+/// the staged marks of its directories, since a move notes it before any mark, under the moves
+/// permit this call holds. Set, the walk takes every directory, so it does not rest on those marks
+/// either.
+async fn check_entries(
+    state: &Arc<State>,
+    context: &Arc<RepositoryContext>,
+    planned: &[Planned],
+    found: &mut LevelFound<Applied>,
+) -> Vec<Tracked> {
+    let tracked_below_added = state.may_hold_tracked_below_added();
+    let mut level = Vec::new();
+    let mut pending = Vec::new();
+    for (entry_index, item) in planned.iter().enumerate() {
+        if tracked_below_added {
+            let failure = match mixed(state, context, item, &mut pending).await {
+                Ok(false) => EntryFailure::None,
+                Ok(true) => EntryFailure::Internal,
+                Err(error) => EntryFailure::of(&error),
+            };
+            if failure.failed() {
+                found.tally.fail(entry_index, failure);
+                continue;
+            }
+        }
+        if item.staged_add {
+            found.added.push(AddedRoot {
+                node_id: item.node_id,
+                parent: item.parent,
+                name_hash: item.name_hash,
+                entry_index,
+            });
+        } else {
+            level.push(Tracked {
+                node_id: item.node_id,
+                parent: item.parent,
+                entry_index,
+            });
+        }
+    }
+    level
 }
 
 /// Remove a batch of subtrees from the revision being built.
@@ -887,15 +913,21 @@ async fn apply(
 /// that are two adjacent levels of the tracked subtrees being removed, the one
 /// being staged and the next, collected from the chain heads its marks read, at a
 /// few dozen bytes per node; one record per added subtree root found, held to the
-/// end of the batch; and, while an added subtree is checked, its directories still
-/// to walk.
+/// end of the batch; and, while an entry's subtree is checked, its directories
+/// still to walk.
+///
+/// Each entry's subtree is checked before any of it is staged, walking every
+/// directory of it but those staged for deletion: an added directory holding a
+/// node the loaded revision holds, moved there, fails the entry with `INTERNAL`,
+/// and the entry changes nothing. A subtree is walked only once a move has put a
+/// node the loaded revision holds into an added directory since the last commit.
 ///
 /// Staging fans out. Nodes are staged one depth level at a time and a level's
 /// nodes spread over at most one task per processor, since a tag is a flag write
 /// under the node's own block lock, beside a read lock of its parent's, and
-/// touches no parent or sibling pointer. Each added subtree is checked whole,
-/// then detached from its directory in one step, its nodes kept for the commit to
-/// free; detaches from one directory run one after another. Per-entry events fire
+/// touches no parent or sibling pointer. Each added subtree is then detached from
+/// its directory in one step, its nodes kept for the commit to free; detaches
+/// from one directory run one after another. Per-entry events fire
 /// in entry order after the whole batch has been walked, and carry a count only
 /// on success. A node staged for deletion inside an added subtree, by a move
 /// there then a delete, is not counted again.
@@ -908,7 +940,7 @@ async fn apply(
 /// with it, and one after is refused. A restore of a node below an added
 /// directory, which stands there only once a move put it there, waits for the
 /// permit instead: landing first, it makes the added subtree mixed, so the
-/// delete's entry fails with `INTERNAL` and nothing is detached. The batch runs
+/// delete's entry fails with `INTERNAL` and changes nothing. The batch runs
 /// in a task the call waits for, so a call dropped part way still finishes its
 /// batch, and reports nothing.
 pub async fn delete(
