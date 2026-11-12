@@ -62,6 +62,19 @@ def unstaged_entries(repo: "Lore") -> list[dict]:
     )
 
 
+def view_file(scratch_dir, name: str, rules: list[str]) -> str:
+    """A view filter file holding `rules`, one per line, beside the repositories.
+
+    Outside every working tree, since a file inside one would be part of the tree
+    the view change carries.
+    """
+    directory = scratch_dir("view", create=True)
+    path = os.path.join(directory, name + ".txt")
+    with open(path, "w+") as output_file:
+        output_file.writelines(rule + "\n" for rule in rules)
+    return path
+
+
 def status_by_path(repo: "Lore", **kwargs) -> dict[str, dict]:
     """The `status` entries keyed by path."""
     return {

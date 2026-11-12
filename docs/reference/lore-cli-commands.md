@@ -1174,7 +1174,7 @@ Synchronize to a given state of a repository
 * `--forward-changes` — Fast forward any local changes if syncing to a local revision
 * `--reset` — Reset any local modified files to match the incoming revision
 * `--root-file <path>` — Root files for dependency-based selective sync (only sync changes for these files and their
-  dependencies). A root file inside a link is skipped
+  dependencies, and the whole folder that replaces a link they lie in). A root file inside a link is skipped
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based sync
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based sync
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
@@ -2504,7 +2504,7 @@ Synchronize to a repository state
 * `--forward-changes` — Fast forward any local changes if syncing to a local revision
 * `--reset` — Reset any local modified files to match the incoming revision
 * `--root-file <path>` — Root files for dependency-based selective sync (only sync changes for these files and their
-  dependencies). A root file inside a link is skipped
+  dependencies, and the whole folder that replaces a link they lie in). A root file inside a link is skipped
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based sync
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based sync
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)

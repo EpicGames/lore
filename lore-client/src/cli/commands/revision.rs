@@ -205,7 +205,8 @@ pub struct RevisionSyncArgs {
     #[clap(long, action, conflicts_with = "forward_changes")]
     reset: bool,
 
-    /// Root files for dependency-based selective sync (only sync changes for these files and their dependencies). A root file inside a link is skipped
+    /// Root files for dependency-based selective sync (only sync changes for these files and their dependencies, and
+    /// the whole folder that replaces a link they lie in). A root file inside a link is skipped
     #[clap(long = "root-file", value_name = "path")]
     root_files: Vec<String>,
 

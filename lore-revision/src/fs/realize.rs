@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::borrow::Borrow;
+use std::collections::HashSet;
 use std::ops::BitAnd;
 use std::path::Path;
 use std::sync::Arc;
@@ -243,18 +244,15 @@ pub async fn realize_state(
 
     let changes = if let Some(inclusion_set) = inclusion_set {
         let change_count = changes.len();
-        let filtered: Vec<NodeChange> = changes
-            .into_iter()
-            .filter(|change| {
-                let (mapping, state) = match change.action {
-                    change::FileAction::Delete => (&change.from.mapping, &state_current),
-                    _ => (&change.to.mapping, &state_target),
-                };
-                // Node ids are numbered per tree, so a change inside a link can carry the id of a
-                // node in the dependency set.
-                inclusion_set.contains(&mapping.node) && Arc::ptr_eq(&mapping.state, state)
-            })
-            .collect();
+        let filtered = changes_in_dependency_set(changes, |change: &NodeChange| {
+            let (mapping, state) = match change.action {
+                change::FileAction::Delete => (&change.from.mapping, &state_current),
+                _ => (&change.to.mapping, &state_target),
+            };
+            // Node ids are numbered per tree, so a change inside a link can carry the id of a
+            // node in the dependency set.
+            inclusion_set.contains(&mapping.node) && Arc::ptr_eq(&mapping.state, state)
+        });
         lore_info!(
             "Dependency filter: {} of {} changes in inclusion set",
             filtered.len(),
@@ -280,7 +278,7 @@ pub async fn realize_state(
 
     let options = Arc::new(options);
     let changes = Arc::new(changes);
-    let changes = if !changes.is_empty() && !force && !options.reset {
+    let VerifiedChanges { changes, kept } = if !changes.is_empty() && !force && !options.reset {
         lore_info!("Verifying {} changes with local file system", changes.len());
         // The list is moved in, so verification can filter it in place and the realize step never
         // holds a second list of the same millions of changes.
@@ -294,7 +292,10 @@ pub async fn realize_state(
         }))
         .await?
     } else {
-        changes
+        VerifiedChanges {
+            changes,
+            kept: Vec::new(),
+        }
     };
 
     if lore_base::allocator::memory_stats_requested() {
@@ -309,6 +310,7 @@ pub async fn realize_state(
         repository_target,
         operation,
         changes,
+        &kept,
         None,
         dry_run,
         false, /* Not a merge */
@@ -326,8 +328,18 @@ pub async fn realize_state(
     Ok(())
 }
 
+/// The changes a verify leaves to realize, and the files a link delete among them keeps.
+pub struct VerifiedChanges {
+    /// The changes still having work to do, sorted by path.
+    pub changes: Arc<Vec<NodeChange>>,
+    /// The paths of the changes below the mount of a deleted link that the verify dropped, where
+    /// the working tree holds what the change set leaves or local work the sync forwards, which
+    /// removing the mount keeps.
+    pub kept: Vec<RelativePath>,
+}
+
 /// Verifies the changes `args` holds against the working copy, each as [`verify_filesystem`]
-/// does, and answers those still having work to do, sorted by path.
+/// does, and answers those still having work to do.
 ///
 /// Where [`SyncVerifyArgs::carries_modes`] is set, gives each file found holding the incoming
 /// content with the other executable bit the change's bit, once no change has refused; otherwise
@@ -337,7 +349,7 @@ pub async fn realize_state(
 #[allow(clippy::manual_async_fn)]
 pub fn verify_filesystem_for_changes(
     args: Arc<SyncVerifyArgs>,
-) -> impl Future<Output = Result<Arc<Vec<NodeChange>>, SyncError>> {
+) -> impl Future<Output = Result<VerifiedChanges, SyncError>> {
     async move {
         // Each task answers with its change's verdict and the flags the verify left on it:
         // verification only ever adds flags. The list to realize is the original filtered in
@@ -346,7 +358,7 @@ pub fn verify_filesystem_for_changes(
         let mut tasks = JoinSet::new();
         let mut verdicts = vec![(Verdict::Drop, change::Flags::None); args.changes.len()];
         let stats = Arc::new(SyncVerifyStats::default());
-        let incoming = Arc::new(IncomingMoves::new(args.changes.clone()));
+        let incoming = Arc::new(IncomingChanges::new(args.changes.clone()));
         let record = |verdicts: &mut Vec<(Verdict, change::Flags)>,
                       failure: &mut Option<SyncError>,
                       result: Result<
@@ -420,7 +432,19 @@ pub fn verify_filesystem_for_changes(
             carried.await?;
         }
 
-        // The moves hold a reference to the list; with them dropped, the list is taken back without
+        let kept = args
+            .changes
+            .iter()
+            .zip(&verdicts)
+            .filter(|(change, (verdict, _))| {
+                *verdict != Verdict::Realize
+                    && change.action != change::FileAction::Delete
+                    && incoming.link_delete_above(change.path()).is_some()
+            })
+            .map(|(change, _)| change.path().clone())
+            .collect();
+
+        // `incoming` holds a reference to the list; with it dropped, the list is taken back without
         // a copy where this holds the only reference to it, which a caller that moves its list in
         // gives it.
         drop(incoming);
@@ -444,7 +468,10 @@ pub fn verify_filesystem_for_changes(
         // in the realize path complete before child file operations are spawned.
         change::sort_by_path(&mut changes);
 
-        Ok(Arc::new(changes))
+        Ok(VerifiedChanges {
+            changes: Arc::new(changes),
+            kept,
+        })
     }
 }
 
@@ -551,18 +578,77 @@ async fn holds_the_replaced_content(
     ))
 }
 
+/// The changes of `changes` a dependency set holds, as `included` answers, in their order.
+///
+/// Where a kept change lies at or below the mount of a link the changes delete, the link delete
+/// and every change at or below its mount are kept too: removing the mount removes everything
+/// below it, so what replaces it lands whole. The link delete's node is one of the tree the sync
+/// leaves, which a dependency set of the tree it reaches does not hold.
+#[lore_macro::test_pub]
+fn changes_in_dependency_set(
+    changes: Vec<NodeChange>,
+    included: impl Fn(&NodeChange) -> bool,
+) -> Vec<NodeChange> {
+    let changes = Arc::new(changes);
+    let keep: Vec<bool> = {
+        let incoming = IncomingChanges::new(changes.clone());
+        let replaced_mounts: HashSet<usize> = changes
+            .iter()
+            .filter(|change| change.action != change::FileAction::Delete && included(change))
+            .filter_map(|change| incoming.link_delete_covering(change.path()))
+            .collect();
+        changes
+            .iter()
+            .map(|change| {
+                included(change)
+                    || incoming
+                        .link_delete_covering(change.path())
+                        .is_some_and(|index| replaced_mounts.contains(&index))
+            })
+            .collect()
+    };
+    let changes = Arc::try_unwrap(changes).unwrap_or_else(|shared| (*shared).clone());
+    changes
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(change, keep)| keep.then_some(change))
+        .collect()
+}
+
+/// The node `current` holds at `path`, as [`NodeMapping::node_at`] finds it, with the context and
+/// state holding it: the linked ones the walk opened where `path` crosses a link, and `current`'s
+/// own elsewhere.
+async fn held_at(
+    current: &NodeMapping,
+    path: &RelativePath,
+) -> Option<(NodeID, crate::link::LinkedState)> {
+    let below = path.below(&current.path)?;
+    let (node_link, linked) = current
+        .state
+        .find_relative(current.repository.clone(), current.node, below)
+        .await
+        .ok()?;
+    node_link.node.is_valid_node_id().then(|| {
+        let held = linked.unwrap_or_else(|| (current.repository.clone(), current.state.clone()));
+        (node_link.node, held)
+    })
+}
+
 /// How the working file at `repository_path`, the path a change names or the one a move carries
 /// its file from, compares to the node it was realized from, and whether the current revision is
 /// what holds that node.
 ///
 /// A three-way merge's from side is the base revision, which answers for nothing on disk, so
-/// the node the current revision holds at the path stands in. Where the change starts at the
-/// current revision the two are the same node, reached by id rather than by path, and where
-/// the current revision holds none the from side is all there is. The node is measured in the
-/// context that holds it, whose partition its content lives in.
+/// the node the current revision holds at the path stands in. Where the change starts at a node
+/// of the current revision the two are the same node, reached by id rather than by path. An add
+/// that starts at the current revision is still measured by path below a link `incoming`
+/// deletes, where the current view holds it: the current revision holds the path through that
+/// link's mount, which `incoming` opens once for every path below it. Where the current revision
+/// holds none the from side is all there is. The node is measured in the context that holds it,
+/// whose partition its content lives in.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
-#[allow(clippy::manual_async_fn)]
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
 fn modification_against_measured_node<'a>(
     operation: &'a Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
@@ -571,6 +657,7 @@ fn modification_against_measured_node<'a>(
     force_full_check: bool,
     repository_path: &'a RelativePath,
     established: &'a lore_storage::ContentHashes,
+    incoming: &'a IncomingChanges,
 ) -> impl Future<Output = Result<crate::fs::filesystem_provider::FileModifiedCheck, SyncError>> + 'a
 {
     async move {
@@ -584,21 +671,24 @@ fn modification_against_measured_node<'a>(
         }
 
         let from_is_current = change.from.mapping.state.revision() == current.state.revision();
-        let node_link = if from_is_current {
-            NodeLink::invalid()
+        let held = if !from_is_current {
+            held_at(current, repository_path).await
+        } else if change.from.mapping.node.is_valid_node_id()
+            || !info.is_file()
+            || incoming.link_delete_above(repository_path).is_none()
+            || repository
+                .filter
+                .excludes_tree(repository_path, false, FilterMode::View)
+        {
+            None
         } else {
-            current.node_at(repository_path).await
+            incoming.held_below_deleted_link(repository_path).await
         };
 
-        let (node, repository_measured, is_current) = if node_link.node.is_valid_node_id() {
-            let (repository_current, state_node) = node_link
-                .resolve(repository.clone(), current.state.clone())
-                .await
-                .forward_with::<SyncError, _>(|| {
-                    format!("Failed to deserialize state {}", node_link.revision)
-                })?;
+        let (node, repository_measured, is_current) = if let Some((held_node, held)) = held {
+            let (repository_current, state_node) = held;
             let node = state_node
-                .node(repository_current.clone(), node_link.node)
+                .node(repository_current.clone(), held_node)
                 .await
                 .forward::<SyncError>("Failed loading the node the current revision holds")?;
             (Some(node), repository_current, true)
@@ -680,6 +770,7 @@ async fn moved_file_holds_local_work(
     current: &NodeMapping,
     force_full_check: bool,
     source: &RelativePath,
+    incoming: &IncomingChanges,
 ) -> Result<bool, SyncError> {
     let established = lore_storage::ContentHashes::default();
     let measured = modification_against_measured_node(
@@ -690,6 +781,7 @@ async fn moved_file_holds_local_work(
         force_full_check,
         source,
         &established,
+        incoming,
     )
     .await?;
     let carried = measured
@@ -790,19 +882,127 @@ async fn mode_is_the_working_tree_own(
     })
 }
 
-/// The moves of a change set, looked up by the path each moves from.
-pub struct IncomingMoves {
+/// The moves and link deletes of a change set, looked up by path.
+pub struct IncomingChanges {
     changes: Arc<Vec<NodeChange>>,
     by_source: OnceLock<Vec<usize>>,
+    deleted_links: OnceLock<Vec<DeletedLink>>,
 }
 
-impl IncomingMoves {
-    /// The moves `changes` holds, indexed on the first lookup.
+/// A link delete of a change set, and the tree it mounts, opened once for every path below it.
+struct DeletedLink {
+    index: usize,
+    mounted: tokio::sync::OnceCell<Option<(NodeID, crate::link::LinkedState)>>,
+}
+
+impl IncomingChanges {
+    /// The changes `changes` holds, indexed on the first lookup of each kind.
     pub fn new(changes: Arc<Vec<NodeChange>>) -> Self {
         Self {
             changes,
             by_source: OnceLock::new(),
+            deleted_links: OnceLock::new(),
         }
+    }
+
+    /// The delete of a link mounted above `path`, which removes everything below the mount from
+    /// the working tree.
+    fn link_delete_above(&self, path: &RelativePath) -> Option<&NodeChange> {
+        self.deleted_link(path, false)
+            .map(|(deleted, _)| &self.changes[deleted.index])
+    }
+
+    /// The index of the delete of a link mounted at or above `path`, the outermost where several
+    /// are.
+    fn link_delete_covering(&self, path: &RelativePath) -> Option<usize> {
+        self.deleted_link(path, true)
+            .map(|(deleted, _)| deleted.index)
+    }
+
+    /// The node at `path` in the tree that the link deleted above `path` mounts, with the context
+    /// and state holding it, or `None` where that tree holds none or the link cannot be opened.
+    /// The link's tree is opened on the first path below its mount and shared by the rest.
+    async fn held_below_deleted_link(
+        &self,
+        path: &RelativePath,
+    ) -> Option<(NodeID, crate::link::LinkedState)> {
+        let (deleted, mount_components) = self.deleted_link(path, false)?;
+        let link = &self.changes[deleted.index];
+        let (mounted, (repository, state)) = deleted
+            .mounted
+            .get_or_init(|| open_deleted_link(link))
+            .await
+            .as_ref()?;
+        let below = path
+            .as_str()
+            .splitn(mount_components + 1, '/')
+            .nth(mount_components)?;
+        let (found, nested) = state
+            .find_relative(repository.clone(), *mounted, below)
+            .await
+            .ok()?;
+        found.node.is_valid_node_id().then(|| {
+            (
+                found.node,
+                nested.unwrap_or_else(|| (repository.clone(), state.clone())),
+            )
+        })
+    }
+
+    /// The link delete mounted above `path`, or at it where `at_path` says so, the outermost
+    /// where several are, with the number of components of its mount.
+    ///
+    /// Matched ignoring case, since on a case-insensitive file system the delete removes the
+    /// mount under any spelling. On a case-sensitive one a case variant of the mount is a
+    /// directory of its own, and a file there is measured as though the link held it.
+    fn deleted_link(&self, path: &RelativePath, at_path: bool) -> Option<(&DeletedLink, usize)> {
+        let changes = &self.changes;
+        let deleted_links = self.deleted_links.get_or_init(|| {
+            let mut deleted_links: Vec<DeletedLink> = (0..changes.len())
+                .filter(|&index| {
+                    changes[index].action == change::FileAction::Delete
+                        && changes[index].from.is_link()
+                })
+                .map(|index| DeletedLink {
+                    index,
+                    mounted: tokio::sync::OnceCell::new(),
+                })
+                .collect();
+            deleted_links.sort_unstable_by(|a, b| {
+                changes[a.index]
+                    .path()
+                    .as_lowercase_str()
+                    .cmp(changes[b.index].path().as_lowercase_str())
+            });
+            deleted_links
+        });
+        if deleted_links.is_empty() {
+            return None;
+        }
+        // Split the lowercase spelling itself: lowercasing can change byte lengths.
+        let folded = path.as_lowercase_str();
+        let at = at_path.then_some(folded.len());
+        folded
+            .match_indices('/')
+            .map(|(end, _)| end)
+            .chain(at)
+            .find_map(|end| {
+                deleted_links
+                    .binary_search_by(|deleted| {
+                        changes[deleted.index]
+                            .path()
+                            .as_lowercase_str()
+                            .cmp(&folded[..end])
+                    })
+                    .ok()
+                    // Lowercasing keeps every separator, so the count holds for `path` too.
+                    .map(|found| {
+                        (
+                            &deleted_links[found],
+                            folded[..end].matches('/').count() + 1,
+                        )
+                    })
+            })
     }
 
     fn source(change: &NodeChange) -> &str {
@@ -829,6 +1029,37 @@ impl IncomingMoves {
     }
 }
 
+/// The node the link `delete` deletes mounts, in the context and state of the revision it pins,
+/// or `None` where the link cannot be read or opened.
+async fn open_deleted_link(delete: &NodeChange) -> Option<(NodeID, crate::link::LinkedState)> {
+    let node = match delete.from.get_node().await {
+        Ok(node) if node.is_link() => node,
+        Ok(_) => return None,
+        Err(err) => {
+            lore_warn!("Unable to read the link at {}: {err}", delete.path());
+            return None;
+        }
+    };
+    let link = node.linked_node();
+    let repository = delete
+        .from
+        .mapping
+        .repository
+        .to_link_context(link.repository)
+        .await;
+    match State::deserialize(repository.clone(), link.revision).await {
+        Ok(state) => Some((link.node, (repository, state))),
+        Err(err) => {
+            lore_warn!(
+                "Unable to open revision {} the link at {} pins: {err}",
+                link.revision,
+                delete.path()
+            );
+            None
+        }
+    }
+}
+
 /// Whether deleting a directory would lose the entry `change` reports below it.
 ///
 /// Nothing is lost of an added entry, which the non-recursive directory delete keeps, of a
@@ -839,7 +1070,7 @@ impl IncomingMoves {
 async fn holds_local_work(
     operation: &InstanceOperationImpl,
     change: &NodeChange,
-    incoming: Option<&IncomingMoves>,
+    incoming: Option<&IncomingChanges>,
 ) -> Result<bool, SyncError> {
     match change.action {
         change::FileAction::Add => return Ok(false),
@@ -975,8 +1206,10 @@ pub enum Verdict {
 /// operation's clock floor ([`InstanceOperationImpl::clock_floor`]), which a comparison reads
 /// before reading the file.
 ///
-/// `incoming` holds the moves of the change set the change belongs to, which answer for the target
-/// where a directory is deleted.
+/// `incoming` holds the change set the change belongs to, or at least its moves and link deletes:
+/// the moves answer for the target where a directory is deleted, and the link deletes for a file
+/// below the mount they remove. A change below such a mount that this drops names a file the
+/// mount's removal keeps ([`VerifiedChanges::kept`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn verify_filesystem(
     change: &mut NodeChange,
@@ -988,7 +1221,7 @@ pub async fn verify_filesystem(
     force_full_check: bool,
     stats: Arc<SyncVerifyStats>,
     filter_mode: FilterMode,
-    incoming: &IncomingMoves,
+    incoming: &IncomingChanges,
 ) -> Result<Verdict, SyncError> {
     lore_trace!("Verify path: {change:?}");
     if let Some(source) = change.relocated_from()
@@ -1000,6 +1233,7 @@ pub async fn verify_filesystem(
             &current,
             force_full_check,
             source,
+            incoming,
         ))
         .await?
     {
@@ -1025,6 +1259,7 @@ pub async fn verify_filesystem(
         force_full_check,
         &repository_path,
         &established,
+        incoming,
     )
     .await?;
 
@@ -1089,8 +1324,12 @@ pub async fn verify_filesystem(
             if holds_the_content(change, modifications.measured.as_ref()) {
                 change.flags |= change::Flags::HoldsContent;
             }
-            if change.action == change::FileAction::Keep
-                && let Some(measured) = modifications.measured.as_ref()
+            // An add measures against the current revision only through the mount of a link the
+            // change set deletes, whose removal keeps the file this leaves in place.
+            if matches!(
+                change.action,
+                change::FileAction::Keep | change::FileAction::Add
+            ) && let Some(measured) = modifications.measured.as_ref()
                 && measured.is_current
                 && !measured.node.address.is_zero()
                 && measured.node.address == incoming_address(change).await
@@ -1380,10 +1619,14 @@ pub async fn verify_filesystem(
     Ok(Verdict::Realize)
 }
 
+/// Realizes `changes` in the working tree, deletes first. A link delete removes its mount but for
+/// the files `kept` names below it ([`VerifiedChanges::kept`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn realize_changes(
     repository: Arc<RepositoryContext>,
     operation: Arc<InstanceOperationImpl>,
     changes: Arc<Vec<NodeChange>>,
+    kept: &[RelativePath],
     state_stage: Option<Arc<State>>,
     dry_run: bool,
     is_merge: bool,
@@ -1404,10 +1647,11 @@ pub async fn realize_changes(
         .store(file_delete_total, Ordering::Relaxed);
 
     // First perform all deletes in case of delete-add for going from/to file & directory
-    let kept = realize_changes_delete(
+    let kept_directories = realize_changes_delete(
         repository.clone(),
         operation.clone(),
         changes.clone(),
+        kept,
         state_stage.clone(),
         dry_run,
         is_merge,
@@ -1516,9 +1760,56 @@ pub async fn realize_changes(
     consumer_result?;
     producer_result?;
 
-    remove_directories_moved_out_of(&operation, &changes, kept).await;
+    remove_directories_moved_out_of(&operation, &changes, kept_directories).await;
 
     Ok(())
+}
+
+/// Removes the directory `path` with everything below it, but for the files `kept` names,
+/// lowercase and sorted, and the directories holding them.
+///
+/// Each entry goes as the listing yields it, so a directory of any width costs one entry, and the
+/// walk holds one listing per level of the directories holding kept files. Every provider's listing
+/// keeps yielding past an entry removed after it was listed.
+async fn remove_all_but(
+    operation: &InstanceOperationImpl,
+    path: &RelativePath,
+    kept: &[&str],
+) -> Result<(), FsError> {
+    if !holds_kept(path, kept) {
+        return operation.remove_recursive(path).await;
+    }
+    // The directories being walked, deepest last, each with what its listing has left to yield.
+    let mut walking = vec![(path.clone(), operation.read_directory(path).await?)];
+    while let Some((directory, listing)) = walking.last_mut() {
+        let Some(entry) = listing.next().await else {
+            walking.pop();
+            continue;
+        };
+        let entry = entry?;
+        let entry_path = directory.join(&entry.name);
+        if kept.binary_search(&entry_path.as_lowercase_str()).is_ok() {
+            continue;
+        }
+        if entry.info.is_file() {
+            operation.remove(&entry_path).await?;
+        } else if holds_kept(&entry_path, kept) {
+            let listing = operation.read_directory(&entry_path).await?;
+            walking.push((entry_path, listing));
+        } else {
+            operation.remove_recursive(&entry_path).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether the directory `path` holds a file `kept` names, lowercase and sorted.
+fn holds_kept(path: &RelativePath, kept: &[&str]) -> bool {
+    let folded = path.as_lowercase_str();
+    kept[kept.partition_point(|kept| *kept <= folded)..]
+        .iter()
+        .take_while(|kept| kept.starts_with(folded))
+        .any(|kept| kept.as_bytes().get(folded.len()) == Some(&b'/'))
 }
 
 /// Removes the directories in `kept`, which their deletes found holding entries, out of which a
@@ -1826,11 +2117,14 @@ fn progress_ticker(stats: Arc<SyncRealizeStats>) -> AbortOnDropHandle<()> {
 }
 
 /// Realizes the deletes `changes` holds, deepest first, and answers the directory deletes that
-/// found their directory holding entries and kept it.
+/// found their directory holding entries and kept it. A link delete removes its mount but for the
+/// files `kept` names below it.
+#[allow(clippy::too_many_arguments)]
 async fn realize_changes_delete(
     repository: Arc<RepositoryContext>,
     operation: Arc<InstanceOperationImpl>,
     changes: Arc<Vec<NodeChange>>,
+    kept: &[RelativePath],
     state_stage: Option<Arc<State>>,
     dry_run: bool,
     is_merge: bool,
@@ -1849,6 +2143,8 @@ async fn realize_changes_delete(
         .cloned()
         .collect();
     change::sort_by_path(delete_changes.as_mut_slice());
+    let mut kept_lowercase: Vec<&str> = kept.iter().map(RelativePath::as_lowercase_str).collect();
+    kept_lowercase.sort_unstable();
     let mut kept = Vec::new();
     for change in delete_changes.iter().rev() {
         let change = change.clone();
@@ -1892,7 +2188,9 @@ async fn realize_changes_delete(
             let mut retry = util::fs::file_unlink_retry();
             loop {
                 if is_link {
-                    if let Err(err) = operation.remove_recursive(&change_path).await {
+                    if let Err(err) =
+                        remove_all_but(&operation, &change_path, &kept_lowercase).await
+                    {
                         lore_debug!(
                             "Unable to unlink linked repository files at {}: {} (attempt {} of {}",
                             change_path,

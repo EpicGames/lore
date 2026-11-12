@@ -1347,7 +1347,7 @@ pub struct SyncVerifyArgs {
 pub async fn sync_verify_filesystem(
     _repository: Arc<RepositoryContext>,
     args: Arc<SyncVerifyArgs>,
-) -> Result<Arc<Vec<NodeChange>>, SyncError> {
+) -> Result<crate::fs::realize::VerifiedChanges, SyncError> {
     crate::fs::realize::verify_filesystem_for_changes(args).await
 }
 
@@ -1425,6 +1425,7 @@ pub async fn realize_changes(
             repository,
             operation,
             changes,
+            &[],
             state_stage,
             dry_run,
             is_merge,

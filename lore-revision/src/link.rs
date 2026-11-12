@@ -1877,10 +1877,13 @@ async fn verify_link_pin_diff(
     new_sig: Hash,
     diff: LinkPinDiff,
     carries_modes: bool,
-) -> Result<Arc<Vec<NodeChange>>, LinkError> {
+) -> Result<crate::fs::realize::VerifiedChanges, LinkError> {
     let LinkPinDiff { changes, current } = diff;
     if changes.is_empty() {
-        return Ok(changes);
+        return Ok(crate::fs::realize::VerifiedChanges {
+            changes,
+            kept: Vec::new(),
+        });
     }
     lore_info!(
         "Verifying {} link changes with local file system",
@@ -1916,8 +1919,11 @@ async fn realize_link_pin_diff(
     diff: LinkPinDiff,
     overwrite_local: bool,
 ) -> Result<(), LinkError> {
-    let changes = if overwrite_local {
-        diff.changes
+    let crate::fs::realize::VerifiedChanges { changes, kept } = if overwrite_local {
+        crate::fs::realize::VerifiedChanges {
+            changes: diff.changes,
+            kept: Vec::new(),
+        }
     } else {
         verify_link_pin_diff(operation, link_context, new_sig, diff, true).await?
     };
@@ -1948,6 +1954,7 @@ async fn realize_link_pin_diff(
         repository,
         operation.clone(),
         changes,
+        &kept,
         None,
         false, /* Not dry run */
         false, /* Not a merge */

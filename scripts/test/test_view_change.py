@@ -21,7 +21,7 @@ from lore_parsers import (
     parse_layer_list_json,
     parse_status_json,
 )
-from test_utils import to_posix
+from test_utils import to_posix, view_file
 
 from lore import Lore
 
@@ -114,19 +114,6 @@ def committed_repository(new_lore_repo) -> Lore:
     repo.commit()
     repo.push()
     return repo
-
-
-def view_file(scratch_dir, name: str, rules: list[str]) -> str:
-    """A view filter file holding `rules`, one per line, beside the repositories.
-
-    Outside every working tree, since a file inside one would be part of the tree
-    the view change carries.
-    """
-    directory = scratch_dir("view", create=True)
-    path = os.path.join(directory, name + ".txt")
-    with open(path, "w+") as output_file:
-        output_file.writelines(rule + "\n" for rule in rules)
-    return path
 
 
 def sync_view(instance: Lore, view: str, **kwargs) -> tuple[str, Realized]:

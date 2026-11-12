@@ -18,7 +18,9 @@ from link_helpers import (
     assert_crr_clean,
     assert_mount_exposes,
     assert_mount_source,
+    folder_replaced_by_a_link,
     link_pin,
+    link_replaced_by_its_folder,
     make_parent_with_link,
     make_parent_with_remount,
     make_repo,
@@ -27,7 +29,7 @@ from link_helpers import (
     remount,
 )
 from lore_parsers import parse_jsonl, parse_status_json
-from test_utils import unstaged_entries
+from test_utils import unstaged_entries, working_tree_files
 
 from lore import Lore
 
@@ -757,40 +759,6 @@ def test_link_remount_divergent_does_not_silently_pick_a_side(new_lore_repo):
 # ---------------------------------------------------------------------------
 
 
-def _folder_replaced_by_a_link(new_lore_repo) -> tuple[Lore, Lore]:
-    """Parent on `main` holding `shared/`, plus a `feature` branch where a link
-    replaced that folder with a repository of its own.
-
-    The linked copy is byte-identical to the folder it replaces, which is what
-    moving a folder out into its own repository leaves behind.
-    """
-    parent = make_repo(
-        new_lore_repo,
-        {
-            "root.txt": "root\n",
-            "shared/a.txt": "a original\n",
-            "shared/b.txt": "b original\n",
-        },
-    )
-
-    source = make_repo(
-        new_lore_repo,
-        {
-            "a.txt": "a original\n",
-            "b.txt": "b original\n",
-        },
-    )
-
-    parent.branch_create("feature")
-    parent.rmtree("shared")
-    parent.stage("shared", scan=True)
-    parent.link_add("shared", source.get_id(), "/")
-    parent.commit("Replace shared/ with a link")
-    parent.push()
-
-    return parent, source
-
-
 def _change_actions(output: str, path: str) -> set[str]:
     """The change actions a diff reported for `path`.
 
@@ -814,13 +782,10 @@ def _conflicted_count(output: str) -> int:
 
 def _change_inside_the_folder(parent: Lore) -> None:
     """Modify a file inside `shared/` and add another."""
-    with parent.open_file("shared/a.txt", "w+") as output_file:
-        output_file.writelines(["a changed on main\n"])
-    with parent.open_file("shared/c.txt", "w+") as output_file:
-        output_file.writelines(["c added on main\n"])
-    parent.stage(scan=True)
-    parent.commit("Change files under shared/")
-    parent.push()
+    parent.write_commit_push(
+        "Change files under shared/",
+        {"shared/a.txt": "a changed on main\n", "shared/c.txt": "c added on main\n"},
+    )
 
 
 def _conflicted_paths(parent: Lore) -> list[str]:
@@ -886,7 +851,7 @@ def _assert_mount_conflict(
 def test_branch_diff_reports_a_link_replacing_a_folder(new_lore_repo):
     """Replacing a committed folder with a link is a type change at the mount,
     and a diff reports it in both directions of the replacement."""
-    parent, _source = _folder_replaced_by_a_link(new_lore_repo)
+    parent, _source = folder_replaced_by_a_link(new_lore_repo)
 
     folder_to_link = parent.branch_diff("main", source="feature")
     assert _change_actions(folder_to_link, "shared") == {"A", "D"}, (
@@ -917,15 +882,13 @@ def test_branch_diff_reports_a_link_replacing_a_folder(new_lore_repo):
 def test_merge_outside_the_folder_keeps_a_link_replacing_it(new_lore_repo):
     """A branch that touched nothing under the folder merges cleanly into the
     branch where a link replaced it, and the mount survives with its pin."""
-    parent, source = _folder_replaced_by_a_link(new_lore_repo)
+    parent, source = folder_replaced_by_a_link(new_lore_repo)
     pin = link_pin(parent, source.get_id())
 
     parent.branch_switch("main")
-    with parent.open_file("root.txt", "w+") as output_file:
-        output_file.writelines(["root changed on main\n"])
-    parent.stage(scan=True)
-    parent.commit("Change a file outside shared/")
-    parent.push()
+    parent.write_commit_push(
+        "Change a file outside shared/", {"root.txt": "root changed on main\n"}
+    )
 
     parent.branch_switch("feature")
     parent.branch_merge_start("main", message="Merge main")
@@ -989,7 +952,7 @@ def test_merge_of_a_link_replaced_by_another_repository_lands_the_new_one(
 def test_merge_of_a_link_replacing_a_folder_lands_the_link(new_lore_repo):
     """Merging the branch where a link replaced the folder into the branch that
     still holds the folder applies the replacement."""
-    parent, source = _folder_replaced_by_a_link(new_lore_repo)
+    parent, source = folder_replaced_by_a_link(new_lore_repo)
     pin = link_pin(parent, source.get_id())
 
     parent.branch_switch("main")
@@ -1008,10 +971,36 @@ def test_merge_of_a_link_replacing_a_folder_lands_the_link(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_merge_of_a_folder_replacing_a_link_lands_the_folder(new_lore_repo):
+    """Merging the branch where a folder replaced the link into the branch that
+    still holds the link applies the replacement, where the folder holds content
+    the link does not."""
+    parent, _source = link_replaced_by_its_folder(new_lore_repo)
+    parent.branch_switch("feature")
+    parent.write_commit_push(
+        "Edit the folder", {"shared/a.txt": "a edited in the folder\n"}
+    )
+
+    parent.branch_switch("main")
+    parent.branch_merge_start("feature", message="Merge feature")
+    parent.push()
+
+    assert working_tree_files(parent, "shared") == ["shared/a.txt", "shared/b.txt"], (
+        "shared/ must hold the folder's files"
+    )
+    with parent.open_file("shared/a.txt", "r") as input_file:
+        assert input_file.read() == "a edited in the folder\n", (
+            "the folder's content must land"
+        )
+    assert parse_status_json(parent.status(json=True)) == [], "nothing may be staged"
+    assert unstaged_entries(parent) == [], "the file system must match the revision"
+
+
+@pytest.mark.smoke
 def test_merge_of_a_link_replacing_a_deleted_folder_conflicts(new_lore_repo):
     """A branch that deleted the folder outright still meets the replacement at
     the mount, where neither side holds what the other names."""
-    parent, _source = _folder_replaced_by_a_link(new_lore_repo)
+    parent, _source = folder_replaced_by_a_link(new_lore_repo)
 
     parent.branch_switch("main")
     parent.rmtree("shared")
@@ -1065,7 +1054,7 @@ def test_resolving_a_mount_conflict_is_refused_and_leaves_the_merge_open(
     path below it or walking to it, staging a side or marking it resolved, is
     refused with nothing but the error, keeps what the branch holds at the mount,
     and leaves the merge open to abort."""
-    parent, source = _folder_replaced_by_a_link(new_lore_repo)
+    parent, source = folder_replaced_by_a_link(new_lore_repo)
     pin = link_pin(parent, source.get_id())
 
     parent.branch_switch("main")
@@ -1109,7 +1098,7 @@ def test_resolving_a_cherry_picked_mount_conflict_is_refused(new_lore_repo):
     """Cherry-picking folder changes onto the branch where a link replaced the
     folder conflicts at the mount. Taking the picked side is refused, keeps the
     link, and leaves the cherry-pick open to abort."""
-    parent, source = _folder_replaced_by_a_link(new_lore_repo)
+    parent, source = folder_replaced_by_a_link(new_lore_repo)
     pin = link_pin(parent, source.get_id())
 
     parent.branch_switch("main")

@@ -1044,34 +1044,39 @@ pub(crate) async fn sync_in_operation(
     let options = Arc::new(options);
     let changes = Arc::new(changes);
     let force = execution_context().globals().force();
-    let changes = if !changes.is_empty() && !force && !options.reset {
-        lore_info!(
-            "Verifying {} layer changes with local file system",
-            changes.len()
-        );
-        sync::sync_verify_filesystem(
-            repository_target.clone(),
-            Arc::new(sync::SyncVerifyArgs {
-                // Moved in, so verification filters it in place.
+    let crate::fs::realize::VerifiedChanges { changes, kept } =
+        if !changes.is_empty() && !force && !options.reset {
+            lore_info!(
+                "Verifying {} layer changes with local file system",
+                changes.len()
+            );
+            sync::sync_verify_filesystem(
+                repository_target.clone(),
+                Arc::new(sync::SyncVerifyArgs {
+                    // Moved in, so verification filters it in place.
+                    changes,
+                    repository_current,
+                    operation: operation.clone(),
+                    current: current_tree,
+                    options: options.clone(),
+                    carries_modes: true,
+                }),
+            )
+            .await
+            .forward::<LayerError>("Failed to verify file system during layer sync")?
+        } else {
+            crate::fs::realize::VerifiedChanges {
                 changes,
-                repository_current,
-                operation: operation.clone(),
-                current: current_tree,
-                options: options.clone(),
-                carries_modes: true,
-            }),
-        )
-        .await
-        .forward::<LayerError>("Failed to verify file system during layer sync")?
-    } else {
-        changes
-    };
+                kept: Vec::new(),
+            }
+        };
 
     let dry_run = execution_context().globals().dry_run();
     crate::fs::realize::realize_changes(
         repository_target.clone(),
         operation.clone(),
         changes.clone(),
+        &kept,
         None,
         dry_run,
         false, /* Not a merge */

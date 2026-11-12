@@ -5159,6 +5159,7 @@ pub(crate) async fn stage_from_parent_state(
         repository_current.clone(),
         operation.clone(),
         changes.clone(),
+        &[],
         None,
         false, /* No dry run */
         false, /* Not a merge */

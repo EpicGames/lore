@@ -2638,8 +2638,9 @@ fn spell_from_mount<'a>(
 /// the incoming side of each conflict.
 ///
 /// The conflicts are checked after the changes, so the failure reported is the earliest one
-/// the merge would have hit. The moves among the changes answer for both where a directory is
-/// deleted, and are copied only where the diff deletes a directory.
+/// the merge would have hit. The moves and link deletes among the changes answer for both, as
+/// [`crate::fs::realize::verify_filesystem`] describes, and are copied only where the diff
+/// deletes a directory or a link.
 async fn verify_spelled_diff(
     operation: &Arc<InstanceOperationImpl>,
     repository: &Arc<RepositoryContext>,
@@ -2648,20 +2649,25 @@ async fn verify_spelled_diff(
     conflicts: Vec<&mut NodeChange>,
     merge_type: MergeType,
 ) -> Result<(), MergeError> {
-    let deletes_a_directory = changes
-        .iter()
-        .chain(&conflicts)
-        .any(|change| change.action == FileAction::Delete && change.from.flags.is_directory());
-    let moves = if deletes_a_directory {
+    let deletes_a_directory_or_link = changes.iter().chain(&conflicts).any(|change| {
+        change.action == FileAction::Delete
+            && (change.from.flags.is_directory() || change.from.is_link())
+    });
+    let answering = if deletes_a_directory_or_link {
         changes
             .iter()
-            .filter(|change| change.move_source().is_some())
+            .filter(|change| {
+                change.move_source().is_some()
+                    || (change.action == FileAction::Delete && change.from.is_link())
+            })
             .map(|change| (**change).clone())
             .collect()
     } else {
         Vec::new()
     };
-    let incoming = Arc::new(crate::fs::realize::IncomingMoves::new(Arc::new(moves)));
+    let incoming = Arc::new(crate::fs::realize::IncomingChanges::new(Arc::new(
+        answering,
+    )));
     verify_changes_against_filesystem(
         operation, repository, current, changes, &incoming, merge_type,
     )
@@ -2687,7 +2693,7 @@ fn verify_changes_against_filesystem<'a>(
     repository: &'a Arc<RepositoryContext>,
     current: &'a NodeMapping,
     mut changes: Vec<&'a mut NodeChange>,
-    incoming: &'a Arc<crate::fs::realize::IncomingMoves>,
+    incoming: &'a Arc<crate::fs::realize::IncomingChanges>,
     merge_type: MergeType,
 ) -> impl Future<Output = Result<(), MergeError>> + 'a {
     fn collect(
@@ -2819,6 +2825,7 @@ async fn restart_reset_conflicts(
         repository.clone(),
         operation.clone(),
         Arc::new(changes),
+        &[],
         None,
         dry_run,
         false, /* is merge */
@@ -2856,6 +2863,7 @@ async fn realize_diff_over_filesystem(args: RealizeDiff<'_>) -> Result<(), Merge
         args.repository.clone(),
         args.operation.clone(),
         args.changes.clone(),
+        &[],
         Some(args.state_staged.clone()),
         args.skip_filesystem,
         true, /* is merge */
@@ -3796,6 +3804,7 @@ pub async fn merge_abort(
             repository.clone(),
             operation.clone(),
             changes.clone(),
+            &[],
             None,
             dry_run,
             false, /* Not a merge */

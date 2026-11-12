@@ -12,6 +12,8 @@ use lore_revision::filter::FilterMode;
 use lore_revision::fs::filesystem_provider::InstanceOperation;
 use lore_revision::fs::filesystem_provider::test_util::TestIdentity;
 use lore_revision::fs::realize::*;
+use lore_revision::lore::RepositoryId;
+use lore_revision::node::INVALID_NODE;
 use lore_revision::node::Node;
 use lore_revision::node::NodeFileMode;
 use lore_revision::node::NodeFlags;
@@ -19,6 +21,7 @@ use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::sync::SyncError;
+use lore_revision::revision::sync::SyncOptions;
 use lore_revision::revision::sync::SyncRealizeStats;
 use lore_revision::revision::sync::SyncVerifyArgs;
 use lore_revision::state;
@@ -34,6 +37,7 @@ use zerocopy::FromZeros;
 use crate::fs::filesystem_provider::TestFilesystemProvider;
 use crate::fs::filesystem_provider::test_repository_over;
 use crate::fs::filesystem_provider::test_store_create;
+use crate::helper::in_memory;
 use crate::helper::in_memory::directory;
 use crate::helper::in_memory::file;
 use crate::repository::test_helpers::file_node;
@@ -200,7 +204,7 @@ async fn verify_action(
         false,
         Arc::default(),
         FilterMode::Full,
-        &IncomingMoves::new(Arc::default()),
+        &IncomingChanges::new(Arc::default()),
     ))
     .await?;
 
@@ -236,6 +240,7 @@ async fn verify_as_a_sync(
         carries_modes: true,
     })))
     .await
+    .map(|verified| verified.changes)
 }
 
 /// Record that the working file holds the current revision's content, which is what a
@@ -917,7 +922,7 @@ async fn verify_relocation(
         false,
         Arc::default(),
         FilterMode::Full,
-        &IncomingMoves::new(Arc::default()),
+        &IncomingChanges::new(Arc::default()),
     ))
     .await
 }
@@ -1053,6 +1058,8 @@ async fn an_untracked_file_at_the_source_of_the_current_branch_s_move_holds_no_l
 const PLUGIN: &str = "Plugin";
 const SOURCE: &str = "Plugin/Source";
 const TRACKED: &str = "Plugin/Source/Plugin.Build.cs";
+/// The name [`TRACKED`] ends in.
+const TRACKED_NAME: &str = "Plugin.Build.cs";
 const VARIANT: &str = "Plugin/Source/Plugin.build.cs";
 
 fn relative(path: &str) -> RelativePath {
@@ -1188,7 +1195,7 @@ async fn verify_change(
         false,
         Arc::default(),
         FilterMode::View,
-        &IncomingMoves::new(Arc::new(incoming.to_vec())),
+        &IncomingChanges::new(Arc::new(incoming.to_vec())),
     ))
     .await?;
     Ok((verdict == Verdict::Realize).then_some(change))
@@ -1226,6 +1233,7 @@ async fn realize_verified(
         repository.clone(),
         operation,
         Arc::new(realized),
+        &[],
         None,
         false,
         false,
@@ -1590,6 +1598,29 @@ async fn a_deleted_directory_keeps_entries_of_another_type_under_a_case_variant_
     .await;
 }
 
+/// The delete of the link mounted at `mount`.
+fn deleted_link(repository: &Arc<RepositoryContext>, mount: &str) -> NodeChange {
+    let mount = relative(mount);
+    let from = NodeChangeState {
+        mapping: NodeMapping {
+            repository: repository.clone(),
+            state: State::new(),
+            path: mount.clone(),
+            node: NodeID::new_zeroed(),
+        },
+        observed: None,
+        flags: NodeFlags::Link,
+        address: Default::default(),
+        mode: 0,
+    };
+    NodeChange {
+        action: FileAction::Delete,
+        flags: change::Flags::None,
+        to: from.invalid(mount),
+        from,
+    }
+}
+
 /// The delete of a link takes the mount it names, not a directory spelled as a case variant of it.
 #[cfg(target_os = "linux")]
 #[tokio::test]
@@ -1599,35 +1630,559 @@ async fn a_deleted_link_keeps_a_directory_under_a_case_variant_of_its_mount() {
         let repository = working_tree_repository(dir.path()).await;
         let work = "libs/shared/mywork.txt";
         write_working_files(&repository, &[(work, b"untracked work")]).await;
-        let mount = relative("libs/Shared");
-        let from = NodeChangeState {
-            mapping: NodeMapping {
-                repository: repository.clone(),
-                state: State::new(),
-                path: mount.clone(),
-                node: NodeID::new_zeroed(),
-            },
-            observed: None,
-            flags: NodeFlags::Link,
-            address: Default::default(),
-            mode: 0,
-        };
-        let deleted = NodeChange {
-            action: FileAction::Delete,
-            flags: change::Flags::None,
-            to: from.invalid(mount),
-            from,
-        };
 
         Box::pin(realize_verified(
             &repository,
             &State::new(),
-            vec![deleted],
+            vec![deleted_link(&repository, "libs/Shared")],
             false,
         ))
         .await
         .expect("the delete realizes");
         assert_eq!(working_file(&repository, work).await, b"untracked work");
+    }))
+    .await;
+}
+
+/// A tree holding, at `mount`, a link mounting the root of a repository of its own, which holds
+/// `files` by name, with the delete of that link.
+async fn linked_plugin_tree(
+    repository: &Arc<RepositoryContext>,
+    mount: &str,
+    files: &[(&str, &[u8])],
+) -> (Arc<State>, NodeChange) {
+    let linked_id: RepositoryId = lore_base::types::Context::from(uuid::Uuid::now_v7()).into();
+    let linked = repository.to_link_context(linked_id).await;
+    let linked_state = State::new();
+    for (name, content) in files {
+        let mut linked_file = file_node(content);
+        linked_file.name_hash = hash::hash_string(name);
+        in_memory::add(&linked_state, linked.clone(), ROOT_NODE, linked_file, name).await;
+    }
+    let revision = in_memory::commit(
+        &linked,
+        &linked_state,
+        lore_base::types::Hash::default(),
+        in_memory::branch_id(),
+    )
+    .await;
+
+    let state = State::new();
+    state.set_revision(lore_base::types::Hash::from([1; 32]));
+    let (parent, name) = mount.rsplit_once('/').unwrap();
+    let parent = in_memory::add(
+        &state,
+        repository.clone(),
+        ROOT_NODE,
+        directory(parent),
+        parent,
+    )
+    .await;
+    let mut link = Node::new_zeroed();
+    link.flags = NodeFlags::Link.bits();
+    link.mode = 0o755;
+    link.name_hash = hash::hash_string(name);
+    link.child = ROOT_NODE;
+    link.address = lore_base::types::Address {
+        hash: revision,
+        context: linked_id.into(),
+    };
+    in_memory::add(&state, repository.clone(), parent, link, name).await;
+    let delete = delete_change(repository, &state, mount).await;
+    (state, delete)
+}
+
+/// The add of a file holding `incoming` at [`TRACKED`], starting at `current` with no node of its
+/// own, as an add below a link that a folder replaces does.
+async fn add_over_tracked(
+    repository: &Arc<RepositoryContext>,
+    current: &Arc<State>,
+    incoming: &[u8],
+) -> NodeChange {
+    let target = plugin_tree(repository, &[(TRACKED, incoming)]).await;
+    let added = Staged {
+        state: current.clone(),
+        node: INVALID_NODE,
+        address: lore_base::types::Address::default(),
+        mode: 0,
+    };
+    let incoming_node = file_node(incoming);
+    let source = Staged {
+        node: target
+            .find_node_link(repository.clone(), TRACKED)
+            .await
+            .unwrap()
+            .node,
+        state: target,
+        address: incoming_node.address,
+        mode: incoming_node.mode,
+    };
+    NodeChange {
+        action: FileAction::Add,
+        flags: change::Flags::None,
+        from: side(repository, &added, relative(TRACKED)),
+        to: side(repository, &source, relative(TRACKED)),
+    }
+}
+
+/// Verifies `changes` against the working tree standing on `state` as a sync does.
+async fn verify_set(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    changes: Vec<NodeChange>,
+) -> Result<VerifiedChanges, SyncError> {
+    Box::pin(verify_set_forwarding(repository, state, changes, false)).await
+}
+
+/// [`verify_set`], forwarding local changes past the sync where `forward_changes` says so.
+async fn verify_set_forwarding(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    changes: Vec<NodeChange>,
+    forward_changes: bool,
+) -> Result<VerifiedChanges, SyncError> {
+    let operation = repository.file_system().begin_operation().await.unwrap();
+    Box::pin(verify_filesystem_for_changes(Arc::new(SyncVerifyArgs {
+        changes: Arc::new(changes),
+        repository_current: repository.clone(),
+        operation,
+        current: NodeMapping::root(repository.clone(), state.clone()),
+        options: Arc::new(SyncOptions {
+            forward_changes,
+            ..Default::default()
+        }),
+        carries_modes: true,
+    })))
+    .await
+}
+
+/// An add below a deleted link whose file already holds the incoming content is left to the
+/// delete to keep, however the delete spells the mount, as the delete matches it ignoring case.
+#[tokio::test]
+async fn an_add_below_a_deleted_link_over_the_incoming_content_is_kept() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let linked = pseudo_random_bytes(20 * 1024, 0);
+        let incoming = pseudo_random_bytes(20 * 1024, 1);
+        write_working_files(&repository, &[(TRACKED, &incoming)]).await;
+        let current = plugin_tree(&repository, &[(TRACKED, &linked)]).await;
+        let add = add_over_tracked(&repository, &current, &incoming).await;
+
+        for mount in [SOURCE.to_string(), SOURCE.to_lowercase()] {
+            let VerifiedChanges { changes, kept } = verify_set(
+                &repository,
+                &current,
+                vec![deleted_link(&repository, &mount), add.clone()],
+            )
+            .await
+            .expect("a file holding the incoming content is not a local change");
+            assert_eq!(
+                changes
+                    .iter()
+                    .map(|change| change.path().as_str())
+                    .collect::<Vec<_>>(),
+                [mount.as_str()],
+                "The file holds what the add writes"
+            );
+            assert_eq!(
+                kept,
+                [relative(TRACKED)],
+                "The delete of the link at {mount} keeps the file"
+            );
+        }
+    }))
+    .await;
+}
+
+/// An add below a deleted link is measured against the file the current revision holds through
+/// the link's mount, however the delete spells the mount, so a file holding that content is
+/// realized rather than refused.
+#[tokio::test]
+async fn an_add_below_a_deleted_link_is_measured_against_the_linked_file() {
+    Box::pin(with_execution(async {
+        for mount in [SOURCE.to_string(), SOURCE.to_lowercase()] {
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+            let repository = working_tree_repository(dir.path()).await;
+            let linked = pseudo_random_bytes(20 * 1024, 0);
+            let incoming = pseudo_random_bytes(20 * 1024, 1);
+            write_working_files(&repository, &[(TRACKED, &linked)]).await;
+            let (current, delete) =
+                linked_plugin_tree(&repository, &mount, &[(TRACKED_NAME, &linked)]).await;
+            let add = add_over_tracked(&repository, &current, &incoming).await;
+
+            assert!(
+                Box::pin(verify_change(&repository, &current, add, &[delete]))
+                    .await
+                    .expect("a file holding the linked content is not a local change")
+                    .is_some(),
+                "The file holds what the link at {mount} held, so the add is realized over it"
+            );
+        }
+    }))
+    .await;
+}
+
+/// A file the view kept out of a link's mount is the user's own, whatever it holds, so an add
+/// below the deleted link that would overwrite it is refused.
+#[tokio::test]
+async fn an_add_below_a_deleted_link_refuses_a_file_the_view_excluded() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let mut filter = Filter::default();
+        filter.view.add_exclusion(&format!("/{TRACKED}")).unwrap();
+        let repository = working_tree_repository_filtered(dir.path(), filter).await;
+        let linked = pseudo_random_bytes(20 * 1024, 0);
+        let incoming = pseudo_random_bytes(20 * 1024, 1);
+        write_working_files(&repository, &[(TRACKED, &linked)]).await;
+        let (current, delete) =
+            linked_plugin_tree(&repository, SOURCE, &[(TRACKED_NAME, &linked)]).await;
+        let add = add_over_tracked(&repository, &current, &incoming).await;
+
+        let result = Box::pin(verify_change(&repository, &current, add, &[delete])).await;
+        assert!(
+            is_local_modifications(&result),
+            "The add would overwrite the user's file: {result:?}"
+        );
+        assert_eq!(working_file(&repository, TRACKED).await, linked);
+    }))
+    .await;
+}
+
+/// The delete of a link keeps a file below its mount that already holds what replaces it, without
+/// writing it again, and removes what the link alone held there.
+#[tokio::test]
+async fn a_deleted_link_keeps_a_file_already_holding_what_replaces_it() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(20 * 1024, 0);
+        let linked_only = "Plugin/Source/linked.txt";
+        write_working_files(
+            &repository,
+            &[(TRACKED, &content), (linked_only, b"linked")],
+        )
+        .await;
+        let (current, delete) = linked_plugin_tree(
+            &repository,
+            SOURCE,
+            &[(TRACKED_NAME, &content), ("linked.txt", b"linked")],
+        )
+        .await;
+        let add = add_over_tracked(&repository, &current, &content).await;
+        let VerifiedChanges { changes, kept } =
+            verify_set(&repository, &current, vec![delete, add])
+                .await
+                .expect("a file holding the incoming content is not a local change");
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.path().as_str())
+                .collect::<Vec<_>>(),
+            [SOURCE],
+            "Only the link delete is left to realize"
+        );
+        assert_eq!(kept, [relative(TRACKED)]);
+
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        Box::pin(realize_changes(
+            repository.clone(),
+            operation,
+            changes,
+            &kept,
+            None,
+            false,
+            false,
+            Arc::default(),
+        ))
+        .await
+        .expect("the link delete realizes");
+        assert_eq!(working_file(&repository, TRACKED).await, content);
+        assert!(
+            !working_path_exists(&repository, linked_only).await,
+            "What the link alone held goes with it"
+        );
+    }))
+    .await;
+}
+
+/// The delete of a link removes every entry of a wide mount but the files it keeps and the
+/// directories holding them.
+#[tokio::test]
+async fn a_deleted_link_removes_a_wide_mount_around_the_files_it_keeps() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let nested = "Plugin/Source/Nested/kept.txt";
+        let siblings: Vec<String> = (0..1500)
+            .map(|index| format!("Plugin/Source/sibling-{index}.txt"))
+            .collect();
+        let mut files: Vec<(&str, &[u8])> = siblings
+            .iter()
+            .map(|path| (path.as_str(), b"linked".as_slice()))
+            .collect();
+        files.extend([
+            (TRACKED, b"kept".as_slice()),
+            (nested, b"kept".as_slice()),
+            ("Plugin/Source/Nested/linked.txt", b"linked".as_slice()),
+            ("Plugin/Source/Gone/linked.txt", b"linked".as_slice()),
+        ]);
+        write_working_files(&repository, &files).await;
+
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        Box::pin(realize_changes(
+            repository.clone(),
+            operation,
+            Arc::new(vec![deleted_link(&repository, SOURCE)]),
+            &[relative(TRACKED), relative(nested)],
+            None,
+            false,
+            false,
+            Arc::default(),
+        ))
+        .await
+        .expect("the link delete realizes");
+
+        let mut left: Vec<String> = files_below(dir.path().join(SOURCE));
+        left.sort();
+        assert_eq!(left, ["Nested/kept.txt", TRACKED_NAME]);
+    }))
+    .await;
+}
+
+/// The delete of a link removes what stands beside a kept file at every level of a deep path to
+/// it.
+#[tokio::test]
+async fn a_deleted_link_removes_a_deep_mount_around_the_file_it_keeps() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let levels: Vec<String> = (0..30)
+            .scan(String::from(SOURCE), |path, level| {
+                path.push_str(&format!("/d{level}"));
+                Some(path.clone())
+            })
+            .collect();
+        let kept = format!("{}/kept.txt", levels.last().unwrap());
+        let siblings: Vec<String> = levels
+            .iter()
+            .map(|level| format!("{level}/sibling.txt"))
+            .collect();
+        let mut files: Vec<(&str, &[u8])> = siblings
+            .iter()
+            .map(|path| (path.as_str(), b"linked".as_slice()))
+            .collect();
+        files.push((kept.as_str(), b"kept".as_slice()));
+        write_working_files(&repository, &files).await;
+
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        Box::pin(realize_changes(
+            repository.clone(),
+            operation,
+            Arc::new(vec![deleted_link(&repository, SOURCE)]),
+            &[relative(&kept)],
+            None,
+            false,
+            false,
+            Arc::default(),
+        ))
+        .await
+        .expect("the link delete realizes");
+
+        assert_eq!(
+            files_below(dir.path().join(SOURCE)),
+            [kept.strip_prefix(&format!("{SOURCE}/")).unwrap()]
+        );
+    }))
+    .await;
+}
+
+/// The files below `root`, as paths relative to it.
+fn files_below(root: std::path::PathBuf) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.clone()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let relative = path.strip_prefix(&root).unwrap();
+                files.push(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    files
+}
+
+/// The delete of a link keeps a local edit below its mount that a sync forwards past it.
+#[tokio::test]
+async fn a_deleted_link_keeps_a_forwarded_local_edit() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let linked = pseudo_random_bytes(20 * 1024, 0);
+        let incoming = pseudo_random_bytes(20 * 1024, 1);
+        let edited = pseudo_random_bytes(20 * 1024, 2);
+        write_working_files(&repository, &[(TRACKED, &edited)]).await;
+        let (current, delete) =
+            linked_plugin_tree(&repository, SOURCE, &[(TRACKED_NAME, &linked)]).await;
+        let add = add_over_tracked(&repository, &current, &incoming).await;
+
+        let VerifiedChanges { changes, kept } = Box::pin(verify_set_forwarding(
+            &repository,
+            &current,
+            vec![delete, add],
+            true,
+        ))
+        .await
+        .expect("a forwarded edit is not refused");
+        assert_eq!(kept, [relative(TRACKED)]);
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        Box::pin(realize_changes(
+            repository.clone(),
+            operation,
+            changes,
+            &kept,
+            None,
+            false,
+            false,
+            Arc::default(),
+        ))
+        .await
+        .expect("the link delete realizes");
+        assert_eq!(working_file(&repository, TRACKED).await, edited);
+    }))
+    .await;
+}
+
+/// The add of `node` at `path`.
+fn add_of(repository: &Arc<RepositoryContext>, path: &str, node: NodeID) -> NodeChange {
+    let to = NodeChangeState {
+        mapping: NodeMapping {
+            repository: repository.clone(),
+            state: State::new(),
+            path: relative(path),
+            node,
+        },
+        observed: None,
+        flags: NodeFlags::File,
+        address: Default::default(),
+        mode: 0,
+    };
+    NodeChange {
+        action: FileAction::Add,
+        flags: change::Flags::None,
+        from: to.invalid(relative(path)),
+        to,
+    }
+}
+
+/// The action and path of each change the dependency set `inclusion_set` keeps of `changes`.
+fn kept_in_dependency_set(changes: Vec<NodeChange>, inclusion_set: &[NodeID]) -> Vec<String> {
+    let included = |change: &NodeChange| {
+        let node = match change.action {
+            FileAction::Delete => change.from.mapping.node,
+            _ => change.to.mapping.node,
+        };
+        inclusion_set.contains(&node)
+    };
+    changes_in_dependency_set(changes, included)
+        .iter()
+        .map(|change| format!("{} {}", change.action.as_string_short(), change.path()))
+        .collect()
+}
+
+/// A dependency set holding a file below the mount of a deleted link keeps the link delete and
+/// every change below the mount, in their order, however the delete spells the mount.
+#[tokio::test]
+async fn a_dependency_set_below_a_deleted_link_lands_what_replaces_it_whole() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        for mount in [SOURCE.to_string(), SOURCE.to_lowercase()] {
+            let changes = vec![
+                deleted_link(&repository, &mount),
+                add_of(&repository, SOURCE, 11),
+                add_of(&repository, TRACKED, 12),
+                add_of(&repository, VARIANT, 13),
+                add_of(&repository, "Plugin/outside.txt", 14),
+            ];
+            assert_eq!(
+                kept_in_dependency_set(changes, &[12]),
+                [
+                    format!("D {mount}"),
+                    format!("A {SOURCE}"),
+                    format!("A {TRACKED}"),
+                    format!("A {VARIANT}"),
+                ],
+                "The link at {mount} goes, and the folder lands whole"
+            );
+        }
+    }))
+    .await;
+}
+
+/// A dependency set holding a file below nested deleted links keeps everything below the
+/// outermost mount.
+#[tokio::test]
+async fn a_dependency_set_below_nested_deleted_links_lands_the_outermost_whole() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let changes = vec![
+            deleted_link(&repository, PLUGIN),
+            deleted_link(&repository, SOURCE),
+            add_of(&repository, TRACKED, 12),
+            add_of(&repository, "Plugin/outside.txt", 14),
+            add_of(&repository, "elsewhere.txt", 15),
+        ];
+        assert_eq!(
+            kept_in_dependency_set(changes, &[12]),
+            [
+                format!("D {PLUGIN}"),
+                format!("D {SOURCE}"),
+                format!("A {TRACKED}"),
+                "A Plugin/outside.txt".to_string(),
+            ],
+        );
+    }))
+    .await;
+}
+
+/// A dependency set holding what replaces a link at its own mount keeps the link delete.
+#[tokio::test]
+async fn a_dependency_set_holding_what_replaces_a_link_at_its_mount_keeps_the_link_delete() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let changes = vec![
+            deleted_link(&repository, SOURCE),
+            add_of(&repository, SOURCE, 11),
+        ];
+        assert_eq!(
+            kept_in_dependency_set(changes, &[11]),
+            [format!("D {SOURCE}"), format!("A {SOURCE}")],
+        );
+    }))
+    .await;
+}
+
+/// A dependency set holding nothing below the mount of a deleted link keeps the link in place.
+#[tokio::test]
+async fn a_dependency_set_outside_a_deleted_link_keeps_only_what_it_holds() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let changes = vec![
+            deleted_link(&repository, SOURCE),
+            add_of(&repository, TRACKED, 12),
+            add_of(&repository, "Plugin/outside.txt", 14),
+        ];
+        assert_eq!(
+            kept_in_dependency_set(changes, &[14]),
+            ["A Plugin/outside.txt"],
+        );
     }))
     .await;
 }
@@ -1789,7 +2344,7 @@ async fn a_merge_deleting_a_directory_keeps_an_edited_case_variant_of_an_ignored
                 false,
                 Arc::default(),
                 FilterMode::Full,
-                &IncomingMoves::new(Arc::default()),
+                &IncomingChanges::new(Arc::default()),
             ))
             .await
             .is_err();
@@ -1801,6 +2356,7 @@ async fn a_merge_deleting_a_directory_keeps_an_edited_case_variant_of_an_ignored
                 repository.clone(),
                 operation,
                 Arc::new(changes),
+                &[],
                 None,
                 false,
                 true,
@@ -1900,6 +2456,7 @@ async fn sync_continues_after_a_materialization_error() {
             repository.clone(),
             operation.clone(),
             Arc::new(changes),
+            &[],
             None,
             false,
             false,
@@ -1970,6 +2527,7 @@ async fn a_refused_move_removes_its_destination_unless_it_is_the_source() {
                 repository.clone(),
                 operation,
                 Arc::new(vec![change]),
+                &[],
                 None,
                 false,
                 false,

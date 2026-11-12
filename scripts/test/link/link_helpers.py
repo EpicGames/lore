@@ -180,6 +180,57 @@ def assert_crr_clean(
             )
 
 
+def folder_replaced_by_a_link(new_lore_repo) -> tuple[Lore, Lore]:
+    """Parent on `main` holding `shared/`, plus a `feature` branch where a link
+    replaced that folder with a repository of its own, with `feature` checked out.
+
+    The linked copy is byte-identical to the folder it replaces, which is what
+    moving a folder out into its own repository leaves behind.
+    """
+    parent = make_repo(
+        new_lore_repo,
+        {
+            "root.txt": "root\n",
+            "shared/a.txt": "a original\n",
+            "shared/b.txt": "b original\n",
+        },
+    )
+
+    source = make_repo(
+        new_lore_repo,
+        {
+            "a.txt": "a original\n",
+            "b.txt": "b original\n",
+        },
+    )
+
+    parent.branch_create("feature")
+    parent.rmtree("shared")
+    parent.stage("shared", scan=True)
+    parent.link_add("shared", source.get_id(), "/")
+    parent.commit("Replace shared/ with a link")
+    parent.push()
+
+    return parent, source
+
+
+def link_replaced_by_its_folder(new_lore_repo) -> tuple[Lore, Lore]:
+    """Parent on `main` holding a link at `shared/`, plus a `feature` branch where
+    a folder of the link's content replaced it, with `main` checked out."""
+    parent, source = make_parent_with_link(
+        new_lore_repo, "shared", {"a.txt": "a original\n", "b.txt": "b original\n"}
+    )
+    parent.branch_create("feature")
+    parent.link_remove("shared")
+    parent.commit("Remove the link")
+    parent.write_commit_push(
+        "Replace the link with its folder",
+        {"shared/a.txt": "a original\n", "shared/b.txt": "b original\n"},
+    )
+    parent.branch_switch("main")
+    return parent, source
+
+
 def assert_mount_source(repo: Lore, link_path: str, source_path: str):
     """The link at `link_path` names `source_path` as what it exposes."""
     info = repo.link_info(link_path)
