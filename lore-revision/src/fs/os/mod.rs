@@ -117,7 +117,7 @@ pub struct OsOperation {
 impl OsOperation {
     /// Where `path` is on disk, under the root the operation was opened on -- the top-level
     /// repository every link and layer in it shares.
-    fn absolute(&self, path: &RelativePath) -> Result<PathBuf, FsError> {
+    pub(crate) fn absolute(&self, path: &RelativePath) -> Result<PathBuf, FsError> {
         path.to_absolute_path(&self.filesystem_root)
             .forward::<FsError>("placing a path below the filesystem root")
     }
@@ -174,7 +174,7 @@ impl OsDirectoryListing {
                 Ok(Some(item)) => {
                     return Some(Ok(ListedEntry::Tracked(DirectoryEntry {
                         name: item.name,
-                        info: FileInfo::from_stat(&item.metadata),
+                        info: item.info,
                         name_hash: item.name_hash,
                     })));
                 }
@@ -250,9 +250,9 @@ impl InstanceOperation for OsOperation {
     async fn read_directory(&self, path: &RelativePath) -> Result<DirectoryListing, FsError> {
         let path = self.absolute(path)?;
         Ok(DirectoryListing::new(StaticDispatchDirectoryListing::Os(
-            OsDirectoryListing {
+            Box::new(OsDirectoryListing {
                 entries: lore_io::IoDriver::global().read_dir(path).await?,
-            },
+            }),
         )))
     }
 
@@ -412,10 +412,45 @@ impl InstanceOperation for OsOperation {
 pub struct FileListItem {
     /// The name of the file/directory (not the full path).
     pub name: String,
-    /// What the name holds: its kind, size, modification time and permission bits.
-    pub metadata: lore_io::Stat,
+    /// What was measured of it: a file with its size, time and mode, or a directory.
+    pub info: FileInfo,
     /// Pre-computed hash of the lowercase name for efficient lookups.
     pub name_hash: u64,
+}
+
+/// The entries of a directory a walk takes one at a time: read from the file system, or held by an
+/// operation that answers for the directory itself.
+pub enum EntryListing {
+    Os(Box<lore_io::DirStream>),
+    Items(std::vec::IntoIter<FileListItem>),
+}
+
+impl EntryListing {
+    /// The next entry: `Ok(None)` for one the walk carries nothing for, and `None` once the
+    /// directory is exhausted. See [`file_list_item`].
+    pub async fn next(&mut self) -> Option<Result<Option<FileListItem>, PathError>> {
+        match self {
+            EntryListing::Os(entries) => entries.next().await.map(file_list_item),
+            EntryListing::Items(items) => items.next().map(|item| Ok(Some(item))),
+        }
+    }
+
+    /// [`Self::next`], skipping each entry read from the file system that `passes_over` says the
+    /// walk passes over unread. An operation's own entries are what it holds, and are all taken.
+    pub async fn next_unless(
+        &mut self,
+        mut passes_over: impl FnMut(&std::io::Result<lore_io::DirEntry>) -> bool,
+    ) -> Option<Result<Option<FileListItem>, PathError>> {
+        match self {
+            EntryListing::Os(entries) => loop {
+                let entry = entries.next().await?;
+                if !passes_over(&entry) {
+                    return Some(file_list_item(entry));
+                }
+            },
+            EntryListing::Items(items) => items.next().map(|item| Ok(Some(item))),
+        }
+    }
 }
 
 /// Result of listing a filesystem path.
@@ -425,7 +460,7 @@ pub enum PathListingResult {
     ///
     /// The listing yields an entry per child, named relative to the directory (just the
     /// filename, not the full path). [`file_list_item`] turns one into a [`FileListItem`].
-    Directory { listing: lore_io::DirStream },
+    Directory { listing: EntryListing },
 
     /// The path was a regular file.
     ///
@@ -489,8 +524,8 @@ pub fn file_list_item(
     let name = entry_name(entry.file_name)?;
     let name_hash = hash_string(name.as_str());
     Ok(Some(FileListItem {
+        info: FileInfo::from_stat(&metadata),
         name,
-        metadata,
         name_hash,
     }))
 }
@@ -527,7 +562,9 @@ pub async fn list_path(path: PathBuf) -> Result<PathListingResult, PathError> {
     let driver = lore_io::IoDriver::global();
 
     if let Ok(listing) = driver.read_dir(path.as_path()).await {
-        return Ok(PathListingResult::Directory { listing });
+        return Ok(PathListingResult::Directory {
+            listing: EntryListing::Os(Box::new(listing)),
+        });
     }
 
     let Ok(metadata) = driver.stat(path.as_path()).await else {
@@ -547,7 +584,7 @@ pub async fn list_path(path: PathBuf) -> Result<PathListingResult, PathError> {
         Ok(PathListingResult::File {
             item: FileListItem {
                 name: file_name,
-                metadata,
+                info: FileInfo::from_stat(&metadata),
                 name_hash,
             },
         })

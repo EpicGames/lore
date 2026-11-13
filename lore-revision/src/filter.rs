@@ -291,14 +291,17 @@ pub fn load(
     ignore_path: impl AsRef<Path>,
     view_path: impl AsRef<Path>,
 ) -> Result<Filter, FilterError> {
-    with_ignore(load_filter(ignore_path)?, view_path)
+    from_instances(load_filter(ignore_path)?, load_filter(view_path)?)
 }
 
-/// The filter of `ignore`, the rules of a repository's ignore file, with the exclusions every
-/// repository holds and the view at `view_path`.
-fn with_ignore(
+/// The repository filter for rules already read: `ignore` gains the exclusions every repository
+/// carries (its own directory, merge artifacts, temporary files), and `view` is taken as given.
+///
+/// For a caller whose filter files are not on disk to [`load`], such as an instance whose working
+/// tree is a virtual filesystem.
+pub fn from_instances(
     mut ignore: FilterInstance,
-    view_path: impl AsRef<Path>,
+    view: FilterInstance,
 ) -> Result<Filter, FilterError> {
     ignore.add_exclusion(DOT_URC)?;
     ignore.add_exclusion(DOT_LORE)?;
@@ -306,8 +309,6 @@ fn with_ignore(
         ignore.add_exclusion(&format!("*{suffix}"))?;
     }
     ignore.add_exclusion(&format!("*{TEMP_FILE_EXTENSION}"))?;
-
-    let view = load_filter(view_path)?;
 
     Ok(Filter {
         ignore,
@@ -342,7 +343,10 @@ pub fn load_with_instance_ignore_from(
         Some((bytes, path)) => parse_filter(bytes, path)?,
         None => FilterInstance::default(),
     };
-    with_instance_ignore(with_ignore(rules, view_path)?, instance_ignore_path)
+    with_instance_ignore(
+        from_instances(rules, load_filter(view_path)?)?,
+        instance_ignore_path,
+    )
 }
 
 /// `filter` with the exclusions in the instance's own ignore file at `instance_ignore_path` after

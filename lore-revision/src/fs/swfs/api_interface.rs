@@ -15,6 +15,7 @@ use lore_error_set::error_set;
 use swfs_api::SWFSHandle;
 
 use crate::event::LoreErrorDetail;
+use crate::fs::swfs::frozen_files::FrozenFile;
 use crate::fs::swfs::handle_gate::HandleGate;
 use crate::fs::swfs::handle_gate::HandleGateGuard;
 use crate::fs::swfs::mount_resources::MountResources;
@@ -145,6 +146,15 @@ impl SwfsInterface {
     pub fn mount(_resources: MountResources) -> Result<Arc<Self>, SwfsInterfaceError> {
         Err(Self::no_swfs_error())
     }
+    pub fn frozen_files(&self) -> Result<Vec<FrozenFile>, SwfsInterfaceError> {
+        Err(Self::no_swfs_error())
+    }
+    pub fn read_frozen_file(&self, _path: &str) -> Result<Option<Vec<u8>>, SwfsInterfaceError> {
+        Err(Self::no_swfs_error())
+    }
+    pub fn modified_files(&self) -> Result<Vec<FrozenFile>, SwfsInterfaceError> {
+        Err(Self::no_swfs_error())
+    }
     #[allow(clippy::unused_async)]
     pub async fn wait_for_ready(&self) -> Result<(), SwfsInterfaceError> {
         let _ = self;
@@ -168,6 +178,8 @@ mod swfs_impl {
     use std::ffi::c_int;
     use std::ffi::c_void;
     use std::ptr::slice_from_raw_parts_mut;
+    use std::sync::atomic::AtomicPtr;
+    use std::sync::atomic::Ordering;
 
     use lore_base::log::LoreLogLevel;
     use lore_error_set::ForwardStrict;
@@ -176,20 +188,31 @@ mod swfs_impl {
     use super::*;
     use crate::fs::mount_manager_state::MountManagerState;
     use crate::fs::swfs::api_interface::swfs_api::SWFSCallbacks;
+    use crate::fs::swfs::api_interface::swfs_api::SWFSDataCBFn;
     use crate::fs::swfs::api_interface::swfs_api::SWFSFile;
     use crate::fs::swfs::api_interface::swfs_api::SWFSHandle;
     use crate::fs::swfs::api_interface::swfs_api::SWFSInit;
     use crate::fs::swfs::api_interface::swfs_api::SWFSResult_Enum;
+    use crate::fs::swfs::api_interface::swfs_api::swfs_u16;
+    use crate::fs::swfs::api_interface::swfs_api::swfs_u32;
     use crate::fs::swfs::api_interface::swfs_api::swfs_u64;
     use crate::fs::swfs::api_interface::swfs_api::swfs_ubyte;
     use crate::fs::swfs::api_interface::swfs_api::swfsClose;
     use crate::fs::swfs::api_interface::swfs_api::swfsFillDirAddFiles;
     use crate::fs::swfs::api_interface::swfs_api::swfsFreeze;
+    use crate::fs::swfs::api_interface::swfs_api::swfsGetFrozenFileList;
+    use crate::fs::swfs::api_interface::swfs_api::swfsGetModifiedFileList;
     use crate::fs::swfs::api_interface::swfs_api::swfsInit;
     use crate::fs::swfs::api_interface::swfs_api::swfsIsBusy;
     use crate::fs::swfs::api_interface::swfs_api::swfsIsFrozen;
+    use crate::fs::swfs::api_interface::swfs_api::swfsReadFrozenFile;
     use crate::fs::swfs::api_interface::swfs_api::swfsThaw;
+    use crate::fs::swfs::file::DIRECTORY_ATTRIBUTE;
     use crate::fs::swfs::file::SwfsFileArray;
+    use crate::fs::swfs::frozen_files::FROZEN_READ_WHOLE_FILE;
+    use crate::fs::swfs::frozen_files::FrozenListCollector;
+    use crate::fs::swfs::frozen_files::FrozenReadBuffer;
+    use crate::fs::swfs::modified_tree::Change;
     use crate::fs::swfs::mount_resources::MountResources;
     use crate::fs::swfs::mount_resources::SwfsWorkError;
     use crate::fs::swfs::panic_guard::panic_guard_swfs_callback;
@@ -230,6 +253,68 @@ mod swfs_impl {
                 return Err(SwfsWorkError::internal("Timed out waiting for the freeze"));
             }
             Ok(())
+        }
+
+        /// The files frozen with the mount, as of the freeze.
+        pub fn frozen_files(&self) -> Result<Vec<FrozenFile>, SwfsInterfaceError> {
+            self.listed_files(swfsGetFrozenFileList)
+        }
+
+        /// The files SWFS holds modified, whether frozen or not, as `swfsGetModifiedFileList` lists
+        /// them: each as a `FrozenFile`, the entries being alike. SWFS keeps the list across thaws
+        /// that do not name a file and across remounts, and names a deletion as well.
+        pub fn modified_files(&self) -> Result<Vec<FrozenFile>, SwfsInterfaceError> {
+            self.listed_files(swfsGetModifiedFileList)
+        }
+
+        /// The files one of SWFS's list calls names, which hands them over through a
+        /// [`FrozenListCollector`].
+        fn listed_files(
+            &self,
+            list: unsafe extern "C" fn(
+                SWFSHandle,
+                SWFSDataCBFn,
+                *mut std::os::raw::c_void,
+            ) -> swfs_u32,
+        ) -> Result<Vec<FrozenFile>, SwfsInterfaceError> {
+            // Held across the call, so the mount cannot close under it.
+            let handle = self.handle()?;
+            let mut collector = FrozenListCollector::default();
+            unsafe {
+                list(
+                    handle.handle(),
+                    Some(swfs_frozen_list_callback),
+                    std::ptr::from_mut(&mut collector).cast(),
+                );
+            }
+            Ok(collector.into_files())
+        }
+
+        /// The content of the frozen file at the SWFS-side `path` (backslash separated, leading
+        /// backslash), or `None` where SWFS has none to give.
+        pub fn read_frozen_file(&self, path: &str) -> Result<Option<Vec<u8>>, SwfsInterfaceError> {
+            // Held across the read, so the mount cannot close under it.
+            let guard = self.handle()?;
+            let handle = guard.handle();
+            let length = swfs_u16::try_from(path.len())
+                .map_err(|_| SwfsInterfaceError::internal("Frozen file path too long"))?;
+            // `swfsReadFrozenFile` takes no user data, so its buffer callback finds the buffer
+            // through this, and one read runs at a time.
+            let _serial = FROZEN_READ_SERIAL.lock();
+            let mut buffer = FrozenReadBuffer::default();
+            FROZEN_READ_TARGET.store(std::ptr::from_mut(&mut buffer), Ordering::Release);
+            let read = unsafe {
+                swfsReadFrozenFile(
+                    handle,
+                    path.as_ptr().cast(),
+                    length,
+                    0,
+                    FROZEN_READ_WHOLE_FILE,
+                    Some(swfs_frozen_read_callback),
+                )
+            };
+            FROZEN_READ_TARGET.store(std::ptr::null_mut(), Ordering::Release);
+            Ok(buffer.into_content(read))
         }
 
         pub async fn thaw(
@@ -466,14 +551,66 @@ mod swfs_impl {
             }
         }
 
-        #[allow(clippy::unused_self)]
-        fn notify_write(&self, _file: *mut SWFSFile) {}
-        #[allow(clippy::unused_self)]
-        fn notify_create(&self, _file: *mut SWFSFile) {}
-        #[allow(clippy::unused_self)]
-        fn notify_move(&self, _old_file: *mut SWFSFile, _new_file: *mut SWFSFile) {}
-        #[allow(clippy::unused_self)]
-        fn notify_delete(&self, _file: *mut SWFSFile) {}
+        // The notify callbacks only feed the modified-file record. They have no caller to report
+        // a failure to, so a change that cannot be read leaves the record untrusted.
+        fn notify_write(&self, file: *mut SWFSFile) {
+            match Self::notified_node(file) {
+                // A directory's own writes are its times changing as entries come and go, which
+                // the create and delete callbacks for those entries already cover.
+                Some((_, true)) => {}
+                Some((path, false)) => self.record_change(Change::Written(path)),
+                None => self.resources.modified().distrust(),
+            }
+        }
+
+        fn notify_create(&self, file: *mut SWFSFile) {
+            match Self::notified_node(file) {
+                Some((path, directory)) => {
+                    self.record_change(Change::Created { path, directory });
+                }
+                None => self.resources.modified().distrust(),
+            }
+        }
+
+        fn notify_move(&self, old_file: *mut SWFSFile, new_file: *mut SWFSFile) {
+            match (Self::notified_node(old_file), Self::notified_node(new_file)) {
+                (Some((from, _)), Some((to, directory))) => {
+                    self.record_change(Change::Moved {
+                        from,
+                        to,
+                        directory,
+                    });
+                }
+                _ => self.resources.modified().distrust(),
+            }
+        }
+
+        fn notify_delete(&self, file: *mut SWFSFile) {
+            match Self::notified_node(file) {
+                Some((path, directory)) => {
+                    self.record_change(Change::Deleted { path, directory });
+                }
+                None => self.resources.modified().distrust(),
+            }
+        }
+
+        fn record_change(&self, change: Change) {
+            self.resources
+                .run_in_runtime_with_context(async move |_token| {
+                    self.resources.modified().record(change).await;
+                });
+        }
+
+        /// The node path and whether it is a directory, for the file a callback was given.
+        fn notified_node(file: *mut SWFSFile) -> Option<(String, bool)> {
+            let file = unsafe { &*file };
+            let path = unsafe { CStr::from_ptr(file.path) }.to_string_lossy();
+            let node_path = Self::handle_lore_result(SwfsPath(&path).node_path())?;
+            Some((
+                node_path.0.as_str().to_owned(),
+                file.finfo.attrs & DIRECTORY_ATTRIBUTE != 0,
+            ))
+        }
 
         #[allow(clippy::unused_self)]
         fn freeze_callback(
@@ -531,6 +668,36 @@ mod swfs_impl {
                 }
             }
         }
+    }
+
+    static FROZEN_READ_SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    static FROZEN_READ_TARGET: AtomicPtr<FrozenReadBuffer> = AtomicPtr::new(std::ptr::null_mut());
+
+    /// `user_data` is the `FrozenListCollector` that `frozen_files` or `modified_files` passed in.
+    unsafe extern "C" fn swfs_frozen_list_callback(
+        _handle: SWFSHandle,
+        user_data: *mut c_void,
+        start_buff: *mut swfs_ubyte,
+        num_bytes: usize,
+        out_num_buff_bytes: *mut usize,
+    ) -> *mut swfs_ubyte {
+        let collector = unsafe { &mut *user_data.cast::<FrozenListCollector>() };
+        unsafe { collector.on_callback(start_buff, num_bytes, out_num_buff_bytes) }
+    }
+
+    /// The buffer is the one `read_frozen_file` published, which is what is being read.
+    unsafe extern "C" fn swfs_frozen_read_callback(
+        _handle: SWFSHandle,
+        _user_data: *mut c_void,
+        start_buff: *mut swfs_ubyte,
+        num_bytes: usize,
+        out_num_buff_bytes: *mut usize,
+    ) -> *mut swfs_ubyte {
+        let target = FROZEN_READ_TARGET.load(Ordering::Acquire);
+        if target.is_null() {
+            return std::ptr::null_mut();
+        }
+        unsafe { (*target).on_callback(start_buff, num_bytes, out_num_buff_bytes) }
     }
 
     fn lookup_handle(handle: SWFSHandle) -> Result<Arc<SwfsInterface>, SwfsInterfaceError> {

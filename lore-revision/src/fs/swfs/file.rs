@@ -7,6 +7,9 @@ use crate::fs::swfs::api_interface::swfs_api::SWFSFile;
 use crate::fs::swfs::api_interface::swfs_api::swfs_u32;
 use crate::fs::swfs::api_interface::swfs_api::swfs_u64;
 
+/// `FILE_ATTRIBUTE_DIRECTORY`, set in an `SWFSFile`'s attributes for a directory.
+pub const DIRECTORY_ATTRIBUTE: swfs_u64 = 0x10;
+
 pub struct SwfsFileArray {
     files: Box<[SwfsFile]>,
 }
@@ -25,6 +28,24 @@ impl SwfsFileArray {
             this.files[i - 1].file.next = next_ptr;
         }
         this
+    }
+
+    /// Each entry's name, whether it is a directory, and its size, for a test of a listing.
+    #[cfg(feature = "test-util")]
+    pub fn entries(&self) -> Vec<(String, bool, u64)> {
+        self.files
+            .iter()
+            .map(|file| {
+                let name = unsafe { std::ffi::CStr::from_ptr(file.file.path) }
+                    .to_string_lossy()
+                    .into_owned();
+                (
+                    name,
+                    file.file.finfo.attrs & DIRECTORY_ATTRIBUTE != 0,
+                    file.file.finfo.size,
+                )
+            })
+            .collect()
     }
 
     pub fn array_ptr(&self) -> *const SWFSFile {
@@ -67,8 +88,7 @@ impl SwfsFile {
                     time_write: file_info.mtime(),
                     size: file_info.size(),
                     attrs: if file_info.is_dir() {
-                        // FILE_ATTRIBUTE_DIRECTORY
-                        0x00000010
+                        DIRECTORY_ATTRIBUTE
                     } else {
                         0
                     },

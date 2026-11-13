@@ -9818,7 +9818,9 @@ pub async fn file_modification(
     } else {
         0
     };
-    if file_mtime == node_mtime {
+    // A forced comparison has no recorded time to answer from, and its stand-in must not match: an
+    // SWFS file the instance holds unmodified, with no time recorded, reads as 0 too.
+    if !force_check_hash && file_mtime == node_mtime {
         lore_trace!("File {file_path} unmodified, size {file_size} and mtime {file_mtime} match");
         return Ok(FileModification::UnmodifiedByMtime);
     }

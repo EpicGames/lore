@@ -197,6 +197,17 @@ pub struct DirectoryEntry {
     pub name_hash: u64,
 }
 
+impl DirectoryEntry {
+    /// The entry for `name`, holding `info`, its name hash taken from the name.
+    pub fn new(name: String, info: FileInfo) -> Self {
+        Self {
+            name_hash: lore_storage::hash::hash_string(&name),
+            name,
+            info,
+        }
+    }
+}
+
 /// One child of a directory listing that yields every child.
 pub enum ListedEntry {
     /// A file or a directory.
@@ -208,9 +219,22 @@ pub enum ListedEntry {
 /// Wraps every type a provider lists a directory with, so a listing dispatches statically for
 /// the same reason [`InstanceOperationImpl`] does.
 pub enum StaticDispatchDirectoryListing {
-    Os(OsDirectoryListing),
+    Os(Box<OsDirectoryListing>),
+    /// Entries a provider built from what it holds, rather than read from a directory.
+    Entries(EntriesListing),
     #[cfg(target_os = "linux")]
     Fuse(FuseDirectoryListing),
+}
+
+/// A listing of entries already in hand.
+pub struct EntriesListing {
+    entries: std::vec::IntoIter<DirectoryEntry>,
+}
+
+impl EntriesListing {
+    fn next(&mut self) -> Option<Result<DirectoryEntry, FsError>> {
+        self.entries.next().map(Ok)
+    }
 }
 
 /// Directory entries, resolved as the consumer asks for them.
@@ -223,6 +247,13 @@ impl DirectoryListing {
         Self { dispatch }
     }
 
+    /// A listing of `entries`, for a provider that holds the directory's children itself.
+    pub fn from_entries(entries: Vec<DirectoryEntry>) -> Self {
+        Self::new(StaticDispatchDirectoryListing::Entries(EntriesListing {
+            entries: entries.into_iter(),
+        }))
+    }
+
     /// The next entry, or `None` once the directory is exhausted.
     ///
     /// Reads no further than the entry asked for, so a consumer that stops early stops the walk
@@ -230,6 +261,7 @@ impl DirectoryListing {
     pub async fn next(&mut self) -> Option<Result<DirectoryEntry, FsError>> {
         match &mut self.dispatch {
             StaticDispatchDirectoryListing::Os(this) => this.next().await,
+            StaticDispatchDirectoryListing::Entries(this) => this.next(),
             #[cfg(target_os = "linux")]
             StaticDispatchDirectoryListing::Fuse(this) => this.next().await,
         }
@@ -240,6 +272,9 @@ impl DirectoryListing {
     pub async fn next_with_untracked(&mut self) -> Option<Result<ListedEntry, FsError>> {
         match &mut self.dispatch {
             StaticDispatchDirectoryListing::Os(this) => this.next_with_untracked().await,
+            StaticDispatchDirectoryListing::Entries(this) => {
+                this.next().map(|entry| entry.map(ListedEntry::Tracked))
+            }
             #[cfg(target_os = "linux")]
             StaticDispatchDirectoryListing::Fuse(this) => this.next_with_untracked().await,
         }
@@ -1114,11 +1149,21 @@ pub struct InstanceOperationImpl {
     modified_times: RecordedModifiedTimes,
     /// The filesystem clock, read once, the first time [`Self::clock_floor`] is asked.
     clock_floor: tokio::sync::OnceCell<u64>,
+    /// Whether a walk of the tree lists directories and probes names through this operation's own
+    /// reads, which it does where the operation answers for the tree itself, rather than reading
+    /// the file system.
+    lists_through_operation: AtomicBool,
+    /// How many directories were listed through the operation.
+    #[cfg(feature = "test-util")]
+    directory_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl InstanceOperationImpl {
     pub fn new(dispatch: StaticDispatchInstanceOperation, holds_state: bool) -> Self {
         Self {
+            lists_through_operation: AtomicBool::new(false),
+            #[cfg(feature = "test-util")]
+            directory_reads: std::sync::atomic::AtomicUsize::new(0),
             dispatch,
             holds_state,
             dry_run: crate::runtime::try_execution_context()
@@ -1128,6 +1173,25 @@ impl InstanceOperationImpl {
             modified_times: RecordedModifiedTimes::default(),
             clock_floor: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Whether a walk of the tree takes its directories and name probes from this operation's
+    /// own reads, rather than from the file system.
+    pub fn lists_through_operation(&self) -> bool {
+        self.lists_through_operation.load(Ordering::Acquire)
+    }
+
+    /// Has a walk list through the operation, or not, whatever the operation is.
+    #[cfg(feature = "test-util")]
+    pub fn set_listing_through_operation(&self, through_operation: bool) {
+        self.lists_through_operation
+            .store(through_operation, Ordering::Release);
+    }
+
+    /// How many directories were listed through the operation.
+    #[cfg(feature = "test-util")]
+    pub fn directory_reads(&self) -> usize {
+        self.directory_reads.load(Ordering::Relaxed)
     }
 
     /// The filesystem clock of `repository`'s working copy as the operation first asked for it,
@@ -1495,6 +1559,8 @@ impl InstanceOperation for InstanceOperationImpl {
     }
 
     async fn read_directory(&self, path: &RelativePath) -> Result<DirectoryListing, FsError> {
+        #[cfg(feature = "test-util")]
+        self.directory_reads.fetch_add(1, Ordering::Relaxed);
         match &self.dispatch {
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.read_directory(path).await,

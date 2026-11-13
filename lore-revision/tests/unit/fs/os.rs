@@ -90,8 +90,8 @@ async fn list_path_yields_a_directory_listing() {
         panic!("a directory must list");
     };
     let mut names = Vec::new();
-    while let Some(entry) = listing.next().await {
-        if let Some(item) = file_list_item(entry).expect("entry name") {
+    while let Some(item) = listing.next().await {
+        if let Some(item) = item.expect("entry name") {
             names.push(item.name);
         }
     }
@@ -114,8 +114,8 @@ async fn a_listing_skips_a_link_to_a_file_it_would_otherwise_track() {
         panic!("a directory must list");
     };
     let mut names = Vec::new();
-    while let Some(entry) = listing.next().await {
-        if let Some(item) = file_list_item(entry).expect("entry name") {
+    while let Some(item) = listing.next().await {
+        if let Some(item) = item.expect("entry name") {
             names.push(item.name);
         }
     }
@@ -181,7 +181,7 @@ async fn list_path_describes_a_file_by_its_own_name() {
         panic!("a file must be described, not listed");
     };
     assert_eq!(item.name, "lonely.txt");
-    assert_eq!(item.metadata.len, 4);
+    assert_eq!(item.info.size(), 4);
 }
 
 #[tokio::test]

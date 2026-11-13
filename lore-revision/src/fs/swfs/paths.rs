@@ -29,6 +29,34 @@ impl PartialEq<Self> for RelativePathKey {
 
 impl Eq for RelativePathKey {}
 
+/// What `path` holds below `ancestor`, compared in any spelling: empty where the two are the same
+/// path, and `None` where `path` lies neither at nor below `ancestor`. The root is above every
+/// path.
+pub fn rest_below<'a>(path: &'a str, ancestor: &str) -> Option<&'a str> {
+    if ancestor.is_empty() {
+        return Some(path);
+    }
+    // Compared as bytes, which match only where `path` has a character boundary there too.
+    let length = ancestor.len();
+    if path.len() < length || !path.as_bytes()[..length].eq_ignore_ascii_case(ancestor.as_bytes()) {
+        return None;
+    }
+    match &path[length..] {
+        "" => Some(""),
+        rest => rest.strip_prefix('/'),
+    }
+}
+
+/// Whether `path` is `ancestor` or lies below it, in any spelling.
+pub fn at_or_below(path: &RelativePath, ancestor: &RelativePath) -> bool {
+    rest_below(path.as_str(), ancestor.as_str()).is_some()
+}
+
+/// Whether `path` lies below `ancestor`, and is not it, in any spelling.
+pub fn strictly_below(path: &RelativePath, ancestor: &RelativePath) -> bool {
+    rest_below(path.as_str(), ancestor.as_str()).is_some_and(|rest| !rest.is_empty())
+}
+
 /// A path provided by SWFS. Always starts with a leading `\` character that represents the root
 /// mount directory
 pub struct SwfsPath<'a>(pub &'a str);
