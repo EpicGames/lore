@@ -485,6 +485,7 @@ async fn merge_repository(
     )
     .await?;
     let merge = prepare_merge(repository.clone(), source, current).await?;
+    refuse_deleting_the_mount(&repository, &merge).await?;
     apply_prepared_merge(repository, token, merge, inherit).await
 }
 
@@ -1538,6 +1539,7 @@ async fn merge_start_all(
     )
     .await?;
     let removed_links = links_the_merge_removes(&main_merge, &eligible_links);
+    refuse_resumed_links_deleting_their_mount(&merged_links, &removed_links).await?;
 
     let mut planned_links = Vec::new();
     for eligible in &eligible_links {
@@ -1634,7 +1636,7 @@ async fn merge_start_all(
         // Every merge is checked before any is written, so a refused one leaves no merge
         // started. Each link's diff is dropped once checked and worked out again from the same
         // revisions to be written, so only one link's diff is held at a time.
-        let source = check_merge(
+        let checked = check_merge(
             &eligible.link_context,
             branch,
             eligible.resolved_branch,
@@ -1642,8 +1644,9 @@ async fn merge_start_all(
             current.clone(),
         )
         .await
-        .forward_with::<MergeError, _>(|| format!("merging link {}", eligible.link_path))?
-        .source;
+        .forward_with::<MergeError, _>(|| format!("merging link {}", eligible.link_path))?;
+        refuse_deleting_the_mount(&eligible.link_context, &checked).await?;
+        let source = checked.source;
         planned_links.push(PlannedLinkMerge {
             eligible,
             source,
@@ -1782,6 +1785,76 @@ async fn merge_start_all(
         dry_run,
     ))
     .await
+}
+
+/// Refuses a merge resumed with a link among `merged_links`, merged on an earlier pass, whose merge
+/// deletes the subtree it mounts or a directory above it, unless the merge removes the link
+/// itself, as `removed_links` says.
+async fn refuse_resumed_links_deleting_their_mount(
+    merged_links: &[MergedLink],
+    removed_links: &HashSet<NodeID>,
+) -> Result<(), MergeError> {
+    for merged in merged_links {
+        if merged.link_node.child == ROOT_NODE
+            || removed_links.contains(&merged.link_reference.local_node)
+        {
+            continue;
+        }
+        let link_state =
+            state::State::deserialize(merged.link_context.clone(), merged.new_signature)
+                .await
+                .forward::<MergeError>("deserializing resumed link state")?;
+        if commit::staged_for_deletion(&merged.link_context, &link_state, merged.link_node.child)
+            .await
+            .forward::<MergeError>("reading the resumed link's mount")?
+        {
+            let mounted = link::link_source_path(
+                merged.link_context.clone(),
+                &link_state,
+                merged.link_node.child,
+            )
+            .await
+            .forward::<MergeError>("resolving the path the link exposes")?;
+            return Err(deleted_mount(&merged.link_path, &mounted));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses `merge`, of a link mounting a subtree, where it deletes that subtree or a directory
+/// above it.
+async fn refuse_deleting_the_mount(
+    repository: &Arc<RepositoryContext>,
+    merge: &PreparedMerge,
+) -> Result<(), MergeError> {
+    let current = &merge.current;
+    if current.node == ROOT_NODE {
+        return Ok(());
+    }
+    let mounted = link::link_source_path(repository.clone(), &current.state, current.node)
+        .await
+        .forward::<MergeError>("resolving the path the link exposes")?;
+    if merge
+        .diff
+        .changes
+        .iter()
+        .any(|change| change.action == FileAction::Delete && mounted.below(change.path()).is_some())
+    {
+        return Err(deleted_mount(current.path.as_str(), &mounted));
+    }
+    Ok(())
+}
+
+/// The refusal of a merge of the link at `link_path` that deletes `mounted`, the subtree it
+/// mounts, or a directory above it: the link would mount nothing.
+fn deleted_mount(link_path: &str, mounted: &RelativePath) -> MergeError {
+    NotSupported {
+        operation: format!(
+            "merging the link at {link_path}, which mounts {mounted}, a path the merged branch \
+             deletes"
+        ),
+    }
+    .into()
 }
 
 /// The nodes of the links among `eligible` whose node `main_merge`'s diff deletes, as

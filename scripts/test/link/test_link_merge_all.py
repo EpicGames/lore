@@ -4,8 +4,13 @@
 import os
 
 import pytest
-from error_types import ImproperArgumentsError
+from error_types import (
+    ImproperArgumentsError,
+    NotSupportedError,
+    UnresolvedConflictError,
+)
 from link_helpers import (
+    committed_link_pin,
     link_pin,
     make_parent_with_link,
     make_repo,
@@ -69,6 +74,154 @@ def test_link_merge_all_conflict_in_a_link_exposing_a_subtree(new_lore_repo):
 
     with urc.open_file(conflict_file, "r") as f:
         assert "resolved through the mount" in f.read()
+
+
+SUBTREE_LINK = "linked/repo"
+
+
+def _subtree_link_with_outside_change(new_lore_repo, inside_change, conflicting):
+    """Returns (parent, linked), parent on main: the link mounts `content/assets`, and the
+    linked repository's feature branch changes `config/settings.txt`, outside it.
+
+    The parent's feature branch changes `a.txt` through the mount where `inside_change`, and
+    `root.txt` otherwise. Where `conflicting`, the linked repository's main branch changes
+    `config/settings.txt` too.
+    """
+    parent, linked = make_parent_with_link(
+        new_lore_repo,
+        SUBTREE_LINK,
+        {"content/assets/a.txt": "a base\n", "config/settings.txt": "settings base\n"},
+        {"root.txt": "root\n"},
+        source_path="content/assets",
+    )
+    parent.branch_create("feature")
+    parent.write_commit_push(
+        "Feature change",
+        {f"{SUBTREE_LINK}/a.txt": "a on feature\n"}
+        if inside_change
+        else {"root.txt": "root on feature\n"},
+    )
+    linked.branch_switch("feature")
+    linked.write_commit_push(
+        "Outside change on feature", {"config/settings.txt": "settings on feature\n"}
+    )
+    parent.link_update(SUBTREE_LINK)
+    parent.commit("Pick up the linked feature branch")
+    parent.push()
+    parent.branch_switch("main")
+    if conflicting:
+        linked.branch_switch("main")
+        linked.write_commit_push(
+            "Outside change on main", {"config/settings.txt": "settings on main\n"}
+        )
+        parent.link_update(SUBTREE_LINK)
+        parent.commit("Pick up the linked main branch")
+        parent.push()
+    return parent, linked
+
+
+def _assert_linked_main_merged_settings(parent: Lore, linked: Lore):
+    """Linked main's latest is a merge holding feature's `config/settings.txt`, and it is the
+    revision the parent's latest pins."""
+    linked.branch_switch("main")
+    merged = linked.revision_info()
+    assert len(merged.merge.split()) == 2, (
+        f"linked main must take a merge revision, got {merged}"
+    )
+    with linked.open_file("config/settings.txt") as f:
+        assert f.read() == "settings on feature\n"
+    assert committed_link_pin(parent, linked.get_id()) == merged.signature
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("inside_change", [False, True], ids=["outside", "both"])
+def test_link_merge_all_commits_changes_outside_a_subtree_link(
+    new_lore_repo, inside_change
+):
+    """A merge of a link mounting a subtree commits what it merged outside the subtree into
+    the linked repository, beside what it merged through the mount."""
+    parent, linked = _subtree_link_with_outside_change(
+        new_lore_repo, inside_change, conflicting=False
+    )
+
+    parent.branch_merge_start("feature", message="Merge feature")
+    parent.push()
+
+    _assert_linked_main_merged_settings(parent, linked)
+    with parent.open_file(f"{SUBTREE_LINK}/a.txt") as f:
+        assert f.read() == ("a on feature\n" if inside_change else "a base\n")
+
+
+@pytest.mark.smoke
+def test_link_commit_link_commits_changes_outside_a_subtree_link(new_lore_repo):
+    """A commit of the link alone, during a merge, commits what the merge staged outside the
+    subtree the link mounts."""
+    parent, linked = _subtree_link_with_outside_change(
+        new_lore_repo, inside_change=False, conflicting=False
+    )
+
+    parent.branch_merge_start("feature", message="Merge feature", no_commit=True)
+    parent.commit("Merge the linked feature branch", link=SUBTREE_LINK)
+    parent.commit("Merge feature")
+    parent.push()
+
+    _assert_linked_main_merged_settings(parent, linked)
+
+
+@pytest.mark.smoke
+def test_link_merge_all_refuses_a_conflict_outside_a_subtree_link(new_lore_repo):
+    """A conflict a merge leaves outside the subtree a link mounts refuses the commit, and an
+    abort restores the pin and the mount."""
+    parent, linked = _subtree_link_with_outside_change(
+        new_lore_repo, inside_change=False, conflicting=True
+    )
+    pin_before = link_pin(parent, linked.get_id())
+
+    parent.branch_merge_start("feature", message="Merge feature")
+    with pytest.raises(UnresolvedConflictError):
+        parent.commit("Merge feature")
+
+    parent.branch_merge_abort()
+    assert link_pin(parent, linked.get_id()) == pin_before
+    assert parse_status_json(parent.status(json=True)) == []
+    with parent.open_file(f"{SUBTREE_LINK}/a.txt") as f:
+        assert f.read() == "a base\n"
+    with parent.open_file("root.txt") as f:
+        assert f.read() == "root\n"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("link", [None, SUBTREE_LINK], ids=["all", "link"])
+def test_link_merge_all_refuses_deleting_the_subtree_a_link_mounts(new_lore_repo, link):
+    """A merge, of every link or of the link alone, whose linked branch deletes the directory
+    holding the subtree a link mounts is refused before it stages anything, leaving the working
+    tree and the pin as they were."""
+    parent, linked = make_parent_with_link(
+        new_lore_repo,
+        SUBTREE_LINK,
+        {"content/assets/a.txt": "a base\n", "config/settings.txt": "settings base\n"},
+        {"root.txt": "root\n"},
+        source_path="content/assets",
+    )
+    parent.branch_create("feature")
+    parent.write_commit_push("Feature change", {"root.txt": "root on feature\n"})
+    linked.branch_switch("feature")
+    linked.rmtree("content")
+    linked.stage(scan=True)
+    linked.commit("Delete content")
+    linked.push()
+    parent.branch_switch("main")
+    pin_before = link_pin(parent, linked.get_id())
+
+    with pytest.raises(NotSupportedError):
+        parent.branch_merge_start("feature", message="Merge feature", link=link)
+
+    assert parse_status_json(parent.status(json=True)) == []
+    assert link_pin(parent, linked.get_id()) == pin_before
+    with parent.open_file(f"{SUBTREE_LINK}/a.txt") as f:
+        assert f.read() == "a base\n"
+    with parent.open_file("root.txt") as f:
+        assert f.read() == "root\n"
 
 
 @pytest.mark.smoke

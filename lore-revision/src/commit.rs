@@ -769,6 +769,7 @@ async fn commit_staged_with_layers(
         .forward_with::<CommitError, _>(|| {
             format!("Failed to deserialize revision state {current_revision}")
         })?;
+    reject_unresolved_link_merge_conflicts(&repository, &state_staged).await?;
 
     let metadata = build_commit_metadata(
         repository.clone(),
@@ -1309,6 +1310,16 @@ async fn commit_link_only(
         .forward_with::<CommitError, _>(|| {
             format!("Failed to deserialize revision state {link_staged_revision}")
         })?;
+    let Ok(link_mount_path) = RelativePath::from_str(&link_path);
+    if let Some(conflict) = unresolved_link_conflict(&link_repository, &link_state_staged).await? {
+        return Err(link_conflict(
+            &link_repository,
+            &link_state_staged,
+            (&link_mount_path, resolved_staged.link_node.child),
+            conflict,
+        )
+        .await);
+    }
 
     // If a prior --link commit advanced the branch, the staged state's parent
     // still points to the parent's committed pin (stale). Update it to the
@@ -1338,7 +1349,6 @@ async fn commit_link_only(
         link_state_staged.revision()
     );
 
-    let Ok(link_mount_path) = RelativePath::from_str(&link_path);
     let (link_signature, link_modified_times) = commit_staged_revision(
         operation,
         link_repository.clone(),
@@ -1937,15 +1947,7 @@ pub(crate) async fn commit_files_and_rehash(
 ) -> Result<(), CommitError> {
     lore_info!("Fragmenting files and updating tree hashes");
 
-    let base = DeletionBase::of(state.committed_revision(), state.parent_self(), based_on);
-    let root_path = relative_path.clone();
-    let delta = Arc::new(parking_lot::RwLock::new(BytesMut::new()));
-    let discard = Arc::new(parking_lot::RwLock::new(vec![]));
-    let subnodes_to_discard = Arc::new(parking_lot::RwLock::new(vec![]));
-
     event::LoreEvent::RevisionCommitBegin(LoreRevisionCommitBeginEventData::default()).send();
-
-    let (file_tx, file_rx) = mpsc::channel(DEFAULT_WORK_CHANNEL_CAPACITY);
 
     // Print progress at regular intervals
     let ticker_stats = stats.clone();
@@ -1960,51 +1962,95 @@ pub(crate) async fn commit_files_and_rehash(
         }
     }));
 
-    // Producer: discover staged files and directories
-    let discover_stats = stats.clone();
-    let producer = {
-        let walk = Arc::new(CommitWalk {
-            hands_directories: operation.holds_state(),
-            operation: operation.clone(),
-            repository: repository.clone(),
-            token: token.share(),
-            state: state.clone(),
-            delta: delta.clone(),
-            discard: discard.clone(),
-            subnodes_to_discard: subnodes_to_discard.clone(),
-            file_tx,
-            metadata,
-            link_messages,
-            stats: stats.clone(),
-            parent_branch,
-            tracker: tracker.clone(),
-            dir_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DIRECTORY_TASKS)),
-        });
-        lore_spawn!(crate::subtask!(async move {
-            let result = commit_directory(walk, relative_path, node_id, None).await;
-            discover_stats
-                .discovery
-                .complete
-                .store(true, Ordering::Relaxed);
-            // Send a progress event immediately when discovery finishes,
-            // ensuring at least one progress event has discoveryComplete=true
-            event::LoreEvent::RevisionCommitProgress(LoreRevisionCommitProgressEventData {
-                count: LoreRevisionCommitCountData::new(discover_stats),
-            })
-            .send();
-            result
-        }))
-    };
+    let (walk, file_rx) = CommitWalk::new(
+        operation.holds_state(),
+        operation,
+        repository.clone(),
+        token,
+        state.clone(),
+        metadata,
+        link_messages,
+        stats.clone(),
+        parent_branch,
+        tracker.clone(),
+    );
+    let delta = commit_walks(
+        walk,
+        file_rx,
+        relative_path,
+        node_id,
+        based_on,
+        modified_times,
+        true,
+    )
+    .await?;
 
-    // Consumer: fragment files as they are discovered
+    drop(ticker);
+
+    event::LoreEvent::RevisionCommitEnd(LoreRevisionCommitEndEventData {
+        count: LoreRevisionCommitCountData::new(stats),
+    })
+    .send();
+
+    rehash_and_record_delta(repository, state, delta, tracker).await
+}
+
+/// Commits the staged nodes of `walk`'s state from `node_id`, the node at `relative_path` in the
+/// working tree, then frees the nodes staged for deletion, and answers the delta.
+///
+/// Where `node_id` is below the root, as for a link or a layer mounting a subtree, the staged nodes
+/// outside it are frozen first ([`freeze_directory`]), so that a refusal of a node the freeze
+/// visits comes before the walk of the working tree writes anything. A subtree staged for deletion,
+/// or below a directory staged for deletion, is refused: the walk would commit into nodes the
+/// deletion then frees. `based_on` is as for [`commit_files_and_rehash`]. Where
+/// `reports_discovery`, the walk's end is reported as the end of the discovery of `walk.stats`.
+#[lore_macro::test_pub]
+#[allow(clippy::too_many_arguments)]
+async fn commit_walks(
+    walk: CommitWalk,
+    file_rx: mpsc::Receiver<FileToCommit>,
+    relative_path: RelativePath,
+    node_id: NodeID,
+    based_on: BasedOn,
+    modified_times: Arc<RecordedModifiedTimes>,
+    reports_discovery: bool,
+) -> Result<Arc<parking_lot::RwLock<BytesMut>>, CommitError> {
+    let walk = Arc::new(walk);
+    let repository = walk.repository.clone();
+    let state = walk.state.clone();
+    let stats = walk.stats.clone();
+    let delta = walk.delta.clone();
+    let discard = walk.discard.clone();
+    let subnodes_to_discard = walk.subnodes_to_discard.clone();
+    let base = DeletionBase::of(state.committed_revision(), state.parent_self(), based_on);
+
+    if node_id != ROOT_NODE {
+        if staged_for_deletion(&repository, &state, node_id).await? {
+            return Err(NotSupported {
+                operation: format!("committing {relative_path}, whose subtree the commit deletes"),
+            }
+            .into());
+        }
+        freeze_directory(
+            repository.clone(),
+            state.clone(),
+            ROOT_NODE,
+            Some((&relative_path, node_id)),
+            delta.clone(),
+            discard.clone(),
+            subnodes_to_discard.clone(),
+            stats.clone(),
+        )
+        .await?;
+    }
+
     let consumer = {
-        let operation = operation.clone();
+        let operation = walk.operation.clone();
         let repository = repository.clone();
         let state = state.clone();
         let delta = delta.clone();
         let stats = stats.clone();
-        let tracker = tracker.clone();
-        let modified_times = modified_times.clone();
+        let tracker = walk.tracker.clone();
         lore_spawn!(crate::subtask!(async move {
             commit_execute(
                 operation,
@@ -2020,27 +2066,68 @@ pub(crate) async fn commit_files_and_rehash(
         }))
     };
 
+    let producer = {
+        let relative_path = relative_path.clone();
+        let stats = stats.clone();
+        lore_spawn!(crate::subtask!(async move {
+            let result = commit_directory(walk, relative_path, node_id, None).await;
+            if reports_discovery {
+                stats.discovery.complete.store(true, Ordering::Relaxed);
+                // Send a progress event immediately when discovery finishes,
+                // ensuring at least one progress event has discoveryComplete=true
+                event::LoreEvent::RevisionCommitProgress(LoreRevisionCommitProgressEventData {
+                    count: LoreRevisionCommitCountData::new(stats),
+                })
+                .send();
+            }
+            result
+        }))
+    };
+
     join_commit_tasks(producer, consumer).await?;
 
     commit_discard(
-        repository.clone(),
-        state.clone(),
+        repository,
+        state,
         base,
-        (&root_path, node_id),
+        (&relative_path, node_id),
         delta.clone(),
         &discard,
         &subnodes_to_discard,
-        stats.clone(),
+        stats,
     )
     .await?;
 
-    drop(ticker);
+    Ok(delta)
+}
 
-    event::LoreEvent::RevisionCommitEnd(LoreRevisionCommitEndEventData {
-        count: LoreRevisionCommitCountData::new(stats.clone()),
-    })
-    .send();
+/// Whether `node_id`, or a directory above it, is staged for deletion.
+pub(crate) async fn staged_for_deletion(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    mut node_id: NodeID,
+) -> Result<bool, CommitError> {
+    while node_id != ROOT_NODE {
+        let block = state
+            .block(repository.clone(), NodeBlock::index(node_id))
+            .await
+            .forward::<CommitError>("Failed deserializing state block")?;
+        let node = *block.read().node(Node::index(node_id));
+        if node.is_staged_delete() {
+            return Ok(true);
+        }
+        node_id = node.parent;
+    }
+    Ok(false)
+}
 
+/// Rehashes the directories the commit of `state` changed and records `delta`, its changes.
+async fn rehash_and_record_delta(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    delta: Arc<parking_lot::RwLock<BytesMut>>,
+    tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+) -> Result<(), CommitError> {
     rehash_directory(repository.clone(), state.clone(), ROOT_NODE).await?;
 
     state
@@ -2049,9 +2136,7 @@ pub(crate) async fn commit_files_and_rehash(
         .forward::<CommitError>("Failed to update tree root hash")?;
     lore_debug!("Rehashed merkle tree");
 
-    generate_delta_block(repository.clone(), state.clone(), delta, tracker).await?;
-
-    Ok(())
+    generate_delta_block(repository, state, delta, tracker).await
 }
 
 /// Rehashes the whole of `state` under one filesystem operation, answering with the modified
@@ -2119,6 +2204,74 @@ fn reject_unresolved_conflict(node: &Node, path: &str) -> Result<(), CommitError
     Ok(())
 }
 
+/// Refuses the commit of `state` where a link it merges holds a conflict not resolved anywhere in
+/// the linked tree. The walks refuse each conflict they meet as well, but only once the links
+/// committed beside it, and the files met before it, are written.
+async fn reject_unresolved_link_merge_conflicts(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+) -> Result<(), CommitError> {
+    let merged = state
+        .deserialize_link_merge_state(repository.clone())
+        .await
+        .forward::<CommitError>("Failed reading link merge state")?;
+    for entry in merged {
+        let link_node = {
+            let block = state
+                .block(repository.clone(), NodeBlock::index(entry.local_node))
+                .await
+                .forward::<CommitError>("Failed deserializing state block")?;
+            *block.read().node(Node::index(entry.local_node))
+        };
+        if !link_node.is_link() {
+            continue;
+        }
+        let link = link_node.linked_node();
+        let (link_repository, link_state) = link
+            .open(repository)
+            .await
+            .forward::<CommitError>("Failed to deserialize link state")?;
+        if let Some(conflict) = unresolved_link_conflict(&link_repository, &link_state).await? {
+            let mount = path_for_message(repository, state, entry.local_node).await;
+            let Ok(mount) = RelativePath::from_str(&mount);
+            return Err(link_conflict(
+                &link_repository,
+                &link_state,
+                (&mount, link.node),
+                conflict,
+            )
+            .await);
+        }
+    }
+    Ok(())
+}
+
+/// The refusal of `conflict` in `state`, a linked repository's, named as a walk of the link at
+/// `mount` names it: the working-tree path of the mount and the node it mounts.
+async fn link_conflict(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    mount: (&RelativePath, NodeID),
+    conflict: NodeID,
+) -> CommitError {
+    Conflict {
+        path: walk_path_for_message(repository, state, mount, conflict).await,
+    }
+    .into()
+}
+
+/// A conflict not resolved anywhere in the tree of `state`, a linked repository's, where it is a
+/// merge.
+async fn unresolved_link_conflict(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+) -> Result<Option<NodeID>, CommitError> {
+    if !state.is_merge() {
+        return Ok(None);
+    }
+    first_staged_node(repository, state, Node::is_staged_merge_unresolved).await
+}
+
 /// What every directory of a commit walk reads and writes.
 #[lore_macro::test_pub]
 struct CommitWalk {
@@ -2141,6 +2294,45 @@ struct CommitWalk {
     parent_branch: BranchId,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
     dir_semaphore: Arc<Semaphore>,
+}
+
+impl CommitWalk {
+    /// A walk handing each directory it adds or moves to `operation` where `hands_directories`,
+    /// and the receiving end of the files it sends.
+    #[lore_macro::test_pub]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        hands_directories: bool,
+        operation: Arc<InstanceOperationImpl>,
+        repository: Arc<RepositoryContext>,
+        token: RepositoryWriteToken,
+        state: Arc<State>,
+        metadata: Arc<Metadata>,
+        link_messages: Arc<HashMap<String, String>>,
+        stats: Arc<CommitStats>,
+        parent_branch: BranchId,
+        tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+    ) -> (Self, mpsc::Receiver<FileToCommit>) {
+        let (file_tx, file_rx) = mpsc::channel(DEFAULT_WORK_CHANNEL_CAPACITY);
+        let walk = Self {
+            hands_directories,
+            operation,
+            repository,
+            token,
+            state,
+            delta: Arc::default(),
+            discard: Arc::default(),
+            subnodes_to_discard: Arc::default(),
+            file_tx,
+            metadata,
+            link_messages,
+            stats,
+            parent_branch,
+            tracker,
+            dir_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DIRECTORY_TASKS)),
+        };
+        (walk, file_rx)
+    }
 }
 
 /// The tasks a commit walk spawns.
@@ -3233,102 +3425,43 @@ async fn commit_link(
         let stats = stats.clone();
         let link_modified_times = link_modified_times.clone();
         async move {
-            let delta = Arc::new(parking_lot::RwLock::new(BytesMut::new()));
-            let discard = Arc::new(parking_lot::RwLock::new(vec![]));
-            let subnodes_to_discard = Arc::new(parking_lot::RwLock::new(vec![]));
-            let (file_tx, file_rx) = mpsc::channel(DEFAULT_WORK_CHANNEL_CAPACITY);
-
             // A linked sub-repo becomes its own `parent_branch` for everything
             // it recurses into — nested operations must anchor against the
-            // link's branch, not the outer repo's.
-            let link_branch = branch;
-
-            let producer = {
-                let walk = Arc::new(CommitWalk {
-                    hands_directories: false,
-                    operation: operation.clone(),
-                    repository: repository.clone(),
-                    token: token.share(),
-                    state: state.clone(),
-                    delta: delta.clone(),
-                    discard: discard.clone(),
-                    subnodes_to_discard: subnodes_to_discard.clone(),
-                    file_tx,
-                    metadata: metadata.clone(),
-                    // Per-link messages are keyed by full mount path, so a
-                    // nested link (e.g. `vendor/b/vendor/c`) still receives
-                    // its `--link-message`; it falls back to the main
-                    // message when no entry matches.
-                    link_messages: link_messages.clone(),
-                    stats: stats.clone(),
-                    parent_branch: link_branch,
-                    tracker: work_tracker.clone(),
-                    // Own budget per linked sub-repo, isolated from the parent's.
-                    dir_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DIRECTORY_TASKS)),
-                });
-                lore_spawn!(crate::subtask!(commit_directory(
-                    walk,
-                    relative_path.clone(),
-                    node_id,
-                    None
-                )))
-            };
-
-            let consumer = {
-                let operation = operation.clone();
-                let repository = repository.clone();
-                let state = state.clone();
-                let delta = delta.clone();
-                let stats = stats.clone();
-                let tracker = work_tracker.clone();
-                let modified_times = link_modified_times.clone();
-                lore_spawn!(crate::subtask!(async move {
-                    commit_execute(
-                        operation,
-                        file_rx,
-                        repository,
-                        state,
-                        delta,
-                        stats,
-                        tracker,
-                        modified_times,
-                    )
-                    .await
-                }))
-            };
-
-            join_commit_tasks(producer, consumer).await?;
-
-            commit_discard(
+            // link's branch, not the outer repo's. Per-link messages are keyed
+            // by full mount path, so a nested link (e.g. `vendor/b/vendor/c`)
+            // still receives its `--link-message`; it falls back to the main
+            // message when no entry matches.
+            let (walk, file_rx) = CommitWalk::new(
+                false,
+                operation.clone(),
                 repository.clone(),
+                token.share(),
                 state.clone(),
-                DeletionBase::of(base, state.parent_self(), based_on),
-                (&relative_path, node_id),
-                delta.clone(),
-                &discard,
-                &subnodes_to_discard,
-                stats.clone(),
+                metadata.clone(),
+                link_messages,
+                stats,
+                branch,
+                work_tracker.clone(),
+            );
+            let delta = commit_walks(
+                walk,
+                file_rx,
+                relative_path,
+                node_id,
+                based_on,
+                link_modified_times,
+                false,
             )
             .await?;
 
-            {
-                let read = delta.read();
-                let delta_count = read.count::<NodeDelta>();
+            // A merge commits as a revision of its own even where it changed nothing, so that
+            // the merged branch is recorded as its second parent.
+            if delta.read().count::<NodeDelta>() == 0 && !state.is_merge() {
+                lore_debug!("Link is unchanged, skipping rehash");
+                return Ok(None);
+            }
 
-                if delta_count == 0 {
-                    lore_debug!("Link is unchanged, skipping rehash");
-                    return Ok(None);
-                }
-            };
-
-            rehash_directory(repository.clone(), state.clone(), ROOT_NODE).await?;
-
-            state
-                .update_tree_root_hash(repository.clone())
-                .await
-                .forward::<CommitError>("Failed to update tree root hash")?;
-
-            generate_delta_block(
+            rehash_and_record_delta(
                 repository.clone(),
                 state.clone(),
                 delta,
@@ -3690,7 +3823,8 @@ async fn path_for_message(
 
 /// The working-tree path of `node_id` for a message, below `walk_root`, the node a commit walk
 /// starts at and its working-tree path: the tree of a link or a layer holds its paths from its own
-/// root.
+/// root. A node outside the walk's root, which a link mounting a subtree has, has no working-tree
+/// path, and is named by its path in the linked tree.
 async fn walk_path_for_message(
     repository: &Arc<RepositoryContext>,
     state: &State,
@@ -3704,9 +3838,13 @@ async fn walk_path_for_message(
     } else {
         path_for_message(repository, state, root).await
     };
-    let below = path
-        .strip_prefix(root_in_tree.as_str())
-        .map_or(path.as_str(), |below| below.trim_start_matches('/'));
+    let below = match path.strip_prefix(root_in_tree.as_str()) {
+        Some(below) if root_in_tree.is_empty() || below.is_empty() || below.starts_with('/') => {
+            below.trim_start_matches('/')
+        }
+        _ if root_path.is_empty() => return format!("{path} (outside /{root_in_tree})"),
+        _ => return format!("{root_path}: {path} (outside /{root_in_tree})"),
+    };
     match (root_path.is_empty(), below.is_empty()) {
         (true, _) => below.to_string(),
         (false, true) => root_path.as_str().to_string(),
@@ -5206,6 +5344,20 @@ async fn has_staged_children(
     state: &Arc<State>,
 ) -> Result<bool, CommitError> {
     let actions_only = state.has_unfinished_change();
+    let found = first_staged_node(&repository, state, |node| {
+        !actions_only || node.flags & (NodeFlags::ActionBits | NodeFlags::MergeBits).bits() != 0
+    })
+    .await?;
+    Ok(found.is_some())
+}
+
+/// The first staged node below the root of `state` that `matches`, found descending only staged
+/// directories that don't match: a node a commit records is staged, and so are its ancestors.
+async fn first_staged_node(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    matches: impl Fn(&Node) -> bool,
+) -> Result<Option<NodeID>, CommitError> {
     let mut pending = Vec::new();
     let mut parent = ROOT_NODE;
     loop {
@@ -5221,10 +5373,8 @@ async fn has_staged_children(
             if !child_node.is_staged() {
                 continue;
             }
-            if !actions_only
-                || child_node.flags & (NodeFlags::ActionBits | NodeFlags::MergeBits).bits() != 0
-            {
-                return Ok(true);
+            if matches(&child_node) {
+                return Ok(Some(child_node_id));
             }
             if child_node.is_directory() {
                 pending.push(child_node_id);
@@ -5232,7 +5382,7 @@ async fn has_staged_children(
         }
         match pending.pop() {
             Some(next) => parent = next,
-            None => return Ok(false),
+            None => return Ok(None),
         }
     }
 }
@@ -5304,6 +5454,7 @@ async fn freeze_tree(
         repository.clone(),
         state.clone(),
         ROOT_NODE,
+        None,
         delta.clone(),
         discard.clone(),
         subnodes_to_discard.clone(),
@@ -5358,10 +5509,17 @@ async fn freeze_tree(
 ///
 /// A staged file or link already carries the address the caller supplied, so
 /// there is nothing to fragment — only the change flags to clear.
+///
+/// Given a `mount`, the working-tree path of a link and the node of the subtree it mounts, the walk
+/// freezes the linked tree outside that subtree, which no working tree holds: it skips the subtree,
+/// names what it refuses as [`walk_path_for_message`] does, and refuses a file with content but no
+/// address and a link pinned at an uncommitted state, as only a working tree could supply either.
+#[allow(clippy::too_many_arguments)]
 async fn freeze_directory(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     node_id: NodeID,
+    mount: Option<(&RelativePath, NodeID)>,
     delta: Arc<parking_lot::RwLock<BytesMut>>,
     discard: Arc<parking_lot::RwLock<Vec<(NodeID, u16)>>>,
     subnodes_to_discard: Arc<parking_lot::RwLock<Vec<(NodeID, u16)>>>,
@@ -5384,7 +5542,8 @@ async fn freeze_directory(
             .await
             .forward::<CommitError>("Failed deserializing state block")?
         {
-            if !child_node.is_staged() {
+            if !child_node.is_staged() || mount.is_some_and(|(_, mounted)| mounted == child_node_id)
+            {
                 continue;
             }
             updated = true;
@@ -5392,11 +5551,10 @@ async fn freeze_directory(
             // No working tree holds this one, so a conflict on any node has nowhere to be resolved and
             // no markers to read.
             if child_node.is_staged_merge_unresolved() {
-                let path = state
-                    .node_path(repository.clone(), child_node_id)
-                    .await
-                    .unwrap_or_default();
-                reject_unresolved_conflict(&child_node, &path)?;
+                return Err(Conflict {
+                    path: freeze_path_for_message(&repository, &state, mount, child_node_id).await,
+                }
+                .into());
             }
 
             if child_node.is_staged_delete() {
@@ -5427,6 +5585,16 @@ async fn freeze_directory(
                 continue;
             }
 
+            if mount.is_some() && !holds_stored_content(&repository, &child_node).await? {
+                return Err(NotSupported {
+                    operation: format!(
+                        "committing {}, which is not stored",
+                        freeze_path_for_message(&repository, &state, mount, child_node_id).await
+                    ),
+                }
+                .into());
+            }
+
             delta_add(delta.clone(), child_node_id, child_node.flags);
             freeze_node(repository.clone(), state.clone(), child_node_id).await?;
             stats.count_file();
@@ -5445,6 +5613,40 @@ async fn freeze_directory(
     }
 
     Ok(())
+}
+
+/// The path of `node_id` for a message of [`freeze_directory`] given `mount`. Boxed, so the walk's
+/// future holds only the box on the paths that report a refusal.
+async fn freeze_path_for_message(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    mount: Option<(&RelativePath, NodeID)>,
+    node_id: NodeID,
+) -> String {
+    let root = RelativePath::new();
+    Box::pin(walk_path_for_message(
+        repository,
+        state,
+        mount.unwrap_or((&root, ROOT_NODE)),
+        node_id,
+    ))
+    .await
+}
+
+/// Whether the staged file or link `node` holds content stored already: a file with an address,
+/// or with neither an address nor content, and a link pinned at a committed revision. The read of
+/// a link's revision is boxed, as few nodes are links.
+async fn holds_stored_content(
+    repository: &Arc<RepositoryContext>,
+    node: &Node,
+) -> Result<bool, CommitError> {
+    if !node.is_link() {
+        return Ok(!(node.address.is_zero() && node.size != 0));
+    }
+    let (_, link_state) = Box::pin(node.linked_node().open(repository))
+        .await
+        .forward::<CommitError>("Failed to deserialize link state")?;
+    Ok(link_state.revision_number() != 0)
 }
 
 /// Clear the staged and dirty flags a committed node no longer carries.
