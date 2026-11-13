@@ -602,7 +602,11 @@ revision involved. An application opens a storage handle and operates on content
   access; nothing about revisions or working trees is required to obtain one.
 - *Content operations.* Through the handle, an application writes and reads content-addressed
   fragments, copies a fragment from one partition to another, uploads not-yet-durable local
-  content to the remote, and obliterates content.
+  content to the remote, and obliterates content. A read that fetches a fragment from the remote
+  writes it to the local store as held by the remote: with its payload where the read caches it
+  or the fragment asks for that, and as an entry without its payload otherwise, so a later write
+  of the same content uploads nothing. A metadata query the remote answers writes the fragment
+  the same way, without its payload.
 - *File ingest and extract.* The same handle reads a file directly into content-addressed
   fragments - chunking and hashing it through the storage subsystem's own machinery (§8) - and
   writes a stored payload straight back to a filesystem path, without the caller assembling bytes
@@ -1392,9 +1396,18 @@ deployment decision, not a client concern.
 
 #### 12.6 The local cache
 
-A client's local store doubles as a fragment cache. Fragments fetched on demand stay locally
-once they are read, so subsequent reads of the same fragment do not contact the remote. The
-cache is the instance's footprint plus whatever was loaded along the way to producing it.
+A client's local store doubles as a fragment cache. Fragments a read caches stay locally once
+they are fetched, so subsequent reads of the same fragment do not contact the remote. The cache
+is the instance's footprint plus whatever was loaded along the way to producing it.
+
+A fragment written with local cache priority, or one that holds a revision state, asks every
+read that fetches it to keep its payload, whether or not the read caches. A read that doesn't
+keep a fetched fragment's payload still writes the fragment to the local store, as an entry
+without its payload, and so does a metadata query the remote answers. Whatever a read writes is
+marked as held by the remote, so a later write of the same content finds it there and uploads
+nothing, with no round trip to ask. Each is an entry in the local index, so the index grows with
+what the store has read, not only with what it keeps. An entry without its payload names
+content the store doesn't hold, so a read of it still fetches the payload.
 
 The cache is sized by the user: an LRU policy evicts the least-recently-used fragments when
 the configured budget is exceeded. A developer iterating on the same area of the repository

@@ -3820,6 +3820,62 @@ async fn a_node_link_crosses_a_link_where_its_repository_or_revision_differs() {
     .await;
 }
 
+/// A recovery that asks the remote whether it holds an address as a list writes the fragment the
+/// remote describes to the local store as an entry without its payload, marked durable, so a later
+/// write of the list uploads nothing.
+#[tokio::test]
+async fn a_remote_list_check_writes_the_fragment_as_an_entry_without_its_payload() {
+    use lore_base::error::Disconnected;
+    use lore_revision::repository::RemoteState;
+    use lore_revision::test_util::context_with_state;
+    use lore_revision::util::request_tracker::StoreRequestTracker;
+    use lore_storage::Fragment;
+    use lore_storage::FragmentFlags;
+    use lore_storage::FragmentReference;
+    use lore_storage::store_types::StoreMatch;
+    use lore_transport::ProtocolError;
+
+    use crate::immutable::session_tests::under_execution_context;
+
+    let repository =
+        context_with_state(RemoteState::Failed(ProtocolError::from(Disconnected))).await;
+    let size_payload = 2 * size_of::<FragmentReference>();
+    let payload = Bytes::from(vec![0x5au8; size_payload]);
+    let address = Address {
+        hash: hash::hash_slice(&payload),
+        context: Context::from([0x5au8; 16]),
+    };
+    let fragment = Fragment {
+        flags: FragmentFlags::PayloadFragmented.bits(),
+        size_payload: size_payload as u32,
+        size_content: 2 * 4096,
+    };
+    lore_storage::test_util::serve_remote(address, fragment, payload);
+
+    let tracker = StoreRequestTracker::default();
+    let lists = under_execution_context(|| {
+        lore_revision::state::remote_lists_fragments(&repository, address, &tracker)
+    })
+    .await;
+    let held = repository
+        .immutable_store()
+        .get_metadata(repository.id, address)
+        .await
+        .expect("the local metadata");
+
+    assert!(lists, "the remote lists the address");
+    assert_eq!(
+        (
+            held.match_made,
+            held.fragment.flags & FragmentFlags::PayloadStored.bits()
+        ),
+        (
+            StoreMatch::MatchFull,
+            FragmentFlags::PayloadStoredDurable.bits()
+        )
+    );
+}
+
 /// A link whose revision cannot be opened answers for nothing in its mount, so a mount holding a
 /// file, or a file standing in its place, holds what cannot be told from local work, and an
 /// absent or empty one holds nothing.

@@ -70,7 +70,11 @@ pub struct LoreStorageGetFileItem {
     /// Content bytes to write from `offset`; `0` writes to the end. The file holds exactly the
     /// requested range starting at its own first byte, and is sized to it
     pub length: u64,
-    /// Cache fetched fragments back to the local store, not just write them to `path`
+    /// Cache fetched fragments in the local store, not just write them to `path`, as they always
+    /// are for a fragment written with `PayloadLocalCachePriority` or one of revision state. A
+    /// fetched fragment that is not cached is still written to the local store as an entry
+    /// without its payload, so a put of the same content uploads nothing. Either is marked stored
+    /// durable
     pub local_cache: u8,
 }
 

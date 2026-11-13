@@ -7080,7 +7080,9 @@ pub type LoreStorageGetMetadataArgs = crate::storage::get_metadata::LoreStorageG
 
 /// Fetch fragment metadata for one or more `(partition, address)` pairs without paying the
 /// payload bytes. Each item's terminal event carries the resolved `Fragment` (`flags`,
-/// `size_payload`, `size_content`); on miss `error_code == ADDRESS_NOT_FOUND`.
+/// `size_payload`, `size_content`); on miss `error_code == ADDRESS_NOT_FOUND`. An item the remote
+/// answers is written to the handle's local store as an entry without its payload, marked stored
+/// durable, so a put of the same content uploads nothing.
 ///
 /// # Events
 ///

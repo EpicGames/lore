@@ -7,7 +7,9 @@ use crate::fragment_flags::FragmentFlags;
 /// Options controlling how a fragment is written to storage.
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct WriteOptions {
-    /// This fragment stores a revision state
+    /// This fragment stores a revision state. Recorded in the fragment's flags, so every store
+    /// that fetches it keeps its payload too, unless the read stores nothing locally
+    /// ([`ReadOptions::no_local_write`]).
     pub revision_state: bool,
     /// This fragment should be cached locally with payload if possible. Recorded in the fragment's
     /// flags, so it travels with the fragment and every store that fetches it caches it too, unless
@@ -149,10 +151,14 @@ pub struct ReadOptions {
     pub local: bool,
     /// Fallback to remote
     pub remote: bool,
-    /// Cache locally
+    /// Keep the payload of what the read fetches in the local store, as a fragment with local
+    /// cache priority or holding a revision state has it kept whatever this says. A fetched
+    /// fragment whose payload the read does not keep is written there as an entry without its
+    /// payload. Either is marked as stored on the remote. With `no_local_write` the read stores
+    /// nothing, whatever this says.
     pub cache: bool,
-    /// Store nothing the read fetches in the local store, whatever `cache`, a local copy that does
-    /// not load, or the fragment's local cache priority asks.
+    /// Store nothing the read fetches in the local store, neither a payload nor a fragment without
+    /// one, whatever `cache`, a local copy that does not load, or the fragment asks.
     pub no_local_write: bool,
     /// Where no remote is in reach, answer a local read that fails with its error, and a local
     /// payload that fails its size check or does not decompress with an internal error, rather

@@ -816,13 +816,166 @@ mod storage_remote_tests {
                     .await
                     .expect("local exist call");
                     assert_eq!(
-                        local_match.match_made,
-                        lore_storage::store_types::StoreMatch::MatchNone,
-                        "unflagged remote-fetched payload must NOT be cached locally",
+                        (
+                            local_match.match_made,
+                            local_match.stored_local,
+                            local_match.stored_durable
+                        ),
+                        (
+                            lore_storage::store_types::StoreMatch::MatchFull,
+                            false,
+                            true
+                        ),
+                        "an unflagged remote-fetched payload is recorded as durable, not cached",
                     );
 
                     close_handle(handle).await;
                 }
+                Ok(())
+            })
+            .await
+    }
+
+    /// The Overmind image store's repro, `get_teaches_store`, against a real server: node B pulls
+    /// the content node A published in fixed-size chunks, with `local_cache` 0, and its put of
+    /// the same content sends the server nothing, neither a payload nor a copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_put_after_a_get_caching_nothing_sends_the_server_nothing() -> TestResult {
+        use lore::storage::get;
+        use lore::storage::get::LoreStorageGetArgs;
+        use lore::storage::get::LoreStorageGetItem;
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+        use lore_revision::interface::LoreArray;
+        use rand::Rng;
+
+        use crate::common::net_common::CountingStore;
+        use crate::common::net_common::Traffic;
+
+        const CHUNK: u64 = 256 * 1024;
+
+        let execution = setup_execution("storage-remote-get-teaches-store".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (backend_immutable, backend_mutable) = make_backends(Partitions::Shared).await;
+                let counted = CountingStore::new(backend_immutable);
+                let server = start_test_server_with(counted.clone(), backend_mutable);
+                let partition = Partition::from([0xb7u8; 16]);
+                let context = Context::from([0xb7u8; 16]);
+                let mut content = vec![0u8; 8 * CHUNK as usize];
+                rand::rng().fill(&mut content[..]);
+
+                let node_a = open_handle(Some(&server.url)).await;
+                let address = put_content(node_a, partition, context, &content, 1, CHUNK).await;
+                close_handle(node_a).await;
+
+                let node_b = open_handle(Some(&server.url)).await;
+                let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+                let received_for_cb = received.clone();
+                let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                    if let LoreEvent::StorageGetData(data) = event {
+                        // SAFETY: the event's bytes are valid for the callback.
+                        let slice = unsafe {
+                            std::slice::from_raw_parts(data.bytes.ptr.cast::<u8>(), data.bytes.len)
+                        };
+                        received_for_cb.lock().unwrap().extend_from_slice(slice);
+                    }
+                }));
+                let status = get::get(
+                    LoreGlobalArgs::default(),
+                    LoreStorageGetArgs {
+                        handle: node_b,
+                        items: LoreArray::from_vec(vec![LoreStorageGetItem {
+                            id: 1,
+                            partition,
+                            address,
+                            local_cache: 0,
+                            ..Default::default()
+                        }]),
+                    },
+                    callback,
+                )
+                .await;
+                assert_eq!(status, 0, "node B's get");
+                assert!(*received.lock().unwrap() == content, "node B's get");
+
+                counted.reset();
+                let put = put_content(node_b, partition, context, &content, 1, CHUNK).await;
+                assert_eq!(put, address);
+                assert_eq!(
+                    counted.traffic(),
+                    Traffic::default(),
+                    "the put after the pull sent the server something"
+                );
+                close_handle(node_b).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// A `get_metadata` the server answers records the fragment in node B's store, so node B's
+    /// put of the same content sends the server nothing, neither a payload nor a copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_put_after_a_remote_get_metadata_sends_the_server_nothing() -> TestResult {
+        use lore::storage::get_metadata;
+        use lore::storage::get_metadata::LoreStorageGetMetadataArgs;
+        use lore::storage::get_metadata::LoreStorageGetMetadataItem;
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+        use lore_revision::interface::LoreArray;
+        use rand::Rng;
+
+        use crate::common::net_common::CountingStore;
+        use crate::common::net_common::Traffic;
+
+        let execution = setup_execution("storage-remote-get-metadata-teaches-store".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (backend_immutable, backend_mutable) = make_backends(Partitions::Shared).await;
+                let counted = CountingStore::new(backend_immutable);
+                let server = start_test_server_with(counted.clone(), backend_mutable);
+                let partition = Partition::from([0xb8u8; 16]);
+                let context = Context::from([0xb8u8; 16]);
+                let mut content = vec![0u8; 64 * 1024];
+                rand::rng().fill(&mut content[..]);
+
+                let node_a = open_handle(Some(&server.url)).await;
+                let address = put_content(node_a, partition, context, &content, 1, 0).await;
+                close_handle(node_a).await;
+
+                let node_b = open_handle(Some(&server.url)).await;
+                let codes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+                let codes_for_cb = codes.clone();
+                let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                    if let LoreEvent::StorageGetMetadataItemComplete(data) = event {
+                        codes_for_cb.lock().unwrap().push(data.error.error_code);
+                    }
+                }));
+                let status = get_metadata::get_metadata(
+                    LoreGlobalArgs::default(),
+                    LoreStorageGetMetadataArgs {
+                        handle: node_b,
+                        items: LoreArray::from_vec(vec![LoreStorageGetMetadataItem {
+                            id: 1,
+                            partition,
+                            address,
+                        }]),
+                    },
+                    callback,
+                )
+                .await;
+                assert_eq!(status, 0, "node B's get_metadata");
+                assert_eq!(*codes.lock().unwrap(), [0], "node B's get_metadata");
+
+                counted.reset();
+                let put = put_content(node_b, partition, context, &content, 1, 0).await;
+                assert_eq!(put, address);
+                assert_eq!(
+                    counted.traffic(),
+                    Traffic::default(),
+                    "the put after the metadata read sent the server something"
+                );
+                close_handle(node_b).await;
                 Ok(())
             })
             .await

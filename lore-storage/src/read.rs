@@ -412,68 +412,114 @@ pub fn check_receipt(
 }
 
 /// What a read keeps locally of the content it fetches, each keeping what the one before keeps.
+/// Each records the fragment, marked durable as the fetch marks it, where it does not store the
+/// payload ([`store_fetched`]).
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Keep {
-    /// Stores it where the fragment's local cache priority asks ([`fetch_is_stored`]).
+    /// Stores the payload where the fragment asks for it, with its local cache priority or as a
+    /// revision state ([`fetch_is_stored`]).
     Priority,
-    /// Stores it.
+    /// Stores the payload.
     Store,
-    /// Stores it, overwriting the local copy, which failed to load.
+    /// Stores the payload, overwriting the local copy, which failed to load.
     Replace,
 }
 
 impl Keep {
-    /// What a read keeps that caches where `cache`, and replaces its local copy where `replace`.
-    pub fn of(cache: bool, replace: bool) -> Self {
-        match (cache, replace) {
-            (_, true) => Self::Replace,
-            (true, false) => Self::Store,
-            (false, false) => Self::Priority,
+    /// What a read with `options` keeps of what it fetches, replacing its local copy where
+    /// `replace`: nothing with `options.no_local_write`, and otherwise the payload where
+    /// `options.cache` or `replace` asks, or where the fragment asks for it ([`fetch_is_stored`]).
+    pub fn of(options: ReadOptions, replace: bool) -> Option<Self> {
+        match (options.no_local_write, options.cache, replace) {
+            (true, _, _) => None,
+            (false, _, true) => Some(Self::Replace),
+            (false, true, false) => Some(Self::Store),
+            (false, false, false) => Some(Self::Priority),
         }
     }
 }
 
-/// Whether a fetch of `fragment` is stored locally: where its read stores what it fetches
-/// (`stores`), or where the fragment's local cache priority asks.
+/// The fragment flags with which a fragment asks every read that fetches it to store its payload
+/// locally: its local cache priority, and a revision state.
+const FETCH_STORED_FLAGS: u32 =
+    FragmentFlags::PayloadLocalCachePriority.bits() | FragmentFlags::PayloadRevisionState.bits();
+
+/// Whether the payload of a fetch of `fragment` is stored locally: where its read stores what it
+/// fetches (`stores`), or where the fragment asks for it with one of [`FETCH_STORED_FLAGS`].
 fn fetch_is_stored(stores: bool, fragment: &Fragment) -> bool {
-    stores || (fragment.flags & FragmentFlags::PayloadLocalCachePriority) != 0
+    stores || fragment.flags & FETCH_STORED_FLAGS != 0
 }
 
-/// Whether a resolve stores the root it fetched, which `fragment` describes, in the local store:
-/// where [`fetch_is_stored`] says for a read that caches where `options.cache`, or replaces a
-/// broken local copy where `replace`, unless `options.no_local_write` forbids it.
-fn stores_fetched(options: ReadOptions, fragment: &Fragment, replace: bool) -> bool {
-    !options.no_local_write && fetch_is_stored(options.cache || replace, fragment)
-}
-
-/// Stores `raw`, the payload fetched for `address`, in `store` as `keep` asks, where
-/// [`fetch_is_stored`] says, and answers whether it stored it. A failed put fails nothing: the
-/// read holds the payload.
+/// Stores what a read fetched from the remote for `address`, which `fragment` describes, in `store`
+/// as `keep` asks: `payload`, where there is one and [`fetch_is_stored`] says, answering whether it
+/// stored it. Otherwise it records the fragment without the payload, so that a later write of the
+/// content finds it durable and uploads nothing; a payload the store holds stays. A read that
+/// fetched no payload, as [`fetch_metadata`], is only ever recorded. Either way the entry is marked
+/// durable: the remote holds what a read fetched. With no `keep` nothing is stored. A failed put
+/// fails nothing: the read holds what it fetched.
 ///
 /// Not an `async fn`, which would hold its arguments beside the put's future.
 fn store_fetched(
     store: &Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
-    raw: &(Fragment, Bytes),
+    fragment: Fragment,
+    payload: Option<&Bytes>,
     keep: Option<Keep>,
 ) -> impl Future<Output = bool> + use<> {
-    let put = keep
-        .filter(|keep| fetch_is_stored(*keep >= Keep::Store, &raw.0))
-        .map(|keep| {
-            store.clone().put(
-                partition,
-                address,
-                raw.0,
-                Some(raw.1.clone()),
-                keep == Keep::Replace,
-            )
-        });
+    let put = keep.map(|keep| {
+        let fragment = Fragment {
+            flags: fragment.flags | FragmentFlags::PayloadStoredDurable.bits(),
+            ..fragment
+        };
+        let payload = payload
+            .filter(|_| fetch_is_stored(keep >= Keep::Store, &fragment))
+            .cloned();
+        let stores = payload.is_some();
+        let put = store
+            .clone()
+            .put(partition, address, fragment, payload, keep == Keep::Replace);
+        (put, stores)
+    });
     async move {
         match put {
-            Some(put) => put.await.is_ok(),
+            Some((put, stores)) => put.await.is_ok() && stores,
             None => false,
         }
+    }
+}
+
+/// Asks the remote through `session` for the fragment stored at `address`, without its payload,
+/// and records it in `store` as [`store_fetched`] records a fetch it does not keep, marked durable,
+/// unless `options.no_local_write` is set. Answers the fragment as the remote describes it, and a
+/// failure of the session as [`crate::error::protocol_error_to_storage`] maps it. A failed write of
+/// the entry fails nothing.
+///
+/// Not an `async fn`, which would hold `options` rather than what it keeps.
+#[inline]
+#[allow(clippy::manual_async_fn)]
+pub fn fetch_metadata<'a>(
+    store: &'a Arc<dyn ImmutableStore>,
+    partition: &'a Partition,
+    address: &'a Address,
+    options: ReadOptions,
+    session: &'a StorageSession,
+) -> impl Future<Output = Result<Fragment, StorageError>> + 'a {
+    let keep = Keep::of(options, false);
+    async move {
+        #[cfg(feature = "test-util")]
+        let served = crate::test_util::remote_metadata(*address);
+        #[cfg(not(feature = "test-util"))]
+        let served = None;
+        let fragment = match served {
+            Some(fragment) => fragment,
+            None => session
+                .get_metadata(address)
+                .await
+                .map_err(|err| crate::error::protocol_error_to_storage(err, *address))?,
+        };
+        store_fetched(store, *partition, *address, fragment, None, keep).await;
+        Ok(fragment)
     }
 }
 
@@ -592,8 +638,9 @@ fn strict_error_asked(session: Option<&Arc<StorageSession>>, options: ReadOption
 /// isolates partitions, and by `options.trust_remote` and `options.no_local_write`, never by the
 /// context or the store: the first caller becomes the leader and fetches, and later callers await
 /// its outcome rather than duplicating the remote fetch. The fetch is stored where each read caches
-/// it, replaces its local copy, or the fragment's local cache priority asks, as
-/// [`fetch_single_flight`] describes, and never for a read with `options.no_local_write`. A leader
+/// it, replaces its local copy, or the fragment asks for it ([`fetch_is_stored`]), as
+/// [`fetch_single_flight`] describes, and recorded without its payload otherwise
+/// ([`store_fetched`]); nothing is stored for a read with `options.no_local_write`. A leader
 /// that vanishes without completing, such as one whose task is cancelled, leaves no result behind;
 /// the next follower observing that promotes itself to leader and retries. A local-only load (no
 /// session, or `options.remote` off) answers its miss with `AddressNotFound` and never joins:
@@ -652,7 +699,7 @@ pub fn load_fragment(
             partition,
             address,
             options,
-            (!options.no_local_write).then_some(Keep::of(options.cache, local_replace)),
+            Keep::of(options, local_replace),
             || fetch_remote(session.as_ref(), address, options),
             || {},
         ))
@@ -717,9 +764,10 @@ impl Flown {
 /// checked less than it asks, and the same [`ReadOptions::no_local_write`], so no caller that stores
 /// nothing locally shares a flight with one that does. `keep` is what the caller keeps of the fetch
 /// in `store`. The leader stores its fetch in its store as its own `keep` and those of its
-/// followers reading its partition and address there ask (`ReadFlightGuard::take_keep`), before it
-/// hands the fetch to them, with one put; any other follower stores the fetch itself, within its
-/// own use of its store. A caller with no `keep`, such as a read with `no_local_write`, has nothing
+/// followers reading its partition and address there ask (`ReadFlightGuard::take_keep`), with one
+/// put: before it hands the fetch to them where the put stores the payload, and after where it
+/// writes the fragment without it ([`store_fetched`]). Any other follower stores the fetch itself,
+/// within its own use of its store. A caller with no `keep`, such as a read with `no_local_write`, has nothing
 /// stored for it by the flight. A follower takes the leader's error only where it asked for the
 /// leader's own partition and address; one whose leader failed on another address probes the local
 /// store, unless `options.local` is off, and fetches and stores itself when nothing is there.
@@ -758,14 +806,37 @@ where
             ) {
                 crate::read_flight::ReadFlight::Leader(guard) => {
                     let result = fetch().await;
-                    let stored = match &result {
-                        Ok(fetched) => {
-                            let kept = guard.take_keep();
-                            store_fetched(&store, partition, address, &fetched.raw, kept).await
+                    let stored = if let Ok(fetched) = &result {
+                        let kept = guard.take_keep();
+                        let stores = kept.is_some_and(|keep| {
+                            fetch_is_stored(keep >= Keep::Store, &fetched.raw.0)
+                        });
+                        // An entry without its payload only spares a later write a round trip,
+                        // so the followers have the fetch before it is written rather than wait
+                        // for the index write.
+                        let guard = if stores {
+                            Some(guard)
+                        } else {
+                            guard.complete(&result);
+                            None
+                        };
+                        let stored = store_fetched(
+                            &store,
+                            partition,
+                            address,
+                            fetched.raw.0,
+                            Some(&fetched.raw.1),
+                            kept,
+                        )
+                        .await;
+                        if let Some(guard) = guard {
+                            guard.complete(&result);
                         }
-                        Err(_) => false,
+                        stored
+                    } else {
+                        guard.complete(&result);
+                        false
                     };
-                    guard.complete(&result);
                     return result.map(if stored {
                         Flown::Stored
                     } else {
@@ -781,9 +852,15 @@ where
                     match crate::read_flight::await_flight(follower).await {
                         Some(Ok(fetched)) => {
                             if !kept {
-                                let _ =
-                                    store_fetched(&store, partition, address, &fetched.raw, keep)
-                                        .await;
+                                let _ = store_fetched(
+                                    &store,
+                                    partition,
+                                    address,
+                                    fetched.raw.0,
+                                    Some(&fetched.raw.1),
+                                    keep,
+                                )
+                                .await;
                             }
                             return Ok(Flown::Fetched(fetched));
                         }
@@ -795,8 +872,15 @@ where
                                 return Ok(Flown::Local(found));
                             }
                             let fetched = fetch().await?;
-                            let _ =
-                                store_fetched(&store, partition, address, &fetched.raw, keep).await;
+                            let _ = store_fetched(
+                                &store,
+                                partition,
+                                address,
+                                fetched.raw.0,
+                                Some(&fetched.raw.1),
+                                keep,
+                            )
+                            .await;
                             return Ok(Flown::Fetched(fetched));
                         }
                         None => {}
@@ -1978,12 +2062,14 @@ fn load_resolved_local(
 /// resolve. A fragment list's leaves go through [`load_fragment`] either way, so they keep their
 /// own local-then-remote fallback and local caching.
 ///
-/// On a remote resolve the key->hash mapping is written back to the local mutable store once the
-/// root's write-back, which [`stores_fetched`] decides, succeeds — so a later call can be served
-/// entirely locally, and the mapping is never left pointing at a root this store does not hold.
-/// Where the local root is held broken, the root the remote resolves to is stored replacing any
-/// copy unless `options.no_local_write` is set, whether or not the read caches, as
-/// [`load_fragment`] stores a refetched payload: over the broken one where the key still names it.
+/// On a remote resolve the root is stored as [`store_fetched`] stores a fetch, and the key->hash
+/// mapping is written back to the local mutable store once the root's payload is stored — so a
+/// later call can be served entirely locally, and the mapping is never left pointing at a root this
+/// store does not hold. A root whose payload is not stored is recorded without it, unless
+/// `options.no_local_write` is set, and its key is not mapped. Where the local root is held broken,
+/// the root the remote resolves to is stored replacing any copy unless `options.no_local_write` is
+/// set, whether or not the read caches, as [`load_fragment`] stores a refetched payload: over the
+/// broken one where the key still names it.
 ///
 /// A local root travels with the caller's session anyway: a fragment list's leaves may still
 /// exist only remotely.
@@ -2087,12 +2173,15 @@ fn resolve_root(
             let raw = (fragment, buffer);
             match check_receipt(&raw, address, options) {
                 Ok(content) => {
-                    if stores_fetched(options, &fragment, replace)
-                        && store
-                            .clone()
-                            .put(partition, address, fragment, Some(raw.1.clone()), replace)
-                            .await
-                            .is_ok()
+                    if store_fetched(
+                        &store,
+                        partition,
+                        address,
+                        raw.0,
+                        Some(&raw.1),
+                        Keep::of(options, replace),
+                    )
+                    .await
                     {
                         let _ = mutable
                             .store(partition, key, resolved, KeyType::Resolve)

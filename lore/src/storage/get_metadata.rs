@@ -14,14 +14,13 @@
 //! 2. Local probe via `ImmutableStore::get_metadata(partition, address)`. Any match the store made
 //!    is a hit, not only a full one — see `resolve_local` for why.
 //! 3. On local miss, fall through to the configured remote (if any) via
-//!    `StorageSession::get_metadata`. The wire op carries no payload bytes — only Fragment.
+//!    `lore_storage::read::fetch_metadata`. The wire op carries no payload bytes — only Fragment.
+//!    A hit is written to the local store as an entry without its payload, marked stored durable,
+//!    so a later put of the content finds it durable and uploads nothing.
 //! 4. On remote miss or no remote configured, emit `ADDRESS_NOT_FOUND`.
 //!
 //! Only step 3 costs a task, and only in a batch of several: the probe runs on the calling task for
 //! every item, and a lone item's remote leg runs there too.
-//!
-//! Successful remote fetches are not cached locally — there is no payload to cache, and
-//! re-fetching metadata is cheap.
 
 use std::sync::Arc;
 
@@ -77,7 +76,9 @@ pub struct LoreStorageGetMetadataArgs {
     pub items: LoreArray<LoreStorageGetMetadataItem>,
 }
 
-/// Fetch fragment metadata for one or more addresses without paying the payload bytes.
+/// Fetch fragment metadata for one or more addresses without paying the payload bytes. An address
+/// the local store does not hold and the remote does is written to the local store as an entry
+/// without its payload, marked stored durable, so a put of the same content uploads nothing.
 pub async fn get_metadata(
     globals: LoreGlobalArgs,
     args: LoreStorageGetMetadataArgs,
@@ -115,7 +116,9 @@ async fn get_metadata_local(
                 outcomes.push(
                     match item_backend(&store, item, effective, &mut reuse).await {
                         ItemBackend::Done(result) => result,
-                        ItemBackend::Remote(session) => resolve_remote(session, *item).await,
+                        ItemBackend::Remote(session) => {
+                            resolve_remote(store, session, effective, *item).await
+                        }
                     },
                 );
                 return outcomes.into_call_result(total, "get_metadata");
@@ -128,7 +131,7 @@ async fn get_metadata_local(
                     ItemBackend::Remote(session) => {
                         lore_spawn!(
                             remote_tasks,
-                            async move { resolve_remote(session, item).await }
+                            resolve_remote(store.clone(), session, effective, item)
                         );
                     }
                 }
@@ -226,23 +229,32 @@ async fn resolve_local(
     }
 }
 
-/// Resolve one item against the remote. Emits the terminal event with the wire-fetched Fragment
+/// Resolve one item against the remote, recording a hit in `store`'s local store
+/// (`lore_storage::read::fetch_metadata`). Emits the terminal event with the wire-fetched Fragment
 /// on success, or the transport error mapped through `protocol_error_to_storage`, which attaches
 /// the address a bare `ProtocolError` does not carry.
-async fn resolve_remote(
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn resolve_remote(
+    store: Arc<StoreInternal>,
     session: Arc<lore_transport::StorageSession>,
+    effective: EffectiveFlags,
     item: LoreStorageGetMetadataItem,
-) -> Result<(), StorageError> {
-    match session.get_metadata(&item.address).await {
-        Ok(fragment) => emit_complete(&item, fragment, Ok(())),
-        Err(err) => emit_complete(
-            &item,
-            Fragment::default(),
-            Err(lore_storage::error::protocol_error_to_storage(
-                err,
-                item.address,
-            )),
-        ),
+) -> impl Future<Output = Result<(), StorageError>> {
+    async move {
+        match lore_storage::read::fetch_metadata(
+            &store.immutable,
+            &item.partition,
+            &item.address,
+            effective.read_options(true),
+            &session,
+        )
+        .await
+        {
+            Ok(fragment) => emit_complete(&item, fragment, Ok(())),
+            Err(err) => emit_complete(&item, Fragment::default(), Err(err)),
+        }
     }
 }
 

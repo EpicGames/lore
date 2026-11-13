@@ -3039,6 +3039,31 @@ impl LocalImmutableStore {
         Ok(())
     }
 
+    /// Whether a put of `fragment` at `address` in `partition`, carrying a payload where
+    /// `has_payload`, finds the store as it would leave it: the association's entry, not a
+    /// tombstone, of the same content, holding the payload where the put carries one, and durable
+    /// where the put says so. Such a put, as a read's write of a fragment the store already holds,
+    /// changes nothing, so it is decided under the read claim the caller holds: it advances no
+    /// epoch, and another process sharing the store does not reload for it. Anything else, a
+    /// failed lookup included, answers `false`, and the put goes on to its write.
+    async fn puts_nothing(
+        &self,
+        partition: Partition,
+        address: Address,
+        fragment: &Fragment,
+        has_payload: bool,
+    ) -> bool {
+        let Ok(find) = self.find(partition, address, Lookup::Read).await else {
+            return false;
+        };
+        let durable = FragmentFlags::PayloadStoredDurable.bits();
+        find.matching == StoreMatch::MatchFull
+            && find.data.flags & FragmentFlags::PayloadObliterated == 0
+            && find.data.size_content == fragment.size_content
+            && (find.data.pack_file != 0 || !has_payload)
+            && (find.data.flags & durable != 0 || fragment.flags & durable == 0)
+    }
+
     /// Write `payload` to the group's packstore outside any bucket lock, then insert the entry for
     /// `address` pointing at it, see [`Self::store_entry`]. The group's payload gate is held from
     /// before the write until the entry is in the bucket, see
@@ -3083,7 +3108,8 @@ impl LocalImmutableStore {
     /// `payload` was written to, and is reported as [`StoreOutcome::NeedsPayload`] while it is
     /// unwritten. A written payload the entry does not take stays unreferenced. A store without a
     /// payload over the tombstone of its association is refused with `PayloadNotFound`. A payload
-    /// the entry takes is assigned to every other entry of its hash but a tombstone.
+    /// the entry takes is assigned to every other entry of its hash but a tombstone. An entry
+    /// without its payload that a payload fills in keeps its `PayloadStoredDurable`.
     async fn store_entry(
         &self,
         partition: &Partition,
@@ -3179,6 +3205,13 @@ impl LocalImmutableStore {
                     return Ok(StoreOutcome::Kept {
                         changed_flags: (current_flags != data.flags).then_some(current_flags),
                     });
+                }
+                // An entry without its payload, such as the header-only entry a read leaves for
+                // content the remote holds, stays durable as a payload fills it in. A put that
+                // found no entry has no durable flag of it to carry: the entry may have landed
+                // while the put wrote its payload.
+                if data.pack_file == 0 && data.flags & FragmentFlags::PayloadObliterated == 0 {
+                    fragment_flags |= data.flags & FragmentFlags::PayloadStoredDurable;
                 }
             }
 
@@ -5564,7 +5597,6 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         payload: Option<Bytes>,
         force: bool,
     ) -> Result<(), StoreError> {
-        let _hold = self.hold(Intent::Write).await?;
         sanitise_fragment_behavior_flags(&mut fragment);
 
         let payload_len = payload.as_ref().map(Bytes::len);
@@ -5607,6 +5639,29 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                 address.hash
             )));
         }
+        // The read claim the check takes is kept until the write claim joins it: released in
+        // between, the write claim would be the first after a release, which reloads a store that
+        // does not reuse its state across holds. It goes once the write claim holds the store, so
+        // the write's states do not carry it.
+        let read = if !force
+            && self
+                .lock
+                .as_ref()
+                .is_some_and(|lock| !lock.covers(Intent::Write))
+        {
+            let read = self.hold(Intent::Read).await?;
+            if self
+                .puts_nothing(partition, address, &fragment, payload.is_some())
+                .await
+            {
+                return Ok(());
+            }
+            Some(read)
+        } else {
+            None
+        };
+        let _hold = self.hold(Intent::Write).await?;
+        drop(read);
         if force && payload.is_some() {
             lore_base::lore_debug!("Force overwrite fragment in local store");
             return self

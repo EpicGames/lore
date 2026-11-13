@@ -4206,6 +4206,86 @@ async fn a_follower_of_a_leader_dropped_during_its_put_stores_the_content_itself
     assert!(holds(&store, partition, address, &payload).await);
 }
 
+/// A leader that keeps no payload of its fetch hands the fetch to its followers before it writes
+/// the fragment without its payload: a follower ends while that write is held, with no fetch of
+/// its own.
+#[tokio::test]
+async fn followers_have_the_fetch_before_the_leader_writes_it_without_its_payload() {
+    let (_dir, store) = make_test_store().await;
+    let (_other_dir, other_inner) = make_test_store().await;
+    let put_held = Arc::new(tokio::sync::Notify::new());
+    let (leader_store, _) = CountingReadStore::with_hooks(
+        other_inner,
+        ReadHooks {
+            put_held: Some(put_held.clone()),
+            ..ReadHooks::default()
+        },
+    );
+    // A seed of its own: read flights are keyed process-wide, and a test leading a flight of the
+    // same content would answer this follower instead.
+    let (partition, address, fragment, payload) = make_input(0xB3);
+    let raw = (fragment, payload.clone());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let fetches = AtomicU64::new(0);
+    let fetch = || {
+        let raw = raw.clone();
+        async move {
+            Ok(Loaded {
+                content: Some(raw.clone()),
+                raw,
+            })
+        }
+    };
+    let mut leader = Box::pin(fetch_single_flight(
+        leader_store.clone(),
+        partition,
+        address,
+        ReadOptions::default(),
+        Some(Keep::Priority),
+        || {
+            let (gate, fetched) = (gate.clone(), fetch());
+            async move {
+                gate.notified().await;
+                fetched.await
+            }
+        },
+        || {},
+    ));
+    let mut follower = Box::pin(fetch_single_flight(
+        store.clone(),
+        partition,
+        address,
+        ReadOptions::default(),
+        Some(Keep::Priority),
+        || {
+            fetches.fetch_add(1, Ordering::SeqCst);
+            fetch()
+        },
+        || {},
+    ));
+    assert!(
+        futures::poll!(leader.as_mut()).is_pending(),
+        "the leader's fetch is held"
+    );
+    assert!(
+        futures::poll!(follower.as_mut()).is_pending(),
+        "the follower follows"
+    );
+    gate.notify_one();
+    assert!(
+        futures::poll!(leader.as_mut()).is_pending(),
+        "the leader's write is held"
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), follower)
+        .await
+        .expect("the follower ends while the leader's write is held")
+        .expect("the follower has the leader's fetch");
+    assert_eq!(fetches.load(Ordering::SeqCst), 0, "the follower fetched");
+    put_held.notify_one();
+    leader.await.expect("the leader's fetch");
+}
+
 /// A follower in the leader's store joining once the leader took less than it keeps there stores
 /// the fetch itself.
 #[tokio::test(flavor = "multi_thread")]
@@ -5181,13 +5261,21 @@ async fn a_read_into_caller_memory_fetches_a_local_compressed_payload_longer_tha
     }
 }
 
-/// A load with `no_local_write` stores nothing it fetches, though the fragment asks to be cached
-/// locally, the read caches, or the fetch replaces a local copy that does not load.
+/// A load with `no_local_write` stores nothing it fetches, neither its payload nor the fragment
+/// without it, whether the read keeps nothing, the fragment asks to be cached locally, the read
+/// caches, or the fetch replaces a local copy that does not load.
 #[tokio::test]
 async fn no_local_write_stores_nothing_a_load_fetches() {
     let [(_, undecodable), _] = broken_copies(4096);
     let priority = FragmentFlags::PayloadLocalCachePriority.bits();
     for (seed, label, flags, options, broken) in [
+        (
+            0x60u8,
+            "a read keeping nothing",
+            0,
+            ReadOptions::default(),
+            None,
+        ),
         (
             0x61u8,
             "a cache priority fragment",
@@ -5246,47 +5334,514 @@ async fn no_local_write_stores_nothing_a_load_fetches() {
     }
 }
 
-/// A resolve with `no_local_write` stores neither the root it fetches nor the key's mapping to it,
-/// though the root asks to be cached locally and the read caches.
+/// A resolve with `no_local_write` stores neither the root it fetches, with or without its
+/// payload, nor the key's mapping to it, whether the read keeps nothing or the root asks to be
+/// cached locally and the read caches.
 #[tokio::test]
 async fn no_local_write_skips_the_store_of_a_resolved_root() {
-    let (dir, inner) = make_test_store().await;
-    let mutable = test_mutable_store(&dir, &inner).await;
-    let partition = Partition::from([0x64; 16]);
-    let (address, fragment, content) = plain_content(Context::from([0x64; 16]), 4096, 0x64);
-    let key = hash::hash_slice(b"a key no resolve maps locally");
-    lore_storage::test_util::serve_remote_resolved(
-        key,
-        address.hash,
-        Fragment {
-            flags: FragmentFlags::PayloadLocalCachePriority.bits(),
-            ..fragment
-        },
-        content.clone(),
-    );
-    let (store, counts) = CountingReadStore::wrap(inner);
+    let priority = FragmentFlags::PayloadLocalCachePriority.bits();
+    for (seed, flags, options) in [
+        (0x64u8, priority, ReadOptions::default().with_cache()),
+        (0x5f, 0, ReadOptions::default()),
+    ] {
+        let (dir, inner) = make_test_store().await;
+        let mutable = test_mutable_store(&dir, &inner).await;
+        let partition = Partition::from([seed; 16]);
+        let (address, fragment, content) = plain_content(Context::from([seed; 16]), 4096, seed);
+        let key = hash::hash_slice(&[seed, 0x4b]);
+        lore_storage::test_util::serve_remote_resolved(
+            key,
+            address.hash,
+            Fragment { flags, ..fragment },
+            content.clone(),
+        );
+        let (store, counts) = CountingReadStore::wrap(inner);
 
-    let resolved = resolve_root(
-        store,
-        mutable.clone(),
+        let resolved = resolve_root(
+            store,
+            mutable.clone(),
+            partition,
+            key,
+            address.context,
+            0,
+            options.with_no_local_write(),
+            stand_in_session(),
+        )
+        .await
+        .expect("the remote resolves the key");
+
+        assert_eq!(resolved.buffer, content, "seed {seed:#x}");
+        assert_eq!(counts.puts(), 0, "seed {seed:#x}: the root was stored");
+        assert!(
+            mutable
+                .load(partition, key, KeyType::Resolve)
+                .await
+                .map_or(true, |hash| hash.is_zero()),
+            "seed {seed:#x}: the mapping was stored"
+        );
+    }
+}
+
+/// The fixed chunk size the Overmind image store cuts its images at.
+const IMAGE_CHUNK: usize = 256 * 1024;
+
+/// `size` bytes of content that no other call makes, so no other test's read of it shares a
+/// flight with this one's.
+fn fresh_content(size: usize) -> Bytes {
+    use rand::Rng;
+    let mut content = vec![0u8; size];
+    rand::rng().fill(&mut content[..]);
+    Bytes::from(content)
+}
+
+/// Writes `content` in fixed-size chunks of [`IMAGE_CHUNK`] to a store of its own, as a remote
+/// holds it after a put, and serves each of its fragments through the stand-in remote. Answers
+/// that store's directory and the address of each fragment, the root first.
+async fn serve_image(
+    partition: Partition,
+    context: Context,
+    content: &Bytes,
+) -> (TempDir, Vec<Address>) {
+    use lore_storage::TypedBytes;
+
+    let (dir, remote) = make_test_store().await;
+    let written = lore_storage::write_content(
+        remote.clone(),
         partition,
-        key,
-        address.context,
-        0,
-        ReadOptions::default().with_cache().with_no_local_write(),
-        stand_in_session(),
+        context,
+        content.clone(),
+        lore_storage::WriteOptions::default().with_fixed_size_chunk(IMAGE_CHUNK),
+        None,
+        lore_storage::WriteContext::none(),
+        None,
     )
     .await
-    .expect("the remote resolves the key");
-
-    assert_eq!(resolved.buffer, content);
-    assert_eq!(counts.puts(), 0, "the root was stored");
-    assert!(
-        mutable
-            .load(partition, key, KeyType::Resolve)
+    .expect("the remote takes the content");
+    let fragmented = FragmentFlags::PayloadFragmented.bits();
+    let mut addresses = vec![written.address];
+    let mut next = 0;
+    while let Some(&address) = addresses.get(next) {
+        next += 1;
+        let held = remote
+            .clone()
+            .get(partition, address)
             .await
-            .map_or(true, |hash| hash.is_zero()),
-        "the mapping was stored"
+            .expect("the remote holds the fragment");
+        let payload = held.payload.expect("the remote holds its payload");
+        if held.fragment.flags & fragmented == fragmented {
+            let list = payload
+                .clone()
+                .to_aligned::<lore_storage::FragmentReference>();
+            addresses.extend(
+                list.as_type_slice::<lore_storage::FragmentReference>()
+                    .iter()
+                    .map(|reference| Address {
+                        hash: reference.hash,
+                        context,
+                    }),
+            );
+        }
+        lore_storage::test_util::serve_remote(address, held.fragment, payload);
+    }
+    lore_storage::test_util::reset_counts();
+    (dir, addresses)
+}
+
+/// The store [`make_test_store`] made in `dir`, opened again.
+async fn reopen_test_store(dir: &TempDir) -> Arc<dyn ImmutableStore> {
+    LocalImmutableStore::new(
+        Some(PathBuf::from(dir.as_ref())),
+        ImmutableStoreSettings::default(),
+    )
+    .await
+    .expect("reopen test store")
+}
+
+/// The Overmind image store's repro, `get_teaches_store`, through the read and write functions its
+/// storage API calls reach. Node A has published an image in fixed-size chunks. Node B, a new
+/// disk-backed store, pulls the image into a file keeping nothing it fetches, as `get_file` with
+/// `local_cache` 0 does, by its address or by a key resolving to it, then flushes and closes.
+/// Reopened, node B's store answers a local metadata query for the root, and a query for each
+/// other fragment, with a full match stored durably and not locally, and a local read of the root
+/// still misses. Node B's put of the pulled file then finds every fragment durable and asks the
+/// remote nothing. The key stays unmapped, as the store holds no payload for the root.
+#[tokio::test]
+async fn a_pull_keeping_nothing_teaches_the_store_that_the_content_is_durable() {
+    for (seed, by_key) in [(0x5au8, false), (0x5b, true)] {
+        let partition = Partition::from([seed; 16]);
+        let context = Context::default();
+        let content = fresh_content(8 * IMAGE_CHUNK);
+        let (_remote, addresses) = serve_image(partition, context, &content).await;
+        let root = addresses[0];
+        let files = TempDir::new("lore-storage-pull-");
+        let pulled = files.child("pulled.bin");
+        let (dir, store) = make_test_store().await;
+
+        if by_key {
+            let mutable = test_mutable_store(&dir, &store).await;
+            let key = hash::hash_slice(&content[..64]);
+            let (fragment, payload) =
+                lore_storage::test_util::remote_payload(root).expect("the served root");
+            lore_storage::test_util::serve_remote_resolved(key, root.hash, fragment, payload);
+            read_resolved_into_file(
+                store.clone(),
+                mutable.clone(),
+                partition,
+                key,
+                context,
+                0,
+                &pulled,
+                ".pulling",
+                None,
+                ReadOptions::default(),
+                stand_in_session(),
+            )
+            .await
+            .expect("the pull by key");
+            assert!(
+                mutable
+                    .load(partition, key, KeyType::Resolve)
+                    .await
+                    .map_or(true, |hash| hash.is_zero()),
+                "the key maps to a root the store holds no payload for"
+            );
+        } else {
+            read_into_file(
+                store.clone(),
+                partition,
+                root,
+                &pulled,
+                ".pulling",
+                None,
+                ReadOptions::default(),
+                stand_in_session(),
+            )
+            .await
+            .expect("the pull");
+        }
+        assert_eq!(std::fs::read(&pulled).expect("the pulled file"), content);
+        store
+            .clone()
+            .flush(FlushOptions::default())
+            .await
+            .expect("node B flushes");
+        drop(store);
+
+        let store = reopen_test_store(&dir).await;
+        let metadata = store
+            .clone()
+            .get_metadata(partition, root)
+            .await
+            .expect("the local metadata of the root");
+        let stored = metadata.fragment.flags & FragmentFlags::PayloadStored.bits();
+        assert_eq!(
+            (metadata.match_made, stored),
+            (
+                lore_storage::StoreMatch::MatchFull,
+                FragmentFlags::PayloadStoredDurable.bits()
+            ),
+            "by key: {by_key}"
+        );
+        for &address in &addresses[1..] {
+            let found = lore_storage::immutable_store::query_one(&store, partition, address)
+                .await
+                .expect("a local query");
+            assert_eq!(
+                (found.match_made, found.stored_durable, found.stored_local),
+                (lore_storage::StoreMatch::MatchFull, true, false),
+                "{address}, by key: {by_key}"
+            );
+        }
+        let local = load_fragment(
+            store.clone(),
+            partition,
+            root,
+            ReadOptions::default().no_remote(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(local, Err(StorageError::AddressNotFound(_))),
+            "by key: {by_key}: {local:?}"
+        );
+
+        let (session, resolutions) =
+            failing_session(ProtocolError::internal("the put needs no remote"));
+        let written = lore_storage::write_from_file(
+            store,
+            partition,
+            &lore_storage::ContentSource::file(&pulled),
+            context,
+            lore_storage::WriteOptions::default().with_fixed_size_chunk(IMAGE_CHUNK),
+            Some(session),
+            lore_storage::WriteContext::none(),
+        )
+        .await
+        .expect("node B's put");
+        assert_eq!(written.address, root, "by key: {by_key}");
+        assert!(written.stored_durable, "by key: {by_key}");
+        assert_eq!(
+            resolutions.load(Ordering::Relaxed),
+            0,
+            "by key: {by_key}: the put asked the remote"
+        );
+    }
+}
+
+/// A miss that follows a miss of the same content, neither keeping what it fetches, makes no
+/// fetch of its own and has the fragment recorded in its store without its payload, marked
+/// durable: by itself, following a leader that reads into another store, and by the leader, which
+/// records it for a follower at its own address in its own store.
+#[tokio::test]
+async fn a_miss_following_a_fetch_it_does_not_keep_has_it_recorded_without_its_payload() {
+    let (_dir, store) = make_test_store().await;
+    let (_other_dir, other_store) = make_test_store().await;
+    for (seed, leader_store) in [(0x74u8, &other_store), (0x75, &store)] {
+        let partition = Partition::from([seed; 16]);
+        let (address, content, session) = serve_compressed(Context::from([seed; 16]), 4096);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        lore_storage::test_util::hold_remote_fetches(gate.clone());
+        let followers = lore_storage::test_util::followers();
+        let load = |store: &Arc<dyn ImmutableStore>| {
+            load_fragment(
+                store.clone(),
+                partition,
+                address,
+                ReadOptions::default(),
+                session.clone(),
+            )
+        };
+        let follower = async {
+            while lore_storage::test_util::counts().0 == 0 {
+                tokio::task::yield_now().await;
+            }
+            load(&store).await
+        };
+        let release = async {
+            while lore_storage::test_util::followers() == followers {
+                tokio::task::yield_now().await;
+            }
+            gate.notify_one();
+        };
+        let (leader, follower, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(load(leader_store), follower, release)
+        })
+        .await
+        .expect("the second miss followed the first");
+
+        assert_eq!(leader.expect("leader").1.as_ref(), content.as_slice());
+        assert_eq!(follower.expect("follower").1.as_ref(), content.as_slice());
+        assert_eq!(
+            lore_storage::test_util::counts().0,
+            1,
+            "seed {seed:#x}: fetches"
+        );
+        for held in [leader_store, &store] {
+            let found = lore_storage::immutable_store::query_one(held, partition, address)
+                .await
+                .expect("a local query");
+            assert_eq!(
+                (found.match_made, found.stored_durable, found.stored_local),
+                (lore_storage::StoreMatch::MatchFull, true, false),
+                "seed {seed:#x}"
+            );
+        }
+    }
+}
+
+/// What a fetch leaves in the local store, as a local metadata query reports it once a load that
+/// does not cache, as a storage API get with `local_cache` 0 is, or one that does, has fetched it:
+/// the payload and the durable mark where the fragment asks for its payload, with its local cache
+/// priority or as a revision state, or where the read caches, and the durable mark alone otherwise.
+#[tokio::test]
+async fn a_fetch_is_recorded_durable_with_its_payload_where_the_fragment_or_the_read_asks() {
+    let durable = FragmentFlags::PayloadStoredDurable.bits();
+    let local = FragmentFlags::PayloadStoredLocal.bits();
+    let cases = [
+        (
+            0x76u8,
+            "local cache priority",
+            FragmentFlags::PayloadLocalCachePriority.bits(),
+            false,
+            durable | local,
+        ),
+        (
+            0x78,
+            "a revision state",
+            FragmentFlags::PayloadRevisionState.bits(),
+            false,
+            durable | local,
+        ),
+        (0x79, "a caching read", 0, true, durable | local),
+        (0x7a, "a plain fragment", 0, false, durable),
+    ];
+    let mut observed = Vec::with_capacity(cases.len());
+    let mut expected = Vec::with_capacity(cases.len());
+    for (seed, label, flags, cache, stored) in cases {
+        let (_dir, store) = make_test_store().await;
+        let partition = Partition::from([seed; 16]);
+        let (address, fragment, content) = plain_content(Context::from([seed; 16]), 4096, seed);
+        lore_storage::test_util::serve_remote(
+            address,
+            Fragment { flags, ..fragment },
+            content.clone(),
+        );
+
+        let (_, loaded) = load_fragment(
+            store.clone(),
+            partition,
+            address,
+            ReadOptions::default().optional_cache(cache),
+            stand_in_session(),
+        )
+        .await
+        .expect(label);
+        let metadata = store
+            .clone()
+            .get_metadata(partition, address)
+            .await
+            .expect(label);
+
+        assert_eq!(loaded, content, "{label}");
+        observed.push((
+            label,
+            metadata.match_made,
+            metadata.fragment.flags & FragmentFlags::PayloadStored.bits(),
+        ));
+        expected.push((label, lore_storage::StoreMatch::MatchFull, stored));
+    }
+    assert_eq!(observed, expected);
+}
+
+/// A metadata read the remote answers records the fragment in the local store without its
+/// payload, marked durable, so a put of the same content finds it durable and asks the remote
+/// nothing. One with `no_local_write` records nothing, and that put asks the remote.
+#[tokio::test]
+async fn a_metadata_read_the_remote_answers_is_recorded_durable_without_its_payload() {
+    for (seed, no_local_write) in [(0x7bu8, false), (0x7c, true)] {
+        let (_dir, store) = make_test_store().await;
+        let partition = Partition::from([seed; 16]);
+        let (address, fragment, content) = plain_content(Context::from([seed; 16]), 4096, seed);
+        lore_storage::test_util::serve_remote(address, fragment, content.clone());
+        let options = ReadOptions {
+            no_local_write,
+            ..ReadOptions::default()
+        };
+        let session = stand_in_session().expect("a stand-in session");
+
+        let described = fetch_metadata(&store, &partition, &address, options, &session)
+            .await
+            .expect("the remote describes the fragment");
+        let metadata = store
+            .clone()
+            .get_metadata(partition, address)
+            .await
+            .expect("the local metadata");
+        let (session, resolutions) =
+            failing_session(ProtocolError::internal("the put needs no remote"));
+        let written = lore_storage::write_content(
+            store,
+            partition,
+            address.context,
+            content,
+            lore_storage::WriteOptions::default(),
+            Some(session),
+            lore_storage::WriteContext::none(),
+            None,
+        )
+        .await
+        .expect("the put");
+
+        assert_eq!(
+            (described.size_payload, described.size_content),
+            (fragment.size_payload, fragment.size_content)
+        );
+        let recorded = (
+            metadata.match_made,
+            metadata.fragment.flags & FragmentFlags::PayloadStored.bits(),
+        );
+        if no_local_write {
+            assert_eq!(
+                recorded.0,
+                lore_storage::StoreMatch::MatchNone,
+                "no_local_write recorded {recorded:?}"
+            );
+            assert_ne!(
+                resolutions.load(Ordering::Relaxed),
+                0,
+                "the put asked nothing"
+            );
+        } else {
+            assert_eq!(
+                recorded,
+                (
+                    lore_storage::StoreMatch::MatchFull,
+                    FragmentFlags::PayloadStoredDurable.bits()
+                )
+            );
+            assert_eq!(written.address, address);
+            assert!(written.stored_durable);
+            assert_eq!(
+                resolutions.load(Ordering::Relaxed),
+                0,
+                "the put asked the remote"
+            );
+        }
+    }
+}
+
+/// A metadata read of an address the stand-in remote does not serve asks the session, and maps its
+/// failure as a fetch's is mapped: a miss to `AddressNotFound`, a refusal to itself, and anything
+/// else to `NotConnected`. A failed read writes nothing to the local store.
+#[tokio::test]
+async fn a_metadata_read_the_session_fails_maps_the_failure_and_writes_nothing() {
+    let (_dir, store) = make_test_store().await;
+    let partition = Partition::from([0x7du8; 16]);
+    let (address, _, _) = plain_content(Context::from([0x7du8; 16]), 4096, 0x7d);
+    let cases: [(ProtocolError, ErrorCheck); 3] = [
+        (
+            ProtocolError::from(lore_base::error::NotFound),
+            StorageError::is_address_not_found,
+        ),
+        (
+            ProtocolError::from(lore_base::error::NotAuthorized),
+            StorageError::is_not_authorized,
+        ),
+        (
+            ProtocolError::internal("the server knows no such session"),
+            StorageError::is_not_connected,
+        ),
+    ];
+    for (error, expected) in cases {
+        let (session, resolutions) = failing_session(error);
+
+        let err = fetch_metadata(
+            &store,
+            &partition,
+            &address,
+            ReadOptions::default(),
+            &session,
+        )
+        .await
+        .expect_err("the session fails");
+        let metadata = store
+            .clone()
+            .get_metadata(partition, address)
+            .await
+            .expect("the local metadata");
+
+        assert!(expected(&err), "{err:?}");
+        assert_eq!(resolutions.load(Ordering::Relaxed), 1, "{err:?}");
+        assert_eq!(
+            metadata.match_made,
+            lore_storage::StoreMatch::MatchNone,
+            "{err:?}"
+        );
+    }
+    assert_eq!(
+        lore_storage::test_util::counts().0,
+        0,
+        "a metadata read counted as a fetch"
     );
 }
 
@@ -6102,12 +6657,12 @@ async fn a_failing_remote_fetch_into_a_buffer_fetches_once() {
     assert_eq!(lore_storage::test_util::counts().0, 1, "fetches");
 }
 
-/// Whether a storage error reports a given refusal.
-type ReportsRefusal = fn(&StorageError) -> bool;
+/// Whether a storage error is the one a test expects, such as one reporting a given refusal.
+type ErrorCheck = fn(&StorageError) -> bool;
 
 /// The refusals a remote answers, each with a reason on its trace as the transport gives one, and
 /// the predicate a storage error reporting it meets.
-fn refusals() -> [(ProtocolError, ReportsRefusal); 2] {
+fn refusals() -> [(ProtocolError, ErrorCheck); 2] {
     use lore_error_set::ErrorSet;
     let with_reason = |mut refusal: ProtocolError| {
         refusal.push_trace(lore_error_set::Location::with_context(

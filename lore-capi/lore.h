@@ -5704,8 +5704,10 @@ typedef struct lore_storage_get_item_t {
   // that fails partway reports the failure on `GET_ITEM_COMPLETE` rather than ending short
   // with a success code
   uint8_t streaming;
-  // Cache fetched bytes back to the local store even without the producer's
-  // `PayloadLocalCachePriority` hint
+  // Cache fetched bytes in the local store, as they always are for a fragment written with
+  // `PayloadLocalCachePriority` or one of revision state. A fetched fragment whose bytes are not
+  // cached is still written to the local store as an entry without its payload, so a put of
+  // the same content uploads nothing. Either is marked stored durable
   uint8_t local_cache;
   // Writable buffer receiving the requested range, `len` stating its capacity. Zero-initialized
   // selects `GET_DATA` delivery.
@@ -5752,8 +5754,10 @@ typedef struct lore_storage_get_resolved_item_t {
   // partway reports the failure on `GET_ITEM_COMPLETE` rather than ending short with a
   // success code
   uint8_t streaming;
-  // Cache fetched bytes back to the local store even without the producer's
-  // `PayloadLocalCachePriority` hint
+  // Cache fetched bytes in the local store, as they always are for a fragment written with
+  // `PayloadLocalCachePriority` or one of revision state. A fetched fragment whose bytes are not
+  // cached is still written to the local store as an entry without its payload, so a put of
+  // the same content uploads nothing. Either is marked stored durable
   uint8_t local_cache;
   // Deliver one `GET_FRAGMENT` per leaf fragment in content order in place of `GET_DATA`, each
   // carrying the leaf's fragment and its payload as stored, with `streaming` ignored. No leaf
@@ -6109,7 +6113,11 @@ typedef struct lore_storage_get_file_item_t {
   // Content bytes to write from `offset`; `0` writes to the end. The file holds exactly the
   // requested range starting at its own first byte, and is sized to it
   uint64_t length;
-  // Cache fetched fragments back to the local store, not just write them to `path`
+  // Cache fetched fragments in the local store, not just write them to `path`, as they always
+  // are for a fragment written with `PayloadLocalCachePriority` or one of revision state. A
+  // fetched fragment that is not cached is still written to the local store as an entry
+  // without its payload, so a put of the same content uploads nothing. Either is marked stored
+  // durable
   uint8_t local_cache;
 } lore_storage_get_file_item_t;
 
@@ -6195,8 +6203,11 @@ typedef struct lore_storage_get_file_resolved_item_t {
   // Content bytes to write from `offset`; `0` writes to the end. The file holds exactly the
   // requested range starting at its own first byte, and is sized to it
   uint64_t length;
-  // Cache fetched fragments and the mapping back to the local store, not just write the content
-  // to `path`
+  // Cache fetched fragments and the mapping in the local store, not just write the content to
+  // `path`, as fragments written with `PayloadLocalCachePriority`, and those of revision state,
+  // always are. A fetched fragment that is not cached is still written to the local store as an
+  // entry without its payload, so a put of the same content uploads nothing. Either is marked
+  // stored durable
   uint8_t local_cache;
 } lore_storage_get_file_resolved_item_t;
 
@@ -12389,7 +12400,9 @@ void lore_storage_flush_async(const struct lore_global_args_t *globals,
 
 // Fetch fragment metadata for one or more `(partition, address)` pairs without paying the
 // payload bytes. Each item's terminal event carries the resolved `Fragment` (`flags`,
-// `size_payload`, `size_content`); on miss `error_code == ADDRESS_NOT_FOUND`.
+// `size_payload`, `size_content`); on miss `error_code == ADDRESS_NOT_FOUND`. An item the remote
+// answers is written to the handle's local store as an entry without its payload, marked stored
+// durable, so a put of the same content uploads nothing.
 //
 // # Events
 //

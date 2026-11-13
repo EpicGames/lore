@@ -11625,20 +11625,33 @@ async fn collect_new_addresses(
 }
 
 /// Whether the remote holds `address` as a list of fragments. `false` without a remote, or when
-/// the remote cannot answer. The remote read counts as a fragment lookup of `tracker`.
-async fn remote_lists_fragments(
-    repository: &Arc<RepositoryContext>,
+/// the remote cannot answer. A remote that holds it has it recorded in the local store as the
+/// metadata read records it ([`lore_storage::read::fetch_metadata`]). The remote read counts as a
+/// fragment lookup of `tracker`.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
+#[allow(clippy::manual_async_fn)]
+fn remote_lists_fragments<'a>(
+    repository: &'a Arc<RepositoryContext>,
     address: Address,
-    tracker: &StoreRequestTracker,
-) -> bool {
-    let Some(session) = immutable::resolve_session(repository) else {
-        return false;
-    };
-    let _request = tracker.track_lookup();
-    session
-        .get_metadata(&address)
+    tracker: &'a StoreRequestTracker,
+) -> impl Future<Output = bool> + 'a {
+    async move {
+        let Some(session) = immutable::resolve_session(repository) else {
+            return false;
+        };
+        let _request = tracker.track_lookup();
+        lore_storage::read::fetch_metadata(
+            repository.immutable_store_ref(),
+            &repository.id,
+            &address,
+            immutable::read_options_from_repository(repository),
+            &session,
+        )
         .await
         .is_ok_and(|fragment| fragment.flags & FragmentFlags::PayloadFragmented != 0)
+    }
 }
 
 fn collect_new_addresses_recurse(

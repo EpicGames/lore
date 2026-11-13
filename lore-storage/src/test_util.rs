@@ -474,6 +474,18 @@ pub fn remote_payload(address: Address) -> Option<(Fragment, Bytes)> {
     })
 }
 
+/// The fragment [`serve_remote`] last set up for `address` on this thread, as a metadata read
+/// answers it: not a fetch, so not counted as one.
+pub fn remote_metadata(address: Address) -> Option<Fragment> {
+    REMOTE.with(|remote| {
+        remote
+            .borrow()
+            .iter()
+            .rfind(|(served, _, _)| *served == address)
+            .map(|(_, fragment, _)| *fragment)
+    })
+}
+
 /// Makes every served remote fetch on this thread wait for one notification of `gate` before it
 /// answers.
 pub fn hold_remote_fetches(gate: Arc<Notify>) {

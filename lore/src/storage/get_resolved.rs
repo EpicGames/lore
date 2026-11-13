@@ -91,8 +91,10 @@ pub struct LoreStorageGetResolvedItem {
     /// partway reports the failure on `GET_ITEM_COMPLETE` rather than ending short with a
     /// success code
     pub streaming: u8,
-    /// Cache fetched bytes back to the local store even without the producer's
-    /// `PayloadLocalCachePriority` hint
+    /// Cache fetched bytes in the local store, as they always are for a fragment written with
+    /// `PayloadLocalCachePriority` or one of revision state. A fetched fragment whose bytes are not
+    /// cached is still written to the local store as an entry without its payload, so a put of
+    /// the same content uploads nothing. Either is marked stored durable
     pub local_cache: u8,
     /// Deliver one `GET_FRAGMENT` per leaf fragment in content order in place of `GET_DATA`, each
     /// carrying the leaf's fragment and its payload as stored, with `streaming` ignored. No leaf
