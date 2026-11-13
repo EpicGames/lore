@@ -7,6 +7,7 @@ use lore_error_set::prelude::*;
 use super::LinkError;
 use crate::branch;
 use crate::errors::InvalidPath;
+use crate::errors::is_refusal;
 use crate::event;
 use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::FileInfo;
@@ -102,26 +103,25 @@ pub async fn add(
     lore_debug!("Resolve link {link} {source_path}");
     let link = repository.to_link_context(link).await;
 
-    let link_remote = link.remote().await.forward::<LinkError>("Not connected")?;
+    let link_remote = link
+        .remote()
+        .await
+        .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
 
     // Determine the link branch and revision based on --pin and --disable-branching
     let (link_revision, link_branch) = if disable_branching {
         if let Some(pin) = pin {
-            link::resolve_pin(link.clone(), pin).await?
+            link::resolve_pin(link.clone(), pin)
+                .await
+                .forward_with::<LinkError, _>(|| link::unreachable(link.id))?
         } else {
             // Use the linked repo's default branch latest
-            let link_metadata = repository::metadata_hash(link.clone())
-                .await
-                .forward::<LinkError>("Failed to load repository metadata")?;
-            let link_metadata = repository::metadata(link.clone(), link_metadata)
-                .await
-                .forward::<LinkError>("Failed to load repository metadata")?;
-            let default_branch_id = link_metadata.default_branch;
+            let default_branch_id = default_branch(&link).await?;
 
             let link_latest =
                 branch::load_remote_latest(link_remote.clone(), link.id, default_branch_id)
                     .await
-                    .forward::<LinkError>("Failed to load link latest")?;
+                    .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
 
             lore_debug!("Using default branch {default_branch_id} at LATEST ({link_latest})");
 
@@ -144,13 +144,7 @@ pub async fn add(
             );
             link_latest
         } else {
-            let link_metadata = repository::metadata_hash(link.clone())
-                .await
-                .forward::<LinkError>("Failed to load repository metadata")?;
-            let link_metadata = repository::metadata(link.clone(), link_metadata)
-                .await
-                .forward::<LinkError>("Failed to load repository metadata")?;
-            let default_branch_id = link_metadata.default_branch;
+            let default_branch_id = default_branch(&link).await?;
 
             let branch_metadata = branch::metadata(repository.clone(), current_branch_id)
                 .await
@@ -162,7 +156,7 @@ pub async fn add(
             let parent_latest =
                 branch::load_remote_latest(link_remote.clone(), link.id, default_branch_id)
                     .await
-                    .forward::<LinkError>("Failed getting branch metadata")?;
+                    .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
 
             let outcome = link::create_branch(
                 link.clone(),
@@ -193,7 +187,10 @@ pub async fn add(
         };
 
         let link_revision = if let Some(pin) = pin {
-            let (pin_revision, _pin_branch) = link::resolve_pin(link.clone(), pin).await?;
+            let (pin_revision, _pin_branch) =
+                link::resolve_pin(link.clone(), pin)
+                    .await
+                    .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
             lore_debug!("Using pinned revision {pin_revision} on branch {current_branch_id}");
             pin_revision
         } else {
@@ -211,20 +208,25 @@ pub async fn add(
         }
         metadata => metadata,
     }
-    .forward::<LinkError>("Failed getting branch metadata")?;
+    .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
     let branch_name =
         branch::name(&branch_metadata).forward::<LinkError>("Failed getting branch metadata")?;
 
     lore_debug!("Load link revision state");
     let link_state = State::deserialize(link.clone(), link_revision)
         .await
-        .forward::<LinkError>("Failed deserializing state")?;
+        .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
 
     lore_debug!("Find link target node for {source_path}");
     let link_node_link = link_state
         .find_node_link(link.clone(), source_path.as_str())
         .await
-        .forward::<LinkError>("Invalid path")?;
+        .forward_with::<LinkError, _>(|| {
+            format!(
+                "Failed to find {source_path} in linked repository {}",
+                link.id
+            )
+        })?;
 
     lore_debug!("Link target node is {link_node_link:?}");
     if !link_node_link.is_valid_or_root() {
@@ -245,7 +247,7 @@ pub async fn add(
     let link_node = link_state
         .node(link.clone(), link_node_link.node)
         .await
-        .forward::<LinkError>("Failed deserializing state")?;
+        .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
 
     if !link_node.is_directory() {
         return Err(LinkError::internal(
@@ -273,7 +275,7 @@ pub async fn add(
     let resolved_source_path =
         link::link_source_path(link.clone(), &link_state, link_node_link.node)
             .await
-            .forward::<LinkError>("Failed resolving link source path")?;
+            .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
 
     link::check_source_path_overlap(
         &inner_state,
@@ -383,7 +385,9 @@ pub async fn add(
     let storage = link_remote
         .session(link.id, &correlation_id)
         .await
-        .forward::<LinkError>("Not connected")?;
+        .forward_with::<LinkError, _>(|| {
+            format!("Failed to open a session on linked repository {}", link.id)
+        })?;
 
     lore_debug!("Clone link in {}", link_path);
 
@@ -414,7 +418,7 @@ pub async fn add(
             clone_states,
         )
         .await
-        .forward::<LinkError>("Failed cloning target link")
+        .forward_with::<LinkError, _>(|| format!("Failed cloning linked repository {}", link.id))
     })
     .await?;
 
@@ -542,4 +546,34 @@ async fn create_link_mount(
     }
 
     Ok(())
+}
+
+async fn default_branch(link: &Arc<RepositoryContext>) -> Result<BranchId, LinkError> {
+    let metadata_failed = || format!("Failed to load metadata of linked repository {}", link.id);
+    let hash = match repository::metadata_hash(link.clone()).await {
+        Ok(hash) => hash,
+        Err(err) => {
+            // `metadata_hash` reports any failure of its remote query as the local miss, which
+            // hides a refusal of the caller's credentials.
+            let answer = async {
+                link.remote()
+                    .await?
+                    .repository()
+                    .await?
+                    .query(Some(link.id), None)
+                    .await
+            }
+            .await;
+            return match answer {
+                Err(refusal) if is_refusal(&refusal) => {
+                    Err(refusal).forward_with::<LinkError, _>(metadata_failed)
+                }
+                _ => Err(err).forward_with::<LinkError, _>(metadata_failed),
+            };
+        }
+    };
+    let metadata = repository::metadata(link.clone(), hash)
+        .await
+        .forward_with::<LinkError, _>(metadata_failed)?;
+    Ok(metadata.default_branch)
 }

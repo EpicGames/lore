@@ -73,7 +73,8 @@ async fn list_recursive(
 
         let described =
             super::describe_link(link_context.clone(), link_reference.signature, &local_node)
-                .await?;
+                .await
+                .forward_with::<LinkError, _>(|| super::unreachable(link_reference.repository))?;
 
         event::LoreEvent::LinkEntry(LoreLinkEntryEventData {
             link: link_reference.repository,
@@ -191,7 +192,7 @@ async fn list_staged_recursive(
         let link_repository = repository.to_link_context(link_ref.repository).await;
         let link_state = State::deserialize(link_repository.clone(), link_ref.signature)
             .await
-            .forward::<LinkError>("Failed deserializing state node block")?;
+            .forward_with::<LinkError, _>(|| super::unreachable(link_ref.repository))?;
 
         if node.is_staged() && !node.is_staged_add() {
             let staged_file_count = crate::state::count_staged_files(

@@ -18,6 +18,7 @@ import base64
 import json
 import time
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -147,6 +148,43 @@ def seed_commit_and_push(repo: Lore, **kwargs) -> None:
     repo.push(**kwargs)
 
 
+def client_with_own_token_store(
+    exchange_env, new_lore_repo, scratch_dir, store: str, repo_id: str | None = None
+) -> Lore:
+    """A client logged in from a token store of its own, which holds no
+    partition token another client's calls fetched."""
+    client = new_lore_repo(
+        remote_url=exchange_env.remote_url,
+        repo_id=repo_id,
+        create_repo=False,
+        environment_vars={"LORE_AUTH_PATH": str(scratch_dir(store, create=True))},
+    )
+    client.run(urc_args=["auth", "login", exchange_env.remote_url, "--no-browser"])
+    return client
+
+
+PIN_FORMS = [
+    "signature",
+    "name@LATEST",
+    "id@LATEST",
+    "name@signature",
+    "id@signature",
+]
+
+
+def pin_in_form(repo: Lore, form: str) -> str:
+    """A pin on the latest revision of `repo`'s current branch, written in
+    `form`, one of `PIN_FORMS`."""
+    branch = repo.branch_info()
+    prefix, _, target = form.rpartition("@")
+    revision = "LATEST" if target == "LATEST" else branch.local_latest
+    return {
+        "": revision,
+        "name": f"{branch.name}@{revision}",
+        "id": f"{branch.id}@{revision}",
+    }[prefix]
+
+
 def exchanges(provider: MockOidcProvider):
     return [
         r
@@ -168,9 +206,7 @@ def resources_token(provider: MockOidcProvider, repo_id: str) -> str:
 
 
 @pytest.mark.smoke
-def test_a_push_exchanges_the_login_token_for_the_partition(
-    exchange_env, make_repo
-):
+def test_a_push_exchanges_the_login_token_for_the_partition(exchange_env, make_repo):
     """The push exchanges the login token for one naming the partition in
     exactly one parameter, the configured carrier, and the server accepts
     the exchanged token's `resources` claim for it."""
@@ -184,7 +220,9 @@ def test_a_push_exchanges_the_login_token_for_the_partition(
     other = "scope" if exchange_env.carrier == "resource" else "resource"
     named = exchange_env.template.replace("{id}", repo_id)
     for request in sent:
-        carried = [value for name, value in request.fields if name == exchange_env.carrier]
+        carried = [
+            value for name, value in request.fields if name == exchange_env.carrier
+        ]
         assert carried == [named], request.fields
         assert other not in request.form, request.fields
         assert request.form["subject_token_type"] == ACCESS_TOKEN_TYPE
@@ -236,9 +274,7 @@ def test_a_partition_the_provider_will_not_grant_is_not_reached(
 
 
 @pytest.mark.smoke
-def test_a_partition_scoped_token_reaches_its_partition_alone(
-    exchange_env, make_repo
-):
+def test_a_partition_scoped_token_reaches_its_partition_alone(exchange_env, make_repo):
     """A token whose `resources` claim names one partition is accepted for
     that partition and denied for another: it clones the first and not the
     second."""
@@ -284,9 +320,7 @@ def test_repository_operations_need_only_the_stored_login_token(
     seed_commit_and_push(repo)
 
     repo.clone()
-    repo.run(
-        ["repository", "clone", f"{remote_url}{repo_id}", f"{repo.path}-by-id"]
-    )
+    repo.run(["repository", "clone", f"{remote_url}{repo_id}", f"{repo.path}-by-id"])
     assert repo_id in repo.repository_info()
     assert repo_id in repo.repository_info(f"{remote_url}{repo.name}")
     repo.repository_metadata_set(["probe", "set-with-the-partition-token"])
@@ -296,9 +330,9 @@ def test_repository_operations_need_only_the_stored_login_token(
     sent = exchanges(exchange_env.provider)
     named = exchange_env.template.replace("{id}", repo_id)
     assert sent, "no call exchanged the login token"
-    assert all(
-        request.form[exchange_env.carrier] == named for request in sent
-    ), [request.fields for request in sent]
+    assert all(request.form[exchange_env.carrier] == named for request in sent), [
+        request.fields for request in sent
+    ]
 
 
 @pytest.mark.smoke
@@ -334,3 +368,164 @@ def test_a_lookup_by_name_does_not_open_an_ungranted_partition(
         )
 
     assert exchanges(provider), "the client never asked for the partition"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("pin_form", [None, *PIN_FORMS])
+def test_a_link_to_an_ungranted_repository_points_at_requesting_access(
+    exchange_env, make_repo, new_lore_repo, scratch_dir, pin_form
+):
+    """Adding a link to a repository the stub grants nothing on, at its latest
+    or pinned without branching, fails as an authorization failure, names the
+    linked repository, and says how to get access. The parent runs from a
+    token store of its own, which holds no partition token from the linked
+    repository's push."""
+    provider = exchange_env.provider
+    linked, linked_id = granted_repository(exchange_env, make_repo)
+    seed_commit_and_push(linked)
+    pin = pin_in_form(linked, pin_form) if pin_form else None
+    del provider.grants[linked_id]
+
+    parent_id = uuid.uuid4().hex
+    provider.grants[parent_id] = GRANTED
+    parent = client_with_own_token_store(
+        exchange_env, new_lore_repo, scratch_dir, "parent-auth-store", parent_id
+    )
+    parent.repository_create(repo_id=parent_id)
+    seed_commit_and_push(parent)
+
+    with pytest.raises(LoreException) as denied:
+        parent.link_add("lib", linked_id, "/", pin=pin, disable_branching=bool(pin))
+
+    assert_points_at_requesting_access(denied.value, linked_id)
+
+
+@pytest.mark.smoke
+def test_a_link_that_cannot_branch_the_linked_repository_points_at_requesting_access(
+    exchange_env, make_repo, new_lore_repo, scratch_dir
+):
+    """Adding a link from a branch the linked repository lacks, with only read
+    access to that repository, fails as an authorization failure when creating
+    the branch there, names the linked repository, and says how to get access."""
+    provider = exchange_env.provider
+    linked, linked_id = granted_repository(exchange_env, make_repo)
+    seed_commit_and_push(linked)
+    provider.grants[linked_id] = ["read"]
+
+    parent_id = uuid.uuid4().hex
+    provider.grants[parent_id] = GRANTED
+    parent = client_with_own_token_store(
+        exchange_env, new_lore_repo, scratch_dir, "parent-auth-store", parent_id
+    )
+    parent.repository_create(repo_id=parent_id)
+    seed_commit_and_push(parent)
+    parent.branch_create("feature")
+
+    with pytest.raises(LoreException) as denied:
+        parent.link_add("lib", linked_id, "/")
+
+    assert_points_at_requesting_access(denied.value, linked_id)
+
+
+def denied_clone_of_a_link(
+    exchange_env, make_repo, new_lore_repo, scratch_dir
+) -> tuple[Lore, str, Lore]:
+    """A fresh clone of a parent that linked a repository while the stub
+    granted it, made after the grant is revoked, the linked repository's id,
+    and the linked repository. The clone runs from a token store of its own, which holds no
+    partition token from the link's addition."""
+    provider = exchange_env.provider
+    linked, linked_id = granted_repository(exchange_env, make_repo)
+    seed_commit_and_push(linked)
+    parent, _ = granted_repository(exchange_env, make_repo)
+    seed_commit_and_push(parent)
+    parent.link_add("lib", linked_id, "/")
+    parent.commit("link lib")
+    parent.push()
+    del provider.grants[linked_id]
+
+    denied = client_with_own_token_store(
+        exchange_env, new_lore_repo, scratch_dir, "denied-auth-store"
+    )
+    Path(denied.path).mkdir()
+    denied.run(["repository", "clone", parent.remote_path, denied.path])
+    return denied, linked_id, linked
+
+
+def assert_points_at_requesting_access(refused: LoreException, linked_id: str):
+    output = str(refused)
+    assert f"linked repository {linked_id}" in output, output
+    assert "Request access to it" in output, output
+
+
+@pytest.mark.smoke
+def test_listing_a_link_to_a_repository_no_longer_granted_points_at_requesting_access(
+    exchange_env, make_repo, new_lore_repo, scratch_dir
+):
+    """Listing links from a clone without access to the linked repository
+    fails as an authorization failure, names the linked repository, and says
+    how to get access."""
+    denied, linked_id, _ = denied_clone_of_a_link(
+        exchange_env, make_repo, new_lore_repo, scratch_dir
+    )
+
+    with pytest.raises(LoreException) as refused:
+        denied.link_list()
+
+    assert_points_at_requesting_access(refused.value, linked_id)
+
+
+@pytest.mark.smoke
+def test_updating_a_link_to_a_repository_no_longer_granted_points_at_requesting_access(
+    exchange_env, make_repo, new_lore_repo, scratch_dir
+):
+    """Updating a link from a clone without access to the linked repository
+    fails as an authorization failure, names the linked repository, and says
+    how to get access."""
+    denied, linked_id, _ = denied_clone_of_a_link(
+        exchange_env, make_repo, new_lore_repo, scratch_dir
+    )
+
+    with pytest.raises(LoreException) as refused:
+        denied.link_update("lib")
+
+    assert_points_at_requesting_access(refused.value, linked_id)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("pin_form", PIN_FORMS)
+def test_updating_a_link_to_a_pin_in_a_repository_no_longer_granted_points_at_requesting_access(
+    exchange_env, make_repo, new_lore_repo, scratch_dir, pin_form
+):
+    """Updating a link to a pinned revision or branch latest from a clone
+    without access to the linked repository fails as an authorization failure,
+    names the linked repository, and says how to get access."""
+    denied, linked_id, linked = denied_clone_of_a_link(
+        exchange_env, make_repo, new_lore_repo, scratch_dir
+    )
+    pin = pin_in_form(linked, pin_form)
+
+    with pytest.raises(LoreException) as refused:
+        denied.link_update("lib", pin=pin)
+
+    assert_points_at_requesting_access(refused.value, linked_id)
+
+
+@pytest.mark.smoke
+def test_listing_staged_links_from_a_repository_no_longer_granted_points_at_requesting_access(
+    exchange_env, make_repo, new_lore_repo, scratch_dir
+):
+    """Listing links with staged changes from a clone without access to the
+    linked repository fails as an authorization failure, names the linked
+    repository, and says how to get access."""
+    denied, linked_id, _ = denied_clone_of_a_link(
+        exchange_env, make_repo, new_lore_repo, scratch_dir
+    )
+    with denied.open_file("staged.txt", "w+") as f:
+        f.write("staged\n")
+    denied.stage("staged.txt")
+
+    with pytest.raises(LoreException) as refused:
+        denied.link_list(staged=True)
+
+    assert_points_at_requesting_access(refused.value, linked_id)

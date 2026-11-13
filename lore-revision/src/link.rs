@@ -336,6 +336,11 @@ pub struct LinkBranchOutcome {
     pub reused: bool,
 }
 
+/// The context of a failure to read the linked repository `id`.
+pub(crate) fn unreachable(id: RepositoryId) -> String {
+    format!("Failed to reach linked repository {id}")
+}
+
 pub async fn create_branch(
     repository: Arc<RepositoryContext>,
     remote: Arc<Connection>,
@@ -360,7 +365,7 @@ pub async fn create_branch(
     let revision = remote
         .revision(repository.id)
         .await
-        .forward::<LinkError>("Not connected")?;
+        .forward_with::<LinkError, _>(|| unreachable(repository.id))?;
 
     // The linked repository already owns this branch ID, so adopt it instead of
     // failing the whole cascade.
@@ -399,7 +404,12 @@ pub async fn create_branch(
             &branch_stack,
         )
         .await
-        .forward::<LinkError>("Failed to create branch in linked repository")?
+        .forward_with::<LinkError, _>(|| {
+            format!(
+                "Failed to create branch in linked repository {}",
+                repository.id
+            )
+        })?
         .latest;
 
     Ok(LinkBranchOutcome {

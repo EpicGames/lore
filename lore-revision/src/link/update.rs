@@ -86,7 +86,11 @@ pub(crate) async fn update(
     let link = repository
         .to_link_context(link_node.address.context.into())
         .await;
-    let link_remote = link.remote().await.forward::<LinkError>("Not connected")?;
+    let unreachable = || link::unreachable(link.id);
+    let link_remote = link
+        .remote()
+        .await
+        .forward_with::<LinkError, _>(unreachable)?;
     let link_reference = inner_state
         .link_find(inner_repository.clone(), link.id, node_link.node)
         .await
@@ -98,11 +102,13 @@ pub(crate) async fn update(
 
     // If a pin is specified, attempt to resolve it
     let (link_revision, link_branch) = if let Some(pin) = pin {
-        link::resolve_pin(link.clone(), pin).await?
+        link::resolve_pin(link.clone(), pin)
+            .await
+            .forward_with::<LinkError, _>(unreachable)?
     } else {
         let link_latest = branch::load_remote_latest(link_remote.clone(), link.id, resolved_branch)
             .await
-            .forward::<LinkError>("Failed to load link latest")?;
+            .forward_with::<LinkError, _>(unreachable)?;
 
         lore_debug!("Using latest {link_latest} of current branch {resolved_branch} as link pin");
 
@@ -136,7 +142,8 @@ pub(crate) async fn update(
             mount_source: link::LinkMountSource::SamePath,
         },
     )
-    .await?;
+    .await
+    .forward_with::<LinkError, _>(unreachable)?;
 
     let mut node = link_node;
     node.address.hash = link_revision;
