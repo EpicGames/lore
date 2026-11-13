@@ -112,6 +112,11 @@ pub struct FixedTopologySettings {
     /// List of peer configurations.
     #[serde(default)]
     pub peers: Vec<PeerSettings>,
+
+    /// This server's own address, left out of the peer list. A peer is left out when its
+    /// `address` is exactly equal to this value.
+    #[serde(default)]
+    pub self_address: Option<String>,
 }
 
 /// Rotating ID Fixed topology settings.

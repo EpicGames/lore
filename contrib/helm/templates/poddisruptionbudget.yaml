@@ -23,9 +23,10 @@ metadata:
   labels:
     {{- include "lore.labels" . | nindent 4 }}
 spec:
-  # maxUnavailable: 1 intentionally allows node drains on this single-replica deployment.
-  # Using minAvailable: 1 instead would block cluster maintenance (drain) because there is
-  # no second replica to satisfy the budget — the pod could never be evicted.
+  # maxUnavailable: 1 lets a drain take one server at a time. With several replicas
+  # (backend.type=aws) the rest keep serving. With one, it still allows the drain;
+  # minAvailable: 1 would block cluster maintenance, since no second replica could
+  # satisfy the budget and the pod could never be evicted.
   maxUnavailable: 1
   selector:
     matchLabels:

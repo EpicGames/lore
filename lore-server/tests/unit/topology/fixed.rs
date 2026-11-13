@@ -23,6 +23,7 @@ fn test_fixed_topology_from_config() {
                 locality: Locality::SameRegion,
             },
         ],
+        self_address: None,
     };
 
     let topology = FixedTopology::from_settings(&config);
@@ -33,7 +34,10 @@ fn test_fixed_topology_from_config() {
 fn test_fixed_topology_empty_peers_succeeds() {
     // Empty peers should succeed - an empty topology is valid
     // (though perhaps not useful in practice)
-    let config = FixedTopologySettings { peers: vec![] };
+    let config = FixedTopologySettings {
+        peers: vec![],
+        self_address: None,
+    };
 
     let _ = FixedTopology::from_settings(&config);
 }
@@ -46,6 +50,7 @@ async fn test_fixed_topology_does_not_support_refresh_loop() {
             port: 9090,
             locality: Locality::SameRegion,
         }],
+        self_address: None,
     };
 
     let topology = FixedTopology::from_settings(&config);
@@ -72,6 +77,7 @@ async fn test_fixed_topology_subscribe_receives_peers_immediately() {
                 locality: Locality::SameRegion,
             },
         ],
+        self_address: None,
     };
     let topology = FixedTopology::from_settings(&config);
 
@@ -112,6 +118,7 @@ async fn test_fixed_topology_peer_info_format() {
             port: 1234,
             locality: Locality::SameRegion,
         }],
+        self_address: None,
     };
     let topology = FixedTopology::from_settings(&config);
 
@@ -142,6 +149,7 @@ async fn test_fixed_topology_multiple_subscribers() {
             port: 5000,
             locality: Locality::SameRegion,
         }],
+        self_address: None,
     };
     let topology = FixedTopology::from_settings(&config);
 
@@ -161,4 +169,66 @@ async fn test_fixed_topology_multiple_subscribers() {
         }
         _ => panic!("Both receivers should receive peers"),
     }
+}
+
+async fn subscribed_peer_addresses(config: &FixedTopologySettings) -> Vec<String> {
+    let mut receiver = FixedTopology::from_settings(config).subscribe_to_peer_refreshes();
+    let peers = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+        .await
+        .expect("Timeout waiting for peers")
+        .expect("Broadcast receive error");
+    let mut addresses: Vec<String> = peers.into_iter().map(|peer| peer.address).collect();
+    addresses.sort();
+    addresses
+}
+
+fn same_region_peers(addresses: &[&str]) -> Vec<PeerSettings> {
+    addresses
+        .iter()
+        .map(|address| PeerSettings {
+            address: (*address).to_string(),
+            port: 41340,
+            locality: Locality::SameRegion,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fixed_topology_self_address_leaves_out_matching_peer() {
+    let config = FixedTopologySettings {
+        peers: same_region_peers(&["lore-0.lore", "lore-1.lore", "lore-2.lore"]),
+        self_address: Some("lore-1.lore".to_string()),
+    };
+
+    assert_eq!(
+        subscribed_peer_addresses(&config).await,
+        vec!["lore-0.lore", "lore-2.lore"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fixed_topology_self_address_without_match_keeps_all_peers() {
+    let config = FixedTopologySettings {
+        peers: same_region_peers(&["lore-0.lore", "lore-1.lore"]),
+        self_address: Some("lore-9.lore".to_string()),
+    };
+
+    assert_eq!(
+        subscribed_peer_addresses(&config).await,
+        vec!["lore-0.lore", "lore-1.lore"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fixed_topology_self_address_requires_exact_match() {
+    // "lore-1.lore" must not match a peer whose address merely starts with it.
+    let config = FixedTopologySettings {
+        peers: same_region_peers(&["lore-1.lore", "lore-1.lore.svc"]),
+        self_address: Some("lore-1.lore".to_string()),
+    };
+
+    assert_eq!(
+        subscribed_peer_addresses(&config).await,
+        vec!["lore-1.lore.svc"]
+    );
 }

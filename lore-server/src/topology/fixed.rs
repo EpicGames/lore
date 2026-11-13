@@ -23,6 +23,8 @@
 //!     { address = "192.168.1.10", port = 9090, locality = "SameRegion" },
 //!     { address = "192.168.1.11", port = 9090, locality = "OtherRegion" },
 //! ]
+//! # Optional: leave this server's own entry out, so every server can share one peer list.
+//! self_address = "192.168.1.10"
 //! ```
 
 use std::collections::HashSet;
@@ -65,14 +67,13 @@ pub struct FixedTopology {
 impl FixedTopology {
     /// Creates a new fixed topology from configuration.
     pub fn from_settings(config: &FixedTopologySettings) -> Arc<Self> {
-        info!(peer_count = config.peers.len(), "Creating fixed topology");
-
         let (peers_updated_broadcaster, _) =
             broadcast::channel::<HashSet<PeerInfo>>(PEERS_UPDATED_NOTIFICATION_BUFFER_CAPACITY);
 
         let peers: HashSet<PeerInfo> = config
             .peers
             .iter()
+            .filter(|peer| config.self_address.as_deref() != Some(peer.address.as_str()))
             .map(|peer| PeerInfo {
                 id: format!(
                     "FixedPeer ({}) {}:{}",
@@ -85,6 +86,12 @@ impl FixedTopology {
                 metric_id: peer.address.clone(),
             })
             .collect();
+
+        info!(
+            peer_count = peers.len(),
+            self_address = config.self_address.as_deref(),
+            "Creating fixed topology"
+        );
 
         Arc::new(FixedTopology {
             peers,

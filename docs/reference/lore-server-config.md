@@ -626,6 +626,17 @@ peers = [{ address = "192.168.1.10", port = 41340, locality = "SameRegion" }]
 | `port` | Peer port. |
 | `locality` | Peer locality relative to this server: either `SameRegion` or `OtherRegion`. |
 
+`[topology.fixed]` also takes an optional `self_address`. The server leaves out any peer whose `address` is exactly equal to it. Set it to the server's own address so that every server in a group can share one `peers` list without replicating to itself. As a scalar it can come from the environment, for example `LORE__TOPOLOGY__FIXED__SELF_ADDRESS`, which lets each server name itself while the list stays in a shared file.
+
+```toml
+[topology.fixed]
+peers = [
+    { address = "lore-0.lore-headless", port = 41340, locality = "SameRegion" },
+    { address = "lore-1.lore-headless", port = 41340, locality = "SameRegion" },
+]
+self_address = "lore-0.lore-headless"
+```
+
 ### Rotating-ID fixed topology
 
 `[topology.rotating_id_fixed]` is `fixed` with periodically rotating peer IDs. It takes the same `peers` array plus a required `rotation_interval_seconds`.

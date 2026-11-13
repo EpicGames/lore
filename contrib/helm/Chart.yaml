@@ -2,7 +2,7 @@ apiVersion: v2
 name: lore
 description: Lore revision control server - tiered (data + caching handler) deployment
 type: application
-version: 0.3.1
+version: 0.4.0
 # Tracks the default image tag in values.yaml. This feeds app.kubernetes.io/version on every
 # rendered object, so "latest" here labels every deployment permanently unversioned.
 appVersion: "0.9.0"

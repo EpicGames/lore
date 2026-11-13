@@ -16,7 +16,10 @@ metadata:
     {{- include "lore.labels" . | nindent 4 }}
     app.kubernetes.io/component: data
 spec:
-  replicas: 1
+  replicas: {{ int .Values.data.replicas }}
+  {{- if ne .Values.data.podManagementPolicy "OrderedReady" }}
+  podManagementPolicy: {{ .Values.data.podManagementPolicy }}
+  {{- end }}
   updateStrategy:
     type: RollingUpdate
   serviceName: {{ include "lore.fullname" . }}-headless
@@ -47,6 +50,10 @@ spec:
       {{- with .Values.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}
+      {{- if .Values.data.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- include "lore.initContainers" (dict "ctx" . "p" .Values.data.persistence "name" "data") | nindent 6 }}
@@ -73,11 +80,17 @@ spec:
             - name: SSL_CERT_FILE
               value: /etc/lore/ca/bundle.crt
             {{- end }}
-            {{- if eq (include "lore.storageType" .Values.data.persistence) "hostPath" }}
+            {{- if or (eq (include "lore.storageType" .Values.data.persistence) "hostPath") (include "lore.statefulsetTopology" .) }}
             - name: POD_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            {{- end }}
+            {{- if include "lore.statefulsetTopology" . }}
+            # Every pod shares one peer list (lore.fixedPeersToml); this drops the
+            # pod's own entry so it does not replicate to itself.
+            - name: LORE__TOPOLOGY__FIXED__SELF_ADDRESS
+              value: "$(POD_NAME).{{ include "lore.dataPodDomain" . }}"
             {{- end }}
             {{- if and .Values.presignedUrl.enabled .Values.presignedUrl.hmacKeySecret.name }}
             - name: LORE__SERVER__HTTP__PRESIGNED_URL_HMAC_KEY
@@ -194,9 +207,17 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- if .Values.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else if and (gt (int .Values.data.replicas) 1) .Values.data.spreadAcrossNodes }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "lore.dataSelectorLabels" . | nindent 18 }}
       {{- end }}
       {{- with .Values.tolerations }}
       tolerations:

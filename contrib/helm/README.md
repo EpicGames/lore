@@ -132,7 +132,9 @@ Override with `--set key=value`. See `values.yaml` for the full, commented list 
 | `priorityClassName` | `""` | PriorityClass for the pods. Set it where the server shares nodes and should win or lose preemption. |
 | `terminationGracePeriodSeconds` | `45` | SIGTERM-to-SIGKILL window. Must cover the preStop hook plus shutdown. |
 | `lifecycle` | preStop `sleep 5` | Container lifecycle hooks. The default delay lets endpoint removal land before shutdown starts; `null` removes it (`{}` does not — Helm coalesces it against the default). |
-| `topology.mode` | `tiered` | `tiered` (data + handler cache) or `single` (one self-contained pod). |
+| `topology.mode` | `tiered` | `tiered` (data + handler cache) or `single` (data pods only). |
+| `backend.type` | `local` | `local` (the store on `/data`) or `aws` (shared S3 + DynamoDB, `/data` as a local cache). See [Multiple servers](#multiple-servers-aws-backend). |
+| `data.replicas` | `1` | Number of data pods. Above 1 needs `backend.type: aws`. |
 | `handler.replicas` | `2` | Number of cache pods. |
 | `service.type` | `NodePort` | `NodePort` \| `LoadBalancer` \| `ClusterIP`. |
 | `tls.mode` | `ephemeral` | `ephemeral` (self-signed, zero setup) \| `selfSigned` \| `certManager` \| `secret`. `certManager` requires [cert-manager](https://cert-manager.io) installed in the cluster; the other modes do not. |
@@ -182,12 +184,72 @@ data:
 
 On `handler`, eviction is safe by construction. A handler's `/data` is a cache in front of the durable store on the data pod, so an evicted fragment is re-fetched rather than lost.
 
+## Multiple servers (AWS backend)
+
+With `backend.type: aws`, the store is shared: S3 holds fragment payloads, and DynamoDB holds
+fragment state, the mutable store and locks. No server owns state the others need, so
+`data.replicas` can run several interchangeable servers behind one Service. Each server's
+`/data` becomes a local fragment cache in front of S3 (a composite store); put it on node-local
+NVMe with `data.persistence.type: hostPath`, and bound it with `data.store.maxSize`, which is safe
+here because an evicted fragment is fetched from S3 again.
+
+```yaml
+topology:
+  mode: single
+backend:
+  type: aws
+  aws:
+    region: us-east-2
+    s3Bucket: lore-fragments
+    fragmentsTable: lore-fragments
+    fragmentStateTable: lore-fragment-state
+    mutableTable: lore-mutable
+    locksTable: lore-locks
+data:
+  replicas: 3
+  podManagementPolicy: Parallel
+replication:
+  enabled: true
+  tls:
+    secretName: lore-replication-tls
+  topology:
+    provider: statefulset
+```
+
+`backend.aws.forceWrite: true` writes to the immutable and mutable stores without first checking
+whether the entry exists, which saves a round trip per write.
+
+**Peers.** With `replication.topology.provider: statefulset`, every server replicates fragments
+it receives to the other servers, so a fragment written through one is already cached on the
+rest, and a cache miss asks the other servers before S3. The chart lists every data pod by its
+headless DNS name (`<release>-N.<release>-headless.<namespace>.svc.cluster.local`) as a `fixed`
+peer, adds any `replication.topology.fixed.peers` (servers in other clusters, say), and each pod
+leaves out its own entry with `[topology.fixed] self_address`. That key needs a **loreserver
+newer than v0.12.0**; an older server ignores it and also replicates to itself.
+
+Peering runs over mutual TLS on the replication port, and each server uses the replication cert
+as its client cert too. Servers dial each other by name, so the cert must be valid for
+`*.<release>-headless.<namespace>.svc.cluster.local`, or set `replication.tls.serverSni` to a
+name it does cover.
+
+**Scaling.** Changing `data.replicas` changes the peer list, so every server restarts, one at a
+time, to pick it up. With more than one replica, each data pod must land on its own node
+(`data.spreadAcrossNodes`, on by default), so one node loss takes out one server and each cache
+has its node's disk to itself. A custom `affinity` replaces that rule.
+
+**Pod management.** Set `data.podManagementPolicy: Parallel` before the first install so pods
+start and are replaced together rather than one after another. Kubernetes does not allow
+changing it on an existing StatefulSet.
+
+See [examples/multi-server-aws.values.yaml](examples/multi-server-aws.values.yaml).
+
 ## Cross-cluster replication
 
 `replication.enabled=true` turns on the server's two internal replication endpoints on
 port 41340 — `quic_internal` (UDP) and `replication` (gRPC/TCP) — on the data pod only.
 Both require mutual TLS, so you must supply a Secret holding the server cert, key, and
-CA chain (`replication.tls.secretName`).
+CA chain (`replication.tls.secretName`). The render fails without it, unless you set
+`replication.verifyClientCerts=false` to accept unauthenticated replication on an isolated network.
 
 By default those ports are published only on the headless Service, which has **no
 external address** — so they reach in-cluster peers and nothing else. For peers in
@@ -226,7 +288,7 @@ See [examples/replication.values.yaml](examples/replication.values.yaml).
 
 ## Notes
 
-- **Not highly available while configured to use local disk.** The single data instance is the sole authoritative store; while it is down, writes and `repository list` fail. For redundant storage, please use the [AWS S3 + DynamoDB backend](examples/aws-s3-dynamodb.values.yaml).
+- **Not highly available while configured to use local disk.** The single data instance is the sole authoritative store; while it is down, writes and `repository list` fail. For redundant storage and several servers, use the AWS S3 + DynamoDB backend — see [Multiple servers](#multiple-servers-aws-backend).
 - **Fast disk matters.** Lore is IO-heavy — prefer NVMe or provisioned-IOPS storage classes.
 
 ## Uninstall

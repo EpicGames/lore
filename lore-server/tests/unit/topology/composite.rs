@@ -20,7 +20,10 @@ use super::*;
 use crate::util::test_support::setup_test_execution;
 
 fn make_fixed_topology(peers: Vec<PeerSettings>) -> Arc<dyn Topology + Send + Sync> {
-    FixedTopology::from_settings(&FixedTopologySettings { peers })
+    FixedTopology::from_settings(&FixedTopologySettings {
+        peers,
+        self_address: None,
+    })
 }
 
 fn make_peer(address: &str, port: u16, locality: Locality) -> PeerSettings {

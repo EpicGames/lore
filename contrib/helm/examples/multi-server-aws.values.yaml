@@ -1,0 +1,100 @@
+# Example: several interchangeable servers on the AWS S3 + DynamoDB backend, each with
+# a local NVMe fragment cache, replicating fragments to each other.
+#
+# Architecture: S3 holds fragment payloads and DynamoDB holds fragment state, the
+# mutable store and locks, so no server owns state the others need. Each server runs
+# a composite store: its node's NVMe as a cache in front of S3. The servers find each
+# other through the StatefulSet's own DNS names (replication.topology.provider=
+# statefulset) and replicate fragments over mutual TLS on port 41340, so a fragment
+# written through one server is already cached on the others when a client reads it.
+#
+# PREREQUISITES
+#   1. The S3 bucket and DynamoDB tables, provisioned out of band with the key schemas
+#      in contrib/aws/storage.tf (see examples/aws-s3-dynamodb.values.yaml).
+#   2. IRSA: an IAM role granting S3, DynamoDB (including dynamodb:TransactWriteItems)
+#      and, for encrypted buckets/tables, KMS access. contrib/aws/iam.tf has the policy.
+#   3. Nodes with their NVMe instance storage mounted at the hostPath below, labelled
+#      for the nodeSelector. The cache directory is NOT kubelet ephemeral storage: a
+#      Karpenter instanceStorePolicy=RAID0 node has no such path.
+#   4. A Secret with the replication cert, key and CA chain. Peers dial each other by
+#      name, so the cert must be valid for
+#        *.lore-headless.<namespace>.svc.cluster.local
+#      (or set replication.tls.serverSni to a name the cert does cover).
+#   5. A loreserver newer than v0.12.0. Each server leaves itself out of the shared
+#      peer list with [topology.fixed] self_address, which older servers ignore.
+
+image:
+  repository: ghcr.io/epicgames/lore/loreserver
+  tag: ""  # empty = the chart's appVersion; see prerequisite 5
+
+topology:
+  mode: single                # every server serves directly; no handler tier
+
+backend:
+  type: aws
+  aws:
+    region: <region>
+    s3Bucket: lore-fragments
+    fragmentsTable: lore-fragments
+    fragmentStateTable: lore-fragment-state
+    mutableTable: lore-mutable
+    locksTable: lore-locks
+
+data:
+  replicas: 3
+  podManagementPolicy: Parallel   # set before the first install; immutable afterwards
+  # spreadAcrossNodes (default true) puts each server on its own node.
+  persistence:
+    # The local fragment cache, on the node's NVMe. Disposable: a fragment that is
+    # evicted or lost with the node is fetched from S3 again.
+    type: hostPath
+    hostPath:
+      path: /mnt/nvme/lore
+  store:
+    # Bound the cache below the NVMe capacity. Required: without a cap it grows
+    # until the disk is full.
+    maxSize: 1500Gi
+    compactionDelaySeconds: 900
+
+nodeSelector:
+  lore.epicgames.com/local-nvme: "true"
+
+serviceAccount:
+  create: true
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::<account-id>:role/lore-server
+
+resources:
+  requests: { cpu: "28", memory: 56Gi }
+  limits:   { cpu: "28", memory: 56Gi }
+
+replication:
+  enabled: true
+  tls:
+    secretName: lore-replication-tls   # keys: tls.crt, tls.key, ca.crt
+  topology:
+    provider: statefulset
+
+# Every server is behind one load balancer. A rolling restart or drain removes one
+# server at a time (the chart's PodDisruptionBudget allows one unavailable).
+service:
+  type: LoadBalancer
+  loadBalancerClass: service.k8s.aws/nlb
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    service.beta.kubernetes.io/aws-load-balancer-enable-tcp-udp-listener: "true"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: http
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "41339"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /health_check
+
+tls:
+  mode: secret
+  existingSecret: lore-tls
+  grpcTls: true                # clients use lores://
+
+auth:
+  enabled: true
+  jwksEndpoint: "https://auth.example.com/.well-known/jwks.json"
+  issuer: "https://auth.example.com/"
+  audience: ["lore"]

@@ -60,6 +60,7 @@ fn test_configure_topology_fixed_builtin_with_inline_config() {
                 port: 9090,
                 locality: Locality::SameRegion,
             }],
+            self_address: None,
         }),
         rotating_id_fixed: None,
         composite: None,
@@ -218,4 +219,33 @@ fn test_topology_settings_deserialization_with_fixed_config() {
     assert_eq!(fixed.peers.len(), 2);
     assert_eq!(fixed.peers[0].address, "192.168.1.10");
     assert_eq!(fixed.peers[0].port, 9090);
+}
+
+#[test]
+fn test_topology_settings_deserialization_with_fixed_self_address() {
+    let config_str = r#"
+            provider = "fixed"
+
+            [fixed]
+            peers = [{ address = "lore-0.lore", port = 41340, locality = "SameRegion" }]
+            self_address = "lore-0.lore"
+        "#;
+
+    let settings: TopologySettings = toml::from_str(config_str).expect("valid toml");
+    let fixed = settings.fixed.as_ref().expect("should have fixed");
+    assert_eq!(fixed.self_address.as_deref(), Some("lore-0.lore"));
+}
+
+#[test]
+fn test_topology_settings_deserialization_fixed_self_address_defaults_to_none() {
+    let config_str = r#"
+            provider = "fixed"
+
+            [fixed]
+            peers = []
+        "#;
+
+    let settings: TopologySettings = toml::from_str(config_str).expect("valid toml");
+    let fixed = settings.fixed.as_ref().expect("should have fixed");
+    assert!(fixed.self_address.is_none());
 }

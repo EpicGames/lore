@@ -9,9 +9,9 @@
 #   - the S3 bucket and DynamoDB tables provisioned out of band, with the key
 #     schemas and indexes in contrib/aws/storage.tf
 #
-# NOTE: the chart runs ONE server pod (topology: single). Redundancy here is in the
-# storage layer, not the pod count — horizontal/multi-writer server scaling is a
-# lore feature not yet exposed by this chart.
+# NOTE: this runs ONE server pod (topology: single). Redundancy here is in the
+# storage layer, not the pod count. For several servers with a local NVMe cache each,
+# see examples/multi-server-aws.values.yaml.
 
 image:
   repository: ghcr.io/epicgames/lore/loreserver

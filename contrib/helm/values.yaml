@@ -6,11 +6,41 @@
 #     durable tier on the data pod, with their mutable store on the data pod. The
 #     public Service routes to the data pod by default (see handler.servePublic).
 #
-#   single: a single self-contained data pod and NO handler pods. Use this for a
-#     simple one-node install, or for a remote backend (e.g. AWS S3 + DynamoDB)
-#     where the store is external and the in-cluster cache tier does not apply.
+#   single: data pods only, NO handler pods. With backend.type=local this is one
+#     self-contained pod. With backend.type=aws the store is external, so it can run
+#     several interchangeable servers (data.replicas) — see backend below.
 topology:
   mode: tiered
+
+# backend: where the authoritative store lives.
+#
+#   local (default): on the data pod's /data volume. Exactly one data pod owns it.
+#
+#   aws: S3 + DynamoDB, shared by every server. /data becomes a local fragment cache
+#     in front of S3 (a composite store), so put it on the fastest disk available —
+#     direct-attached NVMe via data.persistence.type=hostPath. Mutable state and
+#     locks live in DynamoDB. Requires topology.mode=single. Because no server holds
+#     state the others need, data.replicas can be raised above 1.
+#
+#     The bucket and tables are provisioned out of band with the key schemas in
+#     contrib/aws/storage.tf, and the pod needs S3, DynamoDB (including
+#     dynamodb:TransactWriteItems) and KMS access, usually via IRSA
+#     (serviceAccount.annotations). See examples/multi-server-aws.values.yaml.
+backend:
+  type: local  # local | aws
+  aws:
+    region: ""                  # region of the bucket and tables, e.g. us-east-2
+    s3Bucket: ""                # fragment payloads
+    fragmentsTable: ""          # fragment associations
+    fragmentStateTable: ""      # fragment state
+    fragmentMetadataTable: ""   # optional: legacy fragment metadata, read as a fallback
+    mutableTable: ""            # mutable store (repositories, branches)
+    locksTable: ""              # lock store
+    # cacheFlushDelaySeconds: how long the local cache batches its index writes.
+    cacheFlushDelaySeconds: 10
+    # forceWrite: write to the immutable and mutable stores without first checking
+    # whether the entry exists. Saves a round trip per write.
+    forceWrite: false
 
 # handler: the caching replica tier (Pods A/B). Only used when topology.mode=tiered.
 handler:
@@ -64,7 +94,28 @@ handler:
 
 # data: the authoritative durable store (Pod C).
 data:
-  # persistence: where the authoritative store at /data lives.
+  # replicas: number of data pods. Above 1 requires backend.type=aws: with the local
+  # backend each pod would hold its own diverging copy of the store. To make the
+  # servers replicate fragments to each other, also enable replication with
+  # replication.topology.provider=statefulset.
+  replicas: 1
+  # podManagementPolicy: OrderedReady (Kubernetes default) or Parallel. Parallel
+  # starts and replaces data pods together instead of one after another; use it with
+  # several replicas. Kubernetes does not allow changing it on an existing
+  # StatefulSet, so choose before the first install.
+  podManagementPolicy: OrderedReady
+  # spreadAcrossNodes: with more than one replica, require each data pod on its own
+  # node (pod anti-affinity on kubernetes.io/hostname), so one node loss takes out
+  # one server and every server has a node-local cache disk to itself. Only applied
+  # when affinity (below) is empty; a custom affinity replaces it.
+  spreadAcrossNodes: true
+  # hostNetwork: run the data pods in the node's network namespace, so clients and
+  # peers reach the server on the node's own interface, without the pod network in
+  # between. Each pod then binds its ports on the node, so at most one data pod runs
+  # per node. Cluster DNS still resolves (dnsPolicy ClusterFirstWithHostNet).
+  hostNetwork: false
+  # persistence: where the authoritative store at /data lives. With backend.type=aws
+  # this is the local fragment cache instead.
   persistence:
     # type: how /data is backed.
     #   pvc      (default) a durable PersistentVolumeClaim. RECOMMENDED for the data
@@ -104,6 +155,9 @@ data:
   # and never starts the task. Off is still right for this tier, which holds the
   # only authoritative copy — enable it only where the store is deliberately a
   # cache, and note that aged-out content fails to read, it does not read slowly.
+  #
+  # With backend.type=aws, /data IS a cache in front of S3: an evicted fragment is
+  # re-fetched from S3, not lost. Set maxSize there, below the cache volume's size.
   store:
     maxSize: ""                 # payload bytes, k8s quantity ("200Gi"). Bounds disk.
     maxCapacity: 0              # fragment count. Server floors it at 1048576.
@@ -210,12 +264,34 @@ replication:
       quic: ""   # UDP — quic_internal
       grpc: ""   # TCP — replication gRPC
   tls:
-    secretName: ""          # Secret with the cert, key, and CA chain (keys below)
+    # secretName: Secret with the cert, key, and CA chain (keys below). With
+    # backend.type=aws the same cert is also this server's CLIENT cert when it
+    # connects to its peers, and the CA chain is what it trusts them with.
+    #
+    # Peers are dialled by name, so the cert must be valid for the names peers use:
+    # with provider=statefulset that is *.<fullname>-headless.<namespace>.svc.cluster.local.
+    secretName: ""
     certKey: tls.crt
     keyKey: tls.key
     caKey: ca.crt
+    # serverSni: name to verify peer certs against instead of the dialled name, for
+    # a shared cert that does not list every peer. The gRPC connection always uses
+    # it; QUIC uses it only for peers addressed by IP. "" = the dialled name.
+    serverSni: ""
+  # clientMessageBuffer: per-peer queue of in-flight replication messages (backend.type=aws).
+  clientMessageBuffer: 5000
   topology:
-    provider: none          # none | fixed | consul
+    # provider: how a server finds the peers it replicates to. Peers only take part
+    # with backend.type=aws, where /data is a composite store with replicas.
+    #   none        no peers.
+    #   fixed       the static list under fixed.peers.
+    #   statefulset every other data pod of this release, by its headless DNS name,
+    #               plus any fixed.peers (e.g. servers in other clusters). Each pod
+    #               leaves itself out with [topology.fixed] self_address, so this
+    #               REQUIRES a loreserver release newer than v0.12.0. An older server
+    #               ignores the key and replicates to itself as well.
+    #   consul      the consul plugin (needs it in the image); see consul below.
+    provider: none          # none | fixed | statefulset | consul
     fixed:
       # peers: [{ address: lore-0.other-cluster.example, port: 41340, locality: OtherRegion }]
       peers: []

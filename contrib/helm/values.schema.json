@@ -13,7 +13,29 @@
         "mode": {
           "type": "string",
           "enum": ["tiered", "single"],
-          "description": "tiered (default): one durable DATA pod plus a caching HANDLER tier. single: one self-contained data pod, no handlers (use for a one-node install or a remote backend like S3 + DynamoDB)."
+          "description": "tiered (default): one durable DATA pod plus a caching HANDLER tier. single: data pods only, no handlers (one self-contained pod with backend.type=local, or several interchangeable servers with backend.type=aws)."
+        }
+      }
+    },
+    "backend": {
+      "type": "object",
+      "description": "Where the authoritative store lives.",
+      "properties": {
+        "type": { "type": "string", "enum": ["local", "aws"], "description": "local (default): the data pod's /data volume. aws: shared S3 + DynamoDB with /data as a local fragment cache; needs topology.mode=single and allows data.replicas > 1." },
+        "aws": {
+          "type": "object",
+          "description": "S3 bucket and DynamoDB tables for backend.type=aws, with the key schemas in contrib/aws/storage.tf.",
+          "properties": {
+            "region": { "type": "string", "description": "Region of the bucket and tables. Empty = the SDK default." },
+            "s3Bucket": { "type": "string", "description": "S3 bucket for fragment payloads." },
+            "fragmentsTable": { "type": "string", "description": "DynamoDB table for fragment associations." },
+            "fragmentStateTable": { "type": "string", "description": "DynamoDB table for fragment state." },
+            "fragmentMetadataTable": { "type": "string", "description": "Optional DynamoDB table of legacy fragment metadata, read as a fallback." },
+            "mutableTable": { "type": "string", "description": "DynamoDB table for the mutable store." },
+            "locksTable": { "type": "string", "description": "DynamoDB table for the lock store." },
+            "cacheFlushDelaySeconds": { "type": "integer", "minimum": 0, "description": "How long the local cache batches its index writes." },
+            "forceWrite": { "type": "boolean", "description": "Write to the immutable and mutable stores without first checking whether the entry exists." }
+          }
         }
       }
     },
@@ -22,6 +44,10 @@
       "description": "The authoritative durable store (Pod C).",
       "required": ["persistence"],
       "properties": {
+        "replicas": { "type": "integer", "minimum": 1, "description": "Number of data pods. Above 1 needs backend.type=aws." },
+        "podManagementPolicy": { "type": "string", "enum": ["OrderedReady", "Parallel"], "description": "StatefulSet pod management policy. Kubernetes does not allow changing it on an existing StatefulSet." },
+        "spreadAcrossNodes": { "type": "boolean", "description": "With more than one replica and no custom affinity, require each data pod on its own node." },
+        "hostNetwork": { "type": "boolean", "description": "Run the data pods in the node's network namespace. At most one data pod then runs per node." },
         "persistence": {
           "type": "object",
           "description": "How /data (the immutable + mutable store) is backed for the data tier.",
@@ -486,14 +512,16 @@
             "secretName": { "type": "string", "description": "Secret name (empty = no cert mounted)." },
             "certKey": { "type": "string", "description": "Secret key for the server cert." },
             "keyKey": { "type": "string", "description": "Secret key for the private key." },
-            "caKey": { "type": "string", "description": "Secret key for the CA chain (cert_chain)." }
+            "caKey": { "type": "string", "description": "Secret key for the CA chain (cert_chain)." },
+            "serverSni": { "type": "string", "description": "Name to verify peer certs against instead of the dialled name. Empty = the dialled name." }
           }
         },
+        "clientMessageBuffer": { "type": "integer", "minimum": 1, "description": "Per-peer queue of in-flight replication messages (backend.type=aws)." },
         "topology": {
           "type": "object",
           "description": "Peer discovery for replication.",
           "properties": {
-            "provider": { "type": "string", "enum": ["none", "fixed", "consul"], "description": "none (single-node), fixed (static peer list), or consul (needs the consul plugin in the image)." },
+            "provider": { "type": "string", "enum": ["none", "fixed", "statefulset", "consul"], "description": "none (no peers), fixed (static peer list), statefulset (every other data pod of this release plus fixed.peers; needs a loreserver newer than v0.12.0), or consul (needs the consul plugin in the image)." },
             "fixed": {
               "type": "object",
               "properties": {
