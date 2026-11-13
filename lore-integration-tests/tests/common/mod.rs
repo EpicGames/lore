@@ -280,14 +280,7 @@ pub(crate) mod net_common {
         globals: LoreGlobalArgs,
         remote_url: Option<&str>,
     ) -> LoreStore {
-        let opened: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
-        let sink = opened.clone();
-        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
-            if let LoreEvent::StorageOpened(data) = event {
-                *sink.lock().unwrap() = Some(data.handle_id);
-            }
-        }));
-        let status = lore::storage::open::open(
+        open_handle_with_args(
             globals,
             LoreStorageOpenArgs {
                 in_memory: 1,
@@ -297,10 +290,25 @@ pub(crate) mod net_common {
                 has_remote_config: u8::from(remote_url.is_some()),
                 ..Default::default()
             },
-            callback,
         )
-        .await;
-        assert_eq!(status, 0, "opening an in-memory store must succeed");
+        .await
+    }
+
+    /// Opens a storage handle with `args`, and `globals` for the open call. Panics unless the open
+    /// succeeds and reports its handle.
+    pub(crate) async fn open_handle_with_args(
+        globals: LoreGlobalArgs,
+        args: LoreStorageOpenArgs,
+    ) -> LoreStore {
+        let opened: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let sink = opened.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+            if let LoreEvent::StorageOpened(data) = event {
+                *sink.lock().unwrap() = Some(data.handle_id);
+            }
+        }));
+        let status = lore::storage::open::open(globals, args, callback).await;
+        assert_eq!(status, 0, "opening the storage handle must succeed");
         let handle_id = opened.lock().unwrap().expect("STORAGE_OPENED must fire");
         LoreStore { handle_id }
     }

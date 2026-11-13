@@ -18,6 +18,7 @@ use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
+use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
 use lore_revision::store::event::LoreStorageMutableStoreItemCompleteEventData;
@@ -29,7 +30,6 @@ use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
 use crate::storage::invalid_item;
-use crate::storage::item_detail;
 use crate::storage::store::EffectiveFlags;
 use crate::storage::store::StoreInternal;
 
@@ -152,7 +152,7 @@ fn emit_complete(
 ) -> Result<(), StorageError> {
     LoreEvent::StorageMutableStoreItemComplete(LoreStorageMutableStoreItemCompleteEventData {
         id: item.id,
-        error: item_detail(&result),
+        error: LoreErrorDetail::from_result(&result),
     })
     .send();
     result

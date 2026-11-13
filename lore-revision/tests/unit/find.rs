@@ -209,6 +209,7 @@ mod revision_by_number_local {
     use lore_revision::lore::RepositoryId;
     use lore_storage::WriteOptions;
 
+    use crate::branch::write_branch_revision;
     use crate::branch::write_line;
     use crate::branch::write_not_a_state;
     use crate::helper::setup_test_execution;
@@ -243,8 +244,45 @@ mod revision_by_number_local {
                         .await
                         .expect("the store holds every state on the line");
 
-                    assert_eq!(walk, NumberWalk::Found(revision), "number {number}");
+                    assert_eq!(
+                        walk,
+                        NumberWalk::Found {
+                            revision,
+                            metadata: Hash::default()
+                        },
+                        "number {number}"
+                    );
                     assert_eq!(counting.take_reads(), reads(3 - index), "number {number}");
+                }
+            })
+            .await;
+    }
+
+    /// A walk reports the metadata hash the found revision's state records, read in the step that
+    /// finds it, whether that is the start or a revision the walk reaches below it.
+    #[tokio::test]
+    async fn number_walk_reports_the_found_revisions_metadata() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (stores, counting) = counted_client_stores().await;
+                let first = write_branch_revision(&stores.writer, Hash::default(), 1, 6).await;
+                let second = write_branch_revision(&stores.writer, first, 2, 7).await;
+                counting.take_reads();
+
+                for (number, revision, metadata, steps) in [
+                    (2, second, Hash::from([7; 32]), 1),
+                    (1, first, Hash::from([6; 32]), 2),
+                ] {
+                    let walk = revision_by_number_local(&stores.writer, second, number)
+                        .await
+                        .expect("the store holds every state on the line");
+
+                    assert_eq!(
+                        walk,
+                        NumberWalk::Found { revision, metadata },
+                        "number {number}"
+                    );
+                    assert_eq!(counting.take_reads(), reads(steps), "number {number}");
                 }
             })
             .await;
@@ -411,6 +449,95 @@ mod revision_by_number_local {
                 assert_eq!(
                     walk.expect("a state the store lacks is not a failed read"),
                     NumberWalk::Missing(missing)
+                );
+            })
+            .await;
+    }
+}
+
+mod verified_state {
+    use bytes::Bytes;
+    use lore_base::types::Hash;
+    use lore_revision::find::verified_state;
+    use lore_revision::state::StateData;
+    use lore_transport::RevisionItem;
+
+    /// A page item whose bytes hash to its signature but lack the state magic carries no state of
+    /// its own, as a read of the same blob as a state finds none.
+    #[test]
+    fn an_item_whose_state_lacks_the_magic_has_no_verified_state() {
+        let state = Bytes::from(vec![0u8; size_of::<StateData>()]);
+        let item = RevisionItem {
+            number: 0,
+            signature: Hash::hash_buffer(&state),
+            metadata: Hash::default(),
+            state,
+        };
+
+        assert!(verified_state(&item).is_none());
+    }
+}
+
+mod revision_state {
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_base::types::Hash;
+    use lore_revision::find::StateMiss;
+    use lore_revision::find::revision_state;
+    use lore_revision::immutable::read_options_from_repository;
+
+    use crate::branch::write_line;
+    use crate::branch::write_not_a_state;
+    use crate::helper::setup_test_execution;
+    use crate::paged_remote::Reads;
+    use crate::paged_remote::counted_client_stores;
+
+    /// A read of a revision's state tells its three answers apart: the state, a hash the store
+    /// lacks, and a blob that is not a revision state. A zero revision is missing, and reads
+    /// nothing.
+    #[tokio::test]
+    async fn a_state_read_tells_a_missing_state_from_a_blob_that_is_not_one() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (stores, counting) = counted_client_stores().await;
+                let revision = write_line(&stores.writer, Hash::default(), 3, 1).await[0];
+                let not_a_state = write_not_a_state(&stores.writer).await;
+                let options = read_options_from_repository(&stores.writer);
+
+                let state = revision_state(&stores.writer, revision, options)
+                    .await
+                    .expect("the read succeeds")
+                    .expect("the store holds the state");
+                assert_eq!(state.revision_number, 3);
+                for (named, hash, miss) in [
+                    (
+                        "a hash the store lacks",
+                        Hash::from([0xA0; 32]),
+                        StateMiss::Missing,
+                    ),
+                    (
+                        "a blob that is not a state",
+                        not_a_state,
+                        StateMiss::NotAState,
+                    ),
+                ] {
+                    let read = revision_state(&stores.writer, hash, options)
+                        .await
+                        .expect("a miss is not a failed read");
+                    assert_eq!(read.err(), Some(miss), "{named}");
+                }
+                counting.take_reads();
+
+                let zero = revision_state(&stores.writer, Hash::default(), options)
+                    .await
+                    .expect("the read succeeds");
+
+                assert_eq!(zero.err(), Some(StateMiss::Missing));
+                assert_eq!(
+                    counting.take_reads(),
+                    Reads {
+                        payloads: 0,
+                        queries: 0
+                    }
                 );
             })
             .await;

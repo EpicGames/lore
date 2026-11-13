@@ -25,3 +25,21 @@ pub fn to_hex_str<'a>(src: &[u8], dst: &'a mut [u8]) -> &'a str {
     hex::encode_to_slice(src, dst).expect("hex encode failed");
     std::str::from_utf8(dst).expect("hex was not valid utf8")
 }
+
+/// The decimal digits of `value`, as `value.to_string()` writes them, written to the end of `dst`,
+/// which holds the 20 digits of `u64::MAX`, without an allocation.
+#[lore_macro::test_pub]
+#[inline]
+pub(crate) fn to_decimal_str(value: u64, dst: &mut [u8; 20]) -> &str {
+    let mut start = dst.len();
+    let mut rest = value;
+    loop {
+        start -= 1;
+        dst[start] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    std::str::from_utf8(&dst[start..]).unwrap_or_default()
+}

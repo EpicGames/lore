@@ -16,7 +16,6 @@ use lore_proto::BranchPushResponse;
 use lore_revision::branch;
 use lore_revision::branch::BranchError;
 use lore_revision::branch::LATEST;
-use lore_revision::branch::PROTECT;
 use lore_revision::branch::push;
 use lore_revision::interface::ExecutionContext;
 use lore_revision::lore::BranchId;
@@ -1059,7 +1058,7 @@ async fn load_branch_metadata(
 /// Refuses a push the caller's `access` does not cover: a protected branch needs
 /// `push-protected`, any other branch `write`.
 fn check_push_access(metadata: &Metadata, access: PushAccess) -> Result<(), Status> {
-    if metadata.get_bool(PROTECT).unwrap_or_default() {
+    if branch::protected(metadata) {
         if !access.push_protected {
             warn!("Branch push failed, branch is protected");
             return Err(Status::permission_denied("protected"));

@@ -18,16 +18,25 @@
 //! while the op runs.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use lore_base::error::InvalidArguments;
 use lore_base::types::Partition;
+use lore_revision::filter::Filter;
+use lore_revision::instance::InstanceId;
 use lore_revision::protocol::RemoteEndpoint;
+use lore_revision::repository::InMemoryContext;
+use lore_revision::repository::RepositoryContext;
+use lore_revision::repository::RepositoryContextCreationArgs;
+use lore_revision::repository::RepositoryWriteToken;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_storage::options::ReadOptions;
+use lore_transport::Connection;
+use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
 use smallvec::SmallVec;
 use tokio::sync::Notify;
@@ -75,6 +84,7 @@ impl BoundFlags {
 /// Per-call snapshot of the three flag bits an op combines with the handle's `BoundFlags`.
 /// Reading these three booleans up front avoids cloning the full `LoreGlobalArgs` (which
 /// holds three heap-allocated `LoreString` fields) per op invocation.
+#[lore_macro::test_pub]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PerCallFlags {
     pub offline: bool,
@@ -83,6 +93,7 @@ pub(crate) struct PerCallFlags {
 }
 
 impl PerCallFlags {
+    #[lore_macro::test_pub]
     pub(crate) fn from_globals(globals: &LoreGlobalArgs) -> Self {
         Self {
             offline: globals.offline != 0,
@@ -148,6 +159,11 @@ pub(crate) struct StoreInternal {
     /// Whether the handle's remote is a trusted source: `globals.trust_remote` or `skip_verify` at
     /// open.
     pub trust_remote: bool,
+    /// The filter of every context built over this handle ([`Self::repository_context`]), empty,
+    /// built with the first, so a handle that builds none allocates none. One serves them all:
+    /// behind the shared `Arc` it stays empty, and a query of an empty filter never reads or writes
+    /// its memo.
+    empty_filter: OnceLock<Arc<Filter>>,
     /// Optional service-mode connection that owns this handle. Populated by the IPC dispatcher
     /// during a server-mode open so that connection teardown can drive
     /// [`crate::storage::handle::close_all_for_connection`] and reclaim handles whose owning
@@ -192,6 +208,7 @@ impl StoreInternal {
             remote,
             bound_flags,
             trust_remote,
+            empty_filter: OnceLock::new(),
             connection_id: None,
             in_flight: AtomicU64::new(0),
             invalid: AtomicBool::new(false),
@@ -249,6 +266,36 @@ impl StoreInternal {
         })
     }
 
+    /// A path-less context over this handle's stores for `repository`, with a zero instance id, no
+    /// write token and the handle's empty filter, trusting the remote as the handle does, and
+    /// holding its session pools itself so that none stays pinned on the process-wide connection.
+    /// `remote` is its connection, or why it has none: `NoRemote` makes it offline, and any other
+    /// error is what [`RepositoryContext::remote`] answers.
+    pub(crate) fn repository_context(
+        &self,
+        repository: Partition,
+        remote: Result<Arc<Connection>, ProtocolError>,
+    ) -> RepositoryContext {
+        RepositoryContext::new(RepositoryContextCreationArgs {
+            paths: None,
+            immutable_store: self.immutable.clone(),
+            mutable_store: self.mutable.clone(),
+            id: repository,
+            instance_id: InstanceId::default(),
+            remote,
+            filter: self.empty_filter.get_or_init(Arc::default).clone(),
+            filesystem_provider: None,
+        })
+        .with_remote_trust(self.trust_remote)
+        .holding_its_sessions()
+    }
+
+    /// The write token of a path-less context over a storage handle's stores
+    /// ([`Self::repository_context`]). Such a context has no per-path write mutex to take.
+    pub(crate) fn in_memory_write_token() -> RepositoryWriteToken {
+        RepositoryWriteToken::in_memory(&InMemoryMarker)
+    }
+
     /// Ensure the server's `authorized_repos` for the underlying connection contains
     /// `partition`, so subsequent admin / copy / cross-session calls referencing it
     /// pass the connection-scoped authz check. Fast-paths via the connector's
@@ -301,6 +348,11 @@ impl StoreInternal {
         }
     }
 }
+
+/// Gates [`RepositoryWriteToken::in_memory`] for the path-less contexts over a storage handle's
+/// stores ([`StoreInternal::in_memory_write_token`]).
+struct InMemoryMarker;
+impl InMemoryContext for InMemoryMarker {}
 
 /// Reuses one remote [`StorageSession`] per partition across a batched call's items, so a
 /// `SessionReuse` threaded through the item loop resolves each partition's session once for the

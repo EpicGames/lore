@@ -18,6 +18,7 @@ use jsonwebtoken::EncodingKey;
 use jsonwebtoken::Header;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::test_util::TempDir;
+use lore_base::test_util::closed_port_url;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Fragment;
@@ -1583,11 +1584,8 @@ async fn reads_past_the_byte_credit_wait_for_room() {
 async fn grpc_to_a_forwarded_host_that_is_down_is_unavailable() {
     LORE_CONTEXT
         .scope(setup_test_execution(), async {
-            let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let target = format!("http://{}", closed.local_addr().unwrap());
-            drop(closed);
             let server = TestServer::start(Setup {
-                forward: vec![("down.test", target)],
+                forward: vec![("down.test", closed_port_url("http"))],
                 ..Default::default()
             })
             .await;

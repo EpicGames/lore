@@ -72,22 +72,14 @@ fn below_floor_emits_warn() {
 /// the alias, does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_handle_trusts_its_remote_where_the_globals_or_skip_verify_ask() {
-    use std::sync::Arc;
-    use std::sync::Mutex;
-
     use lore::storage::handle::LoreStore;
-    use lore_revision::event::LoreEvent;
-    use lore_revision::interface::LoreEventCallback;
     use lore_revision::interface::LoreGlobalArgs;
 
+    use crate::call::test_support::opened_handle_id;
+    use crate::call::test_support::recording_callback;
+
     for (trust_remote, skip_verify, trusted) in [(0, 0, false), (1, 0, true), (0, 1, true)] {
-        let opened: Arc<Mutex<Option<u64>>> = Arc::default();
-        let sink = opened.clone();
-        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
-            if let LoreEvent::StorageOpened(data) = event {
-                *sink.lock().unwrap() = Some(data.handle_id);
-            }
-        }));
+        let (events, callback) = recording_callback();
         let globals = LoreGlobalArgs {
             trust_remote,
             ..LoreGlobalArgs::default()
@@ -99,7 +91,8 @@ async fn a_handle_trusts_its_remote_where_the_globals_or_skip_verify_ask() {
         };
         assert_eq!(open(globals, args, callback).await, 0, "the open succeeds");
         let handle = LoreStore {
-            handle_id: opened.lock().unwrap().expect("the open reports a handle"),
+            handle_id: opened_handle_id(&events.lock().unwrap())
+                .expect("the open reports a handle"),
         };
 
         let store = lore::storage::handle::unregister(handle).expect("the handle is registered");

@@ -19,6 +19,7 @@ pub mod notification;
 pub mod remote;
 pub mod repository;
 pub mod revision;
+pub mod revision_graph;
 pub mod revision_tree;
 pub mod service;
 pub mod shared_store;

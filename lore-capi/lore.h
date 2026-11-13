@@ -3573,6 +3573,81 @@ typedef struct lore_repository_instance_clone_complete_event_data_t {
   uint64_t copied_file_count;
 } lore_repository_instance_clone_complete_event_data_t;
 
+// One branch, as one location holds it.
+typedef struct lore_revision_graph_branch_event_data_t {
+  // The `id` from the call's arguments.
+  uint64_t id;
+  // The location that holds the branch.
+  enum lore_branch_location_t location;
+  // Branch identifier.
+  lore_branch_id_t branch;
+  // Branch name.
+  struct lore_string_t name;
+  // Branch category.
+  struct lore_string_t category;
+  // The branch's latest revision at this location.
+  struct lore_hash_t latest;
+  // The branch's branch point, then those of the branches it descends from, nearest first.
+  struct lore_branch_point_array_t stack;
+  // Identifier of the user who created the branch.
+  struct lore_string_t creator;
+  // Time the branch was created, in milliseconds since the Unix epoch.
+  uint64_t created;
+  // Set when the branch is protected.
+  uint8_t protect;
+  // Set when the branch is archived.
+  uint8_t archived;
+  // Set when the local latest may hold revisions the remote lacks. Zero on a remote record.
+  uint8_t divergent;
+} lore_revision_graph_branch_event_data_t;
+
+// One repository instance on a branch, as the local store records it.
+typedef struct lore_revision_graph_instance_event_data_t {
+  // The `id` from the call's arguments.
+  uint64_t id;
+  // Always `LORE_BRANCH_LOCATION_LOCAL`, since the local store records instances.
+  enum lore_branch_location_t location;
+  // The instance's id from its registration.
+  struct lore_instance_id_t instance_id;
+  // The instance's working directory, as registered.
+  struct lore_string_t path;
+  // The instance's current branch.
+  lore_branch_id_t branch;
+  // The instance's current revision.
+  struct lore_hash_t revision;
+  // 0 when the instance is live, 1 when the registered path no longer exists, 2 when the path
+  // holds a different instance, which superseded this one, and 3 when the path holds no
+  // readable checkout.
+  uint8_t stale;
+} lore_revision_graph_instance_event_data_t;
+
+// One revision, as one location resolves it.
+typedef struct lore_revision_graph_revision_event_data_t {
+  // The `id` from the call's arguments.
+  uint64_t id;
+  // The location that resolved the revision.
+  enum lore_branch_location_t location;
+  // The revision's hash.
+  struct lore_hash_t revision_hash;
+  // The revision's number.
+  uint64_t revision_number;
+  // The branch the revision was created on. Zero when the location doesn't record it.
+  lore_branch_id_t branch;
+} lore_revision_graph_revision_event_data_t;
+
+// The call's outcome at one location, after that location's record events.
+typedef struct lore_revision_graph_location_complete_event_data_t {
+  // The `id` from the call's arguments.
+  uint64_t id;
+  // The location this outcome is for.
+  enum lore_branch_location_t location;
+  // The number of record events the call emitted for this location, instance records included.
+  uint64_t records;
+  // The location's outcome. Code 0 on success, including when the location doesn't hold the
+  // object.
+  struct lore_error_detail_t error;
+} lore_revision_graph_location_complete_event_data_t;
+
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
 enum lore_event_id_t {
@@ -4070,6 +4145,14 @@ enum lore_event_id_t {
   LORE_EVENT_REPOSITORY_INSTANCE_CLONE_PROGRESS,
   // The completion of an instance clone operation.
   LORE_EVENT_REPOSITORY_INSTANCE_CLONE_COMPLETE,
+  // One branch, as one location holds it.
+  LORE_EVENT_REVISION_GRAPH_BRANCH,
+  // One repository instance on a branch, as the local store records it.
+  LORE_EVENT_REVISION_GRAPH_INSTANCE,
+  // One revision, as one location resolves it.
+  LORE_EVENT_REVISION_GRAPH_REVISION,
+  // A revision graph call's outcome at one location.
+  LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -4322,6 +4405,10 @@ typedef struct lore_event_t {
     struct lore_repository_instance_clone_begin_event_data_t repository_instance_clone_begin;
     struct lore_repository_instance_clone_progress_event_data_t repository_instance_clone_progress;
     struct lore_repository_instance_clone_complete_event_data_t repository_instance_clone_complete;
+    struct lore_revision_graph_branch_event_data_t revision_graph_branch;
+    struct lore_revision_graph_instance_event_data_t revision_graph_instance;
+    struct lore_revision_graph_revision_event_data_t revision_graph_revision;
+    struct lore_revision_graph_location_complete_event_data_t revision_graph_location_complete;
   };
 } lore_event_t;
 
@@ -6602,6 +6689,63 @@ typedef struct lore_revision_tree_commit_args_t {
   // Commit tuneables (local-only vs remote-uploading)
   struct lore_revision_tree_commit_options_t options;
 } lore_revision_tree_commit_args_t;
+
+// A revision identifier in its structured form: the revision with `hash`, or revision
+// `revision_number` on `branch`, where 0 names the branch's latest. A string identifier such as
+// `main@5` names its branch by name; `lore_revision_graph_branch_resolve` finds the branch's id.
+typedef struct lore_revision_identifier_t {
+  // Non-zero: the revision with this hash. `branch` and `revision_number` must then be zero.
+  struct lore_hash_t hash;
+  // With a zero `hash`: the branch whose revision this names.
+  lore_branch_id_t branch;
+  // With a zero `hash`: the revision number on `branch`; 0 names the branch's latest.
+  uint64_t revision_number;
+} lore_revision_identifier_t;
+
+// Arguments for `lore_revision_graph_revision_resolve`.
+typedef struct lore_revision_graph_revision_resolve_args_t {
+  // Caller-chosen id echoed back in every event this surface defines for the call. Separate
+  // from `globals.correlation_id`.
+  uint64_t id;
+  // Open storage handle the call reaches the repository through
+  struct lore_store_t store;
+  // Repository the revision is resolved in
+  struct lore_partition_t repository;
+  // The revision to resolve
+  struct lore_revision_identifier_t revision;
+} lore_revision_graph_revision_resolve_args_t;
+
+// Arguments for `lore_revision_graph_branch_resolve`.
+typedef struct lore_revision_graph_branch_resolve_args_t {
+  // Caller-chosen id echoed back in every event this surface defines for the call. Separate
+  // from `globals.correlation_id`.
+  uint64_t id;
+  // Open storage handle the call reaches the repository through
+  struct lore_store_t store;
+  // Repository the branch is resolved in
+  struct lore_partition_t repository;
+  // Name of the branch to resolve, compared regardless of case. A branch whose id an older
+  // version derived from its name, and that no name maps to, is found only by that name as
+  // given.
+  struct lore_string_t name;
+} lore_revision_graph_branch_resolve_args_t;
+
+// Arguments for `lore_revision_graph_branch_list`.
+typedef struct lore_revision_graph_branch_list_args_t {
+  // Caller-chosen id echoed back in every event this surface defines for the call. Separate
+  // from `globals.correlation_id`.
+  uint64_t id;
+  // Open storage handle the call reaches the repository through
+  struct lore_store_t store;
+  // Repository whose branches are listed
+  struct lore_partition_t repository;
+  // Non-zero to list archived branches too, each with the latest revision it kept when it was
+  // archived
+  uint8_t include_archived;
+  // When non-empty, lists only the branches whose creator equals it exactly, compared
+  // case-sensitively
+  struct lore_string_t creator;
+} lore_revision_graph_branch_list_args_t;
 
 // Return the tag identifying the type of an event.
 uint32_t lore_event_type(const struct lore_event_t *event);
@@ -13574,6 +13718,165 @@ int32_t lore_revision_tree_commit(const struct lore_global_args_t *globals,
 void lore_revision_tree_commit_async(const struct lore_global_args_t *globals,
                                      const struct lore_revision_tree_commit_args_t *args,
                                      struct lore_event_callback_config_t callback);
+
+// Resolve `args->revision` to a revision at each location the call consults.
+//
+// The call consults the remote of `args->store`, if it has one, then the local store: the local
+// store alone where `local` or `offline` is set in `globals` or was set when `args->store` was
+// opened, and the remote alone where `remote` is. Its work at one location never reads or writes
+// the other, it writes nothing to the local store, and a block the local store doesn't hold
+// counts as absent there. It ignores `globals.force` and `globals.dry_run`, and
+// `lore_storage_close` waits for it.
+//
+// The call sends a `LORE_EVENT_REVISION_GRAPH_REVISION` for each location that holds the revision.
+// A revision number can name a different revision at each location, where the local latest holds
+// revisions the remote lacks. Each location the call consults ends with its
+// `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE`, which carries no error and no records where the
+// location doesn't hold the revision. A failure at a location fails the call with that location's
+// error, the remote's where both fail, once the call has consulted the other location too.
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_REVISION_GRAPH_REVISION` | `lore_revision_graph_revision_event_data_t` | The revision, as one location resolves it |
+// | `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE` | `lore_revision_graph_location_complete_event_data_t` | One location's outcome, after its record, if any |
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | A log line |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` on success or the error code, with its detail in `error` |
+//
+// Fails with:
+// - error code 3 (invalid arguments) for a malformed `args->revision`, an unknown or closed
+//   `args->store`, and location flags that contradict each other or those `args->store` was
+//   opened with;
+// - error code 111 (no remote) where `remote` is set in `globals` and `args->store` has no remote;
+// - error code 88 (revision not found) where no location consulted holds the revision, and
+//   error code 87 (branch not found) in its place where none holds `args->revision.branch`;
+// - error code 16 (not authenticated) where the call has no login or tokens the remote accepts.
+//   The call starts no login: the caller logs in, with `lore_auth_login_interactive` or
+//   `lore_auth_login_with_token`, and calls again, and a storage handle's open connection picks
+//   up the new login within a minute. A caller that passes its own tokens in `globals` opens a
+//   new storage handle with fresh ones, since an open connection keeps the tokens it connected
+//   with;
+// - error codes 17 (not authorized), 28 (disconnected), 29 (not connected), 30 (maintenance) and
+//   31 (slow down) where the remote refuses the call or can't be reached;
+// - error code -1 (internal) for any other failure, such as a corrupt block.
+//
+// An event's strings, arrays and error detail are valid only during the callback invocation that
+// delivers it. This call and `lore_revision_graph_revision_resolve_async` copy `args` before they
+// return, so an `_async` caller can free `args` and its strings once the call returns. A caller
+// that passes the same `globals.correlation_id` on every call over one storage handle reuses one
+// storage session per connection, as with the `lore_storage_*` calls. `args->id`, which every
+// `LORE_EVENT_REVISION_GRAPH_*` event echoes, is separate from it.
+int32_t lore_revision_graph_revision_resolve(const struct lore_global_args_t *globals,
+                                             const struct lore_revision_graph_revision_resolve_args_t *args,
+                                             struct lore_event_callback_config_t callback);
+
+// Resolve a revision identifier at each location the call consults (async variant).
+void lore_revision_graph_revision_resolve_async(const struct lore_global_args_t *globals,
+                                                const struct lore_revision_graph_revision_resolve_args_t *args,
+                                                struct lore_event_callback_config_t callback);
+
+// Resolve `args->name` to the branch it names at each location the call consults.
+//
+// An archived branch's name no longer names it, so the call doesn't resolve an archived branch,
+// except, in the local store, one an older version of Lore archived whose id derives from its
+// name. The call consults the locations, works at each, and fails as
+// `lore_revision_graph_revision_resolve` describes. It sends a `LORE_EVENT_REVISION_GRAPH_BRANCH`
+// for each location where the name names a branch. The local store's record is followed by a
+// `LORE_EVENT_REVISION_GRAPH_INSTANCE` for each repository instance registered in the local store
+// whose current branch it is, stale ones included; the call retires no registration. Each location
+// the call consults ends with its `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE`, whose `records`
+// counts the instance records too.
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_REVISION_GRAPH_BRANCH` | `lore_revision_graph_branch_event_data_t` | The branch, as one location holds it |
+// | `LORE_EVENT_REVISION_GRAPH_INSTANCE` | `lore_revision_graph_instance_event_data_t` | An instance on the branch, after the local store's branch record |
+// | `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE` | `lore_revision_graph_location_complete_event_data_t` | One location's outcome, after its records |
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | A log line |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` on success or the error code, with its detail in `error` |
+//
+// Fails with:
+// - error code 3 (invalid arguments) for a name that is empty, longer than 1000 bytes, not UTF-8
+//   or reads as a branch id, an unknown or closed `args->store`, and location flags that
+//   contradict each other or those `args->store` was opened with;
+// - error code 111 (no remote) where `remote` is set in `globals` and `args->store` has no remote;
+// - error code 87 (branch not found) where the name names no branch at any location consulted;
+// - error code 16 (not authenticated) where the call has no login or tokens the remote accepts.
+//   The call starts no login: the caller logs in, with `lore_auth_login_interactive` or
+//   `lore_auth_login_with_token`, and calls again, and a storage handle's open connection picks
+//   up the new login within a minute. A caller that passes its own tokens in `globals` opens a
+//   new storage handle with fresh ones, since an open connection keeps the tokens it connected
+//   with;
+// - error codes 17 (not authorized), 28 (disconnected), 29 (not connected), 30 (maintenance) and
+//   31 (slow down) where the remote refuses the call or can't be reached;
+// - error code -1 (internal) for any other failure, such as a corrupt block.
+//
+// An event's strings, arrays and error detail are valid only during the callback invocation that
+// delivers it. This call and `lore_revision_graph_branch_resolve_async` copy `args` before they
+// return, so an `_async` caller can free `args` and its strings once the call returns. A caller
+// that passes the same `globals.correlation_id` on every call over one storage handle reuses one
+// storage session per connection, as with the `lore_storage_*` calls. `args->id`, which every
+// `LORE_EVENT_REVISION_GRAPH_*` event echoes, is separate from it.
+int32_t lore_revision_graph_branch_resolve(const struct lore_global_args_t *globals,
+                                           const struct lore_revision_graph_branch_resolve_args_t *args,
+                                           struct lore_event_callback_config_t callback);
+
+// Resolve a branch name at each location the call consults (async variant).
+void lore_revision_graph_branch_resolve_async(const struct lore_global_args_t *globals,
+                                              const struct lore_revision_graph_branch_resolve_args_t *args,
+                                              struct lore_event_callback_config_t callback);
+
+// List the branches of `args->repository` at each location the call consults.
+//
+// The call consults the locations, works at each, and fails as
+// `lore_revision_graph_revision_resolve` describes. It sends a `LORE_EVENT_REVISION_GRAPH_BRANCH`
+// for each branch at each location, in no particular order. Each of the local store's branch
+// records is followed by the instance records `lore_revision_graph_branch_resolve` sends for that
+// branch. Each location the call consults ends with its
+// `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE`, whose `records` counts the branch and instance
+// records. With `args->include_archived` set, a branch whose create, name lookup or clone has
+// stored its metadata and not yet claimed its name can list as archived, and one whose lookup or
+// clone then finds its name held by another branch keeps listing as archived. In the local store,
+// a live branch whose id an older version of Lore derived from its name, and that no name maps to,
+// lists only with `args->include_archived` set, and as archived; a branch whose metadata key or
+// metadata blob the local store lacks doesn't list there.
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_REVISION_GRAPH_BRANCH` | `lore_revision_graph_branch_event_data_t` | A branch, as one location holds it |
+// | `LORE_EVENT_REVISION_GRAPH_INSTANCE` | `lore_revision_graph_instance_event_data_t` | An instance on the branch of the local branch record it follows |
+// | `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE` | `lore_revision_graph_location_complete_event_data_t` | One location's outcome, after its records |
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | A log line |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` on success or the error code, with its detail in `error` |
+//
+// Fails with:
+// - error code 3 (invalid arguments) for a creator that is not UTF-8, an unknown or closed
+//   `args->store`, and location flags that contradict each other or those `args->store` was
+//   opened with;
+// - error code 111 (no remote) where `remote` is set in `globals` and `args->store` has no remote;
+// - error code 16 (not authenticated) where the call has no login or tokens the remote accepts.
+//   The call starts no login: the caller logs in, with `lore_auth_login_interactive` or
+//   `lore_auth_login_with_token`, and calls again, and a storage handle's open connection picks
+//   up the new login within a minute. A caller that passes its own tokens in `globals` opens a
+//   new storage handle with fresh ones, since an open connection keeps the tokens it connected
+//   with;
+// - error codes 17 (not authorized), 28 (disconnected), 29 (not connected), 30 (maintenance) and
+//   31 (slow down) where the remote refuses the call or can't be reached;
+// - error code -1 (internal) for any other failure, such as a corrupt block.
+//
+// An event's strings, arrays and error detail are valid only during the callback invocation that
+// delivers it. This call and `lore_revision_graph_branch_list_async` copy `args` before they
+// return, so an `_async` caller can free `args` and its strings once the call returns. A caller
+// that passes the same `globals.correlation_id` on every call over one storage handle reuses one
+// storage session per connection, as with the `lore_storage_*` calls. `args->id`, which every
+// `LORE_EVENT_REVISION_GRAPH_*` event echoes, is separate from it.
+int32_t lore_revision_graph_branch_list(const struct lore_global_args_t *globals,
+                                        const struct lore_revision_graph_branch_list_args_t *args,
+                                        struct lore_event_callback_config_t callback);
+
+// List the branches of a repository at each location the call consults (async variant).
+void lore_revision_graph_branch_list_async(const struct lore_global_args_t *globals,
+                                           const struct lore_revision_graph_branch_list_args_t *args,
+                                           struct lore_event_callback_config_t callback);
 
 // Select how payloads are compressed before they are stored, over
 // `lore_storage::COMPRESSION_MODE`.

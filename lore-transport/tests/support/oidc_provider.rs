@@ -299,26 +299,3 @@ pub fn access_token(issuer: &str, subject: &str, name: &str) -> String {
         "iat": 1_900_000_000,
     }))
 }
-
-/// A loopback port that refuses connections, reserved while the value lives. The socket is bound
-/// and never listens: a released port could be handed to a listener another test binds to port 0,
-/// and a connection meant to be refused would reach it.
-pub struct ClosedPort {
-    _socket: tokio::net::TcpSocket,
-    pub port: u16,
-    /// `http://127.0.0.1:<port>`.
-    pub url: String,
-}
-
-pub fn closed_port() -> ClosedPort {
-    let socket = tokio::net::TcpSocket::new_v4().expect("create a socket");
-    socket
-        .bind(([127, 0, 0, 1], 0).into())
-        .expect("bind a port");
-    let port = socket.local_addr().expect("the bound address").port();
-    ClosedPort {
-        _socket: socket,
-        port,
-        url: format!("http://127.0.0.1:{port}"),
-    }
-}

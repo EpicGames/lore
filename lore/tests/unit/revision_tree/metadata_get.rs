@@ -1,20 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::sync::Arc;
-use std::sync::Mutex;
 
-use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
 use lore::revision_tree::handle as rt_handle;
 use lore::revision_tree::handle::LoreRevisionTree;
-use lore::revision_tree::load::LoreRevisionTreeLoadArgs;
-use lore::revision_tree::load::load;
 use lore::revision_tree::metadata_get::*;
 use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs;
 use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetEntry;
 use lore::revision_tree::metadata_set::metadata_set;
-use lore::storage::handle as storage_handle;
-use lore::storage::store::in_memory_for_tests;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_revision::event::LoreErrorCode;
@@ -25,18 +18,17 @@ use lore_revision::interface::LoreString;
 use lore_revision::metadata::Metadata;
 use lore_revision::metadata::MetadataType;
 
+use crate::call::test_support::Recorded;
+use crate::call::test_support::complete_message;
+use crate::call::test_support::recording_callback;
+use crate::call::test_support::take_recorded;
+use crate::revision_tree::support::batch_outcomes;
+use crate::revision_tree::support::load_handle;
+use crate::revision_tree::support::release;
+
 /// Call-level id every test batch is submitted under, distinct from the
 /// per-entry ids so the two cannot be confused in an assertion.
 const CALL_ID: u64 = 900;
-
-#[derive(Debug, Clone, PartialEq)]
-enum CapturedEvent {
-    Complete(i32, String),
-    RevisionTreeLoaded(u64),
-    GetComplete(u64, String, LoreMetadataValue, LoreErrorCode),
-    BatchComplete(u64, LoreErrorCode),
-    Other(u32),
-}
 
 /// The parts of a `LoreMetadata` a test compares; the type carries FFI
 /// pointers that do not compare meaningfully once copied out of the event.
@@ -57,63 +49,19 @@ impl From<&LoreMetadata> for LoreMetadataValue {
     }
 }
 
-impl CapturedEvent {
-    fn from_event(event: &LoreEvent) -> Self {
-        match event {
-            LoreEvent::Complete(data) => {
-                Self::Complete(data.status, data.error.message.as_str().to_string())
-            }
-            LoreEvent::RevisionTreeLoaded(data) => Self::RevisionTreeLoaded(data.handle_id),
-            LoreEvent::RevisionTreeMetadataGetComplete(data) => Self::GetComplete(
+fn get_outcomes(events: &[LoreEvent]) -> Vec<(u64, String, LoreMetadataValue, LoreErrorCode)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            LoreEvent::RevisionTreeMetadataGetComplete(data) => Some((
                 data.entry_id,
                 data.key.as_str().to_string(),
                 LoreMetadataValue::from(&data.value),
                 data.error_code,
-            ),
-            LoreEvent::RevisionTreeBatchComplete(data) => {
-                Self::BatchComplete(data.batch_id, data.error_code)
-            }
-            other => Self::Other(other.discriminant()),
-        }
-    }
-}
-
-fn make_callback(sink: Arc<Mutex<Vec<CapturedEvent>>>) -> LoreEventCallback {
-    Some(Box::new(move |event: &LoreEvent| {
-        sink.lock().unwrap().push(CapturedEvent::from_event(event));
-    }))
-}
-
-fn get_outcomes(events: &[CapturedEvent]) -> Vec<(u64, String, LoreMetadataValue, LoreErrorCode)> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            CapturedEvent::GetComplete(id, key, value, code) => {
-                Some((*id, key.clone(), value.clone(), *code))
-            }
+            )),
             _ => None,
         })
         .collect()
-}
-
-fn batch_outcomes(events: &[CapturedEvent]) -> Vec<(u64, LoreErrorCode)> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            CapturedEvent::BatchComplete(id, code) => Some((*id, *code)),
-            _ => None,
-        })
-        .collect()
-}
-
-fn rejection_reason(events: &[CapturedEvent]) -> String {
-    events
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::Complete(_, message) => Some(message.clone()),
-            _ => None,
-        })
-        .expect("the call must complete")
 }
 
 fn set_entry(entry_id: u64, key: &str, value: &str) -> LoreRevisionTreeMetadataSetEntry {
@@ -131,42 +79,7 @@ fn get_entry(entry_id: u64, key: &str) -> LoreRevisionTreeMetadataGetEntry {
     }
 }
 
-async fn load_handle(label: &str, repository: Partition) -> (LoreRevisionTree, u64) {
-    let store = in_memory_for_tests(label).await;
-    let store_handle = storage_handle::register(store);
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let status = load(
-        LoreGlobalArgs::default(),
-        LoreRevisionTreeLoadArgs {
-            store: store_handle,
-            repository,
-            revision_hash: Hash::default(),
-        },
-        make_callback(sink.clone()),
-    )
-    .await;
-    assert_eq!(status, 0, "load fixture must succeed");
-    let id = sink
-        .lock()
-        .unwrap()
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::RevisionTreeLoaded(id) => Some(*id),
-            _ => None,
-        })
-        .expect("load fixture must emit RevisionTreeLoaded");
-    (LoreRevisionTree { handle_id: id }, store_handle.handle_id)
-}
-
-fn release(handle: LoreRevisionTree, store_handle_id: u64) {
-    rt_handle::unregister(handle);
-    storage_handle::unregister(lore::storage::handle::LoreStore {
-        handle_id: store_handle_id,
-    });
-}
-
 async fn seed(handle: LoreRevisionTree, entries: Vec<LoreRevisionTreeMetadataSetEntry>) {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let status = metadata_set(
         LoreGlobalArgs::default(),
         LoreRevisionTreeMetadataSetArgs {
@@ -174,7 +87,7 @@ async fn seed(handle: LoreRevisionTree, entries: Vec<LoreRevisionTreeMetadataSet
             handle,
             entries: LoreArray::from_vec(entries),
         },
-        make_callback(sink.clone()),
+        None,
     )
     .await;
     assert_eq!(status, 0, "seeding metadata must succeed");
@@ -183,7 +96,7 @@ async fn seed(handle: LoreRevisionTree, entries: Vec<LoreRevisionTreeMetadataSet
 async fn run_get(
     handle: LoreRevisionTree,
     entries: Vec<LoreRevisionTreeMetadataGetEntry>,
-) -> (i32, Vec<CapturedEvent>) {
+) -> (i32, Recorded) {
     run_get_with(handle, entries, 0).await
 }
 
@@ -191,7 +104,7 @@ async fn run_get(
 async fn run_get_including_revision(
     handle: LoreRevisionTree,
     entries: Vec<LoreRevisionTreeMetadataGetEntry>,
-) -> (i32, Vec<CapturedEvent>) {
+) -> (i32, Recorded) {
     run_get_with(handle, entries, 1).await
 }
 
@@ -199,8 +112,8 @@ async fn run_get_with(
     handle: LoreRevisionTree,
     entries: Vec<LoreRevisionTreeMetadataGetEntry>,
     include_revision: u8,
-) -> (i32, Vec<CapturedEvent>) {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+) -> (i32, Recorded) {
+    let (sink, callback) = recording_callback();
     let status = metadata_get(
         LoreGlobalArgs::default(),
         LoreRevisionTreeMetadataGetArgs {
@@ -209,10 +122,10 @@ async fn run_get_with(
             include_revision,
             entries: LoreArray::from_vec(entries),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     (status, events)
 }
 
@@ -535,11 +448,11 @@ async fn get_rejects_bad_arguments_despite_tolerating_absent_keys() {
 
     let (status, events) = run_get(handle, vec![get_entry(20, "")]).await;
     assert_ne!(status, 0, "an empty key must reject");
-    assert!(rejection_reason(&events).contains("key must not be empty"));
+    assert!(complete_message(&events).contains("key must not be empty"));
 
     let (status, events) = run_get(handle, vec![get_entry(20, "a"), get_entry(20, "b")]).await;
     assert_ne!(status, 0, "a repeated non-zero caller id must reject");
-    assert!(rejection_reason(&events).contains("two entries share one caller id"));
+    assert!(complete_message(&events).contains("two entries share one caller id"));
     assert_eq!(
         get_outcomes(&events),
         vec![(

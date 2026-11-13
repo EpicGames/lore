@@ -231,7 +231,7 @@ async fn set_metadata(
                 .expect("deserialize current");
             match change {
                 Change::Protection => {
-                    let protected = proposed.get_bool(branch::PROTECT).unwrap_or_default();
+                    let protected = branch::protected(&proposed);
                     proposed.set_bool(branch::PROTECT, !protected)
                 }
                 Change::OtherKey => proposed.set_string("custom-key", if v1 { "v1" } else { "v0" }),

@@ -134,7 +134,7 @@ where
             let time_start = Instant::now();
 
             let internal = guard.internal_clone();
-            let detail = LoreErrorDetail::from_result(command(internal, args).await);
+            let detail = LoreErrorDetail::from_result(&command(internal, args).await);
 
             log_command_done(&caller, time_start);
             let status = execution_context().dispatcher.complete(detail).await;

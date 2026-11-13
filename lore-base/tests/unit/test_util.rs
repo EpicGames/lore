@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use lore_base::test_util::*;
@@ -139,5 +140,19 @@ fn names_do_not_collide() {
         first.path(),
         second.path(),
         "two directories asked for with the same prefix must not collide"
+    );
+}
+
+/// A connection to the closed port is refused, on every platform the tests run on.
+#[test]
+fn a_closed_port_refuses_connections() {
+    let connected = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], CLOSED_PORT)),
+        std::time::Duration::from_secs(5),
+    );
+
+    assert_eq!(
+        connected.err().map(|err| err.kind()),
+        Some(ErrorKind::ConnectionRefused)
     );
 }

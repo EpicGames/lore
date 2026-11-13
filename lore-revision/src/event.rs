@@ -4,6 +4,7 @@
 #![allow(unused_parens)]
 
 pub mod metadata;
+pub mod revision_graph;
 pub mod revision_tree;
 
 use lore_macro::VariantTypeSize;
@@ -81,6 +82,10 @@ use crate::dependency::LoreFileDependencyListFileEventData;
 use crate::dependency::LoreFileDependencyRemoveBeginEventData;
 use crate::dependency::LoreFileDependencyRemoveEndEventData;
 use crate::dependency::LoreFileDependencyRemoveEntryEventData;
+use crate::event::revision_graph::LoreRevisionGraphBranchEventData;
+use crate::event::revision_graph::LoreRevisionGraphInstanceEventData;
+use crate::event::revision_graph::LoreRevisionGraphLocationCompleteEventData;
+use crate::event::revision_graph::LoreRevisionGraphRevisionEventData;
 use crate::event::revision_tree::LoreRevisionTreeAddCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeBatchCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeChildEventData;
@@ -744,15 +749,16 @@ impl LoreErrorDetail {
         }
     }
 
-    /// Builds the detail for a command result: the empty success detail on
-    /// `Ok`, the populated detail (read from the error's own trace) on `Err`.
-    pub fn from_result<T, E>(result: Result<T, E>) -> Self
+    /// Builds the detail for `result`: the empty success detail on `Ok`, the
+    /// populated detail (read from the error's own trace) on `Err`. The success
+    /// detail allocates nothing.
+    pub fn from_result<T, E>(result: &Result<T, E>) -> Self
     where
         E: lore_error_set::FfiError + std::fmt::Display + lore_error_set::HasTrace,
     {
         match result {
             Ok(_) => Self::default(),
-            Err(err) => Self::from_error(&err),
+            Err(err) => Self::from_error(err),
         }
     }
 }
@@ -1349,6 +1355,14 @@ pub enum LoreEvent {
     RepositoryInstanceCloneProgress(LoreRepositoryInstanceCloneProgressEventData),
     /// The completion of an instance clone operation.
     RepositoryInstanceCloneComplete(LoreRepositoryInstanceCloneCompleteEventData),
+    /// One branch, as one location holds it.
+    RevisionGraphBranch(LoreRevisionGraphBranchEventData),
+    /// One repository instance on a branch, as the local store records it.
+    RevisionGraphInstance(LoreRevisionGraphInstanceEventData),
+    /// One revision, as one location resolves it.
+    RevisionGraphRevision(LoreRevisionGraphRevisionEventData),
+    /// A revision graph call's outcome at one location.
+    RevisionGraphLocationComplete(LoreRevisionGraphLocationCompleteEventData),
 }
 
 /// Encodes as the event it refers to, so that a sender can encode an event it only borrows.

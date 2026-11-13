@@ -56,12 +56,13 @@ pub async fn initialize_service(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            let result = MountManagerState::initialize()
-                .await
-                .forward_any::<ServiceInitializationError>(
-                    "Failed initializing mounted repositories",
-                );
-            let detail = LoreErrorDetail::from_result(result);
+            let detail = LoreErrorDetail::from_result(
+                &MountManagerState::initialize()
+                    .await
+                    .forward_any::<ServiceInitializationError>(
+                        "Failed initializing mounted repositories",
+                    ),
+            );
 
             execution_context().dispatcher.complete(detail).await
         })

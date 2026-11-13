@@ -7,18 +7,14 @@ use std::thread;
 use std::time::Duration;
 
 use lore::storage::handle;
-use lore::storage::handle::LoreStore;
 use lore::storage::store::*;
 
-async fn register_store() -> (Arc<StoreInternal>, LoreStore) {
-    let store = in_memory_for_tests("test").await;
-    let store_handle = handle::register(store.clone());
-    (store, store_handle)
-}
+use super::in_memory_store;
+use crate::call::test_support::registered_store;
 
 #[tokio::test]
 async fn op_enter_after_mark_invalid_returns_none() {
-    let (store, store_handle) = register_store().await;
+    let (store, store_handle) = registered_store("test").await;
     store.invalid.store(true, Ordering::Release);
     assert!(OpGuard::enter(store_handle).is_none());
     handle::unregister(store_handle);
@@ -26,14 +22,14 @@ async fn op_enter_after_mark_invalid_returns_none() {
 
 #[tokio::test]
 async fn op_enter_unregistered_handle_returns_none() {
-    let (_, store_handle) = register_store().await;
+    let (_, store_handle) = registered_store("test").await;
     handle::unregister(store_handle);
     assert!(OpGuard::enter(store_handle).is_none());
 }
 
 #[tokio::test]
 async fn op_guard_increments_and_decrements_counter() {
-    let (store, store_handle) = register_store().await;
+    let (store, store_handle) = registered_store("test").await;
     assert_eq!(store.in_flight.load(Ordering::Acquire), 0);
     {
         let _guard = OpGuard::enter(store_handle).expect("enter must succeed");
@@ -45,7 +41,7 @@ async fn op_guard_increments_and_decrements_counter() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mark_invalid_and_await_blocks_until_drained() {
-    let (store, store_handle) = register_store().await;
+    let (store, store_handle) = registered_store("test").await;
     let guard = OpGuard::enter(store_handle).expect("enter must succeed");
 
     let store_for_closer = store.clone();
@@ -80,7 +76,7 @@ async fn concurrent_ops_and_close_converge_cleanly() {
     const THREADS: usize = 8;
     const PRE_OBSERVED: usize = 8;
     const POST_OBSERVED: usize = 248;
-    let (store, store_handle) = register_store().await;
+    let (store, store_handle) = registered_store("test").await;
 
     let barrier_start = Arc::new(Barrier::new(THREADS + 1));
     let barrier_observed = Arc::new(Barrier::new(THREADS + 1));
@@ -129,7 +125,7 @@ async fn a_close_racing_an_enter_waits_for_it_or_refuses_it() {
 
     use crate::close_race;
 
-    let (store, store_handle) = register_store().await;
+    let (store, store_handle) = registered_store("test").await;
     let missed = close_race::rounds_missing_each_other(
         || OpGuard::enter(store_handle),
         || store.mark_invalid_and_await().now_or_never().is_some(),
@@ -141,7 +137,7 @@ async fn a_close_racing_an_enter_waits_for_it_or_refuses_it() {
 
 #[tokio::test]
 async fn mark_invalid_and_await_does_not_deadlock_on_already_invalid() {
-    let (store, store_handle) = register_store().await;
+    let (store, store_handle) = registered_store("test").await;
     store.mark_invalid_and_await().await;
     tokio::time::timeout(Duration::from_secs(1), store.mark_invalid_and_await())
         .await
@@ -174,19 +170,14 @@ fn read_options_carry_the_handles_trust_of_its_remote() {
 /// than resolving a new one each time the partition changes.
 #[tokio::test]
 async fn a_batch_reuses_the_session_of_each_partition_it_returns_to() {
-    let bare = in_memory_for_tests("reuse").await;
-    let store = StoreInternal::new(
-        "reuse",
-        bare.immutable.clone(),
-        bare.mutable.clone(),
+    let store = in_memory_store(
         Some(Arc::new(lore_revision::protocol::RemoteEndpoint::new(
             "lore://127.0.0.1:1",
             None,
         ))),
         BoundFlags::default(),
-        false,
-        lore_storage::local::store_lock::StoreHold::default(),
-    );
+    )
+    .await;
     let (first, second) = (
         lore_base::types::Partition::from([0xa1u8; 16]),
         lore_base::types::Partition::from([0xb2u8; 16]),

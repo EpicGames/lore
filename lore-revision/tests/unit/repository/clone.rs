@@ -34,11 +34,11 @@ use lore_revision::state::State;
 use lore_revision::util::path::RelativePath;
 use lore_storage::StoreError;
 use lore_storage::hash::hash_string;
+use lore_storage::test_util::StoreCall;
 use zerocopy::FromZeros;
 
 use crate::branch::null_repository;
 use crate::fs::filesystem_provider::setup_test_execution;
-use crate::hooked_store::StoreCall;
 use crate::repository::test_helpers::caused_by;
 use crate::repository::test_helpers::file_node;
 use crate::repository::test_helpers::working_tree_repository;

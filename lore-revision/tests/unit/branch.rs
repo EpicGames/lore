@@ -15,7 +15,6 @@ use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::BranchPoint;
-use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_error_set::FfiError;
@@ -31,15 +30,15 @@ use lore_revision::node::NodeFlags;
 use lore_revision::relay::EventDispatcher;
 use lore_revision::repository::BranchSwitchOptions;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::repository::SALT_LORE;
 use lore_revision::revision;
 use lore_revision::revision::DiffItem;
 use lore_revision::state;
 use lore_revision::state::State;
-use lore_revision::state::StateData;
 use lore_storage::KeyType;
 use lore_storage::MutableStore;
+use lore_storage::ReadOptions;
 use lore_storage::StoreError;
-use lore_storage::WriteOptions;
 use lore_transport::ProtocolError;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -48,7 +47,15 @@ mod push;
 mod races;
 
 use lore_revision::branch::*;
+pub(crate) use lore_revision::test_util::write_not_a_state;
+use lore_revision::test_util::write_state_revision;
 use lore_revision::util::path::RelativePathBuf;
+use lore_storage::test_util::Answered;
+use lore_storage::test_util::HookedImmutableStore;
+use lore_storage::test_util::HookedStore;
+use lore_storage::test_util::ImmutableCall;
+use lore_storage::test_util::StoreCall;
+use lore_storage::test_util::answered;
 
 use crate::helper::committed_repository;
 use crate::helper::create_branch_on_instance;
@@ -58,10 +65,6 @@ use crate::helper::setup_test_execution;
 use crate::helper::stage_paths;
 use crate::helper::test_execution_with;
 use crate::helper::test_file_write;
-use crate::hooked_store::Answered;
-use crate::hooked_store::HookedStore;
-use crate::hooked_store::StoreCall;
-use crate::hooked_store::answered;
 use crate::paged_remote::PagedRemote;
 use crate::paged_remote::above_unverified;
 use crate::paged_remote::client_stores;
@@ -109,6 +112,42 @@ pub(crate) async fn store_unreadable_metadata(
     mutable_store_metadata(repository.clone(), branch, hash)
         .await
         .expect("storing the metadata hash");
+}
+
+/// The keys of a branch's values in the mutable store hash the lower-case hex of the repository
+/// and branch ids, whose digits here cover `0` to `f`: the expected values are the keys the stores
+/// already hold for these ids, so a change to the encoding fails here.
+#[test]
+fn branch_keys_hash_the_lower_case_hex_of_the_ids() {
+    let repository: RepositoryId = "00112233445566778899aabbccddeeff"
+        .parse()
+        .expect("a repository id");
+    let branch: BranchId = "fedcba98765432100123456789abcdef"
+        .parse()
+        .expect("a branch id");
+    let key = |hex: &str| hex.parse::<Hash>().expect("a key");
+
+    assert_eq!(
+        [
+            mutable_key(SALT_LORE, LATEST, repository, branch),
+            revision_step_key(SALT_LORE, repository, branch, 1234, 100),
+            revision_list_step_key(SALT_LORE, repository, branch, 1234, 100),
+        ],
+        [
+            (
+                key("8814b6c01de6ebaf28014bba0d7c525fa2e22d65fe9edb78be95e0cb6c6c0a3d"),
+                KeyType::BranchLatestPointer
+            ),
+            (
+                key("0559528277025a9a765665a5912c0c47993dc4d4a4cfd1a641f3c2ca999aad10"),
+                KeyType::Untyped
+            ),
+            (
+                key("c85784409597ca859b4bc8922b30ccf7b2300de0080ce9da7ff2ee3dced2f4a6"),
+                KeyType::Untyped
+            ),
+        ]
+    );
 }
 
 /// A branch merging the branch it was created from: the shared branch is the
@@ -250,6 +289,66 @@ fn empty_stacks_are_unresolvable() {
     );
 }
 
+/// A child branch's stack is its branch point, then the parent's stack: the one the parent's
+/// metadata holds, the one branch point an older client recorded without a stack, or none.
+#[test]
+fn child_stack_puts_the_branch_point_ahead_of_the_parents_stack() {
+    let point = branch_point(9, 90);
+    let parent = |stack: Vec<BranchPoint>| {
+        let mut metadata = lore_revision::metadata::Metadata::new();
+        metadata_populate(&mut metadata, branch_id(1), "parent", "", "ana", 0, stack)
+            .expect("populates the parent's metadata");
+        metadata
+    };
+    let mut older = lore_revision::metadata::Metadata::new();
+    older
+        .set_context(PARENT_DEPRECATED, branch_id(2))
+        .expect("sets the parent");
+    older
+        .set_hash(BRANCH_POINT_DEPRECATED, revision(20))
+        .expect("sets the branch point");
+
+    assert_eq!(
+        child_stack(
+            point.clone(),
+            &parent(vec![branch_point(2, 20), branch_point(3, 30)])
+        ),
+        [point.clone(), branch_point(2, 20), branch_point(3, 30)]
+    );
+    assert_eq!(
+        child_stack(point.clone(), &older),
+        [point.clone(), branch_point(2, 20)]
+    );
+    assert_eq!(child_stack(point.clone(), &parent(Vec::new())), [point]);
+}
+
+/// The creator filter reads a blob's creator only where it names one: with no filter, a blob
+/// without a creator, as older clients wrote, costs no allocation, where a read of the missing
+/// entry would build an error. A filter keeps a blob whose creator equals it, compared
+/// case-sensitively, and leaves out a blob without a creator.
+#[test]
+fn metadata_creator_matches_reads_the_creator_only_for_a_filter() {
+    let mut creatorless = lore_revision::metadata::Metadata::new();
+    creatorless
+        .set_string(NAME, "older")
+        .expect("sets the name");
+    let mut by_ana = lore_revision::metadata::Metadata::new();
+    by_ana.set_string(CREATOR, "ana").expect("sets the creator");
+
+    let (kept, allocated) = crate::util::allocations_during(|| {
+        metadata_creator_matches(None, std::hint::black_box(&creatorless))
+    });
+
+    assert!(kept);
+    assert_eq!(
+        allocated, 0,
+        "allocations of a creator read no filter needs"
+    );
+    assert!(!metadata_creator_matches(Some("ana"), &creatorless));
+    assert!(metadata_creator_matches(Some("ana"), &by_ana));
+    assert!(!metadata_creator_matches(Some("Ana"), &by_ana));
+}
+
 /// Run a body with an execution context installed, which the revision store
 /// reads through `execution_context()`.
 async fn with_execution<F: Future>(body: F) -> F::Output {
@@ -315,17 +414,7 @@ pub(crate) async fn write_branch_revision(
     revision_number: u64,
     distinguisher: u8,
 ) -> Hash {
-    let token = repository
-        .try_write_token()
-        .expect("a null context carries a write token");
-    let state = State::new();
-    state.set_parent_self(parent);
-    state.set_revision_number(revision_number);
-    state.set_metadata_hash(revision(distinguisher));
-    state
-        .serialize(repository.clone(), token)
-        .await
-        .expect("serializing the revision state")
+    write_state_revision(repository, parent, revision_number, revision(distinguisher)).await
 }
 
 /// Write a merge revision, carrying the revision merged in as its other parent.
@@ -363,20 +452,6 @@ pub(crate) async fn write_line(
         line.push(parent);
     }
     line
-}
-
-/// Write a blob of a revision state's size that is not a revision state: zeroed, so its header
-/// lacks the state magic. Read as a state, it is a revision numbered 0 without parents.
-pub(crate) async fn write_not_a_state(repository: &Arc<RepositoryContext>) -> Hash {
-    lore_revision::immutable::write(
-        repository.clone(),
-        Context::default(),
-        Bytes::from(vec![0u8; size_of::<StateData>()]),
-        WriteOptions::default(),
-    )
-    .await
-    .expect("writes the blob")
-    .hash
 }
 
 /// The branch point of a branch that has not moved since it was created is
@@ -2063,25 +2138,270 @@ async fn lookup_name_local_unwritten_answers_a_held_mapping() {
     .await;
 }
 
-/// A failed read of the name's mapping, or of the latest revision of the id derived from the
-/// name, fails the lookup.
+/// A repository holding a latest revision of the id derived from [`CLAIMED_NAME`], whose metadata
+/// key names bytes that are not metadata.
+async fn corrupt_derived_metadata() -> Arc<RepositoryContext> {
+    let repository = null_repository().await;
+    store_derived_latest(&repository, CLAIMED_NAME, revision(1)).await;
+    store_unreadable_metadata(&repository, fallback_id(CLAIMED_NAME)).await;
+    repository
+}
+
+/// A failed read of the name's mapping, or of the latest revision, the metadata key or the metadata
+/// blob of the id derived from the name, fails the lookup with the read's error.
 #[tokio::test]
 async fn lookup_name_local_unwritten_reports_a_failed_read() {
     Box::pin(with_execution(async {
-        for failing in [KeyType::BranchId, KeyType::BranchLatestPointer] {
-            let repository = hooked_repository(move |call, _key, key_type| match call {
-                StoreCall::Load if key_type == failing => Err(StoreError::from(Disconnected)),
-                _ => Ok(()),
-            })
-            .await;
-
+        let failing_mapping = hooked_repository(|call, _key, key_type| match call {
+            StoreCall::Load if key_type == KeyType::BranchId => Err(StoreError::from(Disconnected)),
+            _ => Ok(()),
+        })
+        .await;
+        let failing_mapping: (&str, _, fn(&BranchError) -> bool) = (
+            "a failed mapping load",
+            failing_mapping,
+            BranchError::is_disconnected,
+        );
+        for (shape, repository, failed) in
+            std::iter::once(failing_mapping).chain(unreadable_derived_branches().await)
+        {
             let found = lookup_name_local_unwritten(repository, CLAIMED_NAME).await;
 
-            assert!(
-                found.as_ref().is_err_and(|err| err.is_disconnected()),
-                "a failed {failing:?} read: got {found:?}"
+            assert!(found.as_ref().is_err_and(failed), "{shape}: got {found:?}");
+        }
+    }))
+    .await;
+}
+
+/// A branch whose id derives from its name, archived as this version archives it (name released,
+/// metadata stamped archived, latest revision kept), names no branch: the lookup in the local
+/// store answers none, the name lookup finds no branch and maps the name to nothing, and a create
+/// takes the name.
+#[tokio::test]
+async fn an_archived_derived_branch_names_no_branch() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        archive_branch(&repository, fallback_id(CLAIMED_NAME), CLAIMED_NAME).await;
+
+        let found = lookup_name_local_unwritten(repository.clone(), CLAIMED_NAME)
+            .await
+            .expect("the lookup reads the local store");
+        let loaded = load_name_to_id(repository.clone(), CLAIMED_NAME).await;
+
+        assert_eq!(found, None);
+        assert!(
+            loaded.as_ref().is_err_and(|err| err.is_branch_not_found()),
+            "got {loaded:?}"
+        );
+        assert_eq!(
+            name_entries(&repository).await,
+            Vec::<BranchId>::new(),
+            "the name lookup maps the name to nothing"
+        );
+        create_root(&repository, branch_id(2), CLAIMED_NAME)
+            .await
+            .expect("the archived branch's name is free");
+        assert_eq!(mapped(&repository, CLAIMED_NAME).await, Some(branch_id(2)));
+    }))
+    .await;
+}
+
+/// The metadata of a branch whose id derives from [`CLAIMED_NAME`], naming it `name`.
+fn derived_metadata(name: &str) -> lore_revision::metadata::Metadata {
+    let mut metadata = lore_revision::metadata::Metadata::new();
+    metadata_populate(
+        &mut metadata,
+        fallback_id(CLAIMED_NAME),
+        name,
+        default_category(),
+        "creator",
+        1,
+        Vec::new(),
+    )
+    .expect("populating the branch's metadata");
+    metadata
+}
+
+/// A repository whose local store holds `metadata` as the metadata of the id derived from
+/// [`CLAIMED_NAME`].
+async fn with_derived_metadata(
+    metadata: lore_revision::metadata::Metadata,
+) -> Arc<RepositoryContext> {
+    let repository = null_repository().await;
+    let hash = metadata
+        .serialize(repository.clone())
+        .await
+        .expect("storing the branch's metadata");
+    mutable_store_metadata(repository.clone(), fallback_id(CLAIMED_NAME), hash)
+        .await
+        .expect("storing the branch's metadata hash");
+    repository
+}
+
+/// A name with no mapping names the id derived from it where that id has a latest revision and no
+/// metadata that says it is archived or names it otherwise: none, metadata naming the branch so in
+/// any case, metadata a restore left, metadata without a name, or a key naming a blob the store
+/// doesn't hold. Metadata naming the branch so is also what an older version's archive leaves
+/// (name released, metadata unchanged), which reads as live: the known limit. The name lookup maps
+/// the name to it.
+#[tokio::test]
+async fn a_live_derived_branch_still_resolves() {
+    Box::pin(with_execution(async {
+        let id = fallback_id(CLAIMED_NAME);
+        let mut restored = derived_metadata(CLAIMED_NAME);
+        restored
+            .set_u64(ARCHIVED, 1)
+            .expect("sets the archive time");
+        restored
+            .set_u64(RESTORED, 2)
+            .expect("sets the restore time");
+        let mut nameless = lore_revision::metadata::Metadata::new();
+        nameless.set_binary(ID, id.data()).expect("sets the id");
+        let unheld = null_repository().await;
+        mutable_store_metadata(unheld.clone(), id, revision(9))
+            .await
+            .expect("storing a metadata hash");
+
+        for (shape, repository) in [
+            ("no metadata", null_repository().await),
+            (
+                "live metadata, as an older version's archive leaves it",
+                with_derived_metadata(derived_metadata(CLAIMED_NAME)).await,
+            ),
+            (
+                "metadata naming it in another case",
+                with_derived_metadata(derived_metadata(&CLAIMED_NAME.to_uppercase())).await,
+            ),
+            ("restored metadata", with_derived_metadata(restored).await),
+            (
+                "metadata without a name",
+                with_derived_metadata(nameless).await,
+            ),
+            ("a metadata blob the store doesn't hold", unheld),
+        ] {
+            store_derived_latest(&repository, CLAIMED_NAME, revision(1)).await;
+
+            let found = lookup_name_local_unwritten(repository.clone(), CLAIMED_NAME)
+                .await
+                .expect("the lookup reads the local store");
+            let loaded = load_name_to_id(repository.clone(), CLAIMED_NAME).await;
+
+            assert_eq!(found, Some(NamedBranch::Derived(id)), "{shape}");
+            assert_eq!(loaded.ok(), Some(id), "{shape}");
+            assert_eq!(
+                mapped(&repository, CLAIMED_NAME).await,
+                Some(id),
+                "{shape}: the name lookup maps the name"
             );
         }
+    }))
+    .await;
+}
+
+/// A branch whose id derives from its name, archived, then restored under another name, holds the
+/// new name alone: the old name names no branch in the local store, the name lookup finds no
+/// branch and maps it to nothing, and a create takes it.
+#[tokio::test]
+async fn a_derived_branch_restored_under_another_name_frees_its_old_name() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let id = fallback_id(CLAIMED_NAME);
+        archive_branch(&repository, id, CLAIMED_NAME).await;
+        create_root(&repository, id, "renamed")
+            .await
+            .expect("the archived branch is restored under another name");
+
+        let found = lookup_name_local_unwritten(repository.clone(), CLAIMED_NAME)
+            .await
+            .expect("the lookup reads the local store");
+        let loaded = load_name_to_id(repository.clone(), CLAIMED_NAME).await;
+
+        assert_eq!(found, None);
+        assert!(
+            loaded.as_ref().is_err_and(|err| err.is_branch_not_found()),
+            "got {loaded:?}"
+        );
+        assert_eq!(
+            name_entries(&repository).await,
+            [id],
+            "the new name alone maps to the branch"
+        );
+        create_root(&repository, branch_id(2), CLAIMED_NAME)
+            .await
+            .expect("the old name is free");
+        assert_eq!(mapped(&repository, CLAIMED_NAME).await, Some(branch_id(2)));
+        assert_eq!(mapped(&repository, "renamed").await, Some(id));
+    }))
+    .await;
+}
+
+/// A branch whose id derives from its name, archived, is restored under its name by a create given
+/// its id, and the name maps to it again.
+#[tokio::test]
+async fn an_archived_derived_branch_is_restored_under_its_name() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let id = fallback_id(CLAIMED_NAME);
+        archive_branch(&repository, id, CLAIMED_NAME).await;
+
+        let restored = create_root(&repository, id, CLAIMED_NAME).await;
+
+        assert_eq!(restored.as_ref().ok(), Some(&id), "got {restored:?}");
+        assert_eq!(mapped(&repository, CLAIMED_NAME).await, Some(id));
+        assert_eq!(
+            lookup_name_local_unwritten(repository.clone(), CLAIMED_NAME)
+                .await
+                .expect("the lookup reads the local store"),
+            Some(NamedBranch::Mapped(id))
+        );
+    }))
+    .await;
+}
+
+/// The lookup in the local store reads the metadata of the id derived from the name from the local
+/// store alone: metadata only the remote holds, which says the branch is archived, reads as a blob
+/// the store doesn't hold, so the branch reads as live, and the local store still lacks the blob.
+#[tokio::test]
+async fn derived_metadata_only_the_remote_holds_reads_as_live() {
+    Box::pin(with_execution(async {
+        let id = fallback_id(CLAIMED_NAME);
+        let source = null_repository().await;
+        let mut archived = derived_metadata(CLAIMED_NAME);
+        archived
+            .set_u64(ARCHIVED, 1)
+            .expect("sets the archive time");
+        let hash = archived
+            .serialize(source.clone())
+            .await
+            .expect("storing the branch's metadata at the remote");
+        let stores = client_stores().await;
+        store_derived_latest(&stores.writer, CLAIMED_NAME, revision(1)).await;
+        mutable_store_metadata(stores.writer.clone(), id, hash)
+            .await
+            .expect("storing the branch's metadata hash");
+        let storage = crate::immutable::serving::serving_remote(
+            &source,
+            crate::immutable::serving::Serving::default(),
+        );
+        let remote = PagedRemote::new(branch_id(7), Hash::default());
+        let client =
+            crate::paged_remote::client_on_storage(&stores, Arc::new(remote), vec![storage]);
+
+        let found = lookup_name_local_unwritten(client, CLAIMED_NAME)
+            .await
+            .expect("the lookup reads the local store");
+
+        assert_eq!(found, Some(NamedBranch::Derived(id)));
+        let local = lore_revision::metadata::Metadata::deserialize_with(
+            stores.writer.clone(),
+            hash,
+            ReadOptions::default().no_remote(),
+        )
+        .await;
+        assert!(
+            matches!(&local, Err(err) if err.is_address_not_found()),
+            "the local store holds no copy of the blob"
+        );
     }))
     .await;
 }
@@ -2126,6 +2446,227 @@ async fn load_name_to_id_without_a_derived_latest_finds_no_branch() {
             Vec::<BranchId>::new(),
             "the lookup writes no mapping"
         );
+    }))
+    .await;
+}
+
+/// A repository holding a latest revision of the id derived from [`CLAIMED_NAME`], whose loads of
+/// that id's `function` value fail with `Disconnected`, and no other loads.
+async fn failing_derived_load(function: &'static str) -> Arc<RepositoryContext> {
+    let failing = Arc::new(std::sync::OnceLock::new());
+    let hooked = failing.clone();
+    let repository = hooked_repository(move |call, key, _key_type| {
+        if call == StoreCall::Load && hooked.get() == Some(&key) {
+            return Err(StoreError::from(Disconnected));
+        }
+        Ok(())
+    })
+    .await;
+    let (key, _) = mutable_key(
+        repository.salt(),
+        function,
+        repository.id,
+        fallback_id(CLAIMED_NAME),
+    );
+    failing.set(key).expect("the failing key is set once");
+    store_derived_latest(&repository, CLAIMED_NAME, revision(1)).await;
+    repository
+}
+
+/// A repository holding a latest revision of the id derived from [`CLAIMED_NAME`] and metadata
+/// that says the branch is archived, whose immutable store fails each read of that metadata blob
+/// with `Disconnected`.
+async fn failing_derived_metadata_read() -> Arc<RepositoryContext> {
+    let failing = Arc::new(std::sync::OnceLock::new());
+    let hooked = failing.clone();
+    let stores = null_repository().await;
+    let repository = Arc::new(RepositoryContext::new_null_context(
+        HookedImmutableStore::wrap(stores.immutable_store(), move |call, _, address| {
+            if call == ImmutableCall::Get && hooked.get() == Some(&address.hash) {
+                return Err(StoreError::from(Disconnected));
+            }
+            Ok(())
+        }),
+        stores
+            .try_mutable_store_arc()
+            .expect("a null context holds a write token"),
+    ));
+    let mut archived = derived_metadata(CLAIMED_NAME);
+    archived
+        .set_u64(ARCHIVED, 1)
+        .expect("sets the archive time");
+    let hash = archived
+        .serialize(repository.clone())
+        .await
+        .expect("storing the branch's metadata");
+    mutable_store_metadata(repository.clone(), fallback_id(CLAIMED_NAME), hash)
+        .await
+        .expect("storing the branch's metadata hash");
+    failing.set(hash).expect("the failing blob is set once");
+    store_derived_latest(&repository, CLAIMED_NAME, revision(1)).await;
+    repository
+}
+
+/// Repositories where the id derived from [`CLAIMED_NAME`] has a latest revision, and a read of its
+/// latest, its metadata key or its metadata blob fails, the blob as a failed read and as bytes that
+/// are not metadata. Each with the shape's name and the test of the error the read fails with.
+async fn unreadable_derived_branches() -> [(
+    &'static str,
+    Arc<RepositoryContext>,
+    fn(&BranchError) -> bool,
+); 4] {
+    [
+        (
+            "a failed latest load",
+            failing_derived_load(LATEST).await,
+            BranchError::is_disconnected,
+        ),
+        (
+            "a failed metadata key load",
+            failing_derived_load(METADATA).await,
+            BranchError::is_disconnected,
+        ),
+        (
+            "a failed metadata blob read",
+            failing_derived_metadata_read().await,
+            BranchError::is_disconnected,
+        ),
+        (
+            "corrupt metadata",
+            corrupt_derived_metadata().await,
+            BranchError::is_internal,
+        ),
+    ]
+}
+
+/// Without a remote, a name with no mapping whose derived id's latest or metadata can't be read
+/// fails the name lookup with the read's error, and the lookup writes no mapping.
+#[tokio::test]
+async fn load_name_to_id_fails_on_an_unreadable_derived_branch() {
+    Box::pin(with_execution(async {
+        for (shape, repository, failed) in unreadable_derived_branches().await {
+            let found = load_name_to_id(repository.clone(), CLAIMED_NAME).await;
+
+            assert!(found.as_ref().is_err_and(failed), "{shape}: got {found:?}");
+            assert_eq!(
+                name_entries(&repository).await,
+                Vec::<BranchId>::new(),
+                "{shape}: the lookup writes no mapping"
+            );
+        }
+    }))
+    .await;
+}
+
+/// A create of a name with no mapping whose derived id's latest or metadata can't be read fails
+/// with the read's error and takes no name: the derived id may name a live branch.
+#[tokio::test]
+async fn a_create_fails_on_an_unreadable_derived_branch() {
+    Box::pin(with_execution(async {
+        for (shape, repository, failed) in unreadable_derived_branches().await {
+            let created = create_root(&repository, branch_id(2), CLAIMED_NAME).await;
+
+            assert!(
+                created.as_ref().is_err_and(failed),
+                "{shape}: got {created:?}"
+            );
+            assert_eq!(
+                name_entries(&repository).await,
+                Vec::<BranchId>::new(),
+                "{shape}: the create claims no name"
+            );
+        }
+    }))
+    .await;
+}
+
+/// A restore under another name of an archived branch whose old name has no mapping, where a read
+/// of the id derived from the old name fails, fails with the read's error and claims no name.
+#[tokio::test]
+async fn a_restore_under_another_name_fails_on_an_unreadable_derived_branch() {
+    Box::pin(with_execution(async {
+        for (shape, repository, failed) in unreadable_derived_branches().await {
+            write_record(
+                &repository,
+                branch_id(2),
+                BranchLatestStatus::Divergent,
+                BranchId::default(),
+            )
+            .await
+            .expect("an unclaimed name is written");
+            let hash = metadata_hash(repository.clone(), branch_id(2))
+                .await
+                .expect("the record holds metadata");
+            let metadata = lore_revision::branch::metadata(repository.clone(), branch_id(2))
+                .await
+                .expect("the record holds metadata");
+            archive_record(
+                repository.clone(),
+                branch_id(2),
+                CLAIMED_NAME,
+                hash,
+                metadata,
+            )
+            .await
+            .expect("the branch holds its name");
+
+            let restored = create_root(&repository, branch_id(2), "renamed").await;
+
+            assert!(
+                restored.as_ref().is_err_and(failed),
+                "{shape}: got {restored:?}"
+            );
+            assert_eq!(
+                name_entries(&repository).await,
+                Vec::<BranchId>::new(),
+                "{shape}: the restore claims no name"
+            );
+        }
+    }))
+    .await;
+}
+
+/// An archive of a branch whose id derives from its name, which the local store doesn't map, where
+/// the read of that id's latest revision fails, fails with the read's error and archives nothing.
+/// The latest's read is the one that fails: a failed read of the metadata fails the archive before
+/// its lookup of the name.
+#[tokio::test]
+async fn an_archive_fails_on_an_unreadable_derived_branch() {
+    Box::pin(with_execution(async {
+        let repository = failing_derived_load(LATEST).await;
+        let (id, _) = branch_named_elsewhere(&repository, true).await;
+
+        let archived = lore_revision::branch::delete(repository.clone(), id).await;
+
+        assert!(
+            archived.as_ref().is_err_and(|err| err.is_disconnected()),
+            "got {archived:?}"
+        );
+        let metadata = lore_revision::branch::metadata(repository, id)
+            .await
+            .expect("the branch keeps its metadata");
+        assert!(
+            metadata.get_u64(ARCHIVED).is_err(),
+            "the metadata records no archive"
+        );
+    }))
+    .await;
+}
+
+/// A resolution of a name with no mapping, where a read of the id derived from the name fails,
+/// fails with the read's error rather than asking the remote, as the commands that resolve a branch
+/// by name do: a switch, a push, branch info and diff, and the lock commands.
+#[tokio::test]
+async fn resolve_fails_on_an_unreadable_derived_branch() {
+    Box::pin(with_execution(async {
+        for (shape, repository, failed) in unreadable_derived_branches().await {
+            let resolved = lore_revision::branch::resolve(repository, CLAIMED_NAME).await;
+
+            assert!(
+                resolved.as_ref().is_err_and(failed),
+                "{shape}: got {resolved:?}"
+            );
+        }
     }))
     .await;
 }

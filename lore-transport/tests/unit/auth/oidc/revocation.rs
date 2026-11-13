@@ -5,6 +5,7 @@
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Response;
+use lore_base::test_util::closed_port_url;
 use lore_transport::Authentication;
 use lore_transport::ProtocolError;
 use lore_transport::auth::oidc;
@@ -127,8 +128,7 @@ async fn an_unavailable_provider_fails_the_revocation() {
 
 #[tokio::test]
 async fn an_unreachable_revocation_endpoint_is_disconnected() {
-    let closed = closed_port();
-    let endpoint_base = closed.url.clone();
+    let endpoint_base = closed_port_url("http");
     let provider =
         spawn_recording_provider(move |issuer, _, _| json(&document(issuer, &endpoint_base))).await;
 

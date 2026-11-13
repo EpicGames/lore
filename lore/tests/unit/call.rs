@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
-use lore::interface::LoreEventCallback;
 use lore_base::error::RepositoryNotFound;
 use lore_revision::event::EventError;
 use lore_revision::repository::RepositoryError;
@@ -15,8 +14,11 @@ use lore::call::*;
 use lore_base::error::NotFound;
 use lore_error_set::Location;
 use lore_error_set::prelude::*;
-use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreGlobalArgs;
+use test_support::completes;
+use test_support::has_error_event;
+use test_support::recording_callback;
+use test_support::take_recorded;
 
 // A concrete `#[error_set]` error for the wrapper closures. Its `NotFound`
 // variant wraps `lore_base::error::NotFound`, which carries error code 79, so
@@ -28,58 +30,27 @@ enum SampleError {
 
 impl EventError for SampleError {}
 
-// The full event a callback receives, kept verbatim so a test can read the
-// `Complete` detail (code, message, trace) a real consumer would see.
-#[derive(Clone)]
-enum CapturedEvent {
-    Error,
-    Complete(lore_revision::event::LoreCompleteEventData),
-    Other,
-}
-
-impl CapturedEvent {
-    fn from_event(event: &LoreEvent) -> Self {
-        match event {
-            LoreEvent::Error(_) => Self::Error,
-            LoreEvent::Complete(data) => Self::Complete(data.clone()),
-            _ => Self::Other,
-        }
-    }
-}
-
-fn make_callback(sink: Arc<Mutex<Vec<CapturedEvent>>>) -> LoreEventCallback {
-    Some(Box::new(move |event: &LoreEvent| {
-        sink.lock().unwrap().push(CapturedEvent::from_event(event));
-    }))
-}
-
 #[tokio::test]
 async fn failing_op_completes_with_error_code_and_no_error_event() {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = no_repository_call(
         LoreGlobalArgs::default(),
-        make_callback(sink.clone()),
+        callback,
         (),
         "failing_op",
         |()| async move { Err::<(), SampleError>(NotFound.into()) },
     )
     .await;
 
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
 
     assert!(
-        !events.iter().any(|e| matches!(e, CapturedEvent::Error)),
+        !has_error_event(&events),
         "no Error event must be emitted on terminal failure"
     );
 
     // Exactly one `Complete` event.
-    let completes: Vec<_> = events
-        .iter()
-        .filter_map(|e| match e {
-            CapturedEvent::Complete(data) => Some(data.clone()),
-            _ => None,
-        })
-        .collect();
+    let completes = completes(&events);
     assert_eq!(completes.len(), 1, "exactly one Complete event");
 
     // The status holds the error code (79 for `NotFound`) and the detail is
@@ -98,10 +69,10 @@ async fn failing_op_completes_with_error_code_and_no_error_event() {
 
 #[tokio::test]
 async fn succeeding_op_completes_with_status_zero_and_empty_detail() {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = no_repository_call(
         LoreGlobalArgs::default(),
-        make_callback(sink.clone()),
+        callback,
         (),
         "succeeding_op",
         |()| async move { Ok::<(), SampleError>(()) },
@@ -110,14 +81,8 @@ async fn succeeding_op_completes_with_status_zero_and_empty_detail() {
 
     assert_eq!(status, 0);
 
-    let events = sink.lock().unwrap().clone();
-    let completes: Vec<_> = events
-        .iter()
-        .filter_map(|e| match e {
-            CapturedEvent::Complete(data) => Some(data.clone()),
-            _ => None,
-        })
-        .collect();
+    let events = take_recorded(&sink);
+    let completes = completes(&events);
     assert_eq!(completes.len(), 1, "exactly one Complete event");
 
     let data = &completes[0];
@@ -144,24 +109,18 @@ async fn missing_repository_completes_with_real_ffi_code() {
         ..LoreGlobalArgs::default()
     };
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = repository_call_read(
         globals,
-        make_callback(sink.clone()),
+        callback,
         (),
         "missing_repo",
         |_repo, ()| async move { Ok::<(), SampleError>(()) },
     )
     .await;
 
-    let events = sink.lock().unwrap().clone();
-    let completes: Vec<_> = events
-        .iter()
-        .filter_map(|e| match e {
-            CapturedEvent::Complete(data) => Some(data.clone()),
-            _ => None,
-        })
-        .collect();
+    let events = take_recorded(&sink);
+    let completes = completes(&events);
     assert_eq!(completes.len(), 1, "exactly one Complete event");
 
     let expected_code = RepositoryError::from(RepositoryNotFound {
@@ -184,10 +143,10 @@ async fn missing_repository_completes_with_real_ffi_code() {
 
 #[tokio::test]
 async fn failing_op_lets_consumer_read_trace_locations() {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let _status = no_repository_call(
         LoreGlobalArgs::default(),
-        make_callback(sink.clone()),
+        callback,
         (),
         "trace_op",
         |()| async move {
@@ -205,13 +164,10 @@ async fn failing_op_lets_consumer_read_trace_locations() {
     )
     .await;
 
-    let events = sink.lock().unwrap().clone();
-    let data = events
-        .iter()
-        .find_map(|e| match e {
-            CapturedEvent::Complete(data) => Some(data.clone()),
-            _ => None,
-        })
+    let events = take_recorded(&sink);
+    let data = completes(&events)
+        .into_iter()
+        .next()
         .expect("a Complete event must be emitted");
 
     // The pushed location is reconstructable from the trace; with

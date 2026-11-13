@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
-use std::sync::Mutex;
 
-use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddEntry;
@@ -12,20 +10,13 @@ use lore::revision_tree::call::revision_tree_call;
 use lore::revision_tree::handle as rt_handle;
 use lore::revision_tree::handle::LoreRevisionTree;
 use lore::revision_tree::handle::RevisionTreeInternal;
-use lore::revision_tree::load::LoreRevisionTreeLoadArgs;
-use lore::revision_tree::load::load;
 use lore::revision_tree::modify::*;
-use lore::revision_tree::node_info::LoreRevisionTreeNodeInfoArgs;
-use lore::revision_tree::node_info::node_info;
-use lore::storage::handle as storage_handle;
-use lore::storage::store::in_memory_for_tests;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
-use lore_revision::event::revision_tree::LoreRevisionTreeNodeInfoEventData;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreNodeType;
 use lore_revision::interface::LoreString;
@@ -35,6 +26,17 @@ use lore_revision::node::NodeBlock;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 
+use crate::call::test_support::Recorded;
+use crate::call::test_support::complete_message;
+use crate::call::test_support::recording_callback;
+use crate::call::test_support::take_recorded;
+use crate::revision_tree::support::add_outcome;
+use crate::revision_tree::support::assert_entries_then_batch_then_complete;
+use crate::revision_tree::support::batch_outcomes;
+use crate::revision_tree::support::fetch_node_info;
+use crate::revision_tree::support::load_handle;
+use crate::revision_tree::support::release;
+
 /// Call-level id every test batch is submitted under, distinct from the
 /// per-entry ids so the two cannot be confused in an assertion.
 const CALL_ID: u64 = 900;
@@ -43,94 +45,25 @@ const CALL_ID: u64 = 900;
 /// spreads them over more than one task on any ordinary machine.
 const BATCH_FILES: usize = 32;
 
-#[derive(Debug, Clone, PartialEq)]
-enum CapturedEvent {
-    Complete(i32, String),
-    RevisionTreeLoaded(u64),
-    AddComplete(u64, NodeID, LoreErrorCode),
-    ModifyComplete(u64, NodeID, LoreErrorCode),
-    BatchComplete(u64, LoreErrorCode),
-    NodeInfo(Box<LoreRevisionTreeNodeInfoEventData>),
-    Other(u32),
+fn modify_outcome(events: &[LoreEvent], id: u64) -> Option<(NodeID, LoreErrorCode)> {
+    events.iter().find_map(|event| match event {
+        LoreEvent::RevisionTreeModifyComplete(data) if data.entry_id == id => {
+            Some((data.node_id, data.error_code))
+        }
+        _ => None,
+    })
 }
 
-impl CapturedEvent {
-    fn from_event(event: &LoreEvent) -> Self {
-        match event {
-            LoreEvent::Complete(data) => {
-                Self::Complete(data.status, data.error.message.as_str().to_string())
-            }
-            LoreEvent::RevisionTreeLoaded(data) => Self::RevisionTreeLoaded(data.handle_id),
-            LoreEvent::RevisionTreeAddComplete(data) => {
-                Self::AddComplete(data.entry_id, data.node_id, data.error_code)
-            }
+fn modify_outcomes(events: &[LoreEvent]) -> Vec<(u64, NodeID, LoreErrorCode)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
             LoreEvent::RevisionTreeModifyComplete(data) => {
-                Self::ModifyComplete(data.entry_id, data.node_id, data.error_code)
+                Some((data.entry_id, data.node_id, data.error_code))
             }
-            LoreEvent::RevisionTreeBatchComplete(data) => {
-                Self::BatchComplete(data.batch_id, data.error_code)
-            }
-            LoreEvent::RevisionTreeNodeInfo(data) => Self::NodeInfo(Box::new(data.clone())),
-            other => Self::Other(other.discriminant()),
-        }
-    }
-}
-
-fn make_callback(sink: Arc<Mutex<Vec<CapturedEvent>>>) -> LoreEventCallback {
-    Some(Box::new(move |event: &LoreEvent| {
-        sink.lock().unwrap().push(CapturedEvent::from_event(event));
-    }))
-}
-
-fn modify_outcome(events: &[CapturedEvent], id: u64) -> Option<(NodeID, LoreErrorCode)> {
-    events.iter().find_map(|event| match event {
-        CapturedEvent::ModifyComplete(event_id, node_id, error_code) if *event_id == id => {
-            Some((*node_id, *error_code))
-        }
-        _ => None,
-    })
-}
-
-fn modify_outcomes(events: &[CapturedEvent]) -> Vec<(u64, NodeID, LoreErrorCode)> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            CapturedEvent::ModifyComplete(id, node_id, code) => Some((*id, *node_id, *code)),
             _ => None,
         })
         .collect()
-}
-
-/// Every batch terminal in emission order, so a test can pin that exactly one
-/// fired and what it carried.
-fn batch_outcomes(events: &[CapturedEvent]) -> Vec<(u64, LoreErrorCode)> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            CapturedEvent::BatchComplete(id, code) => Some((*id, *code)),
-            _ => None,
-        })
-        .collect()
-}
-
-/// The rejection reason the call completed with, which is the only place the
-/// offending entry's batch index and the rule it broke are reported — the
-/// per-entry terminal carries an error code alone.
-fn rejection_reason(events: &[CapturedEvent]) -> String {
-    events
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::Complete(_, message) => Some(message.clone()),
-            _ => None,
-        })
-        .expect("the call must complete")
-}
-
-fn node_info_event(events: &[CapturedEvent]) -> Option<LoreRevisionTreeNodeInfoEventData> {
-    events.iter().find_map(|event| match event {
-        CapturedEvent::NodeInfo(data) => Some((**data).clone()),
-        _ => None,
-    })
 }
 
 fn address(hash: u64, context: Context) -> Address {
@@ -154,40 +87,6 @@ fn entry(entry_id: u64, node_id: NodeID) -> LoreRevisionTreeModifyEntry {
     }
 }
 
-async fn load_handle(label: &str, repository: Partition) -> (LoreRevisionTree, u64) {
-    let store = in_memory_for_tests(label).await;
-    let store_handle = storage_handle::register(store);
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let status = load(
-        LoreGlobalArgs::default(),
-        LoreRevisionTreeLoadArgs {
-            store: store_handle,
-            repository,
-            revision_hash: Hash::default(),
-        },
-        make_callback(sink.clone()),
-    )
-    .await;
-    assert_eq!(status, 0, "load fixture must succeed");
-    let id = sink
-        .lock()
-        .unwrap()
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::RevisionTreeLoaded(id) => Some(*id),
-            _ => None,
-        })
-        .expect("load fixture must emit RevisionTreeLoaded");
-    (LoreRevisionTree { handle_id: id }, store_handle.handle_id)
-}
-
-fn release(handle: LoreRevisionTree, store_handle_id: u64) {
-    rt_handle::unregister(handle);
-    storage_handle::unregister(lore::storage::handle::LoreStore {
-        handle_id: store_handle_id,
-    });
-}
-
 /// Seed one node of `kind` under the root and return its node id.
 async fn seed(
     handle: LoreRevisionTree,
@@ -195,7 +94,7 @@ async fn seed(
     kind: LoreNodeType,
     address: Address,
 ) -> NodeID {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = add(
         LoreGlobalArgs::default(),
         LoreRevisionTreeAddArgs {
@@ -212,25 +111,25 @@ async fn seed(
                 address,
             }]),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
     assert_eq!(status, 0, "seeding {name} must succeed");
-    let events = sink.lock().unwrap().clone();
-    events
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::AddComplete(_, node_id, LoreErrorCode::None) => Some(*node_id),
-            _ => None,
-        })
-        .expect("seeding must report a node id")
+    let events = take_recorded(&sink);
+    let (node_id, error_code) = add_outcome(&events, 1).expect("seeding must report a node id");
+    assert_eq!(
+        error_code,
+        LoreErrorCode::None,
+        "seeding {name} must report no error"
+    );
+    node_id
 }
 
 async fn run_modify(
     handle: LoreRevisionTree,
     entries: Vec<LoreRevisionTreeModifyEntry>,
-) -> (i32, Vec<CapturedEvent>) {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+) -> (i32, Recorded) {
+    let (sink, callback) = recording_callback();
     let status = modify(
         LoreGlobalArgs::default(),
         LoreRevisionTreeModifyArgs {
@@ -238,30 +137,11 @@ async fn run_modify(
             handle,
             entries: LoreArray::from_vec(entries),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     (status, events)
-}
-
-async fn fetch_node_info(
-    handle: LoreRevisionTree,
-    node_id: NodeID,
-) -> LoreRevisionTreeNodeInfoEventData {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    node_info(
-        LoreGlobalArgs::default(),
-        LoreRevisionTreeNodeInfoArgs {
-            id: 7,
-            handle,
-            node_id,
-        },
-        make_callback(sink.clone()),
-    )
-    .await;
-    let events = sink.lock().unwrap().clone();
-    node_info_event(&events).expect("node_info must emit a record")
 }
 
 /// The common edit: new content at an existing path. Mode, size and content
@@ -357,7 +237,7 @@ async fn modify_rejects_a_directory_and_a_link() {
             Some((INVALID_NODE, LoreErrorCode::InvalidArguments)),
             "a {kind} must be rejected as a bad argument"
         );
-        let reason = rejection_reason(&events);
+        let reason = complete_message(&events);
         assert!(
             reason.contains("only a file carries content"),
             "a {kind} must be refused for its kind, got {reason:?}"
@@ -385,7 +265,7 @@ async fn modify_rejects_an_unknown_node() {
         Some((INVALID_NODE, LoreErrorCode::InvalidArguments)),
         "an unknown node must be rejected as a bad argument"
     );
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("entry 0: node id is unknown"),
         "the reason must name the offending entry's batch index, got {reason:?}"
@@ -412,7 +292,7 @@ async fn modify_rejects_a_node_id_on_an_unallocated_slot() {
 
     let (status, events) = run_modify(handle, vec![entry(10, 400)]).await;
     assert_ne!(status, 0, "an unallocated slot must not be modifiable");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("does not resolve to a named node"),
         "an unallocated slot must be refused as unnamed, not as the wrong kind, got {reason:?}"
@@ -454,7 +334,7 @@ async fn modify_rejects_a_deleted_node() {
         Some((INVALID_NODE, LoreErrorCode::InvalidArguments)),
         "a deleted node must be rejected as a bad argument"
     );
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("has been deleted"),
         "a deleted node must be refused as deleted, not as the wrong kind, got {reason:?}"
@@ -485,7 +365,7 @@ async fn modify_rejects_a_repeated_node_id() {
         vec![(11, INVALID_NODE, LoreErrorCode::InvalidArguments)],
         "only the repeating entry reports; the first was never applied"
     );
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("two entries modify one node"),
         "the repeat must be refused as a repeat, got {reason:?}"
@@ -512,7 +392,7 @@ async fn modify_rejects_a_repeated_caller_id_but_accepts_repeated_zeros() {
 
     let (status, events) = run_modify(handle, vec![entry(10, first), entry(10, second)]).await;
     assert_ne!(status, 0, "a repeated non-zero caller id must reject");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("two entries share one caller id"),
         "the repeat must be refused as a shared id, got {reason:?}"
@@ -668,10 +548,10 @@ async fn a_target_deleted_after_validation_fails_the_batch_as_internal() {
     )
     .await;
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = revision_tree_call(
         LoreGlobalArgs::default(),
-        make_callback(sink.clone()),
+        callback,
         handle,
         CALL_ID,
         modify,
@@ -711,7 +591,7 @@ async fn a_target_deleted_after_validation_fails_the_batch_as_internal() {
         status, 0,
         "a target that vanished after validation must fail the call"
     );
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     assert_eq!(
         modify_outcomes(&events),
         vec![(10, INVALID_NODE, LoreErrorCode::Internal)],
@@ -742,10 +622,10 @@ async fn a_target_staged_for_deletion_after_validation_fails_the_batch_as_intern
 
     let still_deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed = still_deleted.clone();
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = revision_tree_call(
         LoreGlobalArgs::default(),
-        make_callback(sink.clone()),
+        callback,
         handle,
         CALL_ID,
         modify,
@@ -787,7 +667,7 @@ async fn a_target_staged_for_deletion_after_validation_fails_the_batch_as_intern
     .await;
 
     assert_ne!(status, 0, "a target staged for deletion must fail the call");
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     assert_eq!(
         modify_outcomes(&events),
         vec![(10, INVALID_NODE, LoreErrorCode::Internal)],
@@ -811,21 +691,8 @@ async fn modify_reports_entries_then_the_batch_terminal_then_complete() {
     let second = seed(handle, "b.bin", LoreNodeType::File, address(1, file_id())).await;
 
     let (_, events) = run_modify(handle, vec![entry(10, first), entry(11, second)]).await;
-    let batch_at = events
-        .iter()
-        .position(|event| matches!(event, CapturedEvent::BatchComplete(..)))
-        .expect("the batch terminal must fire");
-    let complete_at = events
-        .iter()
-        .position(|event| matches!(event, CapturedEvent::Complete(..)))
-        .expect("Complete must fire");
-    let last_entry_at = events
-        .iter()
-        .rposition(|event| matches!(event, CapturedEvent::ModifyComplete(..)))
-        .expect("both entries must report");
-    assert!(
-        last_entry_at < batch_at && batch_at < complete_at,
-        "order must be entries, then the batch terminal, then Complete: {events:?}"
-    );
+    assert_entries_then_batch_then_complete(&events, |event| {
+        matches!(event, LoreEvent::RevisionTreeModifyComplete(_))
+    });
     release(handle, store_handle_id);
 }

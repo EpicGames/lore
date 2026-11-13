@@ -579,12 +579,22 @@ open a repository, stage and commit changes, create branches, merge, rebase, che
 query history, sync with a remote, manage links. None of these is reachable only through the CLI;
 every one is a function call on the C header.
 
+The C header names each operation for its surface. The storage subsystem has one surface, and the
+version control subsystem three:
+
+| Surface | Works on | Reached through | Prefix |
+| --- | --- | --- | --- |
+| **Storage API** | Fragments and mutable-store keys in a partition | A storage handle | `lore_storage_*` |
+| **Revision tree API** | One revision's tree, in memory | A revision tree handle, loaded from a storage handle | `lore_revision_tree_*` |
+| **Revision graph API** | A repository's branches and revisions | A storage handle and a repository ID | `lore_revision_graph_*` |
+| **File-system-based API** | A repository instance and its working tree | The instance's path | `lore_branch_*`, the other `lore_revision_*` calls, and others |
+
 #### 6.3 The storage subsystem as a standalone API
 
 The storage subsystem is a first-class public API, usable with no repository, no branch, and no
-revision involved. An application opens a store handle and operates on content directly:
+revision involved. An application opens a storage handle and operates on content directly:
 
-- *Open and close.* A store handle is opened in one of two modes: *disk-backed*, against a
+- *Open and close.* A storage handle is opened in one of two modes: *disk-backed*, against a
   local path whose packfiles persist across runs, or *in-memory*, a fresh ephemeral store that
   lives only as long as the handle - useful as a transient deduplicating cache, a scratch store
   for a pipeline stage, or a test fixture. Either mode can carry an optional remote endpoint for
@@ -624,6 +634,18 @@ a build cache, an asset pipeline, a backup target, a multi-tenant artifact servi
 purely as a storage system and never touch the version control subsystem. The version control
 subsystem is then one such consumer of the storage API among many, not a privileged layer with
 private access to it.
+
+The revision tree and revision graph APIs (§6.2) work through the storage handle the storage API
+opens, so a pipeline goes from content to branches without a repository instance. The revision tree
+API loads one revision's tree from a storage handle and a repository ID, edits it in memory, and
+commits it. The revision graph API works on a repository's branches and revisions from the same two
+values, with no handle of its own. All three surfaces use the handle's local stores, reach the
+remote through the handle's remote endpoint, and trust it as the handle does. So a revision tree
+adds content by the address the storage API stored it under. Committing it moves the branch's latest
+in the handle's local mutable store, where the revision graph API reads it. The revision tree API
+loads a revision the revision graph API resolves, by its hash. The handle counts the storage and
+revision graph calls in flight, and closing it waits for them before it flushes the stores. A
+revision tree holds the handle's stores past a close, until the tree itself is closed.
 
 #### 6.4 Specifications behind the API
 

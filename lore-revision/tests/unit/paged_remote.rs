@@ -31,6 +31,9 @@ use lore_storage::StoreMatch;
 use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
 use lore_storage::immutable_store::CopyBehavior;
+use lore_storage::test_util::Answered;
+use lore_storage::test_util::HookedStore;
+use lore_storage::test_util::StoreCall;
 use lore_transport::BranchListResponse;
 use lore_transport::BranchPushResponse;
 use lore_transport::BranchQueryResponse;
@@ -46,9 +49,6 @@ use tokio::sync::Notify;
 use zerocopy::IntoBytes;
 
 use crate::helper::in_memory;
-use crate::hooked_store::Answered;
-use crate::hooked_store::HookedStore;
-use crate::hooked_store::StoreCall;
 
 /// What a page answers: a revision number on the remote's branch, or a revision signature.
 #[derive(Clone, Copy, PartialEq)]

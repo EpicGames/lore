@@ -265,13 +265,15 @@ impl EventDispatcher {
         status
     }
 
-    /// Completes a command from its `Result`: builds the detail and returns the
+    /// Completes a command from its `Result`: builds the detail at the call and returns
+    /// [`Self::complete`]'s future, which holds the detail and not `result` and resolves to the
     /// status the `Complete` event carries.
-    pub async fn complete_result<T, E>(&self, result: Result<T, E>) -> i32
+    #[inline]
+    pub fn complete_result<T, E>(&self, result: Result<T, E>) -> impl Future<Output = i32> + '_
     where
         E: lore_error_set::FfiError + std::fmt::Display + lore_error_set::HasTrace,
     {
-        self.complete(LoreErrorDetail::from_result(result)).await
+        self.complete(LoreErrorDetail::from_result(&result))
     }
 
     pub fn make_log(level: LoreLogLevel, message: String) -> LoreLogEventData {

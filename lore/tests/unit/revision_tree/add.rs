@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::sync::Arc;
-use std::sync::Mutex;
 
-use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
 use lore::revision_tree::add::*;
 use lore::revision_tree::call::EntryFailure;
@@ -11,12 +8,8 @@ use lore::revision_tree::handle as rt_handle;
 use lore::revision_tree::handle::LoreRevisionTree;
 use lore::revision_tree::list_children::LoreRevisionTreeListChildrenArgs;
 use lore::revision_tree::list_children::list_children;
-use lore::revision_tree::load::LoreRevisionTreeLoadArgs;
-use lore::revision_tree::load::load;
 use lore::revision_tree::node_info::LoreRevisionTreeNodeInfoArgs;
 use lore::revision_tree::node_info::node_info;
-use lore::storage::handle as storage_handle;
-use lore::storage::store::in_memory_for_tests;
 use lore_base::error::InvalidArguments;
 use lore_base::error::Oversized;
 use lore_base::types::Address;
@@ -25,7 +18,6 @@ use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
-use lore_revision::event::revision_tree::LoreRevisionTreeNodeInfoEventData;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreNodeType;
 use lore_revision::interface::LoreString;
@@ -36,6 +28,16 @@ use lore_revision::node::NodeBlock;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 
+use crate::call::test_support::Recorded;
+use crate::call::test_support::complete_statuses;
+use crate::call::test_support::recording_callback;
+use crate::call::test_support::take_recorded;
+use crate::revision_tree::support::add_outcome;
+use crate::revision_tree::support::batch_outcomes;
+use crate::revision_tree::support::load_handle;
+use crate::revision_tree::support::node_info_event;
+use crate::revision_tree::support::release;
+
 /// Call-level id every test batch is submitted under, distinct from the
 /// per-entry ids so the two cannot be confused in an assertion.
 const CALL_ID: u64 = 900;
@@ -43,71 +45,6 @@ const CALL_ID: u64 = 900;
 /// Children seeded under one parent before the snapshot collision check runs,
 /// enough that the snapshot has to be ordered to be searchable.
 const SNAPSHOT_SEED_CHILDREN: usize = 16;
-
-#[derive(Debug, Clone, PartialEq)]
-enum CapturedEvent {
-    Complete(i32),
-    RevisionTreeLoaded(u64),
-    AddComplete(u64, NodeID, LoreErrorCode),
-    BatchComplete(u64, LoreErrorCode),
-    NodeInfo(Box<LoreRevisionTreeNodeInfoEventData>),
-    Child(u64, NodeID, String),
-    Other(u32),
-}
-
-impl CapturedEvent {
-    fn from_event(event: &LoreEvent) -> Self {
-        match event {
-            LoreEvent::Complete(data) => Self::Complete(data.status),
-            LoreEvent::RevisionTreeLoaded(data) => Self::RevisionTreeLoaded(data.handle_id),
-            LoreEvent::RevisionTreeAddComplete(data) => {
-                Self::AddComplete(data.entry_id, data.node_id, data.error_code)
-            }
-            LoreEvent::RevisionTreeBatchComplete(data) => {
-                Self::BatchComplete(data.batch_id, data.error_code)
-            }
-            LoreEvent::RevisionTreeNodeInfo(data) => Self::NodeInfo(Box::new(data.clone())),
-            LoreEvent::RevisionTreeChild(data) => {
-                Self::Child(data.id, data.node_id, data.name.as_str().to_string())
-            }
-            other => Self::Other(other.discriminant()),
-        }
-    }
-}
-
-fn make_callback(sink: Arc<Mutex<Vec<CapturedEvent>>>) -> LoreEventCallback {
-    Some(Box::new(move |event: &LoreEvent| {
-        sink.lock().unwrap().push(CapturedEvent::from_event(event));
-    }))
-}
-
-fn add_outcome(events: &[CapturedEvent], id: u64) -> Option<(NodeID, LoreErrorCode)> {
-    events.iter().find_map(|event| match event {
-        CapturedEvent::AddComplete(event_id, node_id, error_code) if *event_id == id => {
-            Some((*node_id, *error_code))
-        }
-        _ => None,
-    })
-}
-
-/// Every batch terminal in emission order, so a test can pin that exactly one
-/// fired and what it carried.
-fn batch_outcomes(events: &[CapturedEvent]) -> Vec<(u64, LoreErrorCode)> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            CapturedEvent::BatchComplete(id, code) => Some((*id, *code)),
-            _ => None,
-        })
-        .collect()
-}
-
-fn node_info_event(events: &[CapturedEvent]) -> Option<LoreRevisionTreeNodeInfoEventData> {
-    events.iter().find_map(|event| match event {
-        CapturedEvent::NodeInfo(data) => Some((**data).clone()),
-        _ => None,
-    })
-}
 
 /// An entry adding `name` under `parent_node_id`.
 fn entry(
@@ -143,45 +80,11 @@ fn nested_entry(
     }
 }
 
-async fn load_handle(label: &str, repository: Partition) -> (LoreRevisionTree, u64) {
-    let store = in_memory_for_tests(label).await;
-    let store_handle = storage_handle::register(store);
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let status = load(
-        LoreGlobalArgs::default(),
-        LoreRevisionTreeLoadArgs {
-            store: store_handle,
-            repository,
-            revision_hash: Hash::default(),
-        },
-        make_callback(sink.clone()),
-    )
-    .await;
-    assert_eq!(status, 0, "load fixture must succeed");
-    let id = sink
-        .lock()
-        .unwrap()
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::RevisionTreeLoaded(id) => Some(*id),
-            _ => None,
-        })
-        .expect("load fixture must emit RevisionTreeLoaded");
-    (LoreRevisionTree { handle_id: id }, store_handle.handle_id)
-}
-
-fn release(handle: LoreRevisionTree, store_handle_id: u64) {
-    rt_handle::unregister(handle);
-    storage_handle::unregister(lore::storage::handle::LoreStore {
-        handle_id: store_handle_id,
-    });
-}
-
 async fn run_add(
     handle: LoreRevisionTree,
     entries: Vec<LoreRevisionTreeAddEntry>,
-) -> (i32, Vec<CapturedEvent>) {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+) -> (i32, Recorded) {
+    let (sink, callback) = recording_callback();
     let status = add(
         LoreGlobalArgs::default(),
         LoreRevisionTreeAddArgs {
@@ -189,15 +92,15 @@ async fn run_add(
             handle,
             entries: LoreArray::from_vec(entries),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     (status, events)
 }
 
-async fn fetch_node_info(handle: LoreRevisionTree, id: u64, node_id: NodeID) -> Vec<CapturedEvent> {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+async fn node_info_events(handle: LoreRevisionTree, id: u64, node_id: NodeID) -> Recorded {
+    let (sink, callback) = recording_callback();
     node_info(
         LoreGlobalArgs::default(),
         LoreRevisionTreeNodeInfoArgs {
@@ -205,14 +108,14 @@ async fn fetch_node_info(handle: LoreRevisionTree, id: u64, node_id: NodeID) -> 
             handle,
             node_id,
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    sink.lock().unwrap().clone()
+    take_recorded(&sink)
 }
 
-async fn list(handle: LoreRevisionTree, id: u64, parent_node_id: NodeID) -> Vec<CapturedEvent> {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+async fn list(handle: LoreRevisionTree, id: u64, parent_node_id: NodeID) -> Recorded {
+    let (sink, callback) = recording_callback();
     list_children(
         LoreGlobalArgs::default(),
         LoreRevisionTreeListChildrenArgs {
@@ -220,17 +123,17 @@ async fn list(handle: LoreRevisionTree, id: u64, parent_node_id: NodeID) -> Vec<
             handle,
             parent_node_id,
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    sink.lock().unwrap().clone()
+    take_recorded(&sink)
 }
 
-fn child_names(events: &[CapturedEvent]) -> Vec<String> {
+fn child_names(events: &[LoreEvent]) -> Vec<String> {
     let mut names: Vec<String> = events
         .iter()
         .filter_map(|event| match event {
-            CapturedEvent::Child(_, _, name) => Some(name.clone()),
+            LoreEvent::RevisionTreeChild(data) => Some(data.name.as_str().to_string()),
             _ => None,
         })
         .collect();
@@ -263,7 +166,7 @@ async fn add_single_entry_round_trips_through_node_info() {
     assert_eq!(error_code, LoreErrorCode::None, "got {events:?}");
     assert_ne!(node_id, INVALID_NODE, "got {events:?}");
 
-    let info_events = fetch_node_info(handle, 2, node_id).await;
+    let info_events = node_info_events(handle, 2, node_id).await;
     let data = node_info_event(&info_events).expect("node info must fire");
     assert_eq!(data.name.as_str(), "doc.md");
     assert_eq!(data.parent_id, ROOT_NODE);
@@ -297,13 +200,13 @@ async fn add_builds_a_subtree_from_entry_parent_references() {
     let (b, _) = add_outcome(&events, 2).expect("entry 2 must complete");
     let (c, _) = add_outcome(&events, 3).expect("entry 3 must complete");
 
-    let b_info = fetch_node_info(handle, 4, b).await;
+    let b_info = node_info_events(handle, 4, b).await;
     assert_eq!(
         node_info_event(&b_info).expect("node info").parent_id,
         a,
         "b must hang off a, got {b_info:?}"
     );
-    let c_info = fetch_node_info(handle, 5, c).await;
+    let c_info = node_info_events(handle, 5, c).await;
     assert_eq!(
         node_info_event(&c_info).expect("node info").parent_id,
         b,
@@ -555,7 +458,7 @@ async fn add_generates_a_file_id_only_for_files_missing_one() {
     let mut file_ids = Vec::new();
     for (event_id, next) in [(1u64, 10u64), (2, 11)] {
         let (node_id, _) = add_outcome(&events, event_id).expect("AddComplete must fire");
-        let info = fetch_node_info(handle, next, node_id).await;
+        let info = node_info_events(handle, next, node_id).await;
         let data = node_info_event(&info).expect("node info must fire");
         assert_ne!(
             data.file_id,
@@ -576,7 +479,7 @@ async fn add_generates_a_file_id_only_for_files_missing_one() {
 
     for (event_id, next) in [(3u64, 12u64), (4, 13)] {
         let (node_id, _) = add_outcome(&events, event_id).expect("AddComplete must fire");
-        let info = fetch_node_info(handle, next, node_id).await;
+        let info = node_info_events(handle, next, node_id).await;
         let data = node_info_event(&info).expect("node info must fire");
         assert_eq!(
             data.file_id,
@@ -679,7 +582,7 @@ async fn add_normalizes_fields_a_kind_does_not_carry() {
     assert_eq!(status, 0, "normalised fields must not fail, got {events:?}");
 
     let (directory, _) = add_outcome(&events, 1).expect("AddComplete must fire");
-    let info = fetch_node_info(handle, 10, directory).await;
+    let info = node_info_events(handle, 10, directory).await;
     let data = node_info_event(&info).expect("node info must fire");
     assert_eq!(data.size, 0, "a directory stores no size, got {info:?}");
     assert_eq!(
@@ -689,7 +592,7 @@ async fn add_normalizes_fields_a_kind_does_not_carry() {
     );
 
     let (link, _) = add_outcome(&events, 2).expect("AddComplete must fire");
-    let info = fetch_node_info(handle, 11, link).await;
+    let info = node_info_events(handle, 11, link).await;
     let data = node_info_event(&info).expect("node info must fire");
     assert_eq!(data.size, 0, "a link stores no size, got {info:?}");
     assert_eq!(
@@ -838,13 +741,10 @@ async fn add_on_unknown_handle_reports_only_the_batch_terminal() {
         );
     }
     assert!(
-        events.contains(&CapturedEvent::BatchComplete(
-            CALL_ID,
-            LoreErrorCode::InvalidArguments
-        )),
+        batch_outcomes(&events).contains(&(CALL_ID, LoreErrorCode::InvalidArguments)),
         "the batch terminal must carry the call id, got {events:?}"
     );
-    assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
+    assert!(complete_statuses(&events).contains(&InvalidArguments::FFI_CODE));
 }
 
 /// The batch terminal fires once on every path, so a caller can wait on it

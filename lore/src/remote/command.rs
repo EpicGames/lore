@@ -173,4 +173,11 @@ pub enum LoreCommand {
     RepositoryInstanceDelete(crate::repository::LoreRepositoryInstanceDeleteArgs),
     RepositoryInstanceMove(crate::repository::LoreRepositoryInstanceMoveArgs),
     RepositoryInstanceClone(crate::repository::LoreRepositoryInstanceCloneArgs),
+    RevisionGraphBranchList(crate::revision_graph::branch_list::LoreRevisionGraphBranchListArgs),
+    RevisionGraphRevisionResolve(
+        crate::revision_graph::revision_resolve::LoreRevisionGraphRevisionResolveArgs,
+    ),
+    RevisionGraphBranchResolve(
+        crate::revision_graph::branch_resolve::LoreRevisionGraphBranchResolveArgs,
+    ),
 }

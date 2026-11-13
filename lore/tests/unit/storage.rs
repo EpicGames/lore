@@ -21,10 +21,19 @@ mod store;
 
 use std::sync::Arc;
 
+use lore::call::setup_execution_with;
+use lore::interface::LoreGlobalArgs;
+use lore::storage::store::BoundFlags;
 use lore::storage::store::StoreInternal;
 use lore::storage::store::in_memory_for_tests;
 use lore::storage::*;
+use lore_base::runtime::LORE_CONTEXT;
 use lore_error_set::FfiError;
+use lore_revision::protocol::RemoteEndpoint;
+use lore_revision::relay::EventDispatcher;
+use lore_storage::local::store_lock::StoreHold;
+
+use crate::revision_tree::support::load_tree;
 
 /// Store `payload` whole in `immutable` with the fragment `flags`, returning its address.
 async fn put_payload(
@@ -212,9 +221,9 @@ async fn drain_in_parallel_marks_each_store_invalid() {
 /// other entries.
 #[tokio::test]
 async fn drain_for_connection_filter_only_returns_matching_entries() {
-    let conn_7_a = build_connection_store("conn-7-a", 7).await;
-    let conn_7_b = build_connection_store("conn-7-b", 7).await;
-    let conn_8 = build_connection_store("conn-8", 8).await;
+    let conn_7_a = build_connection_store(7).await;
+    let conn_7_b = build_connection_store(7).await;
+    let conn_8 = build_connection_store(8).await;
     let client = in_memory_for_tests("client").await;
 
     let h_a = lore::storage::handle::register(conn_7_a);
@@ -241,49 +250,10 @@ async fn drain_for_connection_filter_only_returns_matching_entries() {
 #[tokio::test]
 async fn close_for_connection_closes_the_revision_handles_loaded_on_it() {
     use lore::revision_tree::handle as tree_handle;
-    use lore::revision_tree::handle::LoreRevisionTree;
-    use lore::revision_tree::load::LoreRevisionTreeLoadArgs;
-    use lore::revision_tree::load::load;
-    use lore_base::types::Hash;
-    use lore_base::types::Partition;
-    use lore_revision::event::LoreEvent;
-    use lore_revision::interface::LoreEventCallback;
-    use lore_revision::interface::LoreGlobalArgs;
-
-    async fn load_tree(
-        store: lore::storage::handle::LoreStore,
-        repository: Partition,
-    ) -> LoreRevisionTree {
-        let loaded: Arc<std::sync::Mutex<Option<u64>>> = Arc::new(std::sync::Mutex::new(None));
-        let sink = loaded.clone();
-        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
-            if let LoreEvent::RevisionTreeLoaded(data) = event {
-                *sink.lock().unwrap() = Some(data.handle_id);
-            }
-        }));
-        let status = load(
-            LoreGlobalArgs::default(),
-            LoreRevisionTreeLoadArgs {
-                store,
-                repository,
-                revision_hash: Hash::default(),
-            },
-            callback,
-        )
-        .await;
-        assert_eq!(status, 0, "loading the revision tree fixture must succeed");
-        LoreRevisionTree {
-            handle_id: loaded
-                .lock()
-                .unwrap()
-                .expect("load must emit RevisionTreeLoaded"),
-        }
-    }
 
     const CONNECTION: u64 = 0x18A;
 
-    let dropped =
-        lore::storage::handle::register(build_connection_store("teardown", CONNECTION).await);
+    let dropped = lore::storage::handle::register(build_connection_store(CONNECTION).await);
     let client = lore::storage::handle::register(in_memory_for_tests("teardown-client").await);
     let on_dropped = load_tree(dropped, Partition::from([0x1Au8; 16])).await;
     let on_client = load_tree(client, Partition::from([0x1Bu8; 16])).await;
@@ -307,20 +277,33 @@ async fn close_for_connection_closes_the_revision_handles_loaded_on_it() {
     lore::storage::handle::unregister(client);
 }
 
-async fn build_connection_store(identity: &str, connection_id: u64) -> Arc<StoreInternal> {
-    let bare = in_memory_for_tests(identity).await;
-    let immutable = bare.immutable.clone();
-    let mutable = bare.mutable.clone();
+async fn build_connection_store(connection_id: u64) -> Arc<StoreInternal> {
     Arc::new(
-        StoreInternal::new(
-            identity,
-            immutable,
-            mutable,
-            None,
-            lore::storage::store::BoundFlags::default(),
-            false,
-            lore_storage::local::store_lock::StoreHold::default(),
-        )
-        .with_connection_id(connection_id),
+        in_memory_store(None, BoundFlags::default())
+            .await
+            .with_connection_id(connection_id),
     )
+}
+
+/// A storage handle's state over new in-memory stores, reaching `remote` and opened with `bound`.
+pub(crate) async fn in_memory_store(
+    remote: Option<Arc<RemoteEndpoint>>,
+    bound: BoundFlags,
+) -> StoreInternal {
+    let bare = in_memory_for_tests("in-memory").await;
+    StoreInternal::new(
+        bare.identity.clone(),
+        bare.immutable.clone(),
+        bare.mutable.clone(),
+        remote,
+        bound,
+        false,
+        StoreHold::default(),
+    )
+}
+
+/// Runs `body` under an execution context of its own with `globals`, which sends no events.
+pub(crate) async fn under_globals<T>(globals: LoreGlobalArgs, body: impl Future<Output = T>) -> T {
+    let execution = setup_execution_with(globals, EventDispatcher::no_dispatch());
+    LORE_CONTEXT.scope(execution, body).await
 }

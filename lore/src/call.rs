@@ -115,7 +115,7 @@ where
                     Ok(repository) => repository,
                     Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
                 };
-                let detail = LoreErrorDetail::from_result(command(repository.clone(), args).await);
+                let detail = LoreErrorDetail::from_result(&command(repository.clone(), args).await);
                 (detail, Some(post_command_cleanup(repository)))
             };
 
@@ -172,7 +172,7 @@ where
                     Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
                 };
                 let detail =
-                    LoreErrorDetail::from_result(command(repository.clone(), token, args).await);
+                    LoreErrorDetail::from_result(&command(repository.clone(), token, args).await);
                 (detail, Some(post_command_cleanup(repository)))
             };
 
@@ -273,7 +273,7 @@ where
                         }
                     };
                     let detail = LoreErrorDetail::from_result(
-                        command(repository.clone(), token, &plan).await,
+                        &command(repository.clone(), token, &plan).await,
                     );
                     (detail, Some(post_command_cleanup(repository)))
                 };
@@ -326,7 +326,7 @@ where
                     Ok(repository) => repository,
                     Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
                 };
-                let detail = LoreErrorDetail::from_result(command(repository.clone(), args).await);
+                let detail = LoreErrorDetail::from_result(&command(repository.clone(), args).await);
                 (detail, Some(post_command_cleanup(repository)))
             };
 
@@ -437,7 +437,7 @@ where
 
             let time_start = Instant::now();
 
-            let detail = LoreErrorDetail::from_result(command(args).await);
+            let detail = LoreErrorDetail::from_result(&command(args).await);
 
             log_command_done(&caller, time_start);
             execution_context().dispatcher.complete(detail).await

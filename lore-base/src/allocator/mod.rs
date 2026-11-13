@@ -133,6 +133,16 @@ fn measure_from_environment() {
     }
 }
 
+/// Whether `LORE_ALLOCATOR` selects the system allocator. Reads the environment without
+/// allocating, so that the global allocator's own choice can call it.
+pub(crate) fn system_allocator_selected() -> bool {
+    // SAFETY: both strings are NUL-terminated literals.
+    unsafe {
+        let allocator = libc::getenv(c"LORE_ALLOCATOR".as_ptr().cast());
+        !allocator.is_null() && !libc::strstr(allocator, c"system".as_ptr().cast()).is_null()
+    }
+}
+
 fn default_allocator() -> &'static (dyn GlobalAlloc + Sync) {
     measure_from_environment();
     unsafe {
@@ -140,11 +150,11 @@ fn default_allocator() -> &'static (dyn GlobalAlloc + Sync) {
         if !allocator.is_null() && !libc::strstr(allocator, c"tracking".as_ptr().cast()).is_null() {
             TRACKING_ALLOCATIONS.fetch_or(tracking::TRACK, Ordering::Relaxed);
         }
-        if !allocator.is_null() && !libc::strstr(allocator, c"system".as_ptr().cast()).is_null() {
-            &STANDARD_ALLOCATOR
-        } else {
-            &rpmalloc::RPMALLOC_ALLOCATOR
-        }
+    }
+    if system_allocator_selected() {
+        &STANDARD_ALLOCATOR
+    } else {
+        &rpmalloc::RPMALLOC_ALLOCATOR
     }
 }
 
@@ -159,14 +169,10 @@ pub fn growvec_allocator() -> &'static (dyn GlobalAlloc + Sync) {
         if let Some(allocator) = EXTERN_ALLOCATOR.get() {
             return allocator as &'static (dyn GlobalAlloc + Sync);
         }
-        unsafe {
-            let allocator = libc::getenv(c"LORE_ALLOCATOR".as_ptr().cast());
-            if !allocator.is_null() && !libc::strstr(allocator, c"system".as_ptr().cast()).is_null()
-            {
-                &STANDARD_ALLOCATOR
-            } else {
-                RPMALLOC_HEAP_ALLOCATOR.get_or_init(RpmallocHeapAllocator::default)
-            }
+        if system_allocator_selected() {
+            &STANDARD_ALLOCATOR
+        } else {
+            RPMALLOC_HEAP_ALLOCATOR.get_or_init(RpmallocHeapAllocator::default)
         }
     })
 }
@@ -208,17 +214,13 @@ pub fn node_block_allocator() -> Option<&'static (dyn GlobalAlloc + Sync)> {
         if EXTERN_ALLOCATOR.get().is_some() {
             return None;
         }
-        unsafe {
-            let allocator = libc::getenv(c"LORE_ALLOCATOR".as_ptr().cast());
-            if !allocator.is_null() && !libc::strstr(allocator, c"system".as_ptr().cast()).is_null()
-            {
-                None
-            } else {
-                Some(
-                    NODE_BLOCK_HEAP_ALLOCATOR.get_or_init(RpmallocHeapAllocator::default)
-                        as &'static (dyn GlobalAlloc + Sync),
-                )
-            }
+        if system_allocator_selected() {
+            None
+        } else {
+            Some(
+                NODE_BLOCK_HEAP_ALLOCATOR.get_or_init(RpmallocHeapAllocator::default)
+                    as &'static (dyn GlobalAlloc + Sync),
+            )
         }
     })
 }

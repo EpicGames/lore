@@ -120,17 +120,15 @@ pub async fn create(
     let user_id = execution_context().user_id().await;
     let dry_run = execution_context().globals().dry_run();
 
-    // Gather the parent branch stack
     let parent_metadata = branch::metadata(repository.clone(), current_branch)
         .await
         .forward::<CreateError>("loading parent branch metadata")?;
-    let mut stack = branch::stack(&parent_metadata);
-    stack.insert(
-        0,
+    let stack = branch::child_stack(
         BranchPoint {
             branch: current_branch,
             revision: current_revision,
         },
+        &parent_metadata,
     );
 
     // Create the branch
@@ -321,13 +319,12 @@ async fn layer_branch_create(
         let parent_metadata = branch::metadata(repository.clone(), current_branch)
             .await
             .forward::<CreateError>("loading layer parent branch metadata")?;
-        let mut stack = branch::stack(&parent_metadata);
-        stack.insert(
-            0,
+        let stack = branch::child_stack(
             BranchPoint {
                 branch: current_branch,
                 revision: current_revision.revision(),
             },
+            &parent_metadata,
         );
 
         match branch::create(

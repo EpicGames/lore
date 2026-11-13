@@ -426,7 +426,7 @@ pub async fn load_instance_metadata(
 fn instance_metadata_of(metadata: &Metadata) -> InstanceMetadata {
     InstanceMetadata {
         instance_id: registered_id(metadata),
-        path: registered_path(metadata),
+        path: registered_path(metadata).to_owned(),
         created: metadata.get_u64(CREATED).unwrap_or_default(),
     }
 }
@@ -443,8 +443,8 @@ fn registered_id(metadata: &Metadata) -> InstanceId {
 
 /// The path that the registration blob `metadata` holds, empty where it holds none or one that
 /// isn't UTF-8.
-fn registered_path(metadata: &Metadata) -> String {
-    metadata.get_string(PATH).map_or_default(str::to_owned)
+fn registered_path(metadata: &Metadata) -> &str {
+    metadata.get_string(PATH).unwrap_or_default()
 }
 
 /// Attempt to recover a lost instance ID by enumerating all registered
@@ -589,7 +589,7 @@ pub struct InstanceRecord {
     /// The instance's id, from its registration
     pub instance_id: InstanceId,
     /// The instance's working directory, as registered
-    pub path: String,
+    pub path: LoreString,
     /// The instance's current revision, zero where it has none
     pub revision: Hash,
     /// Whether the registration still describes a live checkout
@@ -689,12 +689,12 @@ fn instance_record(
         if only.is_some_and(|only| only != branch) {
             return Ok(None);
         }
-        let path = registered_path(&registration);
         let revision = load_anchor(repository, ANCHOR_CURRENT, instance_id)
             .await
             .forward::<InstanceError>("loading the current revision of an instance")?
             .unwrap_or_default();
-        let staleness = instance_staleness(&path, instance_id).await;
+        let path = LoreString::from(registered_path(&registration));
+        let staleness = instance_staleness(path.as_str(), instance_id).await;
         Ok(Some((
             branch,
             InstanceRecord {

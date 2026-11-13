@@ -496,20 +496,39 @@ fn mutable_key_type(function: &str) -> KeyType {
     }
 }
 
+/// The key of the `function` value of `branch` in the mutable store of `repository`, hashed with
+/// `salt`, and the key type `function` takes.
 pub fn mutable_key(
     salt: &[u8],
     function: &str,
     repository: RepositoryId,
     branch: BranchId,
 ) -> (Hash, KeyType) {
-    let key = hash::hash_function_args(
-        salt,
-        function,
-        hex::encode(repository.data()).as_str(),
-        hex::encode(branch.data()).as_str(),
-    );
+    let key = hash_branch_function(salt, function, repository, branch, "");
     let key_type = mutable_key_type(function);
     (key, key_type)
+}
+
+/// Hashes `salt`, `function`, the lower-case hex of `repository` and of `branch`, then `suffix`,
+/// encoding the hex on the stack.
+fn hash_branch_function(
+    salt: &[u8],
+    function: &str,
+    repository: RepositoryId,
+    branch: BranchId,
+    suffix: &str,
+) -> Hash {
+    let mut repository_digits = [0u8; 32];
+    let mut branch_digits = [0u8; 32];
+    hash::hash_function_strs_slice(
+        salt,
+        function,
+        &[
+            util::to_hex_str(repository.data(), &mut repository_digits),
+            util::to_hex_str(branch.data(), &mut branch_digits),
+            suffix,
+        ],
+    )
 }
 
 fn mutable_name_key(salt: &[u8], function: &str, name: &str) -> (Hash, KeyType) {
@@ -518,6 +537,8 @@ fn mutable_name_key(salt: &[u8], function: &str, name: &str) -> (Hash, KeyType) 
     (key, key_type)
 }
 
+/// Key for the revision skip pointer at the step boundary that contains `revision_number`, as
+/// [`step_key`] gives it. The pointer names a revision numbered at most the boundary.
 pub fn revision_step_key(
     salt: &[u8],
     repository: RepositoryId,
@@ -525,28 +546,19 @@ pub fn revision_step_key(
     revision_number: u64,
     step_size: u64,
 ) -> (Hash, KeyType) {
-    // Saturating: a revision number within a step of `u64::MAX` cannot exist, so the
-    // clamped bucket is a key that never matches rather than an overflow panic on a
-    // number taken straight from a request.
-    let key_revision_number = revision_number
-        .div_ceil(step_size)
-        .saturating_mul(step_size);
-    let key_type = mutable_key_type(REVISION_NUMBER_STEP);
-    let key = hash::hash_function_strs_slice(
+    step_key(
         salt,
         REVISION_NUMBER_STEP,
-        &[
-            hex::encode(repository.data()).as_str(),
-            hex::encode(branch.data()).as_str(),
-            key_revision_number.to_string().as_str(),
-        ],
-    );
-    (key, key_type)
+        repository,
+        branch,
+        revision_number,
+        step_size,
+    )
 }
 
-/// Key for the cached revision list at the step boundary that contains
-/// `revision_number`. Boundary `B = revision_number.div_ceil(step_size) * step_size`.
-/// The cached list contains up to `step_size` items in segment `(B - step, B]`.
+/// Key for the cached revision list at the step boundary `B` that contains `revision_number`, as
+/// [`step_key`] gives it. The cached list contains up to `step_size` items in segment
+/// `(B - step_size, B]`.
 pub fn revision_list_step_key(
     salt: &[u8],
     repository: RepositoryId,
@@ -554,23 +566,43 @@ pub fn revision_list_step_key(
     revision_number: u64,
     step_size: u64,
 ) -> (Hash, KeyType) {
-    // Saturating: a revision number within a step of `u64::MAX` cannot exist, so the
-    // clamped bucket is a key that never matches rather than an overflow panic on a
-    // number taken straight from a request.
-    let key_revision_number = revision_number
-        .div_ceil(step_size)
-        .saturating_mul(step_size);
-    let key_type = mutable_key_type(REVISION_LIST_STEP);
-    let key = hash::hash_function_strs_slice(
+    step_key(
         salt,
         REVISION_LIST_STEP,
-        &[
-            hex::encode(repository.data()).as_str(),
-            hex::encode(branch.data()).as_str(),
-            key_revision_number.to_string().as_str(),
-        ],
+        repository,
+        branch,
+        revision_number,
+        step_size,
+    )
+}
+
+/// The key of the `function` value of `branch` at the step boundary that contains
+/// `revision_number`, `B = revision_number.div_ceil(step_size) * step_size`, and its key type: the
+/// boundary's decimal digits follow the ids in the hash, encoded on the stack.
+///
+/// The boundary saturates: a revision number within a step of `u64::MAX` cannot exist, so the
+/// clamped boundary is a key that never matches rather than an overflow panic on a number taken
+/// straight from a request.
+fn step_key(
+    salt: &[u8],
+    function: &str,
+    repository: RepositoryId,
+    branch: BranchId,
+    revision_number: u64,
+    step_size: u64,
+) -> (Hash, KeyType) {
+    let boundary = revision_number
+        .div_ceil(step_size)
+        .saturating_mul(step_size);
+    let mut digits = [0u8; 20];
+    let key = hash_branch_function(
+        salt,
+        function,
+        repository,
+        branch,
+        util::to_decimal_str(boundary, &mut digits),
     );
-    (key, key_type)
+    (key, mutable_key_type(function))
 }
 
 /// The branch id derived from `name`: the first 16 bytes of the hash of `name` as given. The
@@ -583,31 +615,64 @@ fn fallback_id(name: &str) -> Context {
     Context::from(data)
 }
 
-async fn mutable_load(
+/// The `function` value of `branch` in the mutable store of `repository`, reporting an absent
+/// value, or one that holds zero, as [`BranchNotFound`].
+#[lore_macro::test_pub]
+#[inline]
+pub(crate) fn mutable_load(
     repository: Arc<RepositoryContext>,
     function: &str,
     branch: BranchId,
-) -> Result<Hash, BranchError> {
+) -> impl Future<Output = Result<Hash, BranchError>> {
+    load_branch_key(repository, function, branch, |value, branch| {
+        value.ok_or_else(|| {
+            BranchError::from(BranchNotFound {
+                branch: branch.to_string(),
+            })
+        })
+    })
+}
+
+/// The `function` value of `branch` in the mutable store of `repository`: `None` where the key is
+/// absent or holds zero, read from the store's answer, so an absence builds no [`BranchError`].
+#[inline]
+pub fn mutable_value(
+    repository: Arc<RepositoryContext>,
+    function: &str,
+    branch: BranchId,
+) -> impl Future<Output = Result<Option<Hash>, BranchError>> {
+    load_branch_key(repository, function, branch, |value, _| Ok(value))
+}
+
+/// What `answer` makes of `branch` and its `function` value in the mutable store of `repository`:
+/// the value, or `None` where the key is absent or holds zero, read from the store's answer, so the
+/// store's absence reaches `answer` as `None`.
+///
+/// `answer` captures nothing at its callers, so it adds nothing to the future.
+async fn load_branch_key<T>(
+    repository: Arc<RepositoryContext>,
+    function: &str,
+    branch: BranchId,
+    answer: impl FnOnce(Option<Hash>, BranchId) -> Result<T, BranchError>,
+) -> Result<T, BranchError> {
     let repository_id = repository.id;
     let (key, key_type) = mutable_key(repository.salt(), function, repository_id, branch);
-
-    // Do not emit the error here, mutable load failures are mostly
-    // benign, and in the cases where it's not it's better if the
-    // call site emits the appropriate error
-    let value = repository
+    let value = match repository
         .read_mutable_store()
         .load(repository_id, key, key_type)
         .await
-        .map_matched_err("Failed to load data from mutable store", |m| match m {
-            MatchedStoreError::AddressNotFound(_) | MatchedStoreError::PayloadNotFound(_) => {
-                BranchError::from(BranchNotFound {
-                    branch: branch.to_string(),
-                })
-            }
-            other => other.forward::<BranchError>("Failed to load data from mutable store"),
-        })?;
-    lore_debug!("Load {function} for branch {branch} repository {repository_id}: {value}");
-    Ok(value)
+    {
+        Ok(value) if value.is_zero() => None,
+        Ok(value) => {
+            lore_debug!("Load {function} for branch {branch} repository {repository_id}: {value}");
+            Some(value)
+        }
+        Err(err) if err.is_address_not_found() || err.is_payload_not_found() => None,
+        Err(err) => {
+            return Err(err).forward::<BranchError>("Failed to load data from mutable store");
+        }
+    };
+    answer(value, branch)
 }
 
 async fn mutable_store(
@@ -805,9 +870,11 @@ fn swap_name_to_id(
 
 /// The id `name` maps to: `name` itself when it parses as a non-zero id, else the mapping in the
 /// local store, then the remote's, then the id derived from `name` when the local store holds a
-/// latest revision for it. A failed read of the local mapping counts as none. A remote that refuses
-/// the caller fails the lookup, and a name found nowhere answers `BranchNotFound`. A mapping found
-/// at the remote, or a derived one, is cached as `load_name_to_id_unmapped` describes.
+/// latest revision for it and no metadata that says it is archived or names it otherwise. A failed
+/// read of the local mapping counts as none. A remote that refuses the caller fails the lookup, as
+/// does a failed read of the derived id's latest, metadata key or metadata blob, and a name found
+/// nowhere answers `BranchNotFound`. A mapping found at the remote, or a derived one, is cached as
+/// `load_name_to_id_unmapped` describes.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
@@ -831,8 +898,10 @@ pub fn load_name_to_id(
 }
 
 /// The id `name` maps to where the local store holds no mapping for it: the remote's mapping, then
-/// the id derived from `name` when the local store holds a latest revision for it. A remote that
-/// refuses the caller fails the lookup, and a name found at neither answers `BranchNotFound`.
+/// the id derived from `name` when the local store holds a latest revision for it and no metadata
+/// that says it is archived or names it otherwise. A remote that refuses the caller fails the
+/// lookup, as does a failed read of the derived id's latest, metadata key or metadata blob, and a
+/// name found at neither answers `BranchNotFound`.
 ///
 /// A mapping found at the remote, or a derived one, is cached in the local store with a claim from
 /// none, so a mapping another writer made after the caller's read stays. The remote's mapping is
@@ -872,11 +941,7 @@ fn load_name_to_id_unmapped(
             return Ok(branch);
         }
 
-        if let Some(id) = live_fallback_id(repository.clone(), name)
-            .await
-            .ok()
-            .flatten()
-        {
+        if let Some(id) = live_fallback_id(repository.clone(), name).await? {
             let _ = claim_name(repository.clone(), name, Context::default(), id).await;
             return Ok(id);
         }
@@ -904,20 +969,52 @@ pub(crate) async fn cache_name_mapping(
     }
 }
 
-/// The id derived from `name`, when the local store holds a latest revision for that id.
-async fn live_fallback_id(
+/// The id derived from `name`, where the local store holds a latest revision for that id and no
+/// metadata of the id that says the branch has left `name` ([`leaves_name`]). An archive keeps a
+/// branch's latest and metadata and removes only its name's mapping, and a restore under another
+/// name keeps the id, so only the metadata tells whether the branch still holds `name`. A branch
+/// without a metadata key, or whose blob the local store doesn't hold, reads as live, as does one
+/// an older version archived, whose metadata doesn't say so.
+///
+/// A failed read of the latest, the metadata key or the blob fails: unread metadata can't tell
+/// whether the branch holds `name`.
+///
+/// The blob is read from the local store alone ([`local_metadata_blob`]), and only that read is
+/// boxed: a cold path that only a legacy derived id with a latest and a metadata key takes. Inline,
+/// it would make every future awaiting a name lookup as large as the read's.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn live_fallback_id(
     repository: Arc<RepositoryContext>,
     name: &str,
-) -> Result<Option<BranchId>, BranchError> {
+) -> impl Future<Output = Result<Option<BranchId>, BranchError>> + '_ {
     let id = fallback_id(name);
-    if id.is_zero() {
-        return Ok(None);
+    async move {
+        if id.is_zero()
+            || mutable_value(repository.clone(), LATEST, id)
+                .await?
+                .is_none()
+        {
+            return Ok(None);
+        }
+        let Some(metadata_hash) = mutable_value(repository.clone(), METADATA, id).await? else {
+            return Ok(Some(id));
+        };
+        let metadata = Box::pin(local_metadata_blob(repository, metadata_hash)).await?;
+        Ok(match metadata {
+            Some(metadata) if leaves_name(&metadata, name) => None,
+            _ => Some(id),
+        })
     }
-    match load_latest_local(repository, id).await {
-        Ok(_) => Ok(Some(id)),
-        Err(err) if err.is_branch_not_found() => Ok(None),
-        Err(err) => Err(err),
-    }
+}
+
+/// Whether `metadata`, the metadata of the id derived from `name`, says the branch has left `name`:
+/// it is archived ([`is_archived`]), or it names the branch otherwise, as a restore under another
+/// name leaves it, compared regardless of case, as the name's mapping key is ([`fold_eq`]).
+/// Metadata without a name says neither.
+fn leaves_name(metadata: &Metadata, name: &str) -> bool {
+    is_archived(metadata) || branch::name(metadata).is_ok_and(|held| !fold_eq(held, name))
 }
 
 /// The branch a name names in the local store, by its mapping or by the id derived from it.
@@ -926,7 +1023,8 @@ pub enum NamedBranch {
     /// The name's mapping holds the id.
     Mapped(BranchId),
     /// The name has no mapping, or an entry holding zero that an older version wrote, and the id
-    /// derived from the name has a latest revision.
+    /// derived from the name has a latest revision and no metadata that says it is archived or
+    /// names it otherwise.
     Derived(BranchId),
 }
 
@@ -950,8 +1048,8 @@ impl NamedBranch {
 
 /// Looks up the branch `name` names in the local store alone, writing nothing: the id the name's
 /// mapping holds or, for a name with no mapping (an archived name included), the id derived from
-/// the name when that id has a latest revision. `None` when neither names a branch. A failed read
-/// is an error, not `None`.
+/// the name when that id has a latest revision and no metadata that says it is archived or names
+/// it otherwise. `None` when neither names a branch. A failed read is an error, not `None`.
 pub async fn lookup_name_local_unwritten(
     repository: Arc<RepositoryContext>,
     name: &str,
@@ -1068,11 +1166,9 @@ pub async fn load_latest_divergent(
     if branch.is_zero() {
         return Ok(false);
     }
-    match mutable_load(repository.clone(), LATEST_STATUS, branch).await {
-        Ok(head) => Ok(!head.is_zero()),
-        Err(err) if err.is_branch_not_found() => Ok(false),
-        Err(err) => Err(err),
-    }
+    Ok(mutable_value(repository, LATEST_STATUS, branch)
+        .await?
+        .is_some())
 }
 
 pub async fn load_last_sync(
@@ -1502,7 +1598,9 @@ fn queried_status(
     }
 }
 
-/// Default branch resolution: prefer local, fall back to remote.
+/// Default branch resolution: prefer local, fall back to remote. A name lookup that fails other
+/// than as not found fails the resolution, as a refusal or a failed read of the derived id's latest
+/// or metadata does ([`load_name_to_id`]).
 ///
 /// `load_name_to_id` opportunistically writes the discovered name->id and
 /// metadata mappings to the local mutable store via `try_write_mutable_store`;
@@ -1516,8 +1614,9 @@ async fn resolve_default(
 ) -> Result<BranchStatus, BranchError> {
     let id = if let Ok(id) = Context::from_str(branch) {
         id
-    } else if let Some(id) = absent_unless_refused::<_, _, BranchError>(
+    } else if let Some(id) = absent_unless::<_, _, BranchError>(
         branch::load_name_to_id(repository.clone(), branch).await,
+        |err| !err.is_branch_not_found(),
         "looking up the branch name",
     )? {
         id
@@ -1575,6 +1674,56 @@ pub async fn load_metadata(
     Metadata::deserialize(repository, hash)
         .await
         .forward::<BranchError>("Failed to deserialize branch metadata")
+}
+
+/// The metadata of `branch`, read through `repository` from the local store alone: the value of its
+/// metadata key, and the blob that value names. `None` where the key is absent or holds zero, as
+/// after a create that lost its name claim, or names a blob the local store doesn't hold.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+///
+/// # Errors
+///
+/// A failed or corrupt read.
+#[allow(clippy::manual_async_fn)]
+pub fn local_metadata(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+) -> impl Future<Output = Result<Option<(Hash, Metadata)>, BranchError>> {
+    async move {
+        let Some(metadata_hash) = mutable_value(repository.clone(), METADATA, branch).await? else {
+            return Ok(None);
+        };
+        Ok(local_metadata_blob(repository, metadata_hash)
+            .await?
+            .map(|metadata| (metadata_hash, metadata)))
+    }
+}
+
+/// The branch metadata blob `metadata_hash`, read through `repository` from the local store alone.
+/// `None` where the local store doesn't hold it.
+///
+/// Returns the read's future with the answer mapped onto its output, without a future of its own.
+///
+/// # Errors
+///
+/// A failed or corrupt read.
+#[inline]
+pub fn local_metadata_blob(
+    repository: Arc<RepositoryContext>,
+    metadata_hash: Hash,
+) -> impl Future<Output = Result<Option<Metadata>, BranchError>> {
+    let options = immutable::read_options_from_repository(&repository)
+        .no_remote()
+        .with_strict_local();
+    futures::FutureExt::map(
+        Metadata::deserialize_with(repository, metadata_hash, options),
+        |read| match read {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(err) if err.is_address_not_found() => Ok(None),
+            Err(err) => Err(err).forward::<BranchError>("reading the branch metadata"),
+        },
+    )
 }
 
 /// The metadata of `branch`, read locally, or on the remote where the instance holds none it can
@@ -1738,6 +1887,14 @@ pub fn personal_category() -> &'static str {
     CATEGORY_PERSONAL
 }
 
+/// The id of the branch `metadata` describes.
+pub fn id(metadata: &Metadata) -> Result<BranchId, BranchError> {
+    metadata
+        .get_binary(ID)
+        .map(BranchId::from)
+        .forward::<BranchError>("reading branch id from metadata")
+}
+
 pub fn name(metadata: &Metadata) -> Result<&str, BranchError> {
     metadata
         .get_string(NAME)
@@ -1770,6 +1927,14 @@ pub fn stack(metadata: &Metadata) -> Vec<BranchPoint> {
     }]
 }
 
+/// The stack of a branch created at `branch_point` on the branch `parent` describes:
+/// `branch_point`, then the stack of `parent`.
+pub fn child_stack(branch_point: BranchPoint, parent: &Metadata) -> Vec<BranchPoint> {
+    let mut stack = stack(parent);
+    stack.insert(0, branch_point);
+    stack
+}
+
 #[allow(clippy::uninit_vec)]
 fn stack_from_bytes(bytes: &[u8]) -> Vec<BranchPoint> {
     let count = bytes.len() / size_of::<BranchPoint>();
@@ -1797,8 +1962,27 @@ pub fn creator(metadata: &Metadata) -> Result<&str, BranchError> {
         .forward::<BranchError>("reading branch creator from metadata")
 }
 
+/// Whether the creator filter `filter` keeps a branch created by `creator`: with no filter, every
+/// branch, and otherwise those whose creator equals it exactly, compared case-sensitively.
+pub fn creator_matches(filter: Option<&str>, creator: &str) -> bool {
+    filter.is_none_or(|filter| filter == creator)
+}
+
+/// Whether the creator filter `filter` keeps the branch `metadata` describes, as
+/// [`creator_matches`] compares, with an empty creator for a blob without one, as older clients
+/// wrote. Reads the creator only where `filter` names one, since a read of an entry the blob
+/// doesn't hold builds an error.
+pub fn metadata_creator_matches(filter: Option<&str>, metadata: &Metadata) -> bool {
+    filter.is_none_or(|filter| creator_matches(Some(filter), creator(metadata).unwrap_or_default()))
+}
+
 pub fn created(metadata: &Metadata) -> u64 {
     metadata.get_u64(CREATED).unwrap_or_default()
+}
+
+/// Whether `metadata` marks its branch protected.
+pub fn protected(metadata: &Metadata) -> bool {
+    metadata.get_bool(PROTECT).unwrap_or_default()
 }
 
 pub async fn branch_metadata(
@@ -2136,10 +2320,10 @@ fn check_new_branch_id(branch: BranchId, name: &str) -> Result<(), BranchError> 
 ///
 /// The mapping is read once, and a read that fails other than as not found fails. Where it holds
 /// none, the name is looked up at the remote, then as the derived id (`load_name_to_id_unmapped`).
-/// A lookup that finds no branch answers zero, and a refusal fails. A lookup that finds a branch
-/// caches it, which may change the mapping, so the mapping is then read again
-/// (`unclaimed_name_mapping`). The claim's compare-and-swap refuses a mapping made after the value
-/// is read.
+/// A lookup that finds no branch answers zero, and a refusal or a failed read of the derived id's
+/// latest or metadata fails. A lookup that finds a branch caches it, which may change the mapping,
+/// so the mapping is then read again (`unclaimed_name_mapping`). The claim's compare-and-swap
+/// refuses a mapping made after the value is read.
 async fn name_claim_expected(
     repository: Arc<RepositoryContext>,
     name: &str,
@@ -3254,10 +3438,11 @@ async fn release_archived_name(
 /// is neither a layer nor a link. Refuses the current branch, a protected branch, the default
 /// branch and a branch without a branch point. The name in the branch's metadata must map to the
 /// branch, as [`load_name_to_id`] looks it up, and otherwise the archive fails with
-/// [`BranchNotFound`]. A remote that refuses the lookup fails the archive with its refusal. A
-/// branch archived already fails the same way, unless the local store maps its name to nothing and
-/// the remote's mapping, or the id derived from the name, names the branch: the lookup caches that
-/// mapping and the remote's metadata, and the branch is archived again. Metadata that says the
+/// [`BranchNotFound`]. A remote that refuses the lookup, or a failed read of the derived id's latest
+/// or metadata, fails the archive with that error. A branch archived already fails with
+/// [`BranchNotFound`], unless the local store maps its name to nothing and the remote's mapping, or
+/// the id derived from the name, names the branch: the lookup caches that mapping and the remote's
+/// metadata, and the branch is archived again. Metadata that says the
 /// branch is archived while its name maps to it, as an older version's restore or an archive that
 /// stopped between its swap and its release leaves it, is archived the same way.
 ///
@@ -3412,7 +3597,7 @@ async fn archivable_metadata(
         branch_name.to_string()
     };
 
-    if branch_metadata.get_bool(PROTECT).unwrap_or_default() {
+    if protected(&branch_metadata) {
         return Err(BranchError::from(DeleteProtected { branch: display }));
     }
     if let Ok(repository_metadata) = repository::metadata_hash(repository.clone()).await
@@ -3739,10 +3924,9 @@ pub async fn list_output(
                     return Ok(());
                 };
 
-                let Ok(id_bytes) = metadata.get_binary(ID) else {
+                let Ok(id) = branch::id(&metadata) else {
                     return Ok(());
                 };
-                let id: BranchId = id_bytes.into();
 
                 if active_ids.contains(&id) {
                     return Ok(());

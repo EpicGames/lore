@@ -13,8 +13,6 @@ use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 use std::process::Stdio;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -22,11 +20,13 @@ use lore::repository;
 use lore::storage::close;
 use lore::storage::handle::LoreStore;
 use lore::storage::open;
-use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::interface::LoreString;
 use lore_revision::repository::LoreSharedStoreMode;
+
+use crate::call::test_support::opened_handle_id;
+use crate::call::test_support::recording_callback;
 
 /// Names, for a child process, the repository to run the probe against.
 const CHILD_REPOSITORY: &str = "LORE_LOCK_INTERLEAVE_REPOSITORY";
@@ -104,8 +104,7 @@ async fn interleave(repository: &Path, rounds: usize) -> Result<(), String> {
         return Err(format!("opening status failed: {status}"));
     }
 
-    let opened: Arc<Mutex<Option<u64>>> = Arc::default();
-    let sink = Arc::clone(&opened);
+    let (events, callback) = recording_callback();
     let code = open::open(
         globals(repository),
         open::LoreStorageOpenArgs {
@@ -113,22 +112,16 @@ async fn interleave(repository: &Path, rounds: usize) -> Result<(), String> {
             in_memory: 0,
             ..Default::default()
         },
-        Some(Box::new(move |event: &LoreEvent| {
-            if let LoreEvent::StorageOpened(data) = event
-                && let Ok(mut slot) = sink.lock()
-            {
-                *slot = Some(data.handle_id);
-            }
-        })),
+        callback,
     )
     .await;
     if code != 0 {
         return Err(format!("storage open failed: {code}"));
     }
-    let handle = opened
+    let handle = events
         .lock()
         .ok()
-        .and_then(|slot| *slot)
+        .and_then(|events| opened_handle_id(&events))
         .ok_or_else(|| "storage open emitted no handle".to_owned())?;
 
     for round in 0..rounds {

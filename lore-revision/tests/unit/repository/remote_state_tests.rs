@@ -245,28 +245,49 @@ async fn the_endpoint_replaces_a_stale_pool() {
         .await;
 }
 
-/// A link context keeps the local reads and the endpoint of the context it is derived from, and
-/// asks the endpoint for a pool on the link's partition.
+/// A link context keeps the local reads, the trust of the remote and the endpoint of the context it
+/// is derived from, and asks the endpoint for a pool on the link's partition. Each context trusts
+/// the remote where the call's globals don't, and the reverse, so the link reads with the context's
+/// trust only where it keeps it.
 #[tokio::test]
-async fn a_link_context_keeps_the_local_reads_and_the_endpoint() {
+async fn a_link_context_keeps_the_local_reads_the_remote_trust_and_the_endpoint() {
     type Build = fn(RepositoryContext) -> RepositoryContext;
-    let builds: [(Build, (bool, bool, bool)); 2] = [
-        (RepositoryContext::reading_remote_only, (false, true, false)),
-        (RepositoryContext::strict_local_reads, (true, false, true)),
+    let builds: [(Build, (bool, bool, bool, bool)); 2] = [
+        (
+            RepositoryContext::reading_remote_only,
+            (false, true, false, true),
+        ),
+        (
+            RepositoryContext::strict_local_reads,
+            (true, false, true, false),
+        ),
     ];
-    LORE_CONTEXT
-        .scope(setup_test_execution(), async {
-            for (build, expected) in builds {
+    for (build, expected) in builds {
+        let trust = expected.3;
+        let globals = LoreGlobalArgs {
+            trust_remote: u8::from(!trust),
+            ..LoreGlobalArgs::default()
+        };
+        LORE_CONTEXT
+            .scope(test_execution_with(globals), async {
                 let link_id: RepositoryId = Context::from(uuid::Uuid::now_v7()).into();
                 let (endpoint, connection) = counted_endpoint(link_id).await;
-                let context =
-                    built_context(|context| build(context).with_remote_endpoint(endpoint.clone()))
-                        .await;
+                let context = built_context(|context| {
+                    build(context)
+                        .with_remote_trust(trust)
+                        .with_remote_endpoint(endpoint.clone())
+                })
+                .await;
                 let link = context.to_link_context(link_id).await;
 
                 let options = read_options_from_repository(&link);
                 assert_eq!(
-                    (options.local, options.no_local_write, options.strict_local),
+                    (
+                        options.local,
+                        options.no_local_write,
+                        options.strict_local,
+                        options.trust_remote
+                    ),
                     expected
                 );
                 let pool = link
@@ -280,9 +301,9 @@ async fn a_link_context_keeps_the_local_reads_and_the_endpoint() {
                         .get(link_id, "c1")
                         .is_some_and(|held| Arc::ptr_eq(&held, &pool))
                 );
-            }
-        })
-        .await;
+            })
+            .await;
+    }
 }
 
 /// Only the terminal no-remote state answers yes. A failure and a connect

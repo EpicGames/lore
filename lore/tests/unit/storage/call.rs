@@ -1,37 +1,29 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use lore::storage::call::*;
 use lore::storage::handle;
 use lore::storage::handle::LoreStore;
-use lore::storage::store::StoreInternal;
-use lore::storage::store::in_memory_for_tests;
 use lore_base::error::InvalidArguments;
 use lore_error_set::FfiError;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_storage::StorageError;
 
-use crate::call::test_support::CapturedEvent;
 use crate::call::test_support::completes;
 use crate::call::test_support::has_error_event;
-use crate::call::test_support::make_callback;
-
-async fn register_test_store() -> (Arc<StoreInternal>, LoreStore) {
-    let store = in_memory_for_tests("call-test").await;
-    let store_handle = handle::register(store.clone());
-    (store, store_handle)
-}
+use crate::call::test_support::recording_callback;
+use crate::call::test_support::registered_store;
+use crate::call::test_support::take_recorded;
 
 #[tokio::test]
 async fn handle_miss_completes_with_error_code_and_no_error_event() {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = storage_call(
         LoreGlobalArgs::default(),
-        make_callback(sink.clone()),
+        callback,
         LoreStore::INVALID,
         (),
         "handle_miss_test",
@@ -39,7 +31,7 @@ async fn handle_miss_completes_with_error_code_and_no_error_event() {
     )
     .await;
 
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     assert!(
         !has_error_event(&events),
         "no Error event must be emitted on terminal failure"
@@ -64,16 +56,16 @@ async fn handle_miss_completes_with_error_code_and_no_error_event() {
 
 #[tokio::test]
 async fn happy_path_completes_with_status_zero_and_decrements_counter() {
-    let (store, store_handle) = register_test_store().await;
+    let (store, store_handle) = registered_store("call-test").await;
     assert_eq!(store.in_flight.load(Ordering::Acquire), 0);
 
     let invoked = Arc::new(AtomicU64::new(0));
     let invoked_clone = invoked.clone();
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = storage_call(
         LoreGlobalArgs::default(),
-        make_callback(sink.clone()),
+        callback,
         store_handle,
         (),
         "happy_path_test",
@@ -92,7 +84,7 @@ async fn happy_path_completes_with_status_zero_and_decrements_counter() {
         0,
         "counter must return to zero after the op"
     );
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let completes = completes(&events);
     assert_eq!(completes.len(), 1, "exactly one Complete event");
     let data = &completes[0];
@@ -105,11 +97,11 @@ async fn happy_path_completes_with_status_zero_and_decrements_counter() {
 
 #[tokio::test]
 async fn op_error_completes_with_error_code_and_no_error_event() {
-    let (store, store_handle) = register_test_store().await;
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (store, store_handle) = registered_store("call-test").await;
+    let (sink, callback) = recording_callback();
     let status = storage_call(
         LoreGlobalArgs::default(),
-        make_callback(sink.clone()),
+        callback,
         store_handle,
         (),
         "op_error_test",
@@ -126,7 +118,7 @@ async fn op_error_completes_with_error_code_and_no_error_event() {
         "counter must return to zero even on error"
     );
 
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     assert!(
         !has_error_event(&events),
         "no Error event must be emitted on terminal failure"

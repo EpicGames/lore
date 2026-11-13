@@ -23,7 +23,8 @@
 //! ```
 //!
 //! They stay compiled by every build, which is what catches a platform they no longer build
-//! on. Without the interposer the counts read as absent and the walk still runs.
+//! on. Without the interposer or the system allocator the counts read as absent, as they do
+//! off Linux, and the walk still runs.
 
 #[cfg(test)]
 mod tests {
@@ -31,31 +32,10 @@ mod tests {
 
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
+    use lore_base::test_util::allocations;
     use lore_revision::lore::RepositoryId;
 
     include!("helper.rs");
-
-    /// Allocations the process has made so far, or `None` where nothing is counting them.
-    ///
-    /// Resolved at run time rather than linked, so the test builds and runs whether or not
-    /// the interposer is preloaded.
-    #[cfg(unix)]
-    fn allocations() -> Option<u64> {
-        type Total = unsafe extern "C" fn() -> u64;
-        let symbol = unsafe { libc::dlsym(std::ptr::null_mut(), c"allocount_total".as_ptr()) };
-        if symbol.is_null() {
-            return None;
-        }
-        let total: Total = unsafe { std::mem::transmute::<*mut libc::c_void, Total>(symbol) };
-        Some(unsafe { total() })
-    }
-
-    /// Nothing counts allocations where the interposer cannot be preloaded, which leaves the
-    /// tests as what they are without it: a walk over a real tree, checked for what it reports.
-    #[cfg(not(unix))]
-    fn allocations() -> Option<u64> {
-        None
-    }
 
     /// How many files the fixture holds. Two runs at different sizes give the per-file cost
     /// without the fixture's own allocations in it.
@@ -101,7 +81,7 @@ mod tests {
                 after - before,
                 (after - before) as f64 / files as f64
             ),
-            _ => println!("scan of {files} {shape} files: no allocation counter preloaded"),
+            _ => println!("scan of {files} {shape} files: allocations not counted"),
         }
     }
 

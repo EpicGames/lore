@@ -23,6 +23,7 @@ use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
+use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
 use lore_revision::store::event::LoreStorageUploadItemCompleteEventData;
@@ -39,7 +40,6 @@ use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
 use crate::storage::invalid_item;
-use crate::storage::item_detail;
 use crate::storage::store::StoreInternal;
 
 /// One upload item — the `(partition, address)` of locally-stored content to push to remote.
@@ -210,7 +210,7 @@ fn emit_complete(
         id: item.id,
         address,
         already_durable,
-        error: item_detail(&result),
+        error: LoreErrorDetail::from_result(&result),
     })
     .send();
     result

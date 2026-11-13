@@ -736,6 +736,9 @@ pub struct RepositoryContext {
     endpoint: Option<Arc<RemoteEndpoint>>,
     /// Set by [`Self::reading_remote_only()`] and [`Self::strict_local_reads()`].
     pub(crate) local_reads: LocalReads,
+    /// Set by [`Self::with_remote_trust`]; `None` leaves the trust of the remote to the call's
+    /// globals.
+    pub(crate) remote_trust: Option<bool>,
     /// The lazy storage session this context's reads and writes carry, with the correlation id
     /// it was built for. Held strongly: a pending session re-resolves after invalidation, so one
     /// serves every operation against this context's partition under that correlation id, until
@@ -851,6 +854,7 @@ impl RepositoryContext {
             holds_its_sessions: false,
             endpoint: None,
             local_reads: LocalReads::Probe,
+            remote_trust: None,
             lazy_session: Default::default(),
             file_system,
         }
@@ -885,6 +889,7 @@ impl RepositoryContext {
             holds_its_sessions: self.holds_its_sessions,
             endpoint: self.endpoint.clone(),
             local_reads: self.local_reads,
+            remote_trust: self.remote_trust,
             lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
@@ -1149,6 +1154,16 @@ impl RepositoryContext {
         self
     }
 
+    /// This context trusting the remote as `trust` says, whatever the call's globals say, in the
+    /// reads that take their options from it: a payload fetched from a trusted remote has only its
+    /// sizes checked
+    /// ([`ReadOptions::trust_remote`](lore_storage::options::ReadOptions::trust_remote)).
+    #[must_use]
+    pub fn with_remote_trust(mut self, trust: bool) -> Self {
+        self.remote_trust = Some(trust);
+        self
+    }
+
     /// Spawn a background task that flushes pending store writes to disk.
     /// Called by the client dispatcher after a command completes.
     ///
@@ -1325,6 +1340,7 @@ impl RepositoryContext {
             holds_its_sessions: false,
             endpoint: None,
             local_reads: LocalReads::Probe,
+            remote_trust: None,
             lazy_session: Default::default(),
         }
     }

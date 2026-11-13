@@ -58,6 +58,8 @@ lore-base = { workspace = true, features = ["test-util"] }
 lore-storage = { workspace = true, features = ["test-util"] }
 # The tests that write node blocks directly (`NodeBlock::write_for_tests`).
 lore-revision = { workspace = true, features = ["test-util"] }
+# The connections the revision graph's context tests connect over (`Connection::detached`).
+lore-transport = { workspace = true, features = ["test-util"] }
 # The futures of the State node harness the C API's scenarios include.
 pin-project = { workspace = true }
 rand = { workspace = true }

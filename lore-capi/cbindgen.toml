@@ -85,9 +85,10 @@ documentation_style = "c99"
 exclude = ["FileInfo", "FilterState", "FilterStates", "FlushOptions"]
 # `LoreStore` and `LoreRevisionTree` are reachable via `lore_*_args_t::handle`
 # but cbindgen misses transitive types behind a typedef field; emit them
-# explicitly. The `lore_revision_tree_*_args_t` types live here too so the
-# args struct definitions land in the header before their extern "C" entry
-# points reference them. `LoreBytes` and `LoreErrorCode` are reachable via
+# explicitly. The `lore_revision_tree_*_args_t` and
+# `lore_revision_graph_*_args_t` types live here too so the args struct
+# definitions land in the header before their extern "C" entry points
+# reference them. `LoreBytes` and `LoreErrorCode` are reachable via
 # the `lore_*_event_data_t` variants and do not need to be listed.
 # `LoreNodeStagedAction` names the values of the `staged_action` field on the
 # child and node-info records; the field is a `uint32_t` there, as `kind` is, so
@@ -115,6 +116,9 @@ include = [
     "LoreRevisionTreeMetadataClearArgs",
     "LoreRevisionTreeCommitArgs",
     "LoreRevisionTreeCommitOptions",
+    "LoreRevisionGraphRevisionResolveArgs",
+    "LoreRevisionGraphBranchResolveArgs",
+    "LoreRevisionGraphBranchListArgs",
 ]
 
 [export.rename]
@@ -580,6 +584,10 @@ include = [
 "LoreRevisionTreeCommitCompleteEventData" = "lore_revision_tree_commit_complete_event_data_t"
 "LoreRevisionTreeCloseCompleteEventData" = "lore_revision_tree_close_complete_event_data_t"
 "LoreRevisionTreeListChildrenBeginEventData" = "lore_revision_tree_list_children_begin_event_data_t"
+"LoreRevisionGraphBranchEventData" = "lore_revision_graph_branch_event_data_t"
+"LoreRevisionGraphInstanceEventData" = "lore_revision_graph_instance_event_data_t"
+"LoreRevisionGraphRevisionEventData" = "lore_revision_graph_revision_event_data_t"
+"LoreRevisionGraphLocationCompleteEventData" = "lore_revision_graph_location_complete_event_data_t"
 "LoreRevisionTree" = "lore_revision_tree_t"
 "LoreRevisionTreeLoadArgs" = "lore_revision_tree_load_args_t"
 "LoreRevisionTreeCloseArgs" = "lore_revision_tree_close_args_t"
@@ -611,6 +619,10 @@ include = [
 "LoreArray_lore_revision_tree_metadata_get_entry" = "lore_revision_tree_metadata_get_entry_array_t"
 "LoreRevisionTreeCommitArgs" = "lore_revision_tree_commit_args_t"
 "LoreRevisionTreeCommitOptions" = "lore_revision_tree_commit_options_t"
+"LoreRevisionIdentifier" = "lore_revision_identifier_t"
+"LoreRevisionGraphRevisionResolveArgs" = "lore_revision_graph_revision_resolve_args_t"
+"LoreRevisionGraphBranchResolveArgs" = "lore_revision_graph_branch_resolve_args_t"
+"LoreRevisionGraphBranchListArgs" = "lore_revision_graph_branch_list_args_t"
 "LoreString" = "lore_string_t"
 "LoreArray_instance_id" = "lore_instance_id_array_t"
 "LoreStringArray" = "lore_string_array_t"

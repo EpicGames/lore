@@ -7,6 +7,7 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Response;
+use lore_base::test_util::closed_port_url;
 use lore_transport::Authentication;
 use lore_transport::auth::AuthMode;
 use lore_transport::auth::authentication;
@@ -463,8 +464,7 @@ async fn an_answer_in_no_known_shape_fails_the_poll() {
 /// gRPC auth service is.
 #[tokio::test]
 async fn an_unreachable_endpoint_is_a_disconnection() {
-    let closed = closed_port();
-    let unreachable = closed.url.clone();
+    let unreachable = closed_port_url("http");
     let provider = spawn_recording_provider(move |issuer, _, _| {
         json(&serde_json::json!({
             "issuer": issuer,

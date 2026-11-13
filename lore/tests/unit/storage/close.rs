@@ -10,11 +10,8 @@ use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
 use lore::revision_tree::handle as tree_handle;
 use lore::revision_tree::handle::LoreRevisionTree;
-use lore::revision_tree::load::LoreRevisionTreeLoadArgs;
-use lore::revision_tree::load::load;
 use lore::storage::close::*;
 use lore::storage::handle;
-use lore::storage::handle::LoreStore;
 use lore::storage::store::OpGuard;
 use lore::storage::store::disk_backed_for_tests;
 use lore::storage::store::in_memory_for_tests;
@@ -38,6 +35,8 @@ use lore_storage::test_util::fail_packfile_syncs;
 use lore_storage::test_util::pause_at;
 
 use super::put_payload;
+use crate::call::test_support::registered_store;
+use crate::revision_tree::support::load_tree;
 
 /// Whether this process holds the lock of the store directory `name` under `root`.
 fn held(root: &Path, name: &str) -> bool {
@@ -46,41 +45,13 @@ fn held(root: &Path, name: &str) -> bool {
         .is_held()
 }
 
-/// Load a revision tree against an already-registered storage handle.
-async fn load_revision_tree(store_handle: LoreStore, repository: Partition) -> LoreRevisionTree {
-    let loaded: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
-    let sink = loaded.clone();
-    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
-        if let LoreEvent::RevisionTreeLoaded(data) = event {
-            *sink.lock().unwrap() = Some(data.handle_id);
-        }
-    }));
-    let status = load(
-        LoreGlobalArgs::default(),
-        LoreRevisionTreeLoadArgs {
-            store: store_handle,
-            repository,
-            revision_hash: Hash::default(),
-        },
-        callback,
-    )
-    .await;
-    assert_eq!(status, 0, "loading the revision tree fixture must succeed");
-    let handle_id = loaded
-        .lock()
-        .unwrap()
-        .expect("load must emit RevisionTreeLoaded");
-    LoreRevisionTree { handle_id }
-}
-
 /// Close must block until the in-flight counter drains. An `OpGuard` held by the test keeps
 /// the counter > 0; close's `mark_invalid_and_await` must not complete until the guard
 /// drops.
 #[allow(clippy::disallowed_methods)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn close_waits_for_in_flight_counter_to_drain() {
-    let store = in_memory_for_tests("close-wait-test").await;
-    let store_handle = handle::register(store.clone());
+    let (_store, store_handle) = registered_store("close-wait-test").await;
     let guard = OpGuard::enter(store_handle).expect("enter must succeed");
 
     let close_task = tokio::spawn(async move {
@@ -312,7 +283,7 @@ async fn the_store_tears_down_only_once_the_last_revision_handle_closes() {
     let store = in_memory_for_tests("close-refcount").await;
     let alive = Arc::downgrade(&store);
     let store_handle = handle::register(store);
-    let tree = load_revision_tree(store_handle, Partition::from([0x1Au8; 16])).await;
+    let tree = load_tree(store_handle, Partition::from([0x1Au8; 16])).await;
 
     let status = close(
         LoreGlobalArgs::default(),
@@ -503,7 +474,7 @@ async fn tree_after_storage_close(
     let store = disk_backed_for_tests("tree-after-storage-close", root).await;
     let stores = (store.immutable.clone(), store.mutable.clone());
     let store_handle = handle::register(store);
-    let tree = load_revision_tree(store_handle, repository).await;
+    let tree = load_tree(store_handle, repository).await;
     let status = close(
         LoreGlobalArgs::default(),
         LoreStorageCloseArgs {

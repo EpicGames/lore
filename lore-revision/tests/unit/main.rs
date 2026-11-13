@@ -27,7 +27,6 @@ mod global;
 #[path = "../helper.rs"]
 mod helper;
 mod history;
-mod hooked_store;
 mod immutable;
 mod infer;
 mod instance;

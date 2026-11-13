@@ -3,16 +3,35 @@
 //! Probes a test reads and arms inside the library, points where it stops a branch write, and
 //! fixtures tests build on, built with the `test-util` feature.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use bytes::Bytes;
+use lore_base::error::NoRemote;
+use lore_base::types::Context;
+use lore_storage::ImmutableStore;
+use lore_storage::MutableStore;
+use lore_storage::WriteOptions;
+use lore_transport::ProtocolError;
 use tokio::sync::Notify;
 
 use crate::fs::filesystem_provider::FsError;
+use crate::instance;
+use crate::instance::InstanceId;
+use crate::lore::BranchId;
+use crate::lore::Hash;
+use crate::lore::RepositoryId;
+use crate::repository::DOT_LORE;
+use crate::repository::INSTANCE;
 use crate::repository::RemoteState;
 use crate::repository::RepositoryContext;
+use crate::repository::RepositoryContextCreationArgs;
+use crate::repository::RepositoryWriteToken;
+use crate::state::State;
+use crate::state::StateData;
 
 /// A path-less context on fresh in-memory stores whose remote is in `state`, so everything but
 /// the remote is valid.
@@ -38,6 +57,89 @@ pub async fn context_built(
         Arc::default(),
         None,
     )))
+}
+
+/// Registers a new instance of `repository` in the stores `immutable` and `mutable` at `dir`, with
+/// `branch` and `revision` as its current branch and revision, and writes `<dir>/.lore/instance`
+/// holding its id, so the registration reads as live. Returns the instance's id. The writes run
+/// in the caller's execution context.
+pub async fn register_live_instance(
+    immutable: Arc<dyn ImmutableStore>,
+    mutable: Arc<dyn MutableStore>,
+    repository: RepositoryId,
+    branch: BranchId,
+    revision: Hash,
+    dir: &Path,
+) -> InstanceId {
+    let instance_id = InstanceId::generate();
+    let context = Arc::new(
+        RepositoryContext::new(RepositoryContextCreationArgs {
+            paths: None,
+            immutable_store: immutable,
+            mutable_store: mutable,
+            id: repository,
+            instance_id,
+            remote: Err(ProtocolError::from(NoRemote)),
+            filter: Arc::default(),
+            filesystem_provider: None,
+        })
+        .with_write_token(RepositoryWriteToken::acquire(dir).await),
+    );
+    instance::register_instance(&context, instance_id, &dir.display().to_string())
+        .await
+        .expect("registers the instance");
+    instance::store_current_anchor_branch(&context, branch)
+        .await
+        .expect("stores the current branch");
+    instance::store_current_anchor(&context, revision)
+        .await
+        .expect("stores the current revision");
+    let dot_lore = dir.join(DOT_LORE);
+    lore_io::IoDriver::global()
+        .create_dir_all(&dot_lore)
+        .await
+        .expect("creates the Lore directory");
+    instance_id
+        .write_to_file(dot_lore.join(INSTANCE))
+        .await
+        .expect("writes the instance file");
+    instance_id
+}
+
+/// Writes through `repository` a revision numbered `number` whose self parent is `parent` and whose
+/// metadata hash is `metadata`, and returns its hash.
+pub async fn write_state_revision(
+    repository: &Arc<RepositoryContext>,
+    parent: Hash,
+    number: u64,
+    metadata: Hash,
+) -> Hash {
+    let token = repository
+        .try_write_token()
+        .expect("the context carries a write token");
+    let state = State::new();
+    state.set_parent_self(parent);
+    state.set_revision_number(number);
+    state.set_metadata_hash(metadata);
+    state
+        .serialize(repository.clone(), token)
+        .await
+        .expect("writes the revision state")
+}
+
+/// Writes through `repository` a blob of a revision state's size that is not a revision state:
+/// zeroed, so its header lacks the state magic. Read as a state, it is a revision numbered 0
+/// without parents. Returns its hash.
+pub async fn write_not_a_state(repository: &Arc<RepositoryContext>) -> Hash {
+    crate::immutable::write(
+        repository.clone(),
+        Context::default(),
+        Bytes::from(vec![0u8; size_of::<StateData>()]),
+        WriteOptions::default(),
+    )
+    .await
+    .expect("writes the blob")
+    .hash
 }
 
 /// The tasks one walk spawns: counts those live, for a test to read the peak, holds each one

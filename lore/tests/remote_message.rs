@@ -26,6 +26,7 @@ use lore_base::env::CallEnvironment;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
+use lore_base::types::Partition;
 use lore_revision::event::LoreBytes;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
@@ -656,6 +657,131 @@ async fn shared_store_list_args_survive_the_wire() {
     match relayed(LoreCommand::SharedStoreList(args.clone())) {
         LoreCommand::SharedStoreList(read_back) => {
             assert_eq!(read_back, args, "must carry every field unchanged");
+        }
+        other => panic!("Unexpected command: {other:?}"),
+    }
+}
+
+/// A branch list relayed to the service carries its creator filter byte for byte, since the filter
+/// matches exactly and case-sensitively, and an empty filter, which keeps every creator.
+#[test]
+fn revision_graph_branch_list_survives_the_wire() {
+    use lore::revision_graph::branch_list::LoreRevisionGraphBranchListArgs;
+    use lore::storage::handle::LoreStore;
+
+    let filtered = LoreRevisionGraphBranchListArgs {
+        id: 31,
+        store: LoreStore { handle_id: 6 },
+        repository: Partition::from([0x5au8; 16]),
+        include_archived: 1,
+        creator: LoreString::from_str("Åsa.Builder"),
+    };
+    let unfiltered = LoreRevisionGraphBranchListArgs {
+        creator: LoreString::default(),
+        include_archived: 0,
+        ..filtered.clone()
+    };
+
+    for args in [filtered, unfiltered] {
+        match relayed(LoreCommand::RevisionGraphBranchList(args.clone())) {
+            LoreCommand::RevisionGraphBranchList(read_back) => {
+                assert_eq!(read_back, args, "must carry every field unchanged");
+            }
+            other => panic!("Unexpected command: {other:?}"),
+        }
+    }
+}
+
+/// The revision graph commands follow the commands that preceded them. Bitcode names a variant by
+/// its position, in the first byte of the encoding, so a command added ahead of another shifts the
+/// variant the other decodes as: the last of the earlier commands keeps the bytes it encodes as
+/// without the revision graph commands, the revision graph commands take the positions after it in
+/// the order they landed, and each reads back as itself.
+#[test]
+fn revision_graph_commands_follow_the_last_existing_command() {
+    use lore::repository::LoreRepositoryInstanceCloneArgs;
+    use lore::revision_graph::LoreRevisionIdentifier;
+    use lore::revision_graph::branch_list::LoreRevisionGraphBranchListArgs;
+    use lore::revision_graph::branch_resolve::LoreRevisionGraphBranchResolveArgs;
+    use lore::revision_graph::revision_resolve::LoreRevisionGraphRevisionResolveArgs;
+    use lore::storage::handle::LoreStore;
+
+    const LAST_EXISTING_COMMAND: [u8; 10] = [161, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    assert_eq!(
+        bitcode::encode(&LoreCommand::RepositoryInstanceClone(
+            LoreRepositoryInstanceCloneArgs {
+                target_path: LoreString::default(),
+                allow_copy: 0,
+            }
+        )),
+        LAST_EXISTING_COMMAND,
+        "the last command before the revision graph commands must keep its encoding"
+    );
+    for (offset, command) in [
+        (1, LoreCommand::RevisionGraphBranchList(Default::default())),
+        (
+            2,
+            LoreCommand::RevisionGraphRevisionResolve(Default::default()),
+        ),
+        (
+            3,
+            LoreCommand::RevisionGraphBranchResolve(Default::default()),
+        ),
+    ] {
+        assert_eq!(
+            bitcode::encode(&command)[0],
+            LAST_EXISTING_COMMAND[0] + offset,
+            "{command:?} must take position {offset} after the last earlier command"
+        );
+    }
+
+    let revision_resolve = LoreRevisionGraphRevisionResolveArgs {
+        id: 11,
+        store: LoreStore { handle_id: 4 },
+        repository: Partition::from([0x21u8; 16]),
+        revision: LoreRevisionIdentifier {
+            hash: Hash::default(),
+            branch: Context::from([0x42u8; 16]),
+            revision_number: 25,
+        },
+    };
+    match relayed(LoreCommand::RevisionGraphRevisionResolve(
+        revision_resolve.clone(),
+    )) {
+        LoreCommand::RevisionGraphRevisionResolve(read_back) => {
+            assert_eq!(
+                read_back, revision_resolve,
+                "must carry every field unchanged"
+            );
+        }
+        other => panic!("Unexpected command: {other:?}"),
+    }
+
+    let branch_resolve = LoreRevisionGraphBranchResolveArgs {
+        id: 12,
+        store: LoreStore { handle_id: 4 },
+        repository: Partition::from([0x21u8; 16]),
+        name: LoreString::from_str("release/5.4"),
+    };
+    match relayed(LoreCommand::RevisionGraphBranchResolve(
+        branch_resolve.clone(),
+    )) {
+        LoreCommand::RevisionGraphBranchResolve(read_back) => {
+            assert_eq!(
+                read_back, branch_resolve,
+                "must carry every field unchanged"
+            );
+        }
+        other => panic!("Unexpected command: {other:?}"),
+    }
+
+    let branch_list = LoreRevisionGraphBranchListArgs {
+        id: 13,
+        ..Default::default()
+    };
+    match relayed(LoreCommand::RevisionGraphBranchList(branch_list.clone())) {
+        LoreCommand::RevisionGraphBranchList(read_back) => {
+            assert_eq!(read_back, branch_list, "must carry every field unchanged");
         }
         other => panic!("Unexpected command: {other:?}"),
     }

@@ -17,6 +17,7 @@ mod move_node;
 mod node_info;
 mod node_path;
 mod resolve_path;
+pub(crate) mod support;
 
 /// Round-trip a `RevisionTreeInternal` through the registry: a fresh
 /// registration produces a non-zero handle; `lookup` returns the same

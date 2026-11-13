@@ -18,6 +18,7 @@ use lore_revision::interface::ExecutionContext;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::relay::EventDispatcher;
 use lore_revision::repository::RemoteState;
+use lore_revision::test_util::context_built;
 use lore_revision::test_util::context_with_state;
 use lore_storage::options::ReadOptions;
 use lore_storage::options::WriteOptions;
@@ -289,6 +290,26 @@ async fn reads_trust_the_remote_where_the_globals_do() {
     })
     .await;
     assert!(!untrusting.trust_remote && trusting.trust_remote);
+}
+
+/// A context that says whether to trust the remote is read as it says, whatever the globals say.
+#[tokio::test]
+async fn reads_trust_the_remote_as_the_context_says_over_the_globals() {
+    for trust in [false, true] {
+        let context = context_built(RemoteState::Offline, |context| {
+            context.with_remote_trust(trust)
+        })
+        .await;
+        let globals = LoreGlobalArgs {
+            trust_remote: u8::from(!trust),
+            ..LoreGlobalArgs::default()
+        };
+
+        let options =
+            under_globals(globals, || async { read_options_from_repository(&context) }).await;
+
+        assert_eq!(options.trust_remote, trust);
+    }
 }
 
 /// Repository calls under one correlation id share the session pool the connection pins for

@@ -2,19 +2,12 @@
 // SPDX-License-Identifier: MIT
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::Mutex;
 
 use lore::call::setup_execution;
-use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
 use lore::revision_tree::handle as rt_handle;
 use lore::revision_tree::handle::LoreRevisionTree;
 use lore::revision_tree::list_children::*;
-use lore::revision_tree::load::LoreRevisionTreeLoadArgs;
-use lore::revision_tree::load::load;
-use lore::storage::handle as storage_handle;
-use lore::storage::store::in_memory_for_tests;
 use lore_base::error::InvalidArguments;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
@@ -30,119 +23,38 @@ use lore_revision::node::Node;
 use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
-use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
-use lore_revision::state::State;
 use lore_storage::hash::hash_string;
 
-#[derive(Debug, Clone, PartialEq)]
-enum CapturedEvent {
-    Error(u32),
-    Complete(i32),
-    RevisionTreeLoaded(u64),
-    Child {
-        id: u64,
-        name: String,
-        kind: u32,
-        mode: u16,
-        size: u64,
-        address: Address,
-        error_code: LoreErrorCode,
-    },
-    Begin {
-        id: u64,
-        repository: RepositoryId,
-        revision: Hash,
-        error_code: LoreErrorCode,
-    },
-    Other(u32),
-}
+use crate::call::test_support::complete_statuses;
+use crate::call::test_support::recording_callback;
+use crate::call::test_support::take_recorded;
+use crate::revision_tree::support::handle_state;
+use crate::revision_tree::support::load_handle;
+use crate::revision_tree::support::release;
 
-impl CapturedEvent {
-    fn from_event(event: &LoreEvent) -> Self {
-        match event {
-            LoreEvent::Error(data) => Self::Error(data.error_type),
-            LoreEvent::Complete(data) => Self::Complete(data.status),
-            LoreEvent::RevisionTreeLoaded(data) => Self::RevisionTreeLoaded(data.handle_id),
-            LoreEvent::RevisionTreeChild(data) => Self::Child {
-                id: data.id,
-                name: data.name.as_str().to_string(),
-                kind: data.kind,
-                mode: data.mode,
-                size: data.size,
-                address: data.address,
-                error_code: data.error_code,
-            },
-            LoreEvent::RevisionTreeListChildrenBegin(data) => Self::Begin {
-                id: data.id,
-                repository: data.repository,
-                revision: data.revision,
-                error_code: data.error_code,
-            },
-            other => Self::Other(other.discriminant()),
-        }
-    }
-}
-
-fn make_callback(sink: Arc<Mutex<Vec<CapturedEvent>>>) -> LoreEventCallback {
-    Some(Box::new(move |event: &LoreEvent| {
-        sink.lock().unwrap().push(CapturedEvent::from_event(event));
-    }))
-}
-
-fn children(events: &[CapturedEvent]) -> Vec<(u64, String, u32, LoreErrorCode)> {
+fn children(events: &[LoreEvent]) -> Vec<(u64, String, u32, LoreErrorCode)> {
     events
         .iter()
         .filter_map(|event| match event {
-            CapturedEvent::Child {
-                id,
-                name,
-                kind,
-                error_code,
-                ..
-            } => Some((*id, name.clone(), *kind, *error_code)),
+            LoreEvent::RevisionTreeChild(data) => Some((
+                data.id,
+                data.name.as_str().to_string(),
+                data.kind,
+                data.error_code,
+            )),
             _ => None,
         })
         .collect()
 }
 
-fn begin(events: &[CapturedEvent]) -> Option<(u64, RepositoryId, Hash, LoreErrorCode)> {
+fn begin(events: &[LoreEvent]) -> Option<(u64, RepositoryId, Hash, LoreErrorCode)> {
     events.iter().find_map(|event| match event {
-        CapturedEvent::Begin {
-            id,
-            repository,
-            revision,
-            error_code,
-        } => Some((*id, *repository, *revision, *error_code)),
+        LoreEvent::RevisionTreeListChildrenBegin(data) => {
+            Some((data.id, data.repository, data.revision, data.error_code))
+        }
         _ => None,
     })
-}
-
-async fn load_handle(label: &str, repository: Partition) -> (LoreRevisionTree, u64) {
-    let store = in_memory_for_tests(label).await;
-    let store_handle = storage_handle::register(store);
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let status = load(
-        LoreGlobalArgs::default(),
-        LoreRevisionTreeLoadArgs {
-            store: store_handle,
-            repository,
-            revision_hash: Hash::default(),
-        },
-        make_callback(sink.clone()),
-    )
-    .await;
-    assert_eq!(status, 0, "load fixture must succeed");
-    let id = sink
-        .lock()
-        .unwrap()
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::RevisionTreeLoaded(id) => Some(*id),
-            _ => None,
-        })
-        .expect("load fixture must emit RevisionTreeLoaded");
-    (LoreRevisionTree { handle_id: id }, store_handle.handle_id)
 }
 
 /// Add a child directly via `State::node_add` (the staging-path allocator)
@@ -208,13 +120,6 @@ async fn add_file_with_metadata(
             },
         )
         .await
-}
-
-fn handle_state(handle: LoreRevisionTree) -> (Arc<State>, Arc<RepositoryContext>) {
-    let entry = rt_handle::REGISTRY
-        .get(&handle.handle_id)
-        .expect("handle registered");
-    (entry.state_for_tests(), entry.repository_context.clone())
 }
 
 /// Add a link node under root targeting `(repository, revision, target_node)`.
@@ -302,17 +207,10 @@ async fn seal(handle: LoreRevisionTree) -> Hash {
         .await
 }
 
-fn release(handle: LoreRevisionTree, store_handle_id: u64) {
-    rt_handle::unregister(handle);
-    storage_handle::unregister(lore::storage::handle::LoreStore {
-        handle_id: store_handle_id,
-    });
-}
-
 #[tokio::test]
 async fn list_children_empty_directory_emits_begin_then_complete() {
     let (handle, store_handle_id) = load_handle("lc-empty", Partition::from([0x11u8; 16])).await;
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
 
     let status = list_children(
         LoreGlobalArgs::default(),
@@ -321,18 +219,18 @@ async fn list_children_empty_directory_emits_begin_then_complete() {
             handle,
             parent_node_id: ROOT_NODE,
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
     assert_eq!(status, 0, "listing an empty directory must succeed");
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     assert!(
         children(&events).is_empty(),
         "an empty directory must emit no child events, got {events:?}"
     );
     assert!(
-        events.contains(&CapturedEvent::Complete(0)),
+        complete_statuses(&events).contains(&0),
         "must complete with status=0, got {events:?}"
     );
     let (begin_id, begin_repository, _begin_revision, begin_error) =
@@ -351,7 +249,7 @@ async fn list_children_emits_one_event_per_child() {
     add_child(handle, "beta", true).await;
     add_child(handle, "subdir", false).await;
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = list_children(
         LoreGlobalArgs::default(),
         LoreRevisionTreeListChildrenArgs {
@@ -359,12 +257,12 @@ async fn list_children_emits_one_event_per_child() {
             handle,
             parent_node_id: ROOT_NODE,
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
     assert_eq!(status, 0);
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let observed: BTreeSet<(String, u32)> = children(&events)
         .into_iter()
         .map(|(id, name, kind, error_code)| {
@@ -384,7 +282,7 @@ async fn list_children_emits_one_event_per_child() {
         observed, expected,
         "every child must be emitted once with its name and kind, got {events:?}"
     );
-    assert!(events.contains(&CapturedEvent::Complete(0)));
+    assert!(complete_statuses(&events).contains(&0));
     let (begin_id, begin_repository, _begin_revision, begin_error) =
         begin(&events).expect("begin event must fire");
     assert_eq!(begin_id, 2);
@@ -393,11 +291,11 @@ async fn list_children_emits_one_event_per_child() {
 
     let begin_index = events
         .iter()
-        .position(|event| matches!(event, CapturedEvent::Begin { .. }))
+        .position(|event| matches!(event, LoreEvent::RevisionTreeListChildrenBegin(_)))
         .expect("begin event must fire");
     let first_child_index = events
         .iter()
-        .position(|event| matches!(event, CapturedEvent::Child { .. }))
+        .position(|event| matches!(event, LoreEvent::RevisionTreeChild(_)))
         .expect("at least one child must fire");
     assert!(
         begin_index < first_child_index,
@@ -412,7 +310,7 @@ async fn list_children_leaf_node_returns_invalid_arguments() {
     let (handle, store_handle_id) = load_handle("lc-leaf", Partition::from([0x33u8; 16])).await;
     let file_id = add_child(handle, "file", true).await;
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = list_children(
         LoreGlobalArgs::default(),
         LoreRevisionTreeListChildrenArgs {
@@ -420,7 +318,7 @@ async fn list_children_leaf_node_returns_invalid_arguments() {
             handle,
             parent_node_id: file_id,
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
@@ -429,7 +327,7 @@ async fn list_children_leaf_node_returns_invalid_arguments() {
         InvalidArguments::FFI_CODE,
         "listing a leaf node must fail"
     );
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let (begin_id, _begin_repository, _begin_revision, begin_error) =
         begin(&events).expect("begin event must fire");
     assert_eq!(begin_id, 3);
@@ -442,7 +340,7 @@ async fn list_children_leaf_node_returns_invalid_arguments() {
         children(&events).is_empty(),
         "a failed listing must emit no children, got {events:?}"
     );
-    assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
+    assert!(complete_statuses(&events).contains(&InvalidArguments::FFI_CODE));
 
     release(handle, store_handle_id);
 }
@@ -451,7 +349,7 @@ async fn list_children_leaf_node_returns_invalid_arguments() {
 async fn list_children_unknown_node_returns_invalid_arguments() {
     let (handle, store_handle_id) = load_handle("lc-unknown", Partition::from([0x44u8; 16])).await;
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = list_children(
         LoreGlobalArgs::default(),
         LoreRevisionTreeListChildrenArgs {
@@ -459,7 +357,7 @@ async fn list_children_unknown_node_returns_invalid_arguments() {
             handle,
             parent_node_id: INVALID_NODE,
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
@@ -468,7 +366,7 @@ async fn list_children_unknown_node_returns_invalid_arguments() {
         InvalidArguments::FFI_CODE,
         "listing an unknown node must fail"
     );
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let (begin_id, _begin_repository, _begin_revision, begin_error) =
         begin(&events).expect("begin event must fire");
     assert_eq!(begin_id, 4);
@@ -478,7 +376,7 @@ async fn list_children_unknown_node_returns_invalid_arguments() {
         "an unknown parent must report InvalidArguments on the begin event, got {events:?}"
     );
     assert!(children(&events).is_empty());
-    assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
+    assert!(complete_statuses(&events).contains(&InvalidArguments::FFI_CODE));
 
     release(handle, store_handle_id);
 }
@@ -491,7 +389,7 @@ async fn list_children_streams_every_child_of_a_large_directory() {
         add_child(handle, &format!("child-{index}"), true).await;
     }
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = list_children(
         LoreGlobalArgs::default(),
         LoreRevisionTreeListChildrenArgs {
@@ -499,12 +397,12 @@ async fn list_children_streams_every_child_of_a_large_directory() {
             handle,
             parent_node_id: ROOT_NODE,
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
     assert_eq!(status, 0);
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let emitted = children(&events);
     assert_eq!(
         emitted.len(),
@@ -532,7 +430,7 @@ async fn list_children_child_event_carries_node_metadata() {
     };
     add_file_with_metadata(handle, "doc.md", 0o644, 1234, address).await;
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = list_children(
         LoreGlobalArgs::default(),
         LoreRevisionTreeListChildrenArgs {
@@ -540,24 +438,22 @@ async fn list_children_child_event_carries_node_metadata() {
             handle,
             parent_node_id: ROOT_NODE,
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
     assert_eq!(status, 0);
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let entry = events
         .iter()
         .find_map(|event| match event {
-            CapturedEvent::Child {
-                name,
-                kind,
-                mode,
-                size,
-                address,
-                error_code,
-                ..
-            } if name == "doc.md" => Some((*kind, *mode, *size, *address, *error_code)),
+            LoreEvent::RevisionTreeChild(data) if data.name.as_str() == "doc.md" => Some((
+                data.kind,
+                data.mode,
+                data.size,
+                data.address,
+                data.error_code,
+            )),
             _ => None,
         })
         .expect("child event for doc.md");
@@ -587,7 +483,7 @@ async fn list_children_reports_a_link_child_as_a_link() {
     )
     .await;
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = list_children(
         LoreGlobalArgs::default(),
         LoreRevisionTreeListChildrenArgs {
@@ -595,12 +491,12 @@ async fn list_children_reports_a_link_child_as_a_link() {
             handle,
             parent_node_id: ROOT_NODE,
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
     assert_eq!(status, 0);
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let entries: BTreeSet<(String, u32)> = children(&events)
         .into_iter()
         .map(|(_, name, kind, _)| (name, kind))
@@ -624,7 +520,7 @@ async fn list_children_through_a_link_lists_the_target_children() {
     let target_revision = seal_target(handle, "doc").await;
     let link_id = add_link(handle, "link", repository, target_revision, ROOT_NODE).await;
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = list_children(
         LoreGlobalArgs::default(),
         LoreRevisionTreeListChildrenArgs {
@@ -632,12 +528,12 @@ async fn list_children_through_a_link_lists_the_target_children() {
             handle,
             parent_node_id: link_id,
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
     assert_eq!(status, 0, "listing through a link must succeed");
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let (_, begin_repository, begin_revision, begin_error) =
         begin(&events).expect("begin event must fire");
     assert_eq!(begin_error, LoreErrorCode::None);
@@ -663,7 +559,7 @@ async fn list_children_through_a_link_lists_the_target_children() {
 
 #[tokio::test]
 async fn list_children_on_unknown_handle_emits_begin_with_invalid_arguments() {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
 
     let status = list_children(
         LoreGlobalArgs::default(),
@@ -672,7 +568,7 @@ async fn list_children_on_unknown_handle_emits_begin_with_invalid_arguments() {
             handle: LoreRevisionTree::INVALID,
             parent_node_id: ROOT_NODE,
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
@@ -681,7 +577,7 @@ async fn list_children_on_unknown_handle_emits_begin_with_invalid_arguments() {
         InvalidArguments::FFI_CODE,
         "listing against an unknown handle must fail"
     );
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let (begin_id, _begin_repository, _begin_revision, begin_error) =
         begin(&events).expect("a handle miss must still emit the begin header carrying the id");
     assert_eq!(begin_id, 9);
@@ -691,7 +587,7 @@ async fn list_children_on_unknown_handle_emits_begin_with_invalid_arguments() {
         "a handle miss must report InvalidArguments on the begin event, got {events:?}"
     );
     assert!(children(&events).is_empty());
-    assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
+    assert!(complete_statuses(&events).contains(&InvalidArguments::FFI_CODE));
 }
 
 #[tokio::test]
@@ -702,7 +598,7 @@ async fn list_children_through_a_link_to_a_leaf_returns_invalid_arguments() {
     let target_revision = seal(handle).await;
     let link_id = add_link(handle, "link", repository, target_revision, file_id).await;
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = list_children(
         LoreGlobalArgs::default(),
         LoreRevisionTreeListChildrenArgs {
@@ -710,7 +606,7 @@ async fn list_children_through_a_link_to_a_leaf_returns_invalid_arguments() {
             handle,
             parent_node_id: link_id,
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
@@ -719,7 +615,7 @@ async fn list_children_through_a_link_to_a_leaf_returns_invalid_arguments() {
         InvalidArguments::FFI_CODE,
         "a link resolving to a leaf must fail"
     );
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let (_, _begin_repository, _begin_revision, begin_error) =
         begin(&events).expect("begin event must fire");
     assert_eq!(
@@ -739,7 +635,7 @@ async fn list_children_through_a_dangling_link_returns_invalid_arguments() {
     let target_revision = seal_target(handle, "doc").await;
     let link_id = add_link(handle, "link", repository, target_revision, 1_000_000).await;
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = list_children(
         LoreGlobalArgs::default(),
         LoreRevisionTreeListChildrenArgs {
@@ -747,7 +643,7 @@ async fn list_children_through_a_dangling_link_returns_invalid_arguments() {
             handle,
             parent_node_id: link_id,
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
@@ -756,7 +652,7 @@ async fn list_children_through_a_dangling_link_returns_invalid_arguments() {
         InvalidArguments::FFI_CODE,
         "a link to a missing node must fail"
     );
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let (_, _begin_repository, _begin_revision, begin_error) =
         begin(&events).expect("begin event must fire");
     assert_eq!(

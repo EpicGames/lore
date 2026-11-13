@@ -1,22 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::Mutex;
 
 use lore::call::setup_execution;
-use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddEntry;
 use lore::revision_tree::add::add;
-use lore::revision_tree::handle as rt_handle;
 use lore::revision_tree::handle::LoreRevisionTree;
-use lore::revision_tree::load::LoreRevisionTreeLoadArgs;
-use lore::revision_tree::load::load;
 use lore::revision_tree::resolve_path::*;
-use lore::storage::handle as storage_handle;
-use lore::storage::store::in_memory_for_tests;
 use lore_base::error::InvalidArguments;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
@@ -34,67 +26,30 @@ use lore_revision::node::Node;
 use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
-use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
-use lore_revision::state::State;
 use lore_storage::hash::hash_string;
 
-#[derive(Debug, Clone, PartialEq)]
-enum CapturedEvent {
-    Error(u32),
-    Complete(i32),
-    RevisionTreeLoaded(u64),
-    AddComplete(u64, NodeID, LoreErrorCode),
-    ResolvePathComplete(u64, NodeID, RepositoryId, Hash, LoreErrorCode),
-    Other(u32),
-}
-
-impl CapturedEvent {
-    fn from_event(event: &LoreEvent) -> Self {
-        match event {
-            LoreEvent::Error(data) => Self::Error(data.error_type),
-            LoreEvent::Complete(data) => Self::Complete(data.status),
-            LoreEvent::RevisionTreeLoaded(data) => Self::RevisionTreeLoaded(data.handle_id),
-            LoreEvent::RevisionTreeAddComplete(data) => {
-                Self::AddComplete(data.entry_id, data.node_id, data.error_code)
-            }
-            LoreEvent::RevisionTreeResolvePathComplete(data) => Self::ResolvePathComplete(
-                data.id,
-                data.node_id,
-                data.repository,
-                data.revision,
-                data.error_code,
-            ),
-            other => Self::Other(other.discriminant()),
-        }
-    }
-}
-
-fn make_callback(sink: Arc<Mutex<Vec<CapturedEvent>>>) -> LoreEventCallback {
-    Some(Box::new(move |event: &LoreEvent| {
-        sink.lock().unwrap().push(CapturedEvent::from_event(event));
-    }))
-}
+use crate::call::test_support::complete_statuses;
+use crate::call::test_support::recording_callback;
+use crate::call::test_support::take_recorded;
+use crate::revision_tree::support::add_outcome;
+use crate::revision_tree::support::handle_state;
+use crate::revision_tree::support::load_handle;
+use crate::revision_tree::support::release;
 
 fn resolve_outcome(
-    events: &[CapturedEvent],
+    events: &[LoreEvent],
     id: u64,
 ) -> Option<(NodeID, RepositoryId, Hash, LoreErrorCode)> {
     events.iter().find_map(|event| match event {
-        CapturedEvent::ResolvePathComplete(event_id, node_id, repository, revision, error_code)
-            if *event_id == id =>
-        {
-            Some((*node_id, *repository, *revision, *error_code))
-        }
+        LoreEvent::RevisionTreeResolvePathComplete(data) if data.id == id => Some((
+            data.node_id,
+            data.repository,
+            data.revision,
+            data.error_code,
+        )),
         _ => None,
     })
-}
-
-fn handle_state(handle: LoreRevisionTree) -> (Arc<State>, Arc<RepositoryContext>) {
-    let entry = rt_handle::REGISTRY
-        .get(&handle.handle_id)
-        .expect("handle registered");
-    (entry.state_for_tests(), entry.repository_context.clone())
 }
 
 /// Add a link node under root targeting `(repository, revision, target_node)`.
@@ -160,45 +115,11 @@ async fn seal_target(handle: LoreRevisionTree, child_name: &str) -> Hash {
         .await
 }
 
-async fn load_handle(label: &str, repository: Partition) -> (LoreRevisionTree, u64) {
-    let store = in_memory_for_tests(label).await;
-    let store_handle = storage_handle::register(store);
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let status = load(
-        LoreGlobalArgs::default(),
-        LoreRevisionTreeLoadArgs {
-            store: store_handle,
-            repository,
-            revision_hash: Hash::default(),
-        },
-        make_callback(sink.clone()),
-    )
-    .await;
-    assert_eq!(status, 0, "load fixture must succeed");
-    let id = sink
-        .lock()
-        .unwrap()
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::RevisionTreeLoaded(id) => Some(*id),
-            _ => None,
-        })
-        .expect("load fixture must emit RevisionTreeLoaded");
-    (LoreRevisionTree { handle_id: id }, store_handle.handle_id)
-}
-
-fn release(handle: LoreRevisionTree, store_handle_id: u64) {
-    rt_handle::unregister(handle);
-    storage_handle::unregister(lore::storage::handle::LoreStore {
-        handle_id: store_handle_id,
-    });
-}
-
 #[tokio::test]
 async fn resolve_empty_path_returns_root() {
     let (handle, store_handle_id) =
         load_handle("resolve-empty", Partition::from([0x11u8; 16])).await;
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
 
     let status = resolve_path(
         LoreGlobalArgs::default(),
@@ -207,12 +128,12 @@ async fn resolve_empty_path_returns_root() {
             handle,
             path: LoreString::default(),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
     assert_eq!(status, 0, "resolving the empty path must succeed");
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let (node_id, repository, _revision, error_code) =
         resolve_outcome(&events, 7).expect("ResolvePathComplete must fire");
     assert_eq!(
@@ -227,11 +148,11 @@ async fn resolve_empty_path_returns_root() {
     );
     let complete_pos = events
         .iter()
-        .position(|event| matches!(event, CapturedEvent::Complete(_)))
+        .position(|event| matches!(event, LoreEvent::Complete(_)))
         .expect("Complete must fire");
     let resolve_pos = events
         .iter()
-        .position(|event| matches!(event, CapturedEvent::ResolvePathComplete(..)))
+        .position(|event| matches!(event, LoreEvent::RevisionTreeResolvePathComplete(..)))
         .expect("ResolvePathComplete must fire");
     assert!(
         resolve_pos < complete_pos,
@@ -267,7 +188,7 @@ async fn build_nested_tree(handle: LoreRevisionTree) -> (NodeID, NodeID, NodeID)
         },
     ];
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = add(
         LoreGlobalArgs::default(),
         LoreRevisionTreeAddArgs {
@@ -275,23 +196,17 @@ async fn build_nested_tree(handle: LoreRevisionTree) -> (NodeID, NodeID, NodeID)
             handle,
             entries: LoreArray::from_vec(entries),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     assert_eq!(status, 0, "building the fixture tree must succeed");
 
     let added = |id: u64| {
-        events
-            .iter()
-            .find_map(|event| match event {
-                CapturedEvent::AddComplete(event_id, node_id, code) if *event_id == id => {
-                    assert_eq!(*code, LoreErrorCode::None, "entry {id} must succeed");
-                    Some(*node_id)
-                }
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("entry {id} must emit AddComplete, got {events:?}"))
+        let (node_id, error_code) = add_outcome(&events, id)
+            .unwrap_or_else(|| panic!("entry {id} must emit AddComplete, got {events:?}"));
+        assert_eq!(error_code, LoreErrorCode::None, "entry {id} must succeed");
+        node_id
     };
     (added(1), added(2), added(3))
 }
@@ -305,7 +220,7 @@ async fn resolve_existing_path_returns_node_id() {
     let (a, b, c) = build_nested_tree(handle).await;
 
     for (id, path, expected) in [(20u64, "a", a), (21, "a/b", b), (22, "a/b/c.txt", c)] {
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let (sink, callback) = recording_callback();
         let status = resolve_path(
             LoreGlobalArgs::default(),
             LoreRevisionTreeResolvePathArgs {
@@ -313,12 +228,12 @@ async fn resolve_existing_path_returns_node_id() {
                 handle,
                 path: LoreString::from_str(path),
             },
-            make_callback(sink.clone()),
+            callback,
         )
         .await;
 
         assert_eq!(status, 0, "resolving {path} must succeed");
-        let events = sink.lock().unwrap().clone();
+        let events = take_recorded(&sink);
         let (node_id, resolved_repository, _revision, error_code) = resolve_outcome(&events, id)
             .unwrap_or_else(|| panic!("ResolvePathComplete must fire for {path}"));
         assert_eq!(error_code, LoreErrorCode::None, "got {events:?}");
@@ -341,7 +256,7 @@ async fn resolve_path_below_a_leaf_returns_invalid_arguments() {
         load_handle("resolve-below-leaf", Partition::from([0xAAu8; 16])).await;
     build_nested_tree(handle).await;
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = resolve_path(
         LoreGlobalArgs::default(),
         LoreRevisionTreeResolvePathArgs {
@@ -349,7 +264,7 @@ async fn resolve_path_below_a_leaf_returns_invalid_arguments() {
             handle,
             path: LoreString::from_str("a/b/c.txt/deeper"),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
@@ -358,7 +273,7 @@ async fn resolve_path_below_a_leaf_returns_invalid_arguments() {
         InvalidArguments::FFI_CODE,
         "descending through a file must fail"
     );
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let (node_id, _repository, _revision, error_code) =
         resolve_outcome(&events, 23).expect("ResolvePathComplete must fire");
     assert_eq!(
@@ -375,7 +290,7 @@ async fn resolve_path_below_a_leaf_returns_invalid_arguments() {
 async fn resolve_missing_path_returns_invalid_arguments() {
     let (handle, store_handle_id) =
         load_handle("resolve-missing", Partition::from([0x22u8; 16])).await;
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
 
     let status = resolve_path(
         LoreGlobalArgs::default(),
@@ -384,7 +299,7 @@ async fn resolve_missing_path_returns_invalid_arguments() {
             handle,
             path: LoreString::from_str("no/such/path"),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
@@ -393,7 +308,7 @@ async fn resolve_missing_path_returns_invalid_arguments() {
         InvalidArguments::FFI_CODE,
         "resolving a missing path must fail"
     );
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let (node_id, _repository, _revision, error_code) =
         resolve_outcome(&events, 8).expect("ResolvePathComplete must fire for the caller id");
     assert_eq!(
@@ -406,7 +321,7 @@ async fn resolve_missing_path_returns_invalid_arguments() {
         "a failed resolve must report the invalid-node sentinel, got {events:?}"
     );
     assert!(
-        events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)),
+        complete_statuses(&events).contains(&InvalidArguments::FFI_CODE),
         "missing path must complete with status=InvalidArguments, got {events:?}"
     );
 
@@ -415,7 +330,7 @@ async fn resolve_missing_path_returns_invalid_arguments() {
 
 #[tokio::test]
 async fn resolve_path_on_unknown_handle_emits_resolve_complete_with_invalid_arguments() {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
 
     let status = resolve_path(
         LoreGlobalArgs::default(),
@@ -424,7 +339,7 @@ async fn resolve_path_on_unknown_handle_emits_resolve_complete_with_invalid_argu
             handle: LoreRevisionTree::INVALID,
             path: LoreString::default(),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
@@ -433,7 +348,7 @@ async fn resolve_path_on_unknown_handle_emits_resolve_complete_with_invalid_argu
         InvalidArguments::FFI_CODE,
         "resolving against an unknown handle must fail"
     );
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let (node_id, _repository, _revision, error_code) = resolve_outcome(&events, 10)
         .expect("a handle miss must still emit ResolvePathComplete carrying the caller id");
     assert_eq!(
@@ -446,7 +361,7 @@ async fn resolve_path_on_unknown_handle_emits_resolve_complete_with_invalid_argu
         "a handle miss must report the invalid-node sentinel, got {events:?}"
     );
     assert!(
-        events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)),
+        complete_statuses(&events).contains(&InvalidArguments::FFI_CODE),
         "a handle miss must complete with status=InvalidArguments, got {events:?}"
     );
 }
@@ -464,7 +379,7 @@ async fn resolve_path_to_a_link_node_returns_the_link_node() {
     )
     .await;
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = resolve_path(
         LoreGlobalArgs::default(),
         LoreRevisionTreeResolvePathArgs {
@@ -472,12 +387,12 @@ async fn resolve_path_to_a_link_node_returns_the_link_node() {
             handle,
             path: LoreString::from_str("link"),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
     assert_eq!(status, 0, "resolving to a link node must succeed");
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let (node_id, resolved_repository, _revision, error_code) =
         resolve_outcome(&events, 11).expect("ResolvePathComplete must fire");
     assert_eq!(error_code, LoreErrorCode::None);
@@ -500,7 +415,7 @@ async fn resolve_path_through_a_link_returns_the_target_repository_and_revision(
     let target_revision = seal_target(handle, "doc").await;
     add_link(handle, "link", repository, target_revision, ROOT_NODE).await;
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = resolve_path(
         LoreGlobalArgs::default(),
         LoreRevisionTreeResolvePathArgs {
@@ -508,12 +423,12 @@ async fn resolve_path_through_a_link_returns_the_target_repository_and_revision(
             handle,
             path: LoreString::from_str("link/doc"),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
     assert_eq!(status, 0, "resolving through a link must succeed");
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let (node_id, resolved_repository, resolved_revision, error_code) =
         resolve_outcome(&events, 12).expect("ResolvePathComplete must fire");
     assert_eq!(error_code, LoreErrorCode::None);

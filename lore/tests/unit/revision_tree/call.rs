@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -22,20 +21,20 @@ use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::state::StateError;
 
-use crate::call::test_support::CapturedEvent;
 use crate::call::test_support::completes;
 use crate::call::test_support::has_error_event;
-use crate::call::test_support::make_callback;
+use crate::call::test_support::recording_callback;
+use crate::call::test_support::take_recorded;
 use crate::revision_tree::handle::test_support;
 
 #[tokio::test]
 async fn handle_miss_completes_with_error_code_and_no_error_event() {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let missed = Arc::new(AtomicBool::new(false));
     let missed_setter = missed.clone();
     let status = revision_tree_call(
         LoreGlobalArgs::default(),
-        make_callback(sink.clone()),
+        callback,
         LoreRevisionTree::INVALID,
         (),
         "handle_miss_test",
@@ -47,7 +46,7 @@ async fn handle_miss_completes_with_error_code_and_no_error_event() {
         missed.load(Ordering::SeqCst),
         "on_handle_miss must fire when the handle is unknown"
     );
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     assert!(
         !has_error_event(&events),
         "no Error event must be emitted on terminal failure"
@@ -76,12 +75,12 @@ async fn happy_path_completes_with_status_zero_and_decrements_counter() {
     let invoked = Arc::new(AtomicU64::new(0));
     let invoked_clone = invoked.clone();
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let missed = Arc::new(AtomicBool::new(false));
     let missed_setter = missed.clone();
     let status = revision_tree_call(
         LoreGlobalArgs::default(),
-        make_callback(sink.clone()),
+        callback,
         handle_value,
         (),
         "happy_path_test",
@@ -105,7 +104,7 @@ async fn happy_path_completes_with_status_zero_and_decrements_counter() {
         0,
         "counter must return to zero after the verb"
     );
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let completes = completes(&events);
     assert_eq!(completes.len(), 1, "exactly one Complete event");
     let data = &completes[0];
@@ -120,12 +119,12 @@ async fn happy_path_completes_with_status_zero_and_decrements_counter() {
 async fn verb_error_completes_with_error_code_and_no_error_event() {
     let internal = test_support::new_for_testing().await;
     let handle_value = handle::register(internal.clone());
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let missed = Arc::new(AtomicBool::new(false));
     let missed_setter = missed.clone();
     let status = revision_tree_call(
         LoreGlobalArgs::default(),
-        make_callback(sink.clone()),
+        callback,
         handle_value,
         (),
         "verb_error_test",
@@ -147,7 +146,7 @@ async fn verb_error_completes_with_error_code_and_no_error_event() {
         "counter must return to zero even on error"
     );
 
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     assert!(
         !has_error_event(&events),
         "no Error event must be emitted on terminal failure"

@@ -26,13 +26,8 @@ use std::sync::atomic::Ordering;
 use dashmap::DashMap;
 use lore_base::error::NoRemote;
 use lore_base::types::Partition;
-use lore_revision::filter::Filter;
-use lore_revision::instance::InstanceId;
 use lore_revision::metadata::Metadata;
-use lore_revision::repository::InMemoryContext;
 use lore_revision::repository::RepositoryContext;
-use lore_revision::repository::RepositoryContextCreationArgs;
-use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::state::State;
 use lore_transport::ProtocolError;
 use tokio::sync::Notify;
@@ -349,7 +344,8 @@ pub(crate) fn unregister(handle: LoreRevisionTree) -> Option<Arc<RevisionTreeInt
 ///
 /// The synthesized context has no working-tree path — every op against the
 /// memory-based revision tree API operates only on the underlying stores.
-/// When `store` has a remote endpoint, the helper resolves the
+/// It carries the in-memory write token, since the handle exists to build
+/// revisions. When `store` has a remote endpoint, the helper resolves the
 /// per-partition `Arc<Connection>` so the context lands in the `Connected`
 /// remote state on success; a connection failure propagates as `Failed`.
 /// Absent a remote endpoint the context resolves directly to the `Offline`
@@ -364,29 +360,11 @@ pub(crate) async fn synth_repository_context(
         None => Err(ProtocolError::from(NoRemote)),
     };
     Arc::new(
-        RepositoryContext::new(RepositoryContextCreationArgs {
-            paths: None,
-            immutable_store: store.immutable.clone(),
-            mutable_store: store.mutable.clone(),
-            id: repository,
-            instance_id: InstanceId::default(),
-            remote: remote_result,
-            filter: Arc::new(Filter::default()),
-            filesystem_provider: None,
-        })
-        .with_write_token(RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER))
-        .holding_its_sessions(),
+        store
+            .repository_context(repository, remote_result)
+            .with_write_token(StoreInternal::in_memory_write_token()),
     )
 }
-
-/// Gates [`RepositoryWriteToken::in_memory`] for this crate.
-///
-/// The handle exists to build revisions, so its context is write-capable from
-/// load. Being path-less it has no per-path write mutex to take; what serializes
-/// publication is the branch tip compare-and-swap in the commit.
-pub(crate) struct InMemoryMarker;
-impl InMemoryContext for InMemoryMarker {}
-pub(crate) const IN_MEMORY_MARKER: InMemoryMarker = InMemoryMarker;
 
 /// RAII guard protecting an in-flight op. Obtained via
 /// [`RevisionTreeGuard::enter`]; dropping it pairs the in-flight

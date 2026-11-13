@@ -4,24 +4,13 @@ use std::str::FromStr;
 
 use lore_revision::util::path::*;
 
+use super::allocations_during;
+
 /// A walk holds a path per change, millions for a large tree, so a path stays 24 bytes: the shared
 /// data and four 32-bit offsets.
 #[test]
 fn a_path_is_24_bytes() {
     assert_eq!(std::mem::size_of::<RelativePath>(), 24);
-}
-
-/// What `f` returns and the allocations the calling thread made running it.
-///
-/// Counting stays on, since switching it off would undercount a test measuring on another thread.
-fn allocations_during<T>(f: impl FnOnce() -> T) -> (T, u64) {
-    lore_base::allocator::set_allocation_counting(true);
-    let before = lore_base::allocator::thread_allocation_count();
-    let value = std::hint::black_box(f());
-    (
-        value,
-        lore_base::allocator::thread_allocation_count() - before,
-    )
 }
 
 /// A path built from a string makes its two strings and the shared data once each, never

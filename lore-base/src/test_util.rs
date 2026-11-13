@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Temporary directories and files for the tests, and [`file_identity`], which tells a file written
-//! in place from one replaced.
+//! Temporary directories and files for the tests, [`file_identity`], which tells a file written in
+//! place from one replaced, [`CLOSED_PORT`], a loopback port that refuses connections, and
+//! [`allocations`], the process's allocation count where an interposer counts them.
 //!
 //! [`TempDir`], and [`TempFile`] for a single file, are the only way a test asks
 //! for scratch space on disk. Names carry a random suffix, so a test is isolated
@@ -259,4 +260,46 @@ pub fn file_identity(path: &Path) -> (u64, u64) {
             (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
         )
     }
+}
+
+/// A loopback port that refuses connections: port 1, which nothing on a test host listens on, and
+/// which a listener bound to port 0 is never handed. A port that is bound but never listens isn't
+/// enough: Linux refuses a connection to it, but macOS drops it, and the connection times out.
+pub const CLOSED_PORT: u16 = 1;
+
+/// `<scheme>://127.0.0.1:<CLOSED_PORT>`, a URL whose connections are refused.
+pub fn closed_port_url(scheme: &str) -> String {
+    format!("{scheme}://127.0.0.1:{CLOSED_PORT}")
+}
+
+/// The allocations the process has made so far, as the `scripts/allocations/allocount.c`
+/// interposer counts them, or `None` where nothing counts them: the interposer isn't preloaded, or
+/// `LORE_ALLOCATOR` doesn't select the system allocator, without which the global allocator is
+/// rpmalloc, which takes its pages from `mmap` and never calls `malloc`.
+///
+/// The counter is resolved at run time rather than linked, so a test builds and runs without the
+/// interposer. The environment is read without allocating, by the allocator's own selection
+/// (`allocator::system_allocator_selected`), so a count taken after a measured window adds nothing
+/// to the window.
+#[cfg(target_os = "linux")]
+pub fn allocations() -> Option<u64> {
+    type Total = unsafe extern "C" fn() -> u64;
+    if !crate::allocator::system_allocator_selected() {
+        return None;
+    }
+    // SAFETY: the name is a NUL-terminated literal.
+    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"allocount_total".as_ptr()) };
+    if symbol.is_null() {
+        return None;
+    }
+    // SAFETY: `allocount_total` in `allocount.c` takes nothing and returns an `unsigned long long`.
+    let total = unsafe { std::mem::transmute::<*mut libc::c_void, Total>(symbol) };
+    // SAFETY: the counter reads atomics and has no precondition.
+    Some(unsafe { total() })
+}
+
+/// Nothing counts allocations off Linux, since the interposer forwards to glibc's allocator.
+#[cfg(not(target_os = "linux"))]
+pub fn allocations() -> Option<u64> {
+    None
 }

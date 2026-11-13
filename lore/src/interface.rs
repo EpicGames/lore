@@ -9009,6 +9009,205 @@ pub extern "C" fn lore_revision_tree_commit_async(
     run_asynchronously(globals, args, callback, dispatch_command);
 }
 
+pub type LoreRevisionIdentifier = crate::revision_graph::LoreRevisionIdentifier;
+pub type LoreRevisionGraphRevisionResolveArgs =
+    crate::revision_graph::revision_resolve::LoreRevisionGraphRevisionResolveArgs;
+
+/// Resolve `args->revision` to a revision at each location the call consults.
+///
+/// The call consults the remote of `args->store`, if it has one, then the local store: the local
+/// store alone where `local` or `offline` is set in `globals` or was set when `args->store` was
+/// opened, and the remote alone where `remote` is. Its work at one location never reads or writes
+/// the other, it writes nothing to the local store, and a block the local store doesn't hold
+/// counts as absent there. It ignores `globals.force` and `globals.dry_run`, and
+/// `lore_storage_close` waits for it.
+///
+/// The call sends a `LORE_EVENT_REVISION_GRAPH_REVISION` for each location that holds the revision.
+/// A revision number can name a different revision at each location, where the local latest holds
+/// revisions the remote lacks. Each location the call consults ends with its
+/// `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE`, which carries no error and no records where the
+/// location doesn't hold the revision. A failure at a location fails the call with that location's
+/// error, the remote's where both fail, once the call has consulted the other location too.
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_REVISION_GRAPH_REVISION` | `lore_revision_graph_revision_event_data_t` | The revision, as one location resolves it |
+/// | `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE` | `lore_revision_graph_location_complete_event_data_t` | One location's outcome, after its record, if any |
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | A log line |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` on success or the error code, with its detail in `error` |
+///
+/// Fails with:
+/// - error code 3 (invalid arguments) for a malformed `args->revision`, an unknown or closed
+///   `args->store`, and location flags that contradict each other or those `args->store` was
+///   opened with;
+/// - error code 111 (no remote) where `remote` is set in `globals` and `args->store` has no remote;
+/// - error code 88 (revision not found) where no location consulted holds the revision, and
+///   error code 87 (branch not found) in its place where none holds `args->revision.branch`;
+/// - error code 16 (not authenticated) where the call has no login or tokens the remote accepts.
+///   The call starts no login: the caller logs in, with `lore_auth_login_interactive` or
+///   `lore_auth_login_with_token`, and calls again, and a storage handle's open connection picks
+///   up the new login within a minute. A caller that passes its own tokens in `globals` opens a
+///   new storage handle with fresh ones, since an open connection keeps the tokens it connected
+///   with;
+/// - error codes 17 (not authorized), 28 (disconnected), 29 (not connected), 30 (maintenance) and
+///   31 (slow down) where the remote refuses the call or can't be reached;
+/// - error code -1 (internal) for any other failure, such as a corrupt block.
+///
+/// An event's strings, arrays and error detail are valid only during the callback invocation that
+/// delivers it. This call and `lore_revision_graph_revision_resolve_async` copy `args` before they
+/// return, so an `_async` caller can free `args` and its strings once the call returns. A caller
+/// that passes the same `globals.correlation_id` on every call over one storage handle reuses one
+/// storage session per connection, as with the `lore_storage_*` calls. `args->id`, which every
+/// `LORE_EVENT_REVISION_GRAPH_*` event echoes, is separate from it.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_graph_revision_resolve(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionGraphRevisionResolveArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, run_command)
+}
+
+/// Resolve a revision identifier at each location the call consults (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_graph_revision_resolve_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionGraphRevisionResolveArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, dispatch_command);
+}
+
+pub type LoreRevisionGraphBranchResolveArgs =
+    crate::revision_graph::branch_resolve::LoreRevisionGraphBranchResolveArgs;
+
+/// Resolve `args->name` to the branch it names at each location the call consults.
+///
+/// An archived branch's name no longer names it, so the call doesn't resolve an archived branch,
+/// except, in the local store, one an older version of Lore archived whose id derives from its
+/// name. The call consults the locations, works at each, and fails as
+/// `lore_revision_graph_revision_resolve` describes. It sends a `LORE_EVENT_REVISION_GRAPH_BRANCH`
+/// for each location where the name names a branch. The local store's record is followed by a
+/// `LORE_EVENT_REVISION_GRAPH_INSTANCE` for each repository instance registered in the local store
+/// whose current branch it is, stale ones included; the call retires no registration. Each location
+/// the call consults ends with its `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE`, whose `records`
+/// counts the instance records too.
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_REVISION_GRAPH_BRANCH` | `lore_revision_graph_branch_event_data_t` | The branch, as one location holds it |
+/// | `LORE_EVENT_REVISION_GRAPH_INSTANCE` | `lore_revision_graph_instance_event_data_t` | An instance on the branch, after the local store's branch record |
+/// | `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE` | `lore_revision_graph_location_complete_event_data_t` | One location's outcome, after its records |
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | A log line |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` on success or the error code, with its detail in `error` |
+///
+/// Fails with:
+/// - error code 3 (invalid arguments) for a name that is empty, longer than 1000 bytes, not UTF-8
+///   or reads as a branch id, an unknown or closed `args->store`, and location flags that
+///   contradict each other or those `args->store` was opened with;
+/// - error code 111 (no remote) where `remote` is set in `globals` and `args->store` has no remote;
+/// - error code 87 (branch not found) where the name names no branch at any location consulted;
+/// - error code 16 (not authenticated) where the call has no login or tokens the remote accepts.
+///   The call starts no login: the caller logs in, with `lore_auth_login_interactive` or
+///   `lore_auth_login_with_token`, and calls again, and a storage handle's open connection picks
+///   up the new login within a minute. A caller that passes its own tokens in `globals` opens a
+///   new storage handle with fresh ones, since an open connection keeps the tokens it connected
+///   with;
+/// - error codes 17 (not authorized), 28 (disconnected), 29 (not connected), 30 (maintenance) and
+///   31 (slow down) where the remote refuses the call or can't be reached;
+/// - error code -1 (internal) for any other failure, such as a corrupt block.
+///
+/// An event's strings, arrays and error detail are valid only during the callback invocation that
+/// delivers it. This call and `lore_revision_graph_branch_resolve_async` copy `args` before they
+/// return, so an `_async` caller can free `args` and its strings once the call returns. A caller
+/// that passes the same `globals.correlation_id` on every call over one storage handle reuses one
+/// storage session per connection, as with the `lore_storage_*` calls. `args->id`, which every
+/// `LORE_EVENT_REVISION_GRAPH_*` event echoes, is separate from it.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_graph_branch_resolve(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionGraphBranchResolveArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, run_command)
+}
+
+/// Resolve a branch name at each location the call consults (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_graph_branch_resolve_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionGraphBranchResolveArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, dispatch_command);
+}
+
+pub type LoreRevisionGraphBranchListArgs =
+    crate::revision_graph::branch_list::LoreRevisionGraphBranchListArgs;
+
+/// List the branches of `args->repository` at each location the call consults.
+///
+/// The call consults the locations, works at each, and fails as
+/// `lore_revision_graph_revision_resolve` describes. It sends a `LORE_EVENT_REVISION_GRAPH_BRANCH`
+/// for each branch at each location, in no particular order. Each of the local store's branch
+/// records is followed by the instance records `lore_revision_graph_branch_resolve` sends for that
+/// branch. Each location the call consults ends with its
+/// `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE`, whose `records` counts the branch and instance
+/// records. With `args->include_archived` set, a branch whose create, name lookup or clone has
+/// stored its metadata and not yet claimed its name can list as archived, and one whose lookup or
+/// clone then finds its name held by another branch keeps listing as archived. In the local store,
+/// a live branch whose id an older version of Lore derived from its name, and that no name maps to,
+/// lists only with `args->include_archived` set, and as archived; a branch whose metadata key or
+/// metadata blob the local store lacks doesn't list there.
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_REVISION_GRAPH_BRANCH` | `lore_revision_graph_branch_event_data_t` | A branch, as one location holds it |
+/// | `LORE_EVENT_REVISION_GRAPH_INSTANCE` | `lore_revision_graph_instance_event_data_t` | An instance on the branch of the local branch record it follows |
+/// | `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE` | `lore_revision_graph_location_complete_event_data_t` | One location's outcome, after its records |
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | A log line |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` on success or the error code, with its detail in `error` |
+///
+/// Fails with:
+/// - error code 3 (invalid arguments) for a creator that is not UTF-8, an unknown or closed
+///   `args->store`, and location flags that contradict each other or those `args->store` was
+///   opened with;
+/// - error code 111 (no remote) where `remote` is set in `globals` and `args->store` has no remote;
+/// - error code 16 (not authenticated) where the call has no login or tokens the remote accepts.
+///   The call starts no login: the caller logs in, with `lore_auth_login_interactive` or
+///   `lore_auth_login_with_token`, and calls again, and a storage handle's open connection picks
+///   up the new login within a minute. A caller that passes its own tokens in `globals` opens a
+///   new storage handle with fresh ones, since an open connection keeps the tokens it connected
+///   with;
+/// - error codes 17 (not authorized), 28 (disconnected), 29 (not connected), 30 (maintenance) and
+///   31 (slow down) where the remote refuses the call or can't be reached;
+/// - error code -1 (internal) for any other failure, such as a corrupt block.
+///
+/// An event's strings, arrays and error detail are valid only during the callback invocation that
+/// delivers it. This call and `lore_revision_graph_branch_list_async` copy `args` before they
+/// return, so an `_async` caller can free `args` and its strings once the call returns. A caller
+/// that passes the same `globals.correlation_id` on every call over one storage handle reuses one
+/// storage session per connection, as with the `lore_storage_*` calls. `args->id`, which every
+/// `LORE_EVENT_REVISION_GRAPH_*` event echoes, is separate from it.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_graph_branch_list(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionGraphBranchListArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, run_command)
+}
+
+/// List the branches of a repository at each location the call consults (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_graph_branch_list_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionGraphBranchListArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, dispatch_command);
+}
+
 /// Select how payloads are compressed before they are stored, over
 /// `lore_storage::COMPRESSION_MODE`.
 ///

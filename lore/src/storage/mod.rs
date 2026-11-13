@@ -214,7 +214,7 @@ impl PutItemOutcome {
         LoreEvent::StoragePutItemComplete(LoreStoragePutItemCompleteEventData {
             id,
             address: placed.map_or_else(Address::default, |outcome| outcome.address),
-            error: item_detail(&result),
+            error: LoreErrorDetail::from_result(&result),
             stored_local: u8::from(placed.is_some_and(|outcome| outcome.stored_local)),
             stored_remote: u8::from(placed.is_some_and(|outcome| outcome.stored_remote)),
         })
@@ -237,16 +237,6 @@ pub(crate) fn offset_past_end(offset: u64, size_content: u64) -> StorageError {
     invalid_item(format!(
         "item offset {offset} starts past the {size_content} byte content"
     ))
-}
-
-/// The detail an item's terminal event carries: the empty default on success, and on failure the
-/// error's own FFI code, message and trace. The default detail allocates nothing, so only a
-/// failure costs anything.
-pub(crate) fn item_detail<T>(result: &Result<T, StorageError>) -> LoreErrorDetail {
-    result
-        .as_ref()
-        .err()
-        .map_or_else(LoreErrorDetail::default, LoreErrorDetail::from_error)
 }
 
 /// How actionable a failure is, highest first. A rejected argument is the caller's own bug and

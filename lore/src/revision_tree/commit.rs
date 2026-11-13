@@ -25,7 +25,6 @@ use lore_revision::event::revision_tree::LoreRevisionTreeCommitCompleteEventData
 use lore_revision::interface::LoreError;
 use lore_revision::metadata::Metadata;
 use lore_revision::repository::RepositoryContext;
-use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::state::State;
 
 use crate::call_delegation::dispatch_call;
@@ -33,10 +32,10 @@ use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::revision_tree::call::revision_tree_call;
 use crate::revision_tree::handle::ExclusiveAccess;
-use crate::revision_tree::handle::IN_MEMORY_MARKER;
 use crate::revision_tree::handle::LoreRevisionTree;
 use crate::revision_tree::handle::RevisionTreeInternal;
 use crate::storage::store::PerCallFlags;
+use crate::storage::store::StoreInternal;
 
 /// Tuneables for `lore_revision_tree_commit`.
 #[repr(C)]
@@ -275,7 +274,7 @@ async fn commit_revision(
         }
     };
 
-    let token = RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER);
+    let token = StoreInternal::in_memory_write_token();
     match commit_in_memory_revision(
         repository_context.clone(),
         &token,

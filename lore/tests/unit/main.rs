@@ -16,6 +16,7 @@ mod log;
 mod remote;
 mod repository;
 mod revision;
+mod revision_graph;
 mod revision_tree;
 mod sandbox_tests;
 mod service;

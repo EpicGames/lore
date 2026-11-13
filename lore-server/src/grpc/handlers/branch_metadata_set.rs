@@ -69,8 +69,7 @@ pub(crate) fn validate_read_only_fields(
 /// `current`. Such a change is repository administration rather than an
 /// ordinary write.
 pub(crate) fn changes_protection(current: &Metadata, proposed: &Metadata) -> bool {
-    current.get_bool(branch::PROTECT).unwrap_or_default()
-        != proposed.get_bool(branch::PROTECT).unwrap_or_default()
+    branch::protected(current) != branch::protected(proposed)
 }
 
 /// Validate that all Address-typed values in the proposed metadata blob reference existing

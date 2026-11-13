@@ -141,9 +141,11 @@ pub fn write_options_from_repository(repository: Arc<RepositoryContext>) -> Writ
     }
 }
 
-/// Construct [`ReadOptions`] from a repository context and the command's globals.
+/// Construct [`ReadOptions`] from a repository context and the command's globals. The remote is
+/// trusted as the context says where it says ([`RepositoryContext::with_remote_trust`]), and as
+/// the globals say otherwise.
 pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptions {
-    let (sync_data, trust_remote) =
+    let (sync_data, globals_trust_remote) =
         crate::runtime::try_execution_context().map_or((false, false), |context| {
             let globals = context.globals();
             (globals.sync_data(), globals.trust_remote())
@@ -156,7 +158,7 @@ pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptio
         strict_local: local_reads == LocalReads::Strict,
         direct_write: repository.direct_file_write(),
         sync_data,
-        trust_remote,
+        trust_remote: repository.remote_trust.unwrap_or(globals_trust_remote),
         ..Default::default()
     }
 }

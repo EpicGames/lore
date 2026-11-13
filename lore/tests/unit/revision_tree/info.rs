@@ -1,17 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::sync::Arc;
-use std::sync::Mutex;
 
-use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
-use lore::revision_tree::handle as rt_handle;
 use lore::revision_tree::handle::LoreRevisionTree;
 use lore::revision_tree::info::*;
-use lore::revision_tree::load::LoreRevisionTreeLoadArgs;
-use lore::revision_tree::load::load;
-use lore::storage::handle as storage_handle;
-use lore::storage::store::in_memory_for_tests;
 use lore_base::error::InvalidArguments;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
@@ -21,82 +13,19 @@ use lore_revision::event::revision_tree::LoreRevisionTreeInfoEventData;
 use lore_revision::metadata::CREATED_BY;
 use lore_revision::metadata::MESSAGE;
 use lore_revision::metadata::Metadata;
-use lore_revision::repository::RepositoryContext;
-use lore_revision::state::State;
 
-#[derive(Debug, Clone, PartialEq)]
-enum CapturedEvent {
-    Error(u32),
-    Complete(i32),
-    RevisionTreeLoaded(u64),
-    Info(Box<LoreRevisionTreeInfoEventData>),
-    Other(u32),
-}
+use crate::call::test_support::complete_statuses;
+use crate::call::test_support::recording_callback;
+use crate::call::test_support::take_recorded;
+use crate::revision_tree::support::handle_state;
+use crate::revision_tree::support::load_handle;
+use crate::revision_tree::support::release;
 
-impl CapturedEvent {
-    fn from_event(event: &LoreEvent) -> Self {
-        match event {
-            LoreEvent::Error(data) => Self::Error(data.error_type),
-            LoreEvent::Complete(data) => Self::Complete(data.status),
-            LoreEvent::RevisionTreeLoaded(data) => Self::RevisionTreeLoaded(data.handle_id),
-            LoreEvent::RevisionTreeInfo(data) => Self::Info(Box::new(data.clone())),
-            other => Self::Other(other.discriminant()),
-        }
-    }
-}
-
-fn make_callback(sink: Arc<Mutex<Vec<CapturedEvent>>>) -> LoreEventCallback {
-    Some(Box::new(move |event: &LoreEvent| {
-        sink.lock().unwrap().push(CapturedEvent::from_event(event));
-    }))
-}
-
-fn info_event(events: &[CapturedEvent]) -> Option<LoreRevisionTreeInfoEventData> {
+fn info_event(events: &[LoreEvent]) -> Option<&LoreRevisionTreeInfoEventData> {
     events.iter().find_map(|event| match event {
-        CapturedEvent::Info(data) => Some((**data).clone()),
+        LoreEvent::RevisionTreeInfo(data) => Some(data),
         _ => None,
     })
-}
-
-async fn load_handle(label: &str, repository: Partition) -> (LoreRevisionTree, u64) {
-    let store = in_memory_for_tests(label).await;
-    let store_handle = storage_handle::register(store);
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let status = load(
-        LoreGlobalArgs::default(),
-        LoreRevisionTreeLoadArgs {
-            store: store_handle,
-            repository,
-            revision_hash: Hash::default(),
-        },
-        make_callback(sink.clone()),
-    )
-    .await;
-    assert_eq!(status, 0, "load fixture must succeed");
-    let id = sink
-        .lock()
-        .unwrap()
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::RevisionTreeLoaded(id) => Some(*id),
-            _ => None,
-        })
-        .expect("load fixture must emit RevisionTreeLoaded");
-    (LoreRevisionTree { handle_id: id }, store_handle.handle_id)
-}
-
-fn handle_state(handle: LoreRevisionTree) -> (Arc<State>, Arc<RepositoryContext>) {
-    let entry = rt_handle::REGISTRY
-        .get(&handle.handle_id)
-        .expect("handle registered");
-    (entry.state_for_tests(), entry.repository_context.clone())
-}
-
-fn release(handle: LoreRevisionTree, store_handle_id: u64) {
-    rt_handle::unregister(handle);
-    storage_handle::unregister(lore::storage::handle::LoreStore {
-        handle_id: store_handle_id,
-    });
 }
 
 #[tokio::test]
@@ -125,16 +54,16 @@ async fn info_returns_parents_timestamp_author_and_key_count() {
     state.set_parent_self(parent_self);
     state.set_parent_other(parent_other);
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = info(
         LoreGlobalArgs::default(),
         LoreRevisionTreeInfoArgs { id: 1, handle },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
     assert_eq!(status, 0);
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let data = info_event(&events).expect("info event must fire");
     assert_eq!(data.id, 1);
     assert_eq!(data.error_code, LoreErrorCode::None);
@@ -155,7 +84,7 @@ async fn info_returns_parents_timestamp_author_and_key_count() {
         data.metadata_key_count, 3,
         "timestamp + created-by + message = 3 keys, got {events:?}"
     );
-    assert!(events.contains(&CapturedEvent::Complete(0)));
+    assert!(complete_statuses(&events).contains(&0));
 
     release(handle, store_handle_id);
 }
@@ -165,16 +94,16 @@ async fn info_without_metadata_reports_zeroed_fields() {
     let partition = Partition::from([0x33u8; 16]);
     let (handle, store_handle_id) = load_handle("info-empty", partition).await;
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = info(
         LoreGlobalArgs::default(),
         LoreRevisionTreeInfoArgs { id: 2, handle },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
     assert_eq!(status, 0);
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let data = info_event(&events).expect("info event must fire");
     assert_eq!(data.error_code, LoreErrorCode::None);
     assert_eq!(data.repository, partition, "got {events:?}");
@@ -197,16 +126,16 @@ async fn info_with_unreadable_metadata_returns_internal() {
     let (state, _repository_context) = handle_state(handle);
     state.set_metadata_hash(Hash::from([0x7Eu8; 32]));
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = info(
         LoreGlobalArgs::default(),
         LoreRevisionTreeInfoArgs { id: 3, handle },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
     assert_ne!(status, 0, "an unreadable metadata fragment must fail");
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let data =
         info_event(&events).expect("a failure must still emit the info terminal carrying the id");
     assert_eq!(data.id, 3);
@@ -216,7 +145,7 @@ async fn info_with_unreadable_metadata_returns_internal() {
         "a present-but-unreadable metadata fragment must report Internal, got {events:?}"
     );
     assert!(
-        events.contains(&CapturedEvent::Complete(status)),
+        complete_statuses(&events).contains(&status),
         "Complete must carry the failure status, got {events:?}"
     );
 
@@ -225,7 +154,7 @@ async fn info_with_unreadable_metadata_returns_internal() {
 
 #[tokio::test]
 async fn info_on_unknown_handle_emits_terminal_with_invalid_arguments() {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
 
     let status = info(
         LoreGlobalArgs::default(),
@@ -233,7 +162,7 @@ async fn info_on_unknown_handle_emits_terminal_with_invalid_arguments() {
             id: 4,
             handle: LoreRevisionTree::INVALID,
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
 
@@ -242,7 +171,7 @@ async fn info_on_unknown_handle_emits_terminal_with_invalid_arguments() {
         InvalidArguments::FFI_CODE,
         "an unknown handle must fail"
     );
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     let data = info_event(&events)
         .expect("a handle miss must still emit the info terminal carrying the id");
     assert_eq!(data.id, 4);
@@ -251,5 +180,5 @@ async fn info_on_unknown_handle_emits_terminal_with_invalid_arguments() {
         LoreErrorCode::InvalidArguments,
         "got {events:?}"
     );
-    assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
+    assert!(complete_statuses(&events).contains(&InvalidArguments::FFI_CODE));
 }

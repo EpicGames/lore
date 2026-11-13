@@ -20,6 +20,7 @@ use lore_base::types::Hash;
 use lore_revision::global::external_dir::external_lore_dir;
 use lore_revision::instance::*;
 use lore_revision::interface::ExecutionContext;
+use lore_revision::interface::LoreString;
 use lore_revision::lore::RepositoryId;
 use lore_revision::relay::EventDispatcher;
 use lore_revision::repository::CONFIG;
@@ -32,14 +33,14 @@ use lore_storage::MutableStore;
 use lore_storage::StoreError;
 use lore_storage::hash_function_arg;
 use lore_storage::store_types::KeyType;
+use lore_storage::test_util::HookedStore;
+use lore_storage::test_util::StoreCall;
 use zerocopy::IntoBytes;
 
 use crate::helper::RepositoryContextCreationArgsExt;
 use crate::helper::default_repository_creation_args;
 use crate::helper::in_memory;
 use crate::helper::test_store_create;
-use crate::hooked_store::HookedStore;
-use crate::hooked_store::StoreCall;
 use crate::paged_remote::counted_client_stores;
 use crate::repository::test_helpers::built_context;
 use crate::repository::test_helpers::counted_endpoint;
@@ -390,7 +391,7 @@ fn record_of(
 ) -> InstanceRecord {
     InstanceRecord {
         instance_id: repository.instance_id,
-        path: clean(path.display().to_string()),
+        path: LoreString::from(clean(path.display().to_string())),
         revision,
         staleness,
     }
