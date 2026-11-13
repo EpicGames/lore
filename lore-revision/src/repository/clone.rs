@@ -1487,7 +1487,9 @@ async fn clone_into(
         Err(e) => Err(CloneError::internal(format!("Store task failed: {e}"))),
     };
 
-    let _ = repository.flush(call.flush_options()).await;
+    if let Err(err) = repository.flush(call.flush_options()).await {
+        lore_warn!("Failed to flush the cloned repository's stores: {err}");
+    }
 
     let operation_result = operation
         .finalize()

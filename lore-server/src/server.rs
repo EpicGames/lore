@@ -42,6 +42,7 @@ use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_storage::assume_server_policies;
 use lore_storage::compress::COMPRESSION_MODE;
+use lore_storage::flush_stores;
 use lore_storage::hash::StringHash;
 use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
 use lore_storage::local::store_lock::StoreHold;
@@ -2613,8 +2614,15 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     up_gauge.record(0, &up_attributes);
 
     info!("Flushing stores");
-    let _ = immutable_store.flush(FlushOptions::SYNC_DATA).await;
-    let _ = mutable_store.flush(FlushOptions::SYNC_DATA).await;
+    if let Err(error) = flush_stores(
+        immutable_store,
+        Some(mutable_store),
+        FlushOptions::SYNC_DATA,
+    )
+    .await
+    {
+        warn!(%error, "Failed to flush the stores at shutdown");
+    }
 
     Ok(hold)
 }

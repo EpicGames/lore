@@ -404,8 +404,8 @@ async fn reconcile_instances(
             });
         }
     }
-    if retired_any {
-        let _ = repository.flush(FlushOptions::default()).await;
+    if retired_any && let Err(err) = repository.flush(FlushOptions::default()).await {
+        lore_warn!("Failed to flush the retired instance registrations: {err}");
     }
     Ok((live, stale))
 }
@@ -3080,7 +3080,9 @@ async fn instance_clone_with(
     .await;
     if let Err(err) = placed {
         remove_instance_keys(&repository, plan.clone_id).await;
-        let _ = repository.flush(flush_options).await;
+        if let Err(flush_err) = repository.flush(flush_options).await {
+            lore_warn!("Failed to flush the removal of a failed clone's registration: {flush_err}");
+        }
         return Err(err).forward_with::<InstanceError, _>(context);
     }
     if let Ok(dot_name) = lore_directory_within(&plan.source, &plan.dot_path)

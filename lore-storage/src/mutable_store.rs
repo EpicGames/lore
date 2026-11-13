@@ -4,10 +4,13 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use lore_error_set::prelude::*;
 
+use crate::FlushOptions;
 use crate::Hash;
 use crate::Partition;
 use crate::immutable_store::CorrelationHold;
+use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
 use crate::local::store_lock::StoreGuard;
 use crate::store_types::KeyType;
@@ -122,5 +125,35 @@ pub trait MutableStore: Send + Sync {
 impl Debug for dyn MutableStore {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "MutableStore")
+    }
+}
+
+/// Flushes `immutable`, then `mutable` where one is given, as `options` asks. The mutable store is
+/// flushed only once the immutable store's flush has succeeded, since its values name content the
+/// immutable store indexes.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+///
+/// # Errors
+///
+/// [`StoreError`] from the first flush that fails.
+#[allow(clippy::manual_async_fn)]
+pub fn flush_stores(
+    immutable: Arc<dyn ImmutableStore>,
+    mutable: Option<Arc<dyn MutableStore>>,
+    options: FlushOptions,
+) -> impl Future<Output = Result<(), StoreError>> + Send {
+    async move {
+        immutable
+            .flush(options)
+            .await
+            .forward::<StoreError>("flushing the immutable store")?;
+        match mutable {
+            Some(mutable) => mutable
+                .flush(options)
+                .await
+                .forward::<StoreError>("flushing the mutable store"),
+            None => Ok(()),
+        }
     }
 }

@@ -19,6 +19,7 @@ mod immutable_store;
 mod local;
 mod maintenance;
 mod mutable_conformance;
+mod mutable_store;
 mod packstore;
 mod read;
 mod read_flight;

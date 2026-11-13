@@ -1181,9 +1181,17 @@ impl RepositoryContext {
     /// store and by marking a shard it could not read to be replaced. The flush
     /// of a later command with a write token that shares the repository lock
     /// writes those changes, and otherwise they are dropped with the lock; the
-    /// next command reads them again. The records are written alongside the
-    /// store flushes, under a sibling of the token, which is released once they
-    /// are written.
+    /// next command reads them again. The records are written once the stores
+    /// are flushed, as [`Self::flush`] writes them. Where the command changed
+    /// them, the task takes a sibling of the token when it is spawned and holds
+    /// it across the store flushes as well as the write-back. That keeps another
+    /// command from changing the records and the anchors between the two, so the
+    /// next write command on the instance waits for the whole flush. The sibling
+    /// is released once the records are written or, when the flush fails and
+    /// writes none, last.
+    ///
+    /// The stores are flushed through [`lore_storage::flush_stores`]. A failed
+    /// flush is logged with the repository's ID.
     ///
     /// The `Arc<RepositoryLock>` is cloned into the task, so the repository
     /// flock and the store claims it contains outlive the caller's
@@ -1197,11 +1205,9 @@ impl RepositoryContext {
     /// order every command takes them in, and a deadlock against a command in
     /// another process holding that store and waiting for the repository.
     pub fn try_spawn_post_command_flush(&self, options: lore_storage::FlushOptions) {
+        let repository_id = self.id;
         let immutable_store = self.immutable_store.clone();
-        let mutable_store = self
-            .write_token
-            .is_some()
-            .then(|| self.mutable_store.clone());
+        let mutable_store = self.try_mutable_store_arc();
         let repo_lock = self.repo_lock.clone();
         let records_token = self
             .instance_records()
@@ -1214,18 +1220,22 @@ impl RepositoryContext {
                 as Arc<dyn std::any::Any + Send + Sync>,
             || {
                 lore_spawn_guarded!(async move {
-                    let records = async {
-                        if let (Some(lock), Some(token)) = (&repo_lock, records_token) {
-                            lock.write_back_records_or_warn(&token).await;
-                        }
-                    };
-                    let stores = async {
-                        let _ = immutable_store.flush(options).await;
-                        if let Some(mutable_store) = mutable_store {
-                            let _ = mutable_store.flush(options).await;
-                        }
-                    };
-                    tokio::join!(records, stores);
+                    // A flag, so that the flush's result is not held across the write-back.
+                    let flushed = lore_storage::flush_stores(
+                        immutable_store,
+                        mutable_store,
+                        options,
+                    )
+                    .await
+                    .inspect_err(|err| {
+                        lore_warn!(
+                            "Failed to flush repository {repository_id} after a command: {err}"
+                        );
+                    })
+                    .is_ok();
+                    if flushed && let (Some(lock), Some(token)) = (&repo_lock, records_token) {
+                        lock.write_back_records_or_warn(&token).await;
+                    }
                     // The repository flock first, then the store claims it was taken inside.
                     drop(repo_lock);
                     drop(own_stores);
@@ -1510,26 +1520,23 @@ impl RepositoryContext {
             .store(prefetch, Ordering::Relaxed);
     }
 
-    /// Writes back the instance's records, where this context holds a write token, alongside
-    /// the immutable store's flush and then the mutable store's. A failed write-back is logged
-    /// and does not fail the flush: the records are advisory.
+    /// Flushes the stores through [`lore_storage::flush_stores`], then writes back the instance's
+    /// records, where this context holds a write token. The records wait for the stores: written
+    /// ahead of a flush that fails, they would describe content the instance's anchors on disk do
+    /// not name, and a scan would trust them. A failed write-back is logged and does not fail the
+    /// flush: the records are advisory.
     pub async fn flush(&self, options: lore_storage::FlushOptions) -> Result<(), RepositoryError> {
-        let records = async {
-            if let (Some(lock), Some(token)) = (&self.repo_lock, &self.write_token) {
-                lock.write_back_records_or_warn(token).await;
-            }
-        };
-        let stores = async {
-            let immutable_store = self.immutable_store.clone();
-            let immutable_result = immutable_store.flush(options).await;
-
-            let mutable_store = self.mutable_store.clone();
-            let mutable_result = mutable_store.flush(options).await;
-
-            immutable_result.and(mutable_result)
-        };
-        let ((), result) = tokio::join!(records, stores);
-        result.forward::<RepositoryError>("Failed to flush stores to disk")
+        lore_storage::flush_stores(
+            self.immutable_store.clone(),
+            Some(self.mutable_store.clone()),
+            options,
+        )
+        .await
+        .forward::<RepositoryError>("flushing the stores")?;
+        if let (Some(lock), Some(token)) = (&self.repo_lock, &self.write_token) {
+            lock.write_back_records_or_warn(token).await;
+        }
+        Ok(())
     }
 
     /// Returns the remote connection, awaiting the pending connect task on first call.

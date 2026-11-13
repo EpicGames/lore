@@ -24,6 +24,7 @@ use crate::interface::LoreString;
 use crate::lore::Context;
 use crate::lore::RepositoryId;
 use crate::lore::execution_context;
+use crate::lore_warn;
 use crate::protocol;
 use crate::repository;
 use crate::util;
@@ -378,7 +379,9 @@ pub(crate) async fn create_with_metadata(
     // explicitly to ensure branch creation, instance registration, and
     // metadata are written before the process exits — synced to disk only
     // under `--sync-data`, as every other command's flush is.
-    let _ = repository.flush(call.flush_options()).await;
+    if let Err(err) = repository.flush(call.flush_options()).await {
+        lore_warn!("Failed to flush the created repository's stores: {err}");
+    }
 
     drop(repository);
     drop(connection);

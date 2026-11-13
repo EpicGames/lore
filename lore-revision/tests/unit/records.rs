@@ -10,8 +10,8 @@ use lore_base::lore_spawn;
 use lore_base::lore_spawn_blocking;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::runtime;
-use lore_base::runtime::runtime_flush_guarded;
 use lore_base::test_util::TempDir;
+use lore_base::types::FragmentFlags;
 use lore_base::types::Hash;
 use lore_base::types::KeyType;
 use lore_revision::interface::LoreGlobalArgs;
@@ -35,11 +35,14 @@ use lore_revision::repository::keeps_records_on_disk;
 use lore_revision::state;
 use lore_revision::util::path::RelativePath;
 use lore_storage::FlushOptions;
+use lore_storage::test_util::fail_packfile_syncs;
+use lore_storage::test_util::packfile_sync_failures_left;
 
 use crate::helper::committed_repository;
 use crate::helper::relative_path;
 use crate::helper::test_execution_with;
 use crate::helper::test_file_write;
+use crate::repository::test_helpers::store_fragment;
 
 /// A key in shard `shard`, told apart from the shard's other keys by `fill`.
 fn key(shard: u8, fill: u8) -> RecordKey {
@@ -645,8 +648,8 @@ async fn instance_record(repository: &RepositoryContext, path: &RelativePath) ->
         .await
 }
 
-/// Runs `test` on the multi-thread runtime, under the execution `args` give, against a committed
-/// repository holding `files`, which it is handed with the repository's path.
+/// Runs `test` in a task on the test's own runtime, under the execution `args` give, against a
+/// committed repository holding `files`, which it is handed with the repository's path.
 async fn in_repository_with<F, Fut>(args: LoreGlobalArgs, files: &[&str], test: F)
 where
     F: FnOnce(Arc<RepositoryContext>, PathBuf) -> Fut + Send + 'static,
@@ -846,7 +849,8 @@ async fn records_are_written_back_after_the_command() {
 
         repository.try_spawn_post_command_flush(FlushOptions::default());
         drop(repository);
-        runtime_flush_guarded().await;
+        // The flush's task holds a sibling of the instance's token until it ends.
+        drop(RepositoryWriteToken::acquire(&path).await);
 
         let records = InstanceRecords::open(&dot_path).await;
         assert_eq!(records.lookup(&key).await, Lookup::Recorded(5678));
@@ -855,6 +859,82 @@ async fn records_are_written_back_after_the_command() {
                 .await
                 .expect("reopen the repository");
         assert_eq!(state::file_modified_time(reopened, &file).await, 5678);
+    })
+    .await;
+}
+
+/// Records a time for `file` in `repository`'s instance, and stores a fragment whose packfile is not
+/// synced, so that a flush that syncs fails once [`fail_packfile_syncs`] has armed it. Returns the
+/// record's key and the instance's dot directory.
+async fn record_with_a_fragment_pending(
+    repository: &Arc<RepositoryContext>,
+    file: &RelativePath,
+) -> (RecordKey, PathBuf) {
+    state::file_modified_time_store(repository.clone(), file, 5678).await;
+    let payload = b"a payload whose sync fails";
+    store_fragment(
+        repository,
+        payload,
+        FragmentFlags::empty(),
+        payload.len() as u64,
+    )
+    .await;
+    let dot_path = repository
+        .dot_dir_path()
+        .expect("a dot directory")
+        .to_path_buf();
+    (
+        state::file_modified_time_record_key(repository.salt(), file),
+        dot_path,
+    )
+}
+
+/// The flush a command ends with writes no records once its store flush has failed: the anchors
+/// on disk still name the revision before the command, which the records do not describe.
+#[tokio::test]
+async fn records_are_not_written_back_after_a_failed_store_flush() {
+    in_repository(|repository, path| async move {
+        let file = relative_path("unflushed.file");
+        let (key, dot_path) = record_with_a_fragment_pending(&repository, &file).await;
+
+        fail_packfile_syncs(1);
+        repository.try_spawn_post_command_flush(FlushOptions::SYNC_DATA);
+        drop(repository);
+        // The flush's task holds a sibling of the instance's token until it ends.
+        drop(RepositoryWriteToken::acquire(&path).await);
+        assert_eq!(
+            packfile_sync_failures_left(),
+            0,
+            "the flush ran, and its immutable store's flush failed"
+        );
+
+        let records = InstanceRecords::open(&dot_path).await;
+        assert!(matches!(records.lookup(&key).await, Lookup::Missing(_)));
+    })
+    .await;
+}
+
+/// A flush whose store flush fails returns the error and writes no records.
+#[tokio::test]
+async fn a_failed_store_flush_writes_no_records() {
+    in_repository(|repository, _| async move {
+        let file = relative_path("unflushed.file");
+        let (key, dot_path) = record_with_a_fragment_pending(&repository, &file).await;
+
+        fail_packfile_syncs(1);
+        assert!(
+            repository.flush(FlushOptions::SYNC_DATA).await.is_err(),
+            "the flush returns the store's error"
+        );
+        assert_eq!(
+            packfile_sync_failures_left(),
+            0,
+            "the immutable store's flush failed"
+        );
+        drop(repository);
+
+        let records = InstanceRecords::open(&dot_path).await;
+        assert!(matches!(records.lookup(&key).await, Lookup::Missing(_)));
     })
     .await;
 }

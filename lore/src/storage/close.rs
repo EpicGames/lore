@@ -30,6 +30,7 @@ use lore_revision::interface::ExecutionContext;
 use lore_revision::lore::execution_context;
 use lore_storage::FlushOptions;
 use lore_storage::StorageError;
+use lore_storage::flush_stores;
 use lore_storage::local::store_lock::StoreHold;
 use tokio::sync::oneshot;
 
@@ -37,7 +38,6 @@ use crate::call::no_repository_call;
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
-use crate::storage::flush::flush_stores;
 use crate::storage::handle;
 use crate::storage::handle::LoreStore;
 use crate::storage::store::StoreInternal;
@@ -78,7 +78,9 @@ pub(crate) fn spawn_flush(
     let mutable_store = store.mutable.clone();
     let flush = async move {
         immutable_store.clone().stop_gc(false).await;
-        let flushed = flush_stores(&immutable_store, &mutable_store, options).await;
+        let flushed = flush_stores(immutable_store, Some(mutable_store), options)
+            .await
+            .forward::<StorageError>("flushing a closed storage handle's stores");
         drop(claims);
         flushed
     }

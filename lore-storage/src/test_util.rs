@@ -230,6 +230,12 @@ pub fn fail_packfile_syncs(count: usize) {
     FAILED_SYNCS.with(|failed| failed.set(count));
 }
 
+/// How many of the packfile syncs [`fail_packfile_syncs`] asked to fail on this thread have not
+/// failed yet.
+pub fn packfile_sync_failures_left() -> usize {
+    FAILED_SYNCS.with(Cell::get)
+}
+
 /// The result of this packfile sync, a failure if [`fail_packfile_syncs`] asked for one.
 pub(crate) fn packfile_sync_result() -> std::io::Result<()> {
     if take_failure(&FAILED_SYNCS) {
