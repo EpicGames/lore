@@ -18,6 +18,8 @@
 //! released either way, and a close dropped once its flush has started leaves it to run to its end.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::atomic::fence;
 
 use futures::FutureExt;
 use lore_base::error::InvalidArguments;
@@ -68,6 +70,9 @@ pub(crate) fn claims_for_flush(store: &StoreInternal) -> StoreHold {
 /// in flight to end, then flushes the stores through [`flush_stores`] as `options` asks; in-memory
 /// stores no-op. A failed flush no receiver takes is logged. Runs without the caller's execution
 /// context.
+///
+/// A `SeqCst` fence before the flush reads the stores' `dirty` flags orders it against a revision
+/// tree's close, as [`crate::revision_tree::close::spawn_flush_after_storage_close`] describes.
 pub(crate) fn spawn_flush(
     store: &StoreInternal,
     claims: StoreHold,
@@ -78,6 +83,7 @@ pub(crate) fn spawn_flush(
     let mutable_store = store.mutable.clone();
     let flush = async move {
         immutable_store.clone().stop_gc(false).await;
+        fence(Ordering::SeqCst);
         let flushed = flush_stores(immutable_store, Some(mutable_store), options)
             .await
             .forward::<StorageError>("flushing a closed storage handle's stores");

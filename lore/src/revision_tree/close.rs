@@ -6,6 +6,7 @@
 //! closed storage handle, drop.
 
 use std::sync::atomic::Ordering;
+use std::sync::atomic::fence;
 
 use lore_base::error::InvalidArguments;
 use lore_error_set::prelude::*;
@@ -16,6 +17,7 @@ use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeCloseCompleteEventData;
 use lore_revision::interface::LoreError;
 use lore_revision::lore::execution_context;
+use lore_storage::FlushOptions;
 use lore_storage::StorageError;
 use tokio::sync::oneshot;
 
@@ -111,7 +113,9 @@ async fn close_tree(tree: LoreRevisionTree, skip_flush: bool) -> Result<(), Clos
     let flushed = if skip_flush {
         None
     } else {
-        spawn_flush_after_storage_close(&internal.store_internal)
+        spawn_flush_after_storage_close(&internal.store_internal, || {
+            execution_context().globals().flush_options()
+        })
     };
     drop(internal);
     match flushed {
@@ -123,18 +127,28 @@ async fn close_tree(tree: LoreRevisionTree, skip_flush: bool) -> Result<(), Clos
     }
 }
 
-/// Starts the flush of the stores once the tree's storage handle has closed, as [`spawn_flush`]
-/// does, under claims joined while the tree still holds the handle's, or returns `None` while
-/// the handle is open: its own close flushes them, unless that close skips the flush. Writes no flush has written keep the store's
-/// lock while anything holds the stores, and are lost once nothing does.
-fn spawn_flush_after_storage_close(
+/// Returns `None` while the tree's storage handle is open: that handle's close flushes the
+/// stores, unless it skips the flush. Otherwise starts the flush as [`spawn_flush`] does, with
+/// the options `options` returns, under claims joined while the tree still holds the handle's.
+/// Writes no flush has written keep the store's lock while anything holds the stores, and are
+/// lost once nothing does.
+///
+/// A store-buffering shape decides whether the tree's writes are flushed: they set the stores'
+/// `dirty` flags, `Relaxed`, before this reads the handle's `invalid`, and the handle's close sets
+/// `invalid` before its flush reads the flags, also `Relaxed`. With nothing more, both reads can
+/// miss the other side's store: this starts no flush, and the handle's flush finds the flags
+/// clear, so nothing flushes what the tree wrote. A `SeqCst` fence before this read, and the one
+/// [`spawn_flush`] runs before its flush reads the flags, rule that out: of the two sides, the one
+/// whose fence comes second in the fences' total order reads the other's store or a later one.
+pub(crate) fn spawn_flush_after_storage_close(
     store: &StoreInternal,
+    options: impl FnOnce() -> FlushOptions,
 ) -> Option<oneshot::Receiver<Result<(), StorageError>>> {
-    if !store.invalid.load(Ordering::Acquire) {
+    fence(Ordering::SeqCst);
+    if !store.invalid.load(Ordering::Relaxed) {
         return None;
     }
-    let options = execution_context().globals().flush_options();
-    Some(spawn_flush(store, claims_for_flush(store), options))
+    Some(spawn_flush(store, claims_for_flush(store), options()))
 }
 
 /// The code `LORE_EVENT_REVISION_TREE_CLOSE_COMPLETE` reports for a finished close.

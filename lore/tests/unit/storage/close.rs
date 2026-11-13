@@ -10,8 +10,10 @@ use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
 use lore::revision_tree::handle as tree_handle;
 use lore::revision_tree::handle::LoreRevisionTree;
+use lore::revision_tree::handle::RevisionTreeGuard;
 use lore::storage::close::*;
 use lore::storage::handle;
+use lore::storage::handle::LoreStore;
 use lore::storage::store::OpGuard;
 use lore::storage::store::disk_backed_for_tests;
 use lore::storage::store::in_memory_for_tests;
@@ -43,6 +45,16 @@ fn held(root: &Path, name: &str) -> bool {
     StoreLock::new(root.join(name), false)
         .expect("a store directory")
         .is_held()
+}
+
+/// Waits until this process no longer holds the lock of the store directory `name` under `root`,
+/// failing with `what` after five seconds.
+async fn wait_until_released(root: &Path, name: &str, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while held(root, name) {
+        assert!(Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 /// Close must block until the in-flight counter drains. An `OpGuard` held by the test keeps
@@ -178,14 +190,12 @@ async fn a_close_dropped_during_its_flush_leaves_the_flush_to_run_to_its_end() {
     );
     scanning.resume.notify_one();
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while held(dir.path(), "immutable") {
-        assert!(
-            Instant::now() < deadline,
-            "the flush runs to its end and lets the store go"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_until_released(
+        dir.path(),
+        "immutable",
+        "the flush runs to its end and lets the store go",
+    )
+    .await;
     let reopened = disk_backed_for_tests("close-dropped-reopened", dir.path()).await;
     let found = reopened
         .immutable
@@ -461,20 +471,31 @@ async fn put_evictable_in_the_first_group(
     .await
 }
 
-/// A revision tree loaded on a disk-backed store under `root`, and the tree's stores, once the
-/// storage handle the tree was loaded against has closed.
-async fn tree_after_storage_close(
+/// A storage handle on a disk-backed store under `root`, opened by the IPC connection
+/// `connection_id` where one is given, a revision tree loaded on it, and the handle's stores.
+async fn tree_on_storage_handle(
     root: &Path,
     repository: Partition,
+    connection_id: Option<u64>,
 ) -> (
+    LoreStore,
     LoreRevisionTree,
     Arc<dyn ImmutableStore>,
     Arc<dyn MutableStore>,
 ) {
-    let store = disk_backed_for_tests("tree-after-storage-close", root).await;
+    let mut store = disk_backed_for_tests("tree-on-storage-handle", root).await;
+    if let Some(connection_id) = connection_id {
+        let opened = Arc::into_inner(store).expect("a store just built has one owner");
+        store = Arc::new(opened.with_connection_id(connection_id));
+    }
     let stores = (store.immutable.clone(), store.mutable.clone());
     let store_handle = handle::register(store);
     let tree = load_tree(store_handle, repository).await;
+    (store_handle, tree, stores.0, stores.1)
+}
+
+/// Close `store_handle`, flushing its stores.
+async fn close_storage_handle(store_handle: LoreStore) {
     let status = close(
         LoreGlobalArgs::default(),
         LoreStorageCloseArgs {
@@ -485,7 +506,22 @@ async fn tree_after_storage_close(
     )
     .await;
     assert_eq!(status, 0, "closing the storage handle must succeed");
-    (tree, stores.0, stores.1)
+}
+
+/// A revision tree loaded on a disk-backed store under `root`, and the tree's stores, once the
+/// storage handle the tree was loaded against has closed.
+async fn tree_after_storage_close(
+    root: &Path,
+    repository: Partition,
+) -> (
+    LoreRevisionTree,
+    Arc<dyn ImmutableStore>,
+    Arc<dyn MutableStore>,
+) {
+    let (store_handle, tree, immutable, mutable) =
+        tree_on_storage_handle(root, repository, None).await;
+    close_storage_handle(store_handle).await;
+    (tree, immutable, mutable)
 }
 
 /// Store a branch metadata value under `key` in `mutable`, as a commit through a tree would.
@@ -601,4 +637,110 @@ async fn a_tree_close_that_skips_the_flush_leaves_what_the_tree_wrote_unflushed(
         loaded.is_err_and(|err| err.is_address_not_found()),
         "the value is not on disk"
     );
+}
+
+/// **Shutdown's drain of a tree flushes what the tree wrote after its storage handle closed.**
+/// The tree's writes keep the store's flock until a flush writes them, so the drain's flush lets
+/// the store go.
+#[tokio::test]
+async fn the_shutdown_drain_flushes_what_a_tree_wrote_after_its_storage_handle_closed() {
+    let dir = TempDir::new("drain-tree-flush-");
+    let repository = Partition::from([0x5Cu8; 16]);
+    let (tree, _immutable, mutable) = tree_after_storage_close(dir.path(), repository).await;
+    store_value(&mutable, repository, Hash::from([0x7Cu8; 32])).await;
+
+    let internal = tree_handle::unregister(tree).expect("the tree must still be registered");
+    lore::revision_tree::drain_in_parallel(vec![(tree.handle_id, internal)]).await;
+    wait_until_released(
+        dir.path(),
+        "mutable",
+        "the drain flushes what the tree wrote and lets the store go",
+    )
+    .await;
+}
+
+/// **Connection teardown flushes what the connection's trees wrote, whether the connection closed
+/// their storage handle or left it open.** The tree on the closed handle flushes the stores
+/// itself; the tree on the open handle leaves the flush to that handle's drain. Each tree's
+/// writes keep its store's flock until a flush writes them, so teardown lets both stores go, and
+/// a store opened on each directory afterwards finds the value.
+#[tokio::test]
+async fn teardown_flushes_what_the_trees_wrote_whether_their_storage_handle_closed_or_not() {
+    const CONNECTION: u64 = 0x7EA2_D0F1;
+    let dir = TempDir::new("teardown-tree-flush-");
+    let closed_root = dir.path().join("closed");
+    let open_root = dir.path().join("open");
+    let repository = Partition::from([0x6Du8; 16]);
+    let key = Hash::from([0x8Du8; 32]);
+
+    let (closed_handle, on_closed, closed_immutable, closed_mutable) =
+        tree_on_storage_handle(&closed_root, repository, Some(CONNECTION)).await;
+    close_storage_handle(closed_handle).await;
+    store_value(&closed_mutable, repository, key).await;
+    let (open_handle, on_open, open_immutable, open_mutable) =
+        tree_on_storage_handle(&open_root, repository, Some(CONNECTION)).await;
+    store_value(&open_mutable, repository, key).await;
+
+    lore::storage::close_for_connection(CONNECTION).await;
+    assert!(
+        tree_handle::lookup(on_closed).is_none() && tree_handle::lookup(on_open).is_none(),
+        "teardown closes both trees"
+    );
+    assert!(
+        handle::lookup(open_handle).is_none(),
+        "and the storage handle the connection left open"
+    );
+    for root in [&closed_root, &open_root] {
+        wait_until_released(
+            root,
+            "mutable",
+            "teardown flushes what the tree wrote and lets the store go",
+        )
+        .await;
+    }
+
+    drop((
+        closed_immutable,
+        closed_mutable,
+        open_immutable,
+        open_mutable,
+    ));
+    for root in [&closed_root, &open_root] {
+        let reopened = disk_backed_for_tests("teardown-tree-flush-reopened", root).await;
+        reopened
+            .mutable
+            .clone()
+            .load(repository, key, KeyType::BranchMetadata)
+            .await
+            .expect("the value the tree wrote is on disk");
+    }
+}
+
+/// **A tree whose call outlasts the teardown's wait is flushed once the call ends.** The drain
+/// stops waiting for the call, but detaches rather than aborts the tree's task, which starts the
+/// flush once the call has ended.
+#[tokio::test]
+async fn teardown_flushes_a_tree_whose_call_outlasts_its_wait_once_the_call_ends() {
+    const CONNECTION: u64 = 0x7EA2_D0F2;
+    let dir = TempDir::new("teardown-late-flush-");
+    let repository = Partition::from([0x6Eu8; 16]);
+    let (store_handle, tree, _immutable, mutable) =
+        tree_on_storage_handle(dir.path(), repository, Some(CONNECTION)).await;
+    close_storage_handle(store_handle).await;
+    let call = RevisionTreeGuard::enter(tree).expect("a call enters the tree");
+    store_value(&mutable, repository, Hash::from([0x8Eu8; 32])).await;
+
+    lore::revision_tree::close_for_connection_within(CONNECTION, Duration::from_millis(20)).await;
+    assert!(
+        held(dir.path(), "mutable"),
+        "what the tree wrote waits for its call to end"
+    );
+
+    drop(call);
+    wait_until_released(
+        dir.path(),
+        "mutable",
+        "the drain flushes what the tree wrote once the call ends",
+    )
+    .await;
 }

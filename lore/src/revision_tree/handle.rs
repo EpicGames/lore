@@ -55,19 +55,13 @@ lore_base::carries_no_text!(LoreRevisionTree);
 ///
 /// Holds an `Arc<StoreInternal>` clone of the parent storage handle so
 /// `lore_storage_close` on the parent does not tear down the underlying
-/// store while a revision tree handle still references it. The
-/// `parent_storage_handle_id` is the registry key of the parent storage
-/// handle at load time and is the matching key used by the IPC dispatcher
-/// to cascade closes on connection teardown.
+/// store while a revision tree handle still references it.
 #[lore_macro::test_pub]
 pub(crate) struct RevisionTreeInternal {
-    /// Shared store reference cloned from the parent storage handle.
+    /// Shared store reference cloned from the parent storage handle: the handle's own state,
+    /// not only its backend, so the connection-teardown cascade matches the tree on the
+    /// connection that opened that handle, whether the handle is still open or not.
     pub(crate) store_internal: Arc<StoreInternal>,
-    /// Registry key of the parent storage handle this revision tree was loaded
-    /// against, and what the connection-teardown cascade matches on. The id
-    /// rather than the store, so two handles sharing one cached backend stay
-    /// distinct.
-    pub(crate) parent_storage_handle_id: u64,
     /// Repository identity (a `Partition`) the loaded revision targets.
     pub(crate) repository: Partition,
     /// Synthesized repository context covering the underlying immutable,
@@ -173,14 +167,12 @@ impl RevisionTreeInternal {
     #[lore_macro::test_pub]
     pub(crate) fn new(
         store_internal: Arc<StoreInternal>,
-        parent_storage_handle_id: u64,
         repository: Partition,
         repository_context: Arc<RepositoryContext>,
         state: Arc<State>,
     ) -> Self {
         Self {
             store_internal,
-            parent_storage_handle_id,
             repository,
             repository_context,
             state: Arc::new(tokio::sync::RwLock::new(state)),
@@ -308,16 +300,15 @@ pub(crate) fn drain_all() -> Vec<(u64, Arc<RevisionTreeInternal>)> {
     drained
 }
 
-/// Drain every registry entry loaded against the storage handle `storage_handle_id`, for
-/// the connection-teardown cascade: a tree outlives its parent by design, so a connection
-/// that drops without closing it would hold the store for the life of the process.
+/// Drain every registry entry loaded against a storage handle the IPC connection
+/// `connection_id` opened, whether that storage handle is still open or not, for the
+/// connection-teardown cascade: a tree outlives its parent by design, so a connection that
+/// drops without closing it would hold the store for the life of the process.
 #[lore_macro::test_pub]
-pub(crate) fn drain_for_storage_handle(
-    storage_handle_id: u64,
-) -> Vec<(u64, Arc<RevisionTreeInternal>)> {
+pub(crate) fn drain_for_connection(connection_id: u64) -> Vec<(u64, Arc<RevisionTreeInternal>)> {
     let mut drained = Vec::new();
     REGISTRY.retain(|&id, internal| {
-        if internal.parent_storage_handle_id == storage_handle_id {
+        if internal.store_internal.connection_id == Some(connection_id) {
             drained.push((id, internal.clone()));
             false
         } else {

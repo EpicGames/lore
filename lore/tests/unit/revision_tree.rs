@@ -192,10 +192,10 @@ async fn guard_enter_unregistered_handle_returns_none() {
     assert!(RevisionTreeGuard::enter(handle_value).is_none());
 }
 
-/// The cascade takes the handles loaded against one storage handle and no others.
-/// Keyed on ids no other test can be using, since it sweeps the live registry.
+/// The cascade takes the handles loaded against storage handles one connection opened, and no
+/// others. Keyed on connection ids no other test can be using, since it sweeps the live registry.
 #[tokio::test]
-async fn drain_for_storage_handle_takes_only_the_handles_loaded_on_it() {
+async fn drain_for_connection_takes_only_the_handles_on_its_storage_handles() {
     use lore::revision_tree::handle;
 
     use crate::revision_tree::handle::test_support;
@@ -203,11 +203,12 @@ async fn drain_for_storage_handle_takes_only_the_handles_loaded_on_it() {
     const OWNER: u64 = 0xC105_E001;
     const SIBLING: u64 = 0xC105_E002;
 
-    let first = handle::register(test_support::new_for_testing_on_storage_handle(OWNER).await);
-    let second = handle::register(test_support::new_for_testing_on_storage_handle(OWNER).await);
-    let other = handle::register(test_support::new_for_testing_on_storage_handle(SIBLING).await);
+    let first = handle::register(test_support::new_for_testing_on_connection(OWNER).await);
+    let second = handle::register(test_support::new_for_testing_on_connection(OWNER).await);
+    let other = handle::register(test_support::new_for_testing_on_connection(SIBLING).await);
+    let client = handle::register(test_support::new_for_testing().await);
 
-    let drained: Vec<u64> = handle::drain_for_storage_handle(OWNER)
+    let drained: Vec<u64> = handle::drain_for_connection(OWNER)
         .into_iter()
         .map(|(id, _)| id)
         .collect();
@@ -215,18 +216,19 @@ async fn drain_for_storage_handle_takes_only_the_handles_loaded_on_it() {
     assert_eq!(
         drained.len(),
         2,
-        "both handles on the closing storage handle must drain, got {drained:?}"
+        "both handles on the connection's storage handles must drain, got {drained:?}"
     );
     assert!(drained.contains(&first.handle_id));
     assert!(drained.contains(&second.handle_id));
     assert!(handle::lookup(first).is_none());
     assert!(handle::lookup(second).is_none());
     assert!(
-        handle::lookup(other).is_some(),
-        "a handle loaded against another storage handle must survive",
+        handle::lookup(other).is_some() && handle::lookup(client).is_some(),
+        "handles on storage handles another connection, or none, opened must survive",
     );
 
     handle::unregister(other);
+    handle::unregister(client);
 }
 
 /// The worker both close paths funnel through. Driven with an explicit entry list, so
@@ -258,7 +260,7 @@ async fn drain_in_parallel_marks_each_handle_invalid() {
 async fn a_teardown_cascade_gives_up_on_an_op_that_will_not_finish() {
     use std::time::Duration;
 
-    use lore::revision_tree::close_for_storage_handle_within;
+    use lore::revision_tree::close_for_connection_within;
     use lore::revision_tree::handle;
     use lore::revision_tree::handle::RevisionTreeGuard;
 
@@ -266,10 +268,10 @@ async fn a_teardown_cascade_gives_up_on_an_op_that_will_not_finish() {
 
     const OWNER: u64 = 0xC105_E005;
 
-    let stuck = handle::register(test_support::new_for_testing_on_storage_handle(OWNER).await);
+    let stuck = handle::register(test_support::new_for_testing_on_connection(OWNER).await);
     let guard = RevisionTreeGuard::enter(stuck).expect("guard enter must succeed");
 
-    close_for_storage_handle_within(OWNER, Duration::from_millis(20)).await;
+    close_for_connection_within(OWNER, Duration::from_millis(20)).await;
 
     assert!(
         handle::lookup(stuck).is_none(),

@@ -164,11 +164,10 @@ pub(crate) struct StoreInternal {
     /// behind the shared `Arc` it stays empty, and a query of an empty filter never reads or writes
     /// its memo.
     empty_filter: OnceLock<Arc<Filter>>,
-    /// Optional service-mode connection that owns this handle. Populated by the IPC dispatcher
-    /// during a server-mode open so that connection teardown can drive
-    /// [`crate::storage::handle::close_all_for_connection`] and reclaim handles whose owning
-    /// connection has dropped without an explicit close. `None` for client-mode opens — those
-    /// remain on explicit-close.
+    /// Optional service-mode connection that owns this handle, set by `with_connection_id`, so
+    /// that [`crate::storage::close_for_connection`] reclaims the handle, and the revision trees
+    /// loaded against it, once that connection has dropped without closing them. `None` for
+    /// client-mode opens — those remain on explicit-close.
     pub connection_id: Option<u64>,
     pub in_flight: AtomicU64,
     pub invalid: AtomicBool,

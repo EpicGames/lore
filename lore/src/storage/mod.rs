@@ -116,15 +116,18 @@ pub async fn close_all_handles() {
 /// message they arrived in. A get item's `data_out` names memory the service cannot write, so it
 /// does not cross, and a relayed get answers with `GET_DATA` events instead.
 ///
-/// Revision tree handles loaded against a drained storage handle are closed too, and this
-/// is the only path that closes one for its caller: elsewhere a tree outlives its parent by
-/// design, but a dropped connection leaves nobody to release it. The cascade runs per
-/// storage handle, each draining its own trees in parallel.
+/// Revision tree handles loaded against a storage handle the connection opened are closed too,
+/// whether that storage handle is still open or was closed, and this is the only path that
+/// closes one for its caller: elsewhere a tree outlives its parent by design, but a dropped
+/// connection leaves nobody to release it. The trees drain in parallel, before the storage
+/// handles. As [`crate::revision_tree::drain_in_parallel`] describes, a tree on a storage
+/// handle still open leaves its flush to that handle's, and one on a storage handle closed
+/// flushes the stores itself. The trees' drain waits at most 10 seconds for their calls in
+/// flight; a tree whose calls end later is flushed once they have. The storage handles' drain
+/// waits for their calls without a bound.
 pub async fn close_for_connection(connection_id: u64) {
     let entries = handle::drain_for_connection(connection_id);
-    for (storage_handle_id, _) in &entries {
-        crate::revision_tree::close_for_storage_handle(*storage_handle_id).await;
-    }
+    crate::revision_tree::close_for_connection(connection_id).await;
     drain_in_parallel(entries).await;
 }
 

@@ -25,15 +25,21 @@ use lore_transport::ProtocolError;
 /// Build a `RevisionTreeInternal` for tests. Uses in-memory stores so
 /// no filesystem touch happens and no cleanup is required.
 pub(crate) async fn new_for_testing() -> Arc<RevisionTreeInternal> {
-    new_for_testing_on_storage_handle(0).await
+    let store_internal: Arc<StoreInternal> = in_memory_for_tests("revision-tree-test").await;
+    on_store(store_internal).await
 }
 
-/// The same fixture, claiming to have been loaded against a given storage
-/// handle — what the connection-teardown close cascade matches on.
-pub(crate) async fn new_for_testing_on_storage_handle(
-    parent_storage_handle_id: u64,
-) -> Arc<RevisionTreeInternal> {
-    let store_internal: Arc<StoreInternal> = in_memory_for_tests("revision-tree-test").await;
+/// The same fixture, loaded against a storage handle the IPC connection `connection_id`
+/// opened — what the connection-teardown close cascade matches on.
+pub(crate) async fn new_for_testing_on_connection(connection_id: u64) -> Arc<RevisionTreeInternal> {
+    let store_internal = Arc::into_inner(in_memory_for_tests("revision-tree-test").await)
+        .expect("a store just built has one owner")
+        .with_connection_id(connection_id);
+    on_store(Arc::new(store_internal)).await
+}
+
+/// The fixture, loaded against the storage handle whose state is `store_internal`.
+async fn on_store(store_internal: Arc<StoreInternal>) -> Arc<RevisionTreeInternal> {
     let (immutable, mutable) = create_client_memory_stores()
         .await
         .expect("create_client_memory_stores");
@@ -51,7 +57,6 @@ pub(crate) async fn new_for_testing_on_storage_handle(
     let state = State::new();
     Arc::new(RevisionTreeInternal::new(
         store_internal,
-        parent_storage_handle_id,
         repository,
         repository_context,
         state,

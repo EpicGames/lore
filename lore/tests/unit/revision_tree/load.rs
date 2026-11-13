@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::sync::Arc;
+
 use lore::revision_tree::handle as rt_handle;
 use lore::revision_tree::load::*;
 use lore::storage::handle as storage_handle;
@@ -140,10 +142,12 @@ async fn load_with_unknown_store_handle_fails_with_invalid_arguments() {
     );
 }
 
+/// The tree holds its storage handle's own state, whose connection the teardown cascade
+/// matches on.
 #[tokio::test]
-async fn load_captures_parent_storage_handle_id_for_close_cascade() {
+async fn load_holds_the_storage_handles_state_for_the_close_cascade() {
     let store = in_memory_for_tests("load-parent-capture").await;
-    let store_handle = storage_handle::register(store);
+    let store_handle = storage_handle::register(store.clone());
     let (sink, callback) = recording_callback();
     let args = LoreRevisionTreeLoadArgs {
         store: store_handle,
@@ -159,9 +163,9 @@ async fn load_captures_parent_storage_handle_id_for_close_cascade() {
     let entry = rt_handle::REGISTRY
         .get(&id)
         .expect("registered revision tree handle");
-    assert_eq!(
-        entry.parent_storage_handle_id, store_handle.handle_id,
-        "internal must record the parent storage handle id for the cascade"
+    assert!(
+        Arc::ptr_eq(&entry.store_internal, &store),
+        "internal must hold the storage handle's own state for the cascade"
     );
     drop(entry);
 
@@ -211,8 +215,6 @@ async fn load_two_revision_trees_against_different_repositories_on_one_storage_h
         .expect("handle B must be registered");
     assert_eq!(entry_a.repository, Partition::from([0xAAu8; 16]));
     assert_eq!(entry_b.repository, Partition::from([0xBBu8; 16]));
-    assert_eq!(entry_a.parent_storage_handle_id, store_handle.handle_id);
-    assert_eq!(entry_b.parent_storage_handle_id, store_handle.handle_id);
     drop(entry_a);
     drop(entry_b);
 

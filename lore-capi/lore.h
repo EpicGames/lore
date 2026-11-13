@@ -13006,6 +13006,13 @@ int32_t lore_log_configure(const struct lore_log_config_t *config);
 // calls still executing safely, but a call it does not stop in time may still
 // use the memory passed to it after this returns.
 //
+// Revision tree handles still open are closed first, then storage handles
+// still open. Closing them flushes, without a sync of what the flush writes,
+// the stores of each storage handle, and those of each tree whose storage
+// handle has closed. Shutdown waits for these flushes, and logs one that
+// fails. It waits at most 10 seconds for the calls in flight on these
+// handles: a handle it has not closed by then may be left unflushed.
+//
 // Returns 0 on success and a non-zero value on failure.
 int32_t lore_shutdown(void);
 
