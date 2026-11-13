@@ -263,10 +263,7 @@ pub async fn handle_put(
     debug!(
         "Handling PutFragment request for fragment with address: {} ({} bytes payload) in repository: {}",
         put.address,
-        put.payload
-            .as_ref()
-            .map(|payload| payload.len())
-            .unwrap_or_default(),
+        put.payload.as_ref().map_or_default(|payload| payload.len()),
         repository
     );
 

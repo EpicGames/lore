@@ -1937,8 +1937,7 @@ impl ResourceDetectorProvider for PluginResourceDetectorProvider<'_> {
     fn detectors(&self, runtime_handle: Handle) -> Vec<Box<dyn ResourceDetector>> {
         let mut detectors = self
             .inner
-            .map(|provider| provider.detectors(runtime_handle.clone()))
-            .unwrap_or_default();
+            .map_or_default(|provider| provider.detectors(runtime_handle.clone()));
         detectors.extend(self.registry.resource_detectors(runtime_handle));
         detectors
     }
@@ -2622,8 +2621,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
 
 fn server_log_dispatch(level: lore_base::log::LoreLogLevel, location: &str, message: &str) {
     let correlation_id = lore_revision::lore::try_execution_context()
-        .map(|e| e.dispatcher.correlation_id.clone())
-        .unwrap_or_default();
+        .map_or_default(|e| e.dispatcher.correlation_id.clone());
 
     match level {
         lore_base::log::LoreLogLevel::None | lore_base::log::LoreLogLevel::Trace => {

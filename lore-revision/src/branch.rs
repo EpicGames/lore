@@ -223,8 +223,7 @@ impl LoreBranchDiffNodeData {
             automerged: node_change.flags.is_conflict_automerged().into(),
             from_path: node_change
                 .move_source()
-                .map(|path| display_path(path.as_str()))
-                .unwrap_or_default(),
+                .map_or_default(|path| display_path(path.as_str())),
         }
     }
 }
@@ -1959,10 +1958,7 @@ pub async fn create_at(
     #[cfg(feature = "test-util")]
     crate::test_util::branch_step(crate::test_util::BranchStep::CreateNameRead).await;
 
-    let mut head = stack
-        .first()
-        .map(|parent| parent.revision)
-        .unwrap_or_default();
+    let mut head = stack.first().map_or_default(|parent| parent.revision);
 
     let mut tasks = JoinSet::new();
 
@@ -4010,8 +4006,7 @@ pub async fn list_revisions(
         let branch_metadata = metadata(repository.clone(), b).await?;
         stack(&branch_metadata)
             .first()
-            .map(|parent| parent.revision)
-            .unwrap_or_default()
+            .map_or_default(|parent| parent.revision)
     };
     let limit = limit.unwrap_or(100);
 

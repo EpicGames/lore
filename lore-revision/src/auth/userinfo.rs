@@ -190,8 +190,7 @@ pub(crate) async fn resolve_user_info(
     };
     let auth_url = remote
         .as_ref()
-        .map(|remote| remote.auth_url().to_string())
-        .unwrap_or_default();
+        .map_or_default(|remote| remote.auth_url().to_string());
 
     let user_ids_vec: Vec<String> = ids
         .as_slice()

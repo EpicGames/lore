@@ -540,8 +540,7 @@ impl CommitReporting {
         self.enabled.then(|| CommitStatsReport {
             reporting: self.clone(),
             baseline: crate::runtime::try_execution_context()
-                .map(|context| context.fragment_stats().snapshot())
-                .unwrap_or_default(),
+                .map_or_default(|context| context.fragment_stats().snapshot()),
         })
     }
 }

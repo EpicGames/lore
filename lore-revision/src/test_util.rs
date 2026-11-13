@@ -237,6 +237,7 @@ pub(crate) async fn branch_step(step: BranchStep) {
 
 /// Where a task run under [`hold_unmount_drains`] reports that a FUSE unmount's drain found the
 /// inode table counting no lookups, and what it waits for to go on.
+#[cfg(target_os = "linux")]
 #[derive(Clone)]
 struct DrainHold {
     reached: tokio::sync::mpsc::UnboundedSender<()>,
@@ -244,6 +245,7 @@ struct DrainHold {
 }
 
 tokio::task_local! {
+    #[cfg(target_os = "linux")]
     static DRAIN_HOLD: DrainHold;
 }
 
@@ -251,6 +253,7 @@ tokio::task_local! {
 /// table counting no lookups, before it waits for the count to settle: a `()` is sent on
 /// `reached`, and the drain waits for a notification of `resume` before it goes on. Tasks
 /// `future` spawns don't stop.
+#[cfg(target_os = "linux")]
 pub fn hold_unmount_drains<F: Future>(
     reached: tokio::sync::mpsc::UnboundedSender<()>,
     resume: Arc<Notify>,
@@ -261,6 +264,7 @@ pub fn hold_unmount_drains<F: Future>(
 
 /// Stops this task where a FUSE unmount's drain has found the inode table counting no lookups,
 /// where it runs under [`hold_unmount_drains`].
+#[cfg(target_os = "linux")]
 pub(crate) async fn unmount_drain_emptied() {
     let Ok(hold) = DRAIN_HOLD.try_with(DrainHold::clone) else {
         return;

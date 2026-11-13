@@ -3825,7 +3825,7 @@ async fn a_delete_fails_when_the_mapping_changed_after_its_read() {
                             && armed.swap(false, Ordering::SeqCst);
                         async move {
                             if change {
-                                let value = held.map(Hash::from_context).unwrap_or_default();
+                                let value = held.map_or_default(Hash::from_context);
                                 inner.store(partition, key, value, key_type).await
                             } else {
                                 Ok(())

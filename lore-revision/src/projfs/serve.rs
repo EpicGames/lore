@@ -433,8 +433,7 @@ unsafe extern "system" fn start_directory_enumeration(
             } else {
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map(|t| t.as_millis())
-                    .unwrap_or_default() as u64
+                    .map_or_default(|t| t.as_millis()) as u64
             }
         },
     ));
@@ -869,8 +868,7 @@ async unsafe fn get_placeholder_info_async(
         } else {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|t| t.as_millis())
-                .unwrap_or_default() as u64
+                .map_or_default(|t| t.as_millis()) as u64
         };
 
         let timestamp = ms_filetime(timestamp) as i64;

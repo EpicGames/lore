@@ -621,7 +621,7 @@ pub fn handle_revision_history(globals: LoreGlobalArgs, args: &RevisionHistoryAr
                 )
                 .unwrap_or_default()
             } else {
-                message.lines().next().map(String::from).unwrap_or_default()
+                message.lines().next().map_or_default(String::from)
             };
 
             println!("{revision_number} {message}");

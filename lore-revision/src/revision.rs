@@ -2853,7 +2853,7 @@ async fn resolved_branch(
         StateError::is_slow_down,
         "reading the branch a revision records",
     )?
-    .unwrap_or_else(|| named.map(|(branch, _)| branch).unwrap_or_default()))
+    .unwrap_or_else(|| named.map_or_default(|(branch, _)| branch)))
 }
 
 /// True when `signature` is a complete revision hash signature.

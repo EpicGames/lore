@@ -444,10 +444,7 @@ fn registered_id(metadata: &Metadata) -> InstanceId {
 /// The path that the registration blob `metadata` holds, empty where it holds none or one that
 /// isn't UTF-8.
 fn registered_path(metadata: &Metadata) -> String {
-    metadata
-        .get_string(PATH)
-        .map(str::to_owned)
-        .unwrap_or_default()
+    metadata.get_string(PATH).map_or_default(str::to_owned)
 }
 
 /// Attempt to recover a lost instance ID by enumerating all registered
@@ -1149,8 +1146,7 @@ async fn instance_anchor_state(
         .await
         .ok()
         .flatten()
-        .map(|h| h.to_context())
-        .unwrap_or_default();
+        .map_or_default(|h| h.to_context());
     let branch_name = if !branch_id.is_zero() {
         crate::branch::metadata(repository.clone(), branch_id)
             .await

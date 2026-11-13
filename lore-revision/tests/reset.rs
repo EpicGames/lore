@@ -830,6 +830,7 @@ mod tests {
         result: Result<(), ResetError>,
         warnings: Vec<String>,
         /// The paths the reset removed recursively.
+        #[cfg(target_os = "linux")]
         removed: Vec<String>,
         /// How many directories the reset read.
         directory_reads: usize,
@@ -903,10 +904,12 @@ mod tests {
             .await;
         execution.dispatcher.drain().await;
         let warnings = std::mem::take(&mut *warnings.lock().expect("Failed to read the warnings"));
+        #[cfg(target_os = "linux")]
         let removed = std::mem::take(&mut *removed.lock());
         RefusedReset {
             result,
             warnings,
+            #[cfg(target_os = "linux")]
             removed,
             directory_reads: directory_reads.load(Ordering::Relaxed),
         }

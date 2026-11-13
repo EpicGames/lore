@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+#[cfg(target_os = "linux")]
 use lore_base::types::FragmentFlags;
 use lore_revision::change;
 use lore_revision::change::FileAction;
@@ -42,6 +43,7 @@ use crate::helper::in_memory;
 use crate::helper::in_memory::directory;
 use crate::helper::in_memory::file;
 use crate::repository::test_helpers::file_node;
+#[cfg(target_os = "linux")]
 use crate::repository::test_helpers::store_fragment;
 use crate::repository::test_helpers::stored_as_list;
 use crate::repository::test_helpers::working_tree_repository;

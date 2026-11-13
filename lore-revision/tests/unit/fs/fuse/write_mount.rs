@@ -14108,13 +14108,11 @@ async fn settled_requests(spawned: &Spawned) {
 /// The names in the staging directory beside `write/`.
 fn names_in_staging(instance: &Instance) -> Vec<String> {
     let staging = instance.write_dir().with_file_name("write-staging");
-    std::fs::read_dir(staging)
-        .map(|dir| {
-            dir.flatten()
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default()
+    std::fs::read_dir(staging).map_or_default(|dir| {
+        dir.flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect()
+    })
 }
 
 /// Forgets every lookup the kernel holds on each of `inos`.

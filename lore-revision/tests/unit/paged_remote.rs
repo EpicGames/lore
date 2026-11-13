@@ -814,14 +814,12 @@ impl Revision for PagedRemote {
                         .listed_metadata
                         .iter()
                         .find(|(revision, _)| *revision == signature)
-                        .map(|&(_, metadata)| metadata)
-                        .unwrap_or_default(),
+                        .map_or_default(|&(_, metadata)| metadata),
                     state: self
                         .held
                         .iter()
                         .find(|revision| revision.signature == signature)
-                        .map(|revision| revision.state.clone())
-                        .unwrap_or_default(),
+                        .map_or_default(|revision| revision.state.clone()),
                 })
                 .collect(),
             next_revision: page.older,

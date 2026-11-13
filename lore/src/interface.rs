@@ -8041,8 +8041,7 @@ pub fn user_directory() -> Option<PathBuf> {
 pub extern "C" fn lore_user_directory() -> *const std::ffi::c_char {
     static CAPI_USER_DIRECTORY: LazyLock<CString> = LazyLock::new(|| {
         user_directory()
-            .map(|path| CString::new(path.display().to_string()).unwrap_or_default())
-            .unwrap_or_default()
+            .map_or_default(|path| CString::new(path.display().to_string()).unwrap_or_default())
     });
 
     CAPI_USER_DIRECTORY.as_c_str().as_ptr()

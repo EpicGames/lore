@@ -533,8 +533,7 @@ async fn incoming_address(change: &NodeChange) -> crate::lore::Address {
         .to
         .get_node()
         .await
-        .map(|node| node.address)
-        .unwrap_or_default()
+        .map_or_default(|node| node.address)
 }
 
 /// Whether the file holds the content the change starts from, which realizing the change

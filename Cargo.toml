@@ -43,7 +43,9 @@ checked_conversions = "warn"
 dbg_macro = "warn"
 debug_assert_with_mut_call = "warn"
 doc_markdown = "warn"
-empty_enums = "warn"
+# empty_enums = "warn" # Off: from Rust 1.100 it flags the variantless marker enums that
+# zerocopy's FromBytes and FromZeros derives emit beside the type, out of reach of an `allow`
+# on it. Turn it back on once clippy stops linting that derive output.
 enum_glob_use = "warn"
 exit = "warn"
 expl_impl_clone_on_copy = "warn"

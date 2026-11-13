@@ -333,8 +333,7 @@ pub mod authentication {
             let auth = map.as_ref().and_then(|m| m.get(scheme).cloned());
             auth.ok_or_else(|| {
                 map.as_ref()
-                    .map(|m| m.keys().cloned().collect::<Vec<String>>())
-                    .unwrap_or_default()
+                    .map_or_default(|m| m.keys().cloned().collect::<Vec<String>>())
             })
         };
         found.map_err(|available| {

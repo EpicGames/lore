@@ -275,14 +275,12 @@ impl StoreConfig {
             max_capacity: Some(self.max_capacity.unwrap_or_default()),
             eviction_delay: Some(
                 self.eviction_delay
-                    .map(|sec| Duration::from_secs(sec as u64))
-                    .unwrap_or_default(),
+                    .map_or_default(|sec| Duration::from_secs(sec as u64)),
             ),
             max_size: Some(self.max_size.unwrap_or_default()),
             compaction_delay: Some(
                 self.compaction_delay
-                    .map(|sec| Duration::from_secs(sec as u64))
-                    .unwrap_or_default(),
+                    .map_or_default(|sec| Duration::from_secs(sec as u64)),
             ),
         }
     }
@@ -1050,8 +1048,7 @@ impl RepositoryContext {
             .as_ref()
             .and_then(|paths| load_config(paths.dot_path.join(CONFIG)).ok());
         let correlation_id = crate::runtime::try_execution_context()
-            .map(|context| context.globals().correlation_id.to_string())
-            .unwrap_or_default();
+            .map_or_default(|context| context.globals().correlation_id.to_string());
         remote_arc(match config {
             Some(config) => {
                 match connect_remote(self.id, correlation_id, &config, config.identity.clone()) {
@@ -3825,8 +3822,7 @@ pub async fn create_local(
     // Written before returning, since clone drops this handle and loads the
     // repository afresh from disk; synced only under `--sync-data`.
     let options = crate::runtime::try_execution_context()
-        .map(|context| context.globals().flush_options())
-        .unwrap_or_default();
+        .map_or_default(|context| context.globals().flush_options());
     repository.flush(options).await?;
 
     #[cfg(target_os = "linux")]
@@ -3963,10 +3959,7 @@ async fn branch_switch_create(
         branch::name(&metadata).forward::<RepositoryError>("Failed to load branch metadata")?;
     let branch_category = branch::default_category();
     let stack = branch::stack(&metadata);
-    let parent = stack
-        .first()
-        .map(|parent| parent.branch)
-        .unwrap_or_default();
+    let parent = stack.first().map_or_default(|parent| parent.branch);
 
     if !parent.is_zero() && !branch::exist_local(repository.clone(), parent).await {
         let remote = repository
@@ -4967,12 +4960,9 @@ pub async fn gc(repository: Arc<RepositoryContext>) -> Result<(), RepositoryErro
 
     let sync_data = crate::runtime::try_execution_context()
         .is_some_and(|context| context.globals().sync_data());
-    let max_size = config_store
-        .map(|config| config.max_size.unwrap_or_default())
-        .unwrap_or_default();
-    let max_capacity = config_store
-        .map(|config| config.max_capacity.unwrap_or_default())
-        .unwrap_or_default();
+    let max_size = config_store.map_or_default(|config| config.max_size.unwrap_or_default());
+    let max_capacity =
+        config_store.map_or_default(|config| config.max_capacity.unwrap_or_default());
     if max_capacity > 0
         && let Err(err) = repository.immutable_store().load_index().await
     {

@@ -469,9 +469,7 @@ fn emit_status_from_service() {
     }
 
     // Get binary path.
-    let binary_path = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
+    let binary_path = std::env::current_exe().map_or_default(|p| p.display().to_string());
 
     // Get mount count from MountManagerState.
     let swfs_mount_count =

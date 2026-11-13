@@ -297,9 +297,7 @@ pub fn handle_lock_file_commands(globals: LoreGlobalArgs, cmd: &LockFileCommands
 }
 
 fn parse_timestamp(timestamp: u64) -> String {
-    DateTime::from_timestamp_millis(timestamp as i64)
-        .map(|time| time.to_rfc2822())
-        .unwrap_or_default()
+    DateTime::from_timestamp_millis(timestamp as i64).map_or_default(|time| time.to_rfc2822())
 }
 
 fn resolve_user_ids(

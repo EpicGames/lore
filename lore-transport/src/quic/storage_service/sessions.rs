@@ -328,8 +328,7 @@ impl Authorizer {
                     &identity_token,
                     &access_token,
                 )
-                .map(|(_, token, _)| token)
-                .unwrap_or_default(),
+                .map_or_default(|(_, token, _)| token),
                 exchanged_with: None,
             };
         }

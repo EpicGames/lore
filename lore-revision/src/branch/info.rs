@@ -208,10 +208,8 @@ pub(crate) async fn info(
         id: branch_resolved.id,
         name: name.into(),
         category: category.into(),
-        latest: branch_local.map(|branch| branch.latest).unwrap_or_default(),
-        latest_remote: branch_remote
-            .map(|branch| branch.latest)
-            .unwrap_or_default(),
+        latest: branch_local.map_or_default(|branch| branch.latest),
+        latest_remote: branch_remote.map_or_default(|branch| branch.latest),
         parent: branch_point.branch,
         branch_point: branch_point.revision,
         creator: creator.into(),

@@ -77,8 +77,7 @@ fn rejected_names_are_the_ones_url_parsing_rewrites() {
     ] {
         assert!(!is_valid_name(url_name), "{url_name} should be rejected");
         let parsed = parse_url(&format!("lores://host/{url_name}"), false)
-            .map(|(_remote_url, name)| name)
-            .unwrap_or_default();
+            .map_or_default(|(_remote_url, name)| name);
         assert_eq!(parsed, parsed_as, "for {url_name}");
     }
 }

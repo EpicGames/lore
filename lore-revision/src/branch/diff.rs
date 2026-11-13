@@ -145,11 +145,9 @@ pub async fn diff(
         branch::metadata(repository.clone(), target_branch.id),
     );
     let source_name = source_metadata
-        .map(|metadata| branch::name(&metadata).unwrap_or_default().to_string())
-        .unwrap_or_default();
+        .map_or_default(|metadata| branch::name(&metadata).unwrap_or_default().to_string());
     let target_name = target_metadata
-        .map(|metadata| branch::name(&metadata).unwrap_or_default().to_string())
-        .unwrap_or_default();
+        .map_or_default(|metadata| branch::name(&metadata).unwrap_or_default().to_string());
 
     let diff = branch::diff3_collect(
         repository,

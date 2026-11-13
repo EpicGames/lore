@@ -373,33 +373,25 @@ impl From<&str> for LoreString {
 
 impl From<Option<String>> for LoreString {
     fn from(value: Option<String>) -> Self {
-        value
-            .as_deref()
-            .map(LoreString::from_str)
-            .unwrap_or_default()
+        value.as_deref().map_or_default(LoreString::from_str)
     }
 }
 
 impl From<Option<&String>> for LoreString {
     fn from(value: Option<&String>) -> Self {
-        value
-            .map(|value| LoreString::from_str(value.as_str()))
-            .unwrap_or_default()
+        value.map_or_default(|value| LoreString::from_str(value.as_str()))
     }
 }
 
 impl From<&Option<String>> for LoreString {
     fn from(value: &Option<String>) -> Self {
-        value
-            .as_deref()
-            .map(LoreString::from_str)
-            .unwrap_or_default()
+        value.as_deref().map_or_default(LoreString::from_str)
     }
 }
 
 impl From<Option<&str>> for LoreString {
     fn from(value: Option<&str>) -> Self {
-        value.map(LoreString::from_str).unwrap_or_default()
+        value.map_or_default(LoreString::from_str)
     }
 }
 
@@ -1129,11 +1121,7 @@ impl ExecutionContext {
         dispatcher
             .correlation_id
             .clone_from(&self.dispatcher.correlation_id);
-        let user_id = self
-            .user_id
-            .try_lock()
-            .map(|id| id.clone())
-            .unwrap_or_default();
+        let user_id = self.user_id.try_lock().map_or_default(|id| id.clone());
         Self {
             globals: self.globals.clone(),
             dispatcher,

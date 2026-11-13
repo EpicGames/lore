@@ -1326,8 +1326,7 @@ mod separate_exchange_issuer {
 
     fn auth(login: &str, exchange: &str, jwk_endpoint: Option<&str>) -> AuthSettings {
         let jwk = jwk_endpoint
-            .map(|endpoint| format!("[server.auth.jwk]\nendpoint = \"{endpoint}\""))
-            .unwrap_or_default();
+            .map_or_default(|endpoint| format!("[server.auth.jwk]\nendpoint = \"{endpoint}\""));
         crate::settings::settings_with_auth_keys(&format!(
             r#"
                 jwt_issuer = "{login}"

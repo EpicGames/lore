@@ -708,8 +708,7 @@ pub(crate) async fn sync(
         .remote()
         .await
         .clone()
-        .map(|remote| remote.remote_url.to_string())
-        .unwrap_or_default();
+        .map_or_default(|remote| remote.remote_url.to_string());
 
     // Named for the branch the instance is on, which the source revision below
     // belongs to.

@@ -1974,14 +1974,10 @@ pub(crate) async fn status(
         None
     };
 
-    let branch_parent = branch_stack
-        .first()
-        .map(|parent| parent.branch)
-        .unwrap_or_default();
+    let branch_parent = branch_stack.first().map_or_default(|parent| parent.branch);
     let branch_point = branch_stack
         .first()
-        .map(|parent| parent.revision)
-        .unwrap_or_default();
+        .map_or_default(|parent| parent.revision);
 
     let revision_merged_parent_branch = if options.sync_point {
         if branch_point.is_zero() {

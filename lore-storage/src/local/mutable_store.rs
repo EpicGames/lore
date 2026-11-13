@@ -1256,8 +1256,7 @@ impl LocalMutableStore {
                     let stored = bytes
                         .as_ref()
                         .first_chunk::<4>()
-                        .map(|value| u32::from_ne_bytes(*value))
-                        .unwrap_or_default();
+                        .map_or_default(|value| u32::from_ne_bytes(*value));
                     match stored {
                         x if x == MutableStoreVersion::LazyFanOut as u32 => {
                             version = MutableStoreVersion::LazyFanOut;

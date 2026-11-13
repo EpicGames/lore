@@ -135,8 +135,8 @@ async fn migrate_initial_to_typed(
 
     // Deserialize all old data, since migrations will require to look up dependent data
     let mut tasks = JoinSet::new();
-    for group_index in 0..GROUP_COUNT {
-        let group = old_store.group[group_index].clone();
+    for (group_index, group) in old_store.group.iter().enumerate() {
+        let group = group.clone();
         let path = path.to_path_buf();
         lore_spawn!(tasks, async move {
             for bucket_index in 0..BUCKET_COUNT {

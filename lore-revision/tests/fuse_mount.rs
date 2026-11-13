@@ -1067,13 +1067,11 @@ fn assert_refused_by_the_stop(error: Option<RepositoryError>) {
 // A fixture read, outside any repository access.
 #[allow(clippy::disallowed_methods)]
 fn names_in(dir: &Path) -> std::collections::BTreeSet<std::ffi::OsString> {
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .filter_map(|entry| Some(entry.ok()?.file_name()))
-                .collect()
-        })
-        .unwrap_or_default()
+    std::fs::read_dir(dir).map_or_default(|entries| {
+        entries
+            .filter_map(|entry| Some(entry.ok()?.file_name()))
+            .collect()
+    })
 }
 
 /// Lets the shared manager mount again when dropped, so a test that stops it leaves it usable for

@@ -262,10 +262,7 @@ pub(super) async fn node_change_to_diff_change(
         thin_client_v1::Action::Delete => node_flags_to_node_type(change.from.flags),
         _ => node_flags_to_node_type(change.to.flags),
     };
-    let path_from = change
-        .move_source()
-        .map(|p| p.to_string())
-        .unwrap_or_default();
+    let path_from = change.move_source().map_or_default(|p| p.to_string());
     let content_from = (action != thin_client_v1::Action::Add).then(|| change.from.address.into());
     let content_to = (action != thin_client_v1::Action::Delete).then(|| change.to.address.into());
     thin_client_v1::DiffChange {

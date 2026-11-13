@@ -164,9 +164,7 @@ where
 }
 
 pub fn identity_from_token(token: &str) -> String {
-    user_info_from_token(token.to_string())
-        .map(|info| info.id)
-        .unwrap_or_default()
+    user_info_from_token(token.to_string()).map_or_default(|info| info.id)
 }
 
 /// The claims Lore reads from `token`, decoded without verifying its signature.

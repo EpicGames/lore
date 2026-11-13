@@ -1032,8 +1032,7 @@ async fn diff_impl(
     let target_hash = if args.revision_target.is_empty() {
         lore_revision::instance::load_current_anchor_boxed(&repository)
             .await
-            .map(|(revision, _branch)| revision)
-            .unwrap_or_default()
+            .map_or_default(|(revision, _branch)| revision)
     } else {
         revision::resolve_boxed(
             repository.clone(),

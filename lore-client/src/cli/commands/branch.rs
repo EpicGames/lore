@@ -1815,8 +1815,7 @@ pub fn handle_branch_metadata_clear(globals: LoreGlobalArgs, args: &BranchMetada
     let keys: Vec<LoreString> = args
         .keys
         .as_ref()
-        .map(|k| k.iter().map(|s| LoreString::from(s.as_str())).collect())
-        .unwrap_or_default();
+        .map_or_default(|k| k.iter().map(|s| LoreString::from(s.as_str())).collect());
 
     let clear_args = LoreBranchMetadataClearArgs {
         branch: resolve_branch_arg(&args.branch),

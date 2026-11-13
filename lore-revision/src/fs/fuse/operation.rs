@@ -233,8 +233,7 @@ impl FuseOperation {
     fn take_handed(&self) -> Vec<RelativePath> {
         self.handed
             .get()
-            .map(|handed| std::iter::from_fn(|| handed.pop()).collect())
-            .unwrap_or_default()
+            .map_or_default(|handed| std::iter::from_fn(|| handed.pop()).collect())
     }
 
     pub(crate) fn keep_serialized_blocks(&self, blocks: SerializedBlocks) {

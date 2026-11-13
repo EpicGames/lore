@@ -270,11 +270,7 @@ impl LoreInterface {
         lore::runtime().block_on(branch::info(
             self.global_args.clone(),
             LoreBranchInfoArgs {
-                branch: operation
-                    .name
-                    .clone()
-                    .map(LoreString::from)
-                    .unwrap_or_default(),
+                branch: operation.name.clone().map_or_default(LoreString::from),
                 link: LoreString::default(),
             },
             Some(Box::new(move |event| error_and_log!(span, event))),

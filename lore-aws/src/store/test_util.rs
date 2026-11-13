@@ -714,8 +714,7 @@ pub(crate) fn aws_error<E>(error: E, status: u16) -> AwsError<SdkError<E, HttpRe
 pub(crate) fn blob(item: &HashMap<String, AttributeValue>, key: &str) -> Vec<u8> {
     item.get(key)
         .and_then(|value| value.as_b().ok())
-        .map(|value| value.as_ref().to_vec())
-        .unwrap_or_default()
+        .map_or_default(|value| value.as_ref().to_vec())
 }
 
 /// A throttling exception carrying the error code a real response would, which is what the

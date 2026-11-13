@@ -705,8 +705,7 @@ pub async fn stage(
         .then(|| Arc::new(layer::mount_paths(layers.iter().map(|(layer, _)| layer))));
     let layer_target_refs: Vec<&str> = global_mask
         .as_deref()
-        .map(|paths| paths.iter().map(String::as_str).collect())
-        .unwrap_or_default();
+        .map_or_default(|paths| paths.iter().map(String::as_str).collect());
 
     // One filesystem operation covers the whole stage: a layer or link at a subpath
     // is a subtree of the same filesystem and takes the operation its parent holds.

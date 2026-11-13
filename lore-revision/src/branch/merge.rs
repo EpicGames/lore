@@ -5196,10 +5196,7 @@ pub async fn merge_into(
         .await
         .forward::<MergeError>("loading branch metadata")?;
     let stack = branch::stack(&branch_metadata);
-    let branch_point = stack
-        .first()
-        .map(|parent| parent.revision)
-        .unwrap_or_default();
+    let branch_point = stack.first().map_or_default(|parent| parent.revision);
     if branch_point.is_zero() {
         return Err(MergeError::internal("Invalid branch"));
     }

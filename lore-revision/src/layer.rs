@@ -1308,7 +1308,7 @@ pub async fn find_revision_match(
 /// where it holds none. Read again after a batch load rather than held across it, which would
 /// grow the search's future by the hash.
 fn last_hash(revisions: &[(Hash, Option<Vec<u8>>)]) -> Hash {
-    revisions.last().map(|tuple| tuple.0).unwrap_or_default()
+    revisions.last().map_or_default(|tuple| tuple.0)
 }
 
 /// The error [`find_revision_match`] fails with where no revision matches: its search reached the

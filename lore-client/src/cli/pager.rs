@@ -47,11 +47,7 @@ impl Pager {
         if CURRENT_PAGER.read().strong_count() > 0 {
             eprintln!("[ERROR] Pager created when pager already exists");
         }
-        *CURRENT_PAGER.write() = pager
-            .process
-            .as_ref()
-            .map(Arc::downgrade)
-            .unwrap_or_default();
+        *CURRENT_PAGER.write() = pager.process.as_ref().map_or_default(Arc::downgrade);
         pager
     }
 

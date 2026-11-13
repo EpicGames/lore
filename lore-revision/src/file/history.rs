@@ -278,8 +278,8 @@ async fn history_state(
         from_path,
         repository.clone(),
         state.clone(),
-        node.as_ref().map(|node| node.address).unwrap_or_default(),
-        node.as_ref().map(|node| node.size).unwrap_or_default(),
+        node.as_ref().map_or_default(|node| node.address),
+        node.as_ref().map_or_default(|node| node.size),
         action as u32,
     ))
     .send();

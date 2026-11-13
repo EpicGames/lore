@@ -305,8 +305,7 @@ impl From<crate::lock::Lock> for LockData {
             owner: lock.owner,
             locked_at: lock
                 .locked_at
-                .map(|t| (t.seconds as u64 * 1000) + (t.nanos as u64 / 1_000_000))
-                .unwrap_or_default(),
+                .map_or_default(|t| (t.seconds as u64 * 1000) + (t.nanos as u64 / 1_000_000)),
         }
     }
 }
@@ -316,19 +315,17 @@ impl From<&crate::lock::Lock> for LockData {
         let resource = lock
             .resource
             .as_ref()
-            .map(|resource| LockResource {
+            .map_or_default(|resource| LockResource {
                 branch: resource.branch.as_ref().into(),
                 hash: resource.hash.as_ref().into(),
                 description: resource.description.clone(),
-            })
-            .unwrap_or_default();
+            });
         LockData {
             resource,
             owner: lock.owner.clone(),
             locked_at: lock
                 .locked_at
-                .map(|t| (t.seconds as u64 * 1000) + (t.nanos as u64 / 1_000_000))
-                .unwrap_or_default(),
+                .map_or_default(|t| (t.seconds as u64 * 1000) + (t.nanos as u64 / 1_000_000)),
         }
     }
 }

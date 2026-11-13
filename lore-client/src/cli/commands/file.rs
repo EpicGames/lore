@@ -2016,8 +2016,7 @@ pub fn handle_file_dependency_add(globals: LoreGlobalArgs, args: &FileDependency
     let tags: Vec<LoreString> = args
         .tags
         .as_ref()
-        .map(|t| t.iter().map(|s| LoreString::from(s.as_str())).collect())
-        .unwrap_or_default();
+        .map_or_default(|t| t.iter().map(|s| LoreString::from(s.as_str())).collect());
 
     let add_args = dependency::LoreFileDependencyAddArgs {
         paths: LoreArray::from_vec(vec![LoreString::from(args.source.as_str())]),
@@ -2069,8 +2068,7 @@ pub fn handle_file_dependency_remove(
     let tags: Vec<LoreString> = args
         .tags
         .as_ref()
-        .map(|t| t.iter().map(|s| LoreString::from(s.as_str())).collect())
-        .unwrap_or_default();
+        .map_or_default(|t| t.iter().map(|s| LoreString::from(s.as_str())).collect());
 
     let remove_args = dependency::LoreFileDependencyRemoveArgs {
         paths: LoreArray::from_vec(vec![LoreString::from(args.source.as_str())]),
@@ -2109,13 +2107,11 @@ pub fn handle_file_dependency_list(globals: LoreGlobalArgs, args: &FileDependenc
     let paths: Vec<LoreString> = args
         .paths
         .as_ref()
-        .map(|p| p.iter().map(|s| LoreString::from(s.as_str())).collect())
-        .unwrap_or_default();
+        .map_or_default(|p| p.iter().map(|s| LoreString::from(s.as_str())).collect());
     let tags: Vec<LoreString> = args
         .tags
         .as_ref()
-        .map(|t| t.iter().map(|s| LoreString::from(s.as_str())).collect())
-        .unwrap_or_default();
+        .map_or_default(|t| t.iter().map(|s| LoreString::from(s.as_str())).collect());
 
     let list_args = dependency::LoreFileDependencyListArgs {
         paths: LoreArray::from_vec(paths),

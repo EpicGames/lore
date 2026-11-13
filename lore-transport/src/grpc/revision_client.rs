@@ -322,8 +322,8 @@ impl RevisionService {
                     state: item.state,
                 })
                 .collect(),
-            next_revision: signature_backward.map(Into::into).unwrap_or_default(),
-            previous_revision: signature_forward.map(Into::into).unwrap_or_default(),
+            next_revision: signature_backward.map_or_default(Into::into),
+            previous_revision: signature_forward.map_or_default(Into::into),
         })
     }
 

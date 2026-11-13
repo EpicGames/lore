@@ -123,8 +123,7 @@ async fn info_impl(
             let creation_timestamp = metadata.get_timestamp().unwrap_or_default() as i64;
             let author_identity = metadata
                 .get_string(CREATED_BY)
-                .map(LoreString::from)
-                .unwrap_or_default();
+                .map_or_default(LoreString::from);
             let mut metadata_key_count = 0u32;
             metadata.walk(|_, _, _| metadata_key_count += 1);
 
