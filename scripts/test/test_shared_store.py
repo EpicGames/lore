@@ -3,6 +3,7 @@
 import enum
 import logging
 import os
+import random
 import shutil
 
 import pytest
@@ -99,6 +100,17 @@ def _get_shared_store_list(repo: Lore, path: str) -> SharedStoreListEntry:
     registry = repo.shared_store_list()
     logger.info(f"Getting shared store registry for {path} from {registry}")
     return registry.entries[path]
+
+
+def enable_cache_payloads(repo: Lore) -> None:
+    """Set `cache_payloads` in the repo's `[store]` table, so the file contents its commands
+    write or fetch are kept in its store."""
+    config_path = os.path.join(repo.dot_path(), "config.toml")
+    with open(config_path, encoding="utf-8") as f:
+        config = f.read()
+    assert "[store]\n" in config, f"No [store] table in {config_path}"
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write(config.replace("[store]\n", "[store]\ncache_payloads = true\n", 1))
 
 
 def verify_shared_store_repo(
@@ -364,10 +376,16 @@ def test_create_two_repos(new_lore_repo, create_repo):
         repo2, shared_store_path, previous_data_size=size_after_repo1_create
     )
 
-    # Create the contents of two files whose size in the immutable store will be much larger than the metadata associated with storing them
-    file_name = "test_file.txt"
-    large_file_contents = "".join(str(x) for x in range(1000))
-    other_large_file_contents = "".join(str(x) for x in range(1000, 2000))
+    # Without cache_payloads, the store keeps the entries of the file contents a commit writes but drops their payloads.
+    enable_cache_payloads(repo1)
+    enable_cache_payloads(repo2)
+
+    # Create the contents of two files whose size in the immutable store will be much larger than the metadata associated with storing them.
+    # The contents must not compress: a commit's metadata takes a few kilobytes of the store, and that varies by hundreds of bytes
+    # with the store groups its hashes fall in, so compressible contents would be lost in that variation.
+    file_name = "test_file.bin"
+    large_file_contents = random.Random(0).randbytes(128 * 1024)
+    other_large_file_contents = random.Random(1).randbytes(128 * 1024)
 
     # Add the same commit to both repo1 and repo2. The second identical commit should add less data to the immutable store because the fragments containing file contents are reused.
     repo1.write_commit_push("test commit", {file_name: large_file_contents})
@@ -401,12 +419,12 @@ def test_create_two_repos(new_lore_repo, create_repo):
     # Verify that both repos can recover their contents from the shared store.
     repo1.remove_file(file_name)
     repo1.reset(".")
-    with repo1.open_file(file_name, "r") as f:
+    with repo1.open_file(file_name, "rb") as f:
         assert f.read() == large_file_contents
 
     repo2.remove_file(file_name)
     repo2.reset(".")
-    with repo2.open_file(file_name, "r") as f:
+    with repo2.open_file(file_name, "rb") as f:
         assert f.read() == other_large_file_contents
 
 
