@@ -3326,8 +3326,8 @@ typedef struct lore_fragment_stats_data_t {
   // Stored payload bytes of `fragmentlists`.
   uint64_t fragmentlist_payload_bytes;
   // Of `fragments_processed`, those that needed no payload, so none was
-  // prepared: the remote duplicated an association for them and the write did
-  // not ask for the payload to be cached locally.
+  // prepared: the remote duplicated an association for them or already held
+  // them, and the write did not ask for the payload to be cached locally.
   uint64_t no_payload_fragments;
   // Content bytes `no_payload_fragments` stand for.
   uint64_t no_payload_content_bytes;
@@ -3361,6 +3361,16 @@ typedef struct lore_fragment_stats_data_t {
   // Their payloads also count toward `local_payload_writes`, which does not
   // distinguish them from payloads kept locally by request.
   uint64_t remote_upload_failed;
+  // Of `fragments_processed`, those the remote was asked about before their
+  // payload was prepared, the write having asked for that (`remote_query`).
+  uint64_t remote_queries;
+  // Of `remote_queries`, those the remote already held under this very
+  // address, so no payload was sent for them. They count toward
+  // `remote_already_durable` too.
+  uint64_t remote_query_hits;
+  // Payload bytes the remote holds for `remote_query_hits`, which the write
+  // did not send.
+  uint64_t remote_query_unsent_bytes;
 } lore_fragment_stats_data_t;
 
 // Event data reporting what a commit cost.
@@ -5647,6 +5657,16 @@ typedef struct lore_storage_put_item_t {
   uint8_t remote_write;
   // Tag the fragment with `PayloadLocalCachePriority` so future remote reads always cache it locally
   uint8_t local_cache;
+  // Ask the remote whether it already holds each fragment at its exact address before
+  // compressing and uploading it, and upload none it holds. With `local_cache`, a fragment the
+  // remote holds is still compressed for the local copy, and only its upload is spared. Costs a
+  // round trip per fragment the local store does not know as stored remotely. A fragment it
+  // knows under another context the remote holds is copied from there first, and asked about
+  // only if the remote refuses the copy. Takes effect only where `remote_write` does. The field
+  // sits in what was padding, so zero the whole item with `memset`, or give it static storage,
+  // before setting its fields: a non-zero padding byte from a caller built against an older
+  // header turns the query on
+  uint8_t remote_query;
   // Leaf fragment size cap for large buffers; `0` lets `write_content` choose. Ignored
   // for buffers under `FRAGMENT_SIZE_THRESHOLD`
   uint64_t fixed_size_chunk;
@@ -5811,6 +5831,16 @@ typedef struct lore_storage_put_resolved_item_t {
   // Tag the fragment with `PayloadLocalCachePriority` so future remote reads always cache it
   // locally
   uint8_t local_cache;
+  // Ask the remote whether it already holds each fragment at its exact address before
+  // compressing and uploading it, and upload none it holds. With `local_cache`, a fragment the
+  // remote holds is still compressed for the local copy, and only its upload is spared. Costs a
+  // round trip per fragment the local store does not know as stored remotely. A fragment it
+  // knows under another context the remote holds is copied from there first, and asked about
+  // only if the remote refuses the copy. Takes effect only where `remote_write` does. The field
+  // sits in what was padding, so zero the whole item with `memset`, or give it static storage,
+  // before setting its fields: a non-zero padding byte from a caller built against an older
+  // header turns the query on
+  uint8_t remote_query;
   // Leaf fragment size cap for large buffers; `0` lets the writer choose. Ignored for buffers
   // under `FRAGMENT_SIZE_THRESHOLD`
   uint64_t fixed_size_chunk;
@@ -6074,6 +6104,16 @@ typedef struct lore_storage_put_file_item_t {
   uint8_t remote_write;
   // Tag the resulting fragment with `PayloadLocalCachePriority` so future remote reads always cache it locally
   uint8_t local_cache;
+  // Ask the remote whether it already holds each fragment at its exact address before
+  // compressing and uploading it, and upload none it holds. With `local_cache`, a fragment the
+  // remote holds is still compressed for the local copy, and only its upload is spared. Costs a
+  // round trip per fragment the local store does not know as stored remotely. A fragment it
+  // knows under another context the remote holds is copied from there first, and asked about
+  // only if the remote refuses the copy. Takes effect only where `remote_write` does. The field
+  // sits in what was padding, so zero the whole item with `memset`, or give it static storage,
+  // before setting its fields: a non-zero padding byte from a caller built against an older
+  // header turns the query on
+  uint8_t remote_query;
   // Leaf fragment size cap for large files; `0` lets `write_content` choose
   uint64_t fixed_size_chunk;
 } lore_storage_put_file_item_t;
@@ -6158,6 +6198,16 @@ typedef struct lore_storage_put_file_resolved_item_t {
   // Tag the fragments with `PayloadLocalCachePriority` so future remote reads always cache them
   // locally
   uint8_t local_cache;
+  // Ask the remote whether it already holds each fragment at its exact address before
+  // compressing and uploading it, and upload none it holds. With `local_cache`, a fragment the
+  // remote holds is still compressed for the local copy, and only its upload is spared. Costs a
+  // round trip per fragment the local store does not know as stored remotely. A fragment it
+  // knows under another context the remote holds is copied from there first, and asked about
+  // only if the remote refuses the copy. Takes effect only where `remote_write` does. The field
+  // sits in what was padding, so zero the whole item with `memset`, or give it static storage,
+  // before setting its fields: a non-zero padding byte from a caller built against an older
+  // header turns the query on
+  uint8_t remote_query;
   // Leaf fragment size cap for large files; `0` lets the writer choose. Ignored for files under
   // `FRAGMENT_SIZE_THRESHOLD`
   uint64_t fixed_size_chunk;

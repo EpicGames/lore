@@ -8,14 +8,14 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Partition;
 use lore_transport::auth::AuthMode;
 use lore_transport::connection::*;
-use lore_transport::test_util::CopyingPeer;
+use lore_transport::test_util::StubPeer;
 
 /// The shutdown frees each connection it closes, though the pool it pins holds it.
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_frees_the_connections_it_closes() {
     LORE_CONTEXT
         .scope(Arc::new(()), async {
-            let connection = Connection::detached(vec![CopyingPeer::new(0, None)]);
+            let connection = Connection::detached(vec![Arc::new(StubPeer::default())]);
             connection
                 .session_pool(Partition::from([0x5au8; 16]), "first")
                 .await

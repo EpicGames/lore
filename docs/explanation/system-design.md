@@ -606,7 +606,10 @@ revision involved. An application opens a storage handle and operates on content
   writes it to the local store as held by the remote: with its payload where the read caches it
   or the fragment asks for that, and as an entry without its payload otherwise, so a later write
   of the same content uploads nothing. A metadata query the remote answers writes the fragment
-  the same way, without its payload.
+  the same way, without its payload. A write to the remote can first ask whether the remote
+  already holds each fragment at its exact address, and send no payload for one it holds: a store
+  that knows nothing of content the remote has, such as one on a fresh machine, then uploads only
+  what the remote lacks, at the cost of a round trip per fragment.
 - *File ingest and extract.* The same handle reads a file directly into content-addressed
   fragments - chunking and hashing it through the storage subsystem's own machinery (§8) - and
   writes a stored payload straight back to a filesystem path, without the caller assembling bytes

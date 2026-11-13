@@ -463,7 +463,7 @@ mod offer {
 /// The peer answers copy requests with `SlowDown`, a refusal, or success.
 mod duplicate_association {
     use lore_base::error::NotFound;
-    use lore_transport::test_util::CopyingPeer;
+    use lore_transport::test_util::StubPeer;
 
     use super::*;
 
@@ -480,7 +480,7 @@ mod duplicate_association {
         let repository = null_repository().await;
         let wanted = address(seed);
         store_local(&repository, wanted).await;
-        let peer = CopyingPeer::new(slow_downs, refusal);
+        let peer = Arc::new(StubPeer::default().with_copy_answers(slow_downs, refusal));
         let session = peer.session(repository.id);
         let progress = PushProgress::new(Arc::new(PushStats::new(false)));
 

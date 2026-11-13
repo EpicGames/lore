@@ -906,6 +906,7 @@ impl LoreBlobStore {
                 // upstream write makes it durable. Off, the local tier holds existence records
                 // and reads go upstream; see `LocalCache`.
                 local_cache: self.local_cache.blobs as u8,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             })
             .collect();
@@ -1009,6 +1010,7 @@ impl LoreBlobStore {
                 path: path.to_string_lossy().as_ref().into(),
                 remote_write: self.upstream as u8,
                 local_cache: self.local_cache.files as u8,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             })
             .collect();

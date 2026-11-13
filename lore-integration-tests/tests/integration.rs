@@ -15,6 +15,7 @@ mod revision_tree_test;
 mod shared_store_test;
 mod storage_copy_on_write_test;
 mod storage_mutable_test;
+mod storage_remote_query_test;
 mod storage_remote_test;
 mod storage_test;
 mod store_fan_out_test;

@@ -26,10 +26,10 @@ use crate::types::Context;
 use crate::types::Fragment;
 use crate::types::FragmentReference;
 use crate::types::Partition;
+use crate::write::FragmentOptions;
 use crate::write::FusedPublish;
 use crate::write::Payload;
 use crate::write::StoreResult;
-use crate::write::store_fragment;
 use crate::write::store_fragment_publishing;
 use crate::write_tracker::WriteContext;
 
@@ -60,7 +60,8 @@ fn chunk_boundaries(
     }
 }
 
-/// Cuts `buffer` into chunks and stores each one via [`store_fragment`].
+/// Cuts `buffer` into chunks and stores each one as [`crate::write::store_fragment`] does, asking
+/// the remote first where `flags` sets [`WriteOptions::remote_query`].
 ///
 /// Uses `FastCDC` (content-defined chunking) when `flags.fixed_size_chunk` is 0,
 /// or fixed-size chunking when it is >0. Each chunk is hashed, stored as a
@@ -127,7 +128,7 @@ pub async fn write_fragmented(
                 Address { context, hash },
                 fragment,
                 Payload::Shared(chunk_buffer),
-                flags.cache_local(),
+                FragmentOptions::of(flags),
                 remote_session,
                 writes,
                 chunk_permit,
@@ -146,16 +147,17 @@ pub async fn write_fragmented(
             let (chunk_address, chunk_local, chunk_remote) = if flags.hash_only {
                 (Address { context, hash }, false, false)
             } else {
-                let result = store_fragment(
+                let result = store_fragment_publishing(
                     store,
                     partition,
                     Address { context, hash },
                     fragment,
-                    chunk_buffer,
-                    flags.cache_local(),
+                    Payload::Shared(chunk_buffer),
+                    FragmentOptions::of(flags),
                     session,
                     task_writes,
                     chunk_permit,
+                    None,
                 )
                 .await?;
                 (result.address, result.stored_local, result.stored_durable)
@@ -189,8 +191,8 @@ pub async fn write_fragmented(
     .await
 }
 
-/// Cuts a file into chunks with [`FileChunker`] and stores each one via
-/// [`store_fragment`], without ever holding the file whole. Boundaries are identical
+/// Cuts a file into chunks with [`FileChunker`] and stores each one as
+/// [`write_fragmented`] does, without ever holding the file whole. Boundaries are identical
 /// to fragmenting the same bytes in memory; see [`crate::chunker`].
 ///
 /// Each chunk's memory permit is taken before its task is spawned, so the chunker
@@ -274,16 +276,17 @@ pub(crate) async fn write_fragmented_from_file(
             let (chunk_address, chunk_local, chunk_remote) = if flags.hash_only {
                 (Address { context, hash }, false, false)
             } else {
-                let result = store_fragment(
+                let result = store_fragment_publishing(
                     store,
                     partition,
                     Address { context, hash },
                     fragment,
-                    chunk_buffer,
-                    flags.cache_local(),
+                    Payload::Shared(chunk_buffer),
+                    FragmentOptions::of(flags),
                     session,
                     task_writes,
                     chunk_budget,
+                    None,
                 )
                 .await?;
                 (result.address, result.stored_local, result.stored_durable)
@@ -523,7 +526,8 @@ async fn write_fragmentlist_impl(
                 Address { context, hash },
                 fragment,
                 Payload::Shared(buffer),
-                true, /* Fragment lists have local priority */
+                // Fragment lists have local priority.
+                FragmentOptions::new(true, flags.remote_query),
                 remote_session,
                 writes,
                 permit,
@@ -588,16 +592,17 @@ async fn write_fragmentlist_impl(
                     (Address { context, hash }, false, false)
                 } else {
                     let permit = chunk_permit;
-                    let result = store_fragment(
+                    let result = store_fragment_publishing(
                         store,
                         partition,
                         Address { context, hash },
                         fragment,
-                        chunk_buffer,
-                        flags.cache_local(),
+                        Payload::Shared(chunk_buffer),
+                        FragmentOptions::of(flags),
                         session,
                         task_writes,
                         permit,
+                        None,
                     )
                     .await?;
                     (result.address, result.stored_local, result.stored_durable)

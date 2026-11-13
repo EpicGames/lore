@@ -173,6 +173,7 @@ fn a_put_carries_its_bytes_to_the_service() {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         })
         .collect();

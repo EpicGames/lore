@@ -81,16 +81,37 @@ pub struct LoreStoragePutResolvedItem {
     /// Tag the fragment with `PayloadLocalCachePriority` so future remote reads always cache it
     /// locally
     pub local_cache: u8,
+    /// Ask the remote whether it already holds each fragment at its exact address before
+    /// compressing and uploading it, and upload none it holds. With `local_cache`, a fragment the
+    /// remote holds is still compressed for the local copy, and only its upload is spared. Costs a
+    /// round trip per fragment the local store does not know as stored remotely. A fragment it
+    /// knows under another context the remote holds is copied from there first, and asked about
+    /// only if the remote refuses the copy. Takes effect only where `remote_write` does. The field
+    /// sits in what was padding, so zero the whole item with `memset`, or give it static storage,
+    /// before setting its fields: a non-zero padding byte from a caller built against an older
+    /// header turns the query on
+    pub remote_query: u8,
     /// Leaf fragment size cap for large buffers; `0` lets the writer choose. Ignored for buffers
     /// under `FRAGMENT_SIZE_THRESHOLD`
     pub fixed_size_chunk: u64,
 }
+
+// Lock the C ABI layout of `LoreStoragePutResolvedItem` on a 64-bit target. `remote_query` sits in
+// the padding after `local_cache`, so a caller built against a header without it passes an item of
+// the same size, with `fixed_size_chunk` at the same offset.
+const _: () = assert!(std::mem::size_of::<LoreStoragePutResolvedItem>() == 104);
+const _: () = assert!(std::mem::offset_of!(LoreStoragePutResolvedItem, fixed_size_chunk) == 96);
+const _: () = assert!(
+    std::mem::offset_of!(LoreStoragePutResolvedItem, remote_query)
+        == std::mem::offset_of!(LoreStoragePutResolvedItem, local_cache) + 1
+);
 
 impl core::fmt::Debug for LoreStoragePutResolvedItem {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LoreStoragePutResolvedItem")
             .field("id", &self.id)
             .field("remote_write", &self.remote_write)
+            .field("remote_query", &self.remote_query)
             .field("local_cache", &self.local_cache)
             .field("fixed_size_chunk", &self.fixed_size_chunk)
             .finish()
@@ -203,6 +224,9 @@ async fn store_and_publish(
     }
     if item.local_cache != 0 {
         write_options = write_options.with_local_cache_priority();
+    }
+    if item.remote_query != 0 {
+        write_options = write_options.with_remote_query();
     }
 
     write_resolved(

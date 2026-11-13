@@ -599,6 +599,7 @@ mod storage_remote_tests {
                         },
                         remote_write: 1,
                         local_cache: 0,
+                        remote_query: 0,
                         fixed_size_chunk: 0,
                     };
                     let status = put::put(
@@ -682,6 +683,7 @@ mod storage_remote_tests {
                         },
                         remote_write: 0,
                         local_cache: 0,
+                        remote_query: 0,
                         fixed_size_chunk: 0,
                     };
                     let status = put::put(
@@ -1364,6 +1366,7 @@ mod storage_remote_tests {
                                 },
                                 remote_write: 1,
                                 local_cache: 0,
+                                remote_query: 0,
                                 fixed_size_chunk: 64 * 1024,
                             }]),
                         },
@@ -2370,6 +2373,7 @@ mod storage_remote_tests {
                         },
                         remote_write: 0,
                         local_cache: 1,
+                        remote_query: 0,
                         fixed_size_chunk: 0,
                     };
                     let status = put::put(
@@ -3330,6 +3334,7 @@ mod storage_remote_tests {
                         path: LoreString::from(path.as_str()),
                         remote_write: 1,
                         local_cache: 0,
+                        remote_query: 0,
                         fixed_size_chunk: 0,
                     };
                     let status = put_file::put_file(
@@ -3523,6 +3528,7 @@ mod storage_remote_tests {
                         },
                         remote_write: 1,
                         local_cache: 0,
+                        remote_query: 0,
                         fixed_size_chunk: 0,
                     };
                     let status = put::put(
@@ -3680,6 +3686,7 @@ mod storage_remote_tests {
                         },
                         remote_write: 1,
                         local_cache: 0,
+                        remote_query: 0,
                         fixed_size_chunk: 0,
                     };
                     let bad = LoreGlobalArgs {
@@ -4917,6 +4924,7 @@ mod storage_remote_tests {
                                 },
                                 remote_write: 1,
                                 local_cache: 0,
+                                remote_query: 0,
                                 fixed_size_chunk: 0,
                             }]),
                         },
@@ -5053,6 +5061,7 @@ mod storage_remote_tests {
                         data,
                         remote_write: 1,
                         local_cache: 0,
+                        remote_query: 0,
                         fixed_size_chunk: 0,
                     };
 
@@ -5197,6 +5206,7 @@ mod storage_remote_tests {
                                 },
                                 remote_write: 0,
                                 local_cache: 0,
+                                remote_query: 0,
                                 fixed_size_chunk: 0,
                             }]),
                         },
@@ -5399,6 +5409,7 @@ mod storage_remote_tests {
                                     },
                                     remote_write: 1,
                                     local_cache: 0,
+                                    remote_query: 0,
                                     fixed_size_chunk: 0,
                                 }]),
                             },
@@ -5519,6 +5530,7 @@ mod storage_remote_tests {
                                 },
                                 remote_write: 1,
                                 local_cache: 0,
+                                remote_query: 0,
                                 fixed_size_chunk: 0,
                             }]),
                         },
@@ -5618,6 +5630,7 @@ mod storage_remote_tests {
                             },
                             remote_write: 1,
                             local_cache: 0,
+                            remote_query: 0,
                             fixed_size_chunk: CHUNK,
                         }]),
                     },
@@ -5707,6 +5720,7 @@ mod storage_remote_tests {
                                 },
                                 remote_write: 1,
                                 local_cache: 0,
+                                remote_query: 0,
                                 fixed_size_chunk: 64 * 1024,
                             }]),
                         },
@@ -5833,6 +5847,7 @@ mod storage_remote_tests {
                                 },
                                 remote_write: 1,
                                 local_cache: 0,
+                                remote_query: 0,
                                 fixed_size_chunk: 64 * 1024,
                             }]),
                         },
@@ -5965,6 +5980,7 @@ mod storage_remote_tests {
                     },
                     remote_write: 1,
                     local_cache: 0,
+                    remote_query: 0,
                     fixed_size_chunk: 64 * 1024,
                 }]),
             },
@@ -6193,6 +6209,7 @@ mod storage_remote_tests {
                                 path: LoreString::from(source.display().to_string().as_str()),
                                 remote_write: 1,
                                 local_cache: 0,
+                                remote_query: 0,
                                 fixed_size_chunk: 0,
                             }]),
                         },
@@ -6343,6 +6360,7 @@ mod storage_remote_tests {
                                 path: LoreString::from(source.display().to_string().as_str()),
                                 remote_write: 1,
                                 local_cache: 0,
+                                remote_query: 0,
                                 fixed_size_chunk: 64 * 1024,
                             }]),
                         },
@@ -6456,6 +6474,7 @@ mod storage_remote_tests {
                                 path: LoreString::from(source.display().to_string().as_str()),
                                 remote_write: 1,
                                 local_cache: 0,
+                                remote_query: 0,
                                 fixed_size_chunk: 64 * 1024,
                             }]),
                         },
@@ -6557,6 +6576,7 @@ mod storage_remote_tests {
                                     path: LoreString::from(path.display().to_string().as_str()),
                                     remote_write: 1,
                                     local_cache: 0,
+                                    remote_query: 0,
                                     fixed_size_chunk: 0,
                                 }]),
                             },
@@ -6767,6 +6787,7 @@ mod storage_remote_tests {
                 },
                 remote_write: 1,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             })
             .collect();
@@ -6964,6 +6985,7 @@ mod storage_remote_tests {
                                 path: LoreString::from(source.display().to_string().as_str()),
                                 remote_write: 1,
                                 local_cache: 0,
+                                remote_query: 0,
                                 fixed_size_chunk: CHUNK,
                             }]),
                         },
@@ -7041,6 +7063,7 @@ mod storage_remote_tests {
                             path: LoreString::from(source.display().to_string().as_str()),
                             remote_write: 1,
                             local_cache: 0,
+                            remote_query: 0,
                             fixed_size_chunk: CHUNK,
                         }]),
                     },

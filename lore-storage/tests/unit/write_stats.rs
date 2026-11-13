@@ -197,6 +197,9 @@ fn a_difference_is_taken_field_by_field() {
         &mut counts.remote_already_durable,
         &mut counts.local_only_writes,
         &mut counts.remote_upload_failed,
+        &mut counts.remote_queries,
+        &mut counts.remote_query_hits,
+        &mut counts.remote_query_unsent_bytes,
     ]
     .into_iter()
     .enumerate()

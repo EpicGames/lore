@@ -361,6 +361,7 @@ pub(crate) mod net_common {
                     },
                     remote_write,
                     local_cache: 0,
+                    remote_query: 0,
                     fixed_size_chunk,
                 }]),
             },
@@ -384,14 +385,15 @@ pub(crate) mod net_common {
     }
 
     /// An immutable store that forwards every method but `get_into` to the store it wraps and
-    /// counts what reaches it: the gets, the puts with and without a payload, and the copies, with
-    /// each copy's source.
+    /// counts what reaches it: the gets, the metadata reads, the puts with and without a payload,
+    /// and the copies, with each copy's source.
     /// One built with [`refusing_copy`](Self::refusing_copy) refuses every copy, as a peer that
     /// won't answer one does. Its `get_into` is the trait's default, which reads through `get`, so
     /// every payload read counts as a get.
     pub(crate) struct CountingStore {
         inner: Arc<dyn ImmutableStore>,
         gets: Arc<AtomicUsize>,
+        metadata_reads: AtomicUsize,
         payload_puts: AtomicUsize,
         empty_puts: AtomicUsize,
         copies: AtomicUsize,
@@ -404,6 +406,7 @@ pub(crate) mod net_common {
             Arc::new(Self {
                 inner,
                 gets: Arc::default(),
+                metadata_reads: AtomicUsize::new(0),
                 payload_puts: AtomicUsize::new(0),
                 empty_puts: AtomicUsize::new(0),
                 copies: AtomicUsize::new(0),
@@ -427,6 +430,11 @@ pub(crate) mod net_common {
             self.gets.clone()
         }
 
+        /// The metadata reads that reached the store since it was built or last reset.
+        pub(crate) fn metadata_reads(&self) -> usize {
+            self.metadata_reads.load(Ordering::SeqCst)
+        }
+
         /// The puts and copies counted since the store was built or last reset.
         pub(crate) fn traffic(&self) -> Traffic {
             Traffic {
@@ -436,9 +444,10 @@ pub(crate) mod net_common {
             }
         }
 
-        /// Zeroes the put and copy counts and clears the recorded copy sources. The get count is
-        /// kept.
+        /// Zeroes the metadata read, put and copy counts and clears the recorded copy sources. The
+        /// get count is kept.
         pub(crate) fn reset(&self) {
+            self.metadata_reads.store(0, Ordering::SeqCst);
             self.payload_puts.store(0, Ordering::SeqCst);
             self.empty_puts.store(0, Ordering::SeqCst);
             self.copies.store(0, Ordering::SeqCst);
@@ -520,6 +529,7 @@ pub(crate) mod net_common {
             partition: Partition,
             address: Address,
         ) -> Result<StoreGetData, StoreError> {
+            self.metadata_reads.fetch_add(1, Ordering::SeqCst);
             self.inner.clone().get_metadata(partition, address).await
         }
 

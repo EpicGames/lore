@@ -137,7 +137,7 @@ pub async fn handle_get_metadata(
                     // was willing to describe would make this stricter than `handle_get`, which
                     // serves whatever `get` returns.
                     if match_made == StoreMatch::MatchNone {
-                        info!({ADDRESS} = %address, "Did not find any fragment for address");
+                        debug!({ADDRESS} = %address, "Did not find any fragment for address");
                         return Err(MessageHandleError::FragmentNotFound);
                     }
                     fragment.flags &= !FragmentFlags::PayloadStored;
@@ -149,7 +149,7 @@ pub async fn handle_get_metadata(
                 }
                 Err(StoreError::SlowDown(_)) => Err(MessageHandleError::SlowDown),
                 Err(StoreError::AddressNotFound(_)) => {
-                    info!({ADDRESS} = %address, "Did not find any fragment for address");
+                    debug!({ADDRESS} = %address, "Did not find any fragment for address");
                     Err(MessageHandleError::FragmentNotFound)
                 }
                 Err(err) => {

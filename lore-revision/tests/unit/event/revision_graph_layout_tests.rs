@@ -5,6 +5,7 @@ use std::mem::size_of;
 
 use lore_base::types::BranchId;
 use lore_base::types::Hash;
+use lore_revision::commit::LoreRevisionCommitStatsEventData;
 use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_graph::LoreRevisionGraphBranchEventData;
@@ -16,11 +17,10 @@ use lore_revision::instance::LoreRepositoryInstanceCloneCompleteEventData;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreBranchLocation;
 use lore_revision::interface::LoreString;
-use lore_revision::repository::status::LoreRepositoryStatusRevisionEventData;
 
-/// The largest payload among the variants ahead of the revision graph ones, tied with
-/// `LoreRevisionCommitStatsEventData`, as `-Zprint-type-sizes` reports `LoreEvent`.
-type LargestExistingPayload = LoreRepositoryStatusRevisionEventData;
+/// The largest payload among the variants ahead of the revision graph ones, as
+/// `-Zprint-type-sizes` reports `LoreEvent`.
+type LargestExistingPayload = LoreRevisionCommitStatsEventData;
 
 /// The tag of `RepositoryInstanceCloneComplete`, the last variant ahead of the revision graph
 /// ones: `LORE_EVENT_REPOSITORY_INSTANCE_CLONE_COMPLETE` in `enum lore_event_id_t`.

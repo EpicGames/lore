@@ -15,7 +15,7 @@ use lore_revision::protocol::RemoteEndpoint;
 use lore_revision::repository::RemoteStatus;
 use lore_revision::state::State;
 use lore_transport::Connection;
-use lore_transport::test_util::CopyingPeer;
+use lore_transport::test_util::StubPeer;
 use lore_transport::traits::Storage;
 
 use crate::storage::in_memory_store;
@@ -25,7 +25,7 @@ use crate::storage::under_globals;
 /// a peer that starts every session it is asked for; and that connection, which counts the session
 /// pools started on it ([`Connection::storage_session_starts`]).
 async fn handle_over_a_peer(partition: Partition) -> (StoreInternal, Arc<Connection>) {
-    let peer: Arc<dyn Storage> = CopyingPeer::new(0, None);
+    let peer: Arc<dyn Storage> = Arc::new(StubPeer::default());
     let connection = Connection::detached(vec![peer]);
     let endpoint = RemoteEndpoint::over(RemoteConnections::with_connection(
         partition,

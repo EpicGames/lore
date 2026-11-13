@@ -21,6 +21,18 @@ pub struct WriteOptions {
     pub keep_local: bool,
     /// Allow attempting to write the fragment to a remote
     pub remote_write: bool,
+    /// Ask the remote whether it holds a fragment's exact address before its payload is prepared,
+    /// for every fragment the local store does not know as stored durable. Where the local store
+    /// knows an association to copy from, the copy, which sends no payload either, comes first, and
+    /// the remote is asked only if it refuses the copy. A fragment the remote holds is recorded as
+    /// stored durable without loading, compressing or uploading its payload. A write that keeps its
+    /// payload locally ([`cache_local`](Self::cache_local)) still loads or compresses the payload
+    /// for the local copy, and only the upload is spared. A miss, or a query that fails, continues
+    /// as without it.
+    ///
+    /// Takes effect only on a write given a remote session, and not under `hash_only`. Costs a
+    /// round trip per fragment it asks about.
+    pub remote_query: bool,
     /// Fixed size chunking if nonzero
     pub fixed_size_chunk: usize,
     /// Compute the address the content would be stored under, storing nothing.
@@ -75,6 +87,12 @@ impl WriteOptions {
 
     pub fn no_remote_write(mut self) -> Self {
         self.remote_write = false;
+        self
+    }
+
+    /// See [`WriteOptions::remote_query`].
+    pub fn with_remote_query(mut self) -> Self {
+        self.remote_query = true;
         self
     }
 

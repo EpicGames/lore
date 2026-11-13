@@ -535,6 +535,7 @@ mod open_tests {
             data,
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
 
@@ -596,6 +597,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
 
@@ -656,6 +658,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             },
             lore::storage::put::LoreStoragePutItem {
@@ -668,6 +671,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             },
         ];
@@ -763,6 +767,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
 
@@ -824,6 +829,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             },
             lore::storage::put::LoreStoragePutItem {
@@ -836,6 +842,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             },
         ];
@@ -993,6 +1000,7 @@ mod open_tests {
             data,
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
         let sink: Arc<Mutex<Vec<LoreEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1795,6 +1803,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             },
             lore::storage::put::LoreStoragePutItem {
@@ -1807,6 +1816,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             },
         ];
@@ -1899,6 +1909,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
         let (put_status, put_completes) =
@@ -3447,6 +3458,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 64 * 1024,
         };
         let (put_status, put_completes) = put_items(handle, vec![item]).await;
@@ -3578,6 +3590,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk,
         };
         let (put_status, completes) = put_items(handle, vec![item]).await;
@@ -4072,6 +4085,7 @@ mod open_tests {
                     path: LoreString::from(file.path().display().to_string().as_str()),
                     remote_write: 0,
                     local_cache: 0,
+                    remote_query: 0,
                     fixed_size_chunk: 0,
                 },
                 lore::storage::put_file::LoreStoragePutFileItem {
@@ -4081,6 +4095,7 @@ mod open_tests {
                     path: LoreString::default(),
                     remote_write: 0,
                     local_cache: 0,
+                    remote_query: 0,
                     fixed_size_chunk: 0,
                 },
             ],
@@ -4133,6 +4148,7 @@ mod open_tests {
             path: LoreString::from(file.path().display().to_string().as_str()),
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
         let (status, completes) = put_file_items(handle, vec![item]).await;
@@ -4188,6 +4204,7 @@ mod open_tests {
                 path: LoreString::from(file.path().display().to_string().as_str()),
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             }],
         )
@@ -4221,6 +4238,7 @@ mod open_tests {
                 path: LoreString::from(missing.display().to_string().as_str()),
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             }],
         )
@@ -4253,6 +4271,7 @@ mod open_tests {
                 path: LoreString::from(file.path().display().to_string().as_str()),
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             }],
         )
@@ -4294,6 +4313,7 @@ mod open_tests {
                 path: LoreString::from(file.path().display().to_string().as_str()),
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 64 * 1024,
             }],
         )
@@ -4646,6 +4666,7 @@ mod open_tests {
                     path: LoreString::from(source.path().display().to_string().as_str()),
                     remote_write: 0,
                     local_cache: 0,
+                    remote_query: 0,
                     fixed_size_chunk,
                 },
             ],
@@ -5320,6 +5341,7 @@ mod open_tests {
                 path: LoreString::from(directory.path().display().to_string().as_str()),
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             }],
         )
@@ -5483,6 +5505,7 @@ mod open_tests {
                     path: LoreString::from(source.path().display().to_string().as_str()),
                     remote_write: 1,
                     local_cache: 0,
+                    remote_query: 0,
                     fixed_size_chunk: 0,
                 },
             ],
@@ -5529,6 +5552,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 64 * 1024,
         };
         let (put_status, put_completes) = put_items(handle, vec![item]).await;
@@ -5602,6 +5626,7 @@ mod open_tests {
                     },
                     remote_write: 0,
                     local_cache: 0,
+                    remote_query: 0,
                     fixed_size_chunk: 0,
                 };
                 let (status, completes) = put_items(handle, vec![item]).await;
@@ -5933,6 +5958,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             };
             let (status, completes) = put_items(handle, vec![item]).await;
@@ -6056,6 +6082,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             })
             .collect();
@@ -6145,6 +6172,7 @@ mod open_tests {
                     },
                     remote_write: 0,
                     local_cache: 0,
+                    remote_query: 0,
                     fixed_size_chunk: 0,
                 })
                 .collect();
@@ -6415,6 +6443,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
         let (_sink, cb) = make_sink();
@@ -6593,6 +6622,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             };
             let (_sink, cb) = make_sink();
