@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -17,9 +18,33 @@ use lore::storage::handle::LoreStore;
 use lore::storage::store::OpGuard;
 use lore::storage::store::disk_backed_for_tests;
 use lore::storage::store::in_memory_for_tests;
+use lore_base::error::InvalidArguments;
+use lore_base::test_util::TempDir;
+use lore_base::types::Address;
 use lore_base::types::Hash;
+use lore_base::types::KeyType;
 use lore_base::types::Partition;
+use lore_error_set::FfiError;
+use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
+use lore_storage::FragmentFlags;
+use lore_storage::ImmutableStore;
+use lore_storage::MutableStore;
+use lore_storage::StorageError;
+use lore_storage::StoreMatch;
+use lore_storage::local::store_lock::StoreLock;
+use lore_storage::test_util::PausePoint;
+use lore_storage::test_util::fail_packfile_syncs;
+use lore_storage::test_util::pause_at;
+
+use super::put_payload;
+
+/// Whether this process holds the lock of the store directory `name` under `root`.
+fn held(root: &Path, name: &str) -> bool {
+    StoreLock::new(root.join(name), false)
+        .expect("a store directory")
+        .is_held()
+}
 
 /// Load a revision tree against an already-registered storage handle.
 async fn load_revision_tree(store_handle: LoreStore, repository: Partition) -> LoreRevisionTree {
@@ -63,6 +88,7 @@ async fn close_waits_for_in_flight_counter_to_drain() {
             LoreGlobalArgs::default(),
             LoreStorageCloseArgs {
                 handle: store_handle,
+                ..Default::default()
             },
             None,
         )
@@ -93,6 +119,191 @@ async fn close_waits_for_in_flight_counter_to_drain() {
     );
 }
 
+/// **Close completes once its flush has run.** A flush held at its first group keeps the close
+/// from completing, and a store opened on the directory after the close finds what the handle
+/// wrote.
+#[tokio::test]
+async fn close_completes_once_the_flush_of_what_the_handle_wrote_has_run() {
+    let dir = TempDir::new("close-awaits-flush-");
+    let store = disk_backed_for_tests("close-awaits-flush", dir.path()).await;
+    let partition = Partition::from([0x3Cu8; 16]);
+    let address = put_payload(&store.immutable, partition, b"what the handle wrote", 0).await;
+    let store_handle = handle::register(store);
+
+    let scanning = pause_at(PausePoint::Scanning);
+    let close_task = lore_base::lore_spawn!(close(
+        LoreGlobalArgs::default(),
+        LoreStorageCloseArgs {
+            handle: store_handle,
+            ..Default::default()
+        },
+        None,
+    ));
+    tokio::time::timeout(Duration::from_secs(5), scanning.reached.notified())
+        .await
+        .expect("close's flush reaches its first group");
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !close_task.is_finished(),
+        "close must not complete while its flush is held"
+    );
+
+    scanning.resume.notify_one();
+    let status = close_task.await.expect("close task join");
+    assert_eq!(status, 0, "close reports the flush's success");
+    assert!(
+        !held(dir.path(), "immutable") && !held(dir.path(), "mutable"),
+        "and its flush has let the stores go"
+    );
+
+    let reopened = disk_backed_for_tests("close-awaits-flush-reopened", dir.path()).await;
+    let found = reopened
+        .immutable
+        .clone()
+        .get_metadata(partition, address)
+        .await
+        .expect("reads the reopened store");
+    assert_eq!(
+        found.match_made,
+        StoreMatch::MatchFull,
+        "the entry is on disk"
+    );
+}
+
+/// **A close dropped during its flush leaves the flush to run to its end.** The flush runs in a
+/// task of its own, so the store opened on the directory afterwards finds what the handle wrote.
+#[tokio::test]
+async fn a_close_dropped_during_its_flush_leaves_the_flush_to_run_to_its_end() {
+    let dir = TempDir::new("close-dropped-");
+    let store = disk_backed_for_tests("close-dropped", dir.path()).await;
+    let partition = Partition::from([0x5Eu8; 16]);
+    let address = put_payload(
+        &store.immutable,
+        partition,
+        b"what the dropped close wrote",
+        0,
+    )
+    .await;
+    let store_handle = handle::register(store);
+
+    let scanning = pause_at(PausePoint::Scanning);
+    let close_task = lore_base::lore_spawn!(close(
+        LoreGlobalArgs::default(),
+        LoreStorageCloseArgs {
+            handle: store_handle,
+            ..Default::default()
+        },
+        None,
+    ));
+    tokio::time::timeout(Duration::from_secs(5), scanning.reached.notified())
+        .await
+        .expect("close's flush reaches its first group");
+    close_task.abort();
+    assert!(
+        close_task.await.is_err_and(|err| err.is_cancelled()),
+        "the close is dropped"
+    );
+    scanning.resume.notify_one();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while held(dir.path(), "immutable") {
+        assert!(
+            Instant::now() < deadline,
+            "the flush runs to its end and lets the store go"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let reopened = disk_backed_for_tests("close-dropped-reopened", dir.path()).await;
+    let found = reopened
+        .immutable
+        .clone()
+        .get_metadata(partition, address)
+        .await
+        .expect("reads the reopened store");
+    assert_eq!(
+        found.match_made,
+        StoreMatch::MatchFull,
+        "the entry is on disk"
+    );
+}
+
+/// **A close whose flush fails releases the handle and returns the error.** The handle is gone
+/// whatever the flush did, so a second close finds no handle, and the mutable store is not
+/// flushed once the immutable store's flush has failed.
+#[tokio::test]
+async fn a_close_whose_flush_fails_releases_the_handle_and_returns_the_error() {
+    let dir = TempDir::new("close-flush-fails-");
+    let store = disk_backed_for_tests("close-flush-fails", dir.path()).await;
+    let partition = Partition::from([0x4Du8; 16]);
+    put_payload(
+        &store.immutable,
+        partition,
+        b"a payload whose sync fails",
+        0,
+    )
+    .await;
+    let key = Hash::from([0x6Eu8; 32]);
+    store
+        .mutable
+        .clone()
+        .store(
+            partition,
+            key,
+            Hash::from([0xE6u8; 32]),
+            KeyType::BranchMetadata,
+        )
+        .await
+        .expect("stores");
+    let store_handle = handle::register(store);
+    let args = LoreStorageCloseArgs {
+        handle: store_handle,
+        ..Default::default()
+    };
+
+    fail_packfile_syncs(1);
+    let status = close(
+        LoreGlobalArgs {
+            sync_data: 1,
+            ..Default::default()
+        },
+        args.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StorageError::internal("flush").ffi_code(),
+        "close returns the flush's error"
+    );
+    assert!(
+        handle::lookup(store_handle).is_none(),
+        "and releases the handle"
+    );
+
+    let status = close(LoreGlobalArgs::default(), args, None).await;
+    let no_handle = StorageError::from(InvalidArguments {
+        reason: String::new(),
+    });
+    assert_eq!(
+        status,
+        no_handle.ffi_code(),
+        "a second close finds no handle"
+    );
+
+    let reopened = disk_backed_for_tests("close-flush-fails-reopened", dir.path()).await;
+    let loaded = reopened
+        .mutable
+        .clone()
+        .load(partition, key, KeyType::BranchMetadata)
+        .await;
+    assert!(
+        loaded.is_err_and(|err| err.is_address_not_found()),
+        "the mutable store is not flushed once the immutable store's flush failed"
+    );
+}
+
 /// The store outlives its storage handle for exactly as long as a revision tree still
 /// references it. That reference is what makes reads work after a parent close, so it
 /// has to be the last one dropped, not merely present.
@@ -107,6 +318,7 @@ async fn the_store_tears_down_only_once_the_last_revision_handle_closes() {
         LoreGlobalArgs::default(),
         LoreStorageCloseArgs {
             handle: store_handle,
+            ..Default::default()
         },
         None,
     )
@@ -132,13 +344,8 @@ async fn the_store_tears_down_only_once_the_last_revision_handle_closes() {
 async fn the_claims_joined_for_a_flush_outlive_the_handle() {
     let dir = lore_base::test_util::TempDir::new("close-flush-claims-");
     let store = disk_backed_for_tests("close-flush-claims", dir.path()).await;
-    let held = |name: &str| {
-        lore_storage::local::store_lock::StoreLock::new(dir.path().join(name), false)
-            .expect("a store directory")
-            .is_held()
-    };
     assert!(
-        held("immutable") && held("mutable"),
+        held(dir.path(), "immutable") && held(dir.path(), "mutable"),
         "an open handle claims both stores"
     );
 
@@ -146,72 +353,281 @@ async fn the_claims_joined_for_a_flush_outlive_the_handle() {
     assert_eq!(claims.len(), 2, "the flush joins a claim on each store");
     drop(store);
     assert!(
-        held("immutable") && held("mutable"),
+        held(dir.path(), "immutable") && held(dir.path(), "mutable"),
         "and those keep both stores once the handle's state is gone"
     );
 
     drop(claims);
     assert!(
-        !held("immutable") && !held("mutable"),
+        !held(dir.path(), "immutable") && !held(dir.path(), "mutable"),
         "until the flush lets them go"
     );
 }
 
-/// **A tree closed after its storage handle flushes what it wrote.** The handle's close
-/// flushed what had been written by then; without a flush at the tree's own close, the
-/// tree's later writes would keep the store's flock for as long as the process ran.
+/// **A close that skips the flush leaves what the handle wrote unflushed.** A flush held at its
+/// first group would keep the close from completing, and a store opened on the directory after
+/// the close finds nothing.
 #[tokio::test]
-async fn closing_a_tree_after_its_storage_handle_flushes_what_it_wrote() {
-    let dir = lore_base::test_util::TempDir::new("close-tree-flush-");
-    let store = disk_backed_for_tests("close-tree-flush", dir.path()).await;
-    let mutable = store.mutable.clone();
-    let repository = Partition::from([0x2Bu8; 16]);
+async fn a_close_that_skips_the_flush_leaves_what_the_handle_wrote_unflushed() {
+    let dir = TempDir::new("close-skips-flush-");
+    let store = disk_backed_for_tests("close-skips-flush", dir.path()).await;
+    let partition = Partition::from([0x7Au8; 16]);
+    let address = put_payload(&store.immutable, partition, b"what no flush writes", 0).await;
+    let store_handle = handle::register(store);
+
+    let _scanning = pause_at(PausePoint::Scanning);
+    let status = tokio::time::timeout(
+        Duration::from_secs(5),
+        close(
+            LoreGlobalArgs::default(),
+            LoreStorageCloseArgs {
+                handle: store_handle,
+                skip_flush: 1,
+            },
+            None,
+        ),
+    )
+    .await
+    .expect("close completes without a flush");
+    assert_eq!(status, 0, "close succeeds");
+    assert!(
+        handle::lookup(store_handle).is_none(),
+        "and releases the handle"
+    );
+
+    let reopened = disk_backed_for_tests("close-skips-flush-reopened", dir.path()).await;
+    let found = reopened
+        .immutable
+        .clone()
+        .get_metadata(partition, address)
+        .await
+        .expect("reads the reopened store");
+    assert_eq!(
+        found.match_made,
+        StoreMatch::MatchNone,
+        "the entry is not on disk"
+    );
+}
+
+/// **Close waits for a garbage collection pass in flight to give up before its flush.** A
+/// compaction pass held in its size eviction keeps the close from completing, and once resumed it
+/// sees the close's stop request and gives up before it evicts, so the store opened on the
+/// directory afterwards still holds the payload.
+#[tokio::test]
+async fn close_waits_for_a_gc_pass_in_flight_to_give_up() {
+    let dir = TempDir::new("close-waits-for-gc-");
+    let store = disk_backed_for_tests("close-waits-for-gc", dir.path()).await;
+    let immutable = store.immutable.clone();
+    let partition = Partition::from([0x6Cu8; 16]);
+    let address = put_evictable_in_the_first_group(&immutable, partition).await;
+    let store_handle = handle::register(store);
+
+    let evicting = pause_at(PausePoint::Evicting);
+    let compaction = lore_base::lore_spawn!(immutable.compact(1, None, false, None));
+    tokio::time::timeout(Duration::from_secs(5), evicting.reached.notified())
+        .await
+        .expect("the compaction reaches its size eviction");
+    let close_task = lore_base::lore_spawn!(close(
+        LoreGlobalArgs::default(),
+        LoreStorageCloseArgs {
+            handle: store_handle,
+            ..Default::default()
+        },
+        None,
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while handle::lookup(store_handle).is_some() {
+        assert!(Instant::now() < deadline, "close unregisters the handle");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !close_task.is_finished(),
+        "close must not complete while a garbage collection pass is in flight"
+    );
+
+    evicting.resume.notify_one();
+    compaction
+        .await
+        .expect("compaction task join")
+        .expect("the compaction gives up without failing");
+    assert_eq!(
+        close_task.await.expect("close task join"),
+        0,
+        "close completes once the pass has given up"
+    );
+
+    let reopened = disk_backed_for_tests("close-waits-for-gc-reopened", dir.path()).await;
+    assert!(
+        reopened
+            .immutable
+            .clone()
+            .get(partition, address)
+            .await
+            .is_ok(),
+        "the pass gave up before it evicted the payload"
+    );
+}
+
+/// Store a payload marked stored upstream, which eviction may drop, in the first group, where a
+/// compaction pass from the start of the store begins, returning its address.
+async fn put_evictable_in_the_first_group(
+    immutable: &Arc<dyn ImmutableStore>,
+    partition: Partition,
+) -> Address {
+    let payload = (0u32..)
+        .map(u32::to_le_bytes)
+        .find(|payload| lore_storage::hash_slice(payload).data()[0] == 0)
+        .expect("a payload hashes into the first group");
+    put_payload(
+        immutable,
+        partition,
+        &payload,
+        FragmentFlags::PayloadStoredDurable.bits(),
+    )
+    .await
+}
+
+/// A revision tree loaded on a disk-backed store under `root`, and the tree's stores, once the
+/// storage handle the tree was loaded against has closed.
+async fn tree_after_storage_close(
+    root: &Path,
+    repository: Partition,
+) -> (
+    LoreRevisionTree,
+    Arc<dyn ImmutableStore>,
+    Arc<dyn MutableStore>,
+) {
+    let store = disk_backed_for_tests("tree-after-storage-close", root).await;
+    let stores = (store.immutable.clone(), store.mutable.clone());
     let store_handle = handle::register(store);
     let tree = load_revision_tree(store_handle, repository).await;
     let status = close(
         LoreGlobalArgs::default(),
         LoreStorageCloseArgs {
             handle: store_handle,
+            ..Default::default()
         },
         None,
     )
     .await;
     assert_eq!(status, 0, "closing the storage handle must succeed");
+    (tree, stores.0, stores.1)
+}
 
-    // Written after the storage handle closed, as a commit through the tree would be.
+/// Store a branch metadata value under `key` in `mutable`, as a commit through a tree would.
+async fn store_value(mutable: &Arc<dyn MutableStore>, repository: Partition, key: Hash) {
     mutable
         .clone()
         .store(
             repository,
-            Hash::from([0x5au8; 32]),
+            key,
             Hash::from([0xa5u8; 32]),
-            lore_base::types::KeyType::BranchMetadata,
+            KeyType::BranchMetadata,
         )
         .await
         .expect("stores");
+}
 
+/// Close `tree` as `globals` and `skip_flush` ask, returning the status and the code its
+/// `RevisionTreeCloseComplete` event carries.
+async fn close_tree(
+    tree: LoreRevisionTree,
+    globals: LoreGlobalArgs,
+    skip_flush: u8,
+) -> (i32, Option<LoreErrorCode>) {
+    let reported: Arc<Mutex<Option<LoreErrorCode>>> = Arc::new(Mutex::new(None));
+    let sink = reported.clone();
+    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+        if let LoreEvent::RevisionTreeCloseComplete(data) = event {
+            *sink.lock().unwrap() = Some(data.error_code);
+        }
+    }));
     let status = lore::revision_tree::close::close(
-        LoreGlobalArgs::default(),
+        globals,
         lore::revision_tree::close::LoreRevisionTreeCloseArgs {
             id: 1,
             handle: tree,
+            skip_flush,
         },
-        None,
+        callback,
     )
     .await;
-    assert_eq!(status, 0, "closing the tree must succeed");
+    let code = *reported.lock().unwrap();
+    (status, code)
+}
 
-    let held = || {
-        lore_storage::local::store_lock::StoreLock::new(dir.path().join("mutable"), false)
-            .expect("a store directory")
-            .is_held()
-    };
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while held() {
-        assert!(
-            Instant::now() < deadline,
-            "the tree's close flushed what it wrote and let the store go"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+/// **A tree closed after its storage handle completes once what it wrote is flushed.** The
+/// handle's close flushed what had been written by then; the tree's later writes keep the store's
+/// flock until a flush writes them, so the close lets the store go before it completes.
+#[tokio::test]
+async fn a_tree_closed_after_its_storage_handle_completes_once_what_it_wrote_is_flushed() {
+    let dir = TempDir::new("close-tree-flush-");
+    let repository = Partition::from([0x2Bu8; 16]);
+    let (tree, _immutable, mutable) = tree_after_storage_close(dir.path(), repository).await;
+    store_value(&mutable, repository, Hash::from([0x5au8; 32])).await;
+
+    let (status, code) = close_tree(tree, LoreGlobalArgs::default(), 0).await;
+    assert_eq!(status, 0, "closing the tree must succeed");
+    assert_eq!(code, Some(LoreErrorCode::None), "and reports so");
+    assert!(
+        !held(dir.path(), "mutable"),
+        "the tree's close flushed what it wrote and let the store go"
+    );
+}
+
+/// **A tree close whose flush fails releases the tree and returns the error.**
+#[tokio::test]
+async fn a_tree_close_whose_flush_fails_releases_the_tree_and_returns_the_error() {
+    let dir = TempDir::new("close-tree-flush-fails-");
+    let repository = Partition::from([0x3Du8; 16]);
+    let (tree, immutable, _mutable) = tree_after_storage_close(dir.path(), repository).await;
+    put_payload(&immutable, repository, b"a payload the tree wrote", 0).await;
+
+    fail_packfile_syncs(1);
+    let (status, code) = close_tree(
+        tree,
+        LoreGlobalArgs {
+            sync_data: 1,
+            ..Default::default()
+        },
+        0,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StorageError::internal("flush").ffi_code(),
+        "the tree's close returns the flush's error"
+    );
+    assert_eq!(code, Some(LoreErrorCode::Internal), "and reports it");
+    assert!(tree_handle::lookup(tree).is_none(), "and releases the tree");
+}
+
+/// **A tree close that skips the flush leaves what the tree wrote unflushed.** A store opened on
+/// the directory once nothing holds the tree's stores finds nothing.
+#[tokio::test]
+async fn a_tree_close_that_skips_the_flush_leaves_what_the_tree_wrote_unflushed() {
+    let dir = TempDir::new("close-tree-skips-flush-");
+    let repository = Partition::from([0x4Eu8; 16]);
+    let key = Hash::from([0x6Bu8; 32]);
+    let (tree, immutable, mutable) = tree_after_storage_close(dir.path(), repository).await;
+    store_value(&mutable, repository, key).await;
+    drop((immutable, mutable));
+
+    let (status, code) = close_tree(tree, LoreGlobalArgs::default(), 1).await;
+    assert_eq!(status, 0, "closing the tree must succeed");
+    assert_eq!(code, Some(LoreErrorCode::None), "and reports so");
+
+    let reopened = disk_backed_for_tests("close-tree-skips-flush-reopened", dir.path()).await;
+    let loaded = reopened
+        .mutable
+        .clone()
+        .load(repository, key, KeyType::BranchMetadata)
+        .await;
+    assert!(
+        loaded.is_err_and(|err| err.is_address_not_found()),
+        "the value is not on disk"
+    );
 }

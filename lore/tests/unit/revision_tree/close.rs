@@ -88,6 +88,7 @@ async fn close_releases_handle_and_subsequent_close_returns_invalid_arguments() 
         LoreRevisionTreeCloseArgs {
             id: 42,
             handle: handle_value,
+            ..Default::default()
         },
         make_callback(sink_first.clone()),
     )
@@ -128,6 +129,7 @@ async fn close_releases_handle_and_subsequent_close_returns_invalid_arguments() 
         LoreRevisionTreeCloseArgs {
             id: 43,
             handle: handle_value,
+            ..Default::default()
         },
         make_callback(sink_second.clone()),
     )
@@ -163,6 +165,7 @@ async fn close_with_unknown_handle_returns_invalid_arguments() {
         LoreRevisionTreeCloseArgs {
             id: 7,
             handle: LoreRevisionTree::INVALID,
+            ..Default::default()
         },
         make_callback(sink.clone()),
     )
@@ -194,6 +197,7 @@ async fn close_with_unknown_handle_emits_close_complete_with_invalid_arguments_e
         LoreRevisionTreeCloseArgs {
             id: 4242,
             handle: LoreRevisionTree::INVALID,
+            ..Default::default()
         },
         make_callback(sink.clone()),
     )
@@ -231,6 +235,7 @@ async fn close_waits_for_in_flight_to_drain() {
             LoreRevisionTreeCloseArgs {
                 id: 99,
                 handle: handle_value,
+                ..Default::default()
             },
             make_callback(sink_clone),
         )
@@ -282,6 +287,7 @@ async fn concurrent_close_on_same_handle_one_wins() {
             LoreRevisionTreeCloseArgs {
                 id: 1,
                 handle: handle_value,
+                ..Default::default()
             },
             None,
         )
@@ -293,6 +299,7 @@ async fn concurrent_close_on_same_handle_one_wins() {
             LoreRevisionTreeCloseArgs {
                 id: 2,
                 handle: handle_value,
+                ..Default::default()
             },
             None,
         )
@@ -357,6 +364,7 @@ async fn open_load_close_storageclose_deregisters_both_handles() {
         LoreRevisionTreeCloseArgs {
             id: 1,
             handle: tree_handle,
+            ..Default::default()
         },
         None,
     )
@@ -371,6 +379,7 @@ async fn open_load_close_storageclose_deregisters_both_handles() {
         LoreGlobalArgs::default(),
         lore::storage::close::LoreStorageCloseArgs {
             handle: store_handle,
+            ..Default::default()
         },
         None,
     )
@@ -418,6 +427,7 @@ async fn revision_handle_survives_parent_storage_close() {
         LoreGlobalArgs::default(),
         lore::storage::close::LoreStorageCloseArgs {
             handle: store_handle,
+            ..Default::default()
         },
         None,
     )
@@ -441,6 +451,7 @@ async fn revision_handle_survives_parent_storage_close() {
         LoreRevisionTreeCloseArgs {
             id: 1,
             handle: tree_handle,
+            ..Default::default()
         },
         None,
     )

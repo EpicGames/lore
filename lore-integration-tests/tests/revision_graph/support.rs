@@ -409,7 +409,11 @@ async fn commit_file_on(
     events_of("closing the tree", |callback| {
         close(
             LoreGlobalArgs::default(),
-            LoreRevisionTreeCloseArgs { id: 1, handle },
+            LoreRevisionTreeCloseArgs {
+                id: 1,
+                handle,
+                ..Default::default()
+            },
             callback,
         )
     })

@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MIT
 //! `lore_revision_tree_close` — release a handle acquired via
 //! `lore_revision_tree_load`. Drain semantics mirror `lore_storage_close`:
-//! unregister, mark invalid, await the in-flight counter, drop.
+//! unregister, mark invalid, await the in-flight counter, flush the stores of a
+//! closed storage handle, drop.
+
+use std::sync::atomic::Ordering;
 
 use lore_base::error::InvalidArguments;
 use lore_error_set::prelude::*;
@@ -12,6 +15,9 @@ use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeCloseCompleteEventData;
 use lore_revision::interface::LoreError;
+use lore_revision::lore::execution_context;
+use lore_storage::StorageError;
+use tokio::sync::oneshot;
 
 use crate::call::no_repository_call;
 use crate::call_delegation::dispatch_call;
@@ -19,6 +25,9 @@ use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::revision_tree::handle;
 use crate::revision_tree::handle::LoreRevisionTree;
+use crate::storage::close::claims_for_flush;
+use crate::storage::close::spawn_flush;
+use crate::storage::store::StoreInternal;
 
 /// Arguments for `lore_revision_tree_close`.
 #[repr(C)]
@@ -29,6 +38,9 @@ pub struct LoreRevisionTreeCloseArgs {
     pub id: u64,
     /// Revision-tree handle to release
     pub handle: LoreRevisionTree,
+    /// Non-zero to release the handle without flushing the stores of a closed storage handle.
+    /// What no flush has written is lost once nothing holds the stores.
+    pub skip_flush: u8,
 }
 
 #[error_set]
@@ -60,7 +72,9 @@ impl EventError for CloseError {
 ///
 /// The handle is unregistered before the drain, so `handle::lookup` refuses new
 /// ops immediately; ops that already took the handle hold their own `Arc` and the
-/// drain waits them out.
+/// drain waits them out. A tree whose storage handle closed first is flushed as
+/// [`spawn_flush_after_storage_close`] describes, unless `skip_flush` is set, and
+/// the close returns the flush's result.
 pub async fn close(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeCloseArgs,
@@ -75,44 +89,59 @@ fn close_impl(
     callback: LoreEventCallback,
 ) -> impl Future<Output = i32> {
     no_repository_call(globals, callback, args, close, async move |args| {
-        let Some(internal) = handle::unregister(args.handle) else {
-            LoreEvent::RevisionTreeCloseComplete(LoreRevisionTreeCloseCompleteEventData {
-                id: args.id,
-                error_code: LoreErrorCode::InvalidArguments,
-            })
-            .send();
-            return Err(CloseError::from(InvalidArguments {
-                reason: "revision tree handle is unknown or has been closed".into(),
-            }));
-        };
-
-        internal.mark_invalid_and_await().await;
-
-        // A tree closed after its storage handle has writes nothing else will flush: the
-        // handle's close flushed what had been written by then. Left flagged, they would keep
-        // the store's flock past this tree — which may be the last thing claiming it — for as
-        // long as the process runs. Flushed under claims joined while the tree still holds the
-        // handle's.
-        let store = &internal.store_internal;
-        if store.invalid.load(std::sync::atomic::Ordering::Acquire) {
-            let options = lore_revision::lore::execution_context()
-                .globals()
-                .flush_options();
-            let claims = crate::storage::close::claims_for_flush(store);
-            crate::storage::close::spawn_flush_for_closed_tree(
-                store.immutable.clone(),
-                store.mutable.clone(),
-                claims,
-                options,
-            );
-        }
-
+        let closed = close_tree(args.handle, args.skip_flush != 0).await;
         LoreEvent::RevisionTreeCloseComplete(LoreRevisionTreeCloseCompleteEventData {
             id: args.id,
-            error_code: LoreErrorCode::None,
+            error_code: close_error_code(&closed),
         })
         .send();
-
-        Ok::<_, CloseError>(())
+        closed
     })
+}
+
+/// Unregisters and drains the tree, then, unless `skip_flush`, flushes the stores of a closed
+/// storage handle.
+async fn close_tree(tree: LoreRevisionTree, skip_flush: bool) -> Result<(), CloseError> {
+    let Some(internal) = handle::unregister(tree) else {
+        return Err(CloseError::from(InvalidArguments {
+            reason: "revision tree handle is unknown or has been closed".into(),
+        }));
+    };
+    internal.mark_invalid_and_await().await;
+    let flushed = if skip_flush {
+        None
+    } else {
+        spawn_flush_after_storage_close(&internal.store_internal)
+    };
+    drop(internal);
+    match flushed {
+        Some(flushed) => flushed
+            .await
+            .internal("awaiting the flush of the closed storage handle's stores")?
+            .forward_any::<CloseError>("flushing the closed storage handle's stores"),
+        None => Ok(()),
+    }
+}
+
+/// Starts the flush of the stores once the tree's storage handle has closed, as [`spawn_flush`]
+/// does, under claims joined while the tree still holds the handle's, or returns `None` while
+/// the handle is open: its own close flushes them, unless that close skips the flush. Writes no flush has written keep the store's
+/// lock while anything holds the stores, and are lost once nothing does.
+fn spawn_flush_after_storage_close(
+    store: &StoreInternal,
+) -> Option<oneshot::Receiver<Result<(), StorageError>>> {
+    if !store.invalid.load(Ordering::Acquire) {
+        return None;
+    }
+    let options = execution_context().globals().flush_options();
+    Some(spawn_flush(store, claims_for_flush(store), options))
+}
+
+/// The code `LORE_EVENT_REVISION_TREE_CLOSE_COMPLETE` reports for a finished close.
+fn close_error_code(closed: &Result<(), CloseError>) -> LoreErrorCode {
+    match closed {
+        Ok(()) => LoreErrorCode::None,
+        Err(CloseError::InvalidArguments(_)) => LoreErrorCode::InvalidArguments,
+        Err(CloseError::Internal(_)) => LoreErrorCode::Internal,
+    }
 }

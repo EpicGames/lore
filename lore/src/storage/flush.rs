@@ -9,9 +9,14 @@
 //! The flush options come from `globals.sync_data` and `globals.fast_flush`, as the close-time
 //! flush's do.
 
+use std::sync::Arc;
+
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::lore::execution_context;
+use lore_storage::FlushOptions;
+use lore_storage::ImmutableStore;
+use lore_storage::MutableStore;
 use lore_storage::StorageError;
 
 use crate::call_delegation::dispatch_call;
@@ -30,7 +35,8 @@ pub struct LoreStorageFlushArgs {
 }
 
 /// Flush pending writes through the handle's stores. Disk-backed stores
-/// fsync; in-memory stores no-op.
+/// write as `globals.sync_data` and `globals.fast_flush` ask; in-memory stores
+/// no-op.
 pub async fn flush(
     globals: LoreGlobalArgs,
     args: LoreStorageFlushArgs,
@@ -53,20 +59,28 @@ async fn flush_local(
         flush,
         async move |store, _args| {
             let options = execution_context().globals().flush_options();
-            store
-                .immutable
-                .clone()
-                .flush(options)
-                .await
-                .forward_any::<StorageError>("immutable store flush")?;
-            store
-                .mutable
-                .clone()
-                .flush(options)
-                .await
-                .forward_any::<StorageError>("mutable store flush")?;
-            Ok::<(), StorageError>(())
+            flush_stores(&store.immutable, &store.mutable, options).await
         },
     )
     .await
+}
+
+/// Flushes `immutable`, then `mutable`, as `options` asks. The mutable store is flushed only once
+/// the immutable store's flush has succeeded, since its values name content the immutable store
+/// holds.
+pub(crate) async fn flush_stores(
+    immutable: &Arc<dyn ImmutableStore>,
+    mutable: &Arc<dyn MutableStore>,
+    options: FlushOptions,
+) -> Result<(), StorageError> {
+    immutable
+        .clone()
+        .flush(options)
+        .await
+        .forward_any::<StorageError>("immutable store flush")?;
+    mutable
+        .clone()
+        .flush(options)
+        .await
+        .forward_any::<StorageError>("mutable store flush")
 }

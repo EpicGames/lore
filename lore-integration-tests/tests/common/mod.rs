@@ -309,7 +309,10 @@ pub(crate) mod net_common {
     pub(crate) async fn close_handle(handle: LoreStore) {
         let status = lore::storage::close::close(
             LoreGlobalArgs::default(),
-            LoreStorageCloseArgs { handle },
+            LoreStorageCloseArgs {
+                handle,
+                ..Default::default()
+            },
             None,
         )
         .await;

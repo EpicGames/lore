@@ -20,7 +20,7 @@ async fn a_get_completes_once_every_buffer_its_items_lent_is_let_go() {
     let bare = in_memory_for_tests("get-held-buffer").await;
     let partition = Partition::from([0x41; 16]);
     let payload = b"content whose buffer the store holds";
-    let address = held::put_payload(&bare, partition, payload).await;
+    let address = super::put_payload(&bare.immutable, partition, payload, 0).await;
     let (handle, holds) = held::holding_handle(&bare, address);
 
     let mut held_buffer = vec![0u8; payload.len()];

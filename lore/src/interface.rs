@@ -6798,9 +6798,9 @@ pub type LoreStorageOpenArgs = crate::storage::open::LoreStorageOpenArgs;
 /// Open a content-addressed storage handle.
 ///
 /// A disk-backed handle claims its stores for this process until it is released, so
-/// another process using the same stores waits until then. The claim ends once the
-/// flush `lore_storage_close` starts has finished and every revision tree loaded
-/// against the handle has been closed.
+/// another process using the same stores waits until then. The claim ends once
+/// `lore_storage_close`, and `lore_revision_tree_close` of every revision tree
+/// loaded against the handle, have completed.
 ///
 /// # Events
 ///
@@ -7011,13 +7011,23 @@ pub type LoreStorageCloseArgs = crate::storage::close::LoreStorageCloseArgs;
 /// Release a content-addressed storage handle.
 ///
 /// Subsequent calls against the same handle return `InvalidArguments`.
-/// Close does not block on the flush it spawns — `Complete` fires after
-/// the in-flight counter drains, not after the flush finishes. The handle's
-/// claim on its stores ends once that flush has finished and every revision
-/// tree loaded against the handle has been closed. With `LORE_STORE_RETAIN`
-/// set to `1` or `true`, a disk-backed handle's stores stay in memory without
-/// the claim for the window `store_keep_alive_seconds` gives, so a
-/// `lore_storage_open` of the same repository in that window reuses them.
+/// Close waits for the calls in flight on the handle, then flushes its stores
+/// as `globals.sync_data` and `globals.fast_flush` ask, once the eviction and
+/// compaction passes in flight on the immutable store have given up and a
+/// verification in flight has ended. `LORE_EVENT_COMPLETE` fires once the
+/// flush has finished. A failed flush still releases the handle, and close
+/// returns the flush's error; a caller that must be able to retry a failed
+/// flush calls `lore_storage_flush` before close. With `skip_flush` set, close
+/// releases the handle once the calls in flight have ended, without a flush:
+/// what the handle, and the revision trees closed while it was open, wrote
+/// that no flush has written is lost once nothing holds the stores. The
+/// handle's claim on its stores ends as `lore_storage_open` describes. With
+/// `LORE_STORE_RETAIN` set to `1` or `true`, a disk-backed handle's stores stay
+/// in memory without the claim for the window `store_keep_alive_seconds`
+/// gives, so a `lore_storage_open` of the same repository in that window
+/// reuses them. Retained stores holding writes no flush has written, after a
+/// failed flush or with `skip_flush`, keep the lock on their directory until
+/// the window ends or a later flush in the process writes them.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_storage_close(
     globals: &LoreGlobalArgs,
@@ -8363,12 +8373,18 @@ pub type LoreRevisionTreeCloseArgs = crate::revision_tree::close::LoreRevisionTr
 /// Subsequent calls against the same handle return `InvalidArguments`. The
 /// call blocks until every in-flight op on the handle has paired its
 /// decrement. Closing a tree on a storage handle that is already closed
-/// flushes what the tree wrote since, and closing the last one releases
-/// what was keeping that handle's claim on its stores.
+/// flushes the stores, as `globals.sync_data` and `globals.fast_flush` ask,
+/// once the eviction and compaction passes in flight on the immutable store
+/// have given up and a verification in flight has ended, and completes once
+/// the flush has finished. A failed flush still releases the handle, and
+/// close returns the flush's error. With `skip_flush` set, close does not
+/// flush: what no flush has written is lost once nothing holds the stores.
+/// Closing the last tree releases what was keeping that handle's claim on its
+/// stores.
 ///
 /// | Terminal event                              | Payload                                       | Notes                                              |
 /// |---------------------------------------------|-----------------------------------------------|----------------------------------------------------|
-/// | `LORE_EVENT_REVISION_TREE_CLOSE_COMPLETE`   | `lore_revision_tree_close_complete_event_data_t` | Emitted on success carrying the caller id       |
+/// | `LORE_EVENT_REVISION_TREE_CLOSE_COMPLETE`   | `lore_revision_tree_close_complete_event_data_t` | Carries the caller id and the outcome           |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_revision_tree_close(
     globals: &LoreGlobalArgs,

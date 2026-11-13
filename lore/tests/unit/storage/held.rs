@@ -7,19 +7,15 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use lore::interface::LoreEventCallback;
 use lore::storage::handle;
 use lore::storage::handle::LoreStore;
 use lore::storage::store::BoundFlags;
 use lore::storage::store::StoreInternal;
 use lore_base::types::Address;
-use lore_base::types::Context;
-use lore_base::types::Partition;
 use lore_revision::event::LoreBytesMut;
 use lore_revision::event::LoreEvent;
 use lore_storage::CallerBuffer;
-use lore_storage::Fragment;
 use lore_storage::test_util::HeldAnswer;
 use lore_storage::test_util::HoldingStore;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -36,35 +32,6 @@ pub(super) fn data_out(buffer: &mut [u8]) -> LoreBytesMut {
         ptr: buffer.as_mut_ptr().cast(),
         len: buffer.len(),
     }
-}
-
-/// Store `payload` whole in `bare`'s immutable store, returning its address.
-pub(super) async fn put_payload(
-    bare: &StoreInternal,
-    partition: Partition,
-    payload: &[u8],
-) -> Address {
-    let address = Address {
-        hash: lore_storage::hash_slice(payload),
-        context: Context::default(),
-    };
-    let fragment = Fragment {
-        flags: 0,
-        size_payload: payload.len() as u32,
-        size_content: payload.len() as u64,
-    };
-    bare.immutable
-        .clone()
-        .put(
-            partition,
-            address,
-            fragment,
-            Some(Bytes::copy_from_slice(payload)),
-            false,
-        )
-        .await
-        .expect("the payload is stored");
-    address
 }
 
 /// A handle over `bare`'s stores whose immutable side holds the buffer of every read into a

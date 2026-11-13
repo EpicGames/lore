@@ -198,7 +198,10 @@ mod shared_store_tests {
     async fn close(handle: lore::storage::handle::LoreStore) {
         let status = lore::storage::close::close(
             globals(),
-            lore::storage::close::LoreStorageCloseArgs { handle },
+            lore::storage::close::LoreStorageCloseArgs {
+                handle,
+                ..Default::default()
+            },
             None,
         )
         .await;

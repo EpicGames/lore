@@ -373,11 +373,11 @@ pub(crate) async fn create_with_metadata(
     }
 
     // The create command goes through dispatch_call, not repository_call,
-    // so the normal spawn_flush_stores path that flushes dirty mutable store
-    // buckets after each command does not run. Flush explicitly to ensure
-    // branch creation, instance registration, and metadata are written
-    // before the process exits — synced to disk only under `--sync-data`, as
-    // every other command's flush is.
+    // so the post-command flush of the stores and the instance records
+    // (`RepositoryContext::try_spawn_post_command_flush`) does not run. Flush
+    // explicitly to ensure branch creation, instance registration, and
+    // metadata are written before the process exits — synced to disk only
+    // under `--sync-data`, as every other command's flush is.
     let _ = repository.flush(call.flush_options()).await;
 
     drop(repository);

@@ -7,34 +7,37 @@
 //!    handle returns `None` → the op rejects with `InvalidArguments`.
 //! 2. Mark the store invalid and await the in-flight counter → 0. In-flight ops that were past
 //!    `op_enter` at step 1 run to completion; new ops bounce off the invalid flag.
-//! 3. Join the handle's store claims and spawn a fire-and-forget flush task that holds them while
-//!    it calls `immutable.flush()` + `mutable.flush()`. For in-memory stores these are no-ops; for
-//!    disk-backed they honor `globals.sync_data` and `globals.fast_flush`.
-//! 4. In a process that retains stores, keep disk-backed stores for the keep-alive window without
-//!    claims, so an open of the same repository in that window reuses them.
+//! 3. Join the handle's store claims. In a process that retains stores, keep disk-backed stores
+//!    for the keep-alive window without claims, so an open of the same repository in that window
+//!    reuses them.
+//! 4. Unless `skip_flush` is set, flush the stores under the joined claims, as [`spawn_flush`]
+//!    describes, honoring `globals.sync_data` and `globals.fast_flush`.
+//! 5. Release the handle's state and await the flush's result.
 //!
-//! Close does not block on the flush. `Complete` fires once the claims are joined; the flush task
-//! outlives the call, and the claims with it, as all work spawned to outlive a storage op holds
-//! claims of its own until it ends.
+//! `Complete` fires once the flush has finished, with the flush's error if it failed. The handle is
+//! released either way, and a close dropped once its flush has started leaves it to run to its end.
 
 use std::sync::Arc;
 
+use futures::FutureExt;
 use lore_base::error::InvalidArguments;
 use lore_base::lore_spawn_guarded;
+use lore_base::lore_warn;
 use lore_base::runtime::LORE_CONTEXT;
+use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::interface::ExecutionContext;
 use lore_revision::lore::execution_context;
 use lore_storage::FlushOptions;
-use lore_storage::ImmutableStore;
-use lore_storage::MutableStore;
 use lore_storage::StorageError;
 use lore_storage::local::store_lock::StoreHold;
+use tokio::sync::oneshot;
 
 use crate::call::no_repository_call;
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
+use crate::storage::flush::flush_stores;
 use crate::storage::handle;
 use crate::storage::handle::LoreStore;
 use crate::storage::store::StoreInternal;
@@ -59,49 +62,38 @@ pub(crate) fn claims_for_flush(store: &StoreInternal) -> StoreHold {
     )
 }
 
-/// Fire-and-forget flush of a closing handle's stores, holding `claims` until it is done — see
-/// [`claims_for_flush`]. Stops the stores' garbage collection first. Runs without the caller's
-/// execution context; errors go to void. Disk-backed stores flush as `options` asks; in-memory
-/// stores no-op.
-pub(crate) fn spawn_flush_stores(
-    immutable_store: Arc<dyn ImmutableStore>,
-    mutable_store: Arc<dyn MutableStore>,
+/// Flushes `store`'s stores in a task shutdown waits for, holding `claims` until it is done — see
+/// [`claims_for_flush`] — and sends the result to the returned receiver. The task waits for the
+/// immutable store's eviction and compaction passes in flight to give up and for a verification
+/// in flight to end, then flushes the stores through [`flush_stores`] as `options` asks; in-memory
+/// stores no-op. A failed flush no receiver takes is logged. Runs without the caller's execution
+/// context.
+pub(crate) fn spawn_flush(
+    store: &StoreInternal,
     claims: StoreHold,
     options: FlushOptions,
-) {
-    spawn_without_context(async move {
+) -> oneshot::Receiver<Result<(), StorageError>> {
+    let (sender, receiver) = oneshot::channel();
+    let immutable_store = store.immutable.clone();
+    let mutable_store = store.mutable.clone();
+    let flush = async move {
         immutable_store.clone().stop_gc(false).await;
-        flush_then_release(immutable_store, mutable_store, claims, options).await;
+        let flushed = flush_stores(&immutable_store, &mutable_store, options).await;
+        drop(claims);
+        flushed
+    }
+    .map(move |flushed| {
+        if let Err(Err(err)) = sender.send(flushed) {
+            lore_warn!("Flush of a closed storage handle's stores failed: {err}");
+        }
     });
-}
-
-/// Fire-and-forget flush of the stores a revision tree wrote after its storage handle closed,
-/// holding `claims` until it is done — see [`claims_for_flush`]. Leaves garbage collection
-/// alone: the handle's close already stopped it. Otherwise as [`spawn_flush_stores`].
-pub(crate) fn spawn_flush_for_closed_tree(
-    immutable_store: Arc<dyn ImmutableStore>,
-    mutable_store: Arc<dyn MutableStore>,
-    claims: StoreHold,
-    options: FlushOptions,
-) {
-    spawn_without_context(flush_then_release(
-        immutable_store,
-        mutable_store,
-        claims,
-        options,
-    ));
-}
-
-/// Flushes both stores, then releases `claims`: only now, since the flushes ran inside them.
-async fn flush_then_release(
-    immutable_store: Arc<dyn ImmutableStore>,
-    mutable_store: Arc<dyn MutableStore>,
-    claims: StoreHold,
-    options: FlushOptions,
-) {
-    let _ = immutable_store.flush(options).await;
-    let _ = mutable_store.flush(options).await;
-    drop(claims);
+    LORE_CONTEXT.sync_scope(
+        Arc::new(ExecutionContext::default()) as Arc<dyn std::any::Any + Send + Sync>,
+        || {
+            lore_spawn_guarded!(flush);
+        },
+    );
+    receiver
 }
 
 /// Keeps a closing handle's stores for the keep-alive window, without claims, in a process that
@@ -121,16 +113,6 @@ fn retain_closed_stores(store: &StoreInternal, claims: &StoreHold) {
     }
 }
 
-/// Spawns `work` outside the caller's execution context, as a task shutdown waits for.
-fn spawn_without_context(work: impl Future<Output = ()> + Send + 'static) {
-    LORE_CONTEXT.sync_scope(
-        Arc::new(ExecutionContext::default()) as Arc<dyn std::any::Any + Send + Sync>,
-        || {
-            lore_spawn_guarded!(work);
-        },
-    );
-}
-
 /// Arguments for `lore_storage_close`.
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
@@ -138,6 +120,10 @@ fn spawn_without_context(work: impl Future<Output = ()> + Send + 'static) {
 pub struct LoreStorageCloseArgs {
     /// Handle to release; from `LORE_EVENT_STORAGE_OPENED`
     pub handle: LoreStore,
+    /// Non-zero to release the handle without flushing its stores. What the handle, and the
+    /// revision trees closed while it was open, wrote that no flush has written is lost once
+    /// nothing holds the stores.
+    pub skip_flush: u8,
 }
 
 /// Release a content-addressed storage handle.
@@ -148,8 +134,8 @@ pub struct LoreStorageCloseArgs {
 /// Revision tree handles loaded against this store are neither closed nor reported: each
 /// holds its own reference to the store and stays usable, reads and commits included.
 /// Releasing them is the caller's job, with `lore_revision_tree_close`. Background eviction
-/// and compaction stop here and do not restart, so a tree that keeps writing afterwards
-/// runs without cache-size enforcement.
+/// and compaction, where the open enabled them, keep their schedule for as long as anything
+/// holds the store.
 pub async fn close(
     globals: LoreGlobalArgs,
     args: LoreStorageCloseArgs,
@@ -174,17 +160,17 @@ fn close_local(
 
         store.mark_invalid_and_await().await;
 
-        // Spawn flush after the drain so it sees a quiesced store.
-        let options = execution_context().globals().flush_options();
         let claims = claims_for_flush(&store);
         retain_closed_stores(&store, &claims);
-        spawn_flush_stores(
-            store.immutable.clone(),
-            store.mutable.clone(),
-            claims,
-            options,
-        );
-
-        Ok::<_, StorageError>(())
+        if args.skip_flush != 0 {
+            return Ok(());
+        }
+        // Flush after the drain so the flush sees a quiesced store.
+        let options = execution_context().globals().flush_options();
+        let flushed = spawn_flush(&store, claims, options);
+        drop(store);
+        flushed
+            .await
+            .internal("awaiting the flush of the closed handle's stores")?
     })
 }

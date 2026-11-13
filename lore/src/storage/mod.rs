@@ -92,27 +92,24 @@ use lore_storage::StoreResult;
 /// Close every storage handle currently registered with the library.
 ///
 /// Drains the registry atomically (no new ops can find the handles after this call enters)
-/// and runs the close sequence — mark invalid, await in-flight counter, spawn flush — for
+/// and runs the drain sequence — mark invalid, await in-flight counter, spawn flush — for
 /// each one. Per-handle drains run in parallel: with N handles, wall time is the slowest
 /// drain rather than the sum. Returns once every handle is invalidated and drained; the
-/// per-handle flush tasks continue in the background and rely on the runtime staying alive
-/// long enough for them to terminate. The library shutdown path calls this before tearing
-/// down the runtime.
+/// per-handle flushes continue in tasks the library shutdown waits for. The library shutdown
+/// path calls this before tearing down the runtime.
 ///
-/// Per-handle flush spawns pass `sync_data = false` (no fsync). Blocking on per-store fsync
-/// at shutdown would defeat the fire-and-forget contract; explicit `lore_storage_close`
-/// calls remain the path for callers that want a sync'd flush.
+/// Per-handle flushes pass `sync_data = false` (no fsync), so shutdown does not wait on a sync
+/// of every store; `lore_storage_close` is the path for callers that want a synced flush.
 pub async fn close_all_handles() {
     drain_in_parallel(handle::drain_all()).await;
 }
 
 /// Close every storage handle whose owning IPC connection matches `connection_id`.
 ///
-/// The IPC dispatcher invokes this on connection teardown — when a server-side connection
-/// drops without an explicit `lore_storage_close` for handles it opened, the dispatcher hands
-/// the connection identifier here and the registry walks itself, draining matching entries
-/// and running the close sequence on each. Client-mode handles (no connection id recorded)
-/// are unaffected. Per-handle drains run in parallel.
+/// This is the teardown of a server-side connection that drops without a `lore_storage_close`
+/// for the handles it opened. The registry walks itself, draining matching entries and running
+/// the drain sequence on each. Client-mode handles (no connection id recorded) are unaffected.
+/// Per-handle drains run in parallel.
 ///
 /// Buffers across the IPC boundary: the `LoreBytes` a `lore_storage_put` or
 /// `lore_storage_put_resolved` item views crosses as its bytes, which the service reads in the
@@ -131,7 +128,7 @@ pub async fn close_for_connection(connection_id: u64) {
     drain_in_parallel(entries).await;
 }
 
-/// Run the close sequence for each entry concurrently: every drain fires its own task so the
+/// Run the drain sequence for each entry concurrently: every drain fires its own task so the
 /// total wall time is bounded by the slowest drain, not the sum. The flush spawned inside is
 /// fire-and-forget; what runs in parallel here is the in-flight-counter await and the join of
 /// the claims each flush holds.
@@ -147,12 +144,11 @@ pub(crate) async fn drain_in_parallel(entries: Vec<(u64, std::sync::Arc<store::S
         lore_base::lore_spawn!(tasks, async move {
             store.mark_invalid_and_await().await;
             let claims = close::claims_for_flush(&store);
-            close::spawn_flush_stores(
-                store.immutable.clone(),
-                store.mutable.clone(),
+            drop(close::spawn_flush(
+                &store,
                 claims,
                 lore_storage::FlushOptions::default(),
-            );
+            ));
         });
     }
     while tasks.join_next().await.is_some() {}

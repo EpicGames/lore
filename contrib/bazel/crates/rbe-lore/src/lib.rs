@@ -1218,10 +1218,10 @@ fn codes_insert(map: &Arc<Mutex<HashMap<u64, Outcome>>>, id: u64, error: &LoreEr
         .insert(id, (error.error_code, error.message.as_str().to_string()));
 }
 
-/// Make Lore's writes durable. Close's flush is otherwise fire-and-forget, so without this a
-/// restart cannot reuse the on-disk repo -- which for a cold/warm benchmark would silently
-/// throw away the warm cache. Run on a dedicated thread so it never observes an ambient tokio
-/// runtime; it then flushes via Lore's shared runtime, sidestepping `block_in_place` ordering.
+/// Make Lore's writes durable. Without this a restart cannot reuse the on-disk repo -- which for
+/// a cold/warm benchmark would silently throw away the warm cache. Run on a dedicated thread so
+/// it never observes an ambient tokio runtime; it then flushes via Lore's shared runtime,
+/// sidestepping `block_in_place` ordering.
 pub fn shutdown_lore() {
     let _ = std::thread::spawn(lore::shutdown).join();
 }

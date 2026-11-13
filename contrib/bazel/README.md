@@ -390,9 +390,9 @@ absence: a non-zero value means warm builds are running cold.
 * **`local_cache = 1` on writes keeps the payload local**, not only fragment metadata: the write
   path retains it only when `!stored_durable || cache_local`, and a successful upstream write
   makes it durable.
-* **The server flushes Lore on shutdown.** Lore's close-time flush is otherwise fire-and-forget,
-  and a restart cannot reuse the on-disk repository, so a warm cache comes back cold. The server
-  handles SIGTERM as well as SIGINT, and `lore-rbe down` waits for each process to exit.
+* **The server flushes Lore on shutdown.** Without it a restart cannot reuse the on-disk
+  repository, so a warm cache comes back cold. The server handles SIGTERM as well as SIGINT, and
+  `lore-rbe down` waits for each process to exit.
 * **`lore-rbe` writes its own loreserver configuration**, overriding only ports and store paths.
   `lore-server/config/local.toml` references test certificates relative to the repository root.
   With no `[server.quic.certificate]` the QUIC endpoint generates an ephemeral self-signed

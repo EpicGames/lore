@@ -154,6 +154,7 @@ async fn interleave(repository: &Path, rounds: usize) -> Result<(), String> {
         globals(repository),
         close::LoreStorageCloseArgs {
             handle: LoreStore { handle_id: handle },
+            ..Default::default()
         },
         None,
     )

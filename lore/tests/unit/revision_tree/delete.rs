@@ -1698,7 +1698,11 @@ async fn a_close_waits_for_a_dropped_deletes_task() {
         let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
         close(
             LoreGlobalArgs::default(),
-            LoreRevisionTreeCloseArgs { id: 1, handle },
+            LoreRevisionTreeCloseArgs {
+                id: 1,
+                handle,
+                ..Default::default()
+            },
             make_callback(sink),
         )
         .await

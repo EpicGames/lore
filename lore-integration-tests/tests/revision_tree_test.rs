@@ -288,7 +288,11 @@ mod support {
         let (sink, callback) = make_sink();
         let status = close(
             LoreGlobalArgs::default(),
-            LoreRevisionTreeCloseArgs { id: 1, handle },
+            LoreRevisionTreeCloseArgs {
+                id: 1,
+                handle,
+                ..Default::default()
+            },
             callback,
         )
         .await;
@@ -3464,6 +3468,7 @@ mod lifecycle_tests {
                 handle: lore::storage::handle::LoreStore {
                     handle_id: store_handle_id,
                 },
+                ..Default::default()
             },
             callback,
         )

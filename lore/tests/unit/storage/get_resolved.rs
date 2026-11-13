@@ -36,7 +36,7 @@ async fn a_get_resolved_completes_once_every_buffer_its_items_lent_is_let_go() {
     let bare = in_memory_for_tests("get-resolved-held-buffer").await;
     let partition = Partition::from([0x42; 16]);
     let payload = b"resolved content whose buffer the store holds";
-    let address = held::put_payload(&bare, partition, payload).await;
+    let address = super::put_payload(&bare.immutable, partition, payload, 0).await;
     let key = lore_storage::hash_slice(b"the key resolving to the held content");
     bare.mutable
         .clone()

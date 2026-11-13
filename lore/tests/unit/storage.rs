@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use bytes::Bytes;
 use lore_base::types::Address;
+use lore_base::types::Context;
+use lore_base::types::Partition;
+use lore_storage::Fragment;
+use lore_storage::ImmutableStore;
 use lore_storage::StorageError;
 
 mod call;
@@ -20,6 +25,36 @@ use lore::storage::store::StoreInternal;
 use lore::storage::store::in_memory_for_tests;
 use lore::storage::*;
 use lore_error_set::FfiError;
+
+/// Store `payload` whole in `immutable` with the fragment `flags`, returning its address.
+async fn put_payload(
+    immutable: &Arc<dyn ImmutableStore>,
+    partition: Partition,
+    payload: &[u8],
+    flags: u32,
+) -> Address {
+    let address = Address {
+        hash: lore_storage::hash_slice(payload),
+        context: Context::default(),
+    };
+    let fragment = Fragment {
+        flags,
+        size_payload: payload.len() as u32,
+        size_content: payload.len() as u64,
+    };
+    immutable
+        .clone()
+        .put(
+            partition,
+            address,
+            fragment,
+            Some(Bytes::copy_from_slice(payload)),
+            false,
+        )
+        .await
+        .expect("the payload is stored");
+    address
+}
 
 fn address_not_found() -> StorageError {
     StorageError::from(lore_base::error::AddressNotFound::from(Address::default()))
