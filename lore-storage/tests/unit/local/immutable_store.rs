@@ -1259,6 +1259,11 @@ async fn a_group_the_delayed_flush_persisted_reopens_at_its_written_level() {
 /// asked for it through a renamed temporary file, with and without `sync_data`. Either way it leaves
 /// no temporary file, and the store reopens with every entry. The second flush is the one observed:
 /// the first commits the groups' level, which renames `.new` files whatever the options.
+///
+/// The fragments are durable and the store does not flush in the background, so it schedules no
+/// delayed flush and the test's flushes are the only writes. A delayed flush writes through a
+/// renamed temporary file, and one that wakes before the second flush would replace the files that
+/// flush is to write.
 #[tokio::test]
 async fn a_flush_writes_bucket_files_in_place_only_with_fast_flush() {
     use lore_storage::immutable_store::ImmutableStore;
@@ -1269,10 +1274,15 @@ async fn a_flush_writes_bucket_files_in_place_only_with_fast_flush() {
             let root = dir.path().join("immutable").join("index");
             let mut addresses = Vec::new();
             {
-                let store =
-                    LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
-                        .await
-                        .expect("store opens");
+                let store = LocalImmutableStore::new(
+                    Some(dir.path().to_path_buf()),
+                    ImmutableStoreSettings {
+                        flush_background: false,
+                        ..client_settings()
+                    },
+                )
+                .await
+                .expect("store opens");
                 let dyn_store: Arc<dyn ImmutableStore> = store.clone();
                 let mut before = None;
                 // Enough fragments per batch that the second lands in groups the first wrote.
@@ -1280,7 +1290,7 @@ async fn a_flush_writes_bucket_files_in_place_only_with_fast_flush() {
                     for seed in seeds {
                         let (address, payload) = payload_off_bucket_zero(seed);
                         let fragment = Fragment {
-                            flags: 0,
+                            flags: FragmentFlags::PayloadStoredDurable.bits(),
                             size_payload: payload.len() as u32,
                             size_content: payload.len() as u64,
                         };
