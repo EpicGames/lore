@@ -127,6 +127,7 @@ use crate::fs::filesystem_provider::FilesystemDiffIntent;
 use crate::fs::filesystem_provider::FilesystemDiffTree;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::ListedEntry;
 use crate::hash;
 use crate::immutable;
 use crate::immutable::ImmutableError;
@@ -8620,6 +8621,10 @@ pub struct FilesystemDiffStats {
     /// `DiffWalkStats::finds_after_change` counts them. For tests.
     #[doc(hidden)]
     pub finds_after_change: AtomicU64,
+    /// One directory that cannot be listed, or file or name that cannot be read, which the walk
+    /// passed over, where it passed over any. A file that cannot be read compares as unmodified,
+    /// so this is all that tells a caller removing it that it may hold work.
+    pub unreadable: parking_lot::Mutex<Option<RelativePath>>,
 }
 
 impl FilesystemDiffStats {
@@ -8650,6 +8655,14 @@ impl FilesystemDiffStats {
             stats.finds_after_change.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+        if let Some(path) = stats.unreadable.into_inner() {
+            self.record_unreadable(path);
+        }
+    }
+
+    /// Record an entry the walk could not read, where it has recorded none yet.
+    pub(crate) fn record_unreadable(&self, path: RelativePath) {
+        self.unreadable.lock().get_or_insert(path);
     }
 
     /// Record what settled a file's comparison. A size mismatch counts as neither.
@@ -9043,19 +9056,40 @@ pub async fn diff_filesystem_subtree(
     intent: FilesystemDiffIntent,
     layer_mounts: Arc<Vec<LayerMountInfo>>,
 ) -> Result<ChangeStream<FilesystemDiffStats>, StateError> {
+    let link_mounts = collect_link_mounts(
+        &[
+            (&from.state, &from.repository, ROOT_NODE),
+            (&current.state, &current.repository, ROOT_NODE),
+        ],
+        &RelativePath::new(),
+    )
+    .await?;
+    Ok(diff_filesystem_with_mounts(
+        operation,
+        from,
+        current,
+        filesystem_path,
+        filter_mode,
+        intent,
+        layer_mounts,
+        link_mounts,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diff_filesystem_with_mounts(
+    operation: &Arc<InstanceOperationImpl>,
+    from: NodeMapping,
+    current: NodeMapping,
+    filesystem_path: RelativePath,
+    filter_mode: FilterMode,
+    intent: FilesystemDiffIntent,
+    layer_mounts: Arc<Vec<LayerMountInfo>>,
+    link_mounts: Vec<LinkMountInfo>,
+) -> ChangeStream<FilesystemDiffStats> {
     let filter_mode = walk_filter_mode(filter_mode, intent);
-    let link_mounts = Arc::new(
-        collect_link_mounts(
-            &[
-                (&from.state, &from.repository, ROOT_NODE),
-                (&current.state, &current.repository, ROOT_NODE),
-            ],
-            &RelativePath::new(),
-        )
-        .await?,
-    );
     let states = from.repository.filter.exclusion_states(&filesystem_path);
-    Ok(diff_with(
+    diff_with(
         operation,
         FilesystemDiffContext {
             operation: operation.clone(),
@@ -9068,10 +9102,151 @@ pub async fn diff_filesystem_subtree(
             filter_mode,
             intent,
             layer_mounts,
-            link_mounts,
+            link_mounts: Arc::new(link_mounts),
             discards: None,
         },
-    ))
+    )
+}
+
+/// How many of the files a refusal names before it counts the rest.
+const NAMED_LOCAL_WORK: usize = 3;
+
+/// What removing a link's mount would lose from the working tree: the content of the files the
+/// link tracks that differ from it. What the link does not track stays when the mount goes, as it
+/// does in a directory a sync deletes, so none of it counts.
+#[lore_macro::test_pub]
+#[derive(Debug, Default)]
+pub(crate) struct LinkMountWork {
+    /// The files that differ in path order, the first [`NAMED_LOCAL_WORK`] of them, or all where
+    /// the caller keeps them.
+    pub modified: Vec<RelativePath>,
+    /// How many files differ.
+    pub modified_count: usize,
+    /// An entry that cannot be read, or the mount itself where the linked revision cannot be
+    /// opened, so what it holds is unknown.
+    pub unknown: Option<RelativePath>,
+}
+
+impl LinkMountWork {
+    /// The modified files, the first [`NAMED_LOCAL_WORK`] by path and the rest by count.
+    pub(crate) fn named(&self) -> String {
+        let named = self
+            .modified
+            .iter()
+            .take(NAMED_LOCAL_WORK)
+            .map(RelativePath::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        match self.modified_count.saturating_sub(NAMED_LOCAL_WORK) {
+            0 => named,
+            rest => format!("{named} and {rest} more"),
+        }
+    }
+}
+
+/// What removing the mount at `mount` of the tree `linked` maps there would lose
+/// ([`LinkMountWork`]), naming every modified file where `names_all`, and sparing those `spares`
+/// answers for, which the removal keeps. `linked` is `None` where the link's revision cannot be
+/// opened.
+///
+/// A mount the working tree holds as a symbolic link loses nothing: the removal leaves it, rather
+/// than following it out of the tree.
+#[lore_macro::test_pub]
+pub(crate) async fn link_mount_work(
+    operation: &Arc<InstanceOperationImpl>,
+    linked: Option<(NodeID, crate::link::LinkedState)>,
+    mount: &RelativePath,
+    names_all: bool,
+    spares: impl Fn(&RelativePath) -> bool,
+) -> Result<LinkMountWork, StateError> {
+    let mut work = LinkMountWork::default();
+    if holds_untracked_kind(operation, mount).await {
+        return Ok(work);
+    }
+    let Some((node, (repository, state))) = linked else {
+        if holds_anything(operation, mount).await {
+            work.unknown = Some(mount.clone());
+        }
+        return Ok(work);
+    };
+    let link_mounts = collect_link_mounts(&[(&state, &repository, node)], mount).await?;
+    let mapping = NodeMapping {
+        repository,
+        state,
+        path: mount.clone(),
+        node,
+    };
+    let mut changes = diff_filesystem_with_mounts(
+        operation,
+        mapping.clone(),
+        mapping,
+        mount.clone(),
+        FilterMode::Full,
+        FilesystemDiffIntent::Report,
+        Arc::new(Vec::new()),
+        link_mounts,
+    );
+    while let Some(change) = changes.next().await {
+        // A merge conflict's file holds what the merge wrote there, or the resolution it staged,
+        // which the staged node marks rather than holds.
+        let modified = !matches!(change.action, FileAction::Add | FileAction::Delete)
+            && change.from.flags.contains(NodeFlags::File)
+            && !change.from.flags.contains(NodeFlags::StagedMergeConflict)
+            && !change.is_case_variant()
+            && !spares(change.path());
+        if modified {
+            work.modified_count += 1;
+            if names_all {
+                work.modified.push(change.path().clone());
+            } else {
+                // The diff yields the files in no path order, so only the first in that order are
+                // held, as few as the refusal names.
+                let at = work
+                    .modified
+                    .partition_point(|named| named.as_str() < change.path().as_str());
+                if at < NAMED_LOCAL_WORK {
+                    work.modified.insert(at, change.path().clone());
+                    work.modified.truncate(NAMED_LOCAL_WORK);
+                }
+            }
+        }
+    }
+    if names_all {
+        work.modified
+            .sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    }
+    work.unknown = changes.finish().await?.unreadable.into_inner();
+    Ok(work)
+}
+
+/// Whether the working tree holds anything at `path` but an empty directory: an incoming
+/// revision writing there could overwrite it.
+async fn holds_anything(operation: &InstanceOperationImpl, path: &RelativePath) -> bool {
+    match operation.read_directory(path).await {
+        Ok(mut listing) => listing.next_with_untracked().await.is_some(),
+        Err(_) => !matches!(operation.file_info(path).await, Ok(info) if !info.exists()),
+    }
+}
+
+/// Whether the working tree holds a symbolic link or a special file at `path`, which reading or
+/// removing what `path` holds would follow out of the tree. Read from the listing of the parent,
+/// which names a link as what it is.
+pub(crate) async fn holds_untracked_kind(
+    operation: &InstanceOperationImpl,
+    path: &RelativePath,
+) -> bool {
+    let Ok(mut listing) = operation.read_directory(&path.parent_path()).await else {
+        return false;
+    };
+    loop {
+        match listing.next_with_untracked().await {
+            None => return false,
+            Some(Ok(ListedEntry::Untracked(name))) if name.eq_ignore_ascii_case(path.name()) => {
+                return true;
+            }
+            Some(_) => {}
+        }
+    }
 }
 
 /// Hands one diff to `operation`, which answers with the walk behind a stream.

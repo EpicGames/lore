@@ -55,7 +55,8 @@ def test_link_remove_keeps_staged_local_edit(new_lore_repo):
 
 @pytest.mark.smoke
 def test_link_remove_keeps_untracked_file_under_mount(new_lore_repo):
-    """Unlinking deletes the mount wholesale, untracked files included."""
+    """Unlinking deletes the files the link tracks and keeps an untracked one,
+    as deleting a folder does, and says so."""
     link_path = "libs/shared"
     untracked_file = f"{link_path}/deep/scratch.txt"
     parent_repo, _link_repo = make_parent_with_link(
@@ -64,10 +65,12 @@ def test_link_remove_keeps_untracked_file_under_mount(new_lore_repo):
 
     parent_repo.write_files({untracked_file: "not tracked yet\n"})
 
-    with pytest.raises(LocalModificationsError):
-        parent_repo.link_remove(link_path)
+    output = parent_repo.link_remove(link_path)
 
-    assert parent_repo.file_exists(untracked_file)
+    assert f"Kept 1 untracked entry in link mount {link_path}" in output
+    assert not parent_repo.file_exists(f"{link_path}/deep/inner.txt")
+    with parent_repo.open_file(untracked_file) as f:
+        assert f.read() == "not tracked yet\n"
 
 
 @pytest.mark.smoke
@@ -163,13 +166,16 @@ def test_link_remove_ignores_changes_outside_the_mount(new_lore_repo):
 @pytest.mark.smoke
 def test_link_remove_keeps_ignored_file_under_mount(new_lore_repo):
     """Ignoring a file says it is not Lore's to track, not that it is worthless
-    - a key or a local config is exactly the sort of thing that gets ignored,
-    and removal takes the whole mount with it.
+    - a key or a local config is exactly the sort of thing that gets ignored.
+    Removal takes the link's content and the folders it leaves empty, keeps the
+    ignored file, and says so.
     """
     link_path = "libs/shared"
     ignored_file = f"{link_path}/deep/local.key"
     parent_repo, _link_repo = make_parent_with_link(
-        new_lore_repo, link_path, {"deep/inner.txt": "pinned content\n"}
+        new_lore_repo,
+        link_path,
+        {"deep/inner.txt": "pinned content\n", "other/file.txt": "pinned\n"},
     )
 
     with parent_repo.open_file(parent_repo.ignore_file(), "w+") as ignore_file:
@@ -177,12 +183,15 @@ def test_link_remove_keeps_ignored_file_under_mount(new_lore_repo):
     parent_repo.write_commit_push("Add ignore file", {"placeholder.txt": "x\n"})
     parent_repo.write_files({ignored_file: "secret\n"})
 
-    with pytest.raises(LocalModificationsError):
-        parent_repo.link_remove(link_path)
+    output = parent_repo.link_remove(link_path)
 
-    assert parent_repo.file_exists(ignored_file), (
-        "An ignored file must survive a refused remove"
+    assert f"Kept 1 ignored entry in link mount {link_path}" in output
+    assert not parent_repo.file_exists(f"{link_path}/deep/inner.txt")
+    assert not parent_repo.file_exists(f"{link_path}/other"), (
+        "A folder the removal leaves empty must go"
     )
+    with parent_repo.open_file(ignored_file) as f:
+        assert f.read() == "secret\n", "An ignored file must survive the remove"
 
 
 @pytest.mark.smoke

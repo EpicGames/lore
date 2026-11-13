@@ -197,6 +197,14 @@ pub struct DirectoryEntry {
     pub name_hash: u64,
 }
 
+/// One child of a directory listing that yields every child.
+pub enum ListedEntry {
+    /// A file or a directory.
+    Tracked(DirectoryEntry),
+    /// A symbolic link or a special file, which the repository cannot track, by its name.
+    Untracked(String),
+}
+
 /// Wraps every type a provider lists a directory with, so a listing dispatches statically for
 /// the same reason [`InstanceOperationImpl`] does.
 pub enum StaticDispatchDirectoryListing {
@@ -224,6 +232,16 @@ impl DirectoryListing {
             StaticDispatchDirectoryListing::Os(this) => this.next().await,
             #[cfg(target_os = "linux")]
             StaticDispatchDirectoryListing::Fuse(this) => this.next().await,
+        }
+    }
+
+    /// The next entry as [`next`](Self::next) answers it, a symbolic link and a special file
+    /// included. A name that could not be read is still left out.
+    pub async fn next_with_untracked(&mut self) -> Option<Result<ListedEntry, FsError>> {
+        match &mut self.dispatch {
+            StaticDispatchDirectoryListing::Os(this) => this.next_with_untracked().await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchDirectoryListing::Fuse(this) => this.next_with_untracked().await,
         }
     }
 }

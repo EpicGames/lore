@@ -252,7 +252,8 @@ async fn named_root(
             .await
     };
     let listed = match &listing {
-        crate::fs::os::PathListingResult::Directory { .. } => true,
+        crate::fs::os::PathListingResult::Directory { .. }
+        | crate::fs::os::PathListingResult::Unlistable => true,
         crate::fs::os::PathListingResult::File { .. } => false,
         crate::fs::os::PathListingResult::NotFound => {
             let node = held().await;
@@ -406,6 +407,21 @@ async fn diff_filesystem_subtree_impl(
             )
             .await
         }
+        crate::fs::os::PathListingResult::Unlistable => {
+            let path = ctx.filesystem_path.clone();
+            let stats = diff_filesystem_missing(
+                ctx.from,
+                ctx.filesystem_path,
+                ctx.states,
+                ctx.filter_mode,
+                ctx.intent,
+                changes,
+                &ctx.link_mounts,
+            )
+            .await?;
+            stats.record_unreadable(path);
+            Ok(stats)
+        }
     }
 }
 
@@ -471,6 +487,9 @@ async fn compare_single_file_against_state(
         )
         .await?;
         stats.classify(&modification);
+        if matches!(modification, FileModification::Unreadable) {
+            stats.record_unreadable(file_path.to_path());
+        }
 
         if modification.is_modified() {
             return Ok(SingleFileCompareResult::Modified);
@@ -1512,6 +1531,42 @@ async fn staged_entry(
     Ok(StagedEntry::Compare { insisted: insists })
 }
 
+/// Whether the walk passes over `entry` without comparing it, recording in `stats` an entry it
+/// cannot read that the filter keeps: what it holds is unknown, so a caller about to remove the
+/// directory has to hear of it.
+fn passes_over(
+    ctx: &FilesystemDiffContext,
+    entry: &std::io::Result<lore_io::DirEntry>,
+    stats: &FilesystemDiffStats,
+) -> bool {
+    let Ok(found) = entry else {
+        stats.record_unreadable(ctx.filesystem_path.clone());
+        return true;
+    };
+    match &found.metadata {
+        _ if found.is_symlink => return true,
+        Some(metadata) => return metadata.kind == lore_io::StatKind::Other,
+        None => {}
+    }
+    let Ok(name) = crate::fs::os::entry_name(found.file_name.clone()) else {
+        stats.record_unreadable(ctx.filesystem_path.clone());
+        return true;
+    };
+    if is_reserved_node_name(name.as_str()) {
+        return true;
+    }
+    let path = ctx.filesystem_path.join(name.as_str());
+    let (_, excluded) =
+        ctx.from
+            .repository
+            .filter
+            .child_excludes_tree(ctx.states, &path, false, ctx.filter_mode);
+    if !excluded {
+        stats.record_unreadable(path);
+    }
+    true
+}
+
 /// Match each filesystem item from `file_receiver` against `node_list` (the
 /// `from` state's children) and `current_node_list` (the `current` state's
 /// children), emitting changes through `changes`, marking matched entries in
@@ -1553,6 +1608,9 @@ async fn diff_filesystem_directory_walk(
         .filesystem_path
         .to_buf_with_capacity(RelativePath::COMPONENT_ROOM);
     while let Some(entry) = file_listing.next().await {
+        if passes_over(ctx, &entry, stats) {
+            continue;
+        }
         let Some(item) = crate::fs::os::file_list_item(entry)
             .forward::<StateError>("Unusable directory entry")?
         else {

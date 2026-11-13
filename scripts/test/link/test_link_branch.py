@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
+import os
 import re
+import shutil
+import sys
 
 import pytest
 from error_types import BranchDivergedError, LinkDivergedError, LocalChanges
@@ -1662,3 +1665,361 @@ def test_switching_off_a_link_keeps_a_local_edit_holding_the_folder_content(
 
     parent.branch_switch("main")
     _assert_holds_folder(parent)
+
+
+# ---------------------------------------------------------------------------
+# Leaving a link mount that holds local work.
+# ---------------------------------------------------------------------------
+
+_LOCAL_WORK = {
+    "vendor/linked.txt": "edited locally\n",
+    "vendor/untracked.txt": "never staged\n",
+}
+
+_LINKED = {"linked.txt": "linked\n", "sub/inner.txt": "inner\n"}
+
+
+def _link_on_feature_with_local_work(
+    new_lore_repo, local_work: dict[str, str] = _LOCAL_WORK
+) -> tuple[Lore, str]:
+    """Parent on `feature`, which links a repository holding `_LINKED` at
+    `vendor/`, with `local_work` written in the mount. `main` holds no link, and
+    `folder` holds a plain `vendor/` folder of other files. Returns the parent and
+    the revision `feature` branched from."""
+    parent = make_repo(new_lore_repo, {"root.txt": "root\n"})
+    source = make_repo(new_lore_repo, _LINKED)
+
+    parent.branch_create("folder")
+    parent.write_commit_push("Add a folder", {"vendor/other.txt": "other\n"})
+    parent.branch_switch("main")
+    branched_from = parent.branch_info().local_latest
+
+    parent.branch_create("feature")
+    parent.link_add("vendor", source.get_id(), "/")
+    parent.commit("Add a link")
+    parent.push()
+
+    parent.write_files(local_work)
+    return parent, branched_from
+
+
+def _assert_local_work_kept(parent: Lore) -> None:
+    for path, content in _LOCAL_WORK.items():
+        with parent.open_file(path, "r") as input_file:
+            assert input_file.read() == content, f"{path} must keep its local content"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("target", ["main", "folder"])
+def test_switching_off_a_link_refuses_to_delete_a_local_edit_in_the_mount(
+    new_lore_repo, target
+):
+    """Switching to a branch without the link is refused while a file the link
+    tracks holds a local edit, with and without `--dry-run`, naming the file and
+    leaving the mount and the branch untouched."""
+    parent, _branched_from = _link_on_feature_with_local_work(new_lore_repo)
+    head_before = parent.branch_info().local_latest
+
+    for dry_run in (True, False):
+        with pytest.raises(LocalChanges) as refused:
+            parent.branch_switch(target, dry_run=dry_run)
+        assert "vendor/linked.txt" in str(refused.value), (
+            "the refusal must name the edited file"
+        )
+        _assert_local_work_kept(parent)
+
+    assert parent.branch_info().local_latest == head_before, (
+        "a refused switch must leave the branch where it was"
+    )
+
+
+@pytest.mark.smoke
+def test_switching_off_a_link_with_force_discards_local_work_in_the_mount(
+    new_lore_repo,
+):
+    """`--force` takes the switch anyway and removes the mount."""
+    parent, _branched_from = _link_on_feature_with_local_work(new_lore_repo)
+
+    parent.branch_switch("main", force=True)
+
+    assert not parent.path_exists("vendor"), "the forced switch must remove the mount"
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="denying reads needs privileges on Windows",
+)
+@pytest.mark.parametrize(
+    ("kind", "path"),
+    [("unlistable", "vendor/sub"), ("unreadable", "vendor/linked.txt")],
+)
+def test_leaving_a_link_refuses_what_it_cannot_read(new_lore_repo, kind, path):
+    """A directory that cannot be listed or a file that cannot be read in the
+    mount may hide local work. The switch and `link remove` refuse before removing
+    anything, naming the path. The unreadable file holds an edit of the same size,
+    so the size alone does not tell."""
+    content = "LINKED\n" if kind == "unreadable" else "linked\n"
+    parent, _branched_from = _link_on_feature_with_local_work(
+        new_lore_repo, {"vendor/linked.txt": content} if kind == "unreadable" else {}
+    )
+    absolute = os.path.join(parent.path, path)
+    os.chmod(absolute, 0o000)
+    try:
+        for leave in (
+            lambda: parent.branch_switch("main"),
+            lambda: parent.link_remove("vendor"),
+        ):
+            with pytest.raises(LocalChanges) as refused:
+                leave()
+            assert path in str(refused.value), "the refusal must name the path"
+    finally:
+        os.chmod(absolute, 0o755 if kind == "unlistable" else 0o644)
+
+    assert parent.path_exists("vendor/sub/inner.txt"), "a refusal must remove nothing"
+    with parent.open_file("vendor/linked.txt", "r") as input_file:
+        assert input_file.read() == content, "the file must be kept as it was"
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="symbolic links need privileges on Windows",
+)
+def test_switching_off_a_link_keeps_a_symbolic_link_in_the_mount(new_lore_repo):
+    """A symbolic link in the mount is no file the link tracks: the switch removes
+    the link's content around it and keeps the symbolic link itself."""
+    parent, _branched_from = _link_on_feature_with_local_work(new_lore_repo, {})
+    os.symlink("sub", os.path.join(parent.path, "vendor", "alias"))
+
+    output = parent.branch_switch("main")
+
+    assert "Kept 1 untracked entry in link mount vendor" in output
+    assert os.path.islink(os.path.join(parent.path, "vendor", "alias"))
+    assert not parent.path_exists("vendor/linked.txt"), "the link's content must go"
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="symbolic links need privileges on Windows",
+)
+@pytest.mark.parametrize("leave", ["switch", "link remove"])
+def test_leaving_a_link_whose_mount_is_a_symbolic_link_follows_it_nowhere(
+    new_lore_repo, tmp_path, leave
+):
+    """A mount replaced by a symbolic link to a directory outside the repository
+    is kept as the link, and nothing in that directory is removed. A switch to the
+    folder, which would write through the link, is refused, though the directory
+    holds the folder's file with its content."""
+    parent, _branched_from = _link_on_feature_with_local_work(new_lore_repo, {})
+    mount = os.path.join(parent.path, "vendor")
+    outside = os.path.join(tmp_path, "vendor")
+    shutil.move(mount, outside)
+    with open(os.path.join(outside, "other.txt"), "w") as output_file:
+        output_file.write("other\n")
+    os.symlink(outside, mount)
+
+    with pytest.raises(LocalChanges) as refused:
+        parent.branch_switch("folder")
+    assert "vendor" in str(refused.value), "the refusal must name the mount"
+
+    if leave == "switch":
+        parent.branch_switch("main")
+    else:
+        parent.link_remove("vendor")
+
+    assert os.path.islink(mount), "the symbolic link must be kept"
+    assert sorted(os.listdir(outside)) == ["linked.txt", "other.txt", "sub"], (
+        "nothing outside the repository may be removed"
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("rule", "label"),
+    [(None, "untracked"), ("ignore", "ignored"), ("view", "view-excluded")],
+)
+def test_switching_off_a_link_keeps_what_it_does_not_track_in_the_mount(
+    new_lore_repo, rule, label
+):
+    """Switching to a branch without the link removes the files it tracks and the
+    folders they leave empty, and keeps an untracked file and what the ignore or
+    view rules exclude, as deleting a folder does, and says so."""
+    kept = "vendor/private/note.txt"
+    parent, _branched_from = _link_on_feature_with_local_work(
+        new_lore_repo, {kept: "local\n"}
+    )
+    if rule is not None:
+        rules = parent.ignore_file() if rule == "ignore" else f"{parent.dot_dir()}/view"
+        with parent.open_file(rules, "w+") as rules_file:
+            rules_file.write("/vendor/private\n")
+
+    output = parent.branch_switch("main")
+
+    assert f"Kept 1 {label} entry in link mount vendor" in output
+    assert not parent.path_exists("vendor/linked.txt"), "the link's content must go"
+    assert not parent.path_exists("vendor/sub"), "a folder left empty must go"
+    with parent.open_file(kept, "r") as input_file:
+        assert input_file.read() == "local\n", "the file must be kept"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "file",
+        pytest.param(
+            "symlink",
+            marks=pytest.mark.skipif(
+                sys.platform == "win32",
+                reason="symbolic links need privileges on Windows",
+            ),
+        ),
+    ],
+)
+def test_switching_off_a_link_refuses_an_ignored_file_in_the_way(new_lore_repo, kind):
+    """An ignored file or symbolic link the switch would keep in the mount refuses
+    the switch where the target branch writes a file at its path, naming it. A
+    write there would follow the link out of the mount."""
+    in_the_way = "vendor/other.txt"
+    parent, _branched_from = _link_on_feature_with_local_work(
+        new_lore_repo, {in_the_way: "ignored\n"} if kind == "file" else {}
+    )
+    if kind == "symlink":
+        os.symlink(
+            os.path.join(parent.path, "root.txt"), os.path.join(parent.path, in_the_way)
+        )
+    with parent.open_file(parent.ignore_file(), "w+") as rules_file:
+        rules_file.write("other.txt\n")
+
+    with pytest.raises(LocalChanges) as refused:
+        parent.branch_switch("folder")
+
+    assert in_the_way in str(refused.value), "the refusal must name the file"
+    with parent.open_file(in_the_way, "r") as input_file:
+        assert input_file.read() == ("ignored\n" if kind == "file" else "root\n")
+    with parent.open_file("root.txt", "r") as input_file:
+        assert input_file.read() == "root\n", "nothing may be written through the link"
+
+
+@pytest.mark.smoke
+def test_syncing_a_link_moved_to_another_repository_checks_the_mount(new_lore_repo):
+    """A link moved to another repository replaces the content of its mount: a
+    local edit in it is refused, and an untracked and an ignored file are kept."""
+    parent, _branched_from = _link_on_feature_with_local_work(new_lore_repo, {})
+    first = parent.branch_info().local_latest
+    other = make_repo(new_lore_repo, {"other.txt": "other\n"})
+    parent.link_remove("vendor")
+    parent.commit("Remove the link")
+    parent.link_add("vendor", other.get_id(), "/")
+    parent.commit("Link another repository")
+    parent.push()
+    parent.sync(first)
+
+    parent.write_files({"vendor/linked.txt": "edited locally\n"})
+    with pytest.raises(LocalChanges) as refused:
+        parent.sync()
+    assert "vendor/linked.txt" in str(refused.value), (
+        "the refusal must name the file"
+    )
+
+    with parent.open_file(parent.ignore_file(), "w+") as rules_file:
+        rules_file.write("*.key\n")
+    parent.write_files(
+        {
+            "vendor/linked.txt": "linked\n",
+            "vendor/local.key": "secret\n",
+            "vendor/untracked.txt": "never staged\n",
+        }
+    )
+    output = parent.sync()
+
+    assert "Kept 1 untracked and 1 ignored entries in link mount vendor" in output
+    assert parent.path_exists("vendor/other.txt"), (
+        "the other repository must be mounted"
+    )
+    assert not parent.path_exists("vendor/linked.txt"), "the old content must go"
+    for path, content in (
+        ("vendor/local.key", "secret\n"),
+        ("vendor/untracked.txt", "never staged\n"),
+    ):
+        with parent.open_file(path, "r") as input_file:
+            assert input_file.read() == content, f"{path} must be kept"
+
+
+@pytest.mark.smoke
+def test_syncing_off_a_link_with_forward_changes_keeps_only_the_local_work(
+    new_lore_repo,
+):
+    """`sync --forward-changes` to a revision without the link keeps the edited
+    and the untracked file, and removes the files the link tracks that hold no
+    local change."""
+    parent, branched_from = _link_on_feature_with_local_work(new_lore_repo)
+
+    parent.sync(branched_from, forward_changes=True)
+
+    _assert_local_work_kept(parent)
+    assert not parent.path_exists("vendor/sub"), "the unchanged content must go"
+
+
+@pytest.mark.smoke
+def test_syncing_off_a_link_holding_a_nested_link_checks_the_nested_mount(
+    new_lore_repo,
+):
+    """A clean mount holding a nested link is left without a refusal, and a local
+    edit inside the nested link is refused."""
+    parent, _b, _c, _b_mount, nested_mount = build_nested_link_repos_at(
+        new_lore_repo, "vendor", "nested"
+    )
+
+    parent.sync("@1")
+    assert not parent.path_exists("vendor"), "leaving the links must remove the mount"
+    parent.sync()
+
+    parent.write_files({f"{nested_mount}/c-data/inner.txt": "edited locally\n"})
+    with pytest.raises(LocalChanges):
+        parent.sync("@1")
+    with parent.open_file(f"{nested_mount}/c-data/inner.txt", "r") as input_file:
+        assert input_file.read() == "edited locally\n", "the local edit must be kept"
+
+
+@pytest.mark.smoke
+def test_merging_the_removal_of_a_link_refuses_a_local_edit_in_the_mount(
+    new_lore_repo,
+):
+    """A merge of a branch that removes the link is refused while a file the link
+    tracks holds a local edit, naming it and keeping it."""
+    parent, _branched_from = _link_on_feature_with_local_work(new_lore_repo, {})
+    parent.branch_create("unlinked")
+    parent.link_remove("vendor")
+    parent.commit("Remove the link")
+    parent.push()
+    parent.branch_switch("feature")
+    parent.write_files({"vendor/linked.txt": "edited locally\n"})
+
+    with pytest.raises(LocalChanges) as refused:
+        parent.branch_merge("unlinked")
+
+    assert "vendor/linked.txt" in str(refused.value), "the refusal must name the file"
+    with parent.open_file("vendor/linked.txt", "r") as input_file:
+        assert input_file.read() == "edited locally\n", "the local edit must be kept"
+
+
+@pytest.mark.smoke
+def test_syncing_a_dependency_set_off_a_link_refuses_a_local_edit_in_the_mount(
+    new_lore_repo,
+):
+    """A sync restricted to a file the folder holds below the link it replaces
+    removes the link, so a local edit to another file the link tracks refuses it."""
+    parent, _source = folder_replaced_by_a_link(new_lore_repo)
+    folder_revision = parent.branch_info("main").local_latest
+    parent.write_commit_push("Add to the link", {"shared/c.txt": "c in the link\n"})
+    parent.write_files({"shared/c.txt": "c edited locally\n"})
+
+    with pytest.raises(LocalChanges) as refused:
+        parent.sync(folder_revision, root_files=["shared/a.txt"])
+
+    assert "shared/c.txt" in str(refused.value), "the refusal must name the file"
+    with parent.open_file("shared/c.txt", "r") as input_file:
+        assert input_file.read() == "c edited locally\n", "the local edit must be kept"

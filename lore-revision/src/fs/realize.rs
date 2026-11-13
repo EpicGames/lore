@@ -26,12 +26,15 @@ use crate::dependency;
 use crate::errors::LocalModifications;
 use crate::errors::WriteRequired;
 use crate::event;
+use crate::filter::Filter;
 use crate::filter::FilterMode;
+use crate::filter::FilterStates;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
 use crate::fs::filesystem_provider::FsError;
 use crate::fs::filesystem_provider::HoldOptions;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::ListedEntry;
 use crate::fs::filesystem_provider::MeasuredNode;
 use crate::hash;
 use crate::immutable;
@@ -55,6 +58,7 @@ use crate::node::NodeLink;
 use crate::node::ROOT_NODE;
 use crate::progress::DEFAULT_WORK_CHANNEL_CAPACITY;
 use crate::repository::BASE_SUFFIX;
+use crate::repository::MERGE_ARTIFACT_SUFFIXES;
 use crate::repository::MINE_SUFFIX;
 use crate::repository::RepositoryContext;
 use crate::repository::THEIRS_SUFFIX;
@@ -425,17 +429,8 @@ pub fn verify_filesystem_for_changes(
         if let Some(err) = failure {
             return Err(err);
         }
-        if args.carries_modes
-            && verdicts
-                .iter()
-                .any(|(verdict, _)| *verdict == Verdict::CarryMode)
-        {
-            let carried: crate::BoxFuture<'_, Result<(), SyncError>> =
-                Box::pin(carry_held_modes(&args.operation, &args.changes, &verdicts));
-            carried.await?;
-        }
 
-        let kept = args
+        let mut kept: Vec<RelativePath> = args
             .changes
             .iter()
             .zip(&verdicts)
@@ -446,6 +441,19 @@ pub fn verify_filesystem_for_changes(
             })
             .map(|(change, _)| change.path().clone())
             .collect();
+        // Before any executable bit is carried, so a refusal leaves the working tree untouched.
+        let forwarded = verify_mounts(&args, &incoming, &mut verdicts, &kept).await?;
+        kept.extend(forwarded);
+
+        if args.carries_modes
+            && verdicts
+                .iter()
+                .any(|(verdict, _)| *verdict == Verdict::CarryMode)
+        {
+            let carried: crate::BoxFuture<'_, Result<(), SyncError>> =
+                Box::pin(carry_held_modes(&args.operation, &args.changes, &verdicts));
+            carried.await?;
+        }
 
         // `incoming` holds a reference to the list; with it dropped, the list is taken back without
         // a copy where this holds the only reference to it, which a caller that moves its list in
@@ -822,6 +830,785 @@ async fn moved_file_holds_local_work(
     }
 }
 
+/// The tree a link's mount shows, with the context and state holding it.
+pub(crate) type MountedTree = (NodeID, crate::link::LinkedState);
+
+/// The tree the link node `node` mounts, opened in the revision it pins from `repository`, the
+/// context holding the node, or `None` where that revision cannot be opened.
+pub(crate) async fn open_mounted_tree(
+    repository: &Arc<RepositoryContext>,
+    node: &Node,
+) -> Option<MountedTree> {
+    let link = node.linked_node();
+    match link.open(repository).await {
+        Ok(linked) => Some((link.node, linked)),
+        Err(err) => {
+            lore_debug!(
+                "Unable to open revision {} a link pins: {err}",
+                link.revision
+            );
+            None
+        }
+    }
+}
+
+/// Whether `change` takes away the content of a link's mount: it deletes the link, or moves it to
+/// another repository, whose content shares nothing with what the mount shows.
+pub(crate) fn replaces_mount(change: &NodeChange) -> bool {
+    change.from.is_link()
+        && (change.action == change::FileAction::Delete
+            || (change.to.is_link() && change.from.address.context != change.to.address.context))
+}
+
+/// The tree the working tree shows at the mount of the link `change` deletes or moves: that of the
+/// link the change starts from, or for a merge, whose changes start from its base, that of the
+/// link `merge_current` holds at the mount. Where `merge_staged`, the staged state of the merge
+/// the merge resumes, holds a link there, its pin stands instead: it names the link's staged
+/// state, which holds what an earlier pass merged and resolved in the mount. `None` where the tree
+/// the working tree stands on holds no link there, `Some(None)` where the link's revision cannot
+/// be opened.
+async fn mount_shown(
+    change: &NodeChange,
+    merge_current: Option<&NodeMapping>,
+    merge_staged: Option<&NodeMapping>,
+) -> Result<Option<Option<MountedTree>>, SyncError> {
+    let (repository, node) = match merge_current {
+        None => (
+            change.from.mapping.repository.clone(),
+            change
+                .from
+                .get_node()
+                .await
+                .forward::<SyncError>("Failed loading the link node")?,
+        ),
+        Some(current) => {
+            let staged = match merge_staged {
+                Some(staged) => link_held_at(staged, change.path()).await?,
+                None => None,
+            };
+            match staged {
+                Some(held) => held,
+                None => match link_held_at(current, change.path()).await? {
+                    Some(held) => held,
+                    None => return Ok(None),
+                },
+            }
+        }
+    };
+    if !node.is_link() {
+        return Ok(None);
+    }
+    Ok(Some(open_mounted_tree(&repository, &node).await))
+}
+
+/// The link node `mapping` holds at `path`, with the repository holding it, or `None` where it
+/// holds no link there.
+async fn link_held_at(
+    mapping: &NodeMapping,
+    path: &RelativePath,
+) -> Result<Option<(Arc<RepositoryContext>, Node)>, SyncError> {
+    let Some((found, (repository, state))) = held_at(mapping, path).await else {
+        return Ok(None);
+    };
+    let node = state
+        .node(repository.clone(), found)
+        .await
+        .forward::<SyncError>("Failed loading the link node the working tree stands on")?;
+    Ok(node.is_link().then_some((repository, node)))
+}
+
+/// What a sync does with the mount of a link it deletes or moves, once [`verify_mount`] has found
+/// it may.
+enum MountVerdict {
+    /// Remove the mount but what the link does not track.
+    Remove,
+    /// Remove it, keeping too the files the link tracks that hold local changes, which the sync
+    /// forwards.
+    KeepModified(Vec<RelativePath>),
+    /// Leave the mount as it is: the sync forwards local changes past a link moved to another
+    /// repository, whose content would land over them.
+    KeepMount,
+}
+
+/// Checks the mount of the link `change` deletes or moves, which `shown` maps, for what removing
+/// it would lose ([`state::link_mount_work`]), sparing the files `held` names, lowercase and
+/// sorted, which the removal keeps.
+///
+/// A file the link tracks that holds local changes refuses the sync, or is kept where the sync
+/// forwards changes. An entry that cannot be read refuses it either way, since what it holds is
+/// unknown, and so does an entry the removal keeps where `incoming` writes.
+#[allow(clippy::too_many_arguments)]
+async fn verify_mount(
+    change: &NodeChange,
+    shown: Option<MountedTree>,
+    operation: &Arc<InstanceOperationImpl>,
+    filter: &Filter,
+    root: Option<&Path>,
+    held: &[&str],
+    incoming: &IncomingWrites<'_>,
+    forward_changes: bool,
+) -> Result<MountVerdict, SyncError> {
+    let mount = change.path();
+    let work = state::link_mount_work(operation, shown.clone(), mount, forward_changes, |path| {
+        held.binary_search(&path.as_lowercase_str()).is_ok()
+    })
+    .await
+    .forward::<SyncError>("Failed comparing the link mount with the file system")?;
+    if let Some(path) = &work.unknown {
+        lore_error!("Link mount {mount} holds what cannot be read: {path}");
+        lore_error!("Make it readable, or use --force to discard it");
+        return Err(LocalModifications.into());
+    }
+    let verdict = if work.modified_count == 0 {
+        MountVerdict::Remove
+    } else if !forward_changes {
+        lore_error!("Link mount {mount} has local changes: {}", work.named());
+        // A switch or merge reaches this as a sync does, with no --forward-changes to offer.
+        lore_error!("Commit or reset them, or use --force to discard them");
+        return Err(LocalModifications.into());
+    } else if change.action == change::FileAction::Delete {
+        lore_info!(
+            "Keeping local changes in link mount {mount}: {}",
+            work.named()
+        );
+        MountVerdict::KeepModified(work.modified)
+    } else {
+        lore_info!(
+            "Keeping link mount {mount} holding local changes: {}",
+            work.named()
+        );
+        return Ok(MountVerdict::KeepMount);
+    };
+    if let Some(shown) = shown {
+        refuse_kept_entries_in_the_way(operation, filter, root, mount, shown, held, incoming)
+            .await?;
+    }
+    Ok(verdict)
+}
+
+/// What the incoming revision writes at a mount the change set takes away, for
+/// [`verify_mount`]: the other changes of a change set, or the tree a link moved to another
+/// repository mounts there.
+async fn incoming_writes<'a>(
+    change: &NodeChange,
+    incoming: &'a IncomingChanges,
+) -> Result<IncomingWrites<'a>, SyncError> {
+    if change.action == change::FileAction::Delete {
+        return Ok(IncomingWrites::Changes(incoming));
+    }
+    let node = change
+        .to
+        .get_node()
+        .await
+        .forward::<SyncError>("Failed loading the incoming link node")?;
+    let Some((node, (repository, state))) =
+        open_mounted_tree(&change.to.mapping.repository, &node).await
+    else {
+        return Err(SyncError::internal(format!(
+            "Failed to open the revision the link at {} moves to",
+            change.path()
+        )));
+    };
+    Ok(IncomingWrites::Tree(NodeMapping {
+        repository,
+        state,
+        path: change.path().clone(),
+        node,
+    }))
+}
+
+/// Checks the mount of each link `args` deletes or moves whose verdict is to realize it, as
+/// [`verify_mount`] does, sparing the files `kept` names, and answers the files to keep beyond
+/// them. A move past whose local changes the sync forwards is dropped from `verdicts`.
+///
+/// Runs once every change has been verified, since the files kept are known only then.
+async fn verify_mounts(
+    args: &SyncVerifyArgs,
+    incoming: &IncomingChanges,
+    verdicts: &mut [(Verdict, change::Flags)],
+    kept: &[RelativePath],
+) -> Result<Vec<RelativePath>, SyncError> {
+    let mut forwarded = Vec::new();
+    let mut held: Option<Vec<&str>> = None;
+    for (index, change) in args.changes.iter().enumerate() {
+        if verdicts[index].0 != Verdict::Realize || !replaces_mount(change) {
+            continue;
+        }
+        let Some(shown) = mount_shown(change, None, None).await? else {
+            continue;
+        };
+        let held = held.get_or_insert_with(|| folded_and_sorted(kept));
+        let writes = incoming_writes(change, incoming).await?;
+        match verify_mount(
+            change,
+            shown,
+            &args.operation,
+            &change.from.mapping.repository.filter,
+            args.repository_current.path(),
+            held,
+            &writes,
+            args.options.forward_changes,
+        )
+        .await?
+        {
+            MountVerdict::Remove => {}
+            MountVerdict::KeepModified(paths) => forwarded.extend(paths),
+            MountVerdict::KeepMount => verdicts[index].0 = Verdict::Drop,
+        }
+    }
+    Ok(forwarded)
+}
+
+/// Checks the mount of each link of `replacing` that a merge deletes or moves, as
+/// [`verify_mount`] does against the link `current` holds there, or `staged`, the staged state of
+/// the merge it resumes, where that holds one ([`mount_shown`]), the merge forwarding nothing.
+pub(crate) async fn verify_merge_mounts(
+    operation: &Arc<InstanceOperationImpl>,
+    current: &NodeMapping,
+    staged: Option<&NodeMapping>,
+    replacing: &[NodeChange],
+    incoming: &IncomingChanges,
+) -> Result<(), SyncError> {
+    for change in replacing {
+        let Some(shown) = mount_shown(change, Some(current), staged).await? else {
+            continue;
+        };
+        let writes = incoming_writes(change, incoming).await?;
+        verify_mount(
+            change,
+            shown,
+            operation,
+            &current.repository.filter,
+            current.repository.path(),
+            &[],
+            &writes,
+            false,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// `paths` lowercase and sorted, for a binary search by case-folded path.
+fn folded_and_sorted(paths: &[RelativePath]) -> Vec<&str> {
+    let mut folded: Vec<&str> = paths.iter().map(RelativePath::as_lowercase_str).collect();
+    folded.sort_unstable();
+    folded
+}
+
+/// Why removing a link's mount leaves an entry in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeptKind {
+    /// The link does not track it, or tracks another kind of node there.
+    Untracked,
+    /// The link does not track it, and the ignore rules exclude it.
+    Ignored,
+    /// The view excludes it.
+    ViewExcluded,
+    /// It cannot be read, or the link it stands for cannot be opened.
+    Unreadable,
+    /// The mount itself is a symbolic link or a special file, which the removal does not follow.
+    Unfollowed,
+    /// The change set leaves it there ([`VerifiedChanges::kept`]).
+    Held,
+}
+
+impl KeptKind {
+    /// What the link does not track at a path the filter answers `states` for.
+    fn untracked(states: FilterStates) -> Self {
+        if states.excluded(FilterMode::Ignore) {
+            KeptKind::Ignored
+        } else {
+            KeptKind::Untracked
+        }
+    }
+
+    /// The kind as a refusal names it.
+    fn describe(self) -> &'static str {
+        match self {
+            KeptKind::Untracked => "Untracked",
+            KeptKind::Ignored => "Ignored",
+            KeptKind::ViewExcluded => "View-excluded",
+            KeptKind::Unreadable => "Unreadable",
+            KeptKind::Unfollowed => "Symbolic link or special file",
+            KeptKind::Held => "Kept",
+        }
+    }
+}
+
+/// An entry removing a link's mount leaves in place with all it holds.
+struct KeptEntry {
+    path: RelativePath,
+    is_directory: bool,
+    kind: KeptKind,
+}
+
+impl KeptEntry {
+    /// What the entry is where it is the mount itself ([`MountWalk::new`]), as a refusal names it.
+    fn describe_mount(&self) -> &'static str {
+        match (self.kind, self.is_directory) {
+            (KeptKind::Unfollowed, _) => "a symbolic link or special file",
+            (KeptKind::Unreadable, _) => "a directory that cannot be read",
+            (_, true) => "a nested repository",
+            (_, false) => "a file",
+        }
+    }
+}
+
+/// What the incoming revision writes at and around a link's mount.
+enum IncomingWrites<'a> {
+    /// The changes of a change set, of which those the view keeps write.
+    Changes(&'a IncomingChanges),
+    /// The tree a link mounts there.
+    Tree(NodeMapping),
+}
+
+impl IncomingWrites<'_> {
+    /// Whether the incoming revision writes a node that `kept` stands in the way of
+    /// ([`meets_kept_entry`]).
+    async fn meet(&self, kept: &KeptEntry, filter: &Filter) -> Result<bool, SyncError> {
+        match self {
+            IncomingWrites::Changes(incoming) => Ok(incoming.writes_meet(kept, filter)),
+            IncomingWrites::Tree(incoming) => incoming_tree_meets(incoming, filter, kept).await,
+        }
+    }
+
+    /// Whether the incoming revision may write anything at, below or above `mount`.
+    fn near(&self, mount: &RelativePath) -> bool {
+        match self {
+            IncomingWrites::Changes(incoming) => incoming.writes_near(mount),
+            IncomingWrites::Tree(_) => true,
+        }
+    }
+}
+
+/// Whether a node written at `path` meets `kept`: at its path where either is not a directory,
+/// at a directory above it as anything else, and below it where it is not a directory.
+fn meets_kept_entry(kept: &KeptEntry, path: &RelativePath, is_directory: bool) -> bool {
+    if path.as_lowercase_str() == kept.path.as_lowercase_str() {
+        return !(kept.is_directory && is_directory);
+    }
+    if path.covers_ignore_case(&kept.path) {
+        return !is_directory;
+    }
+    kept.path.covers_ignore_case(path) && !kept.is_directory
+}
+
+/// Whether the tree `incoming` maps at a mount writes a node that meets `kept`
+/// ([`meets_kept_entry`]): the node at its path, or the nearest above it.
+async fn incoming_tree_meets(
+    incoming: &NodeMapping,
+    filter: &Filter,
+    kept: &KeptEntry,
+) -> Result<bool, SyncError> {
+    let mut path = kept.path.clone();
+    while path.as_str() != incoming.path.as_str() && incoming.path.covers(&path) {
+        let found = incoming.node_at(&path).await;
+        if found.node.is_valid_node_id() {
+            let (repository, state) = found
+                .resolve(incoming.repository.clone(), incoming.state.clone())
+                .await
+                .forward_with::<SyncError, _>(|| {
+                    format!("Failed to deserialize state {}", found.revision)
+                })?;
+            let is_directory = state
+                .node(repository, found.node)
+                .await
+                .forward::<SyncError>("Failed loading the incoming node")?
+                .is_directory();
+            return Ok(!filter.excludes(&path, is_directory, FilterMode::View)
+                && meets_kept_entry(kept, &path, is_directory));
+        }
+        path = path.parent_path();
+    }
+    Ok(false)
+}
+
+/// Refuses removing the mount at `mount` of the tree `shown` maps there where an entry the
+/// removal leaves in place stands where `incoming` writes. A file `held` names is the incoming
+/// revision's own.
+async fn refuse_kept_entries_in_the_way(
+    operation: &InstanceOperationImpl,
+    filter: &Filter,
+    root: Option<&Path>,
+    mount: &RelativePath,
+    shown: MountedTree,
+    held: &[&str],
+    incoming: &IncomingWrites<'_>,
+) -> Result<(), SyncError> {
+    if !incoming.near(mount) {
+        return Ok(());
+    }
+    let mut walk = MountWalk::new(operation, filter, root, mount, shown, held).await?;
+    loop {
+        let Some(entry) = walk.next().await else {
+            break;
+        };
+        let MountEntry::Kept(kept) = entry? else {
+            continue;
+        };
+        if kept.kind != KeptKind::Held && incoming.meet(&kept, filter).await? {
+            if kept.path.as_str() == mount.as_str() {
+                lore_error!(
+                    "Link mount {mount} is {} in the way of the incoming revision",
+                    kept.describe_mount()
+                );
+            } else {
+                lore_error!(
+                    "{} {} in link mount {mount} is in the way of the incoming revision",
+                    kept.kind.describe(),
+                    kept.path
+                );
+            }
+            lore_error!("Move it out of the way, or use --force to discard it");
+            return Err(LocalModifications.into());
+        }
+    }
+    Ok(())
+}
+
+/// What a walk of a link's mount finds ([`MountWalk`]).
+enum MountEntry {
+    /// A file the link tracks, or a copy a conflicted merge left beside one, which removing the
+    /// mount removes.
+    Tracked(RelativePath),
+    /// An entry removing the mount leaves in place with all it holds.
+    Kept(KeptEntry),
+    /// A directory the link tracks whose entries the walk has all yielded, none of them kept,
+    /// which removing the mount removes once they are gone.
+    Left(RelativePath),
+}
+
+/// A directory a [`MountWalk`] is listing, with the node the link's tree holds there.
+struct MountFrame {
+    directory: RelativePath,
+    listing: crate::fs::filesystem_provider::DirectoryListing,
+    node: NodeID,
+    tree: crate::link::LinkedState,
+    states: FilterStates,
+    /// Whether the change set leaves the directory there.
+    held: bool,
+    /// Whether no entry yielded below the directory is kept.
+    emptied: bool,
+}
+
+/// A walk of the working tree under a link's mount against the tree the link mounts there, which
+/// tells what the link tracks from what it does not, as removing the mount does.
+///
+/// An entry the link does not track, or tracks as another kind of node, is kept with all it holds,
+/// as is a symbolic link or a special file, a nested repository, and an entry the view excludes,
+/// that cannot be read, or that the change set leaves there. A copy a conflicted merge left beside
+/// a file the link holds as a merge conflict goes with that file ([`is_conflict_artifact`]). A
+/// directory the link tracks is walked. Each entry is weighed as its directory's listing yields
+/// it, so the walk holds one listing per level of the directories it walks.
+struct MountWalk<'a> {
+    operation: &'a InstanceOperationImpl,
+    filter: &'a Filter,
+    root: Option<&'a Path>,
+    held: &'a [&'a str],
+    frames: Vec<MountFrame>,
+    /// The mount itself where it is no directory to walk.
+    kept_mount: Option<KeptEntry>,
+}
+
+impl<'a> MountWalk<'a> {
+    /// A walk of the mount at `mount`, which `shown` maps. `held` names the files and directories
+    /// the change set leaves there, lowercase and sorted, and `root` is the working tree's, to tell
+    /// a nested repository by.
+    async fn new(
+        operation: &'a InstanceOperationImpl,
+        filter: &'a Filter,
+        root: Option<&'a Path>,
+        mount: &RelativePath,
+        shown: MountedTree,
+        held: &'a [&'a str],
+    ) -> Result<Self, SyncError> {
+        let mut walk = Self {
+            operation,
+            filter,
+            root,
+            held,
+            frames: Vec::new(),
+            kept_mount: None,
+        };
+        let kept = |is_directory, kind| {
+            Some(KeptEntry {
+                path: mount.clone(),
+                is_directory,
+                kind,
+            })
+        };
+        if state::holds_untracked_kind(operation, mount).await {
+            walk.kept_mount = kept(false, KeptKind::Unfollowed);
+            return Ok(walk);
+        }
+        let info = operation.file_info(mount).await?;
+        if !info.exists() {
+            return Ok(walk);
+        }
+        if !info.is_dir() || is_nested_repository(root, mount).await {
+            walk.kept_mount = kept(info.is_dir(), KeptKind::Untracked);
+            return Ok(walk);
+        }
+        let (node, tree) = shown;
+        match operation.read_directory(mount).await {
+            Ok(listing) => walk.frames.push(MountFrame {
+                directory: mount.clone(),
+                listing,
+                node,
+                tree,
+                states: filter.mount_states(mount),
+                held: false,
+                emptied: true,
+            }),
+            Err(_) => walk.kept_mount = kept(true, KeptKind::Unreadable),
+        }
+        Ok(walk)
+    }
+
+    /// The next entry, a directory left once its entries are, or `None` once the walk is done.
+    async fn next(&mut self) -> Option<Result<MountEntry, SyncError>> {
+        if let Some(kept) = self.kept_mount.take() {
+            return Some(Ok(MountEntry::Kept(kept)));
+        }
+        loop {
+            let frame = self.frames.last_mut()?;
+            let Some(listed) = frame.listing.next_with_untracked().await else {
+                let frame = self.frames.pop()?;
+                if frame.emptied && !frame.held {
+                    return Some(Ok(MountEntry::Left(frame.directory)));
+                }
+                self.keep_last();
+                continue;
+            };
+            match self.weigh(listed).await {
+                Ok(Some(entry)) => {
+                    if !matches!(entry, MountEntry::Tracked(_)) {
+                        self.keep_last();
+                    }
+                    return Some(Ok(entry));
+                }
+                Ok(None) => {}
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
+
+    /// Marks the directory being listed as keeping an entry, which its removal then keeps too.
+    fn keep_last(&mut self) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.emptied = false;
+        }
+    }
+
+    /// What the listed entry is to removing the mount, or `None` where it is a directory the walk
+    /// now lists.
+    async fn weigh(
+        &mut self,
+        listed: Result<ListedEntry, FsError>,
+    ) -> Result<Option<MountEntry>, SyncError> {
+        let (name, is_directory, trackable) = match listed? {
+            ListedEntry::Tracked(entry) => (entry.name, entry.info.is_dir(), true),
+            ListedEntry::Untracked(name) => (name, false, false),
+        };
+        let Some(frame) = self.frames.last() else {
+            return Ok(None);
+        };
+        let path = frame.directory.join(name.as_str());
+        let (parent, (repository, state)) = (frame.node, frame.tree.clone());
+        let (states, _) =
+            self.filter
+                .child_excludes_tree(frame.states, &path, is_directory, FilterMode::Full);
+        let kept = |path: RelativePath, kind| -> Result<Option<MountEntry>, SyncError> {
+            Ok(Some(MountEntry::Kept(KeptEntry {
+                path,
+                is_directory,
+                kind,
+            })))
+        };
+        let held = self.held.binary_search(&path.as_lowercase_str()).is_ok();
+        if held && !is_directory {
+            return kept(path, KeptKind::Held);
+        }
+        if !trackable || crate::repository::is_reserved_node_name(name.as_str()) {
+            return kept(path, KeptKind::untracked(states));
+        }
+        if states.excluded(FilterMode::View) {
+            return kept(path, KeptKind::ViewExcluded);
+        }
+        let child = match state
+            .find_subnode(repository.clone(), parent, hash::hash_string(name.as_str()))
+            .await
+        {
+            Ok(child) => child,
+            Err(err) if err.is_node_not_found() => {
+                if !is_directory && is_conflict_artifact(&frame.tree, parent, name.as_str()).await {
+                    return Ok(Some(MountEntry::Tracked(path)));
+                }
+                return kept(path, KeptKind::untracked(states));
+            }
+            Err(err) => {
+                return Err(err)
+                    .forward::<SyncError>("Failed looking up an entry in a link's tree");
+            }
+        };
+        let node = state
+            .node(repository.clone(), child)
+            .await
+            .forward::<SyncError>("Failed loading a node a link tracks")?;
+        if node.is_file() {
+            if is_directory {
+                return kept(path, KeptKind::untracked(states));
+            }
+            return Ok(Some(MountEntry::Tracked(path)));
+        }
+        if !is_directory || is_nested_repository(self.root, &path).await {
+            return kept(path, KeptKind::untracked(states));
+        }
+        let (node, tree) = if node.is_link() {
+            let Some(nested) = open_mounted_tree(&repository, &node).await else {
+                return kept(path, KeptKind::Unreadable);
+            };
+            nested
+        } else {
+            (child, (repository, state))
+        };
+        let Ok(listing) = self.operation.read_directory(&path).await else {
+            return kept(path, KeptKind::Unreadable);
+        };
+        self.frames.push(MountFrame {
+            directory: path,
+            listing,
+            node,
+            tree,
+            states,
+            held,
+            emptied: true,
+        });
+        Ok(None)
+    }
+}
+
+/// Whether `name` is a copy a conflicted merge left beside a file `tree` holds in `parent` as a
+/// merge conflict: it belongs to the merge, as the conflicted file does, and goes with it.
+async fn is_conflict_artifact(tree: &crate::link::LinkedState, parent: NodeID, name: &str) -> bool {
+    let Some(conflicted) = MERGE_ARTIFACT_SUFFIXES
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+    else {
+        return false;
+    };
+    let (repository, state) = tree;
+    let Ok(child) = state
+        .find_subnode(repository.clone(), parent, hash::hash_string(conflicted))
+        .await
+    else {
+        return false;
+    };
+    state
+        .node(repository.clone(), child)
+        .await
+        .is_ok_and(|node| node.is_file() && node.is_staged_merge_conflict())
+}
+
+/// Whether the directory at `path` is the root of a repository of its own, which the working tree
+/// below `root` holds. Without a root on disk there is none.
+async fn is_nested_repository(root: Option<&Path>, path: &RelativePath) -> bool {
+    let Some(mut parent) = root.and_then(|root| path.parent_path().to_absolute_path(root).ok())
+    else {
+        return false;
+    };
+    state::is_nested_repository_root(&mut parent, path.name()).await
+}
+
+/// What removing a link's mount left in place, counted by why.
+#[derive(Default)]
+pub(crate) struct KeptEntries {
+    untracked: usize,
+    ignored: usize,
+    view_excluded: usize,
+    unreadable: usize,
+}
+
+impl KeptEntries {
+    fn count(&mut self, kind: KeptKind) {
+        match kind {
+            KeptKind::Untracked | KeptKind::Unfollowed => self.untracked += 1,
+            KeptKind::Ignored => self.ignored += 1,
+            KeptKind::ViewExcluded => self.view_excluded += 1,
+            KeptKind::Unreadable => self.unreadable += 1,
+            KeptKind::Held => {}
+        }
+    }
+
+    /// Tells the user what stayed in `mount`, where anything did.
+    pub(crate) fn report(&self, mount: &RelativePath) {
+        let counts = [
+            (self.untracked, "untracked"),
+            (self.ignored, "ignored"),
+            (self.view_excluded, "view-excluded"),
+            (self.unreadable, "unreadable"),
+        ];
+        let parts: Vec<String> = counts
+            .iter()
+            .filter(|(count, _)| *count > 0)
+            .map(|(count, kind)| format!("{count} {kind}"))
+            .collect();
+        let Some((last, rest)) = parts.split_last() else {
+            return;
+        };
+        let listed = if rest.is_empty() {
+            last.clone()
+        } else {
+            format!("{} and {last}", rest.join(", "))
+        };
+        let total: usize = counts.iter().map(|(count, _)| count).sum();
+        let entries = if total == 1 { "entry" } else { "entries" };
+        lore_warn!("Kept {listed} {entries} in link mount {mount}");
+    }
+}
+
+/// Removes the mount at `mount` of the tree `shown` maps there but for what the link does not
+/// track ([`MountWalk`]), which stays with the directories leading to it, and the files `held`
+/// names, lowercase and sorted, and answers what stayed. A forced removal takes everything. Where
+/// `shown` is `None`, the link's revision cannot be opened, so only an empty mount goes.
+///
+/// `root` is the working tree's, to tell a nested repository by.
+pub(crate) async fn remove_link_mount(
+    operation: &InstanceOperationImpl,
+    filter: &Filter,
+    root: Option<&Path>,
+    mount: &RelativePath,
+    shown: Option<MountedTree>,
+    held: &[&str],
+) -> Result<KeptEntries, SyncError> {
+    let mut kept = KeptEntries::default();
+    if execution_context().globals().force() {
+        operation.remove_recursive(mount).await?;
+        return Ok(kept);
+    }
+    let Some(shown) = shown else {
+        let _ = operation.remove_empty_directory(mount).await;
+        return Ok(kept);
+    };
+    let mut walk = MountWalk::new(operation, filter, root, mount, shown, held).await?;
+    loop {
+        let Some(entry) = walk.next().await else {
+            break;
+        };
+        match entry? {
+            MountEntry::Tracked(path) => operation.remove(&path).await?,
+            MountEntry::Kept(entry) => kept.count(entry.kind),
+            MountEntry::Left(directory) => {
+                if operation.remove_empty_directory(&directory).await.is_err() {
+                    walk.keep_last();
+                }
+            }
+        }
+    }
+    Ok(kept)
+}
+
 /// Carries the executable bit `wanted` names onto `path`, which is all a change whose content
 /// the working tree already holds has left to apply.
 ///
@@ -884,11 +1671,12 @@ async fn mode_is_the_working_tree_own(
     })
 }
 
-/// The moves and link deletes of a change set, looked up by path.
+/// The moves, link deletes and writes of a change set, looked up by path.
 pub struct IncomingChanges {
     changes: Arc<Vec<NodeChange>>,
     by_source: OnceLock<Vec<usize>>,
     deleted_links: OnceLock<Vec<DeletedLink>>,
+    writes: OnceLock<Vec<usize>>,
 }
 
 /// A link delete of a change set, and the tree it mounts, opened once for every path below it.
@@ -904,12 +1692,102 @@ impl IncomingChanges {
             changes,
             by_source: OnceLock::new(),
             deleted_links: OnceLock::new(),
+            writes: OnceLock::new(),
         }
+    }
+
+    /// The changes writing a node, those deleting none, sorted by their case-folded path.
+    fn writes(&self) -> &[usize] {
+        let changes = &self.changes;
+        self.writes.get_or_init(|| {
+            let mut writes: Vec<usize> = (0..changes.len())
+                .filter(|&index| changes[index].action != change::FileAction::Delete)
+                .collect();
+            writes.sort_unstable_by(|&a, &b| {
+                changes[a]
+                    .path()
+                    .as_lowercase_str()
+                    .cmp(changes[b].path().as_lowercase_str())
+            });
+            writes
+        })
+    }
+
+    /// The changes writing a node at `folded`, a case-folded path, one for each spelling there.
+    fn writes_at<'s>(&'s self, folded: &'s str) -> impl Iterator<Item = &'s NodeChange> + 's {
+        let writes = self.writes();
+        let first =
+            writes.partition_point(|&index| self.changes[index].path().as_lowercase_str() < folded);
+        writes[first..]
+            .iter()
+            .map(|&index| &self.changes[index])
+            .take_while(move |write| write.path().as_lowercase_str() == folded)
+    }
+
+    /// The changes writing a node below the directory at `folded`, a case-folded path.
+    fn writes_below<'s>(&'s self, folded: &str) -> impl Iterator<Item = &'s NodeChange> + 's {
+        let inside = format!("{folded}/");
+        let writes = self.writes();
+        let first = writes.partition_point(|&index| {
+            self.changes[index].path().as_lowercase_str() < inside.as_str()
+        });
+        writes[first..]
+            .iter()
+            .map(|&index| &self.changes[index])
+            .take_while(move |write| write.path().as_lowercase_str().starts_with(inside.as_str()))
+    }
+
+    /// Whether the change set writes a node at `path`, below it, or at a directory above it.
+    fn writes_near(&self, path: &RelativePath) -> bool {
+        let folded = path.as_lowercase_str();
+        let mut above = folded;
+        loop {
+            if self.writes_at(above).next().is_some() {
+                return true;
+            }
+            let Some((parent, _)) = above.rsplit_once('/') else {
+                break;
+            };
+            above = parent;
+        }
+        self.writes_below(folded).next().is_some()
+    }
+
+    /// Whether a change the view keeps writes a node that `kept` stands in the way of
+    /// ([`meets_kept_entry`]).
+    fn writes_meet(&self, kept: &KeptEntry, filter: &Filter) -> bool {
+        let in_view = |write: &&NodeChange| {
+            !filter.excludes(
+                write.path(),
+                write.to.flags.is_directory(),
+                FilterMode::View,
+            )
+        };
+        let folded = kept.path.as_lowercase_str();
+        if self
+            .writes_at(folded)
+            .filter(in_view)
+            .any(|write| meets_kept_entry(kept, write.path(), write.to.flags.is_directory()))
+        {
+            return true;
+        }
+        let mut below = folded;
+        while let Some((above, _)) = below.rsplit_once('/') {
+            if self
+                .writes_at(above)
+                .filter(in_view)
+                .any(|write| !write.to.flags.is_directory())
+            {
+                return true;
+            }
+            below = above;
+        }
+        !kept.is_directory && self.writes_below(folded).any(|write| in_view(&write))
     }
 
     /// The delete of a link mounted above `path`, which removes everything below the mount from
     /// the working tree.
-    fn link_delete_above(&self, path: &RelativePath) -> Option<&NodeChange> {
+    pub(crate) fn link_delete_above(&self, path: &RelativePath) -> Option<&NodeChange> {
         self.deleted_link(path, false)
             .map(|(deleted, _)| &self.changes[deleted.index])
     }
@@ -1221,7 +2099,7 @@ async fn holds_content_of(
 /// a merge's ([`tracked_source`]), and the listing of each directory it reads for another spelling
 /// of a move's source, held for the rest of the realize.
 struct RealizeMoves {
-    merge_current: Option<Arc<State>>,
+    merge_current: Option<MergeCurrent>,
     listings: HeldSpellings,
 }
 
@@ -1307,7 +2185,7 @@ async fn rename_held_spelling(
         && Box::pin(rename_paired_spelling(
             operation,
             change,
-            merge_current.as_ref(),
+            merge_current.as_ref().map(|current| &current.state),
             listed,
             from,
             to,
@@ -1548,7 +2426,7 @@ pub async fn verify_filesystem(
     let was_link = change.from.is_link();
 
     if is_delete && was_link {
-        lore_debug!("Link is for delete, skipping filesystem verification");
+        lore_debug!("Link is for delete, its mount is verified once every change is");
         return Ok(Verdict::Realize);
     }
 
@@ -1811,13 +2689,44 @@ pub async fn verify_filesystem(
     Ok(Verdict::Realize)
 }
 
+/// What a realize of a merge's changes, which start from the merge's base, reads the working tree
+/// against.
+#[derive(Clone)]
+pub struct MergeCurrent {
+    /// The revision the merge applies to, which the working tree stands on.
+    pub state: Arc<State>,
+    /// The staged state of the merge it resumes, whose link pins name what the mounts of the links
+    /// merged on an earlier pass show ([`mount_shown`]).
+    pub staged: Option<Arc<State>>,
+}
+
+impl MergeCurrent {
+    /// The merge of `state`, resuming none.
+    pub fn new(state: Arc<State>) -> Self {
+        MergeCurrent {
+            state,
+            staged: None,
+        }
+    }
+
+    /// [`Self::state`] and [`Self::staged`] from their root in `repository`, for [`mount_shown`].
+    fn roots(&self, repository: &Arc<RepositoryContext>) -> (NodeMapping, Option<NodeMapping>) {
+        (
+            NodeMapping::root(repository.clone(), self.state.clone()),
+            self.staged
+                .as_ref()
+                .map(|staged| NodeMapping::root(repository.clone(), staged.clone())),
+        )
+    }
+}
+
 /// Realizes `changes` in the working tree, deletes first, and stages them in `state_stage` where
 /// given. A link delete removes its mount but for the files `kept` names below it
 /// ([`VerifiedChanges::kept`]).
 ///
-/// `merge_current` is, for a merge, the revision it applies to, which the working tree stands on,
-/// as a merge's changes start from its base; it is `None` for changes that start from the revision
-/// the working tree stands on.
+/// `merge_current` is, for a merge, what the working tree stands on, as a merge's changes start
+/// from its base; it is `None` for changes that start from the revision the working tree stands
+/// on.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn, clippy::too_many_arguments)]
@@ -1828,7 +2737,7 @@ pub fn realize_changes<'a>(
     kept: &'a [RelativePath],
     state_stage: Option<Arc<State>>,
     dry_run: bool,
-    merge_current: Option<Arc<State>>,
+    merge_current: Option<MergeCurrent>,
     stats: Arc<SyncRealizeStats>,
 ) -> impl Future<Output = Result<(), SyncError>> + 'a {
     async move {
@@ -1855,7 +2764,7 @@ pub fn realize_changes<'a>(
             kept,
             state_stage.clone(),
             dry_run,
-            is_merge,
+            merge_current.as_ref(),
             stats.clone(),
         )
         .await?;
@@ -1964,53 +2873,6 @@ pub fn realize_changes<'a>(
 
         Ok(())
     }
-}
-
-/// Removes the directory `path` with everything below it, but for the files `kept` names,
-/// lowercase and sorted, and the directories holding them.
-///
-/// Each entry goes as the listing yields it, so a directory of any width costs one entry, and the
-/// walk holds one listing per level of the directories holding kept files. Every provider's listing
-/// keeps yielding past an entry removed after it was listed.
-async fn remove_all_but(
-    operation: &InstanceOperationImpl,
-    path: &RelativePath,
-    kept: &[&str],
-) -> Result<(), FsError> {
-    if !holds_kept(path, kept) {
-        return operation.remove_recursive(path).await;
-    }
-    // The directories being walked, deepest last, each with what its listing has left to yield.
-    let mut walking = vec![(path.clone(), operation.read_directory(path).await?)];
-    while let Some((directory, listing)) = walking.last_mut() {
-        let Some(entry) = listing.next().await else {
-            walking.pop();
-            continue;
-        };
-        let entry = entry?;
-        let entry_path = directory.join(&entry.name);
-        if kept.binary_search(&entry_path.as_lowercase_str()).is_ok() {
-            continue;
-        }
-        if entry.info.is_file() {
-            operation.remove(&entry_path).await?;
-        } else if holds_kept(&entry_path, kept) {
-            let listing = operation.read_directory(&entry_path).await?;
-            walking.push((entry_path, listing));
-        } else {
-            operation.remove_recursive(&entry_path).await?;
-        }
-    }
-    Ok(())
-}
-
-/// Whether the directory `path` holds a file `kept` names, lowercase and sorted.
-fn holds_kept(path: &RelativePath, kept: &[&str]) -> bool {
-    let folded = path.as_lowercase_str();
-    kept[kept.partition_point(|kept| *kept <= folded)..]
-        .iter()
-        .take_while(|kept| kept.starts_with(folded))
-        .any(|kept| kept.as_bytes().get(folded.len()) == Some(&b'/'))
 }
 
 /// Removes the directories in `kept`, which their deletes found holding entries, out of which a
@@ -2328,9 +3190,10 @@ async fn realize_changes_delete(
     kept: &[RelativePath],
     state_stage: Option<Arc<State>>,
     dry_run: bool,
-    is_merge: bool,
+    merge_current: Option<&MergeCurrent>,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<Vec<NodeChange>, SyncError> {
+    let is_merge = merge_current.is_some();
     // Sort the changes by path length and iterate in descending order. This will make sure that
     // directories have files deleted first, before attempting to delete the directory.
     // If a directory still have local files which are view/ignore filtered, these directories
@@ -2344,8 +3207,7 @@ async fn realize_changes_delete(
         .cloned()
         .collect();
     change::sort_by_path(delete_changes.as_mut_slice());
-    let mut kept_lowercase: Vec<&str> = kept.iter().map(RelativePath::as_lowercase_str).collect();
-    kept_lowercase.sort_unstable();
+    let kept_lowercase = folded_and_sorted(kept);
     let mut kept = Vec::new();
     for change in delete_changes.iter().rev() {
         let change = change.clone();
@@ -2386,26 +3248,47 @@ async fn realize_changes_delete(
         lore_trace!("D {}", change.path());
         let mut deleted = true;
         if !dry_run {
+            let shown = if is_link {
+                let (current, staged) = merge_current
+                    .map(|current| current.roots(&repository))
+                    .unzip();
+                mount_shown(&change, current.as_ref(), staged.flatten().as_ref())
+                    .await?
+                    .flatten()
+            } else {
+                None
+            };
             let mut retry = util::fs::file_unlink_retry();
             loop {
                 if is_link {
-                    if let Err(err) =
-                        remove_all_but(&operation, &change_path, &kept_lowercase).await
+                    match remove_link_mount(
+                        &operation,
+                        &change.from.mapping.repository.filter,
+                        repository.path(),
+                        &change_path,
+                        shown.clone(),
+                        &kept_lowercase,
+                    )
+                    .await
                     {
-                        lore_debug!(
-                            "Unable to unlink linked repository files at {}: {} (attempt {} of {}",
-                            change_path,
-                            err,
-                            retry.counter() + 1,
-                            retry.limit()
-                        );
-                        if !retry.wait().await {
-                            return Err(SyncError::internal(format!(
-                                "Failed to remove file or directory from local file system {change_path}",
-                            )));
+                        Ok(kept) => {
+                            kept.report(&change_path);
+                            break;
                         }
-                    } else {
-                        break;
+                        Err(err) => {
+                            lore_debug!(
+                                "Unable to unlink linked repository files at {}: {} (attempt {} of {}",
+                                change_path,
+                                err,
+                                retry.counter() + 1,
+                                retry.limit()
+                            );
+                            if !retry.wait().await {
+                                return Err(SyncError::internal(format!(
+                                    "Failed to remove file or directory from local file system {change_path}",
+                                )));
+                            }
+                        }
                     }
                 } else if let Err(err) = operation.remove(&change_path).await {
                     // Retry if it is a file, otherwise assume the directory has local files
@@ -2639,7 +3522,7 @@ fn sync_execute_modify_add(
     operation: Arc<InstanceOperationImpl>,
     state_stage: Option<Arc<State>>,
     dry_run: bool,
-    merge_current: Option<Arc<State>>,
+    merge_current: Option<MergeCurrent>,
     view_filter: Arc<crate::filter::Filter>,
     stats: Arc<SyncRealizeStats>,
 ) -> impl Future<Output = Result<(), SyncError>> {
@@ -2887,11 +3770,13 @@ async fn node_with_a_local_mode(
 /// Rewrites a mount whose link node moved to another subtree of the repository it points at.
 ///
 /// The diff reports such a move as the link node alone, so the content the mount exposes has to be
-/// carried here.
+/// carried here. For a merge, whose change starts from its base, `merge_current` holds what the
+/// mount shows ([`mount_shown`]).
 async fn realize_moved_mount(
     operation: &Arc<InstanceOperationImpl>,
     change: &NodeChange,
     node: Node,
+    merge_current: Option<&MergeCurrent>,
 ) -> Result<(), SyncError> {
     if !change.from.is_link() {
         return Ok(());
@@ -2901,10 +3786,23 @@ async fn realize_moved_mount(
     // Another repository's subtree shares nothing with the one it replaces, so it is cloned afresh.
     if change.from.address.context != node.address.context {
         let path = change.path();
-        operation
-            .remove_recursive(path)
-            .await
-            .forward::<SyncError>("Failed removing the subtree the link exposed")?;
+        let (current, staged) = merge_current
+            .map(|current| current.roots(&change.from.mapping.repository))
+            .unzip();
+        let shown = mount_shown(change, current.as_ref(), staged.flatten().as_ref())
+            .await?
+            .flatten();
+        remove_link_mount(
+            operation,
+            &change.from.mapping.repository.filter,
+            repository.path(),
+            path,
+            shown,
+            &[],
+        )
+        .await
+        .forward::<SyncError>("Failed removing the subtree the link exposed")?
+        .report(path);
         operation
             .create_dir_all(path)
             .await
@@ -3122,7 +4020,8 @@ fn realize_change_modify_add<'a>(
             if node.is_link() && change.action == change::FileAction::Add {
                 Box::pin(clone_added_link(&repository, &operation, &node, path)).await?;
             } else if node.is_link() && !dry_run {
-                realize_moved_mount(&operation, &change, node).await?;
+                realize_moved_mount(&operation, &change, node, moves.merge_current.as_ref())
+                    .await?;
             }
         } else if node.is_file() && !dry_run && write_to_disk {
             if content_is_in_place(&change, renamed) {

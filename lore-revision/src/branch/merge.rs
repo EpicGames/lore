@@ -450,6 +450,9 @@ struct PreparedMerge {
     source: MergeSource,
     /// The revision the merge starts from, at the path the working tree holds it.
     current: NodeMapping,
+    /// The staged state of the merge this one resumes, whose link pins name what the mounts of the
+    /// links merged on an earlier pass show.
+    resumed: Option<Arc<State>>,
     diff: PreparedDiff,
 }
 
@@ -650,21 +653,25 @@ async fn prepare_merge(
         source,
         diff: prepare_diff(&repository, diff),
         current,
+        resumed: None,
     })
 }
 
 /// Work out the merge of `source_branch` into `current_signature` and check it against the
-/// working copy, refusing it where a local modification would be overwritten.
+/// working copy, refusing it where a local modification would be overwritten. `resumed` is the
+/// staged state of the merge it resumes.
 async fn check_merge(
     repository: &Arc<RepositoryContext>,
     source_branch: BranchId,
     current_branch: BranchId,
     current_signature: Hash,
     current: NodeMapping,
+    resumed: Option<Arc<State>>,
 ) -> Result<PreparedMerge, MergeError> {
     let source =
         resolve_merge_source(repository, source_branch, current_branch, current_signature).await?;
     let mut merge = prepare_merge(repository.clone(), source, current).await?;
+    merge.resumed = resumed;
     with_operation(repository.file_system(), async |operation| {
         let PreparedDiff {
             changes, conflicts, ..
@@ -673,6 +680,7 @@ async fn check_merge(
             &operation,
             repository,
             &merge.current,
+            merge.resumed.as_ref(),
             changes,
             conflicts,
             MergeType::BranchMerge,
@@ -772,6 +780,7 @@ async fn apply_prepared_merge(
                 ..
             },
         current,
+        resumed,
         diff,
     } = merge;
 
@@ -798,6 +807,7 @@ async fn apply_prepared_merge(
         token,
         diff,
         current,
+        resumed,
         MergeType::BranchMerge,
         // If this merge is reconciling a remote LATEST with local LATEST of a branch
         // reverse the parent order in order to keep the remote history as the main
@@ -1536,6 +1546,7 @@ async fn merge_start_all(
         current_branch,
         state_current.revision(),
         NodeMapping::root(repository.clone(), state_current.clone()),
+        state_staged_opt.clone(),
     )
     .await?;
     let removed_links = links_the_merge_removes(&main_merge, &eligible_links);
@@ -1642,6 +1653,7 @@ async fn merge_start_all(
             eligible.resolved_branch,
             eligible.link_reference.signature,
             current.clone(),
+            None,
         )
         .await
         .forward_with::<MergeError, _>(|| format!("merging link {}", eligible.link_path))?;
@@ -2636,11 +2648,12 @@ async fn apply_graft_copy(
 ///
 /// A linked repository's diff is spelled from its own root, so each change is verified where
 /// `current` stands, below the link's mount. A change outside the subtree the link exposes has
-/// nothing on disk to verify.
+/// nothing on disk to verify. `resumed` is the staged state of the merge this one resumes.
 async fn verify_diff_against_filesystem(
     operation: &Arc<InstanceOperationImpl>,
     repository: &Arc<RepositoryContext>,
     current: &NodeMapping,
+    resumed: Option<&Arc<State>>,
     changes: &mut [NodeChange],
     conflicts: &mut [(NodeChange, NodeChange)],
     merge_type: MergeType,
@@ -2651,6 +2664,7 @@ async fn verify_diff_against_filesystem(
             operation,
             repository,
             current,
+            resumed,
             changes.iter_mut().collect(),
             conflicts.collect(),
             merge_type,
@@ -2667,6 +2681,7 @@ async fn verify_diff_against_filesystem(
         operation,
         repository,
         current,
+        resumed,
         mounted_changes
             .iter_mut()
             .map(|(_, mounted)| mounted)
@@ -2713,11 +2728,16 @@ fn spell_from_mount<'a>(
 /// The conflicts are checked after the changes, so the failure reported is the earliest one
 /// the merge would have hit. The moves and link deletes among the changes answer for both, as
 /// [`crate::fs::realize::verify_filesystem`] describes, and are copied only where the diff
-/// deletes a directory or a link.
+/// deletes a directory or a link, with what it writes below a deleted link. The mount of a link
+/// the merge deletes or moves to another repository is checked once both have passed
+/// ([`crate::fs::realize::verify_merge_mounts`]), against the link `resumed`, the staged state of
+/// the merge this one resumes, holds there where it holds one: a resolution an earlier pass
+/// staged in the link is no local change.
 async fn verify_spelled_diff(
     operation: &Arc<InstanceOperationImpl>,
     repository: &Arc<RepositoryContext>,
     current: &NodeMapping,
+    resumed: Option<&Arc<State>>,
     changes: Vec<&mut NodeChange>,
     conflicts: Vec<&mut NodeChange>,
     merge_type: MergeType,
@@ -2727,17 +2747,38 @@ async fn verify_spelled_diff(
             && (change.from.flags.is_directory() || change.from.is_link())
     });
     let answering = if deletes_a_directory_or_link {
+        // A deleted link's mount is checked against what the merge writes there.
+        let link_deletes = crate::fs::realize::IncomingChanges::new(Arc::new(
+            changes
+                .iter()
+                .chain(&conflicts)
+                .filter(|change| change.action == FileAction::Delete && change.from.is_link())
+                .map(|change| (**change).clone())
+                .collect(),
+        ));
+        let writes_below_a_link_delete = |change: &&&mut NodeChange| {
+            change.action != FileAction::Delete
+                && link_deletes.link_delete_above(change.path()).is_some()
+        };
         changes
             .iter()
             .filter(|change| {
                 change.move_source().is_some()
                     || (change.action == FileAction::Delete && change.from.is_link())
+                    || writes_below_a_link_delete(change)
             })
+            .chain(conflicts.iter().filter(writes_below_a_link_delete))
             .map(|change| (**change).clone())
             .collect()
     } else {
         Vec::new()
     };
+    let replacing: Vec<NodeChange> = changes
+        .iter()
+        .chain(&conflicts)
+        .filter(|change| crate::fs::realize::replaces_mount(change))
+        .map(|change| (**change).clone())
+        .collect();
     let incoming = Arc::new(crate::fs::realize::IncomingChanges::new(Arc::new(
         answering,
     )));
@@ -2749,6 +2790,16 @@ async fn verify_spelled_diff(
         operation, repository, current, conflicts, &incoming, merge_type,
     )
     .await?;
+    let resumed = resumed.map(|state| NodeMapping::root(current.repository.clone(), state.clone()));
+    crate::fs::realize::verify_merge_mounts(
+        operation,
+        current,
+        resumed.as_ref(),
+        &replacing,
+        &incoming,
+    )
+    .await
+    .forward::<MergeError>("verifying the mounts of the links the merge takes away")?;
     lore_debug!("File system verification complete");
     Ok(())
 }
@@ -2917,6 +2968,8 @@ struct RealizeDiff<'a> {
     state_base: &'a Arc<State>,
     state_from: &'a Arc<State>,
     state_to: &'a Arc<State>,
+    /// The staged state of the merge this one resumes.
+    resumed: Option<&'a Arc<State>>,
     changes: &'a Arc<Vec<NodeChange>>,
     conflicts: &'a Arc<Vec<(NodeChange, NodeChange)>>,
     merge_type: MergeType,
@@ -2939,7 +2992,11 @@ async fn realize_diff_over_filesystem(args: RealizeDiff<'_>) -> Result<(), Merge
         &[],
         Some(args.state_staged.clone()),
         args.skip_filesystem,
-        Some(args.state_to.clone()), /* The merge applies to the target */
+        // The merge applies to the target.
+        Some(crate::fs::realize::MergeCurrent {
+            state: args.state_to.clone(),
+            staged: args.resumed.cloned(),
+        }),
         args.stats.clone(),
     )
     .await
@@ -3050,6 +3107,7 @@ pub fn apply_diff<'a>(
         token,
         diff,
         current,
+        None,
         merge_type,
         reverse_parents,
         target_branch,
@@ -3057,13 +3115,14 @@ pub fn apply_diff<'a>(
     )
 }
 
-/// [`apply_diff`] for a prepared diff.
+/// [`apply_diff`] for a prepared diff. `resumed` is the staged state of the merge it resumes.
 #[allow(clippy::too_many_arguments)]
 async fn apply_prepared_diff(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     diff: PreparedDiff,
     current: NodeMapping,
+    resumed: Option<Arc<State>>,
     merge_type: MergeType,
     reverse_parents: bool,
     target_branch: BranchId,
@@ -3113,6 +3172,7 @@ async fn apply_prepared_diff(
             &operation,
             &repository,
             &current,
+            resumed.as_ref(),
             &mut changes,
             &mut conflicts,
             merge_type,
@@ -3131,6 +3191,7 @@ async fn apply_prepared_diff(
             state_base: &state_base,
             state_from: &state_from,
             state_to: &state_to,
+            resumed: resumed.as_ref(),
             changes: &changes,
             conflicts: &conflicts,
             merge_type,
@@ -4057,6 +4118,7 @@ pub async fn apply_restart_diff(
                 state_base: &state_base,
                 state_from: &state_from,
                 state_to: &state_to,
+                resumed: None,
                 changes: &changes,
                 conflicts: &conflicts,
                 merge_type,

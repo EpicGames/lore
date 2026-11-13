@@ -39,6 +39,7 @@ use super::filesystem_provider::FsError;
 use super::filesystem_provider::InstanceCloneError;
 use super::filesystem_provider::InstanceOperation;
 use super::filesystem_provider::InstanceOperationImpl;
+use super::filesystem_provider::ListedEntry;
 use super::filesystem_provider::StaticDispatchDirectoryListing;
 use super::filesystem_provider::StaticDispatchInstanceOperation;
 use crate::hash::hash_string;
@@ -141,16 +142,41 @@ pub struct OsDirectoryListing {
 impl OsDirectoryListing {
     /// The next entry the repository tracks, passing over every entry it holds nothing for.
     pub(crate) async fn next(&mut self) -> Option<Result<DirectoryEntry, FsError>> {
+        loop {
+            match self.next_with_untracked().await? {
+                Ok(ListedEntry::Tracked(entry)) => return Some(Ok(entry)),
+                Ok(ListedEntry::Untracked(_)) => {}
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
+
+    /// The next entry whose name could be read, a symbolic link and a special file included. Of
+    /// those, one whose name is not text is passed over, as [`file_list_item`] passes over all of
+    /// them.
+    pub(crate) async fn next_with_untracked(&mut self) -> Option<Result<ListedEntry, FsError>> {
         while let Some(entry) = self.entries.next().await {
+            if let Ok(found) = &entry
+                && (found.is_symlink
+                    || found
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.kind == StatKind::Other))
+            {
+                if let Ok(name) = entry_name(found.file_name.clone()) {
+                    return Some(Ok(ListedEntry::Untracked(name)));
+                }
+                continue;
+            }
             match file_list_item(entry)
                 .forward_any::<FsError>("A directory entry names what is not text")
             {
                 Ok(Some(item)) => {
-                    return Some(Ok(DirectoryEntry {
+                    return Some(Ok(ListedEntry::Tracked(DirectoryEntry {
                         name: item.name,
                         info: FileInfo::from_stat(&item.metadata),
                         name_hash: item.name_hash,
-                    }));
+                    })));
                 }
                 Ok(None) => {}
                 Err(err) => return Some(Err(err)),
@@ -411,6 +437,9 @@ pub enum PathListingResult {
     /// that we don't handle. A link is stat'd through to what it points at, so one naming a file
     /// or a directory answers as that rather than as a kind we hold nothing for.
     NotFound,
+
+    /// The path was a directory that could not be listed, so what it holds is unknown.
+    Unlistable,
 }
 
 impl PathListingResult {
@@ -485,6 +514,7 @@ pub fn entry_name(name: std::ffi::OsString) -> Result<String, PathError> {
 /// # Returns
 /// * `PathListingResult::Directory` - If path is a directory, with a listing of its children
 /// * `PathListingResult::File` - If path is a single file, with its metadata
+/// * `PathListingResult::Unlistable` - If path is a directory that cannot be listed
 /// * `PathListingResult::NotFound` - If path doesn't exist or isn't accessible
 ///
 /// # Path Semantics
@@ -504,6 +534,9 @@ pub async fn list_path(path: PathBuf) -> Result<PathListingResult, PathError> {
         return Ok(PathListingResult::NotFound);
     };
 
+    if metadata.kind == lore_io::StatKind::Directory {
+        return Ok(PathListingResult::Unlistable);
+    }
     if metadata.kind == lore_io::StatKind::File {
         let file_name = match path.file_name() {
             Some(name) => entry_name(name.to_os_string())?,

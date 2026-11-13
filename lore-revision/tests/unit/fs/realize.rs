@@ -1649,7 +1649,7 @@ async fn a_deleted_link_keeps_a_directory_under_a_case_variant_of_its_mount() {
 }
 
 /// A tree holding, at `mount`, a link mounting the root of a repository of its own, which holds
-/// `files` by name, with the delete of that link.
+/// `files` by their paths below it, with the delete of that link.
 async fn linked_plugin_tree(
     repository: &Arc<RepositoryContext>,
     mount: &str,
@@ -1658,10 +1658,32 @@ async fn linked_plugin_tree(
     let linked_id: RepositoryId = lore_base::types::Context::from(uuid::Uuid::now_v7()).into();
     let linked = repository.to_link_context(linked_id).await;
     let linked_state = State::new();
-    for (name, content) in files {
+    let mut directories: std::collections::HashMap<&str, NodeID> = Default::default();
+    for (path, content) in files {
+        let mut parent = ROOT_NODE;
+        let mut start = 0;
+        for (end, _) in path.match_indices('/') {
+            let component = &path[start..end];
+            parent = if let Some(&node) = directories.get(&path[..end]) {
+                node
+            } else {
+                let node = in_memory::add(
+                    &linked_state,
+                    linked.clone(),
+                    parent,
+                    directory(component),
+                    component,
+                )
+                .await;
+                directories.insert(&path[..end], node);
+                node
+            };
+            start = end + 1;
+        }
+        let name = &path[start..];
         let mut linked_file = file_node(content);
         linked_file.name_hash = hash::hash_string(name);
-        in_memory::add(&linked_state, linked.clone(), ROOT_NODE, linked_file, name).await;
+        in_memory::add(&linked_state, linked.clone(), parent, linked_file, name).await;
     }
     let revision = in_memory::commit(
         &linked,
@@ -1910,8 +1932,8 @@ async fn a_deleted_link_keeps_a_file_already_holding_what_replaces_it() {
     .await;
 }
 
-/// The delete of a link removes every entry of a wide mount but the files it keeps and the
-/// directories holding them.
+/// The delete of a link removes every file the link tracks in a wide mount but the files it keeps,
+/// and every directory but those holding them.
 #[tokio::test]
 async fn a_deleted_link_removes_a_wide_mount_around_the_files_it_keeps() {
     Box::pin(with_execution(async {
@@ -1932,12 +1954,14 @@ async fn a_deleted_link_removes_a_wide_mount_around_the_files_it_keeps() {
             ("Plugin/Source/Gone/linked.txt", b"linked".as_slice()),
         ]);
         write_working_files(&repository, &files).await;
+        let (_current, delete) =
+            linked_plugin_tree(&repository, SOURCE, &below_mount(&files)).await;
 
         let operation = repository.file_system().begin_operation().await.unwrap();
         Box::pin(realize_changes(
             repository.clone(),
             operation,
-            Arc::new(vec![deleted_link(&repository, SOURCE)]),
+            Arc::new(vec![delete]),
             &[relative(TRACKED), relative(nested)],
             None,
             false,
@@ -1954,8 +1978,8 @@ async fn a_deleted_link_removes_a_wide_mount_around_the_files_it_keeps() {
     .await;
 }
 
-/// The delete of a link removes what stands beside a kept file at every level of a deep path to
-/// it.
+/// The delete of a link removes the files the link tracks beside a kept file at every level of a
+/// deep path to it.
 #[tokio::test]
 async fn a_deleted_link_removes_a_deep_mount_around_the_file_it_keeps() {
     Box::pin(with_execution(async {
@@ -1978,12 +2002,14 @@ async fn a_deleted_link_removes_a_deep_mount_around_the_file_it_keeps() {
             .collect();
         files.push((kept.as_str(), b"kept".as_slice()));
         write_working_files(&repository, &files).await;
+        let (_current, delete) =
+            linked_plugin_tree(&repository, SOURCE, &below_mount(&files)).await;
 
         let operation = repository.file_system().begin_operation().await.unwrap();
         Box::pin(realize_changes(
             repository.clone(),
             operation,
-            Arc::new(vec![deleted_link(&repository, SOURCE)]),
+            Arc::new(vec![delete]),
             &[relative(&kept)],
             None,
             false,
@@ -1999,6 +2025,14 @@ async fn a_deleted_link_removes_a_deep_mount_around_the_file_it_keeps() {
         );
     }))
     .await;
+}
+
+/// `files`, below [`SOURCE`], by their paths below it, as the link mounted there tracks them.
+fn below_mount<'a>(files: &[(&'a str, &'a [u8])]) -> Vec<(&'a str, &'a [u8])> {
+    files
+        .iter()
+        .map(|(path, content)| (&path[SOURCE.len() + 1..], *content))
+        .collect()
 }
 
 /// The files below `root`, as paths relative to it.
@@ -2336,7 +2370,7 @@ async fn a_merge_moves_the_other_spelling_of_a_source_edited_since_the_base() {
             &[],
             None,
             false,
-            Some(current),
+            Some(MergeCurrent::new(current)),
             Arc::default(),
         )
         .await
@@ -2476,7 +2510,7 @@ async fn a_merge_deleting_a_directory_keeps_an_edited_case_variant_of_an_ignored
                 &[],
                 None,
                 false,
-                Some(state.clone()),
+                Some(MergeCurrent::new(state.clone())),
                 Arc::default(),
             )
             .await

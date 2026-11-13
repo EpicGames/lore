@@ -38,6 +38,7 @@ use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::FilesystemDiffContext;
 use crate::fs::filesystem_provider::FsError;
 use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::ListedEntry;
 use crate::fs::filesystem_provider::StaticDispatchDirectoryListing;
 use crate::fs::fuse::filesystem::CommitReading;
 use crate::fs::fuse::filesystem::FuseFilesystem;
@@ -1650,19 +1651,33 @@ pub struct FuseDirectoryListing {
 
 impl FuseDirectoryListing {
     pub(crate) async fn next(&mut self) -> Option<Result<DirectoryEntry, FsError>> {
+        loop {
+            // An ordinary clone's listing skips a symlink too (`crate::fs::os::file_list_item`).
+            match self.next_with_untracked().await? {
+                Ok(ListedEntry::Tracked(entry)) => return Some(Ok(entry)),
+                Ok(ListedEntry::Untracked(_)) => {}
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
+
+    /// The next entry as [`next`](Self::next) answers it, a symbolic link included, by its name.
+    pub(crate) async fn next_with_untracked(&mut self) -> Option<Result<ListedEntry, FsError>> {
         while self.index < self.listing.len() {
             let index = self.index;
             self.index += 1;
             let Some(entry) = self.listing.current_entry(index) else {
                 continue;
             };
-            // An ordinary clone's listing skips a symlink too (`crate::fs::os::file_list_item`).
-            if entry.flags & (entry_flags::VIEW_EXCLUDED | entry_flags::SYMLINK) != 0 {
+            if entry.flags & entry_flags::VIEW_EXCLUDED != 0 {
                 continue;
             }
             let Ok(name) = std::str::from_utf8(self.listing.name(index)) else {
                 continue;
             };
+            if entry.flags & entry_flags::SYMLINK != 0 {
+                return Some(Ok(ListedEntry::Untracked(name.to_string())));
+            }
             let info = if entry.flags & entry_flags::LOCAL != 0 && !is_dir(&entry) {
                 let Some(host) = &self.host else {
                     continue;
@@ -1680,11 +1695,11 @@ impl FuseDirectoryListing {
                     .map_or(self.base_time, |mtimes| mtimes[index]);
                 file_info_of(&entry, mtime)
             };
-            return Some(Ok(DirectoryEntry {
+            return Some(Ok(ListedEntry::Tracked(DirectoryEntry {
                 name: name.to_string(),
                 info,
                 name_hash: entry.name_hash,
-            }));
+            })));
         }
         None
     }

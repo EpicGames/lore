@@ -3819,3 +3819,131 @@ async fn a_node_link_crosses_a_link_where_its_repository_or_revision_differs() {
     })
     .await;
 }
+
+/// A link whose revision cannot be opened answers for nothing in its mount, so a mount holding a
+/// file, or a file standing in its place, holds what cannot be told from local work, and an
+/// absent or empty one holds nothing.
+#[tokio::test]
+async fn a_mount_whose_linked_revision_cannot_be_opened_holds_unknown_work() {
+    let dir = lore_base::test_util::TempDir::new("lore-state-test-");
+    let repository = working_tree_repository(dir.path()).await;
+    let mount = RelativePathBuf::new().push_and_freeze("vendor");
+    let mount_work = async || {
+        let operation = working_operation(&repository).await;
+        LORE_CONTEXT
+            .scope(
+                setup_test_execution(),
+                link_mount_work(&operation, None, &mount, false, |_| false),
+            )
+            .await
+            .expect("an unopened link still answers for its mount")
+    };
+
+    assert_eq!(
+        mount_work().await.unknown,
+        None,
+        "an absent mount holds nothing"
+    );
+
+    let file = write_working_file(&repository, "vendor", b"local").await;
+    assert_eq!(
+        mount_work()
+            .await
+            .unknown
+            .as_ref()
+            .map(RelativePath::as_str),
+        Some("vendor"),
+        "a file in place of the mount holds unknown work"
+    );
+    lore_io::IoDriver::global()
+        .remove_file(
+            file.to_absolute_path(repository.require_path().expect("working tree"))
+                .expect("a path below the root"),
+        )
+        .await
+        .expect("remove working file");
+
+    std::fs::create_dir_all(dir.path().join("vendor")).expect("create the mount");
+    assert_eq!(
+        mount_work().await.unknown,
+        None,
+        "an empty mount holds nothing"
+    );
+    write_working_file(&repository, "vendor/linked.txt", b"linked").await;
+    assert_eq!(
+        mount_work()
+            .await
+            .unknown
+            .as_ref()
+            .map(RelativePath::as_str),
+        Some("vendor"),
+        "a mount holding a file holds unknown work"
+    );
+}
+
+/// The files a refusal names are the first in path order, however the walk meets them, and a
+/// caller keeping every modified file has them all in that order.
+#[tokio::test]
+async fn a_mount_names_its_modified_files_in_path_order() {
+    let dir = lore_base::test_util::TempDir::new("lore-state-test-");
+    let repository = working_tree_repository(dir.path()).await;
+    let mount = RelativePathBuf::new().push_and_freeze("vendor");
+    let names = ["e.txt", "b.txt", "d.txt", "a.txt", "c.txt"];
+    let linked = State::new();
+    let vendor = add(
+        &linked,
+        &repository,
+        ROOT_NODE,
+        directory("vendor"),
+        "vendor",
+    )
+    .await;
+    std::fs::create_dir_all(dir.path().join("vendor")).expect("create the mount");
+    for name in names {
+        let node = Node {
+            flags: NodeFlags::File.bits(),
+            name_hash: hash::hash_string(name),
+            ..content_node(b"linked")
+        };
+        add(&linked, &repository, vendor, node, name).await;
+        write_working_file(&repository, &format!("vendor/{name}"), b"edited locally").await;
+    }
+    let mount_work = async |names_all| {
+        let operation = working_operation(&repository).await;
+        let work = LORE_CONTEXT
+            .scope(
+                setup_test_execution(),
+                link_mount_work(
+                    &operation,
+                    Some((vendor, (repository.clone(), linked.clone()))),
+                    &mount,
+                    names_all,
+                    |_| false,
+                ),
+            )
+            .await
+            .expect("the mount compares with its link");
+        let named: Vec<String> = work
+            .modified
+            .iter()
+            .map(|path| path.as_str().to_string())
+            .collect();
+        (named, work.modified_count)
+    };
+
+    assert_eq!(
+        mount_work(false).await,
+        (
+            vec![
+                "vendor/a.txt".to_string(),
+                "vendor/b.txt".to_string(),
+                "vendor/c.txt".to_string(),
+            ],
+            names.len()
+        ),
+        "a refusal holds only the first files by path"
+    );
+    let mut all: Vec<String> = names.iter().map(|name| format!("vendor/{name}")).collect();
+    all.sort();
+    assert_eq!(mount_work(true).await, (all, names.len()));
+}
