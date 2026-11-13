@@ -4887,6 +4887,119 @@ pub async fn store_name_to_id(
         .forward::<RepositoryError>("Failed to store repository metadata")
 }
 
+/// What [`claim_name`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameClaim {
+    /// The name was free or released, and now maps to the claiming repository.
+    Claimed,
+    /// The name already mapped to the claiming repository.
+    AlreadyHeld,
+    /// Another repository holds the name.
+    HeldBy(RepositoryId),
+}
+
+/// Claims `name` for `id` in one compare-and-swap, so concurrent creates of one name with
+/// different IDs cannot both succeed.
+pub async fn claim_name(
+    repository: Arc<RepositoryContext>,
+    name: impl AsRef<str>,
+    id: RepositoryId,
+) -> Result<NameClaim, RepositoryError> {
+    let (key, key_type) = mutable_name_key(repository.salt(), ID, name.as_ref());
+    let handle = repository
+        .try_write_mutable_store()
+        .ok_or_else(|| RepositoryError::from(WriteRequired))?;
+    let claimed = Hash::from_context(id.into());
+    let previous = handle
+        .compare_and_swap(
+            RepositoryId::default(),
+            key,
+            Hash::default(),
+            claimed,
+            key_type,
+        )
+        .await
+        .forward::<RepositoryError>("Failed to claim repository name")?;
+    Ok(if previous.is_zero() {
+        NameClaim::Claimed
+    } else if previous == claimed {
+        NameClaim::AlreadyHeld
+    } else {
+        NameClaim::HeldBy(RepositoryId::from(previous.to_context()))
+    })
+}
+
+/// The outcome of [`create_with_claimed_name`].
+#[derive(Debug)]
+pub enum ClaimedCreate<T, E> {
+    /// The name was claimed for the repository and `create` ran with this result.
+    Ran(Result<T, E>),
+    /// Another repository holds the name, before `create` ran or by the time it finished.
+    HeldBy(RepositoryId),
+}
+
+/// Runs `create` holding `name` for `repository`. Only the attempt that inserted the claim
+/// releases it when `create` fails, and claims it back when another attempt for the same ID has
+/// stored the repository by then; a successful `create` claims the name again. Either way an
+/// overlapping attempt for the same ID that fails cannot leave a created repository unmapped.
+pub async fn create_with_claimed_name<T, E>(
+    repository: Arc<RepositoryContext>,
+    name: &str,
+    create: impl Future<Output = Result<T, E>>,
+) -> Result<ClaimedCreate<T, E>, RepositoryError> {
+    let id = repository.id;
+    let inserted = match claim_name(repository.clone(), name, id).await? {
+        NameClaim::Claimed => true,
+        NameClaim::AlreadyHeld => false,
+        NameClaim::HeldBy(holder) => return Ok(ClaimedCreate::HeldBy(holder)),
+    };
+    let result = create.await;
+    match &result {
+        Ok(_) => {
+            if let NameClaim::HeldBy(holder) = claim_name(repository.clone(), name, id).await? {
+                return Ok(ClaimedCreate::HeldBy(holder));
+            }
+        }
+        Err(_) if inserted => {
+            if let Err(err) = release_name(repository.clone(), name, id).await {
+                lore_warn!("Releasing repository name {name} after a failed create failed: {err}");
+            } else if metadata_hash(repository.clone())
+                .await
+                .is_ok_and(|hash| !hash.is_zero())
+                && let Err(err) = claim_name(repository.clone(), name, id).await
+            {
+                lore_warn!("Restoring repository name {name} for a completed create failed: {err}");
+            }
+        }
+        Err(_) => {}
+    }
+    Ok(ClaimedCreate::Ran(result))
+}
+
+/// Gives up a claim [`claim_name`] made for `id`, leaving the name alone when another repository
+/// holds it.
+pub async fn release_name(
+    repository: Arc<RepositoryContext>,
+    name: impl AsRef<str>,
+    id: RepositoryId,
+) -> Result<(), RepositoryError> {
+    let (key, key_type) = mutable_name_key(repository.salt(), ID, name.as_ref());
+    let handle = repository
+        .try_write_mutable_store()
+        .ok_or_else(|| RepositoryError::from(WriteRequired))?;
+    handle
+        .compare_and_swap(
+            RepositoryId::default(),
+            key,
+            Hash::from_context(id.into()),
+            Hash::default(),
+            key_type,
+        )
+        .await
+        .forward::<RepositoryError>("Failed to release repository name")?;
+    Ok(())
+}
+
 pub async fn delete_name_to_id(
     repository: Arc<RepositoryContext>,
     name: impl AsRef<str>,

@@ -306,6 +306,53 @@ async fn repository_create_inner(
         };
     }
 
+    let created = repository::create_with_claimed_name(
+        repository.clone(),
+        name,
+        Box::pin(create_claimed(
+            repository.clone(),
+            name,
+            description,
+            default_branch_id,
+            default_branch_name,
+            creator,
+            created,
+            registry,
+            authorization,
+        )),
+    )
+    .await
+    .filter_slow_down()?
+    .warn_map_err(|err| {
+        Status::internal(format!("Failed to claim repository name {name}: {err}"))
+    })?;
+    match created {
+        repository::ClaimedCreate::Ran(result) => {
+            if result.is_ok() {
+                info!("Created repository {} with ID {}", name, repository.id);
+            }
+            result
+        }
+        repository::ClaimedCreate::HeldBy(holder) => Err(Status::already_exists(format!(
+            "Repository {} already exist with id {} which does not match {}",
+            name, holder, repository.id
+        ))),
+    }
+}
+
+/// The part of a create that runs once `name` is claimed for `repository`.
+#[allow(clippy::too_many_arguments)]
+async fn create_claimed(
+    repository: Arc<RepositoryContext>,
+    name: &str,
+    description: &str,
+    default_branch_id: Context,
+    default_branch_name: &str,
+    creator: &str,
+    created: u64,
+    registry: &RepositoryRegistry,
+    authorization: Option<String>,
+) -> Result<(RepositoryMetadata, lore_storage::Hash), Status> {
     registry.add(authorization, repository.id, name).await?;
 
     let metadata = RepositoryMetadata {
@@ -360,18 +407,6 @@ async fn repository_create_inner(
                 repository.id
             ))
         })?;
-
-    repository::store_name_to_id(repository.clone(), name, repository.id)
-        .await
-        .filter_slow_down()?
-        .warn_map_err(|err| {
-            Status::internal(format!(
-                "Failed to store name to ID lookup for {name} -> {}: {err}",
-                repository.id
-            ))
-        })?;
-
-    info!("Created repository {} with ID {}", name, repository.id);
 
     Ok((metadata, metadata_hash))
 }
