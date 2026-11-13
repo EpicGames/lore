@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::os::fd::AsFd;
+use std::os::fd::AsRawFd;
+use std::os::fd::BorrowedFd;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -165,6 +168,56 @@ fn mount_appears_in_mountinfo_as_fuse_lore_then_unmounts() {
     assert_eq!(mounted_fstype(dir.path()), None);
 
     drop(guard);
+}
+
+/// Whether `fd` closes on exec.
+fn closes_on_exec(fd: BorrowedFd<'_>) -> bool {
+    // SAFETY: `fcntl` only reads the flags of a descriptor the borrow keeps open.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+    assert!(
+        flags >= 0,
+        "fcntl(F_GETFD): {}",
+        std::io::Error::last_os_error()
+    );
+    flags & libc::FD_CLOEXEC != 0
+}
+
+/// A process started while the mount is up does not inherit its device fd, which would keep the
+/// connection open after the session ends.
+#[test]
+fn mount_device_fd_closes_on_exec() {
+    skip_without_fuse!();
+
+    let dir = TempDir::new("lore-fuse-mount-cloexec-test-");
+    let options = MountOptions {
+        fsname: "none".to_string(),
+        max_read: 1 << 20,
+        fusermount: None,
+    };
+    let mount_handle = mount(dir.path(), &options).expect("mount");
+    let guard = PathUnmountGuard(dir.path().to_path_buf());
+
+    assert!(
+        closes_on_exec(mount_handle.device_fd()),
+        "the device fd must close on exec"
+    );
+
+    drop(guard);
+}
+
+/// Both ends of the socket pair `fusermount3` answers over close on exec as created, so a process
+/// another thread starts during a mount inherits neither.
+#[test]
+fn fusermount_socketpair_ends_close_on_exec() {
+    let (parent_end, child_end) = fusermount_socketpair().expect("socketpair");
+    assert!(
+        closes_on_exec(parent_end.as_fd()),
+        "this process's end must close on exec"
+    );
+    assert!(
+        closes_on_exec(child_end.as_fd()),
+        "fusermount3's end must close on exec until the child that runs fusermount3 clears it"
+    );
 }
 
 /// The per-mount options `/proc/self/mountinfo` records for `path`, if mounted.

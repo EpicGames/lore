@@ -15,6 +15,7 @@ use std::os::fd::OwnedFd;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -80,7 +81,8 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 /// A live mount: the `/dev/fuse` (or clone-source) fd the kernel handed back, and the path it
-/// is mounted at.
+/// is mounted at. The fd closes on exec: a process that held it would keep the connection open
+/// after the session ends, and with it every request still waiting on the connection.
 pub struct Mount {
     fd: OwnedFd,
     path: PathBuf,
@@ -156,31 +158,26 @@ fn mount_via_fusermount(
     access: MountAccess,
 ) -> Result<Mount, FuseError> {
     let fusermount = options.fusermount_path()?;
+    let (parent_end, child_end) = fusermount_socketpair()?;
 
-    let mut fds: [RawFd; 2] = [-1, -1];
-    // SAFETY: `fds` is a valid, appropriately sized out-parameter.
-    let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
-    if ret != 0 {
-        return Err(FuseError::MountFailed(format!(
-            "socketpair: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    // SAFETY: both fds were just created by `socketpair` above and are open and valid.
-    let parent_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    // SAFETY: see above.
-    let child_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-
-    // The child execs `fusermount3`; only `child_end` should survive that exec.
-    set_cloexec(&parent_end)?;
-
+    let child_fd = child_end.as_raw_fd();
     let mut command = Command::new(&fusermount);
     command
         .arg("-o")
         .arg(options.option_string_for(access))
         .arg("--")
         .arg(path)
-        .env("_FUSE_COMMFD", child_end.as_raw_fd().to_string());
+        .env("_FUSE_COMMFD", child_fd.to_string());
+    // Only `fusermount3` keeps `child_end` across its exec.
+    // SAFETY: `fcntl` is async-signal-safe, and `child_end` stays open until after the spawn.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(child_fd, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 
     let mut child = command.spawn().map_err(|error| {
         FuseError::MountFailed(format!("spawning {}: {error}", fusermount.display()))
@@ -211,27 +208,33 @@ fn mount_via_fusermount(
     })
 }
 
-fn set_cloexec(fd: &OwnedFd) -> Result<(), FuseError> {
-    // SAFETY: `fd` is a valid, open fd for the duration of this call.
-    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
-    if flags < 0 {
+/// The socket pair `fusermount3` sends the `/dev/fuse` fd back over: this process's end, then
+/// the end `fusermount3` inherits. Both ends close on exec from the moment they exist, so a
+/// process another thread starts meanwhile inherits neither.
+#[lore_macro::test_pub]
+fn fusermount_socketpair() -> Result<(OwnedFd, OwnedFd), FuseError> {
+    let mut fds: [RawFd; 2] = [-1, -1];
+    // SAFETY: `fds` is a valid, appropriately sized out-parameter.
+    let ret = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
+    if ret != 0 {
         return Err(FuseError::MountFailed(format!(
-            "fcntl(F_GETFD): {}",
+            "socketpair: {}",
             std::io::Error::last_os_error()
         )));
     }
-    // SAFETY: see above.
-    let ret = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) };
-    if ret < 0 {
-        return Err(FuseError::MountFailed(format!(
-            "fcntl(F_SETFD): {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok(())
+    // SAFETY: both fds were just created by `socketpair` above and are open and valid, and
+    // nothing else owns them.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
-/// Receives the `/dev/fuse` fd `fusermount3` sends back over `SCM_RIGHTS`.
+/// Receives the `/dev/fuse` fd `fusermount3` sends back over `SCM_RIGHTS`, close-on-exec.
 fn receive_fd(sock: &OwnedFd) -> Result<OwnedFd, FuseError> {
     let mut iobuf = [0u8; 1];
     let mut iov = [IoSliceMut::new(&mut iobuf)];
@@ -244,7 +247,7 @@ fn receive_fd(sock: &OwnedFd) -> Result<OwnedFd, FuseError> {
     msg.msg_controllen = cmsg_buf.len() as _;
 
     // SAFETY: `msg` points at valid, appropriately sized buffers for the duration of the call.
-    let received = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, 0) };
+    let received = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
     if received <= 0 {
         let reason = if received == 0 {
             "fusermount3 closed its end without sending a file descriptor".to_string()
