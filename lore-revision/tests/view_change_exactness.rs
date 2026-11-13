@@ -763,6 +763,7 @@ mod tests {
 
     /// No mode to record where the filesystem records none.
     #[cfg(not(unix))]
+    #[allow(clippy::unused_async)]
     async fn mode_changes_are_recorded(_fixture: &Fixture, _tree: &Tree, _seed: u64) {}
 
     /// Every generated tree, under every view pair, carries the set one view materializes to the

@@ -471,6 +471,7 @@ unsafe impl Sync for SwfsFileStruct {}
 pub struct SwfsExecutionToken;
 
 impl SwfsExecutionToken {
+    #[lore_macro::test_pub]
     fn new() -> Self {
         Self {}
     }

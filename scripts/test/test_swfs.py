@@ -534,3 +534,23 @@ def test_swfs_refuses_an_instance_past_the_mount_limit(
     for repo in (instances[-1], source.clone(vfs="none")):
         with repo.open_file("a.txt") as f:
             assert f.read() == "a"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_commands_in_succession_each_freeze_and_thaw(
+    new_lore_repo, background_lore_service
+):
+    """Each command on an SWFS instance freezes the mount and thaws it, and the next starts at
+    once. SWFS returns from a thaw before it has finished, so a command that follows another
+    must wait for it rather than fail to freeze."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"changed.txt": "first contents"})
+    swfs_repo = _swfs_clone(original_repo)
+
+    for _ in range(20):
+        swfs_repo.status(scan=True)
+        swfs_repo.file_diff("changed.txt")
+
+    _repositories_match_files(original_repo, swfs_repo, ["changed.txt"])

@@ -50,7 +50,8 @@ pub async fn metadata_set_executable(
     }
 }
 
-/// Does nothing: Windows has no executable bit.
+/// Does nothing: Windows has no executable bit. Async to match the other platforms' signature.
+#[allow(clippy::unused_async)]
 #[cfg(target_family = "windows")]
 pub async fn set_executable(
     _path: impl AsRef<Path>,

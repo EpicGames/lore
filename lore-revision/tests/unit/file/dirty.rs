@@ -4,6 +4,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
+#[cfg(unix)]
 use std::sync::atomic::Ordering;
 
 use lore_base::runtime::LORE_CONTEXT;

@@ -538,7 +538,7 @@ async fn with_execution<F: Future>(body: F) -> F::Output {
 /// read's failure.
 #[tokio::test]
 async fn a_state_read_the_remote_refuses_reports_the_refusal() {
-    with_execution(async {
+    Box::pin(with_execution(async {
         for refusal in [
             ProtocolError::from(NotAuthenticated),
             ProtocolError::from(NotAuthorized),
@@ -554,7 +554,7 @@ async fn a_state_read_the_remote_refuses_reports_the_refusal() {
             };
             assert_eq!(error.ffi_code(), code, "{error:?}");
         }
-    })
+    }))
     .await;
 }
 
@@ -704,14 +704,14 @@ async fn a_refused_branch_metadata_lookup_asks_the_remote_once() {
 /// its metadata looked up on the remote.
 #[tokio::test]
 async fn a_branch_metadata_lookup_past_an_unreadable_local_copy_reports_the_refusal() {
-    with_execution(async {
+    Box::pin(with_execution(async {
         let branch = BranchId::from([1; 16]);
         for (name, repository) in refusing_contexts().await {
             store_unreadable_metadata(&repository, branch).await;
             let error = branch::metadata(repository, branch).await.expect_err(name);
             assert!(error.is_not_authorized(), "{name}: {error:?}");
         }
-    })
+    }))
     .await;
 }
 
@@ -899,14 +899,14 @@ async fn archiving_a_branch_the_remote_refuses_reports_the_refusal() {
 
 #[tokio::test]
 async fn a_layer_latest_lookup_reports_the_refusal() {
-    with_execution(async {
+    Box::pin(with_execution(async {
         for (name, repository) in refusing_contexts().await {
             let error = lore_revision::layer::latest_revision(repository, BranchId::from([1; 16]))
                 .await
                 .expect_err(name);
             assert!(error.is_not_authorized(), "{name}: {error:?}");
         }
-    })
+    }))
     .await;
 }
 

@@ -32,7 +32,7 @@ fn drive_letter_path() {
     let long = long_path(r"C:\foo\", r"\bar");
     assert_eq!(
         to_extended_wide(Path::new(&long)),
-        wide(&format!(r"\\?\{}", long)),
+        wide(&format!(r"\\?\{long}")),
         "long drive-letter path gets the verbatim prefix",
     );
 }

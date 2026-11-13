@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 mod termination_signal_tests {
+    #[cfg(unix)]
     use std::time::Duration;
 
+    #[cfg(unix)]
     use lore_client::util::TerminationSignals;
 
     /// What registering ahead of the socket relies on: the handler is what holds

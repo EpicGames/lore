@@ -9,6 +9,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use dashmap::DashSet;
+use lore_base::error::NotSupported;
 use lore_base::log::LoreLogLevel;
 use lore_error_set::error_set;
 use swfs_api::SWFSHandle;
@@ -18,6 +19,8 @@ use crate::fs::swfs::handle_gate::HandleGate;
 use crate::fs::swfs::handle_gate::HandleGateGuard;
 use crate::fs::swfs::mount_resources::MountResources;
 use crate::fs::swfs::mount_resources::SwfsExecutionToken;
+use crate::fs::swfs::operation_lock::OperationGuard;
+use crate::fs::swfs::operation_lock::OperationLock;
 use crate::fs::swfs::paths::RelativePathKey;
 use crate::service_state::ServiceStateImpl;
 
@@ -47,6 +50,8 @@ pub struct SwfsInterface {
     /// by [`SwfsInterface::close`], which waits for the uses in progress before it closes the
     /// handle.
     gate: HandleGate,
+    /// Which command holds the mount's operation.
+    operation_lock: OperationLock,
     #[allow(unused)]
     resources: MountResources,
 }
@@ -79,6 +84,12 @@ impl SwfsInterface {
             handle: &self.handle,
             _use: guard,
         })
+    }
+
+    /// Waits for the mount's operation, which the caller holds until it drops the guard, after the
+    /// thaw that ends it. Refused where the calling command holds it already.
+    pub async fn lock_operation(&self) -> Result<OperationGuard, NotSupported> {
+        self.operation_lock.acquire().await
     }
 
     /// The handle as a key for finding this interface from an SWFS callback. It is never passed
@@ -176,6 +187,7 @@ mod swfs_impl {
     use crate::fs::swfs::api_interface::swfs_api::swfsFreeze;
     use crate::fs::swfs::api_interface::swfs_api::swfsInit;
     use crate::fs::swfs::api_interface::swfs_api::swfsIsBusy;
+    use crate::fs::swfs::api_interface::swfs_api::swfsIsFrozen;
     use crate::fs::swfs::api_interface::swfs_api::swfsThaw;
     use crate::fs::swfs::file::SwfsFileArray;
     use crate::fs::swfs::mount_resources::MountResources;
@@ -184,27 +196,40 @@ mod swfs_impl {
     use crate::fs::swfs::paths::SwfsPath;
     use crate::fs::swfs::state::written_files;
     use crate::lore_debug;
+    use crate::lore_warn;
     use crate::service_state::ServiceStateImpl;
+
+    /// What mounting found of a freeze left over from before.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StaleFreeze {
+        NotFrozen,
+        Thawed,
+        ThawFailed,
+    }
 
     impl SwfsInterface {
         pub fn resources(&self) -> &MountResources {
             &self.resources
         }
 
-        #[allow(clippy::unused_async)]
         pub async fn freeze(&self, _token: SwfsExecutionToken) -> Result<(), SwfsWorkError> {
             let handle = self.handle().forward::<SwfsWorkError>("Unable to freeze")?;
-            if unsafe {
+            let freeze_result = unsafe {
                 swfsFreeze(
                     handle.handle(),
                     Some(swfs_freeze_callback),
                     std::ptr::null_mut(),
                 )
-            } {
-                Ok(())
-            } else {
-                Err(SwfsWorkError::internal("Failed to freeze"))
+            };
+            if !freeze_result {
+                return Err(SwfsWorkError::internal("Failed to freeze"));
             }
+            // `swfsFreeze` returns before the freeze has taken hold, and the frozen files can be
+            // read only once it has.
+            if !wait_for_frozen_state(&handle, true).await {
+                return Err(SwfsWorkError::internal("Timed out waiting for the freeze"));
+            }
+            Ok(())
         }
 
         pub async fn thaw(
@@ -232,23 +257,24 @@ mod swfs_impl {
 
             // The written nodes are described as the state after this operation holds them.
             self.resources.update_state(token).await?;
-            let state = self.resources.current_read_state().ok_or_else(|| {
-                SwfsWorkError::internal("Describing written nodes with no repository state")
-            })?;
             let mut files = Vec::new();
-            written_files(
-                &mut files,
-                self.resources.repository(),
-                state,
-                written_paths,
-                file_time,
-            )
-            .await?;
+            // With no revision there is nothing to describe from: what the operation wrote that
+            // no state holds was written to the mount when it finalized, which is all of it.
+            if let Some(state) = self.resources.current_read_state() {
+                written_files(
+                    &mut files,
+                    self.resources.repository(),
+                    state,
+                    written_paths,
+                    file_time,
+                )
+                .await?;
+            }
             let files = SwfsFileArray::new(files);
             let handle = self
                 .handle()
                 .forward::<SwfsWorkError>("Getting SWFS handle for thaw")?;
-            if unsafe {
+            let thaw_result = unsafe {
                 swfsThaw(
                     handle.handle(),
                     if apply_changes {
@@ -257,11 +283,16 @@ mod swfs_impl {
                         std::ptr::null_mut()
                     },
                 )
-            } {
-                Ok(())
-            } else {
-                Err(SwfsWorkError::internal("Failed to thaw"))
+            };
+            if !thaw_result {
+                return Err(SwfsWorkError::internal("Failed to thaw"));
             }
+            // `swfsThaw` returns before SWFS has finished thawing, so the operation that follows,
+            // which freezes again, as one command's operations do, is not started until it has.
+            if !wait_for_frozen_state(&handle, false).await {
+                return Err(SwfsWorkError::internal("Timed out waiting for the thaw"));
+            }
+            Ok(())
         }
 
         pub fn mount(resources: MountResources) -> Result<Arc<Self>, SwfsInterfaceError> {
@@ -300,9 +331,16 @@ mod swfs_impl {
             let this = Arc::new(Self {
                 handle: WrappedHandle(handle),
                 gate: HandleGate::default(),
+                operation_lock: OperationLock::default(),
                 resources,
             });
             Ok(this)
+        }
+
+        /// Whether SWFS holds the mount frozen.
+        #[lore_macro::test_pub]
+        fn is_frozen(&self) -> Result<bool, SwfsInterfaceError> {
+            Ok(unsafe { swfsIsFrozen(self.handle()?.handle()) })
         }
 
         pub async fn wait_for_ready(&self) -> Result<(), SwfsInterfaceError> {
@@ -311,7 +349,43 @@ mod swfs_impl {
             while unsafe { swfsIsBusy(self.handle()?.handle()) } {
                 yield_now().await;
             }
+            let handle = self.handle()?;
+            let stale = self.release_stale_freeze(&handle)?;
+            match stale {
+                StaleFreeze::NotFrozen => {}
+                StaleFreeze::Thawed => {
+                    lore_warn!("SWFS mount was frozen when it was mounted; thawed it");
+                    // `swfsThaw` returns before the thaw is finished, and the mount is ready only
+                    // once it is.
+                    if !wait_for_frozen_state(&handle, false).await {
+                        return Err(SwfsInterfaceError::internal(
+                            "SWFS mount was still frozen after its thaw when it was mounted",
+                        ));
+                    }
+                }
+                StaleFreeze::ThawFailed => {
+                    return Err(SwfsInterfaceError::internal(
+                        "SWFS mount was frozen when it was mounted and could not be thawed",
+                    ));
+                }
+            }
             Ok(())
+        }
+
+        /// Thaws a mount found frozen. No operation can be running when it is mounted, so a freeze then is
+        /// one left behind, such as by a service that ended mid-operation, and every freeze after it
+        /// would fail while it stood. `thaw` applies nothing.
+        pub fn release_stale_freeze(
+            &self,
+            handle: &SwfsHandleGuard<'_>,
+        ) -> Result<StaleFreeze, SwfsInterfaceError> {
+            if !self.is_frozen()? {
+                Ok(StaleFreeze::NotFrozen)
+            } else if unsafe { swfsThaw(handle.handle(), std::ptr::null()) } {
+                Ok(StaleFreeze::Thawed)
+            } else {
+                Ok(StaleFreeze::ThawFailed)
+            }
         }
 
         /// Unmount from SWFS and release the mount path. Does nothing if it is already closed.
@@ -469,6 +543,28 @@ mod swfs_impl {
             .ok_or(SwfsInterfaceError::internal(
                 "Missing SWFS interface for handle",
             ))
+    }
+
+    /// How long SWFS may take to take hold of a freeze. It has been seen to take a few milliseconds.
+    const FREEZE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// How long SWFS may take to finish a thaw. It has been seen to take under twenty
+    /// milliseconds.
+    const THAW_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// Waits, asking each millisecond, for the mount of `handle` to be frozen, or thawed if not
+    /// `frozen`: for at most [`FREEZE_TIMEOUT`] when waiting for a freeze, [`THAW_TIMEOUT`] when
+    /// waiting for a thaw. Whether it was.
+    async fn wait_for_frozen_state(handle: &WrappedHandle, frozen: bool) -> bool {
+        let timeout = if frozen { FREEZE_TIMEOUT } else { THAW_TIMEOUT };
+        let started = std::time::Instant::now();
+        while unsafe { swfsIsFrozen(handle.handle()) } != frozen {
+            if started.elapsed() > timeout {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        true
     }
 
     /// Creates a C function that takes an `SWFSHandle` as its first argument and calls the associated

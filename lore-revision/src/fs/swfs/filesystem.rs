@@ -23,6 +23,7 @@ use crate::fs::os::OsFilesystem;
 use crate::fs::os::OsOperation;
 use crate::fs::swfs::api_interface::SwfsInterface;
 use crate::fs::swfs::mount_resources::SwfsExecutionToken;
+use crate::fs::swfs::operation_lock::OperationGuard;
 use crate::fs::swfs::paths::RelativePathKey;
 use crate::fs::swfs::state::tracked_file_info;
 use crate::immutable;
@@ -57,12 +58,16 @@ impl SwfsFilesystem {
 
     #[allow(clippy::unused_async)]
     pub async fn begin_operation(&self) -> Result<SwfsOperation, FsError> {
+        // Held until the operation has thawed, so no other command freezes the mount, or thaws it,
+        // while this one reads it (ADR-00026).
+        let guard = self.mount.lock_operation().await?;
         self.mount
             .freeze(SwfsExecutionToken {})
             .await
             .internal("Freezing SWFS file system")?;
         Ok(SwfsOperation {
             mount: self.mount.clone(),
+            operation: parking_lot::Mutex::new(Some(guard)),
             _repo_path: self.repo_path.clone(),
             touched_nodes: Default::default(),
             os: OsFilesystem::begin_operation(&self.os),
@@ -95,6 +100,8 @@ impl FilesystemProvider for SwfsFilesystem {
 /// SWFS-backed filesystem operation context.
 pub struct SwfsOperation {
     mount: Arc<SwfsInterface>,
+    /// The mount's operation, held from before the freeze until the thaw has ended.
+    operation: parking_lot::Mutex<Option<OperationGuard>>,
     _repo_path: PathBuf,
     /// Paths this operation has written or removed, for thaw to describe to SWFS. Whether a path
     /// was added or deleted makes no difference to that, so they share the set.
@@ -118,8 +125,10 @@ impl SwfsOperation {
             .mount
             .thaw(token, changes_made, &self.touched_nodes)
             .await;
-        // Whatever the outcome, none of these writes are pending any longer.
+        // Whatever the outcome, none of these writes are pending any longer, and the next command
+        // may begin its operation, which a mount still frozen will fail to freeze.
         self.touched_nodes.clear();
+        self.operation.lock().take();
         result.internal("Thawing SWFS file system")?;
         Ok(())
     }

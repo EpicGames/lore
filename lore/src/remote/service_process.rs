@@ -444,7 +444,7 @@ fn detach_from_caller(command: &mut Command) {
 /// run, where one such wait ate the whole job.
 ///
 /// Clearing `HANDLE_FLAG_INHERIT` on this process's three standard handles is
-/// enough: writes to them are unaffected, and both `std::process` and CPython
+/// enough: writes to them are unaffected, and both `std::process` and `CPython`
 /// duplicate a handle afresh — inheritable — when asked to pass one on, so
 /// later children that should share these handles still do. The flags are not
 /// restored afterwards, because restoring makes a race of it: another thread

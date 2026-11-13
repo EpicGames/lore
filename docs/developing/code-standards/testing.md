@@ -439,6 +439,12 @@ service process, so the client relaying to it blocks until the per-test timeout
 kills the worker. A machine without the driver should deselect the tests with
 `-m "smoke and not swfs"`.
 
+The Rust tests that mount SWFS, such as `lore-revision/tests/swfs_freeze.rs`,
+compile for Windows x86-64 only and have the same two preconditions. A machine
+without the driver sets `LORE_TEST_NO_SWFS=1`, and they return at once, passing
+without testing anything. A new Rust test that mounts SWFS must check
+that variable first.
+
 ### Running the machine server's container tests
 
 The tests in `test_uds_containers.py` run a machine server with a container on

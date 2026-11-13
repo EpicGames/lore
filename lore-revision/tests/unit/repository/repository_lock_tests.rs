@@ -5,6 +5,7 @@ use std::sync::Arc;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::repository::*;
 use lore_storage::ImmutableStore;
+#[cfg(unix)]
 use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
 
 use crate::fs::filesystem_provider::setup_test_execution;

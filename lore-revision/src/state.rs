@@ -5295,10 +5295,23 @@ impl State {
         futures::future::Either::Right(async move {
             let repository = repository.to_link_context(link.repository).await;
             let link_state = State::deserialize(repository.clone(), link.revision).await?;
-            let (found, held) =
-                Box::pin(link_state.find_relative(repository.clone(), link.node, rest)).await?;
+            let (found, held) = link_state
+                .find_relative_boxed(repository.clone(), link.node, rest)
+                .await?;
             Ok((found, held.or(Some((repository, link_state)))))
         })
+    }
+
+    /// [`Self::find_relative`] for [`Self::find_relative_from`] to recurse into, boxed as a trait
+    /// object outside it. Its own type would hold `find_relative_from`'s, so proving that one
+    /// `Send` would never end.
+    fn find_relative_boxed<'a>(
+        &'a self,
+        repository: Arc<RepositoryContext>,
+        root: NodeID,
+        path: &'a str,
+    ) -> crate::BoxFuture<'a, Result<(NodeLink, Option<LinkedState>), StateError>> {
+        Box::pin(self.find_relative(repository, root, path))
     }
 
     /// Where a walk of `path` below `root` stops: at its end, at the first link it crosses, or

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+#[cfg(not(target_os = "windows"))]
 use std::path::Path;
 
 #[cfg(not(target_os = "windows"))]
