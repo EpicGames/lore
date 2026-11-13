@@ -275,6 +275,7 @@ async fn a_held_state_at_the_target_takes_no_changes() {
             (&repository, &held),
             (&repository, &r.second),
             &BTreeMap::new(),
+            None,
         )
         .await
         .expect("the changes")
@@ -297,6 +298,7 @@ async fn the_changes_are_the_diff_from_the_held_revision() {
             (&repository, &held),
             (&repository, &r.second),
             &BTreeMap::new(),
+            None,
         )
         .await
         .expect("the changes")
@@ -316,10 +318,15 @@ async fn an_unsettled_path_is_re_placed() {
         let held = r.held(&r.second).await;
         for (adds_back, action) in [(false, FileAction::Keep), (true, FileAction::Add)] {
             let unsettled = BTreeMap::from([("a.txt".to_string(), adds_back)]);
-            let changes = hold::changes((&repository, &held), (&repository, &r.second), &unsettled)
-                .await
-                .expect("the changes")
-                .0;
+            let changes = hold::changes(
+                (&repository, &held),
+                (&repository, &r.second),
+                &unsettled,
+                None,
+            )
+            .await
+            .expect("the changes")
+            .0;
             assert_eq!(paths_of(&changes), vec![(action, "a.txt".to_string())]);
         }
     })
@@ -402,6 +409,7 @@ async fn a_move_out_of_the_view_stays_in_view() {
             (&repository, &held),
             (&repository, &moved),
             &BTreeMap::new(),
+            None,
         )
         .await
         .expect("the changes")
@@ -418,7 +426,8 @@ async fn a_move_out_of_the_view_stays_in_view() {
     .await;
 }
 
-/// A local edit the target changes refuses the hold unless it keeps or overwrites local changes.
+/// A local edit the target changes refuses the hold unless it keeps, overwrites or resets local
+/// changes.
 #[tokio::test]
 async fn a_local_edit_the_target_changes_refuses_the_hold() {
     with_revisions(async |r: Revisions| {
@@ -440,10 +449,14 @@ async fn a_local_edit_the_target_changes_refuses_the_hold() {
                 overwrite_local: true,
                 ..Default::default()
             },
+            HoldOptions {
+                reset_local: true,
+                ..Default::default()
+            },
         ] {
             check(&repository, &held, &changes, options)
                 .await
-                .expect("kept or overwritten");
+                .expect("kept, overwritten or reset");
         }
     })
     .await;
@@ -821,6 +834,7 @@ async fn a_local_edit_in_a_directory_the_target_moves_refuses_the_hold() {
             (&repository, &held),
             (&repository, &fourth),
             &BTreeMap::new(),
+            None,
         )
         .await
         .expect("the changes")

@@ -1056,8 +1056,8 @@ pub enum StaticDispatchInstanceOperation {
 }
 
 /// What holding a target revision does to the local changes at the paths it changes
-/// ([`InstanceOperationImpl::hold_state`]). Without `overwrite_local` or `keep_local`, a local
-/// change at such a path refuses the hold, as it refuses a sync.
+/// ([`InstanceOperationImpl::hold_state`]). Without `overwrite_local`, `keep_local` or
+/// `reset_local`, a local change at such a path refuses the hold, as it refuses a sync.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HoldOptions {
     /// Give a local file the target's content, or remove it where the target removes it, as a
@@ -1066,8 +1066,23 @@ pub struct HoldOptions {
     /// Keep each local change, a local deletion included, as a sync forwarding local changes
     /// does.
     pub keep_local: bool,
+    /// Give every path the held revision tracks and a local change holds what the target holds
+    /// there, whether the target changes the path or not, as a sync resetting local changes does:
+    /// local edits take the target's content and spelling, and local deletions come back. Local
+    /// files at paths the held revision does not track stay, unless the target places a node
+    /// where they stand: a file takes their place, and a node of the other kind removes them
+    /// whole. Overwrites as `overwrite_local` does.
+    pub reset_local: bool,
     /// Check and report what holding the target changes, changing nothing.
     pub dry_run: bool,
+}
+
+impl HoldOptions {
+    /// Whether the hold gives the local files at the paths it changes the target's content, or
+    /// removes them, as a forced sync and one resetting local changes do.
+    pub fn overwrites_local(&self) -> bool {
+        self.overwrite_local || self.reset_local
+    }
 }
 
 pub struct InstanceOperationImpl {
@@ -1312,7 +1327,7 @@ impl InstanceOperationImpl {
 
     /// Hands `target`, under `repository`, its context, to a provider that holds its state in a
     /// `State` ([`FilesystemProvider::holds_state`]) to hold as the revision the working tree
-    /// stands at, its local changes refused, kept or overwritten as `options` asks
+    /// stands at, its local changes refused, kept, overwritten or reset as `options` asks
     /// ([`crate::fs::hold`]). Outside a dry run the hold counts as a change. An operation that
     /// holds no `State` refuses, changing nothing.
     #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]

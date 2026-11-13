@@ -220,7 +220,6 @@ def test_urcignore_merge_new_file_from_incoming_branch(new_lore_repo):
     )
 
 
-@pytest.mark.own_vfs("resets local changes, which a virtual clone refuses: it holds whole revisions")
 @pytest.mark.smoke
 def test_urcignore_branch_switch_preserves_ignored_file(new_lore_repo):
     """
@@ -290,7 +289,6 @@ def test_urcignore_branch_switch_preserves_ignored_file(new_lore_repo):
     )
 
 
-@pytest.mark.own_vfs("resets local changes, which a virtual clone refuses: it holds whole revisions")
 @pytest.mark.smoke
 @pytest.mark.parametrize("command", ["sync", "branch switch"])
 def test_urcignore_reset_restores_committed_file(new_lore_repo, command):

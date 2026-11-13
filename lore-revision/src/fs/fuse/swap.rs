@@ -362,6 +362,7 @@ fn writes_file(change: &NodeChange) -> bool {
 const KEEP_LOCAL: HoldOptions = HoldOptions {
     overwrite_local: false,
     keep_local: true,
+    reset_local: false,
     dry_run: false,
 };
 
@@ -437,10 +438,51 @@ async fn swap_through(
         return Ok(());
     }
     let same_view = same_view(&served.repository, &repository);
-    let unsettled = plan.unsettled.clone();
     let held = (&served.repository, &served.state);
+    let mut paths = hold::Resolver::new(held);
+    let mut unsettled = plan.unsettled.clone();
+    let mut read = None;
+    let mut respelled = Vec::new();
+    if options.reset_local {
+        let deleted = match fs.deletions() {
+            Some(deletions) => deletions
+                .read()
+                .internal("reading the deletion list for a reset")?,
+            None => Vec::new(),
+        };
+        let revision = fs
+            .scoped(State::deserialize(
+                served.repository.clone(),
+                served.state.revision(),
+            ))
+            .await
+            .forward_any::<FsError>("reading the served revision for a reset")?;
+        respelled = fs
+            .scoped(hold::add_reset_paths(
+                &mut paths,
+                (&served.repository, &revision),
+                (&repository, &target),
+                &deleted,
+                &mut unsettled,
+            ))
+            .await
+            .forward_any::<FsError>("listing the local changes a reset discards")?;
+        if !respelled.is_empty() && !options.dry_run {
+            for (from, to) in &respelled {
+                operation.rename(from, to).await?;
+            }
+            // The renames changed names the resolver indexed.
+            paths = hold::Resolver::new(held);
+        }
+        read = Some(revision);
+    }
     let (applied, before) = fs
-        .scoped(hold::changes(held, (&repository, &target), &unsettled))
+        .scoped(hold::changes(
+            held,
+            (&repository, &target),
+            &unsettled,
+            read,
+        ))
         .await
         .forward_any::<FsError>("diffing the served revision against the target")?;
     let changes = hold::in_view(&repository, &applied);
@@ -455,7 +497,6 @@ async fn swap_through(
                 .forward_any::<FsError>("diffing what the served and the target views show")?,
         )
     };
-    let mut paths = hold::Resolver::new(held);
     let host = Host {
         fs,
         served: &served,
@@ -551,6 +592,8 @@ async fn swap_through(
             settled.extend(change.move_source().map(RelativePath::parent_path));
         }
         settled.extend(reconciled.iter().map(RelativePath::parent_path));
+        // A directory the reset respelled settles clean where nothing in it changed.
+        settled.extend(respelled.iter().map(|(_, respelled)| respelled.clone()));
         settled.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
         settled.dedup_by(|a, b| a.as_str() == b.as_str());
         let spelled_by = match &before {
@@ -866,8 +909,11 @@ impl HoldHost for Host<'_> {
 /// [`InstanceOperationImpl::hold_state`] asks. The served State takes the unfiltered diff from
 /// the served revision ([`hold::changes`]); after an apply that failed or was cancelled, the
 /// State may stand anywhere between the served revision and the targets of those applies, so
-/// the next swap also re-places each path they changed. The kernel is told of the changes the
-/// target's view shows. Forwards `swap_through`'s future.
+/// the next swap also re-places each path they changed. A hold resetting local changes re-places
+/// each tracked path holding one as well ([`hold::add_reset_paths`]), after it gives each
+/// directory renamed in case alone the served revision's spelling back through an instance
+/// rename, which a dry run leaves. The kernel is told of the changes the target's view shows.
+/// Forwards `swap_through`'s future.
 #[inline]
 pub fn hold_mounted(
     fs: &FuseFilesystem,

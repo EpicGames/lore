@@ -342,7 +342,16 @@ first, lose the socket and leave dead endpoints.
 - Clone, sync and branch switch hand the provider the target revision alone
   (`InstanceOperationImpl::hold_state`, `fs/filesystem_provider.rs`; `realize_state`,
   `fs/realize.rs`), with `HoldOptions`: `--force` overwrites local changes, forwarding local
-  changes keeps them, and `--dry-run` changes nothing. The provider takes it in
+  changes keeps them, `--reset` gives every tracked path holding a local change the target's
+  content and keeps files added locally where the target places nothing, and `--dry-run`
+  changes nothing. A reset re-places
+  those paths as the swap after an incomplete apply re-places the paths it changed: each local
+  file found through the dirty marks of the served State where the served revision, read clean,
+  holds a node, under the revision's spelling, and each path of the deletion list
+  (`hold::add_reset_paths`). It gives a file or directory renamed in case the revision's
+  spelling, a directory through an instance rename before the apply, which a dry run leaves,
+  and replaces a directory made where a tracked file stood, with the files added in it, as an
+  ordinary clone's reset does. The provider takes it in
   `swap::hold_mounted`, through the provider-agnostic `fs/hold.rs`: it diffs the served revision,
   read clean, against the target (`hold::changes`), checks the local changes the served State
   carries against that diff (`hold::check`), applies it (`hold::apply`), and reports it as a sync does: the totals once
@@ -1576,9 +1585,17 @@ Open follow-ups from milestone 3:
   is a directory the target replaces with a file holding a local edit of the content it
   replaces, where an ordinary clone compares each file (`hold::check`). A refused path is named without the sizes an ordinary clone gives. A sync
   forwarding local changes reports every change the view shows, those it leaves local included,
-  where an ordinary clone reports only what it writes (`hold::report`). A sync resetting local
-  changes (`--reset`) is refused on a virtual clone, as is one carrying layers or restricted to a
-  dependency set (`lore-revision/src/revision/sync.rs`).
+  where an ordinary clone reports only what it writes (`hold::report`). A sync carrying layers
+  or restricted to a dependency set is refused on a virtual clone
+  (`lore-revision/src/revision/sync.rs`).
+- **What a reset leaves and reports.** A sync or branch switch resetting local changes leaves a
+  symbolic link standing at a tracked file's path, and writes nothing through it, as a forced
+  sync does; an ordinary clone's reset writes the file through the link (lore-f16d). It still
+  reports the file added (lore-iul6). A symbolic link standing at a tracked directory's path
+  goes, and the directory comes back, where an ordinary clone's reset writes its files through
+  the link. It re-places and reports each path holding a local
+  change, one already holding the target's content included, where an ordinary clone reports
+  what it writes (`hold::add_reset_paths`).
 - **A hold decodes the changed blocks twice.** A sync or branch switch diffs a clean State of the
   served revision against the target (`hold::changes`): the served State carries the local
   changes in place, so it cannot stand for the revision. Each block the diff visits is decoded a

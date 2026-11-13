@@ -155,6 +155,26 @@ async fn a_sync_forwarding_local_changes_holds_the_target_keeping_them() {
     assert_eq!(vec![(outcome.target, options)], outcome.holds);
 }
 
+/// A sync resetting local changes asks the provider to reset them.
+#[tokio::test]
+async fn a_reset_sync_holds_the_target_resetting_local_changes() {
+    let outcome = sync_onto(
+        TestFilesystemProvider::holding_state(),
+        SyncOptions {
+            reset: true,
+            ..Default::default()
+        },
+        LoreGlobalArgs::default(),
+    )
+    .await;
+    outcome.result.expect("the reset sync succeeds");
+    let options = HoldOptions {
+        reset_local: true,
+        ..Default::default()
+    };
+    assert_eq!(vec![(outcome.target, options)], outcome.holds);
+}
+
 /// A dry-run sync asks the provider for a dry run, and reads no ignore file into the store.
 #[tokio::test]
 async fn a_dry_run_sync_holds_the_target_in_a_dry_run() {

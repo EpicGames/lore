@@ -16363,21 +16363,40 @@ async fn switch_through(
     fs: &Arc<FuseFilesystem>,
     name: &str,
 ) -> Result<Hash, String> {
+    switch_with(
+        instance,
+        fs,
+        name,
+        lore_revision::repository::BranchSwitchOptions {
+            local: true,
+            ..Default::default()
+        },
+        Default::default(),
+    )
+    .await
+}
+
+/// Runs `lore branch switch <name>` with `options` through `fs`, as relayed to the service,
+/// under `globals`.
+async fn switch_with(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+    name: &str,
+    options: lore_revision::repository::BranchSwitchOptions,
+    globals: lore_revision::interface::LoreGlobalArgs,
+) -> Result<Hash, String> {
     use lore_revision::repository::RepositoryWriteToken;
 
     let token = RepositoryWriteToken::acquire(&instance.fixture.path).await;
     let context = instance.command_context(fs, Some(token.share()));
     LORE_CONTEXT
         .scope(
-            fuse_fixture::setup_test_execution(),
+            fuse_fixture::test_execution_with(globals),
             Box::pin(lore_revision::repository::branch_switch(
                 context,
                 &token,
                 name.to_string(),
-                lore_revision::repository::BranchSwitchOptions {
-                    local: true,
-                    ..Default::default()
-                },
+                options,
             )),
         )
         .await
@@ -17120,6 +17139,725 @@ async fn a_forced_sync_keeps_untracked_files_below_a_removed_directory() {
                     && !changed.contains(&"gone/x.txt".to_string()),
                 "{changed:?}"
             );
+        })
+        .await;
+}
+
+/// Runs `lore sync <revision> --reset` through `fs` under `globals`, answering the files it
+/// reports ([`sync_reporting`]).
+async fn reset_sync_through(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+    revision: Hash,
+    globals: lore_revision::interface::LoreGlobalArgs,
+) -> (
+    Result<(), lore_revision::revision::sync::SyncError>,
+    Vec<String>,
+) {
+    let options = lore_revision::revision::sync::SyncOptions {
+        revision: Some(revision.to_string()),
+        reset: true,
+        ..Default::default()
+    };
+    sync_reporting(instance, fs, options, globals).await
+}
+
+/// A sync resetting local changes gives each tracked path the target's content, where the target
+/// changes the path and where it leaves it, and keeps a file added locally: `write/` holds the
+/// added file alone, and status reports it alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_gives_each_tracked_path_the_target_and_keeps_added_files() {
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let f = lookup_path(&fs, "dir/f.txt").await.expect("f.txt");
+            fs.write(&request(), f, 0, 0, b"TWO!", 0)
+                .await
+                .expect("write");
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            let k = lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.write(&request(), k, 0, 0, b"KEPT!", 0)
+                .await
+                .expect("write");
+            create_with(&fs, keep, "new.txt", b"added").await;
+
+            reset_sync_through(&instance, &fs, first, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            for (path, content) in [
+                ("dir/f.txt", &b"one"[..]),
+                ("keep/k.txt", b"kept"),
+                ("keep/new.txt", b"added"),
+            ] {
+                let ino = lookup_path(&fs, path).await.expect(path);
+                assert_eq!(read(&fs, ino, 64).await, content, "{path}");
+            }
+            assert!(!instance.write_dir().join("dir/f.txt").exists());
+            assert!(!instance.write_dir().join("keep/k.txt").exists());
+            assert!(instance.write_dir().join("keep/new.txt").exists());
+            assert_eq!(changed_paths(&instance, &fs).await, vec!["keep/new.txt"]);
+        })
+        .await;
+}
+
+/// A sync resetting local changes brings back a tracked file deleted locally that the target
+/// leaves, and a remount serves it too: the deletion list holds it no more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_restores_a_file_deleted_locally_and_a_remount_serves_it() {
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.unlink(&request(), keep, b"k.txt").await.expect("unlink");
+
+            reset_sync_through(&instance, &fs, first, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            let k = lookup_path(&fs, "keep/k.txt").await.expect("k.txt is back");
+            assert_eq!(read(&fs, k, 64).await, b"kept");
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+            let remounted = provider_at(&instance, first).await;
+            let k = lookup_path(&remounted, "keep/k.txt")
+                .await
+                .expect("the remount serves k.txt");
+            assert_eq!(read(&remounted, k, 64).await, b"kept");
+        })
+        .await;
+}
+
+/// A sync resetting local changes to the revision the mount serves discards them: an edit takes
+/// the revision's content again, a deleted file comes back, and status reports nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_to_the_served_revision_discards_local_changes() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            let k = lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.write(&request(), k, 0, 0, b"KEPT!", 0)
+                .await
+                .expect("write");
+            let dir = lookup_path(&fs, "dir").await.expect("dir");
+            lookup(&fs, dir, "g.txt").await.expect("g.txt");
+            fs.unlink(&request(), dir, b"g.txt").await.expect("unlink");
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            for (path, content) in [("keep/k.txt", &b"kept"[..]), ("dir/g.txt", b"g-two")] {
+                let ino = lookup_path(&fs, path).await.expect(path);
+                assert_eq!(read(&fs, ino, 64).await, content, "{path}");
+            }
+            assert_eq!(fs.served().revision(), second);
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A dry run of a sync resetting local changes reports the paths it would reset and changes
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dry_run_reset_sync_reports_the_paths_and_changes_nothing() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            let k = lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.write(&request(), k, 0, 0, b"KEPT!", 0)
+                .await
+                .expect("write");
+
+            let (dry, reported) = reset_sync_through(
+                &instance,
+                &fs,
+                second,
+                lore_revision::interface::LoreGlobalArgs {
+                    dry_run: 1,
+                    ..Default::default()
+                },
+            )
+            .await;
+            dry.expect("the dry run");
+
+            assert!(
+                reported.iter().any(|line| line.ends_with(" keep/k.txt")),
+                "{reported:?}"
+            );
+            let k = lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            assert_eq!(read(&fs, k, 64).await, b"KEPT!");
+            assert_eq!(changed_paths(&instance, &fs).await, vec!["keep/k.txt"]);
+        })
+        .await;
+}
+
+/// A sync resetting local changes brings back a tracked file a local rename moved away and keeps
+/// the file at its new name, edited since: the revision holds nothing there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_keeps_the_file_a_rename_moved_a_tracked_file_to() {
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.rename(&request(), keep, b"k.txt", keep, b"m.txt", 0)
+                .await
+                .expect("rename");
+            let m = lookup(&fs, keep, "m.txt").await.expect("m.txt");
+            fs.write(&request(), m, 0, 0, b"MOVED!", 0)
+                .await
+                .expect("write");
+
+            reset_sync_through(&instance, &fs, first, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            for (path, content) in [("keep/k.txt", &b"kept"[..]), ("keep/m.txt", b"MOVED!")] {
+                let ino = lookup_path(&fs, path).await.expect(path);
+                assert_eq!(read(&fs, ino, 64).await, content, "{path}");
+            }
+            assert_eq!(changed_paths(&instance, &fs).await, vec!["keep/m.txt"]);
+        })
+        .await;
+}
+
+/// A sync resetting local changes gives a file renamed in case alone the revision's spelling
+/// back, and a remount serves it under that spelling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_gives_a_file_renamed_in_case_the_revision_spelling() {
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.rename(&request(), keep, b"k.txt", keep, b"K.txt", 0)
+                .await
+                .expect("rename");
+
+            reset_sync_through(&instance, &fs, first, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            let k = lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            assert_eq!(read(&fs, k, 64).await, b"kept");
+            assert_eq!(lookup(&fs, keep, "K.txt").await, Err(Errno::ENOENT));
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+            let remounted = provider_at(&instance, first).await;
+            let keep = lookup_path(&remounted, "keep").await.expect("keep");
+            lookup(&remounted, keep, "k.txt")
+                .await
+                .expect("the remount serves k.txt");
+        })
+        .await;
+}
+
+/// A sync resetting local changes gives a tracked path a directory made locally stands at its
+/// file back, removing the directory with the file added in it, as an ordinary clone's does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_replaces_a_directory_made_at_a_tracked_file_with_the_file() {
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.unlink(&request(), keep, b"k.txt").await.expect("unlink");
+            let made = fs
+                .mkdir(&request(), keep, b"k.txt", libc::S_IFDIR | 0o755, 0o022)
+                .await
+                .expect("mkdir")
+                .ino;
+            create_with(&fs, made, "inner.txt", b"inner").await;
+
+            reset_sync_through(&instance, &fs, first, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            let k = lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            assert_eq!(read(&fs, k, 64).await, b"kept");
+            assert!(!instance.write_dir().join("keep/k.txt").exists());
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A sync resetting local changes leaves a symlink made at a tracked file's path and writes
+/// nothing through it, as a forced sync does; status still lists the path.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_keeps_a_symlink_made_at_a_tracked_file() {
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.unlink(&request(), keep, b"k.txt").await.expect("unlink");
+            fs.symlink(&request(), keep, b"k.txt", b"../dir/f.txt")
+                .await
+                .expect("symlink");
+
+            reset_sync_through(&instance, &fs, first, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            let link = lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            assert_eq!(link_target(&fs, link).await, b"../dir/f.txt");
+            let f = lookup_path(&fs, "dir/f.txt").await.expect("f.txt");
+            assert_eq!(read(&fs, f, 64).await, b"one");
+            assert!(
+                changed_paths(&instance, &fs)
+                    .await
+                    .contains(&"keep/k.txt".to_string())
+            );
+        })
+        .await;
+}
+
+/// A sync resetting local changes brings back a tracked directory deleted whole, with its files.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_restores_a_directory_deleted_whole() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let dir = lookup_path(&fs, "dir").await.expect("dir");
+            lookup(&fs, dir, "f.txt").await.expect("f.txt");
+            lookup(&fs, dir, "g.txt").await.expect("g.txt");
+            fs.unlink(&request(), dir, b"f.txt").await.expect("unlink");
+            fs.unlink(&request(), dir, b"g.txt").await.expect("unlink");
+            fs.rmdir(&request(), ROOT_INO, b"dir").await.expect("rmdir");
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            for (path, content) in [("dir/f.txt", &b"two"[..]), ("dir/g.txt", b"g-two")] {
+                let ino = lookup_path(&fs, path).await.expect(path);
+                assert_eq!(read(&fs, ino, 64).await, content, "{path}");
+            }
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A sync resetting local changes brings back the files of a tracked directory deleted and made
+/// again, and keeps the file added in it since.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_keeps_a_file_added_in_a_directory_deleted_and_made_again() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.unlink(&request(), keep, b"k.txt").await.expect("unlink");
+            fs.rmdir(&request(), ROOT_INO, b"keep")
+                .await
+                .expect("rmdir");
+            let made = fs
+                .mkdir(&request(), ROOT_INO, b"keep", libc::S_IFDIR | 0o755, 0o022)
+                .await
+                .expect("mkdir")
+                .ino;
+            create_with(&fs, made, "new.txt", b"added").await;
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            for (path, content) in [("keep/k.txt", &b"kept"[..]), ("keep/new.txt", b"added")] {
+                let ino = lookup_path(&fs, path).await.expect(path);
+                assert_eq!(read(&fs, ino, 64).await, content, "{path}");
+            }
+            assert_eq!(changed_paths(&instance, &fs).await, vec!["keep/new.txt"]);
+        })
+        .await;
+}
+
+/// A branch switch resetting local changes discards them, as a sync resetting them does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_branch_switch_discards_local_changes() {
+    let instance = sync_instance().await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            create_branch_through(&instance, &fs, "other").await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            let k = lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.write(&request(), k, 0, 0, b"KEPT!", 0)
+                .await
+                .expect("write");
+
+            switch_with(
+                &instance,
+                &fs,
+                "other",
+                lore_revision::repository::BranchSwitchOptions {
+                    local: true,
+                    reset: true,
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+            .await
+            .expect("the reset switch");
+
+            let k = lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            assert_eq!(read(&fs, k, 64).await, b"kept");
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A sync resetting local changes gives a directory renamed in case alone the revision's
+/// spelling back, keeping the file added in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_gives_a_directory_renamed_in_case_the_revision_spelling() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            fs.rename(&request(), ROOT_INO, b"keep", ROOT_INO, b"Keep", 0)
+                .await
+                .expect("rename");
+            let keep = lookup(&fs, ROOT_INO, "Keep").await.expect("Keep");
+            create_with(&fs, keep, "new.txt", b"added").await;
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            assert_eq!(lookup(&fs, ROOT_INO, "Keep").await, Err(Errno::ENOENT));
+            for (path, content) in [("keep/k.txt", &b"kept"[..]), ("keep/new.txt", b"added")] {
+                let ino = lookup_path(&fs, path).await.expect(path);
+                assert_eq!(read(&fs, ino, 64).await, content, "{path}");
+            }
+            assert_eq!(changed_paths(&instance, &fs).await, vec!["keep/new.txt"]);
+        })
+        .await;
+}
+
+/// A sync resetting local changes brings back a file renamed in case and then deleted under the
+/// revision's spelling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_restores_a_file_renamed_in_case_then_deleted_as_the_revision_spells_it() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.rename(&request(), keep, b"k.txt", keep, b"K.txt", 0)
+                .await
+                .expect("rename");
+            lookup(&fs, keep, "K.txt").await.expect("K.txt");
+            fs.unlink(&request(), keep, b"K.txt").await.expect("unlink");
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            let k = lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            assert_eq!(read(&fs, k, 64).await, b"kept");
+            assert_eq!(lookup(&fs, keep, "K.txt").await, Err(Errno::ENOENT));
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A sync resetting local changes gives back a tracked file deleted and made again in another
+/// case, under the revision's spelling and with its content.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_replaces_a_tracked_file_made_again_in_another_case() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.unlink(&request(), keep, b"k.txt").await.expect("unlink");
+            create_with(&fs, keep, "K.txt", b"NEW").await;
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            let k = lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            assert_eq!(read(&fs, k, 64).await, b"kept");
+            assert_eq!(lookup(&fs, keep, "K.txt").await, Err(Errno::ENOENT));
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A sync resetting local changes brings back a tracked directory an instance removal took whole,
+/// made again since with a directory standing at its file: the directory there goes, with the
+/// file added in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_replaces_a_directory_at_a_tracked_file_in_a_directory_made_again() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            use lore_revision::fs::filesystem_provider::InstanceOperation as _;
+            let keep = lore_revision::util::path::RelativePath::new_from_initial_path("keep")
+                .expect("path");
+            lore_revision::fs::fuse::operation::FuseOperation::new(fs.clone())
+                .remove_recursive(&keep)
+                .await
+                .expect("the instance removal");
+            let mut dir = ROOT_INO;
+            for name in ["keep", "k.txt"] {
+                dir = fs
+                    .mkdir(
+                        &request(),
+                        dir,
+                        name.as_bytes(),
+                        libc::S_IFDIR | 0o755,
+                        0o022,
+                    )
+                    .await
+                    .expect("mkdir")
+                    .ino;
+            }
+            create_with(&fs, dir, "inner.txt", b"inner").await;
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            let k = lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            assert_eq!(read(&fs, k, 64).await, b"kept");
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A sync resetting local changes to a revision that deletes a file deleted locally reports the
+/// deletion once and leaves nothing of the directory the target removes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_deleting_a_file_deleted_locally_reports_the_deletion_once() {
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let gone = lookup_path(&fs, "gone").await.expect("gone");
+            lookup(&fs, gone, "x.txt").await.expect("x.txt");
+            fs.unlink(&request(), gone, b"x.txt").await.expect("unlink");
+
+            let (synced, reported) =
+                reset_sync_through(&instance, &fs, first, Default::default()).await;
+            synced.expect("the reset sync");
+
+            let deleted: Vec<&String> = reported
+                .iter()
+                .filter(|line| line.ends_with(" gone/x.txt"))
+                .collect();
+            assert_eq!(deleted.len(), 1, "{reported:?}");
+            assert_eq!(lookup_path(&fs, "gone").await, Err(Errno::ENOENT));
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A sync resetting local changes gives a tracked directory deleted and made again in another
+/// case the revision's spelling, keeping the file added in it, and a remount serves it so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_gives_a_directory_made_again_in_another_case_the_revision_spelling() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.unlink(&request(), keep, b"k.txt").await.expect("unlink");
+            fs.rmdir(&request(), ROOT_INO, b"keep")
+                .await
+                .expect("rmdir");
+            let made = fs
+                .mkdir(&request(), ROOT_INO, b"Keep", libc::S_IFDIR | 0o755, 0o022)
+                .await
+                .expect("mkdir")
+                .ino;
+            create_with(&fs, made, "new.txt", b"added").await;
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            assert_eq!(lookup(&fs, ROOT_INO, "Keep").await, Err(Errno::ENOENT));
+            for (path, content) in [("keep/k.txt", &b"kept"[..]), ("keep/new.txt", b"added")] {
+                let ino = lookup_path(&fs, path).await.expect(path);
+                assert_eq!(read(&fs, ino, 64).await, content, "{path}");
+            }
+            assert_eq!(changed_paths(&instance, &fs).await, vec!["keep/new.txt"]);
+            let remounted = provider_at(&instance, second).await;
+            lookup_path(&remounted, "keep/k.txt")
+                .await
+                .expect("the remount serves keep/k.txt");
+        })
+        .await;
+}
+
+/// A sync resetting local changes to a revision that deletes a tracked file removes it where it
+/// was deleted and made again under the same name, as it removes an edit of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_removes_a_file_made_again_where_the_target_deletes_it() {
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let gone = lookup_path(&fs, "gone").await.expect("gone");
+            lookup(&fs, gone, "x.txt").await.expect("x.txt");
+            fs.unlink(&request(), gone, b"x.txt").await.expect("unlink");
+            create_with(&fs, gone, "x.txt", b"NEW").await;
+
+            reset_sync_through(&instance, &fs, first, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            assert_eq!(lookup_path(&fs, "gone/x.txt").await, Err(Errno::ENOENT));
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A sync resetting local changes leaves a symlink made in another case at a tracked file's
+/// path, as it leaves one under the file's own spelling, and writes nothing through it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_keeps_a_symlink_made_in_another_case_at_a_tracked_file() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.unlink(&request(), keep, b"k.txt").await.expect("unlink");
+            fs.symlink(&request(), keep, b"K.txt", b"../dir/f.txt")
+                .await
+                .expect("symlink");
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            let link = lookup(&fs, keep, "K.txt").await.expect("K.txt");
+            assert_eq!(link_target(&fs, link).await, b"../dir/f.txt");
+            let f = lookup_path(&fs, "dir/f.txt").await.expect("f.txt");
+            assert_eq!(read(&fs, f, 64).await, b"two");
+        })
+        .await;
+}
+
+/// A sync resetting local changes leaves a directory it gave the revision's spelling back clean,
+/// where nothing in it changed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_settles_a_directory_it_respells() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            fs.rename(&request(), ROOT_INO, b"keep", ROOT_INO, b"Keep", 0)
+                .await
+                .expect("rename");
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            let keep = fs_node(&instance, &fs, "keep").await;
+            assert!(!keep.is_dirty(), "{keep:?}");
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A forced branch switch resetting local changes, which also keeps local changes the target
+/// leaves, discards the edits and keeps the files added locally.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forced_reset_branch_switch_discards_edits_and_keeps_added_files() {
+    let instance = sync_instance().await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            create_branch_through(&instance, &fs, "other").await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            let k = lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.write(&request(), k, 0, 0, b"KEPT!", 0)
+                .await
+                .expect("write");
+            create_with(&fs, keep, "new.txt", b"added").await;
+
+            switch_with(
+                &instance,
+                &fs,
+                "other",
+                lore_revision::repository::BranchSwitchOptions {
+                    local: true,
+                    reset: true,
+                    ..Default::default()
+                },
+                lore_revision::interface::LoreGlobalArgs {
+                    force: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the forced reset switch");
+
+            for (path, content) in [("keep/k.txt", &b"kept"[..]), ("keep/new.txt", b"added")] {
+                let ino = lookup_path(&fs, path).await.expect(path);
+                assert_eq!(read(&fs, ino, 64).await, content, "{path}");
+            }
+            assert_eq!(changed_paths(&instance, &fs).await, vec!["keep/new.txt"]);
         })
         .await;
 }

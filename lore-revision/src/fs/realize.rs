@@ -151,6 +151,7 @@ pub async fn realize_state(
             HoldOptions {
                 overwrite_local: globals.force(),
                 keep_local: options.forward_changes,
+                reset_local: options.reset,
                 dry_run: globals.dry_run(),
             }
         };

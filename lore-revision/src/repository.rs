@@ -4037,9 +4037,6 @@ pub async fn branch_switch(
     branch: String,
     options: BranchSwitchOptions,
 ) -> Result<Hash, RepositoryError> {
-    if options.reset && !options.bare && repository.file_system().holds_state() {
-        return Err(crate::fs::hold::refused("reset local changes in a branch switch").into());
-    }
     let context = execution_context();
     let global = context.globals();
 

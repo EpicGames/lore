@@ -438,20 +438,16 @@ async fn revision_advances_branch_latest(
 ///
 /// A provider that holds its state in a `State` ([`FilesystemProvider::holds_state`]) holds whole
 /// revisions, keeps its local changes itself and holds no files for a layer to be written into,
-/// so a sync restricted to a dependency set, one resetting local changes, and one carrying layers
-/// are refused there.
+/// so a sync restricted to a dependency set and one carrying layers are refused there. It resets
+/// its local changes itself
+/// ([`HoldOptions::reset_local`](crate::fs::filesystem_provider::HoldOptions::reset_local)).
 pub(crate) async fn sync(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: SyncOptions,
 ) -> Result<(), SyncError> {
-    if repository.file_system().holds_state() {
-        if !options.root_files.is_empty() {
-            return Err(hold::refused("restrict a sync to a dependency set").into());
-        }
-        if options.reset {
-            return Err(hold::refused("reset local changes in a sync").into());
-        }
+    if repository.file_system().holds_state() && !options.root_files.is_empty() {
+        return Err(hold::refused("restrict a sync to a dependency set").into());
     }
     let repository_current = repository.clone();
     let (repository, view_file) = match sync_load_view(&options).await? {

@@ -66,12 +66,14 @@ pub type Before = Option<Arc<State>>;
 
 /// The changes that carry `held`, a State at a revision with its local changes, to `target`: the
 /// unfiltered diff from that revision, read clean, so neither a view nor the local changes decide
-/// it, with each path of `unsettled`, which an incomplete apply changed, applied again. Sorted by
-/// path. With them, that revision's State, read clean, where the revision moves.
+/// it, with each path of `unsettled`, which an incomplete apply changed or a reset re-places
+/// ([`add_reset_paths`]), applied again. Sorted by path. With them, that revision's State, read
+/// clean, where the revision moves: `read` where given, which it is.
 pub async fn changes(
     held: (&Arc<RepositoryContext>, &Arc<State>),
     target: (&Arc<RepositoryContext>, &Arc<State>),
     unsettled: &BTreeMap<String, bool>,
+    read: Option<Arc<State>>,
 ) -> Result<(Vec<NodeChange>, Before), StateError> {
     let revision = held.1.revision();
     let moves = target.1.revision() != revision;
@@ -79,7 +81,10 @@ pub async fn changes(
         return Ok((Vec::new(), None));
     }
     let (mut changes, before) = if moves {
-        let current = State::deserialize(held.0.clone(), revision).await?;
+        let current = match read {
+            Some(read) => read,
+            None => State::deserialize(held.0.clone(), revision).await?,
+        };
         let changes = state::diff_collect(
             held.0.clone(),
             current.clone(),
@@ -104,6 +109,112 @@ pub async fn changes(
         crate::change::sort_by_path(&mut changes);
     }
     Ok((changes, before))
+}
+
+/// Adds to `replaced` each path at which the held State `paths` resolves holds a local change to a
+/// path its revision tracks, for a hold resetting local changes to re-place
+/// ([`HoldOptions::reset_local`]), spelled as `revision`, the held State's revision read clean,
+/// spells it: each local file or link standing where `revision` holds a node, false, and each
+/// path of `deleted`, the provider's local deletions, that `revision` holds, true, as it may lack
+/// the target's node. A deletion of a path `target` lacks too, where nothing stands now, is left
+/// to the diff, whose change there says what the path held. Local files at paths `revision` does
+/// not hold, added or moved there, are left out, so the reset keeps them. A path `replaced` holds
+/// already keeps its value, but a deletion adds back. Answers each directory, tracked or made
+/// again, that the held State spells otherwise than `revision`, a rename in case alone, as its
+/// path and the path under `revision`'s name. Of the directories holding no local change, only
+/// the root is listed.
+#[allow(clippy::while_let_loop)] // Keep the popped value out of the await state.
+pub async fn add_reset_paths(
+    paths: &mut Resolver<'_>,
+    (repository, revision): (&Arc<RepositoryContext>, &State),
+    target: (&Arc<RepositoryContext>, &State),
+    deleted: &[RelativePath],
+    replaced: &mut BTreeMap<String, bool>,
+) -> Result<Vec<(RelativePath, RelativePath)>, StateError> {
+    let mut respelled = Vec::new();
+    let mut pending = vec![(ROOT_NODE, RelativePath::new())];
+    loop {
+        let Some((dir, path)) = pending.pop() else {
+            break;
+        };
+        let count = paths.index(dir).await?.len();
+        for at in 0..count {
+            let child = paths.children[&dir][at].1;
+            let held = paths.node(child).await?;
+            if held.is_discarded() || held.parent != dir {
+                continue;
+            }
+            let added = held.is_dirty_add();
+            let walked = held.is_directory() && held.is_dirty() && !added;
+            let edited = !held.is_directory() && !added && is_local(&held);
+            if !walked && !edited && !(held.is_directory() && added) {
+                continue;
+            }
+            let name = paths
+                .state
+                .node_name_clone(paths.repository.clone(), child)
+                .await?;
+            let child_path = path.join(&name);
+            let tracked = tracked_spelling(repository, revision, &child_path).await?;
+            if !held.is_directory() {
+                if let Some(tracked) = tracked {
+                    replaced.entry(tracked).or_insert(false);
+                }
+                continue;
+            }
+            if let Some(tracked) = tracked
+                && let Some(tracked_name) = tracked.rsplit('/').next()
+                && tracked_name != name
+            {
+                respelled.push((child_path.clone(), path.join(tracked_name)));
+            }
+            if walked {
+                pending.push((child, child_path));
+            }
+        }
+    }
+    for path in deleted {
+        let Some(tracked) = tracked_spelling(repository, revision, path).await? else {
+            continue;
+        };
+        if tracked_node(target.0, target.1, path).await?.is_some()
+            || paths.at(path).await?.is_some()
+        {
+            replaced.insert(tracked, true);
+        }
+    }
+    Ok(respelled)
+}
+
+/// The path at which `state` holds a node at `path`, compared case-folded, as `state` spells it;
+/// `None` where it holds none there, or reaches it through a link.
+async fn tracked_spelling(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    path: &RelativePath,
+) -> Result<Option<String>, StateError> {
+    match tracked_node(repository, state, path).await? {
+        Some(node) => Ok(Some(state.node_path(repository.clone(), node).await?)),
+        None => Ok(None),
+    }
+}
+
+/// The node `state` holds at `path`, compared case-folded; `None` where it holds none there, or
+/// reaches it through a link.
+async fn tracked_node(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    path: &RelativePath,
+) -> Result<Option<NodeID>, StateError> {
+    match state
+        .find_relative_node_link(repository.clone(), ROOT_NODE, path.as_str())
+        .await
+    {
+        Ok(link) if link.revision == state.revision() => Ok(Some(link.node)),
+        Ok(_) => Ok(None),
+        Err(error) if error.is_node_not_found() => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// What carrying `held`, a State at a revision with its local changes, to `target` changes in what
@@ -387,7 +498,7 @@ pub async fn check<H: HoldHost>(
     options: HoldOptions,
 ) -> Result<Matching, FsError> {
     let mut matching = Matching::new();
-    if options.overwrite_local || options.keep_local || changes.is_empty() {
+    if options.overwrites_local() || options.keep_local || changes.is_empty() {
         return Ok(matching);
     }
     lore_info!("Verifying {} changes with the held state", changes.len());
@@ -649,10 +760,10 @@ pub async fn report(changes: &[NodeChange]) -> Result<(), StateError> {
     Ok(())
 }
 
-/// The change that applies `target` again at `path`, which an incomplete apply changed, from what
-/// `held` holds there now: an add where the path may lack the target's node (`adds_back`), a keep
-/// otherwise, so a path deleted since stays deleted, and a delete where the target holds nothing.
-/// `None` where either side reaches `path` through a link.
+/// The change that applies `target` again at `path`, which an incomplete apply changed or a reset
+/// re-places, from what `held` holds there now: an add where the path may lack the target's node
+/// (`adds_back`), a keep otherwise, so a path deleted since stays deleted, and a delete where the
+/// target holds nothing. `None` where either side reaches `path` through a link.
 async fn replacement(
     held: (&Arc<RepositoryContext>, &Arc<State>),
     target: (&Arc<RepositoryContext>, &Arc<State>),
@@ -794,21 +905,21 @@ pub enum SwapPhase {
 /// A test's hook into an apply, run at each [`SwapPhase`]; `false` fails the apply there.
 pub type SwapHook = Arc<dyn Fn(SwapPhase) -> BoxFuture<'static, bool> + Send + Sync>;
 
-/// Applies `changes`, the unfiltered diff from the revision the held State `paths` resolves
-/// stands at to the target, to that State in place: removed paths and move sources first,
-/// parents before children, then placed paths the same way, the provider's local content beside
-/// the State changed through `host`. A local change is never lost unless `options` overwrites
-/// local changes: a file or directory holding local content stays where the target removes or
-/// changes it, and a path the revision holds but the State does not, a local deletion, is brought
-/// back only where the target changes the file and `options` keeps no local change. Records each
-/// path it changes in `changed`, true where the next apply should add it back, and the State
-/// reads `paths` made in `reads`. Nothing below a directory it copied is placed again. A
-/// directory at a path of `unsettled`, which an earlier apply that did not complete changed, is
-/// made to match the target whole; each path below it that this changes goes to `reconciled`,
-/// and each local file a forced hold overwrote to `overwritten`. Each local file of `matching`,
-/// which [`check`] found holding what a change replaces or brings, is overwritten or removed as a
-/// forced hold does. `hook`, a test's, runs after each pass and around each copy; `false` fails
-/// the apply there.
+/// Applies `changes`, the unfiltered diff from the revision the held State `paths` resolves stands
+/// at to the target, to that State in place: removed paths and move sources first, parents before
+/// children, then placed paths the same way, the provider's local content beside the State changed
+/// through `host`. A local change is never lost unless `options` overwrites local changes: a file
+/// or directory holding local content stays where the target removes or changes it, and a path the
+/// revision holds but the State does not, a local deletion, is brought back only where the target
+/// changes the file and `options` keeps no local change, or a reset re-places the path. Records
+/// each path it changes in `changed`, true where the next apply should add it back, and the State
+/// reads `paths` made in `reads`. Nothing below a directory it copied is placed again. A directory
+/// at a path of `unsettled`, which an earlier apply that did not complete changed or a reset
+/// re-places, is made to match the target whole; each path below it that this changes goes to
+/// `reconciled`, and each local file a forced hold overwrote to `overwritten`. Each local file of
+/// `matching`, which [`check`] found holding what a change replaces or brings, is overwritten or
+/// removed as a forced hold does. `hook`, a test's, runs after each pass and around each copy;
+/// `false` fails the apply there.
 pub async fn apply<H: HoldHost>(
     (host, paths): (&H, Resolver<'_>),
     changes: &[NodeChange],
@@ -921,8 +1032,8 @@ struct Directories<'a, H> {
     changed: &'a mut BTreeMap<String, bool>,
     /// The directories this apply attached whole, by path; nothing below them is placed again.
     copied: BTreeSet<String>,
-    /// The paths an earlier apply that did not complete changed; a directory there is made to
-    /// match the target whole.
+    /// The paths an earlier apply that did not complete changed, and those a reset re-places; a
+    /// directory there is made to match the target whole.
     unsettled: &'a BTreeMap<String, bool>,
     /// The paths below such a directory that making it match changed, and the files restored.
     reconciled: Vec<RelativePath>,
@@ -967,7 +1078,7 @@ impl<'a, H: HoldHost> Directories<'a, H> {
     /// the hold overwrites local changes, or the file still holds what [`check`] found it holding
     /// what the change replaces or brings, measured again here, so an edit landing since is kept.
     async fn overwrites(&self, path: &RelativePath) -> Result<bool, StateError> {
-        if self.options.overwrite_local {
+        if self.options.overwrites_local() {
             return Ok(true);
         }
         let Some(&(address, size)) = self.matching.get(path.as_str()) else {
@@ -1208,25 +1319,35 @@ impl<'a, H: HoldHost> Directories<'a, H> {
     }
 
     /// Removes what stands at `path`, unless it holds local content: a file with local content
-    /// stays, and a directory holding some keeps it and loses everything else.
+    /// stays, and a directory holding some keeps it and loses everything else. A reset removes a
+    /// file standing under `path`'s own spelling whatever it holds, a symlink aside.
     async fn remove(&mut self, path: &RelativePath) -> Result<(), StateError> {
         let Some((node, held)) = self.paths.at(path).await? else {
             return Ok(());
         };
-        if Box::pin(self.remove_node(node, held, path)).await? {
+        // A reset removes a file made again under the revision's spelling as it removes an edit
+        // of it; one in another spelling stays, as an ordinary clone keeps it untracked.
+        let whole = self.options.reset_local
+            && held.is_file()
+            && !held.ext_flags().contains(NodeExtFlags::Symlink)
+            && self.paths.spelled(node, path).await.name() == path.name();
+        if Box::pin(self.remove_node(node, held, path, whole)).await? {
             self.paths.note_detached(path);
         }
         Ok(())
     }
 
-    /// Detaches `node`, whose record is `held`, at `path`, and answers true unless it holds
-    /// local content, in which case only the rest of it goes. A directory that is not dirty
-    /// holds none, since local content dirties every ancestor, so nothing below it is read.
+    /// Detaches `node`, whose record is `held`, at `path`, and answers true unless it holds local
+    /// content, in which case only the rest of it goes. Where `whole`, as for a reset placing a
+    /// node of the other kind or a file in the target's spelling, local content goes too: files and
+    /// links added locally, and the directories holding them. A directory that is not dirty holds
+    /// none, since local content dirties every ancestor, so nothing below it is read.
     async fn remove_node(
         &mut self,
         node: NodeID,
         held: Node,
         path: &RelativePath,
+        whole: bool,
     ) -> Result<bool, StateError> {
         let local = is_local(&held);
         if !local {
@@ -1255,8 +1376,8 @@ impl<'a, H: HoldHost> Directories<'a, H> {
             // A forced hold overwrites a local edit of a file the revision holds, never a file
             // added locally, which an ordinary clone keeps too.
             if !(local
-                && !held.is_dirty_add()
-                && !held.ext_flags().contains(NodeExtFlags::Symlink)
+                && (whole
+                    || (!held.is_dirty_add() && !held.ext_flags().contains(NodeExtFlags::Symlink)))
                 && self.overwrites(path).await?)
             {
                 return Ok(false);
@@ -1295,9 +1416,17 @@ impl<'a, H: HoldHost> Directories<'a, H> {
                 .node_name_clone(self.paths.repository.clone(), child)
                 .await?;
             let child_path = path.join(&name);
-            kept |= !Box::pin(self.remove_node(child, child_node, &child_path)).await?;
+            // A reset removes a file it re-places, a tracked file made again, as it removes an
+            // edit of it.
+            let child_whole = whole
+                || (self.options.reset_local
+                    && child_node.is_file()
+                    && !child_node.ext_flags().contains(NodeExtFlags::Symlink)
+                    && self.unsettled.contains_key(child_path.as_str()));
+            kept |=
+                !Box::pin(self.remove_node(child, child_node, &child_path, child_whole)).await?;
         }
-        if kept || held.ext_flags().contains(NodeExtFlags::LocalContent) {
+        if kept || (!whole && held.ext_flags().contains(NodeExtFlags::LocalContent)) {
             return Ok(false);
         }
         let spelled = self.paths.spelled(node, path).await;
@@ -1317,13 +1446,14 @@ impl<'a, H: HoldHost> Directories<'a, H> {
     }
 
     /// Sets what stands at `path` in directory `parent` to `wanted`, node `side.node` of
-    /// `side.state`. A file of either side holding local content stays as it is, unless the
-    /// hold overwrites local changes, which gives a local file the target's content. A tracked
-    /// file takes the target's content in place, and a node of another kind is replaced by a
-    /// copy. Where nothing stands, the path is added where the change adds it or restores it
-    /// (`absent`): a path the revision holds and the State does not is a local deletion, which
-    /// only a change of the file restores. A directory the change adds over a directory takes
-    /// whatever of the target's subtree it lacks.
+    /// `side.state`. A file of either side holding local content stays as it is, unless the hold
+    /// overwrites local changes, which gives a local file the target's content. A tracked file
+    /// takes the target's content in place, and a node of another kind is replaced by a copy. A
+    /// reset also gives a local file the target's spelling, and removes a node of the other kind
+    /// whole, local content included. Where nothing stands, the path is added where the change adds
+    /// it or restores it (`absent`): a path the revision holds and the State does not is a local
+    /// deletion, which only a change of the file restores. A directory the change adds over a
+    /// directory takes whatever of the target's subtree it lacks.
     async fn place(
         &mut self,
         parent: NodeID,
@@ -1346,9 +1476,14 @@ impl<'a, H: HoldHost> Directories<'a, H> {
             }
             return Ok(());
         };
-        // Measured before the match, whose guards cannot wait.
+        // Measured before the match, whose guards cannot wait: whether a local file is
+        // overwritten, and then how the State spells it.
         let overwrite =
             held.is_file() && wanted.is_file() && is_local(&held) && self.overwrites(path).await?;
+        let spelled = match overwrite {
+            true => Some(self.paths.spelled(existing, path).await),
+            false => None,
+        };
         match (held.is_file(), wanted.is_file()) {
             (true, true) if !is_local(&held) => {
                 self.record(path, false);
@@ -1384,10 +1519,27 @@ impl<'a, H: HoldHost> Directories<'a, H> {
                 }
                 Ok(())
             }
+            (true, true)
+                if self.options.reset_local
+                    && spelled
+                        .as_ref()
+                        .is_some_and(|spelled| spelled.name() != name) =>
+            {
+                // A reset gives the file the target's spelling too, as an ordinary clone's does,
+                // over a file added locally as well; a symlink stays.
+                let whole = !held.ext_flags().contains(NodeExtFlags::Symlink);
+                if Box::pin(self.remove_node(existing, held, path, whole)).await? {
+                    self.paths.note_detached(path);
+                    if let Some(node) = self.copy(parent, path, wanted, side).await? {
+                        self.paths.note_attached(path, node, wanted.is_directory());
+                    }
+                }
+                Ok(())
+            }
             (true, true) if overwrite => {
                 self.record(path, false);
                 self.phase(SwapPhase::Modify).await?;
-                let spelled = self.paths.spelled(existing, path).await;
+                let spelled = spelled.unwrap_or_else(|| path.clone());
                 let overwritten = self
                     .host
                     .overwrite_local(&spelled, existing, (parent, held.name_hash), wanted)
@@ -1407,7 +1559,8 @@ impl<'a, H: HoldHost> Directories<'a, H> {
             }
             (true, true) | (false, false) => Ok(()),
             _ => {
-                if Box::pin(self.remove_node(existing, held, path)).await? {
+                let whole = self.options.reset_local;
+                if Box::pin(self.remove_node(existing, held, path, whole)).await? {
                     self.paths.note_detached(path);
                     if let Some(node) = self.copy(parent, path, wanted, side).await? {
                         self.paths.note_attached(path, node, wanted.is_directory());
@@ -1580,7 +1733,7 @@ async fn fill_in<H: HoldHost>(
                     path.join(&from.node_name_clone(from_repository.clone(), child).await?);
                 // Read again, as the record read above is not held this far.
                 let existing_node = dirs.paths.node(existing).await?;
-                if Box::pin(dirs.remove_node(existing, existing_node, &child_path)).await? {
+                if Box::pin(dirs.remove_node(existing, existing_node, &child_path, false)).await? {
                     dirs.copy(dir, &child_path, &wanted, &child_side).await?;
                 }
                 dirs.reconciled.push(child_path);
@@ -1605,7 +1758,7 @@ async fn fill_in<H: HoldHost>(
             .node_name_clone(dirs.paths.repository.clone(), node)
             .await?;
         let child_path = path.join(&name);
-        Box::pin(dirs.remove_node(node, record, &child_path)).await?;
+        Box::pin(dirs.remove_node(node, record, &child_path, false)).await?;
         dirs.reconciled.push(child_path);
     }
     Ok(())
