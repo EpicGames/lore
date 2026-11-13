@@ -1,6 +1,6 @@
 ---
-status: proposed
-date: 2026-10-30
+status: accepted
+date: 2026-11-13
 amended: 2026-11-11
 ---
 

@@ -1,6 +1,6 @@
 ---
-status: proposed
-date: 2026-11-02
+status: accepted
+date: 2026-11-13
 deciders: Mattias Jansson
 ---
 

@@ -26,7 +26,7 @@ When `context/team-workspace.md` exists, follow it before non-trivial work. It d
 
 ## Before writing code
 
-1. Search `docs/developing/decisions` for decisions about the work. Read those that apply, and follow them.
+1. Search `docs/developing/decisions` for decisions about the work. Read those that apply, and follow them. If the work must depart from an accepted ADR, it comes with a new ADR that supersedes it, in the same change.
 2. Read the standards in [Guidance](#guidance) that apply to the work.
 3. Search the code for functions and types that already do what the work needs. Generalize one rather than add another beside it, unless the general form costs performance on a hot path, and say so in the new function's doc comment.
 
@@ -46,7 +46,7 @@ Follow the standards in [Guidance](#guidance) that apply to the code.
 
 Read the standards in [Guidance](#guidance) that apply to the finished work again, and check the work against them.
 
-1. Record an architectural decision that would take more than a day to reverse as an ADR in `docs/developing/decisions`, following `adr-template.md` and that directory's `README.md`. Set a superseded ADR's `status` field to `superseded by [ADR-NNNNN](NNNNN-slug.md)`.
+1. Record an architectural decision the code made concrete, and that would take more than a day to reverse, as an ADR in `docs/developing/decisions`, following `adr-template.md` and that directory's `README.md`. Write it in this change or in a follow-up named in the change's description. A new ADR that supersedes one the work departed from belongs in this change. Set a superseded ADR's `status` field to `superseded by [ADR-NNNNN](NNNNN-slug.md)`.
 2. Update any page in `docs/explanation`, `docs/how-to`, or `docs/tutorials` that the change makes stale.
 3. Add a release note for every change to shipped behaviour: a file in `docs/release-notes/`, as its `README.md` describes, rather than an entry in `docs/release-notes.md`. Only tests, CI, tooling, docs and behaviour-preserving refactors need none.
 4. Check each claim in the comments and docs the change adds against the code, not against memory of writing it.

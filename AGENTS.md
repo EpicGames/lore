@@ -32,21 +32,22 @@ and how to reach it. Without it, work proceeds normally, and specs and plans sta
 A spec plus plan is the whole design record for ordinary work. This project does not
 generally use RFCs.
 
-Four classes are different. A **larger architectural change**, anything touching a
-**data format** or a **protocol**, and any **substantial new capability** are designed
-in this repo, in public:
+Two kinds of document live in this repo, in public, and they come at different times:
 
-- **LEPs** — `docs/proposals/YYYY-MM-DD-<slug>.md`. Required per `GOVERNANCE.md`;
-  discussed in public, and **accepted before the implementation is merged**;
-  implementation work may start while the LEP is under discussion.
-- **ADRs** — `docs/developing/decisions/<NNNNN>-<slug>.md`, for rulings below the
-  LEP bar.
-
-If you are about to write code in one of those four classes, the proposal comes
-first — not afterwards to describe what was built. The LEP bar is in `GOVERNANCE.md`
-and `CONTRIBUTING.md`.
+- **LEPs** — `docs/proposals/YYYY-MM-DD-<slug>.md`. An LEP aligns people on a change
+  before it merges. A change needs one when it affects the **wire protocol or on-disk
+  format**, **public APIs** (`lore` CLI commands, `lore-capi`, language bindings),
+  **cross-cutting features that span multiple subsystems**, or is **any breaking
+  change**. The LEP bar is in `GOVERNANCE.md` and `CONTRIBUTING.md`. An LEP is discussed
+  in public and **accepted before the implementation is merged**; implementation work
+  may start while it is under discussion. Write it early, not afterwards to describe
+  what was built.
+- **ADRs** — `docs/developing/decisions/<NNNNN>-<slug>.md`. An ADR records why an
+  architectural decision was made. Write a new ADR with the code that makes the decision
+  concrete, or after it; it is never a proposal. Accepted ADRs bind new code: a change that
+  departs from one comes with a new ADR that supersedes it, in the same change.
 
 ## Binding rules
 
-The Code of Conduct and the security policy bind every change. A change in one of the
-four classes above also needs an accepted LEP before it merges.
+The Code of Conduct and the security policy bind every change. A change that clears the
+LEP bar also needs an accepted LEP before it merges.

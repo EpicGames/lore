@@ -1,5 +1,5 @@
 ---
-status: proposed | rejected | accepted | deprecated | … | superseded by [ ADR-0005 ](0005-example.md)
+status: accepted | deprecated | superseded by [ADR-NNNNN](NNNNN-slug.md)
 date: YYYY-MM-DD when the decision was last updated
 # The below are optional elements. Feel free to remove any of them.
 deciders: list everyone involved in the decision
@@ -78,8 +78,7 @@ Chosen option: "{title of option 1}", because
 
 {You might want to provide additional evidence/confidence for the decision outcome here and/or
 document the team agreement on the decision and/or
-define when this decision when and how the decision should be realized and if/when it should be
-re-visited and/or
+link the change that implemented the decision, and say when to revisit it, or
 how the decision is validated.
 Links to other decisions and resources might here appear as well.}
 

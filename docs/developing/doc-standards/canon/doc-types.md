@@ -353,7 +353,7 @@ which other Lore subsystems consume it.>
 
 ### Definition
 
-An ADR — Architectural Decision Record — is the durable record of a single architectural decision the Lore project has made. It captures the **context** the decision was made in, the **decision** itself, and the **consequences** the project lives with as a result. ADRs are append-only history: once accepted, they aren't edited substantively. A change of mind produces a new ADR that supersedes the old one and links back.
+An ADR — Architectural Decision Record — is the durable record of a single architectural decision the Lore project has made. It captures the **context** the decision was made in, the **decision** itself, and the **consequences** the project lives with as a result. A new ADR is retrospective: it's written with the code that makes the decision concrete, or after it, and never as a proposal. Alignment before a change merges belongs in an LEP. ADRs are append-only history: once accepted, they aren't edited substantively, and they bind new code. A change that departs from an accepted ADR, or any other change of mind, comes with a new ADR that supersedes the old one and links back, in the same change.
 
 ### When to use it
 
@@ -364,14 +364,14 @@ An ADR — Architectural Decision Record — is the durable record of a single a
 ### When not to use it
 
 - The "decision" is a routine implementation choice with no real trade-off. Document it in code or an Internals doc, not an ADR.
-- The decision is provisional and the team expects to revisit it within weeks. Use an RFC or a tracked issue until it stabilizes.
+- The decision isn't made yet. Align on it in an LEP or a tracked issue, and write the ADR with the code that makes it concrete.
 - The page would primarily explain a subsystem rather than record a choice. Use an Internals doc or a user-facing Explanation.
 
 ### Header block
 
 ADRs begin with a YAML header block. Required fields:
 
-- `status` — one of `proposed`, `rejected`, `accepted`, `deprecated`, `superseded by ADR-NNNNN`. Use lowercase only. Status is the only field that changes after acceptance.
+- `status` — one of `accepted`, `deprecated`, `superseded by [ADR-NNNNN](NNNNN-slug.md)`. Use lowercase only. An ADR starts as `accepted`, because it records a decision already made; `status` and `date` are the only fields that change after that.
 - `date` — `YYYY-MM-DD` of the last status update.
 
 Optional fields (omit when not relevant):
@@ -391,7 +391,7 @@ Optional fields (omit when not relevant):
 Optional sections (use when the content warrants):
 
 - **Pros and Cons of the Options** — between *Decision Outcome* and *More Information*. One H3 per option, with bulleted *Good, because …*, *Neutral, because …*, *Bad, because …* arguments.
-- **More Information** — at the end. Additional evidence, team agreement, links to other decisions, or notes on when the decision should be revisited.
+- **More Information** — at the end. Additional evidence, team agreement, the change that implemented the decision, links to other decisions, or notes on when the decision should be revisited.
 
 ### Filename pattern
 
@@ -407,7 +407,7 @@ Numbering is monotonic across the project. A new ADR claims the next available n
 
 ### Immutability and supersession
 
-Once an ADR moves from `proposed` to `accepted`, the body is **immutable** except for the `status` and `date` header fields. To change a decision, write a new ADR, set its `status` to `accepted` with today's `date`, link to the prior ADR from *More Information*, and edit the prior ADR's `status` to `superseded by ADR-NNNNN`. The prior body stays unchanged so the original record remains readable.
+Once an ADR is accepted, the body is **immutable** except for the `status` and `date` header fields. To change a decision, write a new ADR, set its `status` to `accepted` with today's `date`, link to the prior ADR from *More Information*, and edit the prior ADR's `status` to `superseded by [ADR-NNNNN](NNNNN-slug.md)`. The prior body stays unchanged so the original record remains readable.
 
 ### Template
 

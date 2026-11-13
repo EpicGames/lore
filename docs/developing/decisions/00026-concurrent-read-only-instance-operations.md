@@ -30,7 +30,7 @@ On disk this has no further effect: `OsOperation` holds no state, and both reads
 
 ## Decision Outcome
 
-Proposed option: "Share", because it is the only option that both keeps every reader on a consistent snapshot and lets concurrent `status` and `diff` commands proceed together. It also takes one freeze for a group of concurrent readers, where "Block" takes one per reader.
+Chosen option: "Share", because it is the only option that both keeps every reader on a consistent snapshot and lets concurrent `status` and `diff` commands proceed together. It also takes one freeze for a group of concurrent readers, where "Block" takes one per reader.
 
 The design in outline. It is not exhaustive: the outline fixes the shape of the solution and leaves the names and signatures to the implementation.
 

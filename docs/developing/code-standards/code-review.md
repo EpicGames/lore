@@ -15,7 +15,7 @@ Review against these rules. Each finding cites the rule it breaks. Anything `car
 - For comments and documentation, follow [comments.md](comments.md).
 - For terms in code, comments, messages, and docs, follow the [glossary](../../glossary.md) and [Lore vocabulary, not Git-isms](../doc-standards/canon/language.md#lore-vocabulary-not-git-isms).
 - For the model a change must keep, follow the [system design](../../explanation/system-design.md) for the area it changes. For example, the ignore file filters what's staged and committed, and the view filters what's materialized ([§12.3–12.4](../../explanation/system-design.md#123-ignore-files-outbound-filtering)).
-- For architectural decisions, follow the ADRs in [decisions/](../decisions/README.md).
+- For architectural decisions, follow the accepted ADRs in [decisions/](../decisions/README.md), or supersede one with a new ADR in the same change.
 - For docs pages, follow the [doc review checklist](../doc-standards/operational/review-checklist.md).
 
 ## How to review
@@ -26,12 +26,12 @@ A review must run in a fresh session: a session or subagent that didn't write th
 
 1. Read each changed function and type in full, with its doc comments, not only the hunks, and each changed doc page in full. Follow references outside the diff, such as callers, callees, and types, where needed.
 2. Verify every claim in comments, docs, tests, and the commit message against the code and measurements.
-3. Check that the code matches its intent: the change's description and any ADR, proposal, spec, or doc it implements. Intent docs may be in the diff or already submitted, so search `docs/developing/decisions` and `docs/proposals`. Flag code that does less than, more than, or other than they describe.
+3. Check that the code matches its intent: the change's description and any proposal, spec, or doc it implements. Intent docs may be in the diff or already submitted, so search `docs/proposals`. Flag code that does less than, more than, or other than they describe. Code must also follow the accepted ADRs in `docs/developing/decisions`, or come with a new ADR that supersedes the one it departs from.
 4. Check that the change is complete: each caller, variant, and provider the behavior reaches changes with it, and nothing it implies is left out without a follow-up named in the change's description.
 5. Check that the change is concise: no code, comment, or doc longer than it needs to be, and nothing unrelated to its intent. Flag a change that bundles parts that can land on their own, and name the split.
 6. Check the change against [Guidance](#guidance).
 7. Check for [irreversible changes](#irreversible-changes) and [performance](#performance) issues. These matter most.
-8. Flag a contradicted ADR with no new ADR, an unrecorded decision, and a superseded ADR whose `status` isn't updated.
+8. Flag code that departs from an accepted ADR with no new ADR superseding it in the same change, a new architectural decision with no ADR recording it in the change or in a follow-up named in its description, and a superseded ADR whose `status` isn't updated.
 9. Check that every change to shipped behaviour, including server, auth, storage and data-structure changes, adds a note to `docs/release-notes/` with the right `type`, rather than an entry in `docs/release-notes.md`.
 10. In async code, check that a restructured loop, `select!`, or match keeps its error precedence, draining, and channel-close semantics.
 11. Report the findings as [Reporting findings](#reporting-findings) describes.
