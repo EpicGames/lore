@@ -197,6 +197,103 @@ async fn a_cache_trusting_the_remote_walks_a_fetched_list_unhashed() {
     assert_eq!((decodes, hashes), (0, 0), "nothing is decoded or hashed");
 }
 
+/// A repository holding a fragment list with a hole between two leaves unique to `seed`, the
+/// list's address, and the addresses of its leaves. A hole names no fragment, so the repository
+/// holds nothing for it.
+async fn written_list_with_a_hole(
+    seed: u8,
+) -> (Arc<RepositoryContext>, Address, BTreeSet<Address>) {
+    let written = context_with_state(RemoteState::Offline).await;
+    let context = Context::from([0x5au8; 16]);
+    let mut leaves = BTreeSet::new();
+    let mut references = Vec::new();
+    for (index, offset) in [0u64, 8192].into_iter().enumerate() {
+        let payload: Bytes = (0..4096u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8 ^ seed ^ (0x55 * index as u8))
+            .collect();
+        let address = Address {
+            hash: lore_storage::hash::hash_slice(&payload),
+            context,
+        };
+        let fragment = Fragment {
+            flags: 0,
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+        written
+            .immutable_store()
+            .put(written.id, address, fragment, Some(payload), false)
+            .await
+            .expect("the leaf is stored");
+        leaves.insert(address);
+        references.push(FragmentReference {
+            hash: address.hash,
+            offset_content: offset,
+        });
+    }
+    references.insert(
+        1,
+        FragmentReference {
+            hash: Hash::default(),
+            offset_content: 4096,
+        },
+    );
+    let list = Bytes::copy_from_slice(zerocopy::IntoBytes::as_bytes(references.as_slice()));
+    let root = Address {
+        hash: lore_storage::hash::hash_slice(&list),
+        context,
+    };
+    let fragment = Fragment {
+        flags: FragmentFlags::PayloadFragmented.bits(),
+        size_payload: list.len() as u32,
+        size_content: 3 * 4096,
+    };
+    written
+        .immutable_store()
+        .put(written.id, root, fragment, Some(list), false)
+        .await
+        .expect("the list is stored");
+    (written, root, leaves)
+}
+
+/// A cache walks past the hole of a fragment list, which names no fragment, whether it fetched
+/// the list or holds it: the remote is asked for the list where it is lacking and for the leaves,
+/// never for a hole.
+#[tokio::test]
+async fn caching_a_list_with_a_hole_asks_for_its_leaves_alone() {
+    for list_held in [false, true] {
+        let (written, root, leaves) = written_list_with_a_hole(0x7d + u8::from(list_held)).await;
+        let cached = context_with_state(RemoteState::Offline).await;
+        let mut wanted = leaves.clone();
+        if list_held {
+            let list = written
+                .immutable_store()
+                .get(written.id, root)
+                .await
+                .expect("the list is stored");
+            cached
+                .immutable_store()
+                .put(cached.id, root, list.fragment, list.payload, false)
+                .await
+                .expect("the list alone is stored");
+        } else {
+            wanted.insert(root);
+        }
+        let (session, remote) = serving_session(&written, Serving::default()).await;
+
+        let fetched = under_execution_context(|| {
+            cache_through(cached.clone(), session, None, vec![root], true)
+        })
+        .await
+        .into_result()
+        .expect("the cache fetches what it lacks");
+
+        assert_eq!(fetched, wanted.len(), "list held: {list_held}");
+        assert_eq!(remote.asked(), wanted, "list held: {list_held}");
+        assert!(held(&cached, &leaves).await, "the leaves are stored");
+    }
+}
+
 /// `LORE_CACHE_GETS` takes a count; zero turns the cap off, and a value that is not a count
 /// leaves the default.
 #[test]

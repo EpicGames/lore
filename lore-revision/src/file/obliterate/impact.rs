@@ -111,6 +111,7 @@ async fn children(
         .forward::<ObliterateError>("validating fragment dependencies")?;
     Ok(references
         .iter()
+        .filter(|reference| !reference.is_hole())
         .map(|reference| Address {
             hash: reference.hash,
             context: address.context,

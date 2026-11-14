@@ -6914,7 +6914,9 @@ pub type LoreStorageGetResolvedArgs = crate::storage::get_resolved::LoreStorageG
 ///
 /// Set `fragments` to receive one `LORE_EVENT_STORAGE_GET_FRAGMENT` per leaf fragment in place of
 /// `LORE_EVENT_STORAGE_GET_DATA`, each carrying the leaf's `lore_fragment_t` and its payload as
-/// stored. No leaf is expanded or checked against its hash.
+/// stored. No leaf is expanded or checked against its hash. A hole of the content arrives as a
+/// `LORE_EVENT_STORAGE_GET_FRAGMENT` whose fragment has a `size_payload` of zero and no payload,
+/// covering `size_content` bytes that read as zeros.
 ///
 /// # Events
 ///
@@ -7336,7 +7338,14 @@ pub type LoreStorageGetFileArgs = crate::storage::get_file::LoreStorageGetFileAr
 /// and rename atomically, and a failure mid-write removes the temp file, so the target is either
 /// the finished range or untouched. An `offset` past the end of the content is rejected with
 /// `INVALID_ARGUMENTS` without opening the target, so a destination that was already there
-/// survives.
+/// survives. The temp file is emptied before anything is written to it, so nothing a
+/// `<path>.loretmp` left by an earlier get held stays in it. A hole the content was stored with
+/// (`skip_holes` on `lore_storage_put_file`), a range holding no data, is left unwritten, so it is
+/// a hole of the written file where its file system supports holes. Every range of data is written,
+/// zeros included: written zeros are data.
+///
+/// A `path` takes one get at a time. Items that name the same path, in one call or in concurrent
+/// calls of this function or `lore_storage_get_file_resolved`, are not supported.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_storage_get_file(
     globals: &LoreGlobalArgs,
@@ -7428,11 +7437,15 @@ pub type LoreStorageGetFileResolvedArgs =
 /// no zero-hash truncation as in `lore_storage_get_file`, because a resolve that finds nothing is a
 /// miss rather than an address for empty content.
 ///
-/// `offset` and `length` select part of the content and multi-fragment writes stage through
-/// `<path>.loretmp` before an atomic rename, both as in `lore_storage_get_file`: the file holds
-/// exactly the requested range from its own first byte, and the target is either the finished range
-/// or untouched. A start past the end is rejected with `INVALID_ARGUMENTS` without opening the
-/// target, so a destination that was already there survives.
+/// `offset` and `length` select part of the content, multi-fragment writes stage through
+/// `<path>.loretmp` before an atomic rename, and holes are left unwritten, all as in
+/// `lore_storage_get_file`: the file holds exactly the requested range from its own first byte, and
+/// the target is either the finished range or untouched. A start past the end is rejected with
+/// `INVALID_ARGUMENTS` without opening the target, so a destination that was already there
+/// survives.
+///
+/// A `path` takes one get at a time. Items that name the same path, in one call or in concurrent
+/// calls of this function or `lore_storage_get_file`, are not supported.
 ///
 /// # Events
 ///
@@ -8579,6 +8592,11 @@ pub type LoreRevisionTreeAddArgs = crate::revision_tree::add::LoreRevisionTreeAd
 /// reads through it. Entries under separate parents are created concurrently,
 /// but allocating a node slot is serialized per loaded tree.
 ///
+/// A revision tree does not support content stored with its holes skipped
+/// (`skip_holes` on `lore_storage_put_file` or `lore_storage_put_file_resolved`),
+/// and this call does not refuse an address naming such content: FUSE reads of
+/// the file fail, and status reports the file modified whenever a scan hashes it.
+///
 /// | Terminal event                            | Payload                                          | Notes                                                    |
 /// |-------------------------------------------|--------------------------------------------------|----------------------------------------------------------|
 /// | `LORE_EVENT_REVISION_TREE_ADD_COMPLETE`   | `lore_revision_tree_add_complete_event_data_t`   | One per entry, carrying its `entry_id`                    |
@@ -8693,6 +8711,11 @@ pub type LoreRevisionTreeModifyArgs = crate::revision_tree::modify::LoreRevision
 /// stays an addition or a move, which the commit records with the new content.
 /// Entries touch no parent or sibling chain, so the whole batch applies
 /// concurrently.
+///
+/// A revision tree does not support content stored with its holes skipped
+/// (`skip_holes` on `lore_storage_put_file` or `lore_storage_put_file_resolved`),
+/// and this call does not refuse an address naming such content: FUSE reads of
+/// the file fail, and status reports the file modified whenever a scan hashes it.
 ///
 /// | Terminal event                              | Payload                                           | Notes                                                    |
 /// |---------------------------------------------|---------------------------------------------------|----------------------------------------------------------|

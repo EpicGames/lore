@@ -2456,10 +2456,10 @@ struct SublistSource<'a> {
 /// each allocating and filling its own buffer.
 ///
 /// A chunk that no longer matches returns [`FileMatch::Differs`] immediately, and a walk
-/// that cannot proceed at all — a sublist that fails to load or is not a list — returns
-/// [`FileMatch::Indeterminate`]. A list that merely misdescribes the content reads as a
-/// difference rather than as indeterminate, since the list is what defines the ranges being
-/// hashed: wrong offsets simply hash the wrong bytes.
+/// that cannot proceed at all — a sublist that fails to load or is not a list, or a hole,
+/// which this walk does not compare — returns [`FileMatch::Indeterminate`]. A list that
+/// merely misdescribes the content reads as a difference rather than as indeterminate, since
+/// the list is what defines the ranges being hashed: wrong offsets simply hash the wrong bytes.
 ///
 /// The walk stops having read at most one window more than it compared, where reading per
 /// chunk stopped exactly at the mismatch — the cost of not paying a round trip per chunk on
@@ -2494,6 +2494,10 @@ async fn compare_previous_chunks(
 
     while index < chunks.len() {
         let current = chunks[index];
+        if current.is_hole() {
+            lore_base::lore_trace!("Previous chunk {index} is a hole, cannot compare {source}");
+            return Ok(FileMatch::Indeterminate);
+        }
         let start = current.offset_content;
         let Some(end) = chunk_end(&chunks, index, file_size) else {
             lore_base::lore_trace!(

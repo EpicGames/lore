@@ -10,6 +10,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinError;
 use tokio::task::JoinSet;
 
+use crate::chunker::Chunk;
 use crate::chunker::FileChunker;
 use crate::compress::FRAGMENT_SIZE_THRESHOLD;
 use crate::concurrency::FRAGMENT_SIZE_EXPECTED;
@@ -213,7 +214,11 @@ pub async fn write_fragmented(
 ///
 /// This is only reached for files larger than one fragment, so the single-fragment
 /// fast path in [`write_fragmented`] cannot apply — no chunk ever exceeds
-/// `FRAGMENT_SIZE_THRESHOLD`, so such a file always yields at least two chunks.
+/// `FRAGMENT_SIZE_THRESHOLD`, so such a file always yields at least two chunks, unless
+/// [`WriteOptions::skip_holes`] finds it is one hole, which is a list of that one hole.
+///
+/// Under [`WriteOptions::skip_holes`] each hole the chunker hands out becomes a hole reference in
+/// the list, with no task, no budget and no store.
 ///
 /// `publish` fuses a `KeyType::Resolve` mapping into the upload of the tree's top-level fragment,
 /// as it does in [`write_fragmented`]: publishing a file costs no round trip beyond the ones its
@@ -243,6 +248,9 @@ pub(crate) async fn write_fragmented_from_file(
     } else {
         FileChunker::content_defined(handle, file_size).await
     };
+    if flags.skip_holes {
+        chunker = chunker.skipping_holes();
+    }
 
     // The chunk the chunker pre-paid, as a slot so its use is tracked rather than inferred.
     let reserved_chunk = Arc::new(Semaphore::new(1));
@@ -255,8 +263,16 @@ pub(crate) async fn write_fragmented_from_file(
             break;
         }
 
-        let chunk_offset = chunk.offset as usize;
-        let chunk_buffer = chunk.data;
+        let (chunk_offset, chunk_buffer) = match chunk {
+            Chunk::Data { offset, data } => (offset as usize, data),
+            Chunk::Hole { offset, .. } => {
+                results
+                    .entries
+                    .push(StoredChunk::hole(chunk_index, offset as usize, context));
+                chunk_index += 1;
+                continue;
+            }
+        };
         let chunk_size = chunk_buffer.len();
 
         let fragment = Fragment {
@@ -333,6 +349,23 @@ struct StoredChunk {
     /// refuse to name content the server holds only part of.
     local: bool,
     remote: bool,
+}
+
+impl StoredChunk {
+    /// The reference for a hole at `content_offset`: the zero hash, naming no fragment, which every
+    /// store holds as much of as it needs.
+    fn hole(index: usize, content_offset: usize, context: Context) -> Self {
+        Self {
+            index,
+            content_offset,
+            address: Address {
+                hash: crate::types::Hash::default(),
+                context,
+            },
+            local: true,
+            remote: true,
+        }
+    }
 }
 
 /// Chunk store results gathered so far, so a file can drain its in-flight tasks part

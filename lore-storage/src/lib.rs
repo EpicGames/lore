@@ -121,6 +121,7 @@ pub use lore_base::retry::DEFAULT_JITTER;
 pub use lore_base::retry::Retry;
 pub use lore_base::retry::retry;
 pub use lore_base::retry::retry_with_jitter;
+pub use lore_io::DataCursor;
 // Re-export maintenance functions
 pub use maintenance::compactor;
 pub use maintenance::evictor;

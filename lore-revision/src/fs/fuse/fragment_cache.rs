@@ -1243,10 +1243,11 @@ async fn fetch(
 }
 
 /// Checks a list as it loads, as `lore_storage::defragment` checks a level before walking it:
-/// every entry's window strictly increasing and non-empty, no zero hash, the level reaching
-/// `window` (the READ's part of it, from the level's start), and for a sub-list, covering
-/// exactly the window `parent`'s list gives it. A cached list was checked when it loaded, so a
-/// READ served from the caches pays nothing here.
+/// every entry's window strictly increasing and non-empty, the level reaching `window` (the
+/// READ's part of it, from the level's start), and for a sub-list, covering exactly the window
+/// `parent`'s list gives it. A list holding a hole is refused, as revision trees do not support
+/// content stored with holes. A cached list was checked when it loaded, so a READ served from the
+/// caches pays nothing here.
 fn check_list(
     list: &Bytes,
     fragment: &Fragment,
@@ -1267,10 +1268,14 @@ fn check_list(
         .checked_add(fragment.size_content)
         .ok_or_else(|| StorageError::internal("fragment list end overflows"))?;
     let window = window.start + base..window.end + base;
-    if lore_storage::defragment::wanted_entries(refs, level_end, &window)?.is_none() {
+    let scan = lore_storage::defragment::scan_entries(refs, level_end, &window)?;
+    if scan.wanted.is_none() {
         return Err(StorageError::internal(
             "fragment list does not cover the read",
         ));
+    }
+    if scan.holes {
+        return Err(StorageError::internal("fragment list holds a hole"));
     }
     Ok(())
 }

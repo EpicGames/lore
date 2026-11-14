@@ -40,7 +40,8 @@ use crate::types::Partition;
 /// Target for the streaming defragmentation pipeline.
 #[derive(Clone)]
 pub enum DefragmentSink {
-    /// Write at offset to a file (unordered, concurrent positional writes).
+    /// Write at offset to a file (unordered, concurrent positional writes), opened by
+    /// [`open_file_write`] so every range of it starts unallocated.
     /// `size` is the expected content length, used to reject out-of-range offsets.
     File { file: IoFile, size: usize },
     /// Stream buffers in content order to a caller-provided channel.
@@ -53,14 +54,29 @@ pub enum DefragmentSink {
     },
 }
 
-/// A fetched payload on its way to the write sink: target offset, bytes, and the
-/// fragment memory permit covering those bytes. The permit rides along so it is
-/// released when the write completes rather than when the fetch did.
+/// What the fetch pool hands the write sink.
 #[lore_macro::test_pub]
-type DataMessage = (usize, Bytes, tokio::sync::SemaphorePermit<'static>);
+enum DataMessage {
+    /// A fetched payload: target offset, bytes, and the fragment memory permit covering those
+    /// bytes. The permit rides along so it is released when the write completes rather than when
+    /// the fetch did.
+    Payload(usize, Bytes, tokio::sync::SemaphorePermit<'static>),
+    /// A hole: target offset and length, a range holding no data, which reads as zeros.
+    Hole(usize, u64),
+}
 #[lore_macro::test_pub]
 type DataSender = Sender<DataMessage>;
 type DataReceiver = Receiver<DataMessage>;
+
+/// Zeros a hole is delivered from where it is delivered as bytes, a fragment's worth at a time,
+/// so no hole allocates.
+static ZEROS: [u8; crate::FRAGMENT_SIZE_THRESHOLD] = [0; crate::FRAGMENT_SIZE_THRESHOLD];
+
+/// The first piece of a hole of `len` bytes delivered as zeros, and the bytes it covers.
+fn zero_piece(len: u64) -> (Bytes, u64) {
+    let covered = len.min(ZEROS.len() as u64);
+    (Bytes::from_static(&ZEROS[..covered as usize]), covered)
+}
 
 /// Leaf fragment reference yielded by the tree walker to the fetch pool.
 #[lore_macro::test_pub]
@@ -82,6 +98,13 @@ struct LeafReference {
     /// delivered rather than what is read.
     clip: Range<u64>,
     context: Context,
+}
+
+impl LeafReference {
+    /// Whether this leaf is a hole, which names no fragment; see [`FragmentReference::is_hole`].
+    fn is_hole(&self) -> bool {
+        self.hash.is_zero()
+    }
 }
 
 /// Channel capacity for leaf references from walker to fetch pool.
@@ -177,19 +200,14 @@ fn walk_fragment_tree(
 /// to where the next entry starts, and for the last entry to the end of the level.
 ///
 /// Derived from the list alone rather than from the fragment the entry names, which is what
-/// lets a ranged walk decide an entry is not wanted before paying to load it. A zero hash is
-/// rejected here: it addresses zero-length content, never an entry.
+/// lets a ranged walk decide an entry is not wanted before paying to load it. An entry with the
+/// zero hash is a hole, which names no fragment and spans its window as any entry does.
 fn entry_window(
     fragment_list: &[FragmentReference],
     index: usize,
     level_end: u64,
 ) -> Result<Range<u64>, StorageError> {
     let start = fragment_list[index].offset_content;
-    if fragment_list[index].hash.is_zero() {
-        return Err(StorageError::internal(format!(
-            "fragment list entry {index} at content offset {start} has a zero hash"
-        )));
-    }
     let end = if index + 1 < fragment_list.len() {
         fragment_list[index + 1].offset_content
     } else {
@@ -216,15 +234,35 @@ fn clip_to_window(entry: &Range<u64>, window: &Range<u64>) -> Option<Range<u64>>
 
 /// The contiguous index range of a level's entries that `window` reaches, or `None` when it
 /// reaches none. Every entry is checked, wanted or not: offsets strictly increasing up to
-/// `level_end`, no empty entry, no zero hash.
+/// `level_end`, and no empty entry.
 pub fn wanted_entries(
     fragment_list: &[FragmentReference],
     level_end: u64,
     window: &Range<u64>,
 ) -> Result<Option<Range<usize>>, StorageError> {
+    scan_entries(fragment_list, level_end, window).map(|scan| scan.wanted)
+}
+
+/// What one pass over a level's entries establishes.
+pub struct LevelScan {
+    /// See [`wanted_entries`].
+    pub wanted: Option<Range<usize>>,
+    /// Whether any entry is a hole. Only a list of leaves holds holes, so a level holding one is
+    /// known to be a leaf level without loading an entry.
+    pub holes: bool,
+}
+
+/// [`wanted_entries`], noting on the same pass whether the level holds a hole.
+pub fn scan_entries(
+    fragment_list: &[FragmentReference],
+    level_end: u64,
+    window: &Range<u64>,
+) -> Result<LevelScan, StorageError> {
     let mut wanted: Option<Range<usize>> = None;
+    let mut holes = false;
     for index in 0..fragment_list.len() {
         let entry = entry_window(fragment_list, index, level_end)?;
+        holes |= fragment_list[index].is_hole();
         if clip_to_window(&entry, window).is_some() {
             wanted = Some(match wanted {
                 Some(range) => range.start..index + 1,
@@ -232,7 +270,7 @@ pub fn wanted_entries(
             });
         }
     }
-    Ok(wanted)
+    Ok(LevelScan { wanted, holes })
 }
 
 /// Stops a launcher and waits for it, discarding whatever it has already loaded.
@@ -272,7 +310,7 @@ fn walk_abandoned(leaf_tx: &Sender<LeafReference>) -> bool {
 /// The peek lands on the first *wanted* entry rather than on entry zero. Every entry at a
 /// level is the same tier, so any of them answers the question, and choosing a wanted one
 /// keeps a read of the tail of the content from loading the head of every level on the way
-/// down.
+/// down. A level holding a hole is a leaf level, which takes no peek.
 ///
 /// An empty list is invalid at every level, whatever its parent claims and including a parent
 /// claiming zero: zero-length content is addressed by the zero hash, never by a fragment whose
@@ -316,9 +354,21 @@ async fn walk_fragment_level(
         })?;
 
     // Validates the whole list on the way, so an unwanted level is still a well-formed one.
-    let Some(wanted) = wanted_entries(fragment_list, level_end, window)? else {
+    let scan = scan_entries(fragment_list, level_end, window)?;
+    let Some(wanted) = scan.wanted else {
         return Ok(());
     };
+    if scan.holes {
+        return walk_leaf_level(
+            fragment_list,
+            total_content_size,
+            base_offset,
+            window,
+            context,
+            leaf_tx,
+        )
+        .await;
+    }
     let first_index = wanted.start;
 
     let first_address = Address {
@@ -378,6 +428,9 @@ async fn walk_fragment_level(
 /// narrowed. The checks read a list already in hand and cost no I/O, so there is nothing to
 /// save by skipping them and a malformed list would otherwise be accepted or rejected
 /// depending on which part of the content a caller happened to ask for.
+///
+/// A hole is sent as a reference with the zero hash, which the fetch pools deliver without a
+/// fetch. It is the one entry that may span more than a fragment.
 #[lore_macro::test_pub]
 async fn walk_leaf_level(
     fragment_list: &[FragmentReference],
@@ -396,7 +449,7 @@ async fn walk_leaf_level(
     for (i, frag_ref) in fragment_list.iter().enumerate() {
         let entry = entry_window(fragment_list, i, content_end)?;
         let expected_content_size = entry.end - entry.start;
-        if expected_content_size > crate::FRAGMENT_SIZE_THRESHOLD as u64 {
+        if expected_content_size > crate::FRAGMENT_SIZE_THRESHOLD as u64 && !frag_ref.is_hole() {
             return Err(StorageError::internal(format!(
                 "fragment list chunk size {expected_content_size} exceeds FRAGMENT_SIZE_THRESHOLD {}",
                 crate::FRAGMENT_SIZE_THRESHOLD
@@ -430,7 +483,7 @@ pub fn sublist_coverage(
     sub_content_size: usize,
     window: &Range<u64>,
 ) -> Result<(), StorageError> {
-    if parent.hash.is_zero() {
+    if parent.is_hole() {
         return Err(StorageError::internal(format!(
             "fragment list entry at content offset {} has a zero hash",
             window.start
@@ -521,28 +574,30 @@ async fn walk_intermediate_level(
     )?;
 
     // Every child at this level is the same tier, so peeking at a wanted one settles it
-    // without loading content the read did not ask for.
-    let Some(peek) = wanted_entries(first_list, first_entry.end, window)? else {
+    // without loading content the read did not ask for. A sublist holding a hole is a list of
+    // leaves, which settles it without a load.
+    let first_scan = scan_entries(first_list, first_entry.end, window)?;
+    let Some(peek) = first_scan.wanted else {
         return Err(StorageError::internal(format!(
             "fragment sublist at content offset {} holds none of the range it was entered for",
             first_entry.start
         )));
     };
-    let peek_address = Address {
-        context,
-        hash: first_list[peek.start].hash,
+    let children_are_leaves = first_scan.holes || {
+        let peek_address = Address {
+            context,
+            hash: first_list[peek.start].hash,
+        };
+        let (peek_frag, _peek_buf) = load_fragment(
+            store.clone(),
+            partition,
+            peek_address,
+            options,
+            remote_session.clone(),
+        )
+        .await?;
+        (peek_frag.flags & FragmentFlags::PayloadFragmented) != FragmentFlags::PayloadFragmented
     };
-    let (peek_frag, peek_buf) = load_fragment(
-        store.clone(),
-        partition,
-        peek_address,
-        options,
-        remote_session.clone(),
-    )
-    .await?;
-    let children_are_leaves =
-        (peek_frag.flags & FragmentFlags::PayloadFragmented) != FragmentFlags::PayloadFragmented;
-    drop(peek_buf);
 
     let first_base_offset = first_list[0].offset_content;
     let mut result = if children_are_leaves {
@@ -715,6 +770,14 @@ async fn fetch_unordered(
     let mut result = Ok(());
 
     while let Some(leaf) = next_leaf(&mut leaf_rx, &data_tx).await {
+        if leaf.is_hole() {
+            // A sink that has gone has an error of its own to report; see [`send_to_sink`].
+            if let Ok(slot) = data_tx.reserve().await {
+                let length = leaf.clip.end - leaf.clip.start;
+                slot.send(DataMessage::Hole(leaf.target_offset as usize, length));
+            }
+            continue;
+        }
         let permit = match reserve_leaf_budget(semaphore, &data_tx, leaf.expected_size).await {
             Ok(Some(permit)) => permit,
             Ok(None) => break,
@@ -761,7 +824,7 @@ async fn fetch_unordered(
             // Narrowed only after the whole leaf has been loaded and checked. `slice` is a
             // view onto the same allocation, so a clipped leaf costs no copy.
             let buffer = buffer.slice(clip.start as usize..clip.end as usize);
-            send_to_sink(&tx, (offset, buffer, permit)).await;
+            send_to_sink(&tx, DataMessage::Payload(offset, buffer, permit)).await;
             Ok(())
         });
 
@@ -834,12 +897,12 @@ async fn reserve_leaf_budget<T>(
 /// already found a difference, a reader that stopped early. That is not a failure of this
 /// pipeline, and there is nobody left to report one to, so it is reported as abandonment rather
 /// than as an error. The permit is released here rather than at load, so the budget bounds the
-/// pipeline.
+/// pipeline. A piece of a hole holds no budget, so it comes with no permit.
 #[lore_macro::test_pub]
 async fn send_payload<T>(
     sender: &Sender<Result<T, StorageError>>,
     leaf: T,
-    permit: SemaphorePermit<'static>,
+    permit: Option<SemaphorePermit<'static>>,
 ) -> bool {
     let abandoned = sender
         .reserve()
@@ -919,6 +982,7 @@ fn fetch_ordered_and_stream_from(
         remote_session,
         claim,
         content_leaf,
+        zero_piece,
     )
 }
 
@@ -943,7 +1007,20 @@ fn fetch_ordered_leaves(
         remote_session,
         claim,
         whole_leaf,
+        whole_hole,
     )
+}
+
+/// A hole as a leaf with its fragment: no payload, and a fragment whose `size_payload` is zero,
+/// which no stored fragment has, says it is a hole of `size_content` bytes. Delivered whole.
+#[lore_macro::test_pub]
+fn whole_hole(len: u64) -> ((Fragment, Bytes), u64) {
+    let fragment = Fragment {
+        flags: 0,
+        size_payload: 0,
+        size_content: len,
+    };
+    ((fragment, Bytes::new()), len)
 }
 
 /// A leaf loaded expanded, as the part of its content that was asked for.
@@ -996,14 +1073,23 @@ fn whole_leaf(
     Ok((fragment, payload))
 }
 
+/// What the ordered fetch pool queues in content order: a fetch on its way, or a hole of the given
+/// length, which needs none.
+enum Queued<T> {
+    Fetch(JoinHandle<FetchResult<T>>),
+    Hole(u64),
+}
+
 /// The ordered fetch pool behind [`fetch_ordered_and_stream`]. Each leaf is loaded under
 /// `options` and handed to `make_leaf` with the content size its parent list states and the part
-/// of it that was asked for; what that returns is what the caller receives.
+/// of it that was asked for; what that returns is what the caller receives. A hole is fetched from
+/// nowhere: `make_hole` gives the first piece of a hole of the length it is passed and the bytes
+/// that piece covers, and the pieces are delivered in place of a leaf until the hole is covered.
 ///
 /// The launcher and every fetch it spawns hold `claim`, for the reason [`walk_intermediate_level`]
 /// gives for its loads.
 #[allow(clippy::too_many_arguments)]
-async fn fetch_ordered_from<T, F>(
+async fn fetch_ordered_from<T, F, H>(
     semaphore: &'static Semaphore,
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
@@ -1013,14 +1099,16 @@ async fn fetch_ordered_from<T, F>(
     remote_session: Option<Arc<StorageSession>>,
     claim: Option<Arc<StoreGuard>>,
     make_leaf: F,
+    make_hole: H,
 ) -> Result<(), StorageError>
 where
     T: Send + 'static,
     F: Fn(Fragment, Bytes, u64, Range<u64>) -> Result<T, StorageError> + Copy + Send + 'static,
+    H: Fn(u64) -> (T, u64),
 {
     // Sized so it never binds before the budget does; every payload in it holds a permit.
     let max_tasks = FRAGMENT_BUDGET_KIB / FRAGMENT_MINIMUM_COST_KIB as usize;
-    let (fetch_queue_tx, mut fetch_queue_rx) = channel::<JoinHandle<FetchResult<T>>>(max_tasks);
+    let (fetch_queue_tx, mut fetch_queue_rx) = channel::<Queued<T>>(max_tasks);
 
     // Launcher: read leaf refs from walker, spawn fetch tasks, push handles
     let launcher: JoinHandle<Result<(), StorageError>> = {
@@ -1028,6 +1116,13 @@ where
         let remote_session = remote_session.clone();
         lore_base::lore_spawn!(async move {
             while let Some(leaf) = next_leaf(&mut leaf_rx, &fetch_queue_tx).await {
+                if leaf.is_hole() {
+                    let length = leaf.clip.end - leaf.clip.start;
+                    if fetch_queue_tx.send(Queued::Hole(length)).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 let Some(permit) =
                     reserve_leaf_budget(semaphore, &fetch_queue_tx, leaf.expected_size).await?
                 else {
@@ -1060,7 +1155,7 @@ where
                     ))
                 });
 
-                if fetch_queue_tx.send(handle).await.is_err() {
+                if fetch_queue_tx.send(Queued::Fetch(handle)).await.is_err() {
                     break;
                 }
             }
@@ -1070,14 +1165,26 @@ where
 
     // Consumer: await handles in FIFO order, send to caller's channel
     let mut result = Ok(());
-    while let Some(handle) = fetch_queue_rx.recv().await {
+    loop {
+        let Some(queued) = fetch_queue_rx.recv().await else {
+            break;
+        };
+        let handle = match queued {
+            Queued::Fetch(handle) => handle,
+            Queued::Hole(length) => {
+                if send_hole(&sender, length, &make_hole).await {
+                    break;
+                }
+                continue;
+            }
+        };
         match handle
             .await
             .map_err(|e| StorageError::internal_with_context(e, "load task join"))
             .and_then(|r| r)
         {
             Ok((leaf, permit)) => {
-                if send_payload(&sender, leaf, permit).await {
+                if send_payload(&sender, leaf, Some(permit)).await {
                     break;
                 }
             }
@@ -1089,6 +1196,23 @@ where
     }
 
     result.and(join_launcher(fetch_queue_rx, launcher).await)
+}
+
+/// Hands a hole of `length` bytes to the caller as the pieces `make_hole` cuts it into, reporting
+/// whether the caller has gone, as [`send_payload`] does.
+async fn send_hole<T>(
+    sender: &Sender<Result<T, StorageError>>,
+    mut length: u64,
+    make_hole: &impl Fn(u64) -> (T, u64),
+) -> bool {
+    while length > 0 {
+        let (piece, covered) = make_hole(length);
+        if send_payload(sender, piece, None).await {
+            return true;
+        }
+        length -= covered;
+    }
+    false
 }
 
 /// The outcome of a pipeline stage, with a task that did not run to completion counted as a
@@ -1128,6 +1252,10 @@ fn joined(stage: Result<Result<(), StorageError>, JoinError>) -> Result<(), Stor
 /// a zero-filled hole, indistinguishable from content. Every payload for the whole file
 /// passes through here, which makes this the one place that can see the total. The walker's
 /// tiling checks mean it should never fire, which is the point of having it.
+///
+/// A hole is counted and not written: the file comes from [`open_file_write`], so the range
+/// is unallocated already and reads as zeros. Every payload is written, one of zeros included:
+/// zeros are data.
 #[lore_macro::test_pub]
 async fn write_to_file(
     file: IoFile,
@@ -1138,8 +1266,14 @@ async fn write_to_file(
     let mut result = Ok(());
     let mut written = 0usize;
 
-    while let Some((offset, payload, permit)) = data_rx.recv().await {
-        let Some(end) = offset.checked_add(payload.len()) else {
+    while let Some(message) = data_rx.recv().await {
+        let (offset, length) = match &message {
+            DataMessage::Payload(offset, payload, _) => (*offset, payload.len()),
+            DataMessage::Hole(offset, length) => {
+                (*offset, usize::try_from(*length).unwrap_or(usize::MAX))
+            }
+        };
+        let Some(end) = offset.checked_add(length) else {
             result = Err(StorageError::internal(
                 "file write offset + data length overflows usize",
             ));
@@ -1147,14 +1281,16 @@ async fn write_to_file(
         };
         if end > size {
             result = Err(StorageError::internal(format!(
-                "file write out of bounds: offset {offset} + {} > {size}",
-                payload.len()
+                "file write out of bounds: offset {offset} + {length} > {size}"
             )));
             break;
         }
 
-        written += payload.len();
+        written += length;
 
+        let DataMessage::Payload(offset, payload, permit) = message else {
+            continue;
+        };
         let file = file.clone();
         lore_base::lore_spawn!(tasks, async move {
             let _permit = permit;
@@ -1377,7 +1513,11 @@ pub async fn read_defragment(
         .checked_add(fragment.size_content)
         .ok_or_else(|| StorageError::internal("fragment list content window overflows"))?;
     let window = offset as u64..(offset + range.len()) as u64;
-    let wanted = wanted_entries(fragment_list, level_end, &window)?.unwrap_or(0..0);
+    let scan = scan_entries(fragment_list, level_end, &window)?;
+    if scan.holes {
+        refuse_entries_larger_than_a_leaf(fragment_list, level_end)?;
+    }
+    let wanted = scan.wanted.unwrap_or(0..0);
     let (fragment_begin, fragment_end) = (wanted.start, wanted.end);
 
     let mut subreads = JoinSet::new();
@@ -1408,7 +1548,11 @@ pub async fn read_defragment(
             hash: fragment_list[fragment_index].hash,
         };
         let split_point = target.len() - to_read;
-        let subtarget = target.split_off(split_point);
+        let mut subtarget = target.split_off(split_point);
+        if fragment_list[fragment_index].is_hole() {
+            subtarget.as_mut_slice().fill(0);
+            continue;
+        }
         let subrange = local_offset..(local_offset + to_read);
         let store = store.clone();
         let remote_session = remote_session.clone();
@@ -1423,6 +1567,7 @@ pub async fn read_defragment(
                 options,
                 depth + 1,
                 remote_session,
+                scan.holes,
             )
         );
 
@@ -1461,7 +1606,8 @@ pub async fn read_defragment(
 ///
 /// `false` leaves the leaf to be loaded and cut instead: the range clips it, so it is not the whole
 /// content its address names; the leaf is not the size the list claimed for it; or the read
-/// declined, which the assembling path answers by reaching the remote and healing.
+/// declined, which the assembling path answers by reaching the remote and healing. With `leaf`
+/// set, an address naming a fragment list is refused, as [`refuse_list`] says.
 #[allow(clippy::too_many_arguments)]
 async fn place_whole_leaf(
     store: Arc<dyn ImmutableStore>,
@@ -1472,6 +1618,7 @@ async fn place_whole_leaf(
     options: ReadOptions,
     depth: usize,
     remote_session: Option<Arc<StorageSession>>,
+    leaf: bool,
 ) -> Result<bool, StorageError> {
     if range.start != 0 {
         return Ok(false);
@@ -1490,13 +1637,18 @@ async fn place_whole_leaf(
     )
     .await
     {
-        Ok(Some((_, written))) => Ok(written == piece),
+        Ok(Some((fragment, written))) => {
+            refuse_list(leaf, &fragment)?;
+            Ok(written == piece)
+        }
         Ok(None) => Ok(false),
         Err(err) if err.is_oversized() => Ok(false),
         Err(err) => Err(err),
     }
 }
 
+/// Reads `range` of the content at `address` into `target`. With `leaf` set, as for an entry of a
+/// list holding a hole, the address must name a leaf, as [`refuse_list`] says.
 #[allow(clippy::too_many_arguments)]
 fn read_defragment_subread(
     store: Arc<dyn ImmutableStore>,
@@ -1507,6 +1659,7 @@ fn read_defragment_subread(
     options: ReadOptions,
     depth: usize,
     remote_session: Option<Arc<StorageSession>>,
+    leaf: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StorageError>> + Send>> {
     Box::pin(async move {
         if place_whole_leaf(
@@ -1518,6 +1671,7 @@ fn read_defragment_subread(
             options,
             depth,
             remote_session.clone(),
+            leaf,
         )
         .await?
         {
@@ -1533,6 +1687,7 @@ fn read_defragment_subread(
         )
         .await?;
 
+        refuse_list(leaf, &fragment)?;
         if (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented {
             read_defragment(
                 store,
@@ -1567,13 +1722,48 @@ fn read_defragment_subread(
     })
 }
 
-/// Opens a file for positional writing and sizes it to the whole content up front.
+/// Refuses an entry of `fragment_list`, whose level ends at `level_end`, that is not a hole and
+/// spans more than a fragment: a list holding a hole is a list of leaves, as every walk of one
+/// checks before it reads an entry.
+fn refuse_entries_larger_than_a_leaf(
+    fragment_list: &[FragmentReference],
+    level_end: u64,
+) -> Result<(), StorageError> {
+    for index in 0..fragment_list.len() {
+        let entry = entry_window(fragment_list, index, level_end)?;
+        let size = entry.end - entry.start;
+        if size > crate::FRAGMENT_SIZE_THRESHOLD as u64 && !fragment_list[index].is_hole() {
+            return Err(StorageError::internal(format!(
+                "fragment list entry {index} beside a hole spans {size} bytes, more than a fragment"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses `fragment` where `leaf` is set and it is a fragment list: an entry of a list holding a
+/// hole names a leaf.
+fn refuse_list(leaf: bool, fragment: &Fragment) -> Result<(), StorageError> {
+    if leaf
+        && (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented
+    {
+        return Err(StorageError::internal(
+            "expected leaf fragment but the list holding a hole names a fragment list",
+        ));
+    }
+    Ok(())
+}
+
+/// Opens a file for positional writing, emptied, and sizes it to the whole content up front.
 ///
 /// The handle is shared: positional writes carry their own offset, so concurrent writers to
 /// disjoint ranges need no exclusion. Clones of the returned handle share it.
 ///
-/// The size is set rather than the file truncated, so a range no payload covers reads as zeros
-/// instead of shortening the file — which is what the sink's byte-count check exists to catch.
+/// Emptied first, so every range starts unallocated and reads as zeros, whatever the file held:
+/// a range left unwritten, as a hole is, holds none of a temporary file an interrupted read left
+/// behind, nor of the target a direct write replaces. Then sized rather than left empty, so a
+/// range no payload covers reads as zeros instead of shortening the file — which is what the
+/// sink's byte-count check exists to catch.
 pub async fn open_file_write(
     path: impl AsRef<Path>,
     size: usize,
@@ -1581,7 +1771,11 @@ pub async fn open_file_write(
     let file = IoDriver::global()
         .open(
             path,
-            &OpenOptions::new().read(true).write(true).create(true),
+            &OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true),
         )
         .await?;
     file.set_len(size as u64, ()).await?;

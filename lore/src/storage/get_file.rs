@@ -21,7 +21,11 @@
 //!
 //! Multi-fragment writes go through a temp file at `<path>.loretmp` (or `<path>.<ext>.loretmp`
 //! if `path` already has an extension); the rename to the final target is atomic. A failure
-//! mid-write removes the temp file, so the target is either the finished range or untouched.
+//! mid-write removes the temp file, so the target is either the finished range or untouched. The
+//! temp file is emptied before it is written, and a hole of the content is left unwritten in it.
+//!
+//! A path takes one get at a time. Items that name the same path, in one call or in concurrent
+//! calls of this function or `lore_storage_get_file_resolved`, are not supported.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -61,8 +65,8 @@ pub struct LoreStorageGetFileItem {
     pub partition: Partition,
     /// Content address to read; `hash == Hash::default()` truncates `path` to zero bytes
     pub address: Address,
-    /// Destination path; empty rejects with `INVALID_ARGUMENTS`. Multi-fragment writes
-    /// stage via `<path>.loretmp` then atomically rename
+    /// Destination path, which takes one get at a time; empty rejects with `INVALID_ARGUMENTS`.
+    /// Multi-fragment writes stage via `<path>.loretmp` then atomically rename
     pub path: LoreString,
     /// First content byte to write, counted from the start of the decompressed content.
     /// Past the end of the content rejects with `INVALID_ARGUMENTS`

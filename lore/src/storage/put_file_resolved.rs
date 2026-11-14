@@ -75,19 +75,27 @@ pub struct LoreStoragePutFileResolvedItem {
     /// before setting its fields: a non-zero padding byte from a caller built against an older
     /// header turns the query on
     pub remote_query: u8,
+    /// Store each hole of the file as a hole in the fragment list rather than reading it, as
+    /// `lore_storage_put_file` does. The field sits in what was padding, after `remote_query`, so
+    /// zero the whole item before setting its fields, as for `remote_query`
+    pub skip_holes: u8,
     /// Leaf fragment size cap for large files; `0` lets the writer choose. Ignored for files under
     /// `FRAGMENT_SIZE_THRESHOLD`
     pub fixed_size_chunk: u64,
 }
 
-// Lock the C ABI layout of `LoreStoragePutFileResolvedItem` on a 64-bit target. `remote_query` sits
-// in the padding after `local_cache`, so a caller built against a header without it passes an item
-// of the same size, with `fixed_size_chunk` at the same offset.
+// Lock the C ABI layout of `LoreStoragePutFileResolvedItem` on a 64-bit target. `remote_query` and
+// `skip_holes` sit in the padding after `local_cache`, so a caller built against a header without
+// them passes an item of the same size, with `fixed_size_chunk` at the same offset.
 const _: () = assert!(std::mem::size_of::<LoreStoragePutFileResolvedItem>() == 104);
 const _: () = assert!(std::mem::offset_of!(LoreStoragePutFileResolvedItem, fixed_size_chunk) == 96);
 const _: () = assert!(
     std::mem::offset_of!(LoreStoragePutFileResolvedItem, remote_query)
         == std::mem::offset_of!(LoreStoragePutFileResolvedItem, local_cache) + 1
+);
+const _: () = assert!(
+    std::mem::offset_of!(LoreStoragePutFileResolvedItem, skip_holes)
+        == std::mem::offset_of!(LoreStoragePutFileResolvedItem, remote_query) + 1
 );
 
 impl core::fmt::Debug for LoreStoragePutFileResolvedItem {
@@ -98,6 +106,7 @@ impl core::fmt::Debug for LoreStoragePutFileResolvedItem {
             .field("remote_write", &self.remote_write)
             .field("remote_query", &self.remote_query)
             .field("local_cache", &self.local_cache)
+            .field("skip_holes", &self.skip_holes)
             .field("fixed_size_chunk", &self.fixed_size_chunk)
             .finish()
     }
@@ -195,6 +204,9 @@ async fn resolve_put_file_resolved_item(
     }
     if item.remote_query != 0 {
         write_options = write_options.with_remote_query();
+    }
+    if item.skip_holes != 0 {
+        write_options = write_options.with_skip_holes();
     }
 
     write_resolved_from_file(

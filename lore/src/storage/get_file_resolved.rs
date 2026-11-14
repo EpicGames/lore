@@ -17,9 +17,9 @@
 //! - `offset` past the end of the content → `INVALID_ARGUMENTS`, with `path` left untouched.
 //! - a file write failure reports its own error, `INTERNAL` where the filesystem gave no code.
 //!
-//! Ranges and temp-file staging behave as in `lore_storage_get_file`. Only the terminal
-//! `GET_ITEM_COMPLETE` is emitted, and its `address` is the *resolved* address, so a caller still
-//! learns the key-to-hash mapping.
+//! Ranges and temp-file staging behave as in `lore_storage_get_file`, and a path takes one get at a
+//! time, as there. Only the terminal `GET_ITEM_COMPLETE` is emitted, and its `address` is the
+//! *resolved* address, so a caller still learns the key-to-hash mapping.
 //!
 //! Backend selection matches `lore_storage_get_resolved`: local first, remote on a miss, narrowed
 //! by the handle's bound and the per-call `offline`/`local`/`remote` flags.
@@ -67,8 +67,8 @@ pub struct LoreStorageGetFileResolvedItem {
     /// Paired with the resolved hash to address the immutable read; the mutable store yields only
     /// a hash
     pub context: Context,
-    /// Destination path; empty rejects with `INVALID_ARGUMENTS`. Multi-fragment writes stage via
-    /// `<path>.loretmp` then atomically rename
+    /// Destination path, which takes one get at a time; empty rejects with `INVALID_ARGUMENTS`.
+    /// Multi-fragment writes stage via `<path>.loretmp` then atomically rename
     pub path: LoreString,
     /// First content byte to write, counted from the start of the decompressed content. Past the
     /// end of the content rejects with `INVALID_ARGUMENTS`

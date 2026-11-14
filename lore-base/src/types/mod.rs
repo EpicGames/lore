@@ -328,6 +328,14 @@ pub struct FragmentReference {
     pub offset_content: u64,
 }
 
+impl FragmentReference {
+    /// Whether this reference is a hole: one with the zero hash, which names no fragment and stands
+    /// for a range holding no data, from its offset to the next reference's, which reads as zeros.
+    pub fn is_hole(&self) -> bool {
+        self.hash.is_zero()
+    }
+}
+
 /// Lightweight sanity validator for a [`Fragment`] received from a remote peer
 /// on the read path.
 ///

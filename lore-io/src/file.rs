@@ -304,4 +304,32 @@ impl IoFile {
             .set_len_raw(Arc::clone(&self.file), len, completion)
             .await
     }
+
+    /// The first range at or after `offset` the file system holds data for, ending where the next
+    /// hole begins: `None` when only holes follow `offset`, or `offset` is at or past the end. A
+    /// hole is a range holding no written data: mapped to no storage, or allocated and never
+    /// written (an unwritten extent). It reads as zeros, but zeros written to the file are data.
+    /// On Linux the map comes from `FIEMAP`, with the file synced first, and a range is widened to
+    /// whole blocks of the file system, so it may end past the end of the file. Elsewhere, and on a
+    /// file system without `FIEMAP`, it comes from `SEEK_DATA`, which takes an unwritten extent the
+    /// page cache holds pages for as data. Where the platform reports no holes, everything from
+    /// `offset` to the end is one range of data.
+    ///
+    /// `cursor` is what one walk of the file keeps between calls ([`crate::DataCursor`]): a new one
+    /// for the first call of a walk, then the one each call hands back with its answer.
+    ///
+    /// The lookup starts when this is called, and is not an `async fn`, so a future awaiting it
+    /// holds the pool's task alone.
+    pub fn next_data(
+        &self,
+        offset: u64,
+        cursor: crate::DataCursor,
+    ) -> impl Future<
+        Output = (
+            std::io::Result<Option<std::ops::Range<u64>>>,
+            crate::DataCursor,
+        ),
+    > + use<> {
+        IoDriver::next_data_raw(Arc::clone(&self.file), offset, cursor)
+    }
 }

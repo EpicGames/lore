@@ -2327,6 +2327,126 @@ mod storage_remote_tests {
         Ok(())
     }
 
+    /// The diagnostic immutable query walks a remote list past its hole, which names no fragment:
+    /// it queries the list and each leaf, and never a hole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_immutable_query_walks_past_the_hole_of_a_list() -> TestResult {
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Fragment;
+        use lore_base::types::FragmentReference;
+        use lore_base::types::Hash;
+        use lore_base::types::fragment_flags::FragmentFlags;
+        use lore_revision::event::LoreEndEventData;
+        use lore_revision::interface::ExecutionContext;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::relay::EventDispatcher;
+
+        let queried: Arc<Mutex<Vec<(Address, u8)>>> = Arc::default();
+        let ended = Arc::new(tokio::sync::Notify::new());
+        let (events, end) = (queried.clone(), ended.clone());
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::RepositoryStoreImmutableQuery(data) => {
+                events
+                    .lock()
+                    .unwrap()
+                    .push((data.address, data.subfragment));
+            }
+            LoreEvent::End(_) => end.notify_one(),
+            _ => {}
+        }));
+        let execution = Arc::new(ExecutionContext::new_server(
+            LoreGlobalArgs::default(),
+            EventDispatcher::new(callback),
+            "storage-remote-immutable-query-hole".to_string(),
+        ));
+        let leaves = LORE_CONTEXT
+            .scope(execution, async move {
+                let repository_id = RepositoryId::from([0xd9; 16]);
+                let test = CacheTest::start(Transport::Grpc, repository_id).await?;
+                let context = Context::from([0xd9; 16]);
+                let mut leaves = Vec::new();
+                let mut references = Vec::new();
+                let before: &[u8] = b"the leaf before the hole";
+                for (leaf, offset) in [(before, 0u64), (&b"after"[..], 4096)] {
+                    let address = Address {
+                        hash: lore_storage::hash::hash_slice(leaf),
+                        context,
+                    };
+                    let plain = Fragment {
+                        flags: 0,
+                        size_payload: leaf.len() as u32,
+                        size_content: leaf.len() as u64,
+                    };
+                    test.server
+                        .backend_immutable
+                        .clone()
+                        .put(
+                            repository_id,
+                            address,
+                            plain,
+                            Some(bytes::Bytes::copy_from_slice(leaf)),
+                            false,
+                        )
+                        .await?;
+                    leaves.push(address);
+                    references.push(FragmentReference {
+                        hash: address.hash,
+                        offset_content: offset,
+                    });
+                }
+                references.insert(
+                    1,
+                    FragmentReference {
+                        hash: Hash::default(),
+                        offset_content: before.len() as u64,
+                    },
+                );
+                let list = bytes::Bytes::copy_from_slice(zerocopy::IntoBytes::as_bytes(
+                    references.as_slice(),
+                ));
+                let list_address = Address {
+                    hash: lore_storage::hash::hash_slice(&list),
+                    context,
+                };
+                let fragmented = Fragment {
+                    flags: FragmentFlags::PayloadFragmented.bits(),
+                    size_payload: list.len() as u32,
+                    size_content: 4096 + 5,
+                };
+                test.server
+                    .backend_immutable
+                    .clone()
+                    .put(repository_id, list_address, fragmented, Some(list), false)
+                    .await?;
+
+                lore_revision::repository::store::immutable_query(
+                    test.client_repository.clone(),
+                    list_address.to_string(),
+                    false,
+                    true,
+                )
+                .await?;
+                LoreEvent::End(LoreEndEventData::default()).send();
+                Ok::<_, Box<dyn Error>>(leaves)
+            })
+            .await?;
+
+        tokio::time::timeout(Duration::from_secs(10), ended.notified()).await?;
+        let queried = queried.lock().unwrap().clone();
+        assert!(
+            queried.iter().all(|(address, _)| !address.hash.is_zero()),
+            "a hole is queried: {queried:?}"
+        );
+        for leaf in leaves {
+            assert!(
+                queried.contains(&(leaf, 1)),
+                "the leaf {leaf} is queried as a subfragment"
+            );
+        }
+        Ok(())
+    }
+
     /// `local_cache=1` on a put item tags the resulting fragment with
     /// `PayloadLocalCachePriority`. A subsequent local query of the address shows the flag
     /// is preserved so future remote reads of this content cache regardless of the reader's
@@ -3336,6 +3456,7 @@ mod storage_remote_tests {
                         remote_write: 1,
                         local_cache: 0,
                         remote_query: 0,
+                        skip_holes: 0,
                         fixed_size_chunk: 0,
                     };
                     let status = put_file::put_file(
@@ -3470,6 +3591,280 @@ mod storage_remote_tests {
                     );
 
                     close_handle(handle).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// A file of 8 MiB in `dir` with data at two ranges and a hole everywhere else, made sparse
+    /// on the file system the test runs on, and the content it reads as.
+    #[cfg(unix)]
+    fn sparse_source(dir: &lore_base::test_util::TempDir) -> (std::path::PathBuf, Vec<u8>) {
+        use std::os::unix::fs::FileExt;
+
+        let path = dir.path().join("image.img");
+        let size = 8usize << 20;
+        let file = std::fs::File::create(&path).expect("create the source");
+        file.set_len(size as u64).expect("size the source");
+        let mut content = vec![0u8; size];
+        for (offset, length) in [(1usize << 20, (1usize << 20) + 4096), (5 << 20, 300 << 10)] {
+            let data: Vec<u8> = incompressible(length as u64 + offset as u64).split_off(offset);
+            file.write_all_at(&data, offset as u64).expect("write data");
+            content[offset..offset + length].copy_from_slice(&data);
+        }
+        file.sync_all().expect("sync the source");
+        (path, content)
+    }
+
+    /// The ranges of the file at `path` that hold data, as a put skipping holes finds them.
+    #[cfg(unix)]
+    async fn data_ranges(path: &std::path::Path) -> Vec<std::ops::Range<u64>> {
+        let (handle, size) = lore_storage::ContentSource::file(path)
+            .open()
+            .await
+            .expect("open the file");
+        let mut ranges = Vec::new();
+        let mut offset = 0;
+        let mut cursor = lore_storage::DataCursor::default();
+        while offset < size {
+            let (found, walked) = handle.next_data(offset, cursor).await;
+            cursor = walked;
+            let Some(range) = found.expect("find data") else {
+                break;
+            };
+            offset = range.end;
+            ranges.push(range.start..range.end.min(size));
+        }
+        ranges
+    }
+
+    /// Whether the list the server stores at `address` holds a hole.
+    #[cfg(unix)]
+    async fn server_list_holds_a_hole(
+        server: &TestServer,
+        partition: lore_base::types::Partition,
+        address: lore_base::types::Address,
+    ) -> bool {
+        use lore_base::types::TypedBytes;
+
+        let stored = server
+            .backend_immutable
+            .clone()
+            .get(partition, address)
+            .await
+            .expect("the server stores the list");
+        let (_, list) = lore_storage::expand_payload(
+            stored.fragment,
+            stored.payload.expect("the list payload"),
+        )
+        .expect("the list expands");
+        list.to_aligned::<lore_base::types::FragmentReference>()
+            .as_type_slice::<lore_base::types::FragmentReference>()
+            .iter()
+            .any(lore_base::types::FragmentReference::is_hole)
+    }
+
+    /// A file put with `skip_holes` and `remote_write` reaches the server as lists holding holes,
+    /// which the server checks and stores, and a get through another handle, whose store is empty,
+    /// writes the file back with the same holes.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_put_skipping_holes_round_trips_through_the_server() -> TestResult {
+        use lore::storage::get_file;
+        use lore::storage::get_file::LoreStorageGetFileArgs;
+        use lore::storage::get_file::LoreStorageGetFileItem;
+        use lore::storage::put_file;
+        use lore::storage::put_file::LoreStoragePutFileArgs;
+        use lore::storage::put_file::LoreStoragePutFileItem;
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-put-file-holes".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let dir = lore_base::test_util::TempDir::new("lore-put-file-holes-");
+                    let (source, content) = sparse_source(&dir);
+                    let source_data = data_ranges(&source).await;
+                    if source_data.len() != 2 {
+                        eprintln!("the file system the test runs on reports no hole");
+                        return Ok(());
+                    }
+                    let partition = Partition::from([0xb7u8; 16]);
+
+                    let handle = open_handle(Some(&server.url)).await;
+                    let outcomes: PutOutcomes = Arc::new(Mutex::new(Vec::new()));
+                    let sink = outcomes.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                        if let LoreEvent::StoragePutItemComplete(data) = event {
+                            sink.lock().unwrap().push((
+                                data.id,
+                                data.address,
+                                data.error.error_code,
+                                data.stored_local,
+                                data.stored_remote,
+                            ));
+                        }
+                    }));
+                    let status = put_file::put_file(
+                        LoreGlobalArgs::default(),
+                        LoreStoragePutFileArgs {
+                            handle,
+                            items: LoreArray::from_vec(vec![LoreStoragePutFileItem {
+                                id: 1,
+                                partition,
+                                context: Context::default(),
+                                path: LoreString::from(source.display().to_string().as_str()),
+                                remote_write: 1,
+                                local_cache: 0,
+                                remote_query: 0,
+                                skip_holes: 1,
+                                fixed_size_chunk: 0,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(status, 0, "{transport:?}");
+                    let outcomes = outcomes.lock().unwrap().clone();
+                    let (_, address, code, _, stored_remote) = outcomes[0];
+                    assert_eq!((code, stored_remote), (0, 1), "{transport:?}");
+                    assert!(
+                        server_list_holds_a_hole(&server, partition, address).await,
+                        "the server stores a list holding a hole, {transport:?}"
+                    );
+                    close_handle(handle).await;
+
+                    let reader = open_handle(Some(&server.url)).await;
+                    let target = dir.path().join("target.img");
+                    let status = get_file::get_file(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetFileArgs {
+                            handle: reader,
+                            items: LoreArray::from_vec(vec![LoreStorageGetFileItem {
+                                id: 2,
+                                partition,
+                                address,
+                                path: LoreString::from(target.display().to_string().as_str()),
+                                ..Default::default()
+                            }]),
+                        },
+                        None,
+                    )
+                    .await;
+                    assert_eq!(status, 0, "{transport:?}");
+                    assert_eq!(std::fs::read(&target)?, content, "{transport:?}");
+                    assert_eq!(data_ranges(&target).await, source_data, "{transport:?}");
+                    close_handle(reader).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// `skip_holes` on a `put_file_resolved` item stores the file with its holes skipped and
+    /// publishes the key to it, and `get_file_resolved` through another handle writes the file
+    /// back with the same holes.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_put_resolved_skipping_holes_round_trips_through_the_server() -> TestResult {
+        use lore::storage::get_file_resolved;
+        use lore::storage::get_file_resolved::LoreStorageGetFileResolvedArgs;
+        use lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem;
+        use lore::storage::put_file_resolved;
+        use lore::storage::put_file_resolved::LoreStoragePutFileResolvedArgs;
+        use lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-put-file-resolved-holes".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let dir = lore_base::test_util::TempDir::new("lore-put-file-resolved-holes-");
+                    let (source, content) = sparse_source(&dir);
+                    let source_data = data_ranges(&source).await;
+                    if source_data.len() != 2 {
+                        eprintln!("the file system the test runs on reports no hole");
+                        return Ok(());
+                    }
+                    let partition = Partition::from([0xb8u8; 16]);
+                    let key = Hash::hash_buffer(b"file-with-holes-key");
+
+                    let handle = open_handle(Some(&server.url)).await;
+                    let outcomes: PutOutcomes = Arc::new(Mutex::new(Vec::new()));
+                    let sink = outcomes.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                        if let LoreEvent::StoragePutItemComplete(data) = event {
+                            sink.lock().unwrap().push((
+                                data.id,
+                                data.address,
+                                data.error.error_code,
+                                data.stored_local,
+                                data.stored_remote,
+                            ));
+                        }
+                    }));
+                    let status = put_file_resolved::put_file_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStoragePutFileResolvedArgs {
+                            handle,
+                            items: LoreArray::from_vec(vec![LoreStoragePutFileResolvedItem {
+                                id: 1,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                path: LoreString::from(source.display().to_string().as_str()),
+                                remote_write: 1,
+                                local_cache: 0,
+                                remote_query: 0,
+                                skip_holes: 1,
+                                fixed_size_chunk: 0,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(status, 0, "{transport:?}");
+                    let outcomes = outcomes.lock().unwrap().clone();
+                    let (_, address, code, _, stored_remote) = outcomes[0];
+                    assert_eq!((code, stored_remote), (0, 1), "{transport:?}");
+                    assert!(
+                        server_list_holds_a_hole(&server, partition, address).await,
+                        "the server stores a list holding a hole, {transport:?}"
+                    );
+                    close_handle(handle).await;
+
+                    let reader = open_handle(Some(&server.url)).await;
+                    let target = dir.path().join("target.img");
+                    let status = get_file_resolved::get_file_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetFileResolvedArgs {
+                            handle: reader,
+                            items: LoreArray::from_vec(vec![LoreStorageGetFileResolvedItem {
+                                id: 2,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                path: LoreString::from(target.display().to_string().as_str()),
+                                offset: 0,
+                                length: 0,
+                                local_cache: 0,
+                            }]),
+                        },
+                        None,
+                    )
+                    .await;
+                    assert_eq!(status, 0, "{transport:?}");
+                    assert_eq!(std::fs::read(&target)?, content, "{transport:?}");
+                    assert_eq!(data_ranges(&target).await, source_data, "{transport:?}");
+                    close_handle(reader).await;
                 }
                 Ok(())
             })
@@ -6211,6 +6606,7 @@ mod storage_remote_tests {
                                 remote_write: 1,
                                 local_cache: 0,
                                 remote_query: 0,
+                                skip_holes: 0,
                                 fixed_size_chunk: 0,
                             }]),
                         },
@@ -6362,6 +6758,7 @@ mod storage_remote_tests {
                                 remote_write: 1,
                                 local_cache: 0,
                                 remote_query: 0,
+                                skip_holes: 0,
                                 fixed_size_chunk: 64 * 1024,
                             }]),
                         },
@@ -6476,6 +6873,7 @@ mod storage_remote_tests {
                                 remote_write: 1,
                                 local_cache: 0,
                                 remote_query: 0,
+                                skip_holes: 0,
                                 fixed_size_chunk: 64 * 1024,
                             }]),
                         },
@@ -6578,6 +6976,7 @@ mod storage_remote_tests {
                                     remote_write: 1,
                                     local_cache: 0,
                                     remote_query: 0,
+                                    skip_holes: 0,
                                     fixed_size_chunk: 0,
                                 }]),
                             },
@@ -6987,6 +7386,7 @@ mod storage_remote_tests {
                                 remote_write: 1,
                                 local_cache: 0,
                                 remote_query: 0,
+                                skip_holes: 0,
                                 fixed_size_chunk: CHUNK,
                             }]),
                         },
@@ -7065,6 +7465,7 @@ mod storage_remote_tests {
                             remote_write: 1,
                             local_cache: 0,
                             remote_query: 0,
+                            skip_holes: 0,
                             fixed_size_chunk: CHUNK,
                         }]),
                     },

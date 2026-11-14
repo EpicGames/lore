@@ -123,9 +123,10 @@ async fn a_long_fragment_list_splits_into_valid_sublists() {
         )
         .await
         .expect("create test store");
+        // The references name a fragment, as a zero hash is a hole, and adjacent holes are refused.
         let references: Vec<FragmentReference> = (0..count)
             .map(|index| FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: (index * FRAGMENT_SIZE_EXPECTED) as u64,
             })
             .collect();

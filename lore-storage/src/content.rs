@@ -255,6 +255,33 @@ impl ContentHandle {
             ContentHandle::Virtual(_) => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
         }
     }
+
+    /// The first range at or after `offset` the content holds data for, ending where the next
+    /// hole begins, or `None` when only holes follow, with the walk's `cursor` to pass to the next
+    /// call; see [`lore_io::IoFile::next_data`].
+    ///
+    /// Not an `async fn`, so a future awaiting it holds the lookup's own future alone, as one
+    /// awaiting [`lore_io::IoFile::next_data`] does.
+    pub fn next_data(
+        &self,
+        offset: u64,
+        cursor: lore_io::DataCursor,
+    ) -> impl Future<
+        Output = (
+            std::io::Result<Option<std::ops::Range<u64>>>,
+            lore_io::DataCursor,
+        ),
+    > + use<> {
+        match self {
+            ContentHandle::File(file) => {
+                futures::future::Either::Left(file.next_data(offset, cursor))
+            }
+            ContentHandle::Virtual(_) => futures::future::Either::Right(std::future::ready((
+                Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
+                cursor,
+            ))),
+        }
+    }
 }
 
 /// Open `path` for reading, returning the shared handle and its size.

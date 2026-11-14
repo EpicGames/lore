@@ -45,6 +45,7 @@ pub mod file;
 mod find;
 #[cfg(all(target_family = "windows", feature = "test-util"))]
 pub mod find;
+mod holes;
 #[cfg(all(target_family = "windows", not(feature = "test-util")))]
 mod iocp;
 #[cfg(all(target_family = "windows", feature = "test-util"))]
@@ -84,6 +85,7 @@ pub use driver::IoDriver;
 pub use driver::WHOLE_FILE_LIMIT;
 pub use file::IoFile;
 pub use file::OpenOptions;
+pub use holes::DataCursor;
 #[cfg(target_family = "windows")]
 pub use iocp::IocpStats;
 pub use pool::PoolStats;

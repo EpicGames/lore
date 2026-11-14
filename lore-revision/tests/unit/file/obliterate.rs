@@ -495,3 +495,63 @@ async fn invalid_fragment_dependency_bounds_are_incomplete() {
         )
         .await;
 }
+
+/// A hole in a list names no fragment, so it is no dependency: the deletion set of a list holding
+/// one is the list and its leaves, and a revision naming the list depends on each leaf.
+#[tokio::test]
+async fn a_hole_in_a_list_is_no_dependency() {
+    let (immutable, mutable, execution) = test_store_create().await.unwrap();
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable,
+                mutable,
+                Context::from([1; 16]).into(),
+            ));
+            let context = Context::from([2; 16]);
+            let first = leaf(&repository, context, 1).await;
+            let last = leaf(&repository, context, 2).await;
+            let references = [
+                FragmentReference {
+                    hash: first.hash,
+                    offset_content: 0,
+                },
+                FragmentReference {
+                    hash: Hash::default(),
+                    offset_content: 128,
+                },
+                FragmentReference {
+                    hash: last.hash,
+                    offset_content: 4096,
+                },
+            ];
+            let with_hole = put(
+                &repository,
+                context,
+                references.as_bytes(),
+                4096 + 128,
+                FragmentFlags::PayloadFragmented.as_u32(),
+            )
+            .await;
+
+            let mut deleted = HashSet::new();
+            deletion_set(&repository, with_hole, &mut Budget::default(), &mut deleted)
+                .await
+                .expect("the deletion set of a list holding a hole");
+            assert_eq!(deleted, HashSet::from([first, last, with_hole]));
+
+            let signature = snapshot(&repository, with_hole).await;
+            assert!(
+                snapshot_affected(
+                    &repository,
+                    signature,
+                    first,
+                    &HashSet::from([first]),
+                    &mut Budget::default()
+                )
+                .await
+                .expect("whether the revision depends on the first leaf")
+            );
+        })
+        .await;
+}

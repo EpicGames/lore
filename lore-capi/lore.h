@@ -3449,7 +3449,9 @@ typedef struct lore_storage_get_fragment_event_data_t {
   // The byte offset of this leaf within the item's content.
   uint64_t offset;
   // The leaf's fragment, describing `bytes`: the compression among its flags, the payload size
-  // and the content size the payload expands to.
+  // and the content size the payload expands to. A hole of the content arrives as a
+  // `LORE_EVENT_STORAGE_GET_FRAGMENT` whose fragment has a `size_payload` of zero and no
+  // payload, covering `size_content` bytes that read as zeros.
   struct lore_fragment_t fragment;
   // The leaf's payload, compressed as `fragment` states.
   struct lore_bytes_t bytes;
@@ -5781,8 +5783,9 @@ typedef struct lore_storage_get_resolved_item_t {
   uint8_t local_cache;
   // Deliver one `GET_FRAGMENT` per leaf fragment in content order in place of `GET_DATA`, each
   // carrying the leaf's fragment and its payload as stored, with `streaming` ignored. No leaf
-  // is expanded or checked against its hash. An item with `data_out` supplied rejects with
-  // `INVALID_ARGUMENTS`
+  // is expanded or checked against its hash. A hole of the content arrives as a `GET_FRAGMENT`
+  // whose fragment has a `size_payload` of zero and no payload, covering `size_content` bytes
+  // that read as zeros. An item with `data_out` supplied rejects with `INVALID_ARGUMENTS`
   uint8_t fragments;
   // Writable buffer receiving the content, `len` stating its capacity. Zero-initialized selects
   // delivery in events.
@@ -6114,6 +6117,16 @@ typedef struct lore_storage_put_file_item_t {
   // before setting its fields: a non-zero padding byte from a caller built against an older
   // header turns the query on
   uint8_t remote_query;
+  // Read only the ranges of the file the file system holds data for, and store each hole between
+  // them as a hole in the fragment list: never read, hashed or stored. A hole is a range
+  // holding no data, never written, or allocated and never written (an unwritten extent), as the
+  // file system's extent map tells on Linux. Zeros written to the file are data and stored as
+  // such: a file with a hole and the same file with zeros written over it get different
+  // addresses. A file larger than one fragment that has holes gets a different address than it
+  // gets without this; one without holes gets the same. `lore_storage_get_file` leaves each
+  // hole unwritten, a hole of the file it writes. The field sits in what was padding, after
+  // `remote_query`, so zero the whole item before setting its fields, as for `remote_query`
+  uint8_t skip_holes;
   // Leaf fragment size cap for large files; `0` lets `write_content` choose
   uint64_t fixed_size_chunk;
 } lore_storage_put_file_item_t;
@@ -6144,8 +6157,8 @@ typedef struct lore_storage_get_file_item_t {
   struct lore_partition_t partition;
   // Content address to read; `hash == Hash::default()` truncates `path` to zero bytes
   struct lore_address_t address;
-  // Destination path; empty rejects with `INVALID_ARGUMENTS`. Multi-fragment writes
-  // stage via `<path>.loretmp` then atomically rename
+  // Destination path, which takes one get at a time; empty rejects with `INVALID_ARGUMENTS`.
+  // Multi-fragment writes stage via `<path>.loretmp` then atomically rename
   struct lore_string_t path;
   // First content byte to write, counted from the start of the decompressed content.
   // Past the end of the content rejects with `INVALID_ARGUMENTS`
@@ -6208,6 +6221,10 @@ typedef struct lore_storage_put_file_resolved_item_t {
   // before setting its fields: a non-zero padding byte from a caller built against an older
   // header turns the query on
   uint8_t remote_query;
+  // Store each hole of the file as a hole in the fragment list rather than reading it, as
+  // `lore_storage_put_file` does. The field sits in what was padding, after `remote_query`, so
+  // zero the whole item before setting its fields, as for `remote_query`
+  uint8_t skip_holes;
   // Leaf fragment size cap for large files; `0` lets the writer choose. Ignored for files under
   // `FRAGMENT_SIZE_THRESHOLD`
   uint64_t fixed_size_chunk;
@@ -6244,8 +6261,8 @@ typedef struct lore_storage_get_file_resolved_item_t {
   // Paired with the resolved hash to address the immutable read; the mutable store yields only
   // a hash
   struct lore_context_t context;
-  // Destination path; empty rejects with `INVALID_ARGUMENTS`. Multi-fragment writes stage via
-  // `<path>.loretmp` then atomically rename
+  // Destination path, which takes one get at a time; empty rejects with `INVALID_ARGUMENTS`.
+  // Multi-fragment writes stage via `<path>.loretmp` then atomically rename
   struct lore_string_t path;
   // First content byte to write, counted from the start of the decompressed content. Past the
   // end of the content rejects with `INVALID_ARGUMENTS`
@@ -12334,7 +12351,9 @@ void lore_storage_get_async(const struct lore_global_args_t *globals,
 //
 // Set `fragments` to receive one `LORE_EVENT_STORAGE_GET_FRAGMENT` per leaf fragment in place of
 // `LORE_EVENT_STORAGE_GET_DATA`, each carrying the leaf's `lore_fragment_t` and its payload as
-// stored. No leaf is expanded or checked against its hash.
+// stored. No leaf is expanded or checked against its hash. A hole of the content arrives as a
+// `LORE_EVENT_STORAGE_GET_FRAGMENT` whose fragment has a `size_payload` of zero and no payload,
+// covering `size_content` bytes that read as zeros.
 //
 // # Events
 //
@@ -12604,7 +12623,14 @@ void lore_storage_put_file_async(const struct lore_global_args_t *globals,
 // and rename atomically, and a failure mid-write removes the temp file, so the target is either
 // the finished range or untouched. An `offset` past the end of the content is rejected with
 // `INVALID_ARGUMENTS` without opening the target, so a destination that was already there
-// survives.
+// survives. The temp file is emptied before anything is written to it, so nothing a
+// `<path>.loretmp` left by an earlier get held stays in it. A hole the content was stored with
+// (`skip_holes` on `lore_storage_put_file`), a range holding no data, is left unwritten, so it is
+// a hole of the written file where its file system supports holes. Every range of data is written,
+// zeros included: written zeros are data.
+//
+// A `path` takes one get at a time. Items that name the same path, in one call or in concurrent
+// calls of this function or `lore_storage_get_file_resolved`, are not supported.
 int32_t lore_storage_get_file(const struct lore_global_args_t *globals,
                               const struct lore_storage_get_file_args_t *args,
                               struct lore_event_callback_config_t callback);
@@ -12666,11 +12692,15 @@ void lore_storage_put_file_resolved_async(const struct lore_global_args_t *globa
 // no zero-hash truncation as in `lore_storage_get_file`, because a resolve that finds nothing is a
 // miss rather than an address for empty content.
 //
-// `offset` and `length` select part of the content and multi-fragment writes stage through
-// `<path>.loretmp` before an atomic rename, both as in `lore_storage_get_file`: the file holds
-// exactly the requested range from its own first byte, and the target is either the finished range
-// or untouched. A start past the end is rejected with `INVALID_ARGUMENTS` without opening the
-// target, so a destination that was already there survives.
+// `offset` and `length` select part of the content, multi-fragment writes stage through
+// `<path>.loretmp` before an atomic rename, and holes are left unwritten, all as in
+// `lore_storage_get_file`: the file holds exactly the requested range from its own first byte, and
+// the target is either the finished range or untouched. A start past the end is rejected with
+// `INVALID_ARGUMENTS` without opening the target, so a destination that was already there
+// survives.
+//
+// A `path` takes one get at a time. Items that name the same path, in one call or in concurrent
+// calls of this function or `lore_storage_get_file`, are not supported.
 //
 // # Events
 //
@@ -13449,6 +13479,11 @@ void lore_revision_tree_node_path_async(const struct lore_global_args_t *globals
 // reads through it. Entries under separate parents are created concurrently,
 // but allocating a node slot is serialized per loaded tree.
 //
+// A revision tree does not support content stored with its holes skipped
+// (`skip_holes` on `lore_storage_put_file` or `lore_storage_put_file_resolved`),
+// and this call does not refuse an address naming such content: FUSE reads of
+// the file fail, and status reports the file modified whenever a scan hashes it.
+//
 // | Terminal event                            | Payload                                          | Notes                                                    |
 // |-------------------------------------------|--------------------------------------------------|----------------------------------------------------------|
 // | `LORE_EVENT_REVISION_TREE_ADD_COMPLETE`   | `lore_revision_tree_add_complete_event_data_t`   | One per entry, carrying its `entry_id`                    |
@@ -13539,6 +13574,11 @@ void lore_revision_tree_delete_async(const struct lore_global_args_t *globals,
 // stays an addition or a move, which the commit records with the new content.
 // Entries touch no parent or sibling chain, so the whole batch applies
 // concurrently.
+//
+// A revision tree does not support content stored with its holes skipped
+// (`skip_holes` on `lore_storage_put_file` or `lore_storage_put_file_resolved`),
+// and this call does not refuse an address naming such content: FUSE reads of
+// the file fail, and status reports the file modified whenever a scan hashes it.
 //
 // | Terminal event                              | Payload                                           | Notes                                                    |
 // |---------------------------------------------|---------------------------------------------------|----------------------------------------------------------|

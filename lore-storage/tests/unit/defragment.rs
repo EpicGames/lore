@@ -26,9 +26,9 @@ use tokio::sync::mpsc::channel;
 mod walk_leaf_level {
     use super::*;
 
-    /// Hashes are distinct and non-zero: a zero hash is not a legal list entry, so a
-    /// list built from `Hash::default()` would be rejected before the offset arithmetic
-    /// these tests are about.
+    /// Hashes are distinct and non-zero: a zero hash is a hole, which the walk sends on
+    /// whatever its size, so a list built from `Hash::default()` would not reach the size
+    /// checks these tests are about.
     fn refs(offsets: &[u64]) -> Vec<FragmentReference> {
         offsets
             .iter()
@@ -269,7 +269,35 @@ mod write_to_file {
             .acquire_many(fragment_permit_count(payload.len()))
             .await
             .expect("permit");
-        tx.send((offset, payload, permit)).await.expect("send");
+        tx.send(DataMessage::Payload(offset, payload, permit))
+            .await
+            .expect("send");
+    }
+
+    /// A hole counts toward the file, and reads as zeros where the target held content
+    /// before: a file written in place, or one an earlier write left behind.
+    #[tokio::test]
+    async fn a_hole_reads_as_zeros_in_a_target_that_held_content() {
+        let dir = TempDir::new("lore-storage-sink-test-");
+        let path = dir.path().join("reused");
+        std::fs::write(&path, vec![0xEE; SIZE]).expect("write the earlier content");
+        let file = lore_storage::defragment::open_file_write(&path, SIZE)
+            .await
+            .expect("open the target");
+        let (tx, rx) = channel::<DataMessage>(4);
+        send_one(&tx, 0, Bytes::from(vec![0xAB; 30])).await;
+        tx.send(DataMessage::Hole(30, 50)).await.expect("send");
+        send_one(&tx, 80, Bytes::from(vec![0xCD; SIZE - 80])).await;
+        drop(tx);
+
+        lore_storage::defragment::write_to_file(file.clone(), SIZE, rx)
+            .await
+            .expect("a hole covers its range");
+
+        let contents = file.read_exact_at(SIZE, 0).await.expect("read back");
+        assert_eq!(&contents[..30], &[0xAB; 30]);
+        assert_eq!(&contents[30..80], &[0; 50]);
+        assert_eq!(&contents[80..], &[0xCD; SIZE - 80]);
     }
 
     #[tokio::test]
@@ -786,7 +814,7 @@ mod defragment_integration {
         let permit = budget.try_acquire().expect("an idle budget has a permit");
         let (sender, _receiver) = channel::<Result<Bytes, StorageError>>(1);
 
-        let handover = send_payload(&sender, Bytes::new(), permit);
+        let handover = send_payload(&sender, Bytes::new(), Some(permit));
         let send = sender.send(Ok(Bytes::new()));
         assert!(
             size_of_val(&handover) < size_of_val(&send),
@@ -1093,6 +1121,80 @@ mod defragment_integration {
             gets.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "an abandoned walk must not load a single list node"
+        );
+    }
+
+    /// A level holding a hole is a level of leaves, which the walk sends on without loading one
+    /// of them to learn what tier it is, the hole included.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_level_holding_a_hole_is_walked_without_a_load() {
+        let (_dir, inner) = make_store().await;
+        let partition = Partition::from([0x1D; 16]);
+        let context = Context::from([0x1D; 16]);
+        let (leaf_a, _) = put_leaf(&inner, partition, context, vec![0xAA; 100]).await;
+        let (leaf_b, _) = put_leaf(&inner, partition, context, vec![0xBB; 100]).await;
+        let hole = Address {
+            hash: Hash::default(),
+            context,
+        };
+        let root_address = put_list(
+            &inner,
+            partition,
+            context,
+            &refs_at(&[(leaf_a, 0), (hole, 100), (leaf_b, 1 << 30)]),
+            (1 << 30) + 100,
+        )
+        .await;
+
+        let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store: Arc<dyn ImmutableStore> = Arc::new(CountingGetStore {
+            inner,
+            gets: gets.clone(),
+        });
+        let options = ReadOptions::default().with_decompress();
+        let (root_fragment, root_buffer) = lore_storage::read::load_fragment(
+            store.clone(),
+            partition,
+            root_address,
+            options,
+            None,
+        )
+        .await
+        .expect("load root list");
+        gets.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let (leaf_tx, mut leaf_rx) = channel::<LeafReference>(4);
+        walk_fragment_tree(
+            store,
+            partition,
+            root_address,
+            root_fragment,
+            root_buffer,
+            0..(1 << 30) + 100,
+            leaf_tx,
+            options,
+            None,
+            None,
+        )
+        .await
+        .expect("walk the level");
+
+        let mut sent = Vec::new();
+        while let Some(leaf) = leaf_rx.recv().await {
+            sent.push((leaf.hash.is_zero(), leaf.target_offset, leaf.expected_size));
+        }
+        assert_eq!(
+            sent,
+            [
+                (false, 0, 100),
+                (true, 100, (1 << 30) - 100),
+                (false, 1 << 30, 100)
+            ]
+        );
+        assert_eq!(
+            gets.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a level holding a hole is known to hold leaves without a load"
         );
     }
 
@@ -1608,11 +1710,9 @@ mod defragment_integration {
         );
     }
 
-    /// A zero hash in a list addresses zero-length content, which is never a fragment.
-    /// `load_fragment` answers it with a default `Fragment`, so an unchecked entry in the
-    /// first position would make a level of intermediate references read as leaves.
+    /// A zero hash in a list is a hole: nothing is loaded for it, and it reads as zeros.
     #[tokio::test(flavor = "multi_thread")]
-    async fn rejects_a_zero_hash_in_a_fragment_list() {
+    async fn reads_a_hole_in_a_fragment_list_as_zeros() {
         let (dir, store) = make_store().await;
         let partition = Partition::from([0x0D; 16]);
         let context = Context::from([0x0D; 16]);
@@ -1632,7 +1732,7 @@ mod defragment_integration {
         .await;
 
         let out_path = dir.join("zero-hash.bin");
-        let err = lore_storage::read::read_into_file(
+        lore_storage::read::read_into_file(
             store.clone(),
             partition,
             root,
@@ -1643,18 +1743,15 @@ mod defragment_integration {
             None,
         )
         .await
-        .expect_err("a zero hash in a list should be rejected");
+        .expect("a hole reads as zeros");
 
-        assert!(
-            err.to_string()
-                .contains("entry 1 at content offset 100 has a zero hash"),
-            "unexpected error: {err}"
-        );
+        let mut expected = vec![0xAA; 100];
+        expected.resize(200, 0);
+        assert_eq!(std::fs::read(&out_path).expect("read the output"), expected);
     }
 
-    /// The same rule where the zero hash stands in the intermediate position: a sibling
-    /// of a real sublist. The load answers with an empty default fragment, so without
-    /// the check the entry is reported as an empty sublist rather than as what it is.
+    /// A hole is only ever a leaf: a level holding one is a level of leaves, so a sublist
+    /// beside a hole is refused when its fetch finds a list where a leaf belongs.
     #[tokio::test(flavor = "multi_thread")]
     async fn rejects_a_zero_hash_among_intermediate_entries() {
         let (dir, store) = make_store().await;
@@ -1692,16 +1789,15 @@ mod defragment_integration {
         .expect_err("a zero hash among intermediate entries should be rejected");
 
         assert!(
-            err.to_string()
-                .contains("entry 1 at content offset 100 has a zero hash"),
+            err.to_string().contains("expected leaf fragment"),
             "unexpected error: {err}"
         );
     }
 
-    /// The same rule one level down, where the sublist reaches `walk_leaf_level`
-    /// straight from `walk_intermediate_level` and never passes the root's check.
+    /// One level down, where the sublist reaches `walk_leaf_level` straight from
+    /// `walk_intermediate_level`: a sublist that is one hole reads as zeros.
     #[tokio::test(flavor = "multi_thread")]
-    async fn rejects_a_zero_hash_inside_a_sublist() {
+    async fn reads_a_sublist_that_is_one_hole_as_zeros() {
         let (dir, store) = make_store().await;
         let partition = Partition::from([0x0E; 16]);
         let context = Context::from([0x0E; 16]);
@@ -1724,7 +1820,7 @@ mod defragment_integration {
         .await;
 
         let out_path = dir.join("zero-hash-sublist.bin");
-        let err = lore_storage::read::read_into_file(
+        lore_storage::read::read_into_file(
             store.clone(),
             partition,
             root,
@@ -1735,12 +1831,11 @@ mod defragment_integration {
             None,
         )
         .await
-        .expect_err("a zero hash inside a sublist should be rejected");
+        .expect("a sublist that is one hole reads as zeros");
 
-        assert!(
-            err.to_string().contains("has a zero hash"),
-            "unexpected error: {err}"
-        );
+        let mut expected = vec![0xAA; 100];
+        expected.resize(200, 0);
+        assert_eq!(std::fs::read(&out_path).expect("read the output"), expected);
     }
 
     /// The other half of the same acceptance: an empty list at the root, where there is
@@ -2073,6 +2168,55 @@ mod defragment_integration {
         .await;
         assert!(result.is_err());
     }
+
+    /// The leaf pipeline sends a hole as a hole, a fragment with no payload covering its length,
+    /// and zeros stored as content as the fragment holding them: the delivery keeps a range with no
+    /// data apart from written zeros.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_leaf_pipeline_sends_a_hole_as_a_fragment_with_no_payload() {
+        let (_dir, store) = make_store().await;
+        let partition = Partition::from([0x0E; 16]);
+        let context = Context::from([0x0E; 16]);
+        let (zeros, _) = put_leaf(&store, partition, context, vec![0u8; 100]).await;
+        let hole = Address {
+            hash: Hash::default(),
+            context,
+        };
+
+        let (fragment, list) = list_over(&[(zeros, 0), (hole, 100)], 300);
+        let (tx, mut rx) = channel(2);
+        defragment_pipeline_leaves(
+            store,
+            partition,
+            Address::default(),
+            fragment,
+            list,
+            tx,
+            ReadOptions::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("leaf pipeline");
+
+        let mut delivered = Vec::new();
+        while let Ok(leaf) = rx.try_recv() {
+            delivered.push(leaf.expect("leaf"));
+        }
+        assert_eq!(delivered.len(), 2);
+        let (written, payload) = &delivered[0];
+        assert_ne!(written.size_payload, 0, "written zeros are stored content");
+        assert_eq!(
+            (written.size_content, payload.as_ref()),
+            (100, &[0u8; 100][..])
+        );
+        let (hole, payload) = &delivered[1];
+        assert_eq!(
+            (hole.size_payload, hole.size_content, payload.len()),
+            (0, 200, 0),
+            "a hole is a fragment with no payload"
+        );
+    }
 }
 
 mod whole_leaf {
@@ -2139,24 +2283,27 @@ mod list_checks {
         );
     }
 
-    /// An entry the window does not reach is checked all the same: a zero hash there fails the
-    /// call, whichever part of the content the caller asked for.
+    /// A zero hash is a hole, which spans its window as any entry does, larger than a fragment
+    /// or not.
     #[test]
-    fn wanted_entries_rejects_a_zero_hash_outside_the_window() {
+    fn wanted_entries_takes_a_zero_hash_as_a_hole() {
         let list = [
             entry(0),
             FragmentReference {
                 hash: Hash::default(),
                 offset_content: 100,
             },
+            entry(1 << 30),
         ];
 
-        let err = wanted_entries(&list, 200, &(0..50)).expect_err("a zero hash is no entry");
-
-        assert!(
-            err.to_string()
-                .contains("entry 1 at content offset 100 has a zero hash"),
-            "unexpected error: {err}"
+        assert_eq!(
+            wanted_entries(&list, (1 << 30) + 100, &(50..1000)).expect("a valid list"),
+            Some(0..2)
+        );
+        assert_eq!(
+            wanted_entries(&list, (1 << 30) + 100, &(1 << 30..(1 << 30) + 1))
+                .expect("a valid list"),
+            Some(2..3)
         );
     }
 

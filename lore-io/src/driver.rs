@@ -48,6 +48,7 @@ use crate::file::IoFile;
 use crate::file::OpenOptions;
 #[cfg(target_family = "windows")]
 use crate::iocp::IocpDriver;
+use crate::pool::SyscallTask;
 use crate::psync::PsyncDriver;
 #[cfg(target_os = "linux")]
 use crate::uring::UringDriver;
@@ -709,6 +710,19 @@ impl IoDriver {
         completion: C,
     ) -> std::io::Result<()> {
         PsyncDriver.set_len(file, len, completion).await
+    }
+
+    /// Every backend runs this on the syscall pool, as [`Self::set_len_raw`]. Returns the pool's
+    /// task, which runs whether or not it is awaited, as do the other hole calls.
+    pub(crate) fn next_data_raw(
+        file: Arc<File>,
+        offset: u64,
+        cursor: crate::DataCursor,
+    ) -> SyscallTask<(
+        std::io::Result<Option<std::ops::Range<u64>>>,
+        crate::DataCursor,
+    )> {
+        PsyncDriver::next_data(file, offset, cursor)
     }
 
     /// Reads an entire file into pooled memory as a single backend

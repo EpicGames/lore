@@ -861,12 +861,14 @@ async fn held_flags(
     Ok(if held { metadata.fragment.flags } else { 0 })
 }
 
-/// Pushes the address of every fragment `list` references, in `context`, onto `into`.
+/// Pushes the address of every fragment `list` references, in `context`, onto `into`. A hole
+/// references none.
 fn push_subfragments(list: Bytes, context: Context, into: &mut Vec<Address>) {
     let list = list.to_aligned::<FragmentReference>();
     into.extend(
         list.as_type_slice::<FragmentReference>()
             .iter()
+            .filter(|reference| !reference.is_hole())
             .map(|reference| Address {
                 context,
                 hash: reference.hash,

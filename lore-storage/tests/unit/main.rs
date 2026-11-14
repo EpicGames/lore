@@ -14,6 +14,7 @@ mod deduplicated_gc;
 mod defragment;
 mod fragment_engine;
 mod hash;
+mod holes;
 mod hooked_immutable_store;
 mod immutable_store;
 mod local;

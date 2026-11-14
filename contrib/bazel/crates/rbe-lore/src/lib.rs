@@ -1011,6 +1011,7 @@ impl LoreBlobStore {
                 remote_write: self.upstream as u8,
                 local_cache: self.local_cache.files as u8,
                 remote_query: 0,
+                skip_holes: 0,
                 fixed_size_chunk: 0,
             })
             .collect();

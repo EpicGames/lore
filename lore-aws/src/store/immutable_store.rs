@@ -1828,7 +1828,10 @@ impl AwsImmutableStore {
 
         let span = tracing::Span::current();
         let mut join_set = JoinSet::new();
-        for reference in sub_fragments.iter() {
+        for reference in sub_fragments
+            .iter()
+            .filter(|reference| !reference.is_hole())
+        {
             let self_clone = self.clone();
             let stats = stats.clone();
             let sub_address = Address {
@@ -2693,6 +2696,83 @@ mod test {
             .await
             .expect("query should succeed");
         assert_eq!(result.match_made, StoreMatch::MatchNone);
+    }
+
+    /// Obliterating a list passes over its holes: a hole names no fragment, so its state is never
+    /// read, and the list's leaves are obliterated as those of a list without holes are.
+    #[tokio::test]
+    async fn obliterate_passes_over_the_holes_of_a_list() {
+        let fake = Fake::default();
+        let partition: Partition = random();
+        let context: Context = random();
+        let store = store(&fake).await;
+        let mut state_reads = Vec::new();
+        for with_hole in [false, true] {
+            let leaves: [Hash; 2] = [random(), random()];
+            for hash in leaves {
+                let (fragment, payload) =
+                    representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+                store
+                    .clone()
+                    .put(
+                        partition,
+                        Address { hash, context },
+                        fragment,
+                        Some(payload),
+                        false,
+                    )
+                    .await
+                    .expect("put a leaf");
+            }
+            let mut references = vec![FragmentReference {
+                hash: leaves[0],
+                offset_content: 0,
+            }];
+            if with_hole {
+                references.push(FragmentReference {
+                    hash: Hash::default(),
+                    offset_content: 256,
+                });
+            }
+            references.push(FragmentReference {
+                hash: leaves[1],
+                offset_content: 4096,
+            });
+            let list = Bytes::copy_from_slice(references.as_bytes());
+            let fragment = Fragment {
+                flags: FragmentFlags::PayloadFragmented.bits(),
+                size_payload: u32::try_from(list.len()).unwrap(),
+                size_content: 4096 + 256,
+            };
+            let list_address = Address {
+                hash: random(),
+                context,
+            };
+            store
+                .clone()
+                .put(partition, list_address, fragment, Some(list), false)
+                .await
+                .expect("put the list");
+
+            let before = fake.state_get_items();
+            store
+                .clone()
+                .obliterate(partition, list_address, Arc::default())
+                .await
+                .expect("obliterate the list");
+            state_reads.push(fake.state_get_items() - before);
+            for hash in leaves {
+                assert_eq!(
+                    fake.state_of(hash),
+                    Some(FragmentState::Obliterated),
+                    "with a hole: {with_hole}"
+                );
+            }
+        }
+        assert_eq!(
+            state_reads[0], state_reads[1],
+            "the state of a hole is read"
+        );
     }
 
     #[tokio::test]

@@ -280,9 +280,9 @@ The content-addressed unit of storage in Lore. Files are split into fragments an
 
 ### Fragment reference
 
-An entry in a fragment list recording the hash of a child fragment and the byte offset it represents in the reassembled content; the offset is what makes sparse, range-based reads possible.
+An entry in a fragment list recording the hash of a child fragment and the byte offset it represents in the reassembled content; the offset is what makes sparse, range-based reads possible. An entry with the zero hash stands for a hole.
 
-Also see: fragment, chunking.
+Also see: fragment, chunking, hole.
 
 ## G
 
@@ -317,6 +317,12 @@ Also see: verify.
 The ordered list of revisions reachable from a starting revision, newest first, for a repository, branch, or file (`lore history`, `lore file history`).
 
 Also see: revision graph.
+
+### Hole
+
+A range of a file that holds no data: the file system maps it to no storage, or allocated it and never wrote it. It reads as zeros, and content stored with its holes skipped records each as a fragment reference with the zero hash.
+
+Also see: fragment reference.
 
 ## I
 

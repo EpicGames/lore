@@ -24,7 +24,9 @@
 //! With `fragments` set the leaves arrive as stored: `GET_HEADER`, then one
 //! `GET_FRAGMENT { id, address, offset, fragment, bytes }` per leaf in content order, then
 //! `GET_ITEM_COMPLETE`. `fragment` describes `bytes`. No leaf is expanded or checked against its
-//! hash. `offset` and the byte-count backstop count content, as in streaming mode.
+//! hash. `offset` and the byte-count backstop count content, as in streaming mode. A hole of the
+//! content arrives as a `LORE_EVENT_STORAGE_GET_FRAGMENT` whose fragment has a `size_payload` of
+//! zero and no payload, covering `size_content` bytes that read as zeros.
 //!
 //! `address` is the resolved address (`{ resolved_hash, context }`), so callers may cache the
 //! key->hash mapping from the event stream.
@@ -98,8 +100,9 @@ pub struct LoreStorageGetResolvedItem {
     pub local_cache: u8,
     /// Deliver one `GET_FRAGMENT` per leaf fragment in content order in place of `GET_DATA`, each
     /// carrying the leaf's fragment and its payload as stored, with `streaming` ignored. No leaf
-    /// is expanded or checked against its hash. An item with `data_out` supplied rejects with
-    /// `INVALID_ARGUMENTS`
+    /// is expanded or checked against its hash. A hole of the content arrives as a `GET_FRAGMENT`
+    /// whose fragment has a `size_payload` of zero and no payload, covering `size_content` bytes
+    /// that read as zeros. An item with `data_out` supplied rejects with `INVALID_ARGUMENTS`
     pub fragments: u8,
     /// Writable buffer receiving the content, `len` stating its capacity. Zero-initialized selects
     /// delivery in events.

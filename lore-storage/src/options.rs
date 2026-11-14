@@ -43,6 +43,20 @@ pub struct WriteOptions {
     /// Not for a resolved write, which exists to publish a mapping to stored content and would
     /// publish one to content nobody stored.
     pub hash_only: bool,
+    /// Read only the ranges of a file the file system holds data for, and record each hole between
+    /// them as a hole reference in the fragment list: one entry with the zero hash, spanning to the
+    /// next entry, which stands for a range holding no data. A hole is never read, hashed or
+    /// stored. Fixed-size chunks keep their place on the grid from the start of the file and are
+    /// cut short where data starts or ends. Applies to content read from a file larger than one
+    /// fragment; a file with no hole stores as it would without it.
+    ///
+    /// A hole is a range never written, or allocated and never written (an unwritten extent), as
+    /// [`lore_io::IoFile::next_data`] finds it: from the extent map on Linux, so what the page
+    /// cache holds does not change it. Zeros written to the file are data, stored as any other
+    /// content: a hole is not zeros, even though it reads as zeros. The address therefore depends
+    /// on how the file is allocated as well as on what it reads as. A file with a hole and the same
+    /// file with zeros written over the hole have different addresses.
+    pub skip_holes: bool,
 }
 
 impl WriteOptions {
@@ -120,6 +134,12 @@ impl WriteOptions {
     /// Address the content without storing it. See [`hash_only`](Self::hash_only).
     pub fn hash_only(mut self) -> Self {
         self.hash_only = true;
+        self
+    }
+
+    /// See [`WriteOptions::skip_holes`].
+    pub fn with_skip_holes(mut self) -> Self {
+        self.skip_holes = true;
         self
     }
 }

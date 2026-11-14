@@ -1737,11 +1737,11 @@ pub fn read_into_file(
 ///
 /// A single fragment's payload is already in `buffer` and goes out in one whole-file write, whose
 /// open handle answers the metadata the caller gets back. A fragment list streams through the
-/// defragment pipeline into a file sized to the range up front, so each leaf lands at its own
-/// offset and peak memory follows the leaf rather than the content — and no metadata comes back,
-/// because the handle moves into the pipeline. That path stages through
-/// `<path><temp_file_extension>` and renames, unless `options.direct_write` asks for the target to
-/// be written in place.
+/// defragment pipeline into a file emptied and sized to the range up front, so each leaf lands at
+/// its own offset and peak memory follows the leaf rather than the content — and no metadata comes
+/// back, because the handle moves into the pipeline. A hole is left unwritten, and every leaf is
+/// written, one of zeros included. That path stages through `<path><temp_file_extension>` and
+/// renames, unless `options.direct_write` asks for the target to be written in place.
 ///
 /// Where `options.create_parent` asks for it, a write that finds the directory `path` goes in
 /// missing creates that directory, with its missing ancestors, and opens again at once. A

@@ -164,6 +164,9 @@ mod validate_fragment {
 
     use super::*;
 
+    /// Encodes `refs` as a fragment list payload. The tests give each reference that names a
+    /// fragment a nonzero hash: a zero hash is a hole, and a list holding a hole is checked under
+    /// further rules.
     fn make_fragment_ref_payload(refs: &[FragmentReference]) -> Bytes {
         Bytes::copy_from_slice(refs.as_bytes())
     }
@@ -214,11 +217,11 @@ mod validate_fragment {
     fn fragmented_valid_two_refs() {
         let refs = [
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 0,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 1000,
             },
         ];
@@ -230,15 +233,15 @@ mod validate_fragment {
     fn fragmented_valid_three_refs() {
         let refs = [
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 0,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 500,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 1000,
             },
         ];
@@ -249,7 +252,7 @@ mod validate_fragment {
     #[test]
     fn fragmented_fewer_than_two_refs_one() {
         let refs = [FragmentReference {
-            hash: Hash::default(),
+            hash: Hash::from_u64(1),
             offset_content: 0,
         }];
         let put = fragmented_put(&refs, 2000);
@@ -286,11 +289,11 @@ mod validate_fragment {
         // Non-zero first offset is valid (multi-level fragment list child blob)
         let refs = [
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 10,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 1000,
             },
         ];
@@ -303,11 +306,11 @@ mod validate_fragment {
         // Span (last - first) must be less than size_content
         let refs = [
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 500,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 3000,
             },
         ];
@@ -322,15 +325,15 @@ mod validate_fragment {
     fn fragmented_offsets_not_increasing() {
         let refs = [
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 0,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 1000,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 500,
             },
         ];
@@ -345,15 +348,15 @@ mod validate_fragment {
     fn fragmented_offsets_equal() {
         let refs = [
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 0,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 500,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 500,
             },
         ];
@@ -368,11 +371,11 @@ mod validate_fragment {
     fn fragmented_last_offset_equals_content_size() {
         let refs = [
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 0,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 2000,
             },
         ];
@@ -387,11 +390,11 @@ mod validate_fragment {
     fn fragmented_last_offset_exceeds_content_size() {
         let refs = [
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 0,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 3000,
             },
         ];

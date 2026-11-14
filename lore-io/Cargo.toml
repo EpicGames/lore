@@ -17,7 +17,8 @@ parking_lot = { workspace = true }
 io-uring = { workspace = true }
 
 # For the uring backend's eventfd and poll, the thread disk priority, the error codes that tell
-# a mount point, and the clone backends' `clonefile`, `fcopyfile`, `FICLONE`, `statfs` and `statvfs`.
+# a mount point, the clone backends' `clonefile`, `fcopyfile`, `FICLONE`, `statfs` and `statvfs`,
+# and the hole calls' `FIEMAP`, `lseek` and `posix_fadvise`.
 [target.'cfg(target_family = "unix")'.dependencies]
 libc = { workspace = true }
 

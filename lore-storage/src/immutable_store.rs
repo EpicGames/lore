@@ -360,11 +360,16 @@ fn refuse_inconsistency(fragment: &Fragment) -> Result<(), StoreError> {
 /// Checks:
 /// - `size_payload` is a non-zero multiple of `size_of::<FragmentReference>()`
 /// - Payload buffer length matches `size_payload`
-/// - At least two references are present
+/// - At least two references are present, or one that is a hole
 /// - `offset_content` is strictly increasing
 /// - `first_offset + size_content` does not overflow u64
 /// - `last_offset` is strictly inside the content window
 ///   `[first_offset, first_offset + size_content)`
+/// - No hole follows a hole, and in a list holding a hole, which is a list of leaves, every other
+///   reference spans at most [`FRAGMENT_SIZE_THRESHOLD`](crate::FRAGMENT_SIZE_THRESHOLD)
+///
+/// A hole is a reference with the zero hash: it names no fragment, and stands for a range holding
+/// no data, from its offset to the next reference's, which reads as zeros.
 pub fn validate_fragment_list(
     fragment: &Fragment,
     payload: &bytes::Bytes,
@@ -391,24 +396,15 @@ pub fn validate_fragment_list(
     let aligned = payload.clone().to_aligned::<FragmentReference>();
     let references = aligned.as_type_slice::<FragmentReference>();
 
-    if references.len() < 2 {
+    let one_hole = references.len() == 1 && references[0].is_hole();
+    if references.len() < 2 && !one_hole {
         return Err(StoreError::internal(format!(
             "fragmented fragment has fewer than 2 references ({})",
             references.len()
         )));
     }
 
-    for i in 1..references.len() {
-        if references[i].offset_content <= references[i - 1].offset_content {
-            return Err(StoreError::internal(format!(
-                "fragmented fragment offsets are not strictly increasing at index {i}"
-            )));
-        }
-    }
-
     let first = references[0].offset_content;
-    let last = references[references.len() - 1].offset_content;
-
     let content_end = first.checked_add(fragment.size_content).ok_or_else(|| {
         StoreError::internal(format!(
             "fragmented fragment first offset {first} + size_content {} overflows u64",
@@ -416,9 +412,50 @@ pub fn validate_fragment_list(
         ))
     })?;
 
-    if last >= content_end {
+    let fragment_size = crate::FRAGMENT_SIZE_THRESHOLD as u64;
+    let mut holes = references[0].is_hole();
+    let mut first_oversized = None;
+    for i in 1..references.len() {
+        let (previous, reference) = (&references[i - 1], &references[i]);
+        if reference.offset_content <= previous.offset_content {
+            return Err(StoreError::internal(format!(
+                "fragmented fragment offsets are not strictly increasing at index {i}"
+            )));
+        }
+        if reference.is_hole() {
+            if previous.is_hole() {
+                return Err(StoreError::internal(format!(
+                    "fragmented fragment holds a hole following a hole at index {i}"
+                )));
+            }
+            holes = true;
+        }
+        if first_oversized.is_none()
+            && !previous.is_hole()
+            && reference.offset_content - previous.offset_content > fragment_size
+        {
+            first_oversized = Some(i - 1);
+        }
+    }
+
+    let last_index = references.len() - 1;
+    let last = references[last_index];
+    if last.offset_content >= content_end {
         return Err(StoreError::internal(format!(
-            "fragmented fragment last offset {last} is outside content window [{first}, {content_end})"
+            "fragmented fragment last offset {} is outside content window [{first}, {content_end})",
+            last.offset_content
+        )));
+    }
+    if first_oversized.is_none()
+        && !last.is_hole()
+        && content_end - last.offset_content > fragment_size
+    {
+        first_oversized = Some(last_index);
+    }
+
+    if holes && let Some(i) = first_oversized {
+        return Err(StoreError::internal(format!(
+            "fragmented fragment with holes has a reference at index {i} larger than a fragment"
         )));
     }
 

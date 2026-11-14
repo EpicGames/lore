@@ -652,7 +652,10 @@ adds content by the address the storage API stored it under. Committing it moves
 in the handle's local mutable store, where the revision graph API reads it. The revision tree API
 loads a revision the revision graph API resolves, by its hash. The handle counts the storage and
 revision graph calls in flight, and closing it waits for them before it flushes the stores. A
-revision tree holds the handle's stores past a close, until the tree itself is closed.
+revision tree holds the handle's stores past a close, until the tree itself is closed. A revision
+tree does not support content stored with its holes skipped (§8.5), and nothing refuses it when a
+file is added or modified: FUSE reads of such a file fail, and status reports it modified whenever a
+scan hashes it.
 
 #### 6.4 Specifications behind the API
 
@@ -890,11 +893,11 @@ Fixed-size chunking is the right answer when canonical addressing matters more t
 robustness, or when the property above must hold. Boundaries are determined by offset alone, so
 the same content always produces the same chunks and therefore the same top-level hash,
 regardless of chunking history. The address is canonical - one piece of content has exactly one
-address - and `address(A) != address(B) => content(A) != content(B)` holds unconditionally. A
-chunk at offset 12 GiB has a deterministic address that any party can compute by reading just
-that chunk's bytes. The cost is that dedup is preserved only for aligned, identical regions;
-an insertion at the beginning of a file shifts every subsequent boundary, and no chunk after
-the insertion deduplicates with the original.
+address - and `address(A) != address(B) => content(A) != content(B)` holds for content stored
+without its holes skipped (§8.5). A chunk at offset 12 GiB has a deterministic address that any
+party can compute by reading just that chunk's bytes. The cost is that dedup is preserved only
+for aligned, identical regions; an insertion at the beginning of a file shifts every subsequent
+boundary, and no chunk after the insertion deduplicates with the original.
 
 Lore offers both strategies; the choice for any given content is made by the application calling
 the storage subsystem, not by Lore itself. An application can map content types to strategies in
@@ -932,6 +935,21 @@ advantage of this). Reading a byte range fetches only the fragments that overlap
 typically a small fraction of the file - and those fragments can be fetched in parallel and
 processed out of order, since each is independent of the others. Sparse reads scale with the
 requested range, not with the file size.
+
+A reference with the zero hash is a *hole*: it names no fragment, and stands for a range holding
+no data, from its offset to the next reference, which reads as zeros. A file the file system
+holds mostly as holes, such as a disk image, can be stored with its holes skipped: only the
+ranges the file system holds data for are read, chunked and stored, and each hole between them
+costs one reference, however large it is. A hole is a range never written, or allocated and
+never written, as the file system's extent map tells. Zeros written to the file are data, stored
+as any other content, so a file with a hole and the same file with zeros written over it are
+different content with different addresses. Fixed-size chunks keep their offsets on such a file,
+cut short where data starts or ends, so a chunk inside the data has the address it has without
+the holes skipped. Writing the content to a file empties the file first and leaves each hole
+unwritten, so the hole is a hole of the file again wherever the file system supports holes, and
+writes every range of data, zeros included. Every other reader sees zeros for a hole, but
+fragment delivery, which sends a fragment with no payload for it, and FUSE, which refuses it.
+Only a list of leaves holds holes, and two holes never follow each other.
 
 #### 8.6 Compression as an orthogonal concern
 

@@ -101,7 +101,9 @@ pub struct LoreStorageGetFragmentEventData {
     /// The byte offset of this leaf within the item's content.
     pub offset: u64,
     /// The leaf's fragment, describing `bytes`: the compression among its flags, the payload size
-    /// and the content size the payload expands to.
+    /// and the content size the payload expands to. A hole of the content arrives as a
+    /// `LORE_EVENT_STORAGE_GET_FRAGMENT` whose fragment has a `size_payload` of zero and no
+    /// payload, covering `size_content` bytes that read as zeros.
     pub fragment: Fragment,
     /// The leaf's payload, compressed as `fragment` states.
     pub bytes: LoreBytes,

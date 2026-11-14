@@ -10,6 +10,8 @@ mod clone;
 mod driver;
 #[cfg(target_family = "windows")]
 mod find;
+#[cfg(target_os = "linux")]
+mod holes;
 #[cfg(target_family = "windows")]
 mod iocp;
 mod pool;

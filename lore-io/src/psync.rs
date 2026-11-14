@@ -10,6 +10,7 @@ use crate::buffer::StableBuf;
 use crate::buffer::StableBufList;
 use crate::buffer::StableBufListMut;
 use crate::pool::SyscallPool;
+use crate::pool::SyscallTask;
 use crate::pool::retry_on_interrupt;
 
 /// Segments per vectored syscall, matching the `IOV_MAX` of 1024 on Linux
@@ -368,6 +369,23 @@ impl PsyncDriver {
                 set
             })
             .await
+    }
+
+    /// Runs [`crate::holes::next_data`] on the syscall pool. Returns the pool's task rather than
+    /// awaiting it: a forwarding `async fn` would add a level to every future awaiting this one,
+    /// which the compiler walks to prove that future `Send`.
+    pub(crate) fn next_data(
+        file: Arc<File>,
+        offset: u64,
+        mut cursor: crate::DataCursor,
+    ) -> SyscallTask<(
+        std::io::Result<Option<std::ops::Range<u64>>>,
+        crate::DataCursor,
+    )> {
+        SyscallPool::global().submit(move || {
+            let found = crate::holes::next_data(&file, offset, &mut cursor);
+            (found, cursor)
+        })
     }
 
     pub(crate) async fn rename(&self, from: PathBuf, to: PathBuf) -> std::io::Result<()> {

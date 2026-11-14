@@ -349,11 +349,11 @@ mod validate_list {
     fn accepts_well_formed_list() {
         let refs = [
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 0,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 1000,
             },
         ];
@@ -378,11 +378,11 @@ mod validate_list {
     fn rejects_payload_length_mismatch() {
         let refs = [
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 0,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 500,
             },
         ];
@@ -397,7 +397,7 @@ mod validate_list {
     #[test]
     fn rejects_fewer_than_two_refs() {
         let refs = [FragmentReference {
-            hash: Hash::default(),
+            hash: Hash::from_u64(1),
             offset_content: 0,
         }];
         let fragment = make_fragmented(refs.len(), 1000);
@@ -410,15 +410,15 @@ mod validate_list {
     fn rejects_non_increasing_offsets() {
         let refs = [
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 0,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 1000,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 500,
             },
         ];
@@ -432,15 +432,15 @@ mod validate_list {
     fn rejects_equal_offsets() {
         let refs = [
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 0,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 500,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 500,
             },
         ];
@@ -454,11 +454,11 @@ mod validate_list {
     fn rejects_last_offset_at_content_end() {
         let refs = [
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 0,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 2000,
             },
         ];
@@ -472,11 +472,11 @@ mod validate_list {
     fn rejects_last_offset_beyond_content_end() {
         let refs = [
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 500,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 3000,
             },
         ];
@@ -490,11 +490,11 @@ mod validate_list {
     fn rejects_content_end_overflow() {
         let refs = [
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: u64::MAX - 10,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: u64::MAX,
             },
         ];
@@ -509,16 +509,91 @@ mod validate_list {
         // Interior/child-list case
         let refs = [
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 10_000_000,
             },
             FragmentReference {
-                hash: Hash::default(),
+                hash: Hash::from_u64(1),
                 offset_content: 10_500_000,
             },
         ];
         let fragment = make_fragmented(refs.len(), 1_000_000);
         let payload = make_refs_payload(&refs);
         assert!(validate_fragment_list(&fragment, &payload).is_ok());
+    }
+
+    fn data(offset_content: u64) -> FragmentReference {
+        FragmentReference {
+            hash: Hash::from_u64(offset_content + 1),
+            offset_content,
+        }
+    }
+
+    fn hole(offset_content: u64) -> FragmentReference {
+        FragmentReference {
+            hash: Hash::default(),
+            offset_content,
+        }
+    }
+
+    fn check(refs: &[FragmentReference], size_content: u64) -> Result<(), StoreError> {
+        validate_fragment_list(
+            &make_fragmented(refs.len(), size_content),
+            &make_refs_payload(refs),
+        )
+    }
+
+    /// A hole may span far more than a fragment, between two leaves or at either end.
+    #[test]
+    fn accepts_holes_between_and_around_leaves() {
+        let gib = 1u64 << 30;
+        check(&[data(0), hole(4096), data(gib)], gib + 4096).expect("a hole between leaves");
+        check(&[hole(0), data(gib), hole(gib + 4096)], 2 * gib).expect("holes at either end");
+    }
+
+    /// Content that is one hole is a list of that one hole, while one leaf alone is no list.
+    #[test]
+    fn accepts_one_hole_and_refuses_one_leaf() {
+        check(&[hole(0)], 1 << 40).expect("a list of one hole");
+        let err = check(&[data(0)], 4096).expect_err("a list of one leaf");
+        assert!(matches!(err, StoreError::Internal(_)));
+    }
+
+    /// Two holes in a row are one hole, so a list naming two is not the one way to name it.
+    #[test]
+    fn rejects_a_hole_following_a_hole() {
+        let err = check(&[data(0), hole(4096), hole(8192)], 1 << 20).expect_err("hole after hole");
+        assert!(matches!(err, StoreError::Internal(_)));
+    }
+
+    /// A list holding a hole is a list of leaves, so an entry spanning more than a fragment
+    /// beside one names a list where a leaf belongs.
+    #[test]
+    fn rejects_an_entry_larger_than_a_fragment_beside_a_hole() {
+        let fragment_size = lore_storage::FRAGMENT_SIZE_THRESHOLD as u64;
+        check(&[data(0), hole(fragment_size)], 2 * fragment_size).expect("a leaf-sized entry");
+        let err = check(&[data(0), hole(fragment_size + 1)], 2 * fragment_size)
+            .expect_err("an entry larger than a fragment");
+        assert!(matches!(err, StoreError::Internal(_)));
+    }
+
+    /// The span of every entry beside a hole is checked, before the first hole and after the last
+    /// alike, while a list without holes may name entries of any size.
+    #[test]
+    fn checks_the_span_of_every_entry_in_a_list_with_a_hole() {
+        let fragment_size = lore_storage::FRAGMENT_SIZE_THRESHOLD as u64;
+        let big = fragment_size + 1;
+        check(&[data(0), data(big)], 2 * big).expect("a list of lists without holes");
+        for (refs, size) in [
+            (vec![data(0), data(big), hole(2 * big)], 3 * big),
+            (vec![hole(0), data(4096)], 4096 + big),
+            (
+                vec![data(0), hole(4096), data(8192), data(8192 + big)],
+                8192 + 2 * big,
+            ),
+        ] {
+            let err = check(&refs, size).expect_err("an entry larger than a fragment");
+            assert!(matches!(err, StoreError::Internal(_)), "{refs:?}");
+        }
     }
 }

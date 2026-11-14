@@ -30,6 +30,16 @@ fn reference_fixed_boundaries(size: usize, step: usize) -> Vec<(u64, usize)> {
         .collect()
 }
 
+/// Where a chunk of data starts, and its bytes. A chunker reading every range hands out no hole.
+fn chunk_data(chunk: &Chunk) -> (u64, &[u8]) {
+    match chunk {
+        Chunk::Data { offset, data } => (*offset, data.as_ref()),
+        Chunk::Hole { offset, .. } => {
+            panic!("a hole at {offset} from a chunker reading every range")
+        }
+    }
+}
+
 async fn streamed_chunks(
     dir: &TempDir,
     name: &str,
@@ -63,7 +73,10 @@ async fn assert_matches_reference(name: &str, content: &[u8]) {
     let dir = TempDir::new("lore-storage-chunker-test-");
     let chunks = streamed_chunks(&dir, name, content, 0).await;
 
-    let actual: Vec<(u64, usize)> = chunks.iter().map(|c| (c.offset, c.data.len())).collect();
+    let actual: Vec<(u64, usize)> = chunks
+        .iter()
+        .map(|c| (chunk_data(c).0, chunk_data(c).1.len()))
+        .collect();
     assert_eq!(
         actual,
         reference_boundaries(content),
@@ -78,7 +91,10 @@ async fn assert_matches_fixed_reference(name: &str, content: &[u8], step: usize)
     let dir = TempDir::new("lore-storage-chunker-test-");
     let chunks = streamed_chunks(&dir, name, content, step).await;
 
-    let actual: Vec<(u64, usize)> = chunks.iter().map(|c| (c.offset, c.data.len())).collect();
+    let actual: Vec<(u64, usize)> = chunks
+        .iter()
+        .map(|c| (chunk_data(c).0, chunk_data(c).1.len()))
+        .collect();
     assert_eq!(
         actual,
         reference_fixed_boundaries(content.len(), step),
@@ -91,15 +107,16 @@ async fn assert_matches_fixed_reference(name: &str, content: &[u8], step: usize)
 
 fn assert_covers(chunks: &[Chunk], content: &[u8]) {
     for chunk in chunks {
-        let start = chunk.offset as usize;
+        let (offset, data) = chunk_data(chunk);
+        let start = offset as usize;
         assert_eq!(
-            chunk.data.as_ref(),
-            &content[start..start + chunk.data.len()],
+            data,
+            &content[start..start + data.len()],
             "chunk data at offset {start} does not match the source"
         );
     }
 
-    let covered: usize = chunks.iter().map(|c| c.data.len()).sum();
+    let covered: usize = chunks.iter().map(|c| chunk_data(c).1.len()).sum();
     assert_eq!(covered, content.len(), "chunks do not cover the whole file");
 }
 
@@ -267,7 +284,7 @@ async fn never_reads_past_the_opened_size() {
 
     let mut covered = 0usize;
     while let Some(chunk) = chunker.next_chunk().await.expect("chunking succeeds") {
-        covered += chunk.data.len();
+        covered += chunk_data(&chunk).1.len();
     }
     assert_eq!(
         covered, declared,
@@ -363,4 +380,387 @@ async fn a_failed_read_does_not_leave_the_chunker_usable() {
         format!("{second}").contains("used again after a read failure"),
         "expected the fuse, got: {second}"
     );
+}
+
+/// Chunking that skips holes, which needs a file system reporting them.
+#[cfg(unix)]
+mod skipping_holes {
+    use super::*;
+
+    /// A file of `size` bytes holding random data at `extents`, `(offset, length)` each, and a hole
+    /// everywhere else, with the content it reads as.
+    fn sparse_file(dir: &TempDir, name: &str, size: usize, extents: &[(usize, usize)]) -> Vec<u8> {
+        use std::os::unix::fs::FileExt;
+
+        let path = dir.path().join(name);
+        let file = std::fs::File::create(&path).expect("create test file");
+        file.set_len(size as u64).expect("size test file");
+        let mut content = vec![0u8; size];
+        for &(offset, length) in extents {
+            let data = random_buffer(length);
+            file.write_all_at(&data, offset as u64)
+                .expect("write extent");
+            content[offset..offset + length].copy_from_slice(&data);
+        }
+        file.sync_all().expect("sync test file");
+        content
+    }
+
+    /// The data ranges of `name` up to `size`, as `ContentHandle::next_data` reports them.
+    async fn reported_data(dir: &TempDir, name: &str, size: u64) -> Vec<std::ops::Range<u64>> {
+        let (handle, _) = lore_storage::content::ContentSource::file(&dir.path().join(name))
+            .open()
+            .await
+            .expect("open test file");
+        let mut ranges = Vec::new();
+        let mut offset = 0;
+        let mut cursor = lore_io::DataCursor::default();
+        while offset < size {
+            let (found, walked) = handle.next_data(offset, cursor).await;
+            cursor = walked;
+            let Some(range) = found.expect("find data") else {
+                break;
+            };
+            offset = range.end;
+            ranges.push(range.start..range.end.min(size));
+        }
+        ranges
+    }
+
+    /// Whether the file system the tests run on reports holes, probed once with a file holding a
+    /// hole between two ranges of data. A test that needs holes reported returns early where they
+    /// are not, saying why.
+    async fn holes_reported() -> bool {
+        static REPORTED: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+        let reported = *REPORTED
+            .get_or_init(|| async {
+                let dir = TempDir::new("lore-storage-chunker-holes-probe-");
+                let size = 4 << 20;
+                sparse_file(&dir, "probe", size, &[(0, 4096), (2 << 20, 4096)]);
+                reported_data(&dir, "probe", size as u64).await.len() == 2
+            })
+            .await;
+        if !reported {
+            eprintln!("the file system the test runs on reports no hole");
+        }
+        reported
+    }
+
+    /// Every chunk of `name`, skipping holes, cut every `fixed_size` bytes, or by content when
+    /// `fixed_size` is zero.
+    async fn chunks_skipping_holes(dir: &TempDir, name: &str, fixed_size: usize) -> Vec<Chunk> {
+        let (file, file_size) = lore_storage::content::ContentSource::file(&dir.path().join(name))
+            .open()
+            .await
+            .expect("open test file");
+        let chunker = if fixed_size > 0 {
+            FileChunker::fixed_size(file, file_size, fixed_size).await
+        } else {
+            FileChunker::content_defined(file, file_size).await
+        };
+        let mut chunker = chunker.skipping_holes();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = chunker.next_chunk().await.expect("chunking succeeds") {
+            chunks.push(chunk);
+        }
+        chunks
+    }
+
+    /// The chunks tile the file in order, holes exactly where the file system reports no data, and
+    /// each chunk of data is the content at its offset.
+    fn assert_tiles_with_holes(chunks: &[Chunk], content: &[u8], data: &[std::ops::Range<u64>]) {
+        let mut at = 0u64;
+        let mut holes = Vec::new();
+        for chunk in chunks {
+            match chunk {
+                Chunk::Hole { offset, len } => {
+                    assert_eq!(*offset, at, "chunks leave a gap or overlap at {at}");
+                    holes.push(*offset..offset + len);
+                    at += len;
+                }
+                Chunk::Data {
+                    offset,
+                    data: bytes,
+                } => {
+                    assert_eq!(*offset, at, "chunks leave a gap or overlap at {at}");
+                    let start = *offset as usize;
+                    assert_eq!(
+                        bytes.as_ref(),
+                        &content[start..start + bytes.len()],
+                        "chunk data at offset {start} does not match the source"
+                    );
+                    assert!(
+                        data.iter().any(|range| range.start <= *offset
+                            && offset + bytes.len() as u64 <= range.end),
+                        "chunk at {start} spans more than one range of data"
+                    );
+                    at += bytes.len() as u64;
+                }
+            }
+        }
+        assert_eq!(
+            at,
+            content.len() as u64,
+            "chunks do not cover the whole file"
+        );
+
+        let mut expected_holes = Vec::new();
+        let mut end = 0;
+        for range in data {
+            if range.start > end {
+                expected_holes.push(end..range.start);
+            }
+            end = range.end;
+        }
+        if end < content.len() as u64 {
+            expected_holes.push(end..content.len() as u64);
+        }
+        assert_eq!(
+            holes, expected_holes,
+            "holes differ from what the file system reports"
+        );
+    }
+
+    /// Data at offsets off the 256 KiB grid, holes between, before and after: no hole is read, and
+    /// every fixed-size cut lands on the grid from the start of the file or where data starts or
+    /// ends, so a chunk wholly inside data is the chunk the file cut without holes has there.
+    #[tokio::test]
+    async fn skipping_holes_hands_out_holes_and_keeps_the_fixed_grid() {
+        if !holes_reported().await {
+            return;
+        }
+        const MIB: usize = 1 << 20;
+        let dir = TempDir::new("lore-storage-chunker-holes-");
+        let size = 16 * MIB;
+        let extents = [
+            (MIB + 12 * 4096, 3 * MIB + 5 * 4096),
+            (6 * MIB, MIB),
+            (9 * MIB + 4096, 4096),
+            (12 * MIB - 8 * 4096, 2 * MIB),
+        ];
+        let content = sparse_file(&dir, "sparse", size, &extents);
+        let data = reported_data(&dir, "sparse", size as u64).await;
+        let data_bytes: u64 = data.iter().map(|range| range.end - range.start).sum();
+
+        let step = FRAGMENT_SIZE_THRESHOLD;
+        let chunks = chunks_skipping_holes(&dir, "sparse", step).await;
+        assert_tiles_with_holes(&chunks, &content, &data);
+
+        let data_chunks = || {
+            chunks.iter().filter_map(|chunk| match chunk {
+                Chunk::Data { offset, data } => Some((*offset, data.len() as u64)),
+                Chunk::Hole { .. } => None,
+            })
+        };
+        for (offset, len) in data_chunks() {
+            let end = offset + len;
+            let on_grid = |at: u64| {
+                at.is_multiple_of(step as u64) || data.iter().any(|r| r.start == at || r.end == at)
+            };
+            assert!(
+                on_grid(offset) && on_grid(end),
+                "chunk {offset}..{end} is cut off the grid"
+            );
+        }
+
+        let read: u64 = data_chunks().map(|(_, len)| len).sum();
+        assert_eq!(
+            read, data_bytes,
+            "bytes handed out differ from the data the file holds"
+        );
+    }
+
+    /// Content-defined chunking skipping holes cuts each range of data as a file of its own.
+    #[tokio::test]
+    async fn skipping_holes_cuts_each_range_on_its_own_content() {
+        if !holes_reported().await {
+            return;
+        }
+        const MIB: usize = 1 << 20;
+        let dir = TempDir::new("lore-storage-chunker-holes-cdc-");
+        let size = 8 * MIB;
+        let extents = [(MIB, MIB + 4096), (4 * MIB + 4096, 2 * MIB)];
+        let content = sparse_file(&dir, "sparse", size, &extents);
+        let data = reported_data(&dir, "sparse", size as u64).await;
+
+        let chunks = chunks_skipping_holes(&dir, "sparse", 0).await;
+        assert_tiles_with_holes(&chunks, &content, &data);
+
+        for range in &data {
+            let expected: Vec<(u64, usize)> =
+                reference_boundaries(&content[range.start as usize..range.end as usize])
+                    .into_iter()
+                    .map(|(offset, length)| (offset + range.start, length))
+                    .collect();
+            let actual: Vec<(u64, usize)> = chunks
+                .iter()
+                .filter_map(|chunk| match chunk {
+                    Chunk::Data { offset, data } if range.contains(offset) => {
+                        Some((*offset, data.len()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "range {range:?} is not cut as a file of its own"
+            );
+        }
+    }
+
+    /// A file one window holds is read in one window, which every range of data is read into in
+    /// turn, and a file with no hole is cut exactly as it is without skipping holes.
+    #[tokio::test]
+    async fn skipping_holes_reads_each_range_of_a_file_one_window_holds() {
+        if !holes_reported().await {
+            return;
+        }
+        let dir = TempDir::new("lore-storage-chunker-holes-small-");
+        let size = WINDOW_SIZE;
+        let extents = [(4096, 64 * 1024), (256 * 1024, 8192), (400 * 1024, 4096)];
+        let content = sparse_file(&dir, "small", size, &extents);
+        let data = reported_data(&dir, "small", size as u64).await;
+        for step in [0, FRAGMENT_SIZE_EXPECTED] {
+            let chunks = chunks_skipping_holes(&dir, "small", step).await;
+            assert_tiles_with_holes(&chunks, &content, &data);
+        }
+
+        let full = random_buffer(3 * FRAGMENT_SIZE_THRESHOLD + 17);
+        for step in [0, FRAGMENT_SIZE_THRESHOLD] {
+            let without = streamed_chunks(&dir, "full", &full, step).await;
+            let with = chunks_skipping_holes(&dir, "full", step).await;
+            let cuts = |chunks: &[Chunk]| -> Vec<(u64, usize, u64)> {
+                chunks
+                    .iter()
+                    .map(|c| match c {
+                        Chunk::Data { offset, data } => (*offset, data.len(), 0),
+                        Chunk::Hole { offset, len } => (*offset, 0, *len),
+                    })
+                    .collect()
+            };
+            assert_eq!(
+                cuts(&with),
+                cuts(&without),
+                "a file without holes is cut differently"
+            );
+        }
+    }
+
+    /// A file that is one hole is handed out as that one hole, a chunk that carries no data.
+    #[tokio::test]
+    async fn skipping_holes_hands_out_a_file_that_is_one_hole_as_that_hole() {
+        if !holes_reported().await {
+            return;
+        }
+        let dir = TempDir::new("lore-storage-chunker-holes-empty-");
+        let size = 4 * FRAGMENT_SIZE_THRESHOLD;
+        let content = sparse_file(&dir, "hole", size, &[]);
+        let data = reported_data(&dir, "hole", size as u64).await;
+        let chunks = chunks_skipping_holes(&dir, "hole", FRAGMENT_SIZE_THRESHOLD).await;
+        assert_tiles_with_holes(&chunks, &content, &data);
+        assert!(data.is_empty(), "the file holds no data");
+        assert_eq!(chunks.len(), 1, "one hole is one chunk");
+    }
+
+    /// Whether a walk of the file at `path` takes `SEEK_DATA`, which keeps nothing between lookups:
+    /// on Linux where the file lives on tmpfs, which has no extent map, and everywhere else.
+    fn walked_with_seek(path: &std::path::Path) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::fd::AsRawFd;
+
+            let file = std::fs::File::open(path).expect("open to statfs");
+            let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            // SAFETY: `fstatfs` fills `stats`, which outlives the call.
+            assert_eq!(
+                unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) },
+                0,
+                "statfs"
+            );
+            // SAFETY: `fstatfs` succeeded, so it filled `stats`.
+            unsafe { stats.assume_init() }.f_type as u64 == libc::TMPFS_MAGIC as u64
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let _ = path;
+            true
+        }
+    }
+
+    /// Chunks `name` skipping holes, cut every fragment: takes one chunk, which maps the file,
+    /// shrinks the file to `shrunk` through a handle of its own, then takes the rest.
+    async fn chunks_of_a_file_shrunk_after_its_first_chunk(
+        dir: &TempDir,
+        name: &str,
+        shrunk: u64,
+    ) -> Result<Vec<Chunk>, lore_storage::error::StorageError> {
+        let path = dir.path().join(name);
+        let (file, file_size) = lore_storage::content::ContentSource::file(&path)
+            .open()
+            .await
+            .expect("open test file");
+        let mut chunker = FileChunker::fixed_size(file, file_size, FRAGMENT_SIZE_THRESHOLD)
+            .await
+            .skipping_holes();
+        let mut chunks = vec![
+            chunker
+                .next_chunk()
+                .await
+                .expect("the first chunk")
+                .expect("a chunk"),
+        ];
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open to shrink")
+            .set_len(shrunk)
+            .expect("shrink the file");
+        while let Some(chunk) = chunker.next_chunk().await? {
+            chunks.push(chunk);
+        }
+        Ok(chunks)
+    }
+
+    /// A file that shrinks below a range of data after the walk mapped it fails the chunking where
+    /// the walk keeps an extent map, as the read of that range meets the end of the file. With
+    /// `SEEK_DATA`, which keeps nothing, the lost tail is a hole to the size at open.
+    #[tokio::test]
+    async fn skipping_holes_fails_where_a_shrunk_file_lost_mapped_data() {
+        if !holes_reported().await {
+            return;
+        }
+        const MIB: usize = 1 << 20;
+        let dir = TempDir::new("lore-storage-chunker-holes-shrunk-data-");
+        sparse_file(&dir, "shrinks", 8 * MIB, &[(MIB, MIB), (5 * MIB, MIB)]);
+        let seek = walked_with_seek(&dir.path().join("shrinks"));
+        let chunked = chunks_of_a_file_shrunk_after_its_first_chunk(&dir, "shrinks", 3 << 20).await;
+        if seek {
+            let chunks = chunked.expect("the lost tail is a hole");
+            assert!(matches!(
+                chunks.last(),
+                Some(Chunk::Hole { offset, len }) if *offset == 2 << 20 && *len == 6 << 20
+            ));
+        } else {
+            assert!(chunked.is_err(), "the read of the lost range of data fails");
+        }
+    }
+
+    /// A file that shrinks after the walk mapped it, over a tail that held no data, is chunked at
+    /// its size at open, with the lost tail as a hole.
+    #[tokio::test]
+    async fn skipping_holes_keeps_a_lost_tail_that_held_no_data_as_a_hole() {
+        if !holes_reported().await {
+            return;
+        }
+        const MIB: usize = 1 << 20;
+        let dir = TempDir::new("lore-storage-chunker-holes-shrunk-hole-");
+        sparse_file(&dir, "shrinks", 8 * MIB, &[(MIB, MIB)]);
+        let chunks = chunks_of_a_file_shrunk_after_its_first_chunk(&dir, "shrinks", 4 << 20)
+            .await
+            .expect("the chunking succeeds");
+        assert!(matches!(
+            chunks.last(),
+            Some(Chunk::Hole { offset, len }) if *offset == 2 << 20 && *len == 6 << 20
+        ));
+    }
 }

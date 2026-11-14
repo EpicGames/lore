@@ -65,18 +65,32 @@ pub struct LoreStoragePutFileItem {
     /// before setting its fields: a non-zero padding byte from a caller built against an older
     /// header turns the query on
     pub remote_query: u8,
+    /// Read only the ranges of the file the file system holds data for, and store each hole between
+    /// them as a hole in the fragment list: never read, hashed or stored. A hole is a range
+    /// holding no data, never written, or allocated and never written (an unwritten extent), as the
+    /// file system's extent map tells on Linux. Zeros written to the file are data and stored as
+    /// such: a file with a hole and the same file with zeros written over it get different
+    /// addresses. A file larger than one fragment that has holes gets a different address than it
+    /// gets without this; one without holes gets the same. `lore_storage_get_file` leaves each
+    /// hole unwritten, a hole of the file it writes. The field sits in what was padding, after
+    /// `remote_query`, so zero the whole item before setting its fields, as for `remote_query`
+    pub skip_holes: u8,
     /// Leaf fragment size cap for large files; `0` lets `write_content` choose
     pub fixed_size_chunk: u64,
 }
 
-// Lock the C ABI layout of `LoreStoragePutFileItem` on a 64-bit target. `remote_query` sits in the
-// padding after `local_cache`, so a caller built against a header without it passes an item of the
-// same size, with `fixed_size_chunk` at the same offset.
+// Lock the C ABI layout of `LoreStoragePutFileItem` on a 64-bit target. `remote_query` and
+// `skip_holes` sit in the padding after `local_cache`, so a caller built against a header without
+// them passes an item of the same size, with `fixed_size_chunk` at the same offset.
 const _: () = assert!(std::mem::size_of::<LoreStoragePutFileItem>() == 72);
 const _: () = assert!(std::mem::offset_of!(LoreStoragePutFileItem, fixed_size_chunk) == 64);
 const _: () = assert!(
     std::mem::offset_of!(LoreStoragePutFileItem, remote_query)
         == std::mem::offset_of!(LoreStoragePutFileItem, local_cache) + 1
+);
+const _: () = assert!(
+    std::mem::offset_of!(LoreStoragePutFileItem, skip_holes)
+        == std::mem::offset_of!(LoreStoragePutFileItem, remote_query) + 1
 );
 
 impl core::fmt::Debug for LoreStoragePutFileItem {
@@ -86,6 +100,7 @@ impl core::fmt::Debug for LoreStoragePutFileItem {
             .field("path", &self.path.as_str())
             .field("remote_write", &self.remote_write)
             .field("remote_query", &self.remote_query)
+            .field("skip_holes", &self.skip_holes)
             .field("fixed_size_chunk", &self.fixed_size_chunk)
             .finish()
     }
@@ -176,6 +191,9 @@ async fn resolve_put_file_item(
     }
     if item.remote_query != 0 {
         write_options = write_options.with_remote_query();
+    }
+    if item.skip_holes != 0 {
+        write_options = write_options.with_skip_holes();
     }
 
     write_from_file(

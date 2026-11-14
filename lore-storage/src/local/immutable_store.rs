@@ -5820,7 +5820,11 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
 
                 if let Some(payload) = references {
                     let payload = payload.to_aligned::<FragmentReference>();
-                    for reference in payload.as_type_slice::<FragmentReference>().iter() {
+                    for reference in payload
+                        .as_type_slice::<FragmentReference>()
+                        .iter()
+                        .filter(|reference| !reference.is_hole())
+                    {
                         self.clone()
                             .obliterate(
                                 partition,

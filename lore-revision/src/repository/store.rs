@@ -173,7 +173,11 @@ async fn immutable_query_address(
     {
         // Query the subfragments
         let payload = payload.to_aligned::<FragmentReference>();
-        for reference in payload.as_type_slice::<FragmentReference>() {
+        for reference in payload
+            .as_type_slice::<FragmentReference>()
+            .iter()
+            .filter(|reference| !reference.is_hole())
+        {
             let repository = repository.clone();
             let reference_address = Address {
                 hash: reference.hash,

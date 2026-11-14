@@ -27,6 +27,13 @@
 //! The window travels into the operation and comes back with it, which is what the
 //! owned-buffer contract requires; the windowing, pipelining and cut logic above it is
 //! unchanged by that, as is every cut boundary.
+//!
+//! A chunker [skipping holes](FileChunker::skipping_holes) reads only the ranges the file system
+//! holds data for, one at a time, and hands out each hole between them as a chunk of its own,
+//! never read. Each range is cut as a file of its own would be, starting from an empty window,
+//! except that fixed-size cuts keep the grid that starts at the beginning of the file: a chunk is
+//! cut short where a range starts or ends between two grid points. A file with no hole is one
+//! range, so it is cut exactly as without skipping holes.
 
 use std::collections::VecDeque;
 
@@ -46,10 +53,31 @@ use crate::error::StorageError;
 #[lore_macro::test_pub]
 const WINDOW_SIZE: usize = 2 * FRAGMENT_SIZE_THRESHOLD;
 
-/// A content-defined chunk: where it starts in the source, and its bytes.
-pub struct Chunk {
-    pub offset: u64,
-    pub data: Bytes,
+/// A chunk of the source: a range of its bytes, or a hole, a range it holds no data for.
+pub enum Chunk {
+    /// The bytes of the source from `offset`.
+    Data { offset: u64, data: Bytes },
+    /// A hole of `len` bytes from `offset`.
+    Hole { offset: u64, len: u64 },
+}
+
+/// Whether a chunker reads every range of its file, or the ranges of data alone.
+enum Holes {
+    /// Every range is read, a hole as zeros.
+    Read,
+    /// Only the ranges of data are read; see [`FileChunker::skipping_holes`]. Boxed, so a chunker,
+    /// and every future holding one, carries one pointer for it. A put skipping holes is the cold
+    /// path: it allocates this state, and its cursor allocates the `FIEMAP` batch, once per file.
+    Skip(Box<SkipState>),
+}
+
+/// What a chunker skipping holes keeps between ranges of data.
+#[derive(Default)]
+struct SkipState {
+    /// What the walk of the file's ranges of data keeps between them.
+    cursor: lore_io::DataCursor,
+    /// The hole to hand out once the chunks cut before it are.
+    pending: Option<std::ops::Range<u64>>,
 }
 
 /// How the chunker picks cut points.
@@ -100,11 +128,16 @@ pub struct FileChunker {
     base: u64,
     /// Absolute file offset the next read starts at.
     read_offset: u64,
+    /// Where the range being read and cut ends: the end of the file, or of the range of data
+    /// when holes are skipped.
+    range_end: u64,
     /// Size the file was opened at, used to spot the end when the window is sized to
     /// the file and a completely full buffer therefore also means "nothing follows".
     file_size: u64,
+    /// Every read of the range has been taken, so the cut takes what is left of it.
     eof: bool,
     mode: CutMode,
+    holes: Holes,
     /// Budget for every window and one chunk, released when the chunker is dropped.
     _reservation: Option<tokio::sync::OwnedSemaphorePermit>,
 }
@@ -174,11 +207,23 @@ impl FileChunker {
             spare: (!single_read).then(|| unsafe { lore_io::uninit_buffer(capacity) }),
             base: 0,
             read_offset: 0,
+            range_end: file_size,
             file_size,
             eof: false,
             mode,
+            holes: Holes::Read,
             _reservation: reservation,
         }
+    }
+
+    /// Read only the ranges of the file the file system holds data for, and hand out each hole
+    /// between them, and one at either end, as a chunk with no data. Taken before the first chunk.
+    #[lore_macro::test_pub]
+    pub(crate) fn skipping_holes(mut self) -> Self {
+        self.holes = Holes::Skip(Box::default());
+        self.range_end = 0;
+        self.eof = true;
+        self
     }
 
     /// The next chunk, or `None` once the file is exhausted.
@@ -193,19 +238,77 @@ impl FileChunker {
         }
         loop {
             if let Some((offset, length)) = self.ready.pop_front() {
-                return Ok(Some(Chunk {
+                return Ok(Some(Chunk::Data {
                     offset: self.base + (offset - self.head) as u64,
                     data: Bytes::copy_from_slice(&self.window[offset..offset + length]),
                 }));
             }
-            if self.eof {
-                return Ok(None);
+            if let Holes::Skip(skip) = &mut self.holes
+                && let Some(hole) = skip.pending.take()
+            {
+                return Ok(Some(Chunk::Hole {
+                    offset: hole.start,
+                    len: hole.end - hole.start,
+                }));
             }
-            if let Err(err) = self.advance().await {
+            let step = if self.eof {
+                if matches!(self.holes, Holes::Read) || self.range_end >= self.file_size {
+                    return Ok(None);
+                }
+                self.next_range().await
+            } else {
+                self.advance().await
+            };
+            if let Err(err) = step {
                 self.failed = true;
                 return Err(err);
             }
         }
+    }
+
+    /// Find the next range of data after the one just cut, queue the hole in front of it, and
+    /// start reading it into an empty window. With no data left, the hole runs to the end of the
+    /// file and the chunker ends after it.
+    ///
+    /// A range is clamped to the size the file was opened at, as reads are, and starts no earlier
+    /// than where the last one ended, so every call makes progress.
+    ///
+    /// A file that shrinks after the walk first maps it: with an extent map, a lost tail that held
+    /// data the walk had mapped is still a range, and reading it fails at the end of the file,
+    /// while a lost tail that held no data is a hole to the size at open. With `SEEK_DATA`, which
+    /// keeps nothing, the lost tail is a hole to the size at open.
+    async fn next_range(&mut self) -> Result<(), StorageError> {
+        let Holes::Skip(skip) = &mut self.holes else {
+            return Err(StorageError::internal(
+                "a chunker reading every range looked for the next one",
+            ));
+        };
+        let from = self.range_end;
+        let (found, walked) = self
+            .handle
+            .next_data(from, std::mem::take(&mut skip.cursor))
+            .await;
+        skip.cursor = walked;
+        let data = found
+            .map_err(|e| StorageError::internal_with_context(e, "find data to chunk"))?
+            .map(|range| range.start.max(from)..range.end.min(self.file_size))
+            .filter(|range| range.start < range.end);
+        let hole_end = data.as_ref().map_or(self.file_size, |range| range.start);
+        if hole_end > from {
+            skip.pending = Some(from..hole_end);
+        }
+        let Some(range) = data else {
+            self.range_end = self.file_size;
+            return Ok(());
+        };
+        self.head = self.headroom;
+        self.length = 0;
+        self.decided = 0;
+        self.base = range.start;
+        self.read_offset = range.start;
+        self.range_end = range.end;
+        self.eof = false;
+        Ok(())
     }
 
     /// Take the read that ran while the last batch was handed out, carry the undecided
@@ -248,11 +351,13 @@ impl FileChunker {
         let pending = if let Some(pending) = self.pending.take() {
             pending
         } else {
-            // There is no spare only in the single-read regime, where the file fits
-            // in the one window and nothing has been read into it yet.
+            // There is no spare only in the single-read regime, where the file fits in the one
+            // window, which every range is read into in turn. The spare left there by the read
+            // before is the empty buffer the window was taken from.
             let target = self
                 .spare
                 .take()
+                .filter(|spare| !spare.is_empty())
                 .unwrap_or_else(|| std::mem::take(&mut self.window));
             self.start_read(target)
         };
@@ -264,7 +369,7 @@ impl FileChunker {
             .map_err(|e| StorageError::internal_with_context(e, "read file for chunking"))?;
 
         self.read_offset += pending.want as u64;
-        if self.read_offset >= self.file_size {
+        if self.read_offset >= self.range_end {
             self.eof = true;
         }
 
@@ -272,9 +377,9 @@ impl FileChunker {
     }
 
     /// Start filling the other window, so the read overlaps cutting and handing out the
-    /// batch just cut. Nothing to start once the file is exhausted.
+    /// batch just cut. Nothing to start once the range is exhausted.
     fn issue_read(&mut self) {
-        if self.pending.is_some() || self.read_offset >= self.file_size {
+        if self.pending.is_some() || self.read_offset >= self.range_end {
             return;
         }
         if let Some(target) = self.spare.take() {
@@ -285,15 +390,17 @@ impl FileChunker {
     /// One scatter into `buffer[headroom..]`, spawned so it overlaps the cutting and
     /// handing out of the batch already in the other window.
     ///
-    /// The length is clamped to what the file held when it was opened, so the read is an
-    /// exact one: a file that shrank underneath is an error rather than a silent early
-    /// end, and one appended to mid-write cannot yield a chunk list covering more bytes
-    /// than the root fragment records, which readers trust.
+    /// The length is clamped to the range being read, which ends no later than the file did
+    /// when it was opened, so the read is an exact one: a file that shrank underneath is an error
+    /// rather than a silent early end, and one appended to mid-write cannot yield a chunk list
+    /// covering more bytes than the root fragment records, which readers trust. Skipping holes,
+    /// the ranges come from [`Self::next_range`], which says where a file that shrank fails and
+    /// where its lost tail is a hole.
     fn start_read(&self, buffer: BytesMut) -> PendingRead {
         let handle = self.handle.clone();
         let start = self.headroom;
         let offset = self.read_offset;
-        let remaining = self.file_size.saturating_sub(offset);
+        let remaining = self.range_end.saturating_sub(offset);
         let want = (buffer.len() - start).min(remaining as usize);
 
         let task = lore_base::lore_spawn!(async move {
@@ -325,13 +432,16 @@ impl FileChunker {
         );
     }
 
-    /// Queue whole fixed-size chunks, and the short tail once the file has ended.
+    /// Queue every chunk up to the next point of the `size` grid that starts at the beginning
+    /// of the file, and the short tail once the range has ended. A range starting between two
+    /// points has a short first chunk, so the chunks after it keep their place on the grid.
     fn cut_fixed(&mut self, size: usize) {
         let mut decided = 0;
         while decided < self.length {
             let remaining = self.length - decided;
-            let take = if remaining >= size {
-                size
+            let to_grid = size - ((self.base + decided as u64) % size as u64) as usize;
+            let take = if remaining >= to_grid {
+                to_grid
             } else if self.eof {
                 remaining
             } else {

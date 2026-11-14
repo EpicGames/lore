@@ -4086,6 +4086,7 @@ mod open_tests {
                     remote_write: 0,
                     local_cache: 0,
                     remote_query: 0,
+                    skip_holes: 0,
                     fixed_size_chunk: 0,
                 },
                 lore::storage::put_file::LoreStoragePutFileItem {
@@ -4096,6 +4097,7 @@ mod open_tests {
                     remote_write: 0,
                     local_cache: 0,
                     remote_query: 0,
+                    skip_holes: 0,
                     fixed_size_chunk: 0,
                 },
             ],
@@ -4149,6 +4151,7 @@ mod open_tests {
             remote_write: 0,
             local_cache: 0,
             remote_query: 0,
+            skip_holes: 0,
             fixed_size_chunk: 0,
         };
         let (status, completes) = put_file_items(handle, vec![item]).await;
@@ -4205,6 +4208,7 @@ mod open_tests {
                 remote_write: 0,
                 local_cache: 0,
                 remote_query: 0,
+                skip_holes: 0,
                 fixed_size_chunk: 0,
             }],
         )
@@ -4239,6 +4243,7 @@ mod open_tests {
                 remote_write: 0,
                 local_cache: 0,
                 remote_query: 0,
+                skip_holes: 0,
                 fixed_size_chunk: 0,
             }],
         )
@@ -4272,6 +4277,7 @@ mod open_tests {
                 remote_write: 0,
                 local_cache: 0,
                 remote_query: 0,
+                skip_holes: 0,
                 fixed_size_chunk: 0,
             }],
         )
@@ -4314,6 +4320,7 @@ mod open_tests {
                 remote_write: 0,
                 local_cache: 0,
                 remote_query: 0,
+                skip_holes: 0,
                 fixed_size_chunk: 64 * 1024,
             }],
         )
@@ -4667,6 +4674,7 @@ mod open_tests {
                     remote_write: 0,
                     local_cache: 0,
                     remote_query: 0,
+                    skip_holes: 0,
                     fixed_size_chunk,
                 },
             ],
@@ -5342,6 +5350,7 @@ mod open_tests {
                 remote_write: 0,
                 local_cache: 0,
                 remote_query: 0,
+                skip_holes: 0,
                 fixed_size_chunk: 0,
             }],
         )
@@ -5506,6 +5515,7 @@ mod open_tests {
                     remote_write: 1,
                     local_cache: 0,
                     remote_query: 0,
+                    skip_holes: 0,
                     fixed_size_chunk: 0,
                 },
             ],
