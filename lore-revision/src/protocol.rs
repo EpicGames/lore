@@ -18,6 +18,7 @@ use lore_transport::SessionPool;
 use lore_transport::StorageSession;
 use lore_transport::connection::RECONNECT_MAX_DELAY;
 use lore_transport::connection::RECONNECT_START_DELAY;
+use lore_transport::quic::client::CongestionAlgorithm;
 use tokio::time::Instant;
 
 use crate::errors::is_refusal;
@@ -31,16 +32,19 @@ pub fn connect<'a>(
     identity: &'a str,
     repository: crate::lore::RepositoryId,
 ) -> impl Future<Output = Result<Arc<Connection>, ProtocolError>> + 'a {
-    connect_over(remote_url, identity, repository, None)
+    connect_over(remote_url, identity, repository, None, None)
 }
 
 /// [`connect`], asking for `storage_connections` storage connections where it opens a new
-/// connection, or for the execution's count where `None`.
+/// connection, or for the execution's count where `None`, and for `congestion_algorithm` as the
+/// controller they run, or the one the process names where `None`
+/// ([`lore_transport::connect`]).
 async fn connect_over(
     remote_url: &str,
     identity: &str,
     repository: crate::lore::RepositoryId,
     storage_connections: Option<usize>,
+    congestion_algorithm: Option<CongestionAlgorithm>,
 ) -> Result<Arc<Connection>, ProtocolError> {
     let execution = crate::lore::execution_context();
     let globals = execution.globals();
@@ -52,6 +56,7 @@ async fn connect_over(
         globals.identity_token(),
         globals.access_token(),
         globals.auth_mode,
+        congestion_algorithm,
     )
     .await?;
     take_server_compression_mode(&connection);
@@ -70,17 +75,22 @@ pub struct RemoteConnections {
     /// The storage connections a connect asks for where it opens a new connection, or the
     /// execution's count where `None`.
     storage_connections: Option<usize>,
+    /// The congestion controller the storage connections of a connection a connect establishes
+    /// run, or the one the process names where `None`. A connection already cached is reused as
+    /// it is.
+    congestion_algorithm: Option<CongestionAlgorithm>,
     connect: Connect,
     connections: parking_lot::Mutex<HashMap<RepositoryId, Remote>>,
 }
 
 /// How [`RemoteConnections`] connects to its remote, as its identity, for a repository, asking for
-/// its storage connections.
+/// its storage connections and their congestion controller.
 pub type Connect = fn(
     Arc<str>,
     Arc<str>,
     RepositoryId,
     Option<usize>,
+    Option<CongestionAlgorithm>,
 ) -> BoxFuture<'static, Result<Arc<Connection>, ProtocolError>>;
 
 /// A connect shared by every caller awaiting it.
@@ -130,9 +140,21 @@ impl RemoteConnections {
             remote_url: Arc::from(remote_url.into()),
             identity: Arc::from(identity.unwrap_or_default()),
             storage_connections: None,
-            connect: |remote_url, identity, repository, storage_connections| {
+            congestion_algorithm: None,
+            connect: |remote_url,
+                      identity,
+                      repository,
+                      storage_connections,
+                      congestion_algorithm| {
                 async move {
-                    connect_over(&remote_url, &identity, repository, storage_connections).await
+                    connect_over(
+                        &remote_url,
+                        &identity,
+                        repository,
+                        storage_connections,
+                        congestion_algorithm,
+                    )
+                    .await
                 }
                 .boxed()
             },
@@ -144,6 +166,13 @@ impl RemoteConnections {
     /// than the execution's count where it opens a new connection.
     pub fn connecting_over(mut self, storage_connections: usize) -> Self {
         self.storage_connections = Some(storage_connections);
+        self
+    }
+
+    /// These connections, whose storage connections run `congestion_algorithm` rather than the one
+    /// the process names where a connect establishes a connection.
+    pub fn congestion_algorithm(mut self, congestion_algorithm: CongestionAlgorithm) -> Self {
+        self.congestion_algorithm = Some(congestion_algorithm);
         self
     }
 
@@ -248,6 +277,7 @@ impl RemoteConnections {
                         self.identity.clone(),
                         repository,
                         self.storage_connections,
+                        self.congestion_algorithm,
                     ));
                     connections.insert(
                         repository,

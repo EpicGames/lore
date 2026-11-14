@@ -2277,11 +2277,15 @@ mod deserialize_quic_internal {
 
     const ENDPOINT_KEYS: &str = "host = \"0.0.0.0\"\nport = 41337\nnum_listeners = 10";
 
-    fn parse(extra_keys: &str) -> ServerSettings {
+    /// `[server]` with both QUIC endpoints, each with `extra_keys`.
+    pub(super) fn try_parse(extra_keys: &str) -> Result<ServerSettings, toml::de::Error> {
         toml::from_str(&format!(
-            "[quic]\n{ENDPOINT_KEYS}\n[quic_internal]\n{ENDPOINT_KEYS}\n{extra_keys}"
+            "[quic]\n{ENDPOINT_KEYS}\n{extra_keys}\n[quic_internal]\n{ENDPOINT_KEYS}\n{extra_keys}"
         ))
-        .expect("[server] should deserialize")
+    }
+
+    pub(super) fn parse(extra_keys: &str) -> ServerSettings {
+        try_parse(extra_keys).expect("[server] should deserialize")
     }
 
     #[test]
@@ -2441,5 +2445,163 @@ mod quic_settings_initial_cwnd_bytes {
                 .expect("[server.quic] should deserialize");
 
         assert_eq!(quic.initial_cwnd_bytes, None);
+    }
+}
+
+mod quic_settings_congestion_algorithm {
+    use lore_server::quic::StreamHandlerFactory;
+    use lore_server::quic::quinn::QuinnConfigBuilder;
+    use lore_server::quic::quinn::service_store::StreamDataHandlerBuilder;
+    use lore_transport::quic::client::CongestionAlgorithm;
+
+    use super::deserialize_quic_internal::parse;
+    use super::deserialize_quic_internal::try_parse;
+    use super::*;
+
+    /// Offers one protocol and serves none, which is all building a configuration asks of it.
+    struct NoServices;
+
+    impl StreamHandlerFactory for NoServices {
+        fn supported_protocols(&self) -> Vec<String> {
+            vec!["none/0.1".to_string()]
+        }
+
+        fn get_stream_handler_builder(
+            &self,
+            _protocol: &str,
+        ) -> Option<(&&'static str, &StreamDataHandlerBuilder)> {
+            None
+        }
+    }
+
+    /// The congestion controller of the connections an endpoint configured by `settings` accepts.
+    fn endpoint_algorithm(settings: QuicSettings) -> CongestionAlgorithm {
+        QuinnConfigBuilder::from(settings)
+            .address("127.0.0.1:0".parse().expect("loopback address"))
+            .stream_handler_factory(Box::new(NoServices))
+            .build()
+            .expect("quinn configuration")
+            .congestion_algorithm
+    }
+
+    #[test]
+    fn unset_is_bbr_on_the_public_endpoint_and_cubic_on_the_internal_one() {
+        let server = parse("");
+
+        assert_eq!(
+            endpoint_algorithm(server.quic.expect("[server.quic] present")),
+            CongestionAlgorithm::Bbr
+        );
+        assert_eq!(
+            endpoint_algorithm(
+                server
+                    .quic_internal
+                    .expect("[server.quic_internal] present")
+            ),
+            CongestionAlgorithm::Cubic
+        );
+    }
+
+    #[test]
+    fn a_configured_algorithm_reaches_the_quinn_configuration_of_either_endpoint() {
+        for (name, algorithm) in [
+            ("bbr", CongestionAlgorithm::Bbr),
+            ("cubic", CongestionAlgorithm::Cubic),
+        ] {
+            let server = parse(&format!("congestion_algorithm = \"{name}\""));
+
+            assert_eq!(
+                endpoint_algorithm(server.quic.expect("[server.quic] present")),
+                algorithm
+            );
+            assert_eq!(
+                endpoint_algorithm(
+                    server
+                        .quic_internal
+                        .expect("[server.quic_internal] present")
+                ),
+                algorithm
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_algorithm_is_refused() {
+        assert!(try_parse("congestion_algorithm = \"reno\"").is_err());
+    }
+}
+
+mod remote_store_settings_congestion_algorithm {
+    use lore_transport::quic::client::CongestionAlgorithm;
+
+    use super::*;
+
+    fn parse(extra_keys: &str) -> Result<RemoteStoreSettings, toml::de::Error> {
+        toml::from_str(&format!(
+            "remote_url = \"lore://127.0.0.1:41340\"\n{extra_keys}"
+        ))
+    }
+
+    #[test]
+    fn omitted_congestion_algorithm_is_bbr() {
+        let settings = parse("").expect("valid settings");
+
+        assert_eq!(settings.congestion_algorithm, CongestionAlgorithm::Bbr);
+    }
+
+    #[test]
+    fn configured_congestion_algorithm_is_kept() {
+        for (name, algorithm) in [
+            ("bbr", CongestionAlgorithm::Bbr),
+            ("cubic", CongestionAlgorithm::Cubic),
+        ] {
+            let settings =
+                parse(&format!("congestion_algorithm = \"{name}\"")).expect("valid settings");
+
+            assert_eq!(settings.congestion_algorithm, algorithm);
+        }
+    }
+
+    #[test]
+    fn unknown_congestion_algorithm_is_rejected() {
+        assert!(parse("congestion_algorithm = \"reno\"").is_err());
+    }
+}
+
+mod replicated_store_settings_congestion_algorithm {
+    use lore_transport::quic::client::CongestionAlgorithm;
+
+    use super::*;
+
+    fn parse(extra_keys: &str) -> Result<ReplicatedStoreSettings, toml::de::Error> {
+        toml::from_str(&format!(
+            "{extra_keys}\n{}",
+            super::replicated_store_settings_num_clients::REQUIRED_KEYS
+        ))
+    }
+
+    #[test]
+    fn omitted_congestion_algorithm_is_cubic() {
+        let settings = parse("").expect("valid settings");
+
+        assert_eq!(settings.congestion_algorithm, CongestionAlgorithm::Cubic);
+    }
+
+    #[test]
+    fn configured_congestion_algorithm_is_kept() {
+        for (name, algorithm) in [
+            ("bbr", CongestionAlgorithm::Bbr),
+            ("cubic", CongestionAlgorithm::Cubic),
+        ] {
+            let settings =
+                parse(&format!("congestion_algorithm = \"{name}\"")).expect("valid settings");
+
+            assert_eq!(settings.congestion_algorithm, algorithm);
+        }
+    }
+
+    #[test]
+    fn unknown_congestion_algorithm_is_rejected() {
+        assert!(parse("congestion_algorithm = \"reno\"").is_err());
     }
 }

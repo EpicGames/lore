@@ -18,6 +18,7 @@ use lore_revision::protocol::RemoteConnections;
 use lore_transport::Connection;
 use lore_transport::ProtocolError;
 use lore_transport::connection::RECONNECT_START_DELAY;
+use lore_transport::quic::client::CongestionAlgorithm;
 
 use crate::helper::setup_test_execution;
 
@@ -50,7 +51,13 @@ async fn handed_to_callers(
 #[tokio::test(start_paused = true)]
 async fn callers_are_handed_a_connection_marked_stale_until_its_back_off_passes() {
     static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
-    fn connecting(_: Arc<str>, _: Arc<str>, _: RepositoryId, _: Option<usize>) -> Connected {
+    fn connecting(
+        _: Arc<str>,
+        _: Arc<str>,
+        _: RepositoryId,
+        _: Option<usize>,
+        _: Option<CongestionAlgorithm>,
+    ) -> Connected {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         std::future::ready(Ok(Connection::detached(Vec::new()))).boxed()
     }
@@ -89,7 +96,13 @@ async fn callers_are_handed_a_connection_marked_stale_until_its_back_off_passes(
 #[tokio::test(start_paused = true)]
 async fn a_connection_marked_stale_after_its_back_off_is_replaced_at_once() {
     static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
-    fn connecting(_: Arc<str>, _: Arc<str>, _: RepositoryId, _: Option<usize>) -> Connected {
+    fn connecting(
+        _: Arc<str>,
+        _: Arc<str>,
+        _: RepositoryId,
+        _: Option<usize>,
+        _: Option<CongestionAlgorithm>,
+    ) -> Connected {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         std::future::ready(Ok(Connection::detached(Vec::new()))).boxed()
     }
@@ -115,7 +128,13 @@ async fn a_connection_marked_stale_after_its_back_off_is_replaced_at_once() {
 #[tokio::test(start_paused = true)]
 async fn a_connection_refused_its_credentials_is_replaced_at_once() {
     static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
-    fn refused(_: Arc<str>, _: Arc<str>, _: RepositoryId, _: Option<usize>) -> Connected {
+    fn refused(
+        _: Arc<str>,
+        _: Arc<str>,
+        _: RepositoryId,
+        _: Option<usize>,
+        _: Option<CongestionAlgorithm>,
+    ) -> Connected {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         let refusal = Err(ProtocolError::from(NotAuthorized));
         std::future::ready(Ok(Connection::detached_ready(Vec::new(), refusal))).boxed()
@@ -135,7 +154,13 @@ async fn a_connection_refused_its_credentials_is_replaced_at_once() {
 #[tokio::test]
 async fn a_refused_connect_is_answered_to_no_later_caller() {
     static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
-    fn refusing(_: Arc<str>, _: Arc<str>, _: RepositoryId, _: Option<usize>) -> Connected {
+    fn refusing(
+        _: Arc<str>,
+        _: Arc<str>,
+        _: RepositoryId,
+        _: Option<usize>,
+        _: Option<CongestionAlgorithm>,
+    ) -> Connected {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         async {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -160,7 +185,13 @@ async fn a_refused_connect_is_answered_to_no_later_caller() {
 #[tokio::test]
 async fn callers_waiting_on_a_connect_share_it() {
     static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
-    fn failing_late(_: Arc<str>, _: Arc<str>, _: RepositoryId, _: Option<usize>) -> Connected {
+    fn failing_late(
+        _: Arc<str>,
+        _: Arc<str>,
+        _: RepositoryId,
+        _: Option<usize>,
+        _: Option<CongestionAlgorithm>,
+    ) -> Connected {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         async {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -188,6 +219,7 @@ async fn a_superseded_connect_leaves_its_successor_in_place() {
         _: Arc<str>,
         _: RepositoryId,
         _: Option<usize>,
+        _: Option<CongestionAlgorithm>,
     ) -> Connected {
         let attempt = ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         async move {
@@ -222,7 +254,13 @@ async fn a_superseded_connect_leaves_its_successor_in_place() {
 #[tokio::test(start_paused = true)]
 async fn a_failed_connect_is_retried_once_its_back_off_passes() {
     static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
-    fn failing(_: Arc<str>, _: Arc<str>, _: RepositoryId, _: Option<usize>) -> Connected {
+    fn failing(
+        _: Arc<str>,
+        _: Arc<str>,
+        _: RepositoryId,
+        _: Option<usize>,
+        _: Option<CongestionAlgorithm>,
+    ) -> Connected {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         std::future::ready(Err(ProtocolError::from(Disconnected))).boxed()
     }
@@ -253,7 +291,13 @@ async fn a_failed_connect_is_retried_once_its_back_off_passes() {
 #[tokio::test]
 async fn a_connect_asks_for_the_storage_connections_it_was_given() {
     static OPENED: std::sync::Mutex<Vec<Option<usize>>> = std::sync::Mutex::new(Vec::new());
-    fn connecting(_: Arc<str>, _: Arc<str>, _: RepositoryId, opened: Option<usize>) -> Connected {
+    fn connecting(
+        _: Arc<str>,
+        _: Arc<str>,
+        _: RepositoryId,
+        opened: Option<usize>,
+        _: Option<CongestionAlgorithm>,
+    ) -> Connected {
         OPENED.lock().expect("the opened counts").push(opened);
         std::future::ready(Ok(Connection::detached(Vec::new()))).boxed()
     }
@@ -272,6 +316,47 @@ async fn a_connect_asks_for_the_storage_connections_it_was_given() {
             }
 
             assert_eq!(*OPENED.lock().expect("the opened counts"), [None, Some(4)]);
+        })
+        .await;
+}
+
+/// A connect's storage connections run the congestion controller its connections were given, and
+/// the one the process names where they were given none.
+#[tokio::test]
+async fn a_connect_runs_the_congestion_algorithm_it_was_given() {
+    static RUN: std::sync::Mutex<Vec<Option<CongestionAlgorithm>>> =
+        std::sync::Mutex::new(Vec::new());
+    fn connecting(
+        _: Arc<str>,
+        _: Arc<str>,
+        _: RepositoryId,
+        _: Option<usize>,
+        congestion_algorithm: Option<CongestionAlgorithm>,
+    ) -> Connected {
+        RUN.lock()
+            .expect("the algorithms")
+            .push(congestion_algorithm);
+        std::future::ready(Ok(Connection::detached(Vec::new()))).boxed()
+    }
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let repository = RepositoryId::from([7u8; 16]);
+
+            for connections in [
+                RemoteConnections::with_connect(connecting),
+                RemoteConnections::with_connect(connecting)
+                    .congestion_algorithm(CongestionAlgorithm::Cubic),
+            ] {
+                connections
+                    .connection(repository)
+                    .await
+                    .expect("a connection");
+            }
+
+            assert_eq!(
+                *RUN.lock().expect("the algorithms"),
+                [None, Some(CongestionAlgorithm::Cubic)]
+            );
         })
         .await;
 }

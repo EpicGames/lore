@@ -72,6 +72,7 @@ use lore_transport::RevisionListStart;
 use lore_transport::SuppliedCredentials;
 use lore_transport::auth::AuthEndpoint;
 use lore_transport::auth::AuthMode;
+use lore_transport::quic::client::CongestionAlgorithm;
 use lore_transport::traits::Admin;
 use lore_transport::traits::Environment;
 use lore_transport::traits::Lock;
@@ -237,6 +238,7 @@ impl Protocol for RefusingProtocol {
         _: Partition,
         _: usize,
         _: &Arc<SuppliedCredentials>,
+        _: CongestionAlgorithm,
     ) -> Result<Arc<dyn Storage>, ProtocolError> {
         Err(refusal())
     }
@@ -333,6 +335,7 @@ async fn connected(protocol: Arc<RefusingProtocol>, repository: RepositoryId) ->
             "",
             "",
             AuthMode::Auto,
+            None,
         )
         .await
         .expect("the remote advertises no authentication"),

@@ -17,6 +17,7 @@ mod remote_store_tests {
     use lore_server::quic::quinn::QuinnConfigBuilder;
     use lore_server::quic::quinn::QuinnServer;
     use lore_server::quic::tests::TestHandlerFactory;
+    use lore_server::settings::RemoteStoreSettings;
     use lore_storage::CallerBuffer;
     use lore_storage::CompressionMode;
     use lore_storage::ImmutableStore;
@@ -30,6 +31,7 @@ mod remote_store_tests {
     use lore_storage::immutable_store::query_one;
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
+    use lore_transport::quic::client::CongestionAlgorithm;
     use rand::random;
 
     use crate::common::net_common::Partitions;
@@ -667,6 +669,37 @@ mod remote_store_tests {
                 .await?;
 
                 assert_eq!(StoreMatch::MatchFull, match_result.match_made);
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// The storage connections a remote store establishes to its upstream, which no other
+    /// connection reaches, run the congestion controller its settings name, read back from the
+    /// QUIC connection.
+    #[tokio::test]
+    async fn a_remote_store_runs_the_congestion_algorithm_its_settings_name() -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_quic_server().await;
+                let settings = RemoteStoreSettings {
+                    remote_url: server.url.clone(),
+                    congestion_algorithm: CongestionAlgorithm::Cubic,
+                    ..Default::default()
+                };
+                let store = lore_server::server::configure_remote_immutable_store(&settings, 1)?;
+                let (_, address, _) = fragment::generate_random();
+                query_one(&store, random::<RepositoryId>(), address).await?;
+
+                let connection =
+                    cached_connection(&server.url).expect("the store's connection is cached");
+                let storage = connection.storage().await?;
+                assert_eq!(
+                    storage.running_congestion_algorithm().await,
+                    Some(CongestionAlgorithm::Cubic)
+                );
 
                 Ok(())
             })

@@ -18,6 +18,7 @@ use lore_transport::PartitionSessions;
 use lore_transport::ProtocolError;
 use lore_transport::SessionPool;
 use lore_transport::StorageSession;
+use lore_transport::quic::client::CongestionAlgorithm;
 
 use super::StoreObliterateStats;
 use crate::errors::AddressNotFound;
@@ -79,6 +80,12 @@ impl RemoteImmutableStore {
     /// See [`RemoteConnections::connecting_over`](protocol::RemoteConnections::connecting_over).
     pub fn connecting_over(mut self, storage_connections: usize) -> Self {
         self.connections = self.connections.connecting_over(storage_connections);
+        self
+    }
+
+    /// See [`RemoteConnections::congestion_algorithm`](protocol::RemoteConnections::congestion_algorithm).
+    pub fn congestion_algorithm(mut self, congestion_algorithm: CongestionAlgorithm) -> Self {
+        self.connections = self.connections.congestion_algorithm(congestion_algorithm);
         self
     }
 
@@ -539,6 +546,12 @@ impl RemoteMutableStore {
     /// See [`RemoteConnections::connecting_over`](protocol::RemoteConnections::connecting_over).
     pub fn connecting_over(mut self, storage_connections: usize) -> Self {
         self.connections = self.connections.connecting_over(storage_connections);
+        self
+    }
+
+    /// See [`RemoteConnections::congestion_algorithm`](protocol::RemoteConnections::congestion_algorithm).
+    pub fn congestion_algorithm(mut self, congestion_algorithm: CongestionAlgorithm) -> Self {
+        self.connections = self.connections.congestion_algorithm(congestion_algorithm);
         self
     }
 

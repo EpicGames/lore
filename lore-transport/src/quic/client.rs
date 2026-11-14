@@ -228,8 +228,12 @@ impl From<quinn::ConnectionStats> for ConnectionStats {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+/// The congestion controller of a QUIC connection, which paces what its own end sends.
+/// Configuration names it `bbr` or `cubic`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CongestionAlgorithm {
+    #[default]
     Bbr,
     Cubic,
 }
@@ -554,6 +558,26 @@ impl QuicConnection {
 
     pub async fn connection_stats(&self) -> ConnectionStats {
         self.connection.read().await.connection.stats().into()
+    }
+
+    /// The congestion controller the connection held now runs, as quinn reports it, or `None` for
+    /// one that is neither algorithm.
+    #[cfg(feature = "test-util")]
+    pub async fn running_congestion_algorithm(&self) -> Option<CongestionAlgorithm> {
+        let controller = self
+            .connection
+            .read()
+            .await
+            .connection
+            .congestion_state()
+            .into_any();
+        if controller.is::<congestion::Bbr>() {
+            Some(CongestionAlgorithm::Bbr)
+        } else if controller.is::<congestion::Cubic>() {
+            Some(CongestionAlgorithm::Cubic)
+        } else {
+            None
+        }
     }
 
     /// Requests outstanding on each stream, as the stream selection sees them.

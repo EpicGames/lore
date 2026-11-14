@@ -23,6 +23,7 @@ use crate::auth::AuthEndpoint;
 use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
+use crate::quic::client::CongestionAlgorithm;
 use crate::quic::storage_service::client::StorageClient;
 use crate::traits::Storage;
 
@@ -105,6 +106,7 @@ pub async fn storage(
     identity: &str,
     partition: Partition,
     credentials: &Arc<SuppliedCredentials>,
+    congestion_algorithm: CongestionAlgorithm,
 ) -> Result<Arc<dyn Storage>, ProtocolError> {
     let remote_domain = domain_from_url_str_or_url(remote_url)
         .internal_with(|| format!("remote {remote_url} is invalid"))?;
@@ -118,6 +120,7 @@ pub async fn storage(
         partition,
         credentials,
         None,
+        congestion_algorithm,
     )
     .await
     .forward_with::<ProtocolError, _>(|| format!("connecting to {remote_url}"))?;

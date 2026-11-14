@@ -413,6 +413,7 @@ mod refused {
             test_partition(),
             credentials,
             None,
+            lore_transport::quic::client::CongestionAlgorithm::default(),
         )
         .await
         .expect("connect to the test server")

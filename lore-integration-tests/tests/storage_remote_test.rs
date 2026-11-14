@@ -1667,6 +1667,7 @@ mod storage_remote_tests {
                 "",
                 "",
                 lore_transport::auth::AuthMode::Auto,
+                None,
             )
             .await?;
             let client_repository =
@@ -7881,6 +7882,7 @@ mod storage_remote_tests {
             "",
             "",
             lore_transport::auth::AuthMode::Auto,
+            None,
         )
         .await
         .expect("connect to the test server")

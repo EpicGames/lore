@@ -144,6 +144,7 @@ At startup the server also reports where each local store lands, warning when th
 | `transport_bits_per_second` | `1073741824` (`quic`), `10737418240` (`quic_internal`) | Transport bandwidth estimate in bits per second. |
 | `transport_rtt` | `100` (`quic`), `220` (`quic_internal`) | Expected round-trip time in milliseconds. Together with `transport_bits_per_second` it sizes the receive and send windows of every connection the endpoint accepts: how much a client may have in flight, and how much of a response the server holds until it is acknowledged. One value serves every client, so set it for the most distant one; a window sized too short limits a distant client's throughput, and a nearer client never fills a larger one. Each connection may buffer up to one window in each direction, so a larger value raises the server's worst-case memory per connection. The internal endpoint's default covers peers in other regions. |
 | `initial_cwnd_bytes` | none (`quic`), `1048576` (`quic_internal`) | Congestion window, in bytes, that each accepted connection starts with: how much the server sends before the peer's first acknowledgements arrive. The congestion controller may cap it at the send window derived from `transport_bits_per_second` and `transport_rtt`. When unset, `quic` uses the congestion controller's own default and `quic_internal` always uses `1048576`. At least `2400`. |
+| `congestion_algorithm` | `bbr` (`quic`), `cubic` (`quic_internal`) | Congestion controller of each connection the endpoint accepts: `bbr` or `cubic`. It paces only what the server sends, such as the data of a get. What a client sends, such as the data of a put, follows the client's controller: a CLI or storage API client's is the one `LORE_QUIC_CONGESTION_ALGORITHM` names, another server's `remote` store's is its `congestion_algorithm` (see [Remote store mode](#remote-store-mode)), and on `quic_internal`, a peer's replicated store's is the `congestion_algorithm` of its `[immutable_store.replicated]` table, Cubic unless configured (see [Replicated store mode](#replicated-store-mode)). [Environment variables](lore-cli-config.md#environment-variables) in the Lore CLI configuration reference says when to choose which. Any other value fails startup. |
 | `handler_timeout_seconds` | `50` | Per-request handler timeout. Guards against handlers that hang indefinitely. |
 | `connection_message_limit` | none | Maximum in-flight messages per connection. When unset, the server falls back to `500` for the public endpoint and `50000` for the internal endpoint. |
 
@@ -572,7 +573,7 @@ Each mode reads its settings from a matching sub-table. The `local` mode uses `[
 | `compaction_parallel_groups` | `8` | immutable | Number of compaction groups processed in parallel. |
 
 > [!NOTE]
-> The `composite` mode layers a local cache tier over a durable plugin tier (for example, a local cache in front of S3). It reads `[immutable_store.composite.local]` and `[immutable_store.composite.durable]`, where the durable tier names a plugin mode such as `aws`, or `remote` (see [Remote store mode](#remote-store-mode)). Composite and replicated store internals are out of scope here.
+> The `composite` mode layers a local cache tier over a durable plugin tier (for example, a local cache in front of S3). It reads `[immutable_store.composite.local]` and `[immutable_store.composite.durable]`, where the durable tier names a plugin mode such as `aws`, or `remote` (see [Remote store mode](#remote-store-mode)). Composite store internals are out of scope here. Of the replicated store's settings, only `congestion_algorithm` is covered, in [Replicated store mode](#replicated-store-mode).
 
 The lock store's `local` mode takes no sub-table — it uses an in-process, in-memory lock store (a single in-memory map) with no fields to configure. Because it lives entirely within one server process, it coordinates locks only on that node; distributed locking across a multi-node cluster requires a plugin backend such as `aws` (DynamoDB).
 
@@ -585,6 +586,7 @@ The `remote` mode keeps a store at another Lore server, the upstream, which the 
 | `remote_url` | required | both | URL of the upstream as a client names it, without a repository, for example `lores://lore.example.com:41337`. |
 | `verify` | `false` | immutable | Whether the store checks each payload the upstream serves against its address, decoding and hashing it. When `false`, the store trusts the upstream and checks only a payload's sizes. Either way, a client checks each payload it fetches from the server against its address, except a client that trusts its remote (`--trust-remote`, or `trust_remote` or `skip_verify` through the C API), which checks only the sizes. A client that finds a payload corrupt asks the server to heal it: the server drops its own copy only if that copy is corrupt, and asks the upstream to heal only where its own copy was corrupt or missing. |
 | `auth_url` | none | immutable | Despite its name, the identity the store authenticates at the upstream as, not a URL. The server uses the login stored for that identity in the token store of the user it runs as. When unset, the store uses the first identity stored there that the upstream accepts. The `remote` mutable store ignores the field and always uses that first identity. |
+| `congestion_algorithm` | `bbr` | both | Congestion controller a storage connection to the upstream runs when the store establishes it, which paces what the server sends there, such as content it writes through: `bbr` or `cubic`. A connection to the upstream already established is reused as it is, so where the immutable and mutable stores reach one upstream as the same identity, their connections run the controller of the store that established them. Any other value fails startup. The server reads no environment variable for it; `LORE_QUIC_CONGESTION_ALGORITHM` is for clients with no settings to name one. |
 
 ```toml
 [mutable_store]
@@ -592,6 +594,23 @@ mode = "remote"
 
 [mutable_store.remote]
 remote_url = "lores://lore.example.com:41337"
+```
+
+### Replicated store mode
+
+The `replicated` mode forwards the immutable store's operations to another Lore server, the peer, which the server reaches on the peer's internal QUIC endpoint, `[server.quic_internal]` (see [QUIC endpoints](#quic-endpoints)). `[immutable_store] mode = "replicated"` reads `[immutable_store.replicated]`, and a composite store's tier in `replicated` mode reads the `replicated` table of that tier, such as `[immutable_store.composite.durable.replicated]`. The server refuses to start in `replicated` mode without the table. Only the table's `congestion_algorithm` field is covered here.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `congestion_algorithm` | `cubic` | Congestion controller of each connection the store establishes to the peer's internal QUIC endpoint, which paces what the server sends there, such as the content it stores at the peer: `bbr` or `cubic`. It applies to every connection the store establishes, including those that replace a connection at a periodic refresh or after a failure. A connection already established is reused as it is, with the controller it was established with. What the peer sends back follows the `congestion_algorithm` of the peer's `[server.quic_internal]`. Any other value fails startup. `LORE_QUIC_CONGESTION_ALGORITHM` doesn't apply to it. |
+
+```toml
+[immutable_store]
+mode = "replicated"
+
+[immutable_store.replicated]
+# remote_url and the store's other settings, not covered here
+congestion_algorithm = "bbr"
 ```
 
 ## Topology settings

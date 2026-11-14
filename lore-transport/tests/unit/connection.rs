@@ -9,6 +9,7 @@ use lore_error_set::ext::ResultExt;
 use lore_transport::auth::AuthMode;
 use lore_transport::connection::*;
 use lore_transport::error::ProtocolError;
+use lore_transport::quic::client::CongestionAlgorithm;
 use lore_transport::session::StorageSession;
 use lore_transport::types::*;
 
@@ -537,6 +538,7 @@ mod check_advertised_endpoints {
             _: Partition,
             _: usize,
             _: &Arc<SuppliedCredentials>,
+            _: CongestionAlgorithm,
         ) -> Result<Arc<dyn Storage>, ProtocolError> {
             Err(ProtocolError::from(Disconnected))
         }
@@ -619,6 +621,7 @@ mod check_advertised_endpoints {
             "",
             "",
             AuthMode::Auto,
+            None,
         )
         .await
         .err()
@@ -633,6 +636,7 @@ mod check_advertised_endpoints {
             "",
             "",
             AuthMode::Auto,
+            None,
         )
         .await
         .expect("an endpoint that authenticates the server is accepted");
@@ -1050,6 +1054,7 @@ mod cache {
                 "rotated identity token",
                 "rotated access token",
                 AuthMode::Auto,
+                None,
             )
             .await
             .expect("the cached connection");
@@ -1232,6 +1237,7 @@ mod cache {
             _: Partition,
             _: usize,
             _: &Arc<SuppliedCredentials>,
+            _: CongestionAlgorithm,
         ) -> Result<Arc<dyn Storage>, ProtocolError> {
             self.connections.lock().push(connection);
             std::future::pending().await
@@ -1324,6 +1330,7 @@ mod cache {
                             "",
                             "",
                             AuthMode::Auto,
+                            None,
                         )
                         .await
                     });
@@ -1562,5 +1569,200 @@ mod cache {
             "taken at the first check that found no call holding it"
         );
         assert_eq!(take_unused(&mut cache, Duration::ZERO, start).len(), 1);
+    }
+}
+
+/// The congestion controller of a connection's storage connections.
+mod congestion_algorithm {
+    use std::sync::Weak;
+
+    use lore_transport::auth::AuthEndpoint;
+    use lore_transport::traits::Admin;
+    use lore_transport::traits::Environment;
+    use lore_transport::traits::Lock;
+    use lore_transport::traits::Protocol;
+    use lore_transport::traits::Repository;
+    use lore_transport::traits::Revision;
+    use lore_transport::traits::Storage;
+
+    use super::*;
+
+    /// A protocol whose storage records the controller each storage connection is opened with, and
+    /// connects none.
+    #[derive(Default)]
+    struct RecordingProtocol(parking_lot::Mutex<Vec<CongestionAlgorithm>>);
+
+    impl RecordingProtocol {
+        fn opened(&self) -> Vec<CongestionAlgorithm> {
+            self.0.lock().clone()
+        }
+    }
+
+    struct NoEndpoints;
+
+    #[async_trait::async_trait]
+    impl Environment for NoEndpoints {
+        async fn get(&self) -> Result<EnvironmentConfig, ProtocolError> {
+            Ok(EnvironmentConfig::default())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Protocol for RecordingProtocol {
+        async fn storage(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: Partition,
+            _: usize,
+            _: &Arc<SuppliedCredentials>,
+            congestion_algorithm: CongestionAlgorithm,
+        ) -> Result<Arc<dyn Storage>, ProtocolError> {
+            self.0.lock().push(congestion_algorithm);
+            Err(ProtocolError::from(Disconnected))
+        }
+
+        async fn revision(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: RepositoryId,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Revision>, ProtocolError> {
+            Err(ProtocolError::from(Disconnected))
+        }
+
+        async fn repository(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Repository>, ProtocolError> {
+            Err(ProtocolError::from(Disconnected))
+        }
+
+        async fn admin(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: RepositoryId,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Admin>, ProtocolError> {
+            Err(ProtocolError::from(Disconnected))
+        }
+
+        async fn lock(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: RepositoryId,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Lock>, ProtocolError> {
+            Err(ProtocolError::from(Disconnected))
+        }
+
+        async fn environment(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+        ) -> Result<Arc<dyn Environment>, ProtocolError> {
+            Ok(Arc::new(NoEndpoints))
+        }
+    }
+
+    /// A connection to `remote` whose storage connections run `congestion_algorithm`.
+    async fn connected(remote: &str, congestion_algorithm: CongestionAlgorithm) -> Arc<Connection> {
+        connect(
+            remote,
+            "",
+            RepositoryId::default(),
+            1,
+            "",
+            "",
+            AuthMode::Auto,
+            Some(congestion_algorithm),
+        )
+        .await
+        .expect("a connection")
+    }
+
+    /// The controller a connection is opened with is the one each of its storage connections is
+    /// opened with.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connections_storage_runs_the_algorithm_it_was_opened_with() {
+        let protocol = Arc::new(RecordingProtocol::default());
+        add("ccopened", protocol.clone()).expect("the scheme is not registered yet");
+
+        let connection = connected(
+            "ccopened://remote.invalid:41337",
+            CongestionAlgorithm::Cubic,
+        )
+        .await;
+        let _ = connection.storage().await;
+
+        assert_eq!(
+            connection.congestion_algorithm(),
+            CongestionAlgorithm::Cubic
+        );
+        assert_eq!(protocol.opened(), [CongestionAlgorithm::Cubic]);
+        remove_connection(connection);
+    }
+
+    /// A call naming another controller is served the connection already cached for the remote,
+    /// which runs the controller it was established with.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cached_connection_is_reused_with_the_algorithm_it_was_established_with() {
+        add("cccached", Arc::new(RecordingProtocol::default()))
+            .expect("the scheme is not registered yet");
+        let remote = "cccached://remote.invalid:41337";
+
+        let established = connected(remote, CongestionAlgorithm::Cubic).await;
+        let reused = connected(remote, CongestionAlgorithm::Bbr).await;
+
+        assert!(Arc::ptr_eq(&established, &reused));
+        assert_eq!(reused.congestion_algorithm(), CongestionAlgorithm::Cubic);
+        remove_connection(established);
+    }
+
+    /// `LORE_QUIC_CONGESTION_ALGORITHM` names either algorithm as the server's configuration does,
+    /// and BBR when unset or blank.
+    #[test]
+    fn the_variable_names_either_algorithm_and_defaults_to_bbr() {
+        for (value, algorithm) in [
+            (None, CongestionAlgorithm::Bbr),
+            (Some(""), CongestionAlgorithm::Bbr),
+            (Some("bbr"), CongestionAlgorithm::Bbr),
+            (Some("cubic"), CongestionAlgorithm::Cubic),
+        ] {
+            assert_eq!(
+                congestion_algorithm_named(value).ok(),
+                Some(algorithm),
+                "{value:?}"
+            );
+        }
+    }
+
+    /// A value that names neither algorithm is refused rather than read as the default, naming the
+    /// variable.
+    #[test]
+    fn a_value_naming_neither_algorithm_is_refused() {
+        for value in ["reno", "Cubic", " bbr"] {
+            let error = congestion_algorithm_named(Some(value)).expect_err(value);
+
+            assert!(
+                error.to_string().contains(CONGESTION_ALGORITHM_ENV),
+                "unexpected error: {error}"
+            );
+        }
     }
 }

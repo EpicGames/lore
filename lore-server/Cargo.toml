@@ -88,6 +88,7 @@ ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
 lore-credential = { workspace = true }
 lore-storage = { workspace = true, features = ["test-util"] }
+lore-transport = { workspace = true, features = ["test-util"] }
 axum-test = { version = "18.1.0", default-features = false }
 rcgen = { workspace = true }
 http-body = "1.0.1"

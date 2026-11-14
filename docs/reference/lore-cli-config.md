@@ -214,11 +214,12 @@ The Python test suite sets this per run, so running it leaves a service you have
 
 ## Environment variables
 
-`LORE_SERVICE_EXECUTABLE`, `LORE_USE_SERVICE` and `LORE_SERVICE_SOCKET` choose the Lore service that carries out commands; the [`[service]` table](#service-table) and [Giving a run its own service](#giving-a-run-its-own-service) describe them. The variable below decides how a process reaches its remote.
+`LORE_SERVICE_EXECUTABLE`, `LORE_USE_SERVICE` and `LORE_SERVICE_SOCKET` choose the Lore service that carries out commands; the [`[service]` table](#service-table) and [Giving a run its own service](#giving-a-run-its-own-service) describe them. The variables below decide how a process reaches its remote.
 
 | Variable | Effect |
 | --- | --- |
 | `LORE_UDS_SOCKET` | Names the socket of a machine server. Every gRPC channel the process opens goes through it, and a `lore-unix` remote requires it. |
+| `LORE_QUIC_CONGESTION_ALGORITHM` | Names the congestion controller a QUIC storage connection runs when the process establishes it, as the CLI or a program using the storage API does: `bbr`, the default, or `cubic`. |
 
 `LORE_UDS_SOCKET` holds the absolute path of a socket a machine server listens on, typically one bind-mounted into a container (see [Container sockets](lore-server-config.md#container-sockets)). With it set, every gRPC channel the process opens, the authentication service's included, connects through the socket in plaintext and keeps the host it would have dialed as the request's authority, which the machine server forwards the request by. A `lore-unix` remote also sends its storage requests through the socket, over one storage connection per process. The process sizes its network threads for that one connection. OIDC login requests, which are HTTP, still go to the network.
 
@@ -227,6 +228,13 @@ The Python test suite sets this per run, so running it leaves a service you have
 - A process with the variable set reaches over gRPC only the hosts the machine server forwards to. It can use a remote of another scheme as well only if the machine server forwards that remote's host and the process has network access for the remote's QUIC storage, which it reaches over one storage connection. In a container with no network, as usual, only `lore-unix` remotes work.
 - Each process reads the variable once, from its own environment. The relay does not pass it to the Lore service, so set it for the service as well.
 - A Lore server refuses to start with the variable set in its own environment, since the variable would send the server's own gRPC into a socket (see [Container sockets](lore-server-config.md#container-sockets)).
+
+`LORE_QUIC_CONGESTION_ALGORITHM` decides how the process paces what it sends on its QUIC storage connections, which is the data of a put; the data of a get is paced by the server, as its endpoint's `congestion_algorithm` sets (see [QUIC endpoints](lore-server-config.md#quic-endpoints)). BBR paces at its estimate of the path's bandwidth, which packet loss alone doesn't lower. Cubic shrinks its window when it detects loss, which suits a path that drops datagrams under load, such as a full socket buffer on the way, where BBR retransmits what is dropped and so sends more bytes than the data holds.
+
+- Unset or blank, the process uses BBR. Any value other than `bbr` or `cubic` makes each connection the process establishes fail with an error naming the variable.
+- A connection already established is reused as it is.
+- Each process reads the variable once, from its own environment, the first time it establishes a storage connection. The relay does not pass it to the Lore service, so set it for the service as well.
+- A Lore server doesn't read it. The connections a `remote` store establishes to its upstream run the controller its `congestion_algorithm` key names (see [Remote store mode](lore-server-config.md#remote-store-mode)).
 
 ## Examples
 

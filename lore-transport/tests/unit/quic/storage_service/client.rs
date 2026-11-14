@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! A storage client one of whose streams stops carrying requests while its connection stays up.
+//! A storage client: the congestion controller its connection runs, and a client one of whose
+//! streams stops carrying requests while its connection stays up.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use lore_transport::error::ProtocolError;
+use lore_transport::quic::client::CongestionAlgorithm;
 use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::storage_service::client::StorageClient;
 use lore_transport::traits::Storage;
@@ -71,4 +73,18 @@ async fn a_request_on_a_stream_whose_reader_stopped_reconnects() {
     let started = start_session_after_fault(&client).await;
     assert!(started.is_ok(), "{started:?}");
     assert_eq!(server.started_sessions_per_connection(), [1, 1]);
+}
+
+/// A storage client's connection runs the congestion controller it is opened with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_storage_client_runs_the_congestion_algorithm_it_is_opened_with() {
+    let server = TestStorageServer::start();
+    for algorithm in [CongestionAlgorithm::Bbr, CongestionAlgorithm::Cubic] {
+        let client = server.connect_client_running(algorithm).await;
+
+        assert_eq!(
+            client.quic().running_congestion_algorithm().await,
+            Some(algorithm)
+        );
+    }
 }

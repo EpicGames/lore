@@ -141,6 +141,7 @@ impl StorageClient {
         partition: Partition,
         credentials: &Arc<SuppliedCredentials>,
         user_agent: Option<String>,
+        congestion_algorithm: CongestionAlgorithm,
     ) -> Result<Arc<Self>, ProtocolError> {
         let user_agent = user_agent.unwrap_or_else(|| crate::user_agent().to_string());
         let auth_adapter = Arc::new(StorageClientAuth {
@@ -153,7 +154,7 @@ impl StorageClient {
         let transport_config = TransportConfig {
             max_bytes_bandwidth_per_second: MAX_BYTES_BANDWIDTH_PER_SEC,
             expected_rtt_ms: DEFAULT_EXPECTED_RTT_MS,
-            congestion_algorithm: CongestionAlgorithm::Bbr,
+            congestion_algorithm,
             initial_cwnd: None,
         };
 
@@ -368,6 +369,11 @@ impl Storage for StorageClient {
 
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError> {
         sessions::stop(self, session_id).await
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn running_congestion_algorithm(&self) -> Option<CongestionAlgorithm> {
+        self.quic.running_congestion_algorithm().await
     }
 
     async fn get(

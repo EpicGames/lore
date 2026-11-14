@@ -92,9 +92,10 @@ async fn get(
     concurrency: usize,
     passes: usize,
 ) -> Result<()> {
-    let connection = lore_transport::connect(remote_url, "", partition, 1, "", "", AuthMode::Auto)
-        .await
-        .with_context(|| format!("connecting to {remote_url}"))?;
+    let connection =
+        lore_transport::connect(remote_url, "", partition, 1, "", "", AuthMode::Auto, None)
+            .await
+            .with_context(|| format!("connecting to {remote_url}"))?;
     let storage = connection.storage().await?;
     let session = storage.session_start(partition, "uds-bench").await?;
     let addresses = Arc::new(addresses);

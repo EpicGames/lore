@@ -64,7 +64,7 @@ uuid = { workspace = true }
 ctor = { workspace = true }
 lore = { workspace = true, features = ["test-util"] }
 lore-base = { workspace = true, features = ["test-util"] }
-lore-server = { workspace = true }
+lore-server = { workspace = true, features = ["test-util"] }
 lore-storage = { workspace = true, features = ["test-util"] }
 # Here rather than under [dependencies]: a normal dependency's features apply to every build that
 # includes this package, so a release build of the workspace would compile lore-revision's test

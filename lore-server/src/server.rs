@@ -51,7 +51,6 @@ use lore_telemetry::user_agent_filter::UserAgentFilter;
 use lore_transport::make_user_agent_with_component;
 use lore_transport::quic::client;
 use lore_transport::quic::client::ClientCerts;
-use lore_transport::quic::client::CongestionAlgorithm;
 use lore_transport::quic::client::STREAM_COUNT;
 use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::storage_service::client::StorageClient;
@@ -368,6 +367,10 @@ impl From<QuicSettings> for QuinnConfigBuilder {
             builder = builder.initial_cwnd(v);
         }
 
+        if let Some(v) = settings.congestion_algorithm {
+            builder = builder.congestion_algorithm(v);
+        }
+
         builder
     }
 }
@@ -385,7 +388,6 @@ async fn launch_quinn_server(
     stream_handler_factory: Box<dyn StreamHandlerFactory>,
     metrics_frequency: Duration,
     quic_settings: QuicSettings,
-    congestion_algorithm: CongestionAlgorithm,
     generate_ephemeral_cert: bool,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
@@ -422,8 +424,7 @@ async fn launch_quinn_server(
             .pkey_file(cert_settings.pkey_file)
             .client_cert_verifier(client_verifier)
             .stream_handler_factory(stream_handler_factory)
-            .metrics_frequency(metrics_frequency)
-            .congestion_algorithm(congestion_algorithm);
+            .metrics_frequency(metrics_frequency);
 
         info!(address = %addr, "server starting");
         let server = QuinnServer::start(settings_builder.build()?)?;
@@ -1430,6 +1431,7 @@ async fn configure_local_mutable_store(
     .await?)
 }
 
+#[lore_macro::test_pub]
 fn configure_remote_immutable_store(
     settings: &RemoteStoreSettings,
     upstream_connections: u32,
@@ -1442,19 +1444,17 @@ fn configure_remote_immutable_store(
     Ok(Arc::new(
         RemoteImmutableStore::new(settings.remote_url.as_str(), settings.auth_url.as_deref())
             .verifying(settings.verify)
-            .connecting_over(upstream_connections as usize),
+            .connecting_over(upstream_connections as usize)
+            .congestion_algorithm(settings.congestion_algorithm),
     ))
 }
 
-async fn configure_replicated_immutable_store(
+/// The factory of a replicated store's clients, each connecting to the remote as `settings`
+/// configure it.
+#[lore_macro::test_pub]
+fn replicated_client_factory(
     settings: &ReplicatedStoreSettings,
-) -> Result<Arc<dyn ImmutableStore>> {
-    info!(
-        remote_url = %settings.remote_url,
-        num_clients = settings.num_clients,
-        "Wiring up replicated immutable store"
-    );
-
+) -> client_container::QuicClientFactory {
     let certs = if let Some(setting_certs) = &settings.certs {
         let setting_certs = setting_certs.clone();
         client::CertificateSettings {
@@ -1487,10 +1487,24 @@ async fn configure_replicated_immutable_store(
         factory.transport_config.expected_rtt_ms = expected_rtt_ms;
     }
     factory.transport_config.initial_cwnd = Some(settings.initial_cwnd_bytes.get());
+    factory.transport_config.congestion_algorithm = settings.congestion_algorithm;
     factory.user_agent = Some(make_user_agent_with_component(
         user_agent_product(),
         "replicated-immutable-store",
     ));
+    factory
+}
+
+async fn configure_replicated_immutable_store(
+    settings: &ReplicatedStoreSettings,
+) -> Result<Arc<dyn ImmutableStore>> {
+    info!(
+        remote_url = %settings.remote_url,
+        num_clients = settings.num_clients,
+        "Wiring up replicated immutable store"
+    );
+
+    let factory = replicated_client_factory(settings);
 
     let container_config = ClientContainerConfig {
         regenerate_retry_policy: (&settings.regenerate_retry).into(),
@@ -1519,7 +1533,8 @@ fn configure_remote_mutable_store(
 
     Ok(Arc::new(
         RemoteMutableStore::new(settings.remote_url.as_str(), identity)
-            .connecting_over(upstream_connections as usize),
+            .connecting_over(upstream_connections as usize)
+            .congestion_algorithm(settings.congestion_algorithm),
     ))
 }
 
@@ -2440,7 +2455,6 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 )),
                 frequency,
                 quic_settings,
-                CongestionAlgorithm::Bbr,
                 // User-facing endpoint: generate an ephemeral certificate when
                 // none is configured so the server runs with zero config.
                 true,
@@ -2538,10 +2552,6 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 )),
                 frequency,
                 quic_settings,
-                // Cubic only shrinks the window on packet loss, so a peer that goes quiet
-                // between replication bursts doesn't come back to a window BBR has drained
-                // and stall the next large get or put.
-                CongestionAlgorithm::Cubic,
                 generate_ephemeral_cert,
                 shutdown_rx,
             )

@@ -22,12 +22,16 @@ mod integration {
     use lore_server::quic::quinn::QuinnServer;
     use lore_server::quic::replication_store_service::client::CommandBehavior;
     use lore_server::quic::replication_store_service::client::ReplicationStoreClient;
+    use lore_server::quic::replication_store_service::client_container::ClientFactory;
     use lore_server::quic::tests::ObservedContexts;
     use lore_server::quic::tests::TestHandlerFactory;
     use lore_server::quic::tests::server_certs;
+    use lore_server::server::replicated_client_factory;
+    use lore_server::settings::ReplicatedStoreSettings;
     use lore_transport::quic::client::CertificateSettings;
     use lore_transport::quic::client::CongestionAlgorithm;
     use lore_transport::quic::client::DEFAULT_EXPECTED_RTT_MS;
+    use lore_transport::quic::client::ServiceClient;
     use lore_transport::quic::client::TransportConfig;
 
     use crate::store::test_support::test_store_create;
@@ -160,6 +164,44 @@ mod integration {
             .expect("connect with user agent must succeed");
 
             assert_eq!(await_announced_user_agent(&contexts).await, "lore-test/1.0");
+        }))
+        .await
+        .expect("Test task failed");
+    }
+
+    /// A replicated store's client connection runs the congestion controller its settings name,
+    /// read back from the QUIC connection. BBR, since the factory's own default is Cubic.
+    #[tokio::test]
+    async fn a_replicated_stores_client_runs_the_congestion_algorithm_its_settings_name() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create store");
+
+        lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+            let (server_addr, _server, _contexts) =
+                start_test_server(immutable_store, mutable_store);
+            let settings: ReplicatedStoreSettings = toml::from_str(&format!(
+                r#"
+                    remote_url = "quic://{server_addr}"
+                    periodic_client_refresh_secs = 300
+                    congestion_algorithm = "bbr"
+
+                    [regenerate_retry]
+                    initial_backoff_ms = 250
+                    max_backoff_ms = 10_000
+                    max_attempts = 5
+                "#
+            ))
+            .expect("valid settings");
+
+            let client = replicated_client_factory(&settings)
+                .make_client(None)
+                .await
+                .expect("a client of the replicated store");
+
+            assert_eq!(
+                client.quic().running_congestion_algorithm().await,
+                Some(CongestionAlgorithm::Bbr)
+            );
         }))
         .await
         .expect("Test task failed");
