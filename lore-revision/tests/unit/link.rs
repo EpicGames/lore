@@ -17,6 +17,7 @@ use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::diff3_collect;
+use lore_revision::state::LinkReference;
 use lore_revision::state::Mark;
 use lore_revision::state::NodeMapping;
 use lore_revision::state::State;
@@ -850,6 +851,47 @@ async fn a_link_has_no_child_in_the_state_holding_it() {
             }
         })
         .await;
+}
+
+/// A link at `path` of [`merged`] pinned at `signature` with `flags`.
+fn link_at(path: &str, signature: u64, flags: LinkFlags) -> LinkAtPath {
+    LinkAtPath {
+        path: path.to_string(),
+        reference: LinkReference {
+            repository: merged(),
+            signature: Hash::from_u64(signature),
+            local_node: 2,
+            flags: flags.bits(),
+            ..Default::default()
+        },
+        mount_source: None,
+    }
+}
+
+/// A link whose row changed only its flags is touched.
+#[test]
+fn a_link_with_other_flags_is_touched() {
+    let from = [link_at("libs/a", 1, LinkFlags::NoFlags)];
+    let to = [link_at("libs/a", 1, LinkFlags::DisableAutoFollow)];
+    assert_eq!(
+        touched_link_repositories(&from, &to).collect::<Vec<_>>(),
+        [merged(), merged()]
+    );
+}
+
+/// The same links in another order touch nothing, as a link removed and added back moves its row
+/// to the end of the registry.
+#[test]
+fn the_same_links_in_another_order_touch_nothing() {
+    let from = [
+        link_at("libs/a", 1, LinkFlags::NoFlags),
+        link_at("libs/b", 2, LinkFlags::DisableAutoFollow),
+    ];
+    let to = [
+        link_at("libs/b", 2, LinkFlags::DisableAutoFollow),
+        link_at("libs/a", 1, LinkFlags::NoFlags),
+    ];
+    assert_eq!(touched_link_repositories(&from, &to).count(), 0);
 }
 
 /// A revision of `holder` linking each of `links`, as (mount, repository, pin), at its root.

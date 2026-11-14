@@ -1849,6 +1849,19 @@ pub struct LinkAtPath {
     pub mount_source: Option<NodeID>,
 }
 
+impl LinkAtPath {
+    /// Whether `other` is the same link: at the same path, of the same repository, branch, pin
+    /// and flags, and mounting the same node.
+    pub fn same_link(&self, other: &LinkAtPath) -> bool {
+        self.path == other.path
+            && self.reference.repository() == other.reference.repository()
+            && self.reference.branch() == other.reference.branch()
+            && self.reference.signature() == other.reference.signature()
+            && self.reference.flags() == other.reference.flags()
+            && self.mount_source == other.mount_source
+    }
+}
+
 /// Each link in `state`'s registry. Drops stale registry entries whose node is
 /// gone from the tree.
 pub async fn link_pins_by_path(
@@ -1914,6 +1927,22 @@ pub async fn diff_link_pins(
     Ok(link_pin_changes(&from_pins, &to_pins))
 }
 
+/// Whether a link of `state_from`'s registry differs from `state_to`'s, per
+/// [`touched_link_repositories`].
+pub async fn link_registries_differ(
+    repository: Arc<RepositoryContext>,
+    state_from: &Arc<State>,
+    state_to: &Arc<State>,
+) -> Result<bool, LinkError> {
+    let (from_pins, to_pins) = tokio::try_join!(
+        link_pins_by_path(state_from, repository.clone()),
+        link_pins_by_path(state_to, repository),
+    )?;
+    Ok(touched_link_repositories(&from_pins, &to_pins)
+        .next()
+        .is_some())
+}
+
 /// [`diff_link_pins`] over the pins [`link_pins_by_path`] returned.
 pub fn link_pin_changes(from_pins: &[LinkAtPath], to_pins: &[LinkAtPath]) -> Vec<LinkPinChange> {
     to_pins
@@ -1939,43 +1968,31 @@ pub fn link_pin_changes(from_pins: &[LinkAtPath], to_pins: &[LinkAtPath]) -> Vec
 }
 
 /// Repositories of the links that differ between `from_pins` and `to_pins`: a
-/// path with a link on one side only, or with another repository, branch, pin
-/// or mount source.
+/// path with a link on one side only, or with another link per
+/// [`LinkAtPath::same_link`].
 pub fn touched_link_repositories<'a>(
     from_pins: &'a [LinkAtPath],
     to_pins: &'a [LinkAtPath],
 ) -> impl Iterator<Item = RepositoryId> + 'a {
     let unmatched = |pins: &'a [LinkAtPath], others: &'a [LinkAtPath]| {
         pins.iter()
-            .filter(move |link| {
-                !others.iter().any(|other| {
-                    other.path == link.path
-                        && other.reference.repository() == link.reference.repository()
-                        && other.reference.branch() == link.reference.branch()
-                        && other.reference.signature() == link.reference.signature()
-                        && other.mount_source == link.mount_source
-                })
-            })
+            .filter(move |link| !others.iter().any(|other| other.same_link(link)))
             .map(|link| link.reference.repository())
     };
     unmatched(from_pins, to_pins).chain(unmatched(to_pins, from_pins))
 }
 
-/// Returns true if `staged_node` is a staged link pin or mount change (an update
-/// to an existing link, not an add or remove) with no staged changes on the
-/// linked side.
+/// Returns true if `staged_node` is a staged change to an existing link itself (not an add or
+/// remove), with no staged changes on the linked side.
 pub async fn is_staged_link_update(
     staged_node: &Node,
-    current_node: &Node,
     parent_repository: Arc<RepositoryContext>,
 ) -> Result<bool, LinkError> {
-    let is_update = staged_node.is_link()
-        && staged_node.is_staged()
-        && !staged_node.is_staged_add()
-        && !staged_node.is_staged_delete();
-    let moved = staged_node.address.hash != current_node.address.hash
-        || !staged_node.mounts_same_source(current_node);
-    if !is_update || !moved {
+    if !staged_node.is_link()
+        || !staged_node.is_staged()
+        || staged_node.is_staged_add()
+        || staged_node.is_staged_delete()
+    {
         return Ok(false);
     }
 

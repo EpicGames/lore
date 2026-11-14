@@ -1716,6 +1716,45 @@ async fn reading_the_link_list_leaves_it_editable() {
     );
 }
 
+/// Replacing the row of a link the registry doesn't hold fails as not found, and leaves the
+/// registry as it was.
+#[tokio::test]
+async fn replacing_an_unregistered_link_row_is_not_found() {
+    let repository = null_repository().await;
+    let state = State::new();
+    state
+        .link_add(
+            repository.clone(),
+            link_id(1),
+            BranchId::default(),
+            Hash::from([1u8; 32]),
+            2,
+            LinkFlags::NoFlags,
+        )
+        .await
+        .expect("adding the link");
+
+    let unregistered = LinkReference {
+        repository: link_id(1),
+        local_node: 3,
+        flags: LinkFlags::DisableAutoFollow.bits(),
+        ..Default::default()
+    };
+    assert!(
+        state
+            .link_replace(repository.clone(), unregistered)
+            .await
+            .expect_err("a link the registry doesn't hold")
+            .is_link_not_found()
+    );
+    let links = state
+        .link_list(repository)
+        .await
+        .expect("reading the registry");
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].flags, LinkFlags::NoFlags.bits());
+}
+
 /// A node carrying `flags`, named for the name table by its hash.
 fn dirty_node(name: &str, flags: NodeFlags) -> Node {
     Node {

@@ -74,11 +74,12 @@ def remount(
     source_path: str,
     message: str | None = "Remount the link",
     pin: str | None = None,
+    **link_add_kwargs,
 ):
     """Re-points the link at `link_path` to `source_path`, at `pin` when given, committed and
     pushed unless `message` is None."""
     repo.link_remove(link_path)
-    repo.link_add(link_path, source_id, source_path, pin=pin)
+    repo.link_add(link_path, source_id, source_path, pin=pin, **link_add_kwargs)
     if message is not None:
         repo.commit(message)
         repo.push()
@@ -135,6 +136,12 @@ def remote_branch_entries(repo: Lore) -> list[dict]:
     ]
 
 
+def link_entry(repo: Lore, link_path: str) -> dict:
+    """The `link list` entry of the link at `link_path`."""
+    entries = parse_jsonl(repo.link_list(json=True), "linkEntry")
+    return next(e for e in entries if e["linkPath"] == link_path)
+
+
 def link_pin(repo: Lore, source_id: str) -> str:
     """The revision `source_id` is pinned at, read from `link list`."""
     output = repo.link_list()
@@ -145,12 +152,7 @@ def link_pin(repo: Lore, source_id: str) -> str:
 
 def link_pin_at(repo: Lore, link_path: str) -> str:
     """The revision the link at `link_path` pins, read from `link list`."""
-    output = repo.link_list()
-    match = re.search(
-        rf"Link path: {link_path} .*?Revision:\s*(\w+)", output, re.DOTALL
-    )
-    assert match, f"No pin for {link_path} in link list:\n{output}"
-    return match.group(1)
+    return link_entry(repo, link_path)["revision"]
 
 
 def committed_link_pin(repo: Lore, source_id: str) -> str:

@@ -6264,18 +6264,48 @@ impl State {
             "Update link with ID {link_id}, local node {local_node}, new signature {signature}, new branch {branch}"
         );
 
-        self.edit_link_list(repository, |link_list| {
-            for link in link_list.iter_mut() {
-                if link.repository == link_id && link.local_node == local_node {
-                    link.branch = branch;
-                    link.signature = signature;
-                    return Ok(());
-                }
-            }
-
-            Err(LinkNotFound.into())
+        self.edit_link_row(repository, &link_id, &local_node, |link| {
+            link.branch = branch;
+            link.signature = signature;
         })
         .await
+    }
+
+    /// Replaces the registry row of `reference`'s repository and node with `reference`, or fails
+    /// with [`LinkNotFound`] where the registry holds no such row.
+    pub async fn link_replace(
+        &self,
+        repository: Arc<RepositoryContext>,
+        reference: LinkReference,
+    ) -> Result<(), StateError> {
+        self.edit_link_row(
+            repository,
+            &reference.repository,
+            &reference.local_node,
+            |link| *link = reference,
+        )
+        .await
+    }
+
+    /// Applies `edit` to the registry row of `link_id` at `local_node`, or fails with
+    /// [`LinkNotFound`] where the registry holds no such row.
+    ///
+    /// Not an `async fn`, so its callers hold the future of [`Self::edit_link_list`] alone.
+    fn edit_link_row<'a>(
+        &'a self,
+        repository: Arc<RepositoryContext>,
+        link_id: &'a RepositoryId,
+        local_node: &'a NodeID,
+        edit: impl FnOnce(&mut LinkReference) + 'a,
+    ) -> impl Future<Output = Result<(), StateError>> + 'a {
+        self.edit_link_list(repository, |link_list| {
+            let link = link_list
+                .iter_mut()
+                .find(|link| link.repository == *link_id && link.local_node == *local_node)
+                .ok_or(LinkNotFound)?;
+            edit(link);
+            Ok(())
+        })
     }
 
     pub async fn link_remove(

@@ -1154,14 +1154,14 @@ async fn unstage_node(
 
         was_staged_delete = node.is_staged_delete();
 
-        let is_staged_update_link =
-            link::is_staged_link_update(&node, &current_node, repository.clone())
-                .await
-                .forward::<UnstageError>("Failed to check link staged pin change")?;
+        let is_staged_update_link = link::is_staged_link_update(&node, repository.clone())
+            .await
+            .forward::<UnstageError>("Failed to check for a staged link change")?;
 
-        // A staged modification of a file takes the current revision's mode and size back,
-        // and a staged repin of a link the current revision's pin, the node it exposes
-        // included; the rest of the node stays as it is.
+        // A staged modification of a file takes the current revision's mode and size back. A
+        // staged change to a link takes back the current revision's pin, the node it exposes and
+        // its registry row, or only the row's branch and flags where changes inside the link are
+        // staged. The rest of the node stays as it is.
         if node.is_staged_modify() && node.is_file() {
             node.mode = current_node.mode;
             node.size = current_node.size;
@@ -1197,6 +1197,20 @@ async fn unstage_node(
             stats
                 .directory_unstaged_count
                 .fetch_add(1, Ordering::Relaxed);
+        } else if node.is_link()
+            && !was_staged_delete
+            && current_node.is_link()
+            && current_node.linked_node().repository == node.linked_node().repository
+        {
+            link::reset::reset_staged_link_branching(
+                repository.clone(),
+                &state_staged,
+                &state_current,
+                node.linked_node().repository,
+                node_id,
+            )
+            .await
+            .forward::<UnstageError>("Failed to restore the link's branch and flags")?;
         }
 
         let restore_file = node.is_staged_modify() && node.is_file();

@@ -4,13 +4,20 @@ import json
 import os
 
 import pytest
-from error_types import ImproperArgumentsError, LocalChanges, NotSupportedError
+from error_types import (
+    ImproperArgumentsError,
+    LocalChanges,
+    NothingStagedError,
+    NotSupportedError,
+)
 from link_helpers import (
     assert_crr_clean,
     build_nested_link_repos_at,
+    link_entry,
     make_parent_with_link,
     make_repo,
     make_repo_renumbering_folder,
+    remount,
 )
 from lore_parsers import parse_status_json
 from test_utils import has_staged_anchor, status_by_path
@@ -809,6 +816,83 @@ def test_link_reset_staged_update(new_lore_repo):
     assert main_repo.link_list() == pre_link_list, (
         "Registry must match pre-update exactly (branch + signature)"
     )
+
+
+@pytest.mark.smoke
+def test_link_branching_change_commits(new_lore_repo):
+    """A link added back at the same pin with branching disabled commits as a fixed link, which a
+    clone of the pushed revision holds; adding it back the same way again stages nothing to
+    commit."""
+    link_path = "linked/repo"
+    parent, link_repo = make_parent_with_link(new_lore_repo, link_path)
+
+    remount(parent, link_path, link_repo.get_id(), "/", None, disable_branching=True)
+    assert status_by_path(parent)[link_path]["flagStaged"]
+    parent.commit("Make the link fixed")
+    parent.push()
+
+    entry = link_entry(parent, link_path)
+    assert (entry["tracking"], entry["flags"]) == (False, 1)
+    assert link_entry(parent.clone(), link_path) == entry
+
+    remount(parent, link_path, link_repo.get_id(), "/", None, disable_branching=True)
+    with pytest.raises(NothingStagedError):
+        parent.commit("Nothing to commit")
+
+
+def link_branching(repo: Lore, link_path: str) -> tuple:
+    """The branch, tracking and flags of the link at `link_path`."""
+    entry = link_entry(repo, link_path)
+    return entry["branch"], entry["tracking"], entry["flags"]
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("undo", "staged_inside"), [("unstage", False), ("unstage", True), ("reset", False)]
+)
+def test_link_branching_change_undone(new_lore_repo, undo, staged_inside):
+    """Unstaging or resetting a staged branching change puts the committed branch and flags back,
+    also where a change inside the link is staged, leaving nothing staged, so the branch can be
+    switched."""
+    link_path = "linked/repo"
+    parent, link_repo = make_parent_with_link(new_lore_repo, link_path)
+    parent.branch_create("feature")
+    committed = link_branching(parent, link_path)
+
+    remount(parent, link_path, link_repo.get_id(), "/", None, disable_branching=True)
+    if staged_inside:
+        parent.write_files({f"{link_path}/linked.txt": "local\n"})
+        parent.stage(f"{link_path}/linked.txt", scan=True)
+    getattr(parent, undo)(link_path)
+
+    assert link_branching(parent, link_path) == committed
+    assert not any(entry["flagStaged"] for entry in status_by_path(parent).values())
+    parent.branch_switch("main")
+    assert parent.branch_info().name == "main"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("staged_inside", [False, True])
+def test_link_unstage_of_a_link_replaced_by_another_repository(
+    new_lore_repo, staged_inside
+):
+    """Unstaging a link replaced by one to another repository refuses before it changes the
+    link's files, and with a change staged inside the link unstages that change."""
+    link_path = "linked/repo"
+    parent, _ = make_parent_with_link(new_lore_repo, link_path)
+    other_repo = make_repo(new_lore_repo, {"other.txt": "other\n"})
+    remount(parent, link_path, other_repo.get_id(), "/", None)
+    if staged_inside:
+        parent.write_files({f"{link_path}/other.txt": "local\n"})
+        parent.stage(f"{link_path}/other.txt", scan=True)
+        parent.unstage(link_path)
+        assert not any(entry["flagStaged"] for entry in status_by_path(parent).values())
+        return
+
+    with pytest.raises(NotSupportedError):
+        parent.unstage(link_path)
+    assert link_entry(parent, link_path)["link"] == other_repo.get_id()
+    assert sorted(os.listdir(os.path.join(parent.path, link_path))) == ["other.txt"]
 
 
 @pytest.mark.smoke

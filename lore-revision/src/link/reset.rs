@@ -6,16 +6,21 @@ use lore_error_set::prelude::*;
 
 use super::LinkError;
 use crate::errors::LocalModifications;
+use crate::errors::NotSupported;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::link;
 use crate::link::LinkFlags;
 use crate::lore::Hash;
+use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::lore_warn;
 use crate::node::Node;
 use crate::node::NodeBlock;
+use crate::node::NodeID;
 use crate::node::ROOT_NODE;
+use crate::repository::RepositoryContext;
+use crate::state::LinkReference;
 use crate::state::NodeMapping;
 use crate::state::OwnFlags;
 use crate::state::State;
@@ -219,8 +224,9 @@ pub(crate) async fn reset_staged_remove_link(
     Ok(())
 }
 
-/// Puts a link whose pin or mount move was staged back to the pin and mount the current revision
-/// holds, on disk and in the registry.
+/// Puts a link whose pin, mount or registry row change was staged back to the pin, mount and row
+/// the current revision holds, on disk and in the registry. Refuses a link replaced by one to
+/// another repository before it changes anything.
 ///
 /// Realizes through the caller's `operation`, as [`reset_staged_remove_link`] does.
 pub(crate) async fn reset_staged_update_link(
@@ -238,6 +244,14 @@ pub(crate) async fn reset_staged_update_link(
         node: link_node_id,
     } = at;
     let link_id = current_link_node.linked_node().repository;
+    if staged_link_node.linked_node().repository != link_id {
+        return Err(NotSupported {
+            operation: format!(
+                "restoring the link at '{link_path}' replaced by a link to another repository"
+            ),
+        }
+        .into());
+    }
     let staged_pin = staged_link_node.address.hash;
     let current_pin = current_link_node.address.hash;
 
@@ -246,32 +260,58 @@ pub(crate) async fn reset_staged_update_link(
         .await
         .forward::<LinkError>("Failed to find link registry entry")?;
 
-    let linked_repository = repository.to_link_context(link_id).await;
-    link::realize_link_pin_change_in_operation(
-        operation,
-        repository.clone(),
-        linked_repository,
-        link::LinkPinRealizeTarget {
-            link_path,
-            old_signature: staged_pin,
-            new_signature: current_pin,
-            current_node: staged_link_node.child,
-            mount_source: link::LinkMountSource::Node(current_link_node.child),
-        },
-        overwrite_local,
-    )
-    .await?;
+    if staged_pin != current_pin || !staged_link_node.mounts_same_source(&current_link_node) {
+        link::realize_link_pin_change_in_operation(
+            operation,
+            repository.clone(),
+            repository.to_link_context(link_id).await,
+            link::LinkPinRealizeTarget {
+                link_path,
+                old_signature: staged_pin,
+                new_signature: current_pin,
+                current_node: staged_link_node.child,
+                mount_source: link::LinkMountSource::Node(current_link_node.child),
+            },
+            overwrite_local,
+        )
+        .await?;
+    }
 
     state_staged
-        .link_update(
-            repository,
-            link_id,
-            prev_ref.branch,
-            current_pin,
-            link_node_id,
-        )
+        .link_replace(repository, prev_ref)
         .await
         .forward::<LinkError>("Failed to update link registry entry")?;
 
     Ok(())
+}
+
+/// Puts the branch and flags of the current revision's registry row for the link `link_id` at
+/// `link_node_id` back on its staged row, and leaves the pin to the changes staged inside the link.
+pub(crate) async fn reset_staged_link_branching(
+    repository: Arc<RepositoryContext>,
+    state_staged: &State,
+    state_current: &State,
+    link_id: RepositoryId,
+    link_node_id: NodeID,
+) -> Result<(), LinkError> {
+    let (staged, current) = tokio::try_join!(
+        state_staged.link_find(repository.clone(), link_id, link_node_id),
+        state_current.link_find(repository.clone(), link_id, link_node_id),
+    )
+    .forward::<LinkError>("Failed to find the link's registry rows")?;
+    if staged.branch == current.branch && staged.flags == current.flags {
+        return Ok(());
+    }
+
+    state_staged
+        .link_replace(
+            repository,
+            LinkReference {
+                branch: current.branch,
+                flags: current.flags,
+                ..staged
+            },
+        )
+        .await
+        .forward::<LinkError>("Failed to restore the link's branch and flags")
 }

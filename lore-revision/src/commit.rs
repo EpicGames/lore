@@ -1824,7 +1824,12 @@ async fn commit_staged_revision(
             .await
             .forward::<CommitError>("Failed to read revision tree data")?
             .hash_root;
-        if !state_staged.is_merge_or_cherry_pick_or_revert() && root_staged == root_current {
+        if !state_staged.is_merge_or_cherry_pick_or_revert()
+            && root_staged == root_current
+            && !link::link_registries_differ(repository.clone(), &state_current, &state_staged)
+                .await
+                .forward::<CommitError>("Failed to compare the link registries")?
+        {
             if !globals.force() {
                 lore_debug!(
                     "Staged tree {} in revision {} is identical to current tree {} in revision {}",

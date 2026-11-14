@@ -12,6 +12,7 @@ from link_helpers import (
     DEFAULT_PARENT_FILE,
     build_nested_link_repos_at,
     folder_replaced_by_a_link,
+    link_entry,
     link_pin_at,
     link_replaced_by_its_folder,
     make_parent_with_link,
@@ -769,8 +770,7 @@ def _current_revision(repo: Lore) -> str:
 
 def _tracks(repo: Lore, link_path: str) -> bool:
     """Whether the link at `link_path` follows its parent's branch."""
-    entries = parse_jsonl(repo.link_list(json=True), "linkEntry")
-    return bool(next(e for e in entries if e["linkPath"] == link_path)["tracking"])
+    return bool(link_entry(repo, link_path)["tracking"])
 
 
 def _assert_link_follows_feature(repo: Lore, source: Lore):
