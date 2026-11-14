@@ -2648,6 +2648,12 @@ async fn diff_filesystem_missing_nodes(
             .binary_search_by(|child| child.name.cmp(&from_named_node.name))
             .is_ok();
         if ctx.intent.marks_dirty() && from_node.node.is_file() && !in_current {
+            // A merge conflict on a file deleted here and changed on the incoming side has no file
+            // on disk by design, and is not in the current revision either. It is not a reverted
+            // add: the conflict stays until it is resolved.
+            if from_node.node.is_staged_merge_unresolved() {
+                continue;
+            }
             lore_trace!(
                 "Queueing reverted-DirtyAdd node {} (no file at {}, not in current)",
                 from_named_node.node,
