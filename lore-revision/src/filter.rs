@@ -1989,6 +1989,13 @@ impl FilterStates {
 }
 
 impl Filter {
+    /// A filter whose view excludes every path.
+    pub fn excluding_all_from_view() -> Result<Self, FilterError> {
+        let mut filter = Self::default();
+        filter.view.add_exclusion("**")?;
+        Ok(filter)
+    }
+
     /// The same ignore rules with `view` in the view slot, and a fresh
     /// [`AncestorMemo`].
     ///

@@ -101,6 +101,36 @@ async fn link_work_past_the_limit_runs_the_limit_at_a_time() {
     assert_eq!(peak.load(Ordering::SeqCst), MAX_CONCURRENT_LINK_TASKS);
 }
 
+/// The first error starts no more link work and is returned once the work in flight finishes.
+#[tokio::test]
+async fn link_work_failing_finishes_the_work_in_flight_and_starts_no_more() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    let (started, finished) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let work = (0..MAX_CONCURRENT_LINK_TASKS * 2)
+        .map(|index| {
+            let (started, finished) = (&started, &finished);
+            async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                if index == 0 {
+                    return Err(index);
+                }
+                tokio::task::yield_now().await;
+                finished.fetch_add(1, Ordering::SeqCst);
+                Ok(index)
+            }
+        })
+        .collect();
+
+    assert_eq!(try_join_links(work).await, Err(0));
+    assert_eq!(started.load(Ordering::SeqCst), MAX_CONCURRENT_LINK_TASKS);
+    assert_eq!(
+        finished.load(Ordering::SeqCst),
+        MAX_CONCURRENT_LINK_TASKS - 1
+    );
+}
+
 /// The repository the merged link points at.
 fn merged() -> RepositoryId {
     RepositoryId::from([1; 16])
@@ -278,6 +308,148 @@ async fn a_merged_link_the_merge_removes_or_replaces_stands_nowhere() {
                     "a merged link on {branch:?} must stand nowhere in {staged:?}"
                 );
             }
+        })
+        .await;
+}
+
+/// A merge brings in each following link of the merged side at a path where neither the side it
+/// merges into nor the base links the same repository, grouped by repository.
+#[tokio::test]
+async fn a_merge_brings_in_the_following_links_only_the_merged_side_holds() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let other = RepositoryId::from([2; 16]);
+            let (target, _) = state_linking(
+                &repository,
+                &[
+                    ("libs/kept", merged(), tracking(), false),
+                    ("libs/replaced", merged(), tracking(), false),
+                ],
+            )
+            .await;
+            let (base, _) = state_linking(
+                &repository,
+                &[
+                    ("libs/kept", merged(), tracking(), false),
+                    ("libs/removed", merged(), tracking(), false),
+                ],
+            )
+            .await;
+            let (source, _) = state_linking(
+                &repository,
+                &[
+                    ("libs/kept", merged(), tracking(), false),
+                    ("libs/removed", merged(), tracking(), false),
+                    ("libs/replaced", other, tracking(), false),
+                    ("libs/pinned", merged(), branch_id(), false),
+                    ("libs/new", merged(), tracking(), false),
+                    ("vendor/new", merged(), tracking(), false),
+                ],
+            )
+            .await;
+            let libs = node_at(&repository, &source, "libs").await;
+            let vendored = add(
+                &source,
+                repository.clone(),
+                libs,
+                link_node("vendored", merged(), Hash::from_u64(0x11)),
+                "vendored",
+            )
+            .await;
+            source
+                .link_add(
+                    repository.clone(),
+                    merged(),
+                    tracking(),
+                    Hash::from_u64(0x11),
+                    vendored,
+                    LinkFlags::DisableAutoFollow,
+                )
+                .await
+                .expect("registering the link");
+
+            let mut incoming: Vec<(RepositoryId, Vec<String>)> =
+                incoming_following_links(&repository, &target, &base, &source)
+                    .await
+                    .expect("finding the incoming links")
+                    .into_iter()
+                    .map(|(link_id, mounts)| {
+                        let mut paths: Vec<String> =
+                            mounts.into_iter().map(|mount| mount.link_path).collect();
+                        paths.sort();
+                        (link_id, paths)
+                    })
+                    .collect();
+            incoming.sort();
+
+            let mut expected = vec![
+                (
+                    merged(),
+                    vec!["libs/new".to_string(), "vendor/new".to_string()],
+                ),
+                (other, vec!["libs/replaced".to_string()]),
+            ];
+            expected.sort();
+            assert_eq!(incoming, expected);
+        })
+        .await;
+}
+
+/// A merge keeps each repository the side it merges into links, at the pin it holds there, but at a
+/// path where the base links it and the merged side removed it.
+#[tokio::test]
+async fn a_merge_keeps_the_repositories_linked_but_where_the_merged_side_removes_them() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let (removed, added) = (RepositoryId::from([2; 16]), RepositoryId::from([3; 16]));
+            let (target, nodes) = state_linking(
+                &repository,
+                &[
+                    ("libs/kept", merged(), tracking(), false),
+                    ("libs/removed", removed, tracking(), false),
+                    ("libs/added", added, tracking(), false),
+                ],
+            )
+            .await;
+            target
+                .link_update(
+                    repository.clone(),
+                    merged(),
+                    tracking(),
+                    Hash::from_u64(0x22),
+                    nodes[0],
+                )
+                .await
+                .expect("repinning the kept link");
+            let (base, _) = state_linking(
+                &repository,
+                &[
+                    ("libs/kept", merged(), tracking(), false),
+                    ("libs/removed", removed, tracking(), false),
+                ],
+            )
+            .await;
+            let (source, _) =
+                state_linking(&repository, &[("libs/kept", merged(), tracking(), false)]).await;
+
+            let kept = repositories_the_merge_keeps(&repository, &target, &base, &source)
+                .await
+                .expect("finding the repositories the merge keeps");
+
+            assert_eq!(
+                kept,
+                [
+                    (merged(), Hash::from_u64(0x22)),
+                    (added, Hash::from_u64(0x11))
+                ]
+                .into()
+            );
         })
         .await;
 }

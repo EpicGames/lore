@@ -1214,6 +1214,27 @@ pub async fn load_remote_latest(
         })
 }
 
+/// The latest revision of `branch` on the remote where it holds the branch, even where the local
+/// history is ahead of it, and the local latest otherwise. Zero where neither holds the branch.
+/// The remote's refusal of the caller is returned rather than read as no branch.
+pub async fn load_latest_preferring_remote(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+) -> Result<Hash, BranchError> {
+    if let Some(remote) = absent_unless_refused::<_, _, BranchError>(
+        repository.remote().await,
+        "connecting to the remote",
+    )? && let Some(latest) = absent_unless_refused::<_, _, BranchError>(
+        load_remote_latest(remote, repository.id, branch).await,
+        "loading the remote branch latest",
+    )? {
+        return Ok(latest);
+    }
+    Ok(load_latest(repository.clone(), branch)
+        .await
+        .unwrap_or_default())
+}
+
 #[derive(PartialEq)]
 pub enum BranchLatestStatus {
     /// The latest revision is not guaranteed to be in sync with remote branch history.

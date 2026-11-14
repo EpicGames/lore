@@ -2594,9 +2594,11 @@ produces a new parent revision; the previous parent revision still pins the prev
 linked revision.
 
 Merging the parent carries its link changes as the parent's diff records them. A link the
-merged branch removes is removed, and its repository is not merged. A link the merged
-branch adds keeps the pin it was given. A link the merged branch moves is merged where it
-moves to.
+merged branch removes is removed, and its repository is not merged. The repository of an
+auto-following link the merged branch adds is merged into the linked branch the link lands
+on, and the link pins the result: the pin it was given names a revision of the merged
+branch's counterpart, which the target's need not hold. A link with an explicit branch keeps
+the pin it was given. A link the merged branch moves is merged where it moves to.
 
 #### 22.4 Link-scoped committing and single-link merging
 

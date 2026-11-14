@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
 use std::str::FromStr;
@@ -423,70 +424,145 @@ pub async fn create_branch(
 #[lore_macro::test_pub]
 const MAX_CONCURRENT_LINK_TASKS: usize = crate::revision::DEFAULT_HISTORY_WALK_CONCURRENCY;
 
-/// Awaits per-link work [`MAX_CONCURRENT_LINK_TASKS`] at a time, in order, stopping at the first
-/// error. A future starts no work until it is polled, so only those in flight do any.
+/// Awaits per-link work [`MAX_CONCURRENT_LINK_TASKS`] at a time, in order. After the first error
+/// no more work starts, and the error is returned once the work in flight settles, so none is
+/// dropped halfway, as a push would be. A future starts no work until it is polled.
 #[lore_macro::test_pub]
 pub(crate) async fn try_join_links<T, E>(
     work: Vec<impl Future<Output = Result<T, E>>>,
 ) -> Result<Vec<T>, E> {
     let mut in_flight = futures::stream::FuturesOrdered::new();
     let mut results = Vec::with_capacity(work.len());
-    for future in work {
-        if in_flight.len() == MAX_CONCURRENT_LINK_TASKS
-            && let Some(result) = in_flight.next().await
+    let mut first_error = None;
+    let mut work = work.into_iter();
+    loop {
+        while first_error.is_none()
+            && in_flight.len() < MAX_CONCURRENT_LINK_TASKS
+            && let Some(future) = work.next()
         {
-            results.push(result?);
+            in_flight.push_back(future);
         }
-        in_flight.push_back(future);
+        match in_flight.next().await {
+            Some(Ok(result)) => results.push(result),
+            Some(Err(error)) => {
+                first_error.get_or_insert(error);
+            }
+            None => break,
+        }
     }
-    while let Some(result) = in_flight.next().await {
-        results.push(result?);
-    }
-    Ok(results)
+    first_error.map_or(Ok(results), Err)
 }
 
-/// Gives each auto-following link a merge brought in a branch for the one it landed on.
+/// A following link a merge brings in: one the merged side holds to a repository the side it
+/// merges into does not link, at a path where the base of the merge does not link it.
+#[lore_macro::test_pub]
+#[derive(Clone)]
+pub(crate) struct IncomingLink {
+    /// The path the merged side holds the link at.
+    pub link_path: String,
+    /// The merged side's row of the link.
+    pub link_reference: LinkReference,
+}
+
+/// The following links a merge of `state_source` into `state_target`, from `state_base`, brings
+/// in, grouped by linked repository.
+#[lore_macro::test_pub]
+pub(crate) async fn incoming_following_links(
+    repository: &Arc<RepositoryContext>,
+    state_target: &Arc<State>,
+    state_base: &Arc<State>,
+    state_source: &Arc<State>,
+) -> Result<Vec<(RepositoryId, Vec<IncomingLink>)>, LinkError> {
+    let rows = state_source
+        .link_list(repository.clone())
+        .await
+        .forward::<LinkError>("Failed to list links")?;
+    let incoming = try_join_links(
+        rows.into_iter()
+            .filter(|row| row.branch.is_zero() && row.flags & LinkFlags::DisableAutoFollow == 0)
+            .map(async |link_reference| {
+                let link_path = state_source
+                    .node_path(repository.clone(), link_reference.local_node)
+                    .await
+                    .forward::<LinkError>("Failed resolving link node path")?;
+                let (target, base) = tokio::try_join!(
+                    link_node_to(
+                        state_target,
+                        repository,
+                        &link_path,
+                        link_reference.repository
+                    ),
+                    link_node_to(
+                        state_base,
+                        repository,
+                        &link_path,
+                        link_reference.repository
+                    ),
+                )?;
+                Ok::<_, LinkError>(
+                    (target.is_none() && base.is_none()).then_some(IncomingLink {
+                        link_path,
+                        link_reference,
+                    }),
+                )
+            })
+            .collect(),
+    )
+    .await?;
+    Ok(group_by_repository(
+        incoming.into_iter().flatten(),
+        |link| link.link_reference.repository,
+    ))
+}
+
+/// The repositories `state_target` links at a path a merge of `state_source` into it, from
+/// `state_base`, keeps them at, each with the pin `state_target` holds it at: each but those the
+/// base links there and the merged side removed.
+#[lore_macro::test_pub]
+pub(crate) async fn repositories_the_merge_keeps(
+    repository: &Arc<RepositoryContext>,
+    state_target: &Arc<State>,
+    state_base: &Arc<State>,
+    state_source: &Arc<State>,
+) -> Result<HashMap<RepositoryId, Hash>, LinkError> {
+    let rows = state_target
+        .link_list(repository.clone())
+        .await
+        .forward::<LinkError>("Failed to list links")?;
+    let kept = try_join_links(
+        rows.into_iter()
+            .map(async |row| {
+                let link_path = state_target
+                    .node_path(repository.clone(), row.local_node)
+                    .await
+                    .forward::<LinkError>("Failed resolving link node path")?;
+                let (base, source) = tokio::try_join!(
+                    link_node_to(state_base, repository, &link_path, row.repository),
+                    link_node_to(state_source, repository, &link_path, row.repository),
+                )?;
+                Ok::<_, LinkError>(
+                    (base.is_none() || source.is_some()).then_some((row.repository, row.signature)),
+                )
+            })
+            .collect(),
+    )
+    .await?;
+    Ok(kept.into_iter().flatten().collect())
+}
+
+/// Gives each repository in `incoming`, which holds no branch for the links a merge brought in to
+/// land on, that branch.
 ///
 /// `link add` and `branch create` make that branch when a link starts following a parent branch,
 /// and a merged-in link skips both, so without this its revision has no branch to be pushed to. It
 /// branches from where the link followed on the merged side, at the revision the link pins.
-pub async fn create_branches_for_merged_links(
+pub(crate) async fn create_branches_for_merged_links(
     repository: Arc<RepositoryContext>,
-    state_current: &Arc<State>,
-    state_staged: &State,
+    incoming: &[(RepositoryId, Vec<IncomingLink>)],
     current_branch: BranchId,
     merged_branch: BranchId,
 ) -> Result<(), LinkError> {
-    let staged_links = state_staged
-        .link_list(repository.clone())
-        .await
-        .forward::<LinkError>("Failed to list links")?;
-    let merged_in: Vec<(LinkReference, String)> = try_join_links(
-        staged_links
-            .into_iter()
-            .filter(|link| link.branch.is_zero())
-            .map(|link| {
-                let repository = repository.clone();
-                async move {
-                    let link_path = state_staged
-                        .node_path(repository.clone(), link.local_node)
-                        .await
-                        .forward::<LinkError>("Failed resolving link node path")?;
-                    let merged_in = link_node_at_path(state_current, repository, &link_path)
-                        .await?
-                        .is_none_or(|(_, node)| {
-                            RepositoryId::from(node.address.context) != link.repository
-                        });
-                    Ok::<_, LinkError>(merged_in.then_some((link, link_path)))
-                }
-            })
-            .collect(),
-    )
-    .await?
-    .into_iter()
-    .flatten()
-    .collect();
-    if merged_in.is_empty() {
+    if incoming.is_empty() {
         return Ok(());
     }
 
@@ -497,14 +573,13 @@ pub async fn create_branches_for_merged_links(
         branch::name(&branch_metadata).forward::<LinkError>("Failed getting branch metadata")?;
     let branch_category = branch::category(&branch_metadata).unwrap_or_default();
 
-    let links: Vec<LinkReference> = merged_in.iter().map(|(link, _)| *link).collect();
     // Every creation runs to completion, so a failure knows each branch the others made.
     let results = try_join_links(
-        auto_following_mounts(&links)
-            .into_iter()
+        incoming
+            .iter()
             .map(|(link_id, mounts)| {
-                let link = repository.to_link_context(link_id);
-                let leader = mounts[0];
+                let link = repository.to_link_context(*link_id);
+                let leader = mounts[0].link_reference;
                 async move {
                     let created = create_merged_link_branch(
                         link.await,
@@ -515,7 +590,7 @@ pub async fn create_branches_for_merged_links(
                         leader.signature,
                     )
                     .await;
-                    Ok::<_, LinkError>((link_id, mounts, created))
+                    Ok::<_, LinkError>((*link_id, mounts, created))
                 }
             })
             .collect(),
@@ -552,14 +627,9 @@ pub async fn create_branches_for_merged_links(
     }
 
     for (link_id, mounts, _, outcome) in created {
-        let paths = merged_in.iter().filter(|(link, _)| {
-            mounts
-                .iter()
-                .any(|mount| mount.local_node == link.local_node)
-        });
-        for (_, link_path) in paths {
+        for mount in mounts {
             report_branch_outcome(
-                link_path,
+                &mount.link_path,
                 link_id,
                 current_branch,
                 outcome.revision,
@@ -2577,6 +2647,19 @@ pub async fn verify_link_pins(
         verify_link_pin_diff(operation, link_context, pin.new_signature, diff, false).await?;
     }
     Ok(())
+}
+
+/// The link node at `link_path` where it links `link_repository`, or `None` where the state has
+/// no link to it there.
+pub(crate) async fn link_node_to(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    link_path: &str,
+    link_repository: RepositoryId,
+) -> Result<Option<(NodeID, Node)>, LinkError> {
+    Ok(link_node_at_path(state, repository.clone(), link_path)
+        .await?
+        .filter(|(_, node)| RepositoryId::from(node.address.context) == link_repository))
 }
 
 /// The link node at `link_path`, or `None` when the state has no link there.

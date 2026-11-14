@@ -29,7 +29,7 @@ from link_helpers import (
     remount,
 )
 from lore_parsers import parse_jsonl, parse_status_json
-from test_utils import unstaged_entries, working_tree_files
+from test_utils import registered_links, unstaged_entries, working_tree_files
 
 from lore import Lore
 
@@ -169,7 +169,8 @@ def test_link_add_merged_into_another_branch_pushes(new_lore_repo, merge_into):
 
 @pytest.mark.smoke
 def test_link_add_merged_with_ignore_links_leaves_linked_branches(new_lore_repo):
-    """`--ignore-links` creates no branch in a linked repository a merge brings in."""
+    """`--ignore-links` creates no branch in a linked repository a merge brings in, and warns
+    that the repository was left unmerged."""
     source_repo = make_repo(new_lore_repo, {"link-file.txt": "link source content\n"})
     repo = make_repo(new_lore_repo, {"main-file.txt": "initial content\n"})
 
@@ -181,11 +182,267 @@ def test_link_add_merged_with_ignore_links_leaves_linked_branches(new_lore_repo)
     repo.push()
 
     repo.branch_switch("feature-branch")
-    repo.branch_merge_start("main", message="Merge main", ignore_links=True)
+    output = repo.branch_merge_start("main", message="Merge main", ignore_links=True)
 
     branches = sorted(entry["name"] for entry in remote_branch_entries(source_repo))
     assert branches == ["main"], (
         f"The linked repository should still hold only 'main'.\nGot: {branches}"
+    )
+    _assert_warns_once(output)
+
+
+@pytest.mark.smoke
+def test_link_add_merged_into_with_ignore_links_leaves_its_repository(new_lore_repo):
+    """`merge into --ignore-links` leaves the repository of a link it brings in unmerged, and
+    warns of it."""
+    repo, source_repo = _link_added_on_feature_branch(new_lore_repo, "linked/repo")
+    repo.write_commit_push("Edit inside the link", {"linked/repo/link-file.txt": "edit\n"})
+    linked_main = source_repo.branch_info("main").remote_latest
+
+    output = repo.branch_merge_into("main", message="Merge", ignore_links=True)
+
+    assert source_repo.branch_info("main").remote_latest == linked_main
+    _assert_warns_once(output)
+
+
+def _assert_warns_once(output: str):
+    warnings = [line for line in output.splitlines() if line.startswith("[Warn]")]
+    assert len(warnings) == 1, f"Expected one warning for the link.\nGot: {output}"
+
+
+def _link_added_on_branch_and_main_moved(
+    new_lore_repo, link_path: str, feature_edit: str | None, linked_main_files: dict
+) -> tuple[Lore, Lore]:
+    """`feature-branch` adds a following link and, given `feature_edit`, commits it to
+    `link-file.txt` through the mount. `linked_main_files` are committed to the linked
+    repository's `main` and a change to the parent's, which is left checked out."""
+    repo, source_repo = _link_added_on_feature_branch(new_lore_repo, link_path)
+    if feature_edit:
+        repo.write_commit_push(
+            "Edit inside the link", {f"{link_path}/link-file.txt": feature_edit}
+        )
+    if linked_main_files:
+        source_repo.write_commit_push("Linked main moves on", linked_main_files)
+    repo.branch_switch("main")
+    repo.write_commit_push("Change on main", {"root.txt": "root\n"})
+    return repo, source_repo
+
+
+def _merge_main_into_feature(repo: Lore):
+    repo.branch_switch("feature-branch")
+    repo.branch_merge_start("main", message="Merge main")
+    repo.push()
+
+
+def _mounted_files(repo: Lore, link_path: str) -> dict[str, str]:
+    mount = os.path.join(repo.path, link_path)
+    files = {}
+    for name in os.listdir(mount):
+        with open(os.path.join(mount, name)) as f:
+            files[name] = f.read()
+    return files
+
+
+def _assert_conflict_marked(repo: Lore, path: str):
+    with repo.open_file(path) as f:
+        assert "<<<<<<<" in f.read(), f"{path} should hold conflict markers"
+
+
+def _sorted_by_name(entries: list[dict]) -> list[dict]:
+    return sorted(entries, key=lambda entry: entry["name"])
+
+
+def _link_pins(repo: Lore, source_id: str) -> list[str]:
+    return re.findall(
+        rf"Link\s+{source_id}.*?Revision:\s*(\w+)", repo.link_list(), re.DOTALL
+    )
+
+
+def _assert_pinned_at_linked_main(repo: Lore, source_repo: Lore):
+    assert link_pin(repo, source_repo.get_id()) == (
+        source_repo.branch_info("main").remote_latest
+    ), "The link should pin the latest of the linked repository's main"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "merge_into, feature_edit, linked_main_files",
+    [
+        (False, "edited on feature\n", {}),
+        (False, None, {"main-only.txt": "main\n"}),
+        (True, "edited on feature\n", {"main-only.txt": "main\n"}),
+    ],
+    ids=["edited", "linked main moved", "merge into"],
+)
+def test_link_added_on_branch_merges_its_repository(
+    new_lore_repo, merge_into, feature_edit, linked_main_files
+):
+    """A following link a merged branch adds is merged in its repository's own branch, which the
+    link lands pinned at, so a commit inside the link afterwards pushes."""
+    link_path = "linked/repo"
+    repo, source_repo = _link_added_on_branch_and_main_moved(
+        new_lore_repo, link_path, feature_edit, {} if merge_into else linked_main_files
+    )
+
+    if merge_into:
+        _merge_main_into_feature(repo)
+        source_repo.write_commit_push("Linked main moves on", linked_main_files)
+        repo.branch_merge_into("main", message="Merge feature-branch into main")
+        repo.branch_switch("main")
+    else:
+        repo.branch_merge_start("feature-branch", message="Merge feature-branch")
+        repo.push()
+
+    _assert_pinned_at_linked_main(repo, source_repo)
+    assert _mounted_files(repo, link_path) == {
+        "link-file.txt": feature_edit or "link source content\n",
+        **linked_main_files,
+    }
+
+    repo.write_commit_push(
+        "Edit inside the link on main", {f"{link_path}/link-file.txt": "on main\n"}
+    )
+    _assert_pinned_at_linked_main(repo, source_repo)
+
+
+@pytest.mark.smoke
+def test_link_added_on_branch_to_a_repository_linked_already_shares_its_pin(new_lore_repo):
+    """A following link a merged branch adds to a repository the target links already lands at
+    the pin of the target's link, which one repository's links share, however the repository's
+    own branch moved on."""
+    repo, source_repo = make_parent_with_link(new_lore_repo, "linked/a")
+    pin = link_pin(repo, source_repo.get_id())
+    repo.branch_create("feature-branch")
+    repo.link_add("linked/b", source_repo.get_id(), "/")
+    repo.commit("Add a second link on feature branch")
+    repo.push()
+    source_repo.write_commit_push("Linked main moves on", {"main-only.txt": "main\n"})
+    repo.branch_switch("main")
+    repo.write_commit_push("Change on main", {"root.txt": "root\n"})
+
+    repo.branch_merge_start("feature-branch", message="Merge feature-branch")
+    repo.push()
+
+    assert _link_pins(repo.clone(), source_repo.get_id()) == [pin, pin]
+    assert _mounted_files(repo, "linked/b") == {"linked.txt": "linked content\n"}
+
+
+@pytest.mark.smoke
+def test_link_added_on_branch_with_conflicting_edits_merges_once_resolved(
+    new_lore_repo,
+):
+    """Edits a merged branch makes inside a link it adds stop the merge where they conflict with
+    the linked repository's own branch. Once resolved, starting the merge again is refused, and
+    the merge pushes the linked repository's merge with it."""
+    link_path = "linked/repo"
+    repo, source_repo = _link_added_on_branch_and_main_moved(
+        new_lore_repo,
+        link_path,
+        "edited on feature\n",
+        {"link-file.txt": "edited on linked main\n"},
+    )
+
+    repo.branch_merge_start("feature-branch", message="Merge feature-branch")
+    conflicted = f"{link_path}/link-file.txt"
+    _assert_conflict_marked(repo, conflicted)
+
+    repo.write_files({conflicted: "resolved\n"})
+    repo.branch_merge_resolve(conflicted)
+    with pytest.raises(NotSupportedError):
+        repo.branch_merge_start("feature-branch", message="Merge feature-branch")
+    repo.commit("Merge feature-branch")
+    repo.push()
+
+    _assert_pinned_at_linked_main(repo, source_repo)
+    assert _mounted_files(repo.clone(), link_path) == {"link-file.txt": "resolved\n"}
+
+
+@pytest.mark.smoke
+def test_link_added_on_branch_with_conflicting_edits_refuses_merge_into(new_lore_repo):
+    """`merge into` refuses a merge whose linked repository conflicts, before pushing either."""
+    link_path = "linked/repo"
+    repo, source_repo = _link_added_on_branch_and_main_moved(
+        new_lore_repo, link_path, "edited on feature\n", {}
+    )
+    _merge_main_into_feature(repo)
+    source_repo.write_commit_push(
+        "Linked main moves on", {"link-file.txt": "edited on linked main\n"}
+    )
+    parent_main = repo.branch_info("main").remote_latest
+    linked_main = source_repo.branch_info("main").remote_latest
+
+    with pytest.raises(NotSupportedError):
+        repo.branch_merge_into("main", message="Merge feature-branch into main")
+
+    assert repo.branch_info("main").remote_latest == parent_main
+    assert source_repo.branch_info("main").remote_latest == linked_main
+
+
+@pytest.mark.smoke
+def test_link_added_on_branch_merge_dry_run_writes_nothing(new_lore_repo):
+    """A dry run of a merge bringing in a following link leaves the working tree, the staged
+    state and the linked repository as they were."""
+    link_path = "linked/repo"
+    repo, source_repo = _link_added_on_branch_and_main_moved(
+        new_lore_repo, link_path, "edited on feature\n", {"main-only.txt": "main\n"}
+    )
+    linked_branches = _sorted_by_name(remote_branch_entries(source_repo))
+    linked_main = source_repo.branch_info("main").remote_latest
+
+    repo.branch_merge_start(
+        "feature-branch", message="Merge feature-branch", dry_run=True
+    )
+
+    assert not repo.path_exists(link_path)
+    assert parse_status_json(repo.status(json=True)) == []
+    assert _sorted_by_name(remote_branch_entries(source_repo)) == linked_branches
+    assert source_repo.branch_info("main").remote_latest == linked_main
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("ignore_links", [False, True])
+def test_link_added_on_branch_merge_abort_restores_the_working_tree(
+    new_lore_repo, ignore_links
+):
+    """Aborting a merge stopped on a conflict inside a link the merged branch adds removes the
+    link with the merge."""
+    link_path = "linked/repo"
+    repo, source_repo = _link_added_on_branch_and_main_moved(
+        new_lore_repo,
+        link_path,
+        "edited on feature\n",
+        {"link-file.txt": "edited on linked main\n"},
+    )
+    repo.branch_merge_start("feature-branch", message="Merge feature-branch")
+    _assert_conflict_marked(repo, f"{link_path}/link-file.txt")
+
+    repo.branch_merge_abort(ignore_links=ignore_links)
+
+    assert registered_links(repo) == {}
+    assert not repo.path_exists(link_path)
+    assert parse_status_json(repo.status(json=True)) == []
+
+
+@pytest.mark.smoke
+def test_link_added_on_branch_merge_abort_of_the_link_lands_it_on_linked_main(
+    new_lore_repo,
+):
+    """Aborting only the merge of a link the merged branch adds leaves the link at the latest of
+    the linked repository's own branch, which the merge was staged on."""
+    link_path = "linked/repo"
+    repo, source_repo = _link_added_on_branch_and_main_moved(
+        new_lore_repo,
+        link_path,
+        "edited on feature\n",
+        {"link-file.txt": "edited on linked main\n"},
+    )
+    repo.branch_merge_start("feature-branch", message="Merge feature-branch")
+
+    repo.branch_merge_abort(link=link_path)
+
+    assert _mounted_files(repo, link_path) == {"link-file.txt": "edited on linked main\n"}
+    assert link_pin(repo, source_repo.get_id()) == (
+        source_repo.branch_info("main").remote_latest
     )
 
 
@@ -1239,9 +1496,13 @@ def test_abort_restores_a_link_holding_a_nested_link(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_abort_restores_a_conflict_inside_a_link_mounted_from_a_folder(new_lore_repo):
-    """Aborting a merge that conflicts inside a link mounted from a folder
-    restores the conflicted file from the folder and the link's pin."""
+@pytest.mark.parametrize("link_only", [False, True], ids=["merge", "link"])
+def test_abort_restores_a_conflict_inside_a_link_mounted_from_a_folder(
+    new_lore_repo, link_only
+):
+    """Aborting a merge, or only its link's merge, that conflicts inside a link mounted from a
+    folder restores the conflicted file from the folder and the link's pin, and leaves no copy
+    of either side."""
     link_path = "linked/repo"
     parent, source = make_parent_with_link(
         new_lore_repo,
@@ -1262,11 +1523,12 @@ def test_abort_restores_a_conflict_inside_a_link_mounted_from_a_folder(new_lore_
         "the merge must conflict on the file both branches changed inside the link"
     )
 
-    parent.branch_merge_abort()
+    parent.branch_merge_abort(link=link_path if link_only else None)
 
     assert link_pin(parent, source.get_id()) == pin_before, (
         "aborting the merge must restore the link's pin"
     )
+    assert sorted(os.listdir(os.path.join(parent.path, link_path))) == ["data.txt"]
     with parent.open_file(conflicted, "r") as input_file:
         assert input_file.read() == "mine\n", (
             "aborting the merge must restore the conflicted file"

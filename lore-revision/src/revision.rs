@@ -228,11 +228,13 @@ pub(crate) async fn reported_metadata(
 /// Were the blanket exclusion refused, the filter would be empty, and target's
 /// walk would run unscoped and without the repository's view and ignore rules.
 fn filter_from_source_changes(source_changes: &[NodeChange]) -> Filter {
-    let mut filter = Filter::default();
-    if let Err(err) = filter.view.add_exclusion("**") {
-        lore_warn!("Failed to add target filter global exclusion: {err}");
-        return filter;
-    }
+    let mut filter = match Filter::excluding_all_from_view() {
+        Ok(filter) => filter,
+        Err(err) => {
+            lore_warn!("Failed to add target filter global exclusion: {err}");
+            return Filter::default();
+        }
+    };
     for change in source_changes {
         filter.view.add_path_inclusion(change.path());
         if let Some(from_path) = change.move_source() {

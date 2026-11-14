@@ -1886,10 +1886,10 @@ def _merge_a_branch_removing_a_link(
     pinned: bool,
     conflict: str | None = None,
     link_messages: dict[str, str] | None = None,
-) -> tuple[Lore, Lore, str | None]:
-    """Returns (urc, link_repo, added_pin) once main merges `feature-branch`, which removes the
-    link at `libs/old` while each branch changes the linked repository through it, and links the
-    repository again at `libs/new` where `added`, at the pin `added_pin`.
+) -> tuple[Lore, Lore]:
+    """Returns (urc, link_repo) once main merges `feature-branch`, which removes the link at
+    `libs/old` while each branch changes the linked repository through it, and links the
+    repository again at `libs/new` where `added`.
 
     `pinned` links the first revision of the linked repository at both paths rather than its
     latest. `conflict` names the file both branches change apart from that: `main-file.txt`, or
@@ -1915,10 +1915,8 @@ def _merge_a_branch_removing_a_link(
     urc.branch_create("feature-branch")
     urc.write_commit_push("Feature changes the link", changes("feature"))
     urc.link_remove("libs/old")
-    added_pin = None
     if added:
         urc.link_add("libs/new", link_repo.get_id(), "/", pin=first if pinned else None)
-        added_pin = link_pin(urc, link_repo.get_id())
     urc.commit("Feature removes the link")
     urc.push()
 
@@ -1928,7 +1926,7 @@ def _merge_a_branch_removing_a_link(
     urc.branch_merge(
         "feature-branch", message="Merge feature-branch", link_messages=link_messages
     )
-    return urc, link_repo, added_pin
+    return urc, link_repo
 
 
 @pytest.mark.smoke
@@ -1940,21 +1938,13 @@ def test_link_merge_all_of_a_branch_removing_a_link_with_incoming_changes(
     new_lore_repo, pinned, added
 ):
     """A default merge of a branch that removes a link whose repository has incoming changes
-    carries the removal. A link the branch adds to the same repository elsewhere keeps the pin
-    the branch gives it, which holds none of main's changes to the repository."""
-    urc, link_repo, added_pin = _merge_a_branch_removing_a_link(
-        new_lore_repo, added, pinned
-    )
+    carries the removal. A link the branch adds to the same repository elsewhere is merged in
+    the repository, so it holds main's changes to the repository as well."""
+    urc, link_repo = _merge_a_branch_removing_a_link(new_lore_repo, added, pinned)
     urc.push()
 
     assert registered_links(urc) == ({"libs/new": link_repo.get_id()} if added else {})
-    if added:
-        assert link_pin(urc, link_repo.get_id()) == added_pin
-    exposed = (
-        ["linked.txt", "shared.txt"]
-        if pinned
-        else ["feature.txt", "linked.txt", "shared.txt"]
-    )
+    exposed = ["feature.txt", "linked.txt", "main.txt", "shared.txt"]
     for repo in [urc, urc.clone()]:
         assert not repo.path_exists("libs/old"), "the merge should remove the old mount"
         if added:
@@ -1969,7 +1959,7 @@ def test_link_merge_all_of_a_branch_removing_a_link_leaves_out_its_message(
 ):
     """A per-link message naming a link the merged branch removes names no link of the merge's
     result, so the merge leaves it out and commits."""
-    urc, _, _ = _merge_a_branch_removing_a_link(
+    urc, _ = _merge_a_branch_removing_a_link(
         new_lore_repo,
         added=False,
         pinned=False,
@@ -1988,7 +1978,7 @@ def test_link_merge_all_of_a_branch_removing_a_link_leaves_out_its_conflicts(
 ):
     """A link the merged branch removes is not merged in its own right, so a conflict between
     the branches' changes to its repository does not stop the merge."""
-    urc, _, _ = _merge_a_branch_removing_a_link(
+    urc, _ = _merge_a_branch_removing_a_link(
         new_lore_repo, added=False, pinned=False, conflict="shared.txt"
     )
 
@@ -2007,7 +1997,7 @@ def test_link_merge_all_of_a_branch_removing_a_link_leaves_out_its_conflicts(
 )
 def test_link_merge_abort_all_of_a_branch_removing_a_link(new_lore_repo, pinned, added):
     """Aborting a merge that removes a link puts the link back where it was."""
-    urc, link_repo, _ = _merge_a_branch_removing_a_link(
+    urc, link_repo = _merge_a_branch_removing_a_link(
         new_lore_repo, added, pinned, conflict="main-file.txt"
     )
 
@@ -2178,7 +2168,7 @@ LINK_MOVES = {
     "directory-elsewhere": (
         ("libs", "vendor"),
         "vendor/old",
-        ["feature.txt", "linked.txt"],
+        ["feature.txt", "linked.txt", "main.txt"],
     ),
 }
 
@@ -2189,8 +2179,8 @@ LINK_MOVES = {
 def test_link_merge_all_of_a_branch_moving_a_link(new_lore_repo, pinned, how):
     """A link the merged branch renames in case, or carries along with a directory renamed in
     case, is merged in its own right where it moves to. The diff holds a directory moved elsewhere
-    as a delete and an add, so the merge carries the removal of the link inside it, and the link
-    the branch adds there keeps its pin."""
+    as a delete and an add, so the merge carries the removal of the link inside it, and merges
+    the repository of the link the branch adds there."""
     moved, destination, exposed = LINK_MOVES[how]
     urc, link_repo = _merge_a_branch_moving_a_link(new_lore_repo, pinned, moved)
     urc.push()
