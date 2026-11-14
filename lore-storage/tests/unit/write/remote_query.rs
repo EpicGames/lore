@@ -79,6 +79,63 @@ async fn peer_holding(partition: Partition, content: &[u8]) -> Arc<StubPeer> {
     peer
 }
 
+/// A write beside a copy source, and what it wrote into.
+struct BesideCopySource {
+    written: Written,
+    peer: Arc<StubPeer>,
+    store: Arc<dyn ImmutableStore>,
+    address: Address,
+    _dir: TempDir,
+}
+
+/// Writes content under [`context`] in `partition` of a store that holds it durably under another
+/// context, as a copy source, through a peer that holds the write's address and answers copy
+/// requests as [`StubPeer::with_copy_answers`] does with `slow_downs` and `refusal`.
+async fn write_beside_a_copy_source(
+    partition: Partition,
+    slow_downs: usize,
+    refusal: Option<ProtocolError>,
+) -> BesideCopySource {
+    let content = pseudo_random_content(48 * 1024);
+    let (dir, store) = make_test_store().await;
+    let uploader = Arc::new(StubPeer::default());
+    let source = write_content(
+        store.clone(),
+        partition,
+        Context::from([0x5B; 16]),
+        Bytes::copy_from_slice(&content),
+        WriteOptions::default().with_remote_write(),
+        Some(Arc::new(uploader.session(partition))),
+        WriteContext::none(),
+        None,
+    )
+    .await
+    .expect("store the association to copy from");
+    assert!(source.stored_durable, "the copy source is durable");
+    let held = Fragment {
+        flags: FragmentFlags::PayloadCompressedLZ4.bits(),
+        size_payload: 1000,
+        size_content: content.len() as u64,
+    };
+    let address = Address {
+        hash: source.address.hash,
+        context: context(),
+    };
+    let peer = Arc::new(
+        StubPeer::default()
+            .with_held(vec![(address, held)])
+            .with_copy_answers(slow_downs, refusal),
+    );
+    let written = write(store.clone(), &peer, partition, &content, querying()).await;
+    BesideCopySource {
+        written,
+        peer,
+        store,
+        address,
+        _dir: dir,
+    }
+}
+
 /// A fragment the remote holds is recorded as the remote's fragment, stored durable and without a
 /// payload, and none is loaded, compressed or sent.
 #[tokio::test]
@@ -138,8 +195,8 @@ async fn a_fragment_the_remote_holds_is_recorded_durable_and_not_sent() {
     assert_eq!(written.counts.local_metadata_writes, 1);
 }
 
-/// A fragment the remote describes as other content than the write's, by its size or the kind of
-/// its payload, or with a header no local store takes, is no hit, and the write uploads.
+/// A fragment the remote describes as other content than the write's, by its size, or with a header
+/// no local store takes, is no hit, and the write uploads.
 #[tokio::test]
 async fn a_fragment_the_remote_misdescribes_is_uploaded() {
     let content = pseudo_random_content(48 * 1024);
@@ -153,11 +210,6 @@ async fn a_fragment_the_remote_misdescribes_is_uploaded() {
             flags: FragmentFlags::PayloadCompressedLZ4.bits(),
             size_payload: 1000,
             size_content: size + 1,
-        },
-        Fragment {
-            flags: FragmentFlags::PayloadFragmented.bits(),
-            size_payload: 48,
-            size_content: size,
         },
         Fragment {
             flags: 0,
@@ -177,6 +229,51 @@ async fn a_fragment_the_remote_misdescribes_is_uploaded() {
         assert!(written.result.stored_durable, "{held:?}");
         assert_eq!(written.counts.remote_query_hits, 0, "{held:?}");
     }
+}
+
+/// A fragment the remote holds as another kind of payload than the write's, a fragment list for
+/// content the write stores whole, is no hit though a local store takes its header, and the write
+/// uploads and records its own fragment.
+#[tokio::test]
+async fn a_fragment_the_remote_holds_as_another_kind_of_payload_is_uploaded() {
+    let partition = Partition::from([0x5D; 16]);
+    let content = pseudo_random_content(48 * 1024);
+    let address = Address {
+        hash: lore_storage::hash::hash_slice(&content),
+        context: context(),
+    };
+    let held = Fragment {
+        flags: FragmentFlags::PayloadFragmented.bits(),
+        size_payload: size_of::<FragmentReference>() as u32,
+        size_content: content.len() as u64,
+    };
+    let durable = Fragment {
+        flags: held.flags | FragmentFlags::PayloadStoredDurable.bits(),
+        ..held
+    };
+    assert!(
+        lore_storage::immutable_store::put_is_valid(&durable, None),
+        "a local store takes the header"
+    );
+    let peer = Arc::new(StubPeer::default().with_held(vec![(address, held)]));
+    let (_dir, store) = make_test_store().await;
+
+    let written = write(store.clone(), &peer, partition, &content, querying()).await;
+
+    assert_eq!(written.metadata_requests, 1);
+    assert_eq!(written.puts, 1, "the write uploads");
+    assert!(written.result.stored_durable);
+    assert_eq!(written.counts.remote_query_hits, 0);
+    let recorded = store
+        .get_metadata(partition, address)
+        .await
+        .expect("read the recorded entry")
+        .fragment;
+    assert_eq!(
+        recorded.flags & FragmentFlags::PayloadFragmented.bits(),
+        0,
+        "the entry records the write's own fragment"
+    );
 }
 
 /// Content the remote does not hold is uploaded after the query.
@@ -204,15 +301,10 @@ async fn content_the_remote_lacks_is_uploaded() {
     assert_eq!(written.counts.remote_put_writes, 1);
 }
 
-/// A query that fails is no answer, and the write uploads as it would without asking.
-#[tokio::test]
-async fn a_failed_query_falls_through_to_the_upload() {
-    let partition = Partition::from([0x53; 16]);
-    let peer = Arc::new(
-        StubPeer::default().with_metadata_failure(ProtocolError::internal(
-            "the peer fails every metadata request",
-        )),
-    );
+/// Writes content in `partition` through a peer that answers every metadata request with `failure`,
+/// and checks that the write asks once and uploads as it would without asking.
+async fn assert_a_failed_query_falls_through(partition: Partition, failure: ProtocolError) {
+    let peer = Arc::new(StubPeer::default().with_metadata_failure(failure));
     let (_dir, store) = make_test_store().await;
 
     let written = write(
@@ -230,6 +322,27 @@ async fn a_failed_query_falls_through_to_the_upload() {
     assert_eq!(written.counts.remote_queries, 1);
     assert_eq!(written.counts.remote_query_hits, 0);
     assert_eq!(written.counts.remote_put_writes, 1);
+}
+
+/// A query that fails is no answer, and the write uploads as it would without asking.
+#[tokio::test]
+async fn a_failed_query_falls_through_to_the_upload() {
+    assert_a_failed_query_falls_through(
+        Partition::from([0x53; 16]),
+        ProtocolError::internal("the peer fails every metadata request"),
+    )
+    .await;
+}
+
+/// A query the remote answers with `SlowDown` is not asked again and is no answer, and the write
+/// uploads as it would without asking.
+#[tokio::test]
+async fn a_throttled_query_falls_through_to_the_upload() {
+    assert_a_failed_query_falls_through(
+        Partition::from([0x63; 16]),
+        ProtocolError::from(lore_base::error::SlowDown),
+    )
+    .await;
 }
 
 /// Without the option the remote is asked nothing, and content it holds is uploaded again.
@@ -434,41 +547,15 @@ async fn a_resolved_write_of_content_the_remote_holds_sends_none() {
 /// whether it holds the address, and sends none it holds.
 #[tokio::test]
 async fn a_refused_copy_is_followed_by_the_query() {
-    let partition = Partition::from([0x5A; 16]);
-    let content = pseudo_random_content(48 * 1024);
-    let (_dir, store) = make_test_store().await;
-    let uploader = Arc::new(StubPeer::default());
-    let source = write_content(
-        store.clone(),
-        partition,
-        Context::from([0x5B; 16]),
-        Bytes::copy_from_slice(&content),
-        WriteOptions::default().with_remote_write(),
-        Some(Arc::new(uploader.session(partition))),
-        WriteContext::none(),
-        None,
+    let beside = write_beside_a_copy_source(
+        Partition::from([0x5A; 16]),
+        0,
+        Some(ProtocolError::from(lore_base::error::NotFound)),
     )
-    .await
-    .expect("store the association to copy from");
-    assert!(source.stored_durable, "the copy source is durable");
-    let held = Fragment {
-        flags: FragmentFlags::PayloadCompressedLZ4.bits(),
-        size_payload: 1000,
-        size_content: content.len() as u64,
-    };
-    let address = Address {
-        hash: source.address.hash,
-        context: context(),
-    };
-    let peer = Arc::new(
-        StubPeer::default()
-            .with_held(vec![(address, held)])
-            .with_copy_answers(0, Some(ProtocolError::from(lore_base::error::NotFound))),
-    );
+    .await;
+    let written = &beside.written;
 
-    let written = write(store, &peer, partition, &content, querying()).await;
-
-    assert_eq!(peer.copies(), 1, "the copy was asked for");
+    assert_eq!(beside.peer.copies(), 1, "the copy was asked for");
     assert_eq!(
         written.metadata_requests, 1,
         "the refused copy is followed by the query"
@@ -477,6 +564,35 @@ async fn a_refused_copy_is_followed_by_the_query() {
     assert!(written.result.stored_durable);
     assert_eq!(written.counts.remote_copy_writes, 0);
     assert_eq!(written.counts.remote_query_hits, 1);
+}
+
+/// Where the remote throttles the copy from an association the local store knows through every
+/// retry, the write does not ask whether it holds the address, though it does, uploads nothing,
+/// and keeps the payload locally, not durable, for a later push.
+#[tokio::test(start_paused = true)]
+async fn a_throttled_copy_is_followed_by_no_query() {
+    let partition = Partition::from([0x5F; 16]);
+    let beside = write_beside_a_copy_source(partition, usize::MAX, None).await;
+    let written = &beside.written;
+
+    assert_eq!(
+        beside.peer.copies(),
+        lore_storage::store_retry().limit() + 1
+    );
+    assert_eq!(
+        written.metadata_requests, 0,
+        "the throttled copy is followed by no query"
+    );
+    assert_eq!(written.puts, 0);
+    assert!(!written.result.stored_durable);
+    assert!(written.result.stored_local);
+    assert_eq!(written.counts.remote_queries, 0);
+    let recorded = query_one(&beside.store, partition, beside.address)
+        .await
+        .expect("query the entry");
+    assert_eq!(recorded.match_made, StoreMatch::MatchFull);
+    assert!(recorded.stored_local);
+    assert!(!recorded.stored_durable);
 }
 
 /// A fragment the remote holds, over a local entry of the address that holds a payload but is not

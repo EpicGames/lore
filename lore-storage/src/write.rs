@@ -1435,6 +1435,12 @@ fn leader_body(
 ///
 /// Asks for the exact address. A peer serves its own read scope, which for a server is the exact
 /// association.
+///
+/// Asks [`StorageSession::get_metadata`] directly. [`crate::read::fetch_metadata`] maps each miss
+/// into a [`StorageError`], an allocation per fragment the peer lacks on the write's hot path, and,
+/// unless `no_local_write` is set, records the answer before the write checks it. The write records
+/// a hit only after the check, through its terminal write, which fails the write where the local
+/// store refuses the entry.
 async fn remote_fragment(
     session: &StorageSession,
     address: &Address,
