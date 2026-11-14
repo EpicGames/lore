@@ -15,6 +15,7 @@ use crate::lore::BranchId;
 use crate::lore::Context;
 use crate::lore_debug;
 use crate::lore_info;
+use crate::repository::BranchSwitchOptions;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::state::State;
@@ -97,7 +98,8 @@ impl EventError for CreateError {
 /// Creates the branch `branch` off the instance's current branch and makes it current. Where
 /// [`branch::create_at`] fails with [`BranchAlreadyExists`], so does the create, unless `force`
 /// replaces the branch. Its refusals and [`InvalidArguments`] are forwarded, and its other failures
-/// are reported as `Internal`; the create a forced replace retries forwards every failure.
+/// are reported as `Internal`; the create a forced replace retries forwards every failure. A
+/// restored branch is switched to, at the revision it left off at.
 pub async fn create(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -262,9 +264,24 @@ pub async fn create(
     )
     .await?;
 
-    // Linked branches can move the new branch past the current revision, and the working copy
-    // stands on the branch's head.
+    // Linked branches can move the new branch past the current revision.
     let (head, staged) = match created {
+        Some(created) if created.restored && !dry_run => {
+            // A restore is rare, so the switch is boxed rather than held by every create.
+            return Box::pin(crate::repository::branch_switch(
+                repository.clone(),
+                token,
+                branch.clone(),
+                BranchSwitchOptions::default(),
+            ))
+            .await
+            .map(|_| ())
+            .forward_any_with::<CreateError, _>(|| {
+                format!(
+                    "switching to the restored branch, which `lore branch switch {branch}` retries"
+                )
+            });
+        }
         Some(created) if !created.head.is_zero() => (created.head, created.staged),
         _ => (current_revision, None),
     };

@@ -2593,6 +2593,21 @@ Updating the link to a different revision is an explicit `link update` operation
 produces a new parent revision; the previous parent revision still pins the previous
 linked revision.
 
+A branch create also reaches nested links, so the repositories those link to get the
+branch too, up to the link depth limit of 8. It follows three rules:
+
+- *One branch per repository.* If several links reach the same repository at different
+  pins, the branch starts at the newest pin. That needs the pins to lie on one line of
+  history. If they diverged there is no newest pin, so the create is refused, even in a
+  dry run, and the user is asked to pin them on one line first.
+- *Links move to the new branch.* A link that tracks its parent's branch already follows
+  the new one and is left as it is. A link that names another branch is changed to track
+  the new one. Lore records that change as a revision on the new branch, with the message
+  `Repin links onto branch <name>`. The link into that repository then pins that
+  revision, so every repository above it gets a repin revision too.
+- *Rolled back on failure.* If the create fails in any linked repository, Lore deletes the
+  branches it already created there. A branch it fails to delete stays, with a warning.
+
 Merging the parent carries its link changes as the parent's diff records them. A link the
 merged branch removes is removed, and its repository is not merged. The repository of an
 auto-following link the merged branch adds is merged into the linked branch the link lands

@@ -851,3 +851,120 @@ async fn a_link_has_no_child_in_the_state_holding_it() {
         })
         .await;
 }
+
+/// A revision of `holder` linking each of `links`, as (mount, repository, pin), at its root.
+async fn revision_linking(
+    root: &Arc<RepositoryContext>,
+    holder: RepositoryId,
+    links: &[(&str, RepositoryId, Hash)],
+) -> Hash {
+    let context = root.to_link_context(holder).await;
+    let state = State::new();
+    for &(name, repository, pin) in links {
+        let node = add(
+            &state,
+            context.clone(),
+            ROOT_NODE,
+            link_node(name, repository, pin),
+            name,
+        )
+        .await;
+        state
+            .link_add(
+                context.clone(),
+                repository,
+                BranchId::default(),
+                pin,
+                node,
+                LinkFlags::NoFlags,
+            )
+            .await
+            .expect("registering the link");
+    }
+    in_memory::commit(&context, &state, Hash::default(), branch_id()).await
+}
+
+fn first_reach(repository: RepositoryId, pin: Hash, mount_path: &str) -> LinkReach {
+    LinkReach {
+        repository,
+        pin,
+        branch: branch_id(),
+        mount_path: mount_path.to_string(),
+        depth: 1,
+        leads: true,
+    }
+}
+
+/// A walk reaches a repository through a cycle once, reads each distinct pin of it, and never lists
+/// the root, even where a linked revision links it back.
+#[tokio::test]
+async fn a_link_walk_reads_each_pin_once_and_skips_the_root() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable_store, mutable_store, _execution) =
+                test_store_create().await.expect("making test stores");
+            let root = Arc::new(RepositoryContext::new_null_context(
+                immutable_store,
+                mutable_store,
+            ));
+            let (a, b) = (RepositoryId::from([1; 16]), RepositoryId::from([2; 16]));
+            let a_unlinked = revision_linking(&root, a, &[]).await;
+            let b_pin = revision_linking(&root, b, &[("a", a, a_unlinked)]).await;
+            let a_pin = revision_linking(
+                &root,
+                a,
+                &[("b", b, b_pin), ("up", root.id, Hash::from_u64(7))],
+            )
+            .await;
+
+            let reached = collect_with_context(&root, vec![first_reach(a, a_pin, "a")])
+                .await
+                .expect("walking the links");
+
+            let listed: Vec<_> = reached.iter().map(|linked| linked.repository).collect();
+            assert_eq!(listed, [a, b]);
+            let a_paths: Vec<_> = reached[0]
+                .reaches
+                .iter()
+                .map(|r| r.mount_path.as_str())
+                .collect();
+            assert_eq!(a_paths, ["a", "a/b/a"]);
+            let a_pins: Vec<_> = reached[0].pins.iter().map(|walked| walked.pin).collect();
+            assert_eq!(a_pins, [a_pin, a_unlinked]);
+            assert_eq!(reached[0].pins[0].linked, [b]);
+            assert_eq!(reached[1].reaches[0].depth, 2);
+        })
+        .await;
+}
+
+/// A walk reads the revision a link at the depth limit pins, and goes no deeper.
+#[tokio::test]
+async fn a_link_walk_stops_at_the_depth_limit() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable_store, mutable_store, _execution) =
+                test_store_create().await.expect("making test stores");
+            let root = Arc::new(RepositoryContext::new_null_context(
+                immutable_store,
+                mutable_store,
+            ));
+            let chain: Vec<RepositoryId> = (1..=lore_revision::state::MAX_LINK_DEPTH as u8 + 1)
+                .map(|byte| RepositoryId::from([byte; 16]))
+                .collect();
+            let mut pin = revision_linking(&root, chain[chain.len() - 1], &[]).await;
+            for pair in chain.windows(2).rev() {
+                pin = revision_linking(&root, pair[0], &[("next", pair[1], pin)]).await;
+            }
+
+            let reached = collect_with_context(&root, vec![first_reach(chain[0], pin, "first")])
+                .await
+                .expect("walking the links");
+
+            let listed: Vec<_> = reached.iter().map(|linked| linked.repository).collect();
+            assert_eq!(listed, chain[..lore_revision::state::MAX_LINK_DEPTH]);
+            let deepest = reached.last().expect("the deepest repository");
+            assert_eq!(deepest.pins.len(), 1, "the deepest pin must be read");
+            assert!(deepest.pins[0].linked.is_empty());
+        })
+        .await;
+}

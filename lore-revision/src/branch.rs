@@ -9,6 +9,7 @@ pub mod push;
 pub mod reset;
 
 use std::cmp::PartialEq;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str;
@@ -2104,6 +2105,8 @@ pub struct CreatedBranch {
     pub head: Hash,
     /// The staged state based on `head`, where linked branches repinned or rebased it.
     pub staged: Option<Hash>,
+    /// Set where an existing branch was restored rather than created.
+    pub restored: bool,
 }
 
 /// [`create`], reporting the head it stored and the staged state rebased onto it.
@@ -2114,8 +2117,9 @@ pub struct CreatedBranch {
 ///    release a name its metadata marks released, before a check refuses it.
 /// 2. Otherwise find the value the claim of `name` swaps from (`name_claim_expected`). A branch the
 ///    name names with metadata refuses the create.
-/// 3. Check the parent and, outside a dry run, create the linked branches and write the record
-///    (`create_record`), claiming the name from that value.
+/// 3. Check the parent, create the linked branches (`create_linked_branches`), and outside a dry
+///    run write the record (`create_record`), claiming the name from that value. A record that
+///    fails to write deletes the linked branches.
 ///
 /// A name that isn't valid, or a zero `branch`, fails with [`InvalidArguments`] before anything is
 /// written. In step 3, a parent that is zero, the branch itself, or a personal branch, or a zero
@@ -2156,6 +2160,7 @@ pub async fn create_at(
             branch,
             head: Hash::default(),
             staged: None,
+            restored: true,
         });
     }
 
@@ -2261,39 +2266,47 @@ pub async fn create_at(
     let mut is_commit = false;
     let mut staged = None;
 
+    let mut linked = None;
+    if !head.is_zero()
+        && create_linked
+        && let Ok((state_current, state_staged, current_branch)) =
+            State::deserialize_current_and_staged(repository.clone())
+                .await
+                .forward::<BranchError>("Failed to deserialize current revision anchor")
+    {
+        let cascade = LinkCascade {
+            token,
+            branch,
+            name,
+            category,
+            dry_run,
+        };
+        let created_linked = create_linked_branches(
+            &cascade,
+            &repository,
+            &state_current,
+            state_staged.as_ref(),
+            current_branch,
+            head,
+        )
+        .await?;
+        lore_debug!(
+            "Created linked branches, new latest {}",
+            created_linked.head
+        );
+
+        is_commit = created_linked.head != head;
+        head = created_linked.head;
+        staged = created_linked.staged;
+        linked = Some(created_linked);
+    }
+
     if !dry_run {
         lore_debug!("Creating branch {name} {branch} with stack {stack:?} at signature {head}");
-
-        if !head.is_zero() && create_linked {
-            if let Ok((state_current, state_staged, current_branch)) =
-                State::deserialize_current_and_staged(repository.clone())
-                    .await
-                    .forward::<BranchError>("Failed to deserialize current revision anchor")
-            {
-                let (serialized_latest, rebased_staged) = create_linked_branches(
-                    repository.clone(),
-                    token,
-                    state_current,
-                    state_staged,
-                    branch,
-                    current_branch,
-                    head,
-                    name.into(),
-                    category.into(),
-                )
-                .await?;
-
-                is_commit = serialized_latest != head;
-                head = serialized_latest;
-                staged = rebased_staged;
-            }
-
-            lore_debug!("Created linked branches, new latest {head}");
-        }
         #[cfg(feature = "test-util")]
         crate::test_util::branch_step(crate::test_util::BranchStep::CreateUnrestored).await;
 
-        create_record(
+        let recorded = create_record(
             repository.clone(),
             branch,
             name,
@@ -2305,7 +2318,16 @@ pub async fn create_at(
             BranchLatestStatus::Divergent,
             name_expected,
         )
-        .await?;
+        .await;
+
+        if let Some(linked) = linked {
+            if recorded.is_ok() {
+                linked.report(branch);
+            } else {
+                delete_linked_branches(linked.created, branch).await;
+            }
+        }
+        recorded?;
     }
 
     if !head.is_zero() {
@@ -2321,6 +2343,7 @@ pub async fn create_at(
         branch,
         head,
         staged,
+        restored: false,
     })
 }
 
@@ -3161,10 +3184,6 @@ struct CascadeMount {
 /// The staged state's rows come first, so a group's first row is the pin the next commit takes.
 /// A row of `state` that the staged state removes or remounts stays in its group, so the link is
 /// on the new branch once the change is unstaged.
-///
-/// Grouping keeps the cascade from racing itself: concurrent creates with the same branch ID
-/// resolve to one winner, and the loser is rejected with "branch has been advanced by another
-/// instance", failing the whole create.
 async fn cascade_mounts(
     repository: &Arc<RepositoryContext>,
     state: &State,
@@ -3189,129 +3208,535 @@ async fn cascade_mounts(
             link,
             staged: false,
         }))
-        .filter(|mount| mount.link.flags & link::LinkFlags::DisableAutoFollow == 0);
+        .filter(|mount| mount.link.auto_follows());
     Ok(link::group_by_repository(mounts, |mount| {
         mount.link.repository
     }))
 }
 
-/// Creates `branch` in the linked repositories, and moves each link that names an explicit
-/// branch onto it.
-///
-/// The links of `state_staged` and `state` both drive the cascade, the staged ones first, so a
-/// linked branch starts at the pin the next commit takes. A row naming an explicit branch is
-/// repinned in the state holding it, at its own pin, with the zero branch to follow the new one.
-///
-/// Repinning `state` writes a revision on top of `current_latest`, which is returned as the
-/// branch's latest, and `state_staged` is rebased onto it.
-#[allow(clippy::too_many_arguments)]
-async fn create_linked_branches(
-    repository: Arc<RepositoryContext>,
-    token: &RepositoryWriteToken,
-    state: Arc<State>,
-    state_staged: Option<Arc<State>>,
+/// The branch a cascade makes in linked repositories.
+struct LinkCascade<'a> {
+    token: &'a RepositoryWriteToken,
     branch: BranchId,
-    current_branch: BranchId,
-    current_latest: Hash,
-    name: String,
-    category: String,
-) -> Result<(Hash, Option<Hash>), BranchError> {
-    let link_groups = cascade_mounts(&repository, &state, state_staged.as_ref()).await?;
+    name: &'a str,
+    category: &'a str,
+    dry_run: bool,
+}
 
-    if link_groups.is_empty() {
-        return Ok((current_latest, None));
+/// A linked repository a cascade makes its branch in.
+#[lore_macro::test_pub]
+struct CascadeRepository {
+    reached: link::ReachedRepository,
+    /// The position in `reached.reaches` of the link whose pin the branch starts at.
+    start: usize,
+}
+
+impl CascadeRepository {
+    #[lore_macro::test_pub]
+    fn start(&self) -> &link::LinkReach {
+        &self.reached.reaches[self.start]
     }
 
-    let mut link_tasks = JoinSet::new();
+    /// The paths the repository's outcome is reported under: those of the links the next commit
+    /// keeps, or of every link where none does.
+    fn report_paths(&self) -> impl Iterator<Item = &str> {
+        let leads = self.reached.reaches.iter().any(|reach| reach.leads);
+        self.reached
+            .reaches
+            .iter()
+            .filter(move |reach| reach.leads || !leads)
+            .map(|reach| reach.mount_path.as_str())
+    }
 
-    for (link_id, mounts) in link_groups {
-        lore_spawn!(link_tasks, {
-            let link = repository.to_link_context(link_id).await;
-            let link_remote = link.remote().await.forward_with::<BranchError, _>(|| {
-                format!("Failed to connect to link repository {link_id}")
-            })?;
+    fn mounts(&self) -> String {
+        self.report_paths()
+            .map(link::display_path)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
 
-            let repository = repository.clone();
-            let state = state.clone();
-            let state_staged = state_staged.clone();
-            let branch_id = branch;
-            let branch_name = name.clone();
-            let branch_category = category.clone();
+/// A branch a cascade made in a linked repository, which a failure deletes.
+struct LinkedBranch {
+    repository: RepositoryId,
+    remote: Arc<Connection>,
+}
 
-            async move {
-                // The first mount seeds the branch point; the others adopt what
-                // it resolved to, since they all address the same branch.
-                let leader = mounts[0];
-                let resolved_parent_branch = leader.link.resolve_branch(current_branch);
+/// What [`create_linked_branches`] left.
+struct LinkedBranches {
+    /// The branch's latest revision.
+    head: Hash,
+    /// The staged state based on `head`, where the repins changed it.
+    staged: Option<Hash>,
+    /// The branches made in linked repositories.
+    created: Vec<LinkedBranch>,
+    outcomes: Vec<(CascadeRepository, link::LinkBranchOutcome)>,
+}
 
-                let outcome = link::create_branch(
-                    link.clone(),
-                    link_remote,
-                    branch_id,
-                    branch_name,
-                    branch_category,
-                    resolved_parent_branch,
-                    leader.link.signature,
-                )
-                .await
-                .forward_with::<BranchError, _>(|| {
-                    format!("Failed to create branch for link repository {link_id}")
-                })?;
+impl LinkedBranches {
+    fn unchanged(head: Hash) -> Self {
+        Self {
+            head,
+            staged: None,
+            created: Vec::new(),
+            outcomes: Vec::new(),
+        }
+    }
 
-                for mount in mounts.iter() {
-                    let mount_state = match &state_staged {
-                        Some(state_staged) if mount.staged => state_staged,
-                        _ => &state,
-                    };
-
-                    // The create is shared, the reporting is not: every mount of the state that
-                    // seeded the branch reports its own outcome, keyed on its path, because the
-                    // repository ID cannot tell the mounts apart.
-                    if mount.staged == leader.staged {
-                        let link_path = mount_state
-                            .node_path(repository.clone(), mount.link.local_node)
-                            .await
-                            .unwrap_or_default();
-
-                        link::report_branch_outcome(
-                            &link_path,
-                            link_id,
-                            branch_id,
-                            outcome.revision,
-                            outcome.reused,
-                        );
-                    }
-
-                    // A row that tracks its parent's branch already resolves to the new one, at
-                    // the same revision, so it is left alone.
-                    if !mount.link.branch.is_zero() {
-                        link::update_link_pin_by_node(
-                            mount_state,
-                            repository.clone(),
-                            mount.link.repository,
-                            BranchId::default(),
-                            mount.link.signature,
-                            mount.link.local_node,
-                        )
-                        .await
-                        .forward_with::<BranchError, _>(|| {
-                            format!(
-                                "Failed to update link reference for link repository {}",
-                                mount.link.repository
-                            )
-                        })?;
-                    }
-                }
-
-                Ok(())
+    /// Reports how each linked repository's branch was resolved, once the whole create succeeded.
+    fn report(&self, branch: BranchId) {
+        for (linked, outcome) in &self.outcomes {
+            for path in linked.report_paths() {
+                link::report_branch_outcome(
+                    path,
+                    linked.reached.repository,
+                    branch,
+                    outcome.revision,
+                    outcome.reused,
+                );
             }
+        }
+    }
+}
+
+/// Creates the cascade's branch in the repositories `state_staged` and `state` link, at every
+/// depth, and moves each link that names an explicit branch onto it.
+///
+/// A linked branch starts at the pin the next commit takes, so a link the staged state replaces
+/// is followed but doesn't choose the pin. A repository several links reach starts at the newest
+/// of their pins ([`cascade_start`]). Every link row is repinned in the state holding it, so a
+/// link the staged state moves or removes stays on the new branch once unstaged. A row at the pin
+/// a branch starts at moves to the revision repinning the links below it.
+///
+/// Repinning `state` writes a revision on top of `current_latest`, which is returned as the
+/// branch's latest, and `state_staged` is rebased onto it. A dry run stops before the creates.
+///
+/// A failing create starts no more, deletes the branches made, and returns its error naming its
+/// links. The other failures are logged.
+async fn create_linked_branches(
+    cascade: &LinkCascade<'_>,
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    state_staged: Option<&Arc<State>>,
+    current_branch: BranchId,
+    current_latest: Hash,
+) -> Result<LinkedBranches, BranchError> {
+    let groups = cascade_mounts(repository, state, state_staged).await?;
+    let mut rows = Vec::new();
+    for (_link_id, mounts) in &groups {
+        let staged = mounts.iter().any(|mount| mount.staged);
+        for mount in mounts {
+            let mount_state = match state_staged {
+                Some(state_staged) if mount.staged => state_staged.as_ref(),
+                _ => state.as_ref(),
+            };
+            rows.push((mount_state, mount.link, mount.staged == staged));
+        }
+    }
+    let first_level = link::reach_links(repository, rows, current_branch, "", 0).await;
+    let reached = link::collect_with_context(repository, first_level)
+        .await
+        .forward::<BranchError>("walking the nested links")?;
+    let repositories =
+        link::try_join_links(reached.into_iter().map(cascade_start).collect()).await?;
+    if repositories.is_empty() || cascade.dry_run {
+        return Ok(LinkedBranches::unchanged(current_latest));
+    }
+
+    let creates = (0..repositories.len())
+        .map(|position| create_cascade_branch(cascade, &repositories[position]))
+        .collect();
+    let results = link::join_links_until_failure(creates).await;
+
+    let mut outcomes = Vec::with_capacity(results.len());
+    let mut created = Vec::new();
+    let mut failures = Vec::new();
+    for (linked, result) in repositories.iter().zip(results) {
+        match result {
+            Ok((remote, outcome)) => {
+                if !outcome.reused {
+                    created.push(LinkedBranch {
+                        repository: linked.reached.repository,
+                        remote,
+                    });
+                }
+                outcomes.push(outcome);
+            }
+            Err(err) => failures.push((err, linked)),
+        }
+    }
+    if let Some((first, mounts)) = log_cascade_failures(cascade, failures) {
+        delete_linked_branches(created, cascade.branch).await;
+        return Err(first).forward_with::<BranchError, _>(|| {
+            format!(
+                "creating branch {} in the linked repository at {mounts}",
+                cascade.name
+            )
         });
     }
 
-    lore_drain_tasks!(link_tasks, BranchError::internal("Task failed"))?;
+    let index: HashMap<RepositoryId, usize> = repositories
+        .iter()
+        .enumerate()
+        .map(|(position, linked)| (linked.reached.repository, position))
+        .collect();
+    match store_cascade_repins(
+        cascade,
+        repository,
+        (state, state_staged),
+        &groups,
+        (&repositories, &index),
+        &outcomes,
+        current_latest,
+    )
+    .await
+    {
+        Ok((head, staged)) => Ok(LinkedBranches {
+            head,
+            staged,
+            created,
+            outcomes: repositories.into_iter().zip(outcomes).collect(),
+        }),
+        Err(err) => {
+            delete_linked_branches(created, cascade.branch).await;
+            Err(err)
+        }
+    }
+}
 
+/// `reached` with the link whose pin its branch starts at: the newest of the pins of the links
+/// the next commit keeps, or of every link where none does. A pin on a line that diverged from
+/// another's fails with [`InvalidArguments`] naming the two links, since no branch holds both.
+///
+/// A walk that spends its budget before it reaches the older pin proves neither, and the higher
+/// numbered pin is taken.
+#[lore_macro::test_pub]
+async fn cascade_start(reached: link::ReachedRepository) -> Result<CascadeRepository, BranchError> {
+    let leads = reached.reaches.iter().any(|reach| reach.leads);
+    let mut candidates =
+        (0..reached.reaches.len()).filter(|&position| reached.reaches[position].leads || !leads);
+    let Some(mut start) = candidates.next() else {
+        return Err(BranchError::internal(format!(
+            "no link reaches repository {}",
+            reached.repository
+        )));
+    };
+    let number = |pin: Hash| {
+        reached
+            .pins
+            .iter()
+            .find(|walked| walked.pin == pin)
+            .map(|walked| walked.number)
+            .ok_or_else(|| BranchError::internal(format!("revision {pin} was not read")))
+    };
+    for candidate in candidates {
+        let (current, reach) = (&reached.reaches[start], &reached.reaches[candidate]);
+        if reach.pin == current.pin {
+            continue;
+        }
+        let (current_number, reach_number) = (number(current.pin)?, number(reach.pin)?);
+        let (newer, newer_number, older, older_number) = if reach_number > current_number {
+            (reach, reach_number, current, current_number)
+        } else {
+            (current, current_number, reach, reach_number)
+        };
+        let search = if newer_number == older_number {
+            HistoryLineSearch::Diverged
+        } else {
+            Box::pin(find_revision_in_history_line(
+                reached.context.clone(),
+                newer.pin,
+                newer_number,
+                older.pin,
+                older_number,
+            ))
+            .await?
+        };
+        if search == HistoryLineSearch::Diverged {
+            return Err(BranchError::from(InvalidArguments {
+                reason: format!(
+                    "the links at {} and {} pin revisions of repository {} on lines that diverged. \
+                     Pin them on one line with `lore link update <path> --pin <revision>`, \
+                     commit, and create the branch again",
+                    link::display_path(&current.mount_path),
+                    link::display_path(&reach.mount_path),
+                    reached.repository
+                ),
+            }));
+        }
+        if reach_number > current_number {
+            start = candidate;
+        }
+    }
+    Ok(CascadeRepository { reached, start })
+}
+
+/// Connects to the linked repository and creates the cascade's branch there, at the pin it starts
+/// at, returning the connection a rollback deletes it through.
+async fn create_cascade_branch(
+    cascade: &LinkCascade<'_>,
+    linked: &CascadeRepository,
+) -> Result<(Arc<Connection>, link::LinkBranchOutcome), BranchError> {
+    let remote = linked
+        .reached
+        .context
+        .remote()
+        .await
+        .forward_with::<BranchError, _>(|| link::unreachable(linked.reached.repository))?;
+    let outcome = link::create_branch(
+        linked.reached.context.clone(),
+        remote.clone(),
+        cascade.branch,
+        cascade.name,
+        cascade.category,
+        linked.start().branch,
+        linked.start().pin,
+    )
+    .await
+    .forward::<BranchError>("creating the linked branch")?;
+    Ok((remote, outcome))
+}
+
+/// The first of `failures`, with the paths of its links, having logged each other failure on a
+/// line of its own. None where nothing failed.
+fn log_cascade_failures(
+    cascade: &LinkCascade<'_>,
+    failures: Vec<(BranchError, &CascadeRepository)>,
+) -> Option<(BranchError, String)> {
+    let mut failures = failures.into_iter();
+    let (first, first_linked) = failures.next()?;
+    for (err, linked) in failures {
+        lore_error!(
+            "Failed to create branch {} in the linked repository at {}: {err}",
+            cascade.name,
+            linked.mounts()
+        );
+    }
+    Some((first, first_linked.mounts()))
+}
+
+/// Repins the links of every repository the cascade made its branch in, each after the
+/// repositories its revision links, then those of `state` and `state_staged`, returning the head
+/// and staged state [`repin_links`] leaves there.
+///
+/// A holder's revision is read again here rather than kept from the walk, so the cascade holds no
+/// state of a repository between the walk and its repins. A reused branch keeps its own history,
+/// so the links below it are left as they are.
+async fn store_cascade_repins(
+    cascade: &LinkCascade<'_>,
+    repository: &Arc<RepositoryContext>,
+    (state, state_staged): (&Arc<State>, Option<&Arc<State>>),
+    groups: &[(RepositoryId, Vec<CascadeMount>)],
+    (repositories, index): (&[CascadeRepository], &HashMap<RepositoryId, usize>),
+    outcomes: &[link::LinkBranchOutcome],
+    current_latest: Hash,
+) -> Result<(Hash, Option<Hash>), BranchError> {
+    let linked: Vec<Vec<usize>> = repositories
+        .iter()
+        .zip(outcomes)
+        .map(|(linked, outcome)| {
+            let start = linked.start().pin;
+            match linked
+                .reached
+                .pins
+                .iter()
+                .find(|walked| walked.pin == start)
+            {
+                Some(walked) if !outcome.reused => walked
+                    .linked
+                    .iter()
+                    .filter_map(|repository| index.get(repository).copied())
+                    .collect(),
+                _ => Vec::new(),
+            }
+        })
+        .collect();
+
+    let mut heads: Vec<Hash> = repositories
+        .iter()
+        .map(|linked| linked.start().pin)
+        .collect();
+    if linked.iter().any(|below| !below.is_empty()) {
+        // Few linked repositories hold links, so their repins are boxed rather than held by
+        // every create over links.
+        Box::pin(repin_holders(
+            cascade,
+            (repositories, index),
+            &linked,
+            &mut heads,
+        ))
+        .await?;
+    }
+
+    repin_links(
+        cascade,
+        repository,
+        (state, state_staged),
+        groups,
+        (repositories, index),
+        &heads,
+        current_latest,
+    )
+    .await
+}
+
+/// Repins the links each of `repositories` holds at the pin its branch starts at, in the levels
+/// [`repin_levels`] orders them in, the repositories of a level at once, and records each head.
+async fn repin_holders(
+    cascade: &LinkCascade<'_>,
+    (repositories, index): (&[CascadeRepository], &HashMap<RepositoryId, usize>),
+    linked: &[Vec<usize>],
+    heads: &mut [Hash],
+) -> Result<(), BranchError> {
+    for level in repin_levels(linked) {
+        let work = level
+            .iter()
+            .filter(|&&position| !linked[position].is_empty())
+            .map(|&position| {
+                let heads = &*heads;
+                async move {
+                    let holder = &repositories[position];
+                    let context = &holder.reached.context;
+                    let holder_state = State::deserialize(context.clone(), holder.start().pin)
+                        .await
+                        .forward_with::<BranchError, _>(|| {
+                            format!(
+                                "deserializing the revision linked at {}",
+                                link::display_path(&holder.start().mount_path)
+                            )
+                        })?;
+                    let holder_groups = cascade_mounts(context, &holder_state, None).await?;
+                    let (head, _staged) = repin_links(
+                        cascade,
+                        context,
+                        (&holder_state, None),
+                        &holder_groups,
+                        (repositories, index),
+                        heads,
+                        holder.start().pin,
+                    )
+                    .await?;
+                    Ok::<_, BranchError>((position, head))
+                }
+            })
+            .collect();
+        for (position, head) in link::try_join_links(work).await? {
+            heads[position] = head;
+        }
+    }
+    Ok(())
+}
+
+/// The positions of `linked`, where `linked[i]` lists the positions the revision at `i` links, in
+/// levels: each after every position it links. A link cycle is cut where the walk first meets it.
+#[lore_macro::test_pub]
+fn repin_levels(linked: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    fn level_of(
+        position: usize,
+        linked: &[Vec<usize>],
+        levels: &mut [Option<usize>],
+        visiting: &mut [bool],
+    ) -> usize {
+        if let Some(level) = levels[position] {
+            return level;
+        }
+        visiting[position] = true;
+        let mut level = 0;
+        for &below in &linked[position] {
+            if !visiting[below] {
+                level = level.max(level_of(below, linked, levels, visiting) + 1);
+            }
+        }
+        visiting[position] = false;
+        levels[position] = Some(level);
+        level
+    }
+
+    let mut levels = vec![None; linked.len()];
+    let mut visiting = vec![false; linked.len()];
+    let mut ordered: Vec<Vec<usize>> = Vec::new();
+    for position in 0..linked.len() {
+        let level = level_of(position, linked, &mut levels, &mut visiting);
+        if ordered.len() <= level {
+            ordered.resize_with(level + 1, Vec::new);
+        }
+        ordered[level].push(position);
+    }
+    ordered
+}
+
+/// Repins the links of `groups` onto the cascade's branch, moving those at the pin a linked branch
+/// starts at to that repository's head, and stores what that changes.
+///
+/// Only a row that names an explicit branch, or whose revision moves, leaves a state to write, so
+/// the writes are boxed rather than held by every create over links.
+async fn repin_links(
+    cascade: &LinkCascade<'_>,
+    repository: &Arc<RepositoryContext>,
+    (state, state_staged): (&Arc<State>, Option<&Arc<State>>),
+    groups: &[(RepositoryId, Vec<CascadeMount>)],
+    (repositories, index): (&[CascadeRepository], &HashMap<RepositoryId, usize>),
+    heads: &[Hash],
+    current_latest: Hash,
+) -> Result<(Hash, Option<Hash>), BranchError> {
+    for (link_id, mounts) in groups {
+        let Some(&position) = index.get(link_id) else {
+            continue;
+        };
+        let (pin, head) = (repositories[position].start().pin, heads[position]);
+        for mount in mounts {
+            let signature = if mount.link.signature == pin {
+                head
+            } else {
+                mount.link.signature
+            };
+            if mount.link.is_tracking() && signature == mount.link.signature {
+                continue;
+            }
+            let mount_state = match state_staged {
+                Some(state_staged) if mount.staged => state_staged,
+                _ => state,
+            };
+            link::update_link_pin_by_node(
+                mount_state,
+                repository.clone(),
+                mount.link.repository,
+                BranchId::default(),
+                signature,
+                mount.link.local_node,
+            )
+            .await
+            .forward_with::<BranchError, _>(|| {
+                format!(
+                    "repinning the link to repository {} onto branch {}",
+                    mount.link.repository, cascade.name
+                )
+            })?;
+        }
+    }
+
+    if !state.is_dirty() && state_staged.is_none_or(|state_staged| !state_staged.is_dirty()) {
+        return Ok((current_latest, None));
+    }
+    Box::pin(store_repinned_states(
+        cascade,
+        repository,
+        (state, state_staged),
+        current_latest,
+    ))
+    .await
+}
+
+/// Writes the repins `state` holds as a revision on top of `current_latest`, and `state_staged`
+/// rebased onto that revision, returning both.
+async fn store_repinned_states(
+    cascade: &LinkCascade<'_>,
+    repository: &Arc<RepositoryContext>,
+    (state, state_staged): (&Arc<State>, Option<&Arc<State>>),
+    current_latest: Hash,
+) -> Result<(Hash, Option<Hash>), BranchError> {
     let head = if state.is_dirty() {
-        store_repin_revision(&repository, token, &state, branch, current_latest).await?
+        store_repin_revision(cascade, repository, state, current_latest).await?
     } else {
         current_latest
     };
@@ -3327,7 +3752,7 @@ async fn create_linked_branches(
     let staged = match staged {
         Some(state_staged) => Some(
             state_staged
-                .serialize(repository.clone(), token)
+                .serialize(repository.clone(), cascade.token)
                 .await
                 .forward::<BranchError>("Failed to serialize staged state")?,
         ),
@@ -3339,34 +3764,16 @@ async fn create_linked_branches(
 
 /// Writes the repins `state` holds as a revision on top of `current_latest`.
 async fn store_repin_revision(
+    cascade: &LinkCascade<'_>,
     repository: &Arc<RepositoryContext>,
-    token: &RepositoryWriteToken,
     state: &Arc<State>,
-    branch: BranchId,
     current_latest: Hash,
 ) -> Result<Hash, BranchError> {
-    let metadata_hash = state.metadata_hash();
-
-    if metadata_hash.is_zero() {
-        return Err(BranchError::internal(
-            "Failed to deserialize revision metadata",
-        ));
-    }
-
-    let original_metadata = Metadata::deserialize(repository.clone(), metadata_hash)
-        .await
-        .forward::<BranchError>("Failed to deserialize revision metadata")?;
-
-    let message = original_metadata
-        .get_string(metadata::MESSAGE)
-        .forward::<BranchError>("Failed to deserialize revision metadata")?
-        .to_owned();
-
     let metadata = commit::prepare_commit_metadata(
         repository.clone(),
-        original_metadata,
-        branch,
-        message.clone(),
+        Metadata::new(),
+        cascade.branch,
+        format!("Repin links onto branch {}", cascade.name),
         None,
         None,
         None,
@@ -3393,9 +3800,62 @@ async fn store_repin_revision(
     .forward::<BranchError>("Failed to weave history")?;
 
     state
-        .serialize(repository.clone(), token)
+        .serialize(repository.clone(), cascade.token)
         .await
         .forward::<BranchError>("Failed to serialize revision state")
+}
+
+/// Deletes the branches a failed cascade made in linked repositories.
+async fn delete_linked_branches(created: Vec<LinkedBranch>, branch: BranchId) {
+    futures::stream::iter(created)
+        .for_each_concurrent(link::MAX_CONCURRENT_LINK_TASKS, |made| async move {
+            if let Err(err) = delete_remote(made.remote, made.repository, branch).await {
+                lore_warn!(
+                    "Failed to remove branch {branch} from linked repository {}: {err}",
+                    made.repository
+                );
+            }
+        })
+        .await;
+}
+
+/// Access to the branch cascade for the crate's tests.
+#[cfg(feature = "test-util")]
+pub mod test_util {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::LinkCascade;
+    use super::repin_links;
+    use crate::lore::BranchId;
+    use crate::lore::Hash;
+    use crate::repository::RepositoryContext;
+    use crate::repository::RepositoryWriteToken;
+    use crate::state::State;
+
+    /// The size of the future that repins a cascade's links in `state`.
+    pub fn repin_links_future_size(
+        repository: &Arc<RepositoryContext>,
+        token: &RepositoryWriteToken,
+        state: &Arc<State>,
+    ) -> usize {
+        let cascade = LinkCascade {
+            token,
+            branch: BranchId::default(),
+            name: "",
+            category: "",
+            dry_run: false,
+        };
+        size_of_val(&repin_links(
+            &cascade,
+            repository,
+            (state, None),
+            &[],
+            (&[], &HashMap::new()),
+            &[],
+            Hash::default(),
+        ))
+    }
 }
 
 /// Archives `branch`, named `name`, whose metadata the metadata key holds locally as `expected`.

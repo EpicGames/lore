@@ -1413,13 +1413,18 @@ impl LinkReference {
         self.branch.is_zero()
     }
 
+    /// Whether the link follows its parent onto the branches made from it.
+    pub fn auto_follows(&self) -> bool {
+        self.flags & LinkFlags::DisableAutoFollow == 0
+    }
+
     /// The branch to store for this link to resolve to `branch` under a parent on
     /// `parent_branch`.
     ///
     /// An auto-following link on its parent's branch stores zero, so it follows the parent onto
     /// every branch made from it. Any other link stores `branch`.
     pub fn branch_to_store(&self, branch: BranchId, parent_branch: BranchId) -> BranchId {
-        if branch == parent_branch && self.flags & LinkFlags::DisableAutoFollow == 0 {
+        if branch == parent_branch && self.auto_follows() {
             BranchId::default()
         } else {
             branch

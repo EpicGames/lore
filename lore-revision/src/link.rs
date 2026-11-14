@@ -346,8 +346,8 @@ pub async fn create_branch(
     repository: Arc<RepositoryContext>,
     remote: Arc<Connection>,
     branch_id: Context,
-    branch_name: String,
-    branch_category: String,
+    branch_name: &str,
+    branch_category: &str,
     parent_id: Context,
     parent_latest: Hash,
 ) -> Result<LinkBranchOutcome, LinkError> {
@@ -380,11 +380,11 @@ pub async fn create_branch(
     }
 
     let branch_name =
-        if let Ok(_previous_id) = branch::load_name_to_id(repository.clone(), &branch_name).await {
+        if let Ok(_previous_id) = branch::load_name_to_id(repository.clone(), branch_name).await {
             lore_debug!("Link branch with name {branch_name} already exists, appending branch ID");
-            format!("{branch_name}-{branch_id}")
+            std::borrow::Cow::Owned(format!("{branch_name}-{branch_id}"))
         } else {
-            branch_name
+            std::borrow::Cow::Borrowed(branch_name)
         };
 
     // A dry run reports the branch at the revision it would start at, creating nothing on the
@@ -400,7 +400,7 @@ pub async fn create_branch(
         .branch_create(
             branch_id,
             &branch_name,
-            &branch_category,
+            branch_category,
             user_id.as_str(),
             &branch_stack,
         )
@@ -419,10 +419,12 @@ pub async fn create_branch(
     })
 }
 
-/// Links a merge works on at once. Each pins deserialized revisions of its linked repository, as a
-/// history walk does, so it shares the bound measured for those.
+/// Links a merge or a branch cascade works on at once. Each pins deserialized revisions of its
+/// linked repository, as a history walk does, or holds a connection to it, so it shares the bound
+/// measured for those.
 #[lore_macro::test_pub]
-const MAX_CONCURRENT_LINK_TASKS: usize = crate::revision::DEFAULT_HISTORY_WALK_CONCURRENCY;
+pub(crate) const MAX_CONCURRENT_LINK_TASKS: usize =
+    crate::revision::DEFAULT_HISTORY_WALK_CONCURRENCY;
 
 /// Awaits per-link work [`MAX_CONCURRENT_LINK_TASKS`] at a time, in order. After the first error
 /// no more work starts, and the error is returned once the work in flight settles, so none is
@@ -513,6 +515,31 @@ pub(crate) async fn incoming_following_links(
         incoming.into_iter().flatten(),
         |link| link.link_reference.repository,
     ))
+}
+
+/// Awaits per-link work [`MAX_CONCURRENT_LINK_TASKS`] at a time, in order, starting none after the
+/// first that fails. The work in flight then finishes, so what it did can be undone, and the
+/// results end where the work stopped.
+pub(crate) async fn join_links_until_failure<T, E>(
+    work: Vec<impl Future<Output = Result<T, E>>>,
+) -> Vec<Result<T, E>> {
+    let mut in_flight = futures::stream::FuturesOrdered::new();
+    let mut results = Vec::with_capacity(work.len());
+    let mut work = work.into_iter();
+    loop {
+        let failed = results.iter().any(Result::is_err);
+        if !failed
+            && in_flight.len() < MAX_CONCURRENT_LINK_TASKS
+            && let Some(future) = work.next()
+        {
+            in_flight.push_back(future);
+            continue;
+        }
+        let Some(result) = in_flight.next().await else {
+            return results;
+        };
+        results.push(result);
+    }
 }
 
 /// The repositories `state_target` links at a path a merge of `state_source` into it, from
@@ -658,8 +685,8 @@ async fn create_merged_link_branch(
         link,
         link_remote.clone(),
         branch,
-        branch_name.to_string(),
-        branch_category.to_string(),
+        branch_name,
+        branch_category,
         parent_branch,
         parent_latest,
     )
@@ -703,7 +730,7 @@ pub fn auto_following_mounts(
 ) -> Vec<(RepositoryId, Vec<LinkReference>)> {
     group_by_repository(
         link_list.iter().copied().filter(|link_reference| {
-            let follows = link_reference.flags & LinkFlags::DisableAutoFollow == 0;
+            let follows = link_reference.auto_follows();
             if !follows {
                 lore_debug!(
                     "Auto follow disabled for link {}",
@@ -736,98 +763,227 @@ pub fn group_by_repository<T>(
 /// For operations that cascade into every linked repository, including the
 /// links nested inside them.
 ///
-/// `branch create` only seeds the top level, so the deeper repositories are
-/// reached here for the sake of converging on whatever a branch has been left
-/// in, however it got there.
+/// A repository reached through several links is listed once, at the mount
+/// path of the outermost link reaching it.
 pub async fn list_with_context(
     repository: Arc<RepositoryContext>,
 ) -> Result<Vec<LinkTarget>, LinkError> {
-    let (state, _parent_branch) = current_or_staged_state(repository.clone()).await?;
-
-    let mut seen = std::collections::HashSet::from([repository.id]);
-    Box::pin(collect_with_context(
-        repository,
-        state,
-        String::new(),
-        0,
-        &mut seen,
-    ))
-    .await
-}
-
-/// Bounded by `MAX_LINK_DEPTH` and a visited-repository set, so a link cycle
-/// terminates and a repository reachable by several paths is acted on once.
-///
-/// Each context costs its own connection, so the links at one level are opened
-/// concurrently rather than one handshake after another.
-async fn collect_with_context(
-    repository: Arc<RepositoryContext>,
-    state: Arc<State>,
-    path_prefix: String,
-    link_depth: usize,
-    seen: &mut std::collections::HashSet<RepositoryId>,
-) -> Result<Vec<LinkTarget>, LinkError> {
-    let link_list = state
+    let (state, parent_branch) = current_or_staged_state(repository.clone()).await?;
+    let links = state
         .link_list(repository.clone())
         .await
         .forward::<LinkError>("Failed to list links")?;
-
-    let mounts: Vec<(RepositoryId, Vec<LinkReference>)> = auto_following_mounts(&link_list)
+    let rows = links
         .into_iter()
-        .filter(|(link_id, _mounts)| seen.insert(*link_id))
-        .collect();
+        .filter(LinkReference::auto_follows)
+        .map(|link| (state.as_ref(), link, true));
+    let first_level = Box::pin(reach_links(&repository, rows, parent_branch, "", 0)).await;
+    let reached = Box::pin(collect_with_context(&repository, first_level)).await?;
+    Ok(reached
+        .into_iter()
+        .map(|mut linked| LinkTarget {
+            mount_path: linked.reaches.swap_remove(0).mount_path,
+            repository: linked.repository,
+            context: linked.context,
+        })
+        .collect())
+}
 
-    let level = futures::future::join_all(mounts.into_iter().map(|(link_id, mounts)| {
-        let repository = repository.clone();
-        let state = state.clone();
-        let path_prefix = path_prefix.clone();
-        async move {
-            let local_path = state
-                .node_path(repository.clone(), mounts[0].local_node)
-                .await
-                .unwrap_or_default();
+/// A link that a walk over nested links follows.
+#[lore_macro::test_pub]
+pub(crate) struct LinkReach {
+    pub repository: RepositoryId,
+    /// The revision the link pins.
+    pub pin: Hash,
+    /// The branch the link resolves to.
+    pub branch: BranchId,
+    /// The path the link is mounted at, from the root of the walk.
+    pub mount_path: String,
+    /// The number of links from the root of the walk to this one, one for a link the root holds.
+    pub depth: usize,
+    /// Whether the next commit keeps the link: a link the staged state replaces, or one below it,
+    /// is followed but doesn't choose where a cascade's branch starts.
+    pub leads: bool,
+}
 
-            let full_path = if path_prefix.is_empty() {
-                local_path.clone()
+/// A revision of a linked repository that a walk read.
+#[lore_macro::test_pub]
+pub(crate) struct WalkedPin {
+    pub pin: Hash,
+    pub number: u64,
+    /// The repositories the revision's auto-following links reach, none past the depth limit.
+    pub linked: Vec<RepositoryId>,
+}
+
+/// A linked repository a walk over nested links reaches.
+#[lore_macro::test_pub]
+pub(crate) struct ReachedRepository {
+    pub repository: RepositoryId,
+    pub context: Arc<RepositoryContext>,
+    /// Every link reaching the repository, the outermost first.
+    pub reaches: Vec<LinkReach>,
+    /// Every distinct pin of `reaches`.
+    pub pins: Vec<WalkedPin>,
+}
+
+/// The `rows` a holder on `holder_branch` mounted at `mount_prefix` holds, `depth` links below the
+/// root of the walk, as reaches. Each row names the state holding it, and whether it leads.
+#[lore_macro::test_pub]
+pub(crate) async fn reach_links<'a>(
+    repository: &Arc<RepositoryContext>,
+    rows: impl IntoIterator<Item = (&'a State, LinkReference, bool)>,
+    holder_branch: BranchId,
+    mount_prefix: &str,
+    depth: usize,
+) -> Vec<LinkReach> {
+    futures::future::join_all(rows.into_iter().map(|(state, link, leads)| async move {
+        let local_path = state
+            .node_path(repository.clone(), link.local_node)
+            .await
+            .unwrap_or_default();
+        LinkReach {
+            repository: link.repository,
+            pin: link.signature,
+            branch: link.resolve_branch(holder_branch),
+            mount_path: if mount_prefix.is_empty() {
+                local_path
             } else {
-                format!("{path_prefix}/{local_path}")
-            };
-            let target = LinkTarget {
-                mount_path: full_path,
-                repository: link_id,
-                context: repository.to_link_context(link_id).await,
-            };
-
-            (target, mounts[0].signature)
+                format!("{mount_prefix}/{local_path}")
+            },
+            depth: depth + 1,
+            leads,
         }
     }))
-    .await;
+    .await
+}
 
-    let mut targets = Vec::new();
-    for (target, signature) in level {
-        let nested = if link_depth + 1 < crate::state::MAX_LINK_DEPTH {
-            let context = target.context.clone();
-            let nested_state = State::deserialize(context.clone(), signature)
-                .await
-                .forward::<LinkError>("Failed deserializing state")?;
+/// Walks the links below `first_level`, the links the root of the walk holds, level by level, so
+/// that a repository is first reached through the outermost link reaching it. Each distinct pin of
+/// a repository is read once, so the links of whichever pin an operation settles on are reached,
+/// and the pins of one level are read [`MAX_CONCURRENT_LINK_TASKS`] at a time.
+///
+/// Bounded by `MAX_LINK_DEPTH` and the pins already read, so a link cycle terminates. The root of
+/// the walk is never listed.
+#[lore_macro::test_pub]
+pub(crate) async fn collect_with_context(
+    root: &Arc<RepositoryContext>,
+    first_level: Vec<LinkReach>,
+) -> Result<Vec<ReachedRepository>, LinkError> {
+    let mut walk = LinkWalk {
+        root: root.id,
+        reached: Vec::new(),
+        index: HashMap::new(),
+        read: HashSet::new(),
+    };
+    let mut level = walk.add(root, first_level).await;
+    loop {
+        if level.is_empty() {
+            return Ok(walk.reached);
+        }
+        let reads = level
+            .iter()
+            .map(|&(position, reach)| {
+                let linked = &walk.reached[position];
+                let reach = &linked.reaches[reach];
+                let context = &linked.context;
+                async move {
+                    let state = State::deserialize(context.clone(), reach.pin)
+                        .await
+                        .forward_with::<LinkError, _>(|| unreachable(reach.repository))?;
+                    let nested = if reach.depth < crate::state::MAX_LINK_DEPTH {
+                        let links = state
+                            .link_list(context.clone())
+                            .await
+                            .forward_with::<LinkError, _>(|| unreachable(reach.repository))?;
+                        let rows = links
+                            .into_iter()
+                            .filter(LinkReference::auto_follows)
+                            .map(|link| (state.as_ref(), link, reach.leads));
+                        reach_links(context, rows, reach.branch, &reach.mount_path, reach.depth)
+                            .await
+                    } else {
+                        Vec::new()
+                    };
+                    Ok::<_, LinkError>((state.revision_number(), nested))
+                }
+            })
+            .collect();
+        // Boxed once a level, so a walk over no links holds none of the reads.
+        let read = Box::pin(try_join_links(reads)).await?;
 
-            Box::pin(collect_with_context(
-                context,
-                nested_state,
-                target.mount_path.clone(),
-                link_depth + 1,
-                seen,
-            ))
-            .await?
-        } else {
-            Vec::new()
-        };
-
-        targets.push(target);
-        targets.extend(nested);
+        let mut next = Vec::new();
+        for (&(position, reach), (number, nested)) in level.iter().zip(read) {
+            let mut linked: Vec<RepositoryId> = nested
+                .iter()
+                .map(|link| link.repository)
+                .filter(|repository| *repository != walk.root)
+                .collect();
+            linked.sort_unstable();
+            linked.dedup();
+            let holder = &mut walk.reached[position];
+            holder.pins.push(WalkedPin {
+                pin: holder.reaches[reach].pin,
+                number,
+                linked,
+            });
+            let context = holder.context.clone();
+            next.extend(walk.add(&context, nested).await);
+        }
+        level = next;
     }
+}
 
-    Ok(targets)
+/// The repositories a walk over nested links reached, and the pins it read.
+struct LinkWalk {
+    root: RepositoryId,
+    reached: Vec<ReachedRepository>,
+    index: HashMap<RepositoryId, usize>,
+    read: HashSet<(RepositoryId, Hash)>,
+}
+
+impl LinkWalk {
+    /// Records `reaches`, made from the revision of `holder` that holds them, returning the
+    /// position of each pin not read yet and of the reach naming it.
+    async fn add(
+        &mut self,
+        holder: &Arc<RepositoryContext>,
+        mut reaches: Vec<LinkReach>,
+    ) -> Vec<(usize, usize)> {
+        reaches.retain(|reach| reach.repository != self.root);
+        let mut new_repositories: Vec<RepositoryId> = reaches
+            .iter()
+            .map(|reach| reach.repository)
+            .filter(|repository| !self.index.contains_key(repository))
+            .collect();
+        new_repositories.sort_unstable();
+        new_repositories.dedup();
+        let contexts = futures::future::join_all(
+            new_repositories
+                .iter()
+                .map(|repository| holder.to_link_context(*repository)),
+        )
+        .await;
+        for (repository, context) in new_repositories.into_iter().zip(contexts) {
+            self.index.insert(repository, self.reached.len());
+            self.reached.push(ReachedRepository {
+                repository,
+                context,
+                reaches: Vec::new(),
+                pins: Vec::new(),
+            });
+        }
+
+        let mut unread = Vec::new();
+        for reach in reaches {
+            let position = self.index[&reach.repository];
+            let linked = &mut self.reached[position];
+            if self.read.insert((reach.repository, reach.pin)) {
+                unread.push((position, linked.reaches.len()));
+            }
+            linked.reaches.push(reach);
+        }
+        unread
+    }
 }
 
 /// Resolves the link mounted at `path` for a cascade scoped to one link.
@@ -842,7 +998,7 @@ pub async fn find_with_context(
     let (state, _parent_branch) = current_or_staged_state(repository.clone()).await?;
     let resolved = resolve_link_at_path(&state, repository, path).await?;
 
-    if resolved.link_reference.flags & LinkFlags::DisableAutoFollow != 0 {
+    if !resolved.link_reference.auto_follows() {
         return Err(InvalidArguments {
             reason: format!("link at {path} does not follow the parent's branches"),
         }
@@ -3192,7 +3348,7 @@ pub async fn check_link_merge_eligible(
     link_reference: &LinkReference,
     target_branch: BranchId,
 ) -> LinkMergeEligibility {
-    if link_reference.flags & LinkFlags::DisableAutoFollow != 0 {
+    if !link_reference.auto_follows() {
         return LinkMergeEligibility::AutoFollowDisabled;
     }
 

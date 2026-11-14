@@ -12,6 +12,7 @@ from link_helpers import (
     DEFAULT_PARENT_FILE,
     build_nested_link_repos_at,
     folder_replaced_by_a_link,
+    link_pin_at,
     link_replaced_by_its_folder,
     make_parent_with_link,
     make_repo,
@@ -937,14 +938,20 @@ def test_branch_created_over_a_staged_link_change_keeps_the_link_on_it_once_unst
 
 
 @pytest.mark.smoke
-def test_branch_created_over_nested_links_takes_a_commit(new_lore_repo):
-    """A link added inside another keeps the outer link tracking, so a branch
-    created over them starts at the parent's revision and takes its first
-    commit. Pushing it needs the nested repository's branch, which branch
-    creation does not make."""
-    parent, _b, _c, b_mount, _nested_mount = build_nested_link_repos_at(
+def test_branch_created_over_nested_links_takes_a_commit_and_pushes(new_lore_repo):
+    """A branch created over nested links is made once in the repository at
+    every level, including one two linked repositories link, so its first
+    commit pushes."""
+    parent, b, c, b_mount, _nested_mount = build_nested_link_repos_at(
         new_lore_repo, "vendor", "nested"
     )
+    other = make_repo(new_lore_repo, {"other.txt": "other\n"})
+    parent.link_add("other", other.get_id(), "/")
+    parent.commit("Link other")
+    parent.push()
+    parent.link_add("other/nested", c.get_id(), "/")
+    parent.commit("Link C through other")
+    parent.push()
     assert _tracks(parent, b_mount), "the outer link must follow main"
     start = _current_revision(parent)
 
@@ -952,11 +959,50 @@ def test_branch_created_over_nested_links_takes_a_commit(new_lore_repo):
     assert parent.branch_info().local_latest == start
     assert _current_revision(parent) == start
 
-    parent.write_files({"feature.txt": "on feature\n"})
-    parent.stage("feature.txt")
-    parent.commit("First commit")
+    branch_id = parent.branch_info("feature").id
+    for linked in (b, other, c):
+        cascaded = [
+            e["id"] for e in remote_branch_entries(linked) if e["name"] == "feature"
+        ]
+        assert cascaded == [branch_id], (
+            f"branch create must make the branch at every level, got {cascaded}"
+        )
+
+    parent.write_commit_push("First commit", {"feature.txt": "on feature\n"})
 
     assert _current_revision(parent) == parent.branch_info().local_latest
+
+
+@pytest.mark.smoke
+def test_branch_created_over_a_nested_link_on_another_branch_moves_it_onto_the_branch(
+    new_lore_repo,
+):
+    """A nested link pinned to another branch follows the new branch in the
+    repository holding it, the outer link moves onto that repository's new
+    revision, and the branch takes a commit through the nested mount and pushes."""
+    parent, b, c, b_mount, nested_mount = build_nested_link_repos_at(
+        new_lore_repo, "vendor", "nested"
+    )
+    c.branch_create("release")
+    c.write_commit_push("Release", {"release.txt": "release\n"})
+    parent.link_update(nested_mount, pin="release@LATEST")
+    parent.commit("Pin the nested link to release")
+    parent.push()
+    assert not _tracks(parent, nested_mount), "the nested link must name release"
+    outer_pin = link_pin_at(parent, b_mount)
+
+    parent.branch_create("feature")
+
+    assert _tracks(parent, nested_mount), "the nested link must follow the new branch"
+    assert _tracks(parent, b_mount), "the outer link must follow the new branch"
+    assert link_pin_at(parent, b_mount) != outer_pin, (
+        "the outer link must move onto the revision repinning the nested link"
+    )
+    edit = f"{nested_mount}/feature.txt"
+    parent.write_commit_push("Edit through the nested mount", {edit: "on feature\n"})
+    assert c.clone(branch="feature").file_exists("feature.txt")
+    messages = [revision.message for revision in b.clone(branch="feature").history()]
+    assert any("Repin links onto branch feature" in m for m in messages), messages
 
 
 def _stage_a_link_add(new_lore_repo) -> tuple[Lore, Lore]:
@@ -1129,11 +1175,7 @@ def test_link_push_pushes_a_repository_two_links_reach_once(new_lore_repo):
     # mount is moved onto first, so the revisions the two name are on one line.
     for name in ("first", "second"):
         if name == "second":
-            first_pin = re.search(
-                r"Link path: first/shared .*?Revision:\s*(\w+)",
-                parent.link_list(),
-                re.DOTALL,
-            ).group(1)
+            first_pin = link_pin_at(parent, "first/shared")
             parent.link_update(f"{name}/shared", pin=first_pin)
             parent.commit(f"Move {name}/shared onto the first edit")
         mounted_file = f"{name}/shared/{name}-edit.txt"

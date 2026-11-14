@@ -474,10 +474,17 @@ async fn served_committed_instance() -> (
 /// stored and anchored nowhere. The instance's directory is removed with the [`TempDir`].
 async fn linked_committed_instance() -> (Arc<RepositoryContext>, Hash, TempDir) {
     let (repository, tempdir) = committed_repository("", &[]).await;
+    let linked = state_linking(&repository, Hash::from([9; 32])).await;
+    (repository, linked, tempdir)
+}
+
+/// The state of `repository`'s current revision with a link to [`linked_repository`] at `pin`
+/// added, stored and anchored nowhere.
+async fn state_linking(repository: &Arc<RepositoryContext>, pin: Hash) -> Hash {
     let token = repository
         .try_write_token()
         .expect("The repository was opened for writing");
-    let (revision, _branch) = lore_revision::instance::load_current_anchor_boxed(&repository)
+    let (revision, _branch) = lore_revision::instance::load_current_anchor_boxed(repository)
         .await
         .expect("loading the current anchor");
     let state = State::deserialize(repository.clone(), revision)
@@ -488,18 +495,17 @@ async fn linked_committed_instance() -> (Arc<RepositoryContext>, Hash, TempDir) 
             repository.clone(),
             linked_repository(),
             BranchId::default(),
-            Hash::from([9; 32]),
+            pin,
             1,
             LinkFlags::NoFlags,
         )
         .await
         .expect("adding a link");
     state.mark_dirty();
-    let linked = state
+    state
         .serialize(repository.clone(), token)
         .await
-        .expect("storing the linked state");
-    (repository, linked, tempdir)
+        .expect("storing the linked state")
 }
 
 /// `repository`, rooted at `tempdir`, opened again over `remote`.
@@ -797,7 +803,13 @@ async fn creating_a_branch_the_remote_refuses_writes_nothing() {
 #[tokio::test]
 async fn creating_a_branch_a_linked_repository_refuses_reports_the_refusal() {
     Box::pin(with_execution(async {
-        let (instance, linked, _tempdir, protocol, _remote) = served_committed_instance().await;
+        let (instance, _linked, _tempdir, protocol, _remote) = served_committed_instance().await;
+        // The create reads the pinned revision for nested links before it asks the linked
+        // repository for the branch, so the link pins a revision the instance holds.
+        let (revision, _branch) = lore_revision::instance::load_current_anchor_boxed(&instance)
+            .await
+            .expect("loading the current anchor");
+        let linked = state_linking(&instance, revision).await;
         lore_revision::instance::store_staged_anchor(&instance, linked)
             .await
             .expect("staging the link");

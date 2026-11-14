@@ -162,8 +162,8 @@ pub async fn add(
                 link.clone(),
                 link_remote.clone(),
                 current_branch_id,
-                branch_name.into(),
-                branch_category.into(),
+                branch_name,
+                branch_category,
                 default_branch_id,
                 parent_latest,
             )

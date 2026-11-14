@@ -5389,3 +5389,151 @@ mod resolve_through_the_remote {
         assert!(differing.is_empty(), "{differing:#?}");
     }
 }
+
+/// Repinning a cascade's links keeps the write of the repinned state in a box of its own, so a
+/// branch create over links that repins nothing holds no state write.
+#[tokio::test]
+async fn repinning_links_keeps_the_state_write_out_of_its_future() {
+    let (immutable, mutable, _execution) = crate::helper::test_store_create()
+        .await
+        .expect("creating the stores");
+    let repository = in_memory::repository(immutable, mutable);
+    let token = in_memory::token();
+    let state = State::new();
+
+    let repin =
+        lore_revision::branch::test_util::repin_links_future_size(&repository, &token, &state);
+    let write = state.serialize(repository.clone(), &token);
+
+    assert!(
+        repin < size_of_val(&write),
+        "repinning links holds {repin} bytes, a state write {}",
+        size_of_val(&write)
+    );
+}
+
+/// Commits `count` revisions on a line from `parent` in `repository`, each adding a file named
+/// after `line`, returning the hash and number of each.
+async fn commit_line(
+    repository: &Arc<RepositoryContext>,
+    line_name: &str,
+    parent: Hash,
+    count: usize,
+) -> Vec<(Hash, u64)> {
+    let branch = in_memory::branch_id();
+    let mut line = Vec::with_capacity(count);
+    let mut current = parent;
+    for _ in 0..count {
+        let state = if current.is_zero() {
+            State::new()
+        } else {
+            in_memory::revision_state(repository, current).await
+        };
+        in_memory::add(
+            &state,
+            repository.clone(),
+            lore_revision::node::ROOT_NODE,
+            in_memory::file(&format!("{line_name}{}.txt", line.len())),
+            &format!("{line_name}{}.txt", line.len()),
+        )
+        .await;
+        current = in_memory::commit(repository, &state, current, branch).await;
+        let number = in_memory::revision_state(repository, current)
+            .await
+            .revision_number();
+        line.push((current, number));
+    }
+    line
+}
+
+/// The repository `repository` reached through a link at each of `pins`, as (pin, number, leads).
+fn reached_at(
+    repository: &Arc<RepositoryContext>,
+    pins: &[(Hash, u64, bool)],
+) -> lore_revision::link::ReachedRepository {
+    lore_revision::link::ReachedRepository {
+        repository: repository.id,
+        context: repository.clone(),
+        reaches: pins
+            .iter()
+            .enumerate()
+            .map(
+                |(position, &(pin, _number, leads))| lore_revision::link::LinkReach {
+                    repository: repository.id,
+                    pin,
+                    branch: in_memory::branch_id(),
+                    mount_path: format!("mount{position}"),
+                    depth: 1,
+                    leads,
+                },
+            )
+            .collect(),
+        pins: pins
+            .iter()
+            .map(|&(pin, number, _leads)| lore_revision::link::WalkedPin {
+                pin,
+                number,
+                linked: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+/// A linked repository several links reach starts its branch at the newest of their pins when
+/// they are on one line, and where the walk spends its budget first, at the higher numbered one.
+/// Pins on lines that diverged refuse the create, unless the diverged link is one the staged state
+/// replaces.
+#[tokio::test]
+async fn a_cascade_starts_at_the_newest_pin_on_one_line() {
+    let (immutable, mutable, execution) = crate::helper::test_store_create()
+        .await
+        .expect("creating the stores");
+    lore_spawn!(LORE_CONTEXT.scope(execution, async move {
+        let repository = in_memory::repository(immutable, mutable);
+        let base = commit_line(&repository, "base", Hash::default(), 1).await[0];
+        let line = commit_line(&repository, "line", base.0, 2).await;
+        let other = commit_line(&repository, "other", base.0, 1).await[0];
+        let start = |pins: &[(Hash, u64, bool)]| {
+            lore_revision::branch::cascade_start(reached_at(&repository, pins))
+        };
+
+        let newer = start(&[(base.0, base.1, true), (line[1].0, line[1].1, true)])
+            .await
+            .expect("pins on one line");
+        assert_eq!(newer.start().pin, line[1].0);
+
+        let refused = start(&[(line[1].0, line[1].1, true), (other.0, other.1, true)])
+            .await
+            .err()
+            .expect("pins on diverged lines");
+        assert!(refused.is_invalid_arguments(), "{refused}");
+
+        let staged = start(&[(line[1].0, line[1].1, true), (other.0, other.1, false)])
+            .await
+            .expect("a replaced link doesn't choose the pin");
+        assert_eq!(staged.start().pin, line[1].0);
+
+        let long = commit_line(
+            &repository,
+            "long",
+            base.0,
+            lore_revision::branch::MAX_DIVERGENT_HISTORY_LENGTH + lore_revision::find::BATCH_COUNT,
+        )
+        .await;
+        let tip = long[long.len() - 1];
+        let exhausted = start(&[(other.0, other.1, true), (tip.0, tip.1, true)])
+            .await
+            .expect("a spent budget proves neither");
+        assert_eq!(exhausted.start().pin, tip.0);
+    }))
+    .await
+    .expect("the test task");
+}
+
+/// A repository is repinned after every repository it links, and a link cycle is cut.
+#[test]
+fn repin_levels_order_each_repository_after_those_it_links() {
+    // 0 links 1 and 2, 2 links 1, and 3 and 4 link each other.
+    let levels = repin_levels(&[vec![1, 2], vec![], vec![1], vec![4], vec![3]]);
+    assert_eq!(levels, [vec![1, 4], vec![2, 3], vec![0]]);
+}

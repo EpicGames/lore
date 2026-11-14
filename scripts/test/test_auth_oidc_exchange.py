@@ -22,7 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from error_types import LoreException
+from error_types import LoreException, ProtectedError
 from lore_server import (
     _kill_server_by_pid,
     allocate_free_port,
@@ -529,3 +529,44 @@ def test_listing_staged_links_from_a_repository_no_longer_granted_points_at_requ
         denied.link_list(staged=True)
 
     assert_points_at_requesting_access(refused.value, linked_id)
+
+
+@pytest.mark.smoke
+def test_a_branch_create_linked_repositories_refuse_names_them_and_takes_back_the_rest(
+    exchange_env, make_repo
+):
+    """A branch create whose token grants nothing on two linked repositories
+    fails with the first refusal, names both links, deletes the branch it made
+    in the other linked repository, and leaves the parent on its branch."""
+    provider = exchange_env.provider
+    parent, parent_id = granted_repository(exchange_env, make_repo)
+    healthy, healthy_id = granted_repository(exchange_env, make_repo)
+    refusing = [granted_repository(exchange_env, make_repo)[0] for _ in range(2)]
+    for repo in (parent, healthy, *refusing):
+        seed_commit_and_push(repo)
+    parent.link_add("vendor/healthy", healthy.get_id(), "/")
+    for position, repo in enumerate(refusing):
+        parent.link_add(f"vendor/refusing{position}", repo.get_id(), "/")
+    parent.commit("Link three repositories")
+    parent.push()
+    scoped = provider.mint_token(
+        USER,
+        resources=[
+            {"resource_id": f"urc-{repo_id}", "permission": GRANTED}
+            for repo_id in (parent_id, healthy_id)
+        ],
+    )
+    branch_id = uuid.uuid4().hex
+
+    with pytest.raises(ProtectedError) as refused:
+        parent.branch_create(
+            "feature", id=branch_id, identity_token=scoped, access_token=scoped
+        )
+
+    assert refused.value.returncode == 17, "the refusal must keep its exit code"
+    for position in range(2):
+        assert f"linked repository at vendor/refusing{position}" in str(refused.value)
+    assert parent.branch_info().name == "main", "the parent must stay on its branch"
+    assert "Restoring deleted branch 'feature'" in healthy.branch_create(
+        "feature", id=branch_id
+    ), "the branch made in the healthy linked repository must have been deleted"

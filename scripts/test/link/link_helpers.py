@@ -143,6 +143,16 @@ def link_pin(repo: Lore, source_id: str) -> str:
     return match.group(1)
 
 
+def link_pin_at(repo: Lore, link_path: str) -> str:
+    """The revision the link at `link_path` pins, read from `link list`."""
+    output = repo.link_list()
+    match = re.search(
+        rf"Link path: {link_path} .*?Revision:\s*(\w+)", output, re.DOTALL
+    )
+    assert match, f"No pin for {link_path} in link list:\n{output}"
+    return match.group(1)
+
+
 def committed_link_pin(repo: Lore, source_id: str) -> str:
     """The pin `repo`'s latest pushed revision holds, which `link list` on `repo` itself does not
     show while the staged state repins the link."""
