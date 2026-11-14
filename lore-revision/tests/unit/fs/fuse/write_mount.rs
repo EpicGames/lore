@@ -20785,11 +20785,11 @@ async fn empty_directories_a_commit_adds_are_settled_and_their_removals_recorded
 }
 
 /// H20: an empty directory added and staged, then removed before the commit, when no commit
-/// reads content: the RMDIR of an added directory records nothing, and the commit stores the
-/// directory. The commit hands it to its settle, whose pre-record finds no directory at its path
-/// and records the deletion, so status reports it and a remount keeps it deleted.
+/// reads content: the RMDIR of an added directory records nothing, and the commit leaves the
+/// directory out, as the working tree no longer holds it, handing its settle nothing of it: no
+/// deletion is recorded, nothing is changed past the commit, and a remount holds no `e`.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_added_directory_removed_between_the_stage_and_the_commit_is_recorded_deleted() {
+async fn an_added_directory_removed_between_the_stage_and_the_commit_is_left_out() {
     let instance = Instance::new(&[("keep.txt", b"k")]).await;
     LORE_CONTEXT
         .scope(fuse_fixture::setup_test_execution(), async {
@@ -20797,36 +20797,32 @@ async fn an_added_directory_removed_between_the_stage_and_the_commit_is_recorded
             fs.mkdir(&request(), ROOT_INO, b"e", libc::S_IFDIR | 0o755, 0o022)
                 .await
                 .expect("mkdir");
+            create_with(&fs, ROOT_INO, "n.txt", b"new").await;
             stage_through(&instance, &fs).await.expect("stage");
             fs.rmdir(&request(), ROOT_INO, b"e").await.expect("rmdir");
             assert!(deleted(&instance).is_empty(), "{:?}", deleted(&instance));
 
             let revision = commit_staged(&instance, &fs).await.expect("commit");
 
+            assert!(committed_node(&instance, revision, "n.txt").await.is_file());
             assert!(
-                committed_node(&instance, revision, "e")
-                    .await
-                    .is_directory()
-            );
-            assert!(
-                deleted(&instance).iter().any(|line| line == "e"),
-                "the deletion list misses e: {:?}",
+                !deleted(&instance).iter().any(|line| line == "e"),
+                "the deletion list holds e: {:?}",
                 deleted(&instance)
             );
-            assert_eq!(changed_paths(&instance, &fs).await, vec!["e"]);
+            assert!(changed_paths(&instance, &fs).await.is_empty());
             let again = provider_at(&instance, revision).await;
             assert!(lookup(&again, ROOT_INO, "e").await.is_err(), "e is back");
         })
         .await;
 }
 
-/// H20: [`an_added_directory_removed_between_the_stage_and_the_commit_is_recorded_deleted`] with
-/// the commit's reconcile refused, as a commit dropped before its settle: its pre-record alone
-/// records the directory's deletion. The settle stays owed, so the UNLINK of a file the commit
-/// stored, still marked added as no settle reached it, records its deletion too, and a remount
-/// keeps both deleted.
+/// H20: [`an_added_directory_removed_between_the_stage_and_the_commit_is_left_out`] with the
+/// commit's reconcile refused, as a commit dropped before its settle: the directory left out is
+/// recorded nowhere. The settle stays owed, so the UNLINK of a file the commit stored, still
+/// marked added as no settle reached it, records its deletion, and a remount holds neither.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_commit_dropped_before_its_settle_has_recorded_and_keeps_recording() {
+async fn a_commit_dropped_before_its_settle_keeps_recording() {
     use lore_revision::fs::fuse::filesystem::WriteStep;
 
     let instance = Instance::new(&[("keep.txt", b"k")]).await;
@@ -20848,8 +20844,8 @@ async fn a_commit_dropped_before_its_settle_has_recorded_and_keeps_recording() {
                 Some(b"eff".to_vec())
             );
             assert!(
-                deleted(&instance).iter().any(|line| line == "e"),
-                "the pre-record misses e: {:?}",
+                !deleted(&instance).iter().any(|line| line == "e"),
+                "the pre-record holds e: {:?}",
                 deleted(&instance)
             );
             assert!(fs_node(&instance, &fs, "f.txt").await.is_dirty_add());
@@ -20868,6 +20864,39 @@ async fn a_commit_dropped_before_its_settle_has_recorded_and_keeps_recording() {
                     "{name} is back"
                 );
             }
+        })
+        .await;
+}
+
+/// The settle a commit owes records the deletion of each handed path the served State holds no
+/// directory at, as no settle reaches it, and leaves a handed directory it holds to the settle.
+#[tokio::test(flavor = "multi_thread")]
+async fn owing_a_settle_records_the_deletion_of_a_handed_path_holding_no_directory() {
+    use lore_revision::util::path::RelativePath;
+
+    let instance = Instance::new(&[("keep.txt", b"k")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            fs.mkdir(&request(), ROOT_INO, b"d", libc::S_IFDIR | 0o755, 0o022)
+                .await
+                .expect("mkdir");
+            let handed = ["d", "e", "keep.txt"]
+                .map(|path| RelativePath::new_from_initial_path(path).expect("a path"));
+
+            let owed = fs.owe_settle(handed.to_vec()).await;
+
+            let recorded = deleted(&instance);
+            assert!(
+                recorded.iter().any(|line| line == "e")
+                    && recorded.iter().any(|line| line == "keep.txt"),
+                "the pre-record: {recorded:?}"
+            );
+            assert!(
+                !recorded.iter().any(|line| line == "d"),
+                "the pre-record holds d: {recorded:?}"
+            );
+            drop(owed);
         })
         .await;
 }
@@ -21162,11 +21191,11 @@ async fn a_directory_its_settle_kept_dirty_records_its_removal() {
 }
 
 /// H20: an added empty directory staged, then replaced by a file of its name before the commit:
-/// the commit stores the directory and hands it to its settle, whose pre-record finds a file at
-/// the path and records the directory's deletion. The file is left as it stands, added, which a
-/// forced sync must not delete; a remount serves it.
+/// the commit leaves the directory out, as the working tree holds a file at its path, and hands
+/// its settle nothing of it, so no deletion is recorded. The file is left as it stands, added,
+/// which a forced sync must not delete; a remount serves it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_handed_directory_path_now_holding_a_file_is_recorded_and_the_file_kept() {
+async fn a_staged_directory_path_now_holding_a_file_leaves_the_directory_out_and_the_file_kept() {
     let instance = Instance::new(&[("keep.txt", b"k")]).await;
     LORE_CONTEXT
         .scope(fuse_fixture::setup_test_execution(), async {
@@ -21174,16 +21203,25 @@ async fn a_handed_directory_path_now_holding_a_file_is_recorded_and_the_file_kep
             fs.mkdir(&request(), ROOT_INO, b"e", libc::S_IFDIR | 0o755, 0o022)
                 .await
                 .expect("mkdir");
+            create_with(&fs, ROOT_INO, "n.txt", b"new").await;
             stage_through(&instance, &fs).await.expect("stage");
             fs.rmdir(&request(), ROOT_INO, b"e").await.expect("rmdir");
             create_with(&fs, ROOT_INO, "e", b"a file").await;
 
             let revision = commit_staged(&instance, &fs).await.expect("commit");
 
+            assert!(committed_node(&instance, revision, "n.txt").await.is_file());
             assert!(
-                committed_node(&instance, revision, "e")
+                state_at(&instance, revision)
                     .await
-                    .is_directory()
+                    .find_subnode(
+                        instance.fixture.repository.clone(),
+                        ROOT_NODE,
+                        hash_string("e")
+                    )
+                    .await
+                    .is_err_and(|error| error.is_node_not_found()),
+                "the revision holds a node at e"
             );
             let node = fs_node(&instance, &fs, "e").await;
             assert!(
@@ -21191,8 +21229,8 @@ async fn a_handed_directory_path_now_holding_a_file_is_recorded_and_the_file_kep
                 "the file at e lost its add"
             );
             assert!(
-                deleted(&instance).iter().any(|line| line == "e"),
-                "the deletion list misses e: {:?}",
+                !deleted(&instance).iter().any(|line| line == "e"),
+                "the deletion list holds e: {:?}",
                 deleted(&instance)
             );
             let again = provider_at(&instance, revision).await;

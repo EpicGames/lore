@@ -548,6 +548,22 @@ impl Node {
         (self.flags & NodeFlags::DirtyCopy) == NodeFlags::DirtyCopy.bits()
     }
 
+    /// Whether the node is marked dirty for a change of its own, an action bit with no staged change
+    /// to claim it, as a directory marked dirty as added or moved is, rather than by the bare `Dirty`
+    /// bit a mark below carries up.
+    pub fn is_dirty_in_own_right(&self) -> bool {
+        self.is_dirty() && !self.is_staged() && self.action_bits() != 0
+    }
+
+    /// Whether a staged move that takes a node out of this directory stages it for the commit's
+    /// rehash: one a commit or a realize gave an address, carrying no dirty change of its own. One
+    /// with no address stays unstaged, for the commit to drop, which a staged bit would make it
+    /// keep. A staged bit beside a change of its own would read the change as staged; the commit
+    /// stages such a directory for its rehash once the change is left out.
+    pub fn stages_when_left(&self) -> bool {
+        !self.address.is_zero() && !self.is_dirty_in_own_right()
+    }
+
     /// Check if node is dirty or staged (has any lifecycle change)
     pub fn is_dirty_or_staged(&self) -> bool {
         self.is_dirty() || self.is_staged()

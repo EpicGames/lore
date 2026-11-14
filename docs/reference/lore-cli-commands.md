@@ -393,7 +393,9 @@ virtual clone writes no files and reads them from the remote when a command need
 * `--view <view>` — Optional client side view filter file
 * `--revision <revision>` — Optional revision to sync
 * `--branch <branch>` — Optional branch to sync (shorthand for a full revision specifier)
-* `--bare` — Clone without files, only fetch latest revision tree
+* `--bare` — Clone without files, only fetch latest revision tree. Don't commit after merging, reverting or
+  cherry-picking in such an instance: the commit can delete a directory the instance never had on disk, with everything
+  in it
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into
   place
 * `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
@@ -416,8 +418,9 @@ virtual clone writes no files and reads them from the remote when a command need
 * `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 * `--no-tracking` — Clone without local repository tracking (memory-only stores)
-* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies).
-  A root file inside a link is skipped
+* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their
+  dependencies). A root file inside a link is skipped. Don't commit after merging, reverting or cherry-picking in such
+  an instance: the commit can delete a directory the instance never had on disk, with everything in it
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based clone
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based clone
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
@@ -752,7 +755,9 @@ Switch to a different branch
 * `--dry-run` — Do a dry run sync and only report what changes would be done, do not change anything in the file system
 * `--local` — Keep last local latest revision, do not sync latest revision from remote (implied by offline mode)
 * `--reset` — Reset any local modified files to match the incoming revision
-* `--bare` — Only update anchor tracking without modifying or verifying files, useful for bare repositories
+* `--bare` — Only update anchor tracking without modifying or verifying files, useful for bare repositories. Don't
+  commit after merging, reverting or cherry-picking in such an instance: the commit can delete a directory the instance
+  never had on disk, with everything in it
 
 ## `lore branch push`
 
@@ -1174,7 +1179,9 @@ Synchronize to a given state of a repository
 * `--forward-changes` — Fast forward any local changes if syncing to a local revision
 * `--reset` — Reset any local modified files to match the incoming revision
 * `--root-file <path>` — Root files for dependency-based selective sync (only sync changes for these files and their
-  dependencies, and the whole folder that replaces a link they lie in). A root file inside a link is skipped
+  dependencies, and the whole folder that replaces a link they lie in). A root file inside a link is skipped. Don't
+  commit after merging, reverting or cherry-picking in such an instance: the commit can delete a directory the instance
+  never had on disk, with everything in it
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based sync
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based sync
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
@@ -2239,7 +2246,9 @@ virtual clone writes no files and reads them from the remote when a command need
 * `--view <view>` — Optional client side view filter file
 * `--revision <revision>` — Optional revision to sync
 * `--branch <branch>` — Optional branch to sync (shorthand for a full revision specifier)
-* `--bare` — Clone without files, only fetch latest revision tree
+* `--bare` — Clone without files, only fetch latest revision tree. Don't commit after merging, reverting or
+  cherry-picking in such an instance: the commit can delete a directory the instance never had on disk, with everything
+  in it
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into
   place
 * `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
@@ -2262,8 +2271,9 @@ virtual clone writes no files and reads them from the remote when a command need
 * `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 * `--no-tracking` — Clone without local repository tracking (memory-only stores)
-* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies).
-  A root file inside a link is skipped
+* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their
+  dependencies). A root file inside a link is skipped. Don't commit after merging, reverting or cherry-picking in such
+  an instance: the commit can delete a directory the instance never had on disk, with everything in it
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based clone
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based clone
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
@@ -2505,7 +2515,9 @@ Synchronize to a repository state
 * `--forward-changes` — Fast forward any local changes if syncing to a local revision
 * `--reset` — Reset any local modified files to match the incoming revision
 * `--root-file <path>` — Root files for dependency-based selective sync (only sync changes for these files and their
-  dependencies, and the whole folder that replaces a link they lie in). A root file inside a link is skipped
+  dependencies, and the whole folder that replaces a link they lie in). A root file inside a link is skipped. Don't
+  commit after merging, reverting or cherry-picking in such an instance: the commit can delete a directory the instance
+  never had on disk, with everything in it
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based sync
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based sync
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)

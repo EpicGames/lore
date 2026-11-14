@@ -1197,6 +1197,12 @@ pub(crate) fn std_stat(path: &std::path::Path) -> std::io::Result<crate::Stat> {
     std::fs::metadata(path).map(|metadata| crate::Stat::from(&metadata))
 }
 
+/// What [`IoDriver::stat`](crate::IoDriver::stat) answers for `path`, read on the calling
+/// thread, for a caller on a blocking thread that reads many paths. Blocking.
+pub fn stat_blocking(path: &std::path::Path) -> std::io::Result<crate::Stat> {
+    stat_impl(path)
+}
+
 #[cfg(not(target_family = "windows"))]
 fn stat_impl(path: &std::path::Path) -> std::io::Result<crate::Stat> {
     std_stat(path)

@@ -17,7 +17,6 @@ use crate::event::EventError;
 use crate::file::stage::route_layer_paths;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
-use crate::filter::query_depth;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
@@ -371,6 +370,15 @@ async fn unstage_parent(
     }
 
     state_staged.mark_dirty();
+    if state_staged.holds_promoted_moves() {
+        Box::pin(crate::file::stage::stage_promoted_moves_of_call(
+            &repository,
+            &state_staged,
+            None,
+        ))
+        .await
+        .forward::<UnstageError>("Failed to stage the move of a directory holding a staged link")?;
+    }
 
     let signature = state_staged
         .serialize(repository.clone(), token)
@@ -461,6 +469,15 @@ async fn unstage_from_layer(
 
     if execution_context().globals().dry_run() {
         return Ok(());
+    }
+    if layer_state.state_staged.holds_promoted_moves() {
+        Box::pin(crate::file::stage::stage_promoted_moves_of_call(
+            &layer_state.repository,
+            &layer_state.state_staged,
+            None,
+        ))
+        .await
+        .forward::<UnstageError>("Failed to stage the move of a directory holding a staged link")?;
     }
 
     let signature = layer::store_staged_or_clear(repository, token, layer, &layer_state)
@@ -1590,11 +1607,7 @@ fn view_below(
     states: Option<FilterStates>,
     path: &RelativePath,
 ) -> Option<FilterStates> {
-    let filter = &repository.filter;
-    states.filter(|&states| {
-        !filter.view.is_empty()
-            && !filter.covers_subtree(states, path, query_depth(path.as_str()), FilterMode::View)
-    })
+    states.filter(|&states| !repository.filter.view_covers_subtree(states, path))
 }
 
 /// Demote a staged-add subtree to dirty in place: clear the staged flags on every

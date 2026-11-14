@@ -185,6 +185,19 @@ const LEFT: Mark = Mark {
     dirty: Some((NodeFlags::Dirty, Ext::Keep, false)),
 };
 
+/// The mark of a directory a staged move takes a node out of, holding `left`: [`LEFT`], or its
+/// dirty half alone where the move stages no such directory ([`Node::stages_when_left`]).
+fn left_mark(left: &Node) -> Mark {
+    if left.stages_when_left() {
+        LEFT
+    } else {
+        Mark {
+            staged: None,
+            ..LEFT
+        }
+    }
+}
+
 /// The holder a reattach replaces, or the absence it checks against, that `check` names.
 fn replacing_or_absent(check: ReattachCheck<'_>) -> (Option<NodeID>, Option<&Absent>) {
     match check {
@@ -240,7 +253,8 @@ impl State {
     ///    walked here unless `walked`.
     /// 2. The directory the node leaves, then the destination, each with its ancestors, marked
     ///    staged and dirty (H8): a commit descends into and rehashes both whatever happens next.
-    ///    Neither where it is the root, whose flags no mark changes.
+    ///    Neither where it is the root, whose flags no mark changes. A directory left that is dirty
+    ///    in its own right is marked dirty alone ([`left_mark`]), and the commit stages it.
     /// 3. The move itself, [`Self::node_move`]'s section: the name stored, the node detached,
     ///    relinked and given its own staged and dirty flags in one critical section, so a failure
     ///    leaves it where it was, under its old name. The node and both parents are refused there
@@ -426,7 +440,8 @@ impl State {
         let marked = marks_source || destination_parent_id != ROOT_NODE;
         let unfinished = UnfinishedChange::armed_if(marked, self);
         if marks_source {
-            self.node_mark(&repository, source_parent_id, LEFT).await?;
+            let left = left_mark(&self.node(repository.clone(), source_parent_id).await?);
+            self.node_mark(&repository, source_parent_id, left).await?;
         }
         self.node_mark_destination(&repository, destination_parent_id, own)
             .await?;
@@ -448,7 +463,8 @@ impl State {
         if from != source_parent_id && from != destination_parent_id && from != ROOT_NODE {
             #[cfg(feature = "state-hooks")]
             log::arm(&self.hooks, log::Arm::MoverBeaten);
-            self.node_mark(&repository, from, LEFT).await?;
+            let left = left_mark(&self.node(repository.clone(), from).await?);
+            self.node_mark(&repository, from, left).await?;
         }
         Ok(())
     }

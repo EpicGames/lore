@@ -16,9 +16,11 @@ use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreString;
 use lore_revision::lore::RepositoryId;
 use lore_revision::node::Node;
+use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::stage::StageOptions;
+use lore_revision::state::Mark;
 use lore_revision::state::State;
 
 use crate::helper::TestRepository;
@@ -119,6 +121,27 @@ pub async fn staged(instance: &TestRepository, signature: Hash) -> Arc<State> {
     State::deserialize(instance.repository.clone(), signature)
         .await
         .expect("the staged state")
+}
+
+/// Renames `from` to `to` below `instance`'s working tree, then stages the move, as `lore stage
+/// move` does.
+pub async fn staged_moved(instance: &TestRepository, from: &str, to: &str) -> Arc<State> {
+    rename(instance, from, to);
+    staged_move(instance, from, to).await
+}
+
+/// Stages the move of `from` to `to`, which the working tree holds moved.
+pub async fn staged_move(instance: &TestRepository, from: &str, to: &str) -> Arc<State> {
+    let signature = lore_revision::file::stage::stage_move(
+        instance.repository.clone(),
+        &instance.write_token,
+        instance.path.join(from).to_string_lossy().into_owned(),
+        instance.path.join(to).to_string_lossy().into_owned(),
+        StageOptions::default(),
+    )
+    .await
+    .expect("the staged move");
+    staged(instance, signature).await
 }
 
 /// Writes `files` as [`written`] does and commits them.
@@ -247,4 +270,56 @@ pub async fn chained(instance: &TestRepository) -> (NodeID, NodeID, BTreeMap<Str
     dirty_moved(instance, "h/x.txt", "h/sub/x.txt").await;
     dirty_moved(instance, "y.txt", "h/x.txt").await;
     (x, y, held)
+}
+
+/// Asserts that each directory of `revision`, which holds `held`, holds the address its children
+/// hash to, as a commit rehashing it derives.
+pub async fn assert_addresses(
+    instance: &TestRepository,
+    revision: &State,
+    held: &BTreeMap<String, NodeID>,
+) {
+    let rehashed = State::deserialize(instance.repository.clone(), revision.revision())
+        .await
+        .expect("the revision again");
+    let mut directories = vec![ROOT_NODE];
+    for node in held.values() {
+        if node_of(instance, revision, *node).await.is_directory() {
+            directories.push(*node);
+        }
+    }
+    for directory in &directories {
+        rehashed
+            .node_mark(
+                &instance.repository,
+                *directory,
+                Mark::staged(NodeFlags::Staged, false),
+            )
+            .await
+            .expect("the directory marked for its rehash");
+    }
+    lore_revision::commit::rehash_directory(
+        instance.repository.clone(),
+        rehashed.clone(),
+        ROOT_NODE,
+    )
+    .await
+    .expect("the rehash");
+    let root = revision
+        .tree(instance.repository.clone())
+        .await
+        .expect("the revision's tree")
+        .hash_root;
+    assert_eq!(
+        node_of(instance, &rehashed, ROOT_NODE).await.address.hash,
+        root,
+        "the root holds the hash its children hash to"
+    );
+    for directory in directories.into_iter().skip(1) {
+        assert_eq!(
+            node_of(instance, &rehashed, directory).await.address,
+            node_of(instance, revision, directory).await.address,
+            "directory {directory} holds the address its children hash to"
+        );
+    }
 }

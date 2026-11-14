@@ -3,6 +3,7 @@
 // Fixtures build working-tree state directly; what these test is how the commit reads it.
 #![allow(clippy::disallowed_methods)]
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -11,9 +12,12 @@ use async_trait::async_trait;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::runtime;
 use lore_base::types::Hash;
+use lore_base::types::TypedBytes;
 use lore_revision::branch;
+use lore_revision::change::FileAction;
 use lore_revision::commit::*;
 use lore_revision::filter::Filter;
+use lore_revision::fs::filesystem_provider::CaseLookup;
 use lore_revision::fs::filesystem_provider::FilesystemProvider;
 use lore_revision::fs::filesystem_provider::FsError;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
@@ -26,18 +30,39 @@ use lore_revision::layer;
 use lore_revision::layer::Layer;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
+use lore_revision::node::NodeDelta;
+use lore_revision::node::NodeID;
+use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::state::State;
 use serde::Serialize;
 
+use crate::dirty_move_fixture::assert_addresses;
+use crate::dirty_move_fixture::committed;
+use crate::dirty_move_fixture::dirtied;
+use crate::dirty_move_fixture::holds;
+use crate::dirty_move_fixture::node_at;
+use crate::dirty_move_fixture::node_id_at;
+use crate::dirty_move_fixture::node_of;
+use crate::dirty_move_fixture::removed_directory;
+use crate::dirty_move_fixture::restaged;
+use crate::dirty_move_fixture::stage_path;
+use crate::dirty_move_fixture::staged_moved;
+use crate::dirty_move_fixture::staged_tree;
+use crate::dirty_move_fixture::tree_paths;
+use crate::dirty_move_fixture::with_instance;
+use crate::dirty_move_fixture::written;
 use crate::fs::filesystem_provider::TestFilesystemProvider;
 use crate::fs::filesystem_provider::setup_test_execution;
 use crate::fs::filesystem_provider::test_execution_with;
 use crate::fs::filesystem_provider::test_repository;
 use crate::fs::filesystem_provider::test_store_create;
 use crate::helper::RepositoryContextCreationArgsExt;
+use crate::helper::TestRepository;
 use crate::helper::default_repository_creation_args;
+use crate::helper::mount_intermediate_at;
+use crate::helper::test_commit as committed_state;
 
 /// One commit reads the working tree through the one operation it opens, whatever it
 /// commits: a provider that freezes hands out one snapshot, and a second opened partway
@@ -74,34 +99,1205 @@ async fn one_call_reads_the_working_tree_through_one_operation() {
     );
 }
 
-/// A staged file the working tree no longer holds is reported rather than fragmented: what
-/// a commit stores for a file it reads from the working tree, and a path holding nothing
-/// has nothing to store.
+/// A commit of a staged edit whose file the working tree no longer holds takes the file's
+/// deletion, as it takes what the working tree holds at a staged path: the revision lacks the file,
+/// and its delta records the deletion.
 #[tokio::test]
-async fn a_staged_file_the_working_tree_no_longer_holds_is_reported() {
+async fn a_commit_deletes_a_staged_edit_the_working_tree_no_longer_holds() {
+    with_instance(|instance| async move {
+        let first = committed(&instance, &["f.txt", "other.txt"]).await;
+        let held = tree_paths(&instance, &first).await;
+        restaged(&instance, "f.txt").await;
+        std::fs::remove_file(instance.path.join("f.txt")).expect("the delete on disk");
+
+        let revision = committed_state(&instance, "Deleted").await;
+        let kept = tree_paths(&instance, &revision).await;
+        assert_eq!(kept.keys().collect::<Vec<_>>(), ["other.txt"]);
+        assert_eq!(kept["other.txt"], held["other.txt"]);
+        assert_eq!(
+            delta_of(&instance, &revision).await,
+            [(held["f.txt"], FileAction::Delete as u16)]
+        );
+    })
+    .await;
+}
+
+/// A commit of a staged add whose file the working tree no longer holds commits nothing for it:
+/// the revision holds the committed directory it was added to unchanged and the other staged
+/// change, and its delta records nothing of the add.
+#[tokio::test]
+async fn a_commit_drops_a_staged_add_the_working_tree_no_longer_holds() {
+    with_instance(|instance| async move {
+        let first = committed(&instance, &["c/keep.txt", "other.txt"]).await;
+        let held = tree_paths(&instance, &first).await;
+        written(&instance, &["c/new.txt"]);
+        let staged = stage_path(&instance, "c/new.txt").await;
+        let added = node_id_at(&instance, &staged, "c/new.txt").await;
+        std::fs::remove_file(instance.path.join("c/new.txt")).expect("the delete on disk");
+        restaged(&instance, "other.txt").await;
+
+        let revision = committed_state(&instance, "Edited").await;
+        assert_eq!(tree_paths(&instance, &revision).await, held);
+        assert_eq!(
+            node_of(&instance, &revision, held["c"]).await.address,
+            node_of(&instance, &first, held["c"]).await.address
+        );
+        let delta = delta_of(&instance, &revision).await;
+        assert!(
+            delta.iter().all(|(node, _)| *node != added),
+            "the delta records the add: {delta:?}"
+        );
+    })
+    .await;
+}
+
+/// A commit of a staged edit, and of a staged add, whose path the working tree holds a directory
+/// at takes the file as gone: the edited file's deletion, and nothing of the add. The directory
+/// stays on disk untracked, for a scan or a stage to take as a change of kind.
+#[tokio::test]
+async fn a_commit_takes_a_staged_file_whose_path_holds_a_directory_as_gone() {
+    for added in [false, true] {
+        with_instance(|instance| async move {
+            let first = committed(&instance, &["a.txt", "other.txt"]).await;
+            let held = tree_paths(&instance, &first).await;
+            let path = if added {
+                written(&instance, &["n.txt"]);
+                stage_path(&instance, "n.txt").await;
+                restaged(&instance, "other.txt").await;
+                "n.txt"
+            } else {
+                restaged(&instance, "a.txt").await;
+                "a.txt"
+            };
+            std::fs::remove_file(instance.path.join(path)).expect("the delete on disk");
+            written(&instance, &[&format!("{path}/inside.txt")]);
+
+            let revision = committed_state(&instance, "Replaced").await;
+            let kept = tree_paths(&instance, &revision).await;
+            if added {
+                assert_eq!(kept, held, "the revision's paths");
+            } else {
+                assert_eq!(kept.keys().collect::<Vec<_>>(), ["other.txt"]);
+                assert_eq!(
+                    delta_of(&instance, &revision).await,
+                    [(held["a.txt"], FileAction::Delete as u16)]
+                );
+            }
+            let (_, staged, _) = State::deserialize_current_and_staged(instance.repository.clone())
+                .await
+                .expect("the states");
+            if let Some(staged) = staged {
+                assert!(
+                    !holds(&instance, &staged, path).await,
+                    "added {added}: the staged tree tracks {path}"
+                );
+            }
+            assert!(
+                instance.path.join(path).join("inside.txt").is_file(),
+                "added {added}: the directory left the working tree"
+            );
+        })
+        .await;
+    }
+}
+
+/// A commit of a staged move whose file the working tree holds at its committed path again, and
+/// at the moved path no longer, leaves the move out: the revision holds the file where it was
+/// committed, with its committed content, and records nothing of it.
+#[tokio::test]
+async fn a_commit_leaves_out_a_staged_move_whose_file_went_back() {
+    with_instance(|instance| async move {
+        let first = committed(&instance, &["a.txt", "other.txt"]).await;
+        let held = tree_paths(&instance, &first).await;
+        staged_moved(&instance, "a.txt", "b.txt").await;
+        std::fs::rename(instance.path.join("b.txt"), instance.path.join("a.txt"))
+            .expect("the move back on disk");
+        std::fs::write(instance.path.join("a.txt"), b"edited after the move back")
+            .expect("the edit on disk");
+        restaged(&instance, "other.txt").await;
+
+        let revision = committed_state(&instance, "Edited").await;
+        assert_eq!(tree_paths(&instance, &revision).await, held);
+        assert_eq!(
+            node_of(&instance, &revision, held["a.txt"]).await.address,
+            node_of(&instance, &first, held["a.txt"]).await.address
+        );
+        let delta = delta_of(&instance, &revision).await;
+        assert!(
+            delta.iter().all(|(node, _)| *node != held["a.txt"]),
+            "the delta records the moved file: {delta:?}"
+        );
+    })
+    .await;
+}
+
+/// What stands at a staged-moved directory's committed path once the directory left its new one,
+/// and what else changed below it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AtSource {
+    /// The directory, moved back.
+    MovedBack,
+    /// The directory moved back, a file in it edited since.
+    EditedAfter,
+    /// The directory moved back in another case, which Linux tells apart.
+    OtherCase,
+    /// The directory moved back with a file added and staged in it after the move.
+    AddedInside,
+    /// The directory moved back with a directory holding a file added and staged in it after the
+    /// move.
+    AddedDirectoryInside,
+    /// The directory moved back with a copy of a file made and staged in it after the move, which a
+    /// stage takes as an add.
+    CopiedInside,
+    /// The directory moved back with a subdirectory a staged move renamed inside it, renamed back.
+    RenamedInside,
+    /// The directory moved back with a directory of equal depth a staged move took into it, moved
+    /// back to its own place.
+    MovedInAndBack,
+    /// The directory moved back with a file and a directory staged moves took into it, which stay
+    /// inside it.
+    MovedInAndKept,
+    /// The directory moved back with a file in it staged for deletion.
+    DeletedInside,
+    /// The directory moved back with a file a staged move took out of it.
+    MovedOut,
+    /// The directory moved back with a subdirectory a staged move renamed inside it, kept so.
+    RenamedInsideKept,
+    /// A file.
+    File,
+    /// A directory staged as added there since, which holds the name in the staged tree.
+    StagedDirectory,
+}
+
+/// A commit of a staged directory move whose directory the working tree holds at its committed path
+/// again, and at its moved path no longer, leaves the move out: the directory goes back with what
+/// moved with it, as committed, and the delta records no change of theirs, a file edited since
+/// keeping its committed content. A directory that moved inside it and went back too returns to
+/// its own place, whatever order the two are met in. What came into it otherwise leaves: a file or
+/// a directory a separate move brought in, and a subdirectory renamed inside it that stays so. A
+/// staged add or copy in it, a directory added with what it holds among them, is left out and stays
+/// marked dirty alone at the place it went back to, so the directory takes no staged mark past the
+/// commit, and a stage of the directory and a commit then take it. A staged deletion in it is
+/// committed, and a file a staged move took out of it stays where the move took it. Where a file or
+/// a staged node stands at the committed path, the moved directory is gone, and the commit deletes
+/// it with what it holds. Every directory holds the address its children hash to.
+#[tokio::test]
+async fn a_commit_leaves_out_a_staged_directory_move_whose_directory_went_back() {
+    let mut cases = vec![
+        AtSource::MovedBack,
+        AtSource::EditedAfter,
+        AtSource::AddedInside,
+        AtSource::AddedDirectoryInside,
+        AtSource::CopiedInside,
+        AtSource::RenamedInside,
+        AtSource::MovedInAndBack,
+        AtSource::MovedInAndKept,
+        AtSource::DeletedInside,
+        AtSource::MovedOut,
+        AtSource::RenamedInsideKept,
+        AtSource::File,
+        AtSource::StagedDirectory,
+    ];
+    if cfg!(target_os = "linux") {
+        cases.push(AtSource::OtherCase);
+    }
+    for at_source in cases {
+        with_instance(|instance| async move {
+            let first = committed(
+                &instance,
+                &["d/k.txt", "d/s/g.txt", "m/h.txt", "x.txt", "other.txt"],
+            )
+            .await;
+            let held = tree_paths(&instance, &first).await;
+            match at_source {
+                AtSource::RenamedInside | AtSource::RenamedInsideKept => {
+                    staged_moved(&instance, "d/s", "d/t").await;
+                }
+                AtSource::MovedInAndBack | AtSource::MovedInAndKept => {
+                    staged_moved(&instance, "m", "d/m").await;
+                }
+                _ => {}
+            }
+            staged_moved(&instance, "d", "e").await;
+            match at_source {
+                AtSource::AddedInside => {
+                    written(&instance, &["e/new.txt"]);
+                    stage_path(&instance, "e/new.txt").await;
+                }
+                AtSource::AddedDirectoryInside => {
+                    written(&instance, &["e/n/f.txt"]);
+                    stage_path(&instance, "e/n").await;
+                }
+                AtSource::CopiedInside => {
+                    std::fs::copy(instance.path.join("x.txt"), instance.path.join("e/x2.txt"))
+                        .expect("the copy on disk");
+                    lore_revision::file::dirty::dirty_copy(
+                        instance.repository.clone(),
+                        instance.path.join("x.txt").to_string_lossy().into_owned(),
+                        instance
+                            .path
+                            .join("e/x2.txt")
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                    .await
+                    .expect("the dirty copy");
+                    stage_path(&instance, "e/x2.txt").await;
+                }
+                AtSource::MovedInAndKept => {
+                    staged_moved(&instance, "x.txt", "e/x.txt").await;
+                }
+                AtSource::DeletedInside => {
+                    std::fs::remove_file(instance.path.join("e/k.txt")).expect("the removal");
+                    stage_path(&instance, "e/k.txt").await;
+                }
+                AtSource::MovedOut => {
+                    staged_moved(&instance, "e/k.txt", "k.txt").await;
+                }
+                _ => {}
+            }
+            match at_source {
+                AtSource::OtherCase => {
+                    std::fs::rename(instance.path.join("e"), instance.path.join("D"))
+                        .expect("the move back on disk");
+                }
+                AtSource::File => {
+                    removed_directory(&instance, "e");
+                    std::fs::write(instance.path.join("d"), b"a file").expect("the file on disk");
+                }
+                AtSource::StagedDirectory => {
+                    removed_directory(&instance, "e");
+                    written(&instance, &["d/n.txt"]);
+                    stage_path(&instance, "d/n.txt").await;
+                }
+                _ => {
+                    std::fs::rename(instance.path.join("e"), instance.path.join("d"))
+                        .expect("the move back on disk");
+                }
+            }
+            match at_source {
+                AtSource::EditedAfter => {
+                    std::fs::write(instance.path.join("d/k.txt"), b"edited after the move back")
+                        .expect("the edit on disk");
+                }
+                AtSource::RenamedInside => {
+                    std::fs::rename(instance.path.join("d/t"), instance.path.join("d/s"))
+                        .expect("the rename back on disk");
+                }
+                AtSource::MovedInAndBack => {
+                    std::fs::rename(instance.path.join("d/m"), instance.path.join("m"))
+                        .expect("the move back on disk");
+                }
+                _ => {}
+            }
+            restaged(&instance, "other.txt").await;
+
+            let revision = committed_state(&instance, "Edited").await;
+            let kept = tree_paths(&instance, &revision).await;
+            let delta = delta_of(&instance, &revision).await;
+            let left: &[&str] = match at_source {
+                AtSource::MovedInAndKept => &["m", "m/h.txt", "x.txt"],
+                AtSource::DeletedInside => &["d/k.txt"],
+                AtSource::RenamedInsideKept => &["d/s", "d/s/g.txt"],
+                AtSource::File => &["d", "d/k.txt", "d/s", "d/s/g.txt"],
+                _ => &[],
+            };
+            let mut expected = held.clone();
+            for path in left {
+                expected.remove(*path);
+            }
+            if at_source == AtSource::MovedOut {
+                let moved = expected.remove("d/k.txt").expect("d/k.txt");
+                expected.insert("k.txt".to_string(), moved);
+            }
+            assert_addresses(&instance, &revision, &kept).await;
+            match at_source {
+                AtSource::File => {
+                    assert_eq!(kept, expected, "{at_source:?}");
+                }
+                AtSource::StagedDirectory => {
+                    assert_eq!(
+                        kept.keys().collect::<Vec<_>>(),
+                        ["d", "d/n.txt", "m", "m/h.txt", "other.txt", "x.txt"]
+                    );
+                    assert_ne!(kept["d"], held["d"], "the moved directory stays");
+                }
+                _ => {
+                    assert_eq!(kept, expected, "{at_source:?}");
+                    if at_source != AtSource::DeletedInside {
+                        assert_eq!(
+                            node_of(&instance, &revision, held["d/k.txt"]).await.address,
+                            node_of(&instance, &first, held["d/k.txt"]).await.address,
+                            "{at_source:?}"
+                        );
+                    }
+                    let deleted: Vec<NodeID> = left.iter().map(|path| held[*path]).collect();
+                    let directories: Vec<NodeID> =
+                        ["d", "d/s", "m"].iter().map(|path| held[*path]).collect();
+                    let recorded = |&(node, action): &(NodeID, u16)| {
+                        node == held["other.txt"]
+                            || deleted.contains(&node)
+                            || (directories.contains(&node) && action == FileAction::Keep as u16)
+                            || (at_source == AtSource::MovedOut && node == held["d/k.txt"])
+                    };
+                    assert!(
+                        delta.iter().all(recorded),
+                        "{at_source:?}: the delta records {delta:?}"
+                    );
+                }
+            }
+            if at_source == AtSource::EditedAfter {
+                let marked = dirtied(&instance, "d/k.txt").await;
+                let node = node_at(&instance, &marked, "d/k.txt").await;
+                assert!(
+                    node.is_dirty_modify(),
+                    "a mark misses the edit, flags {:#x}",
+                    node.flags
+                );
+            }
+            let kept: &[&str] = match at_source {
+                AtSource::AddedInside => &["d/new.txt"],
+                AtSource::AddedDirectoryInside => &["d/n", "d/n/f.txt"],
+                AtSource::CopiedInside => &["d/x2.txt"],
+                _ => &[],
+            };
+            if !kept.is_empty() {
+                assert_kept_marked_dirty(&instance, at_source, kept).await;
+            }
+        })
+        .await;
+    }
+}
+
+/// Asserts that the staged tree past a commit holds each of `kept`, the staged adds a directory that
+/// went back held, a copy staged as an add among them, marked dirty as added and not staged, with
+/// no staged mark on the directory; that the dirty paths a status lists hold the files; and that a
+/// stage of the directory, which takes what is marked dirty, and a commit take them.
+async fn assert_kept_marked_dirty(instance: &TestRepository, at_source: AtSource, kept: &[&str]) {
+    let staged = staged_tree(instance).await;
+    let returned = node_at(instance, &staged, "d").await;
+    assert!(
+        !returned.is_staged(),
+        "{at_source:?}: d keeps no staged mark, flags {:#x}",
+        returned.flags
+    );
+    for path in kept {
+        let node = node_at(instance, &staged, path).await;
+        assert!(
+            node.is_dirty_add() && !node.is_staged(),
+            "{at_source:?}: {path}, flags {:#x}",
+            node.flags
+        );
+    }
+    let listed: Vec<String> = staged
+        .collect_dirty_paths(
+            instance.repository.clone(),
+            ROOT_NODE,
+            lore_revision::util::path::RelativePath::new(),
+        )
+        .await
+        .expect("the dirty paths")
+        .iter()
+        .map(|path| path.as_str().to_string())
+        .collect();
+    let file = kept.last().expect("a kept file");
+    assert!(
+        listed.iter().any(|path| path == file),
+        "{at_source:?}: the paths a status lists hold {file}: {listed:?}"
+    );
+    lore_revision::file::stage::stage(
+        instance.repository.clone(),
+        &instance.write_token,
+        LoreArray::from_vec(vec![LoreString::from(&instance.path.join("d"))]),
+        lore_revision::stage::StageOptions::default(),
+    )
+    .await
+    .expect("the stage of d");
+    let revision = committed_state(instance, "Kept").await;
+    let held = tree_paths(instance, &revision).await;
+    for path in kept {
+        assert!(
+            held.contains_key(*path),
+            "{at_source:?}: the commit takes {path}: {held:?}"
+        );
+    }
+    assert_addresses(instance, &revision, &held).await;
+}
+
+/// What a directory holds that the working tree lacks without its having been deleted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeldOnlyBy {
+    /// A link's mount, `lib`.
+    Link,
+    /// `private`, which the view excludes.
+    View,
+}
+
+/// The repository `instance` commits through for `held_by`: its own, or one whose view excludes
+/// `**/private`.
+fn committing_through(instance: &TestRepository, held_by: HeldOnlyBy) -> Arc<RepositoryContext> {
+    if held_by == HeldOnlyBy::Link {
+        return instance.repository.clone();
+    }
+    let mut filter = (*instance.repository.filter).clone();
+    filter
+        .view
+        .add_exclusion("**/private")
+        .expect("A view line");
+    Arc::new(instance.repository.to_filter_context(Arc::new(filter)))
+}
+
+/// Commits `d/k.txt` and `other.txt` with `d/lib`, a link's mount, or `d/private/p.txt`, as
+/// `held_by` says, then stages the move of `d` to `e`, which the working tree holds moved. The
+/// working tree then lacks `e/private`, as the view excludes it. Answers the committed paths.
+async fn moved_holding(instance: &TestRepository, held_by: HeldOnlyBy) -> BTreeMap<String, NodeID> {
+    let first = match held_by {
+        HeldOnlyBy::Link => {
+            committed(instance, &["d/k.txt", "other.txt"]).await;
+            mount_intermediate_at(
+                &instance.repository,
+                "d/lib",
+                RepositoryId::from(uuid::Uuid::now_v7()),
+                true,
+            )
+            .await;
+            written(instance, &["d/lib/src/Intermediate"]);
+            committed_state(instance, "Linked").await
+        }
+        HeldOnlyBy::View => committed(instance, &["d/k.txt", "d/private/p.txt", "other.txt"]).await,
+    };
+    let held = tree_paths(instance, &first).await;
+    staged_moved(instance, "d", "e").await;
+    if held_by == HeldOnlyBy::View {
+        removed_directory(instance, "e/private");
+    }
+    held
+}
+
+/// A commit of a staged directory move whose directory went back to its committed path leaves the
+/// move out where the directory holds a link's mount or what the view excludes, which keep a
+/// directory gone from the working tree held: it goes back with what it holds, the link's mount
+/// with it, and the revision holds nothing at the moved path. Where its committed path is not held
+/// either, the directory stays held at the moved path, and the move is committed with the deletion
+/// of the files the working tree holds there no longer.
+#[tokio::test]
+async fn a_commit_returns_a_moved_directory_held_only_by_a_link_or_the_view() {
+    for held_by in [HeldOnlyBy::Link, HeldOnlyBy::View] {
+        for went_back in [true, false] {
+            with_instance(|instance| async move {
+                let held = moved_holding(&instance, held_by).await;
+                let to = if went_back { "d" } else { "f" };
+                std::fs::rename(instance.path.join("e"), instance.path.join(to))
+                    .expect("the rename on disk");
+                restaged(&instance, "other.txt").await;
+
+                let through = committing_through(&instance, held_by);
+                let revision = committed_through(&instance, &through, "Moved").await;
+                let case = format!("{held_by:?}, went back {went_back}");
+                let at = if went_back { "d" } else { "e" };
+                let expected: BTreeMap<String, NodeID> = held
+                    .iter()
+                    .filter(|(path, _)| {
+                        went_back || !matches!(path.as_str(), "d/k.txt" | "d/private/p.txt")
+                    })
+                    .map(|(path, node)| {
+                        let path = match path.strip_prefix("d") {
+                            Some(rest) => format!("{at}{rest}"),
+                            None => path.clone(),
+                        };
+                        (path, *node)
+                    })
+                    .collect();
+                let kept = tree_paths(&instance, &revision).await;
+                assert_eq!(kept, expected, "{case}: the revision's paths");
+                assert_addresses(&instance, &revision, &kept).await;
+                if held_by == HeldOnlyBy::Link {
+                    let links = revision
+                        .link_list(instance.repository.clone())
+                        .await
+                        .expect("the link registry");
+                    assert_eq!(
+                        links
+                            .iter()
+                            .map(|link| link.local_node())
+                            .collect::<Vec<_>>(),
+                        [held["d/lib"]],
+                        "{case}: the registry holds the link"
+                    );
+                }
+            })
+            .await;
+        }
+    }
+}
+
+/// A commit of a staged directory move whose directory went back to its committed path is refused
+/// where a link with a staged change lies inside it, whose commit would read the linked tree at the
+/// moved path: the staged tree and the linked repository's branch are as they were.
+#[tokio::test]
+async fn a_commit_refuses_a_staged_link_inside_a_moved_directory_that_went_back() {
+    with_instance(|instance| async move {
+        let linked = RepositoryId::from(uuid::Uuid::now_v7());
+        committed(&instance, &["d/k.txt", "other.txt"]).await;
+        mount_intermediate_at(&instance.repository, "d/lib", linked, true).await;
+        written(&instance, &["d/lib/src/Intermediate"]);
+        committed_state(&instance, "Linked").await;
+        written(&instance, &["d/lib/src/new.txt"]);
+        stage_path(&instance, "d/lib/src/new.txt").await;
+        let staged = staged_tree(&instance).await;
+        let link = node_at(&instance, &staged, "d/lib").await;
+        assert!(link.is_staged(), "d/lib: flags {:#x}", link.flags);
+        staged_moved(&instance, "d", "e").await;
+        std::fs::rename(instance.path.join("e"), instance.path.join("d"))
+            .expect("the rename on disk");
+        let (_, branch) = lore_revision::instance::load_current_anchor_boxed(&instance.repository)
+            .await
+            .expect("the current anchor");
+        let linked_context = instance.repository.to_link_context(linked).await;
+        let latest = async || {
+            branch::load_latest(linked_context.clone(), branch)
+                .await
+                .ok()
+        };
+        let linked_before = latest().await;
+        let staged_before = staged_tree(&instance).await.revision();
+
+        let refused = commit_boxed(
+            instance.repository.clone(),
+            &instance.write_token,
+            CommitOptions::new("Moved".to_string()),
+        )
+        .await;
+        assert!(
+            refused.as_ref().is_err_and(|error| error.is_internal()
+                && error.to_string().contains(
+                    "a staged link lies inside a directory moved back to its committed path; \
+                     stage the move back or unstage it"
+                )),
+            "the commit: {:?}",
+            refused.map(|_| ())
+        );
+        assert_eq!(
+            staged_tree(&instance).await.revision(),
+            staged_before,
+            "the staged tree"
+        );
+        assert_eq!(latest().await, linked_before, "the linked branch");
+    })
+    .await;
+}
+
+/// A commit of a staged directory move whose directory the working tree no longer holds deletes
+/// each file the move took, and the directory with them.
+#[tokio::test]
+async fn a_commit_deletes_a_staged_directory_move_gone_from_the_working_tree() {
+    with_instance(|instance| async move {
+        let first = committed(&instance, &["d/x.txt", "d/y.txt", "other.txt"]).await;
+        let held = tree_paths(&instance, &first).await;
+        staged_moved(&instance, "d", "e").await;
+        std::fs::remove_dir_all(instance.path.join("e")).expect("the delete on disk");
+        restaged(&instance, "other.txt").await;
+
+        let revision = committed_state(&instance, "Deleted").await;
+        let kept = tree_paths(&instance, &revision).await;
+        assert_eq!(kept.keys().collect::<Vec<_>>(), ["other.txt"]);
+        assert_deletes(
+            &instance,
+            &revision,
+            &[held["d"], held["d/x.txt"], held["d/y.txt"]],
+        )
+        .await;
+    })
+    .await;
+}
+
+/// A commit of a staged directory add whose files the working tree no longer holds, while it
+/// holds the directory, takes the directory added and empty; one the working tree no longer holds
+/// either it leaves out.
+#[tokio::test]
+async fn a_commit_takes_a_staged_directory_add_as_the_working_tree_holds_it() {
+    for gone in [false, true] {
+        with_instance(|instance| async move {
+            let first = committed(&instance, &["other.txt"]).await;
+            let other = node_id_at(&instance, &first, "other.txt").await;
+            written(&instance, &["n/a.txt"]);
+            stage_path(&instance, "n").await;
+            if gone {
+                std::fs::remove_dir_all(instance.path.join("n")).expect("the delete on disk");
+            } else {
+                std::fs::remove_file(instance.path.join("n/a.txt")).expect("the delete on disk");
+            }
+            restaged(&instance, "other.txt").await;
+
+            let revision = committed_state(&instance, "Edited").await;
+            let kept = tree_paths(&instance, &revision).await;
+            assert_eq!(kept["other.txt"], other);
+            let expected: &[&str] = if gone {
+                &["other.txt"]
+            } else {
+                &["n", "other.txt"]
+            };
+            assert_eq!(kept.keys().collect::<Vec<_>>(), expected, "gone {gone}");
+        })
+        .await;
+    }
+}
+
+/// A commit of staged edits in a committed directory the working tree no longer holds deletes the
+/// directory with everything below it, as it does where a file stands at its path, which stays
+/// on disk, unmarked.
+#[tokio::test]
+async fn a_commit_deletes_a_directory_removed_after_edits_in_it_were_staged() {
+    for replaced in [false, true] {
+        with_instance(|instance| async move {
+            let first = committed(&instance, &["a/x.txt", "a/y.txt", "other.txt"]).await;
+            let held = tree_paths(&instance, &first).await;
+            restaged(&instance, "a/x.txt").await;
+            restaged(&instance, "a/y.txt").await;
+            removed_directory(&instance, "a");
+            if replaced {
+                std::fs::write(instance.path.join("a"), b"a file").expect("the file on disk");
+            }
+
+            let revision = committed_state(&instance, "Removed").await;
+            let kept = tree_paths(&instance, &revision).await;
+            assert_eq!(
+                kept.keys().collect::<Vec<_>>(),
+                ["other.txt"],
+                "replaced {replaced}"
+            );
+            assert_deletes(
+                &instance,
+                &revision,
+                &[held["a"], held["a/x.txt"], held["a/y.txt"]],
+            )
+            .await;
+            if replaced {
+                let (_, staged, _) =
+                    State::deserialize_current_and_staged(instance.repository.clone())
+                        .await
+                        .expect("the states");
+                assert!(
+                    staged.is_none(),
+                    "the commit left the file at the path marked"
+                );
+                assert_eq!(
+                    std::fs::read(instance.path.join("a")).expect("the file on disk"),
+                    b"a file"
+                );
+            }
+        })
+        .await;
+    }
+}
+
+/// A commit of a staged edit in a committed directory the working tree no longer holds deletes
+/// the committed file beside it that was not staged, with the directory.
+#[tokio::test]
+async fn a_commit_deletes_a_removed_directory_with_a_file_in_it_not_staged() {
+    with_instance(|instance| async move {
+        let first = committed(&instance, &["a/x.txt", "a/y.txt", "other.txt"]).await;
+        let held = tree_paths(&instance, &first).await;
+        restaged(&instance, "a/x.txt").await;
+        removed_directory(&instance, "a");
+
+        let revision = committed_state(&instance, "Removed").await;
+        let kept = tree_paths(&instance, &revision).await;
+        assert_eq!(kept.keys().collect::<Vec<_>>(), ["other.txt"]);
+        assert_deletes(
+            &instance,
+            &revision,
+            &[held["a"], held["a/x.txt"], held["a/y.txt"]],
+        )
+        .await;
+    })
+    .await;
+}
+
+/// A commit of a staged deletion in a committed directory the working tree no longer holds deletes
+/// the directory with everything below it, the staged deletion recorded once.
+#[tokio::test]
+async fn a_commit_deletes_a_removed_directory_that_held_only_a_staged_deletion() {
+    with_instance(|instance| async move {
+        let first = committed(&instance, &["a/x.txt", "a/y.txt", "other.txt"]).await;
+        let held = tree_paths(&instance, &first).await;
+        std::fs::remove_file(instance.path.join("a/x.txt")).expect("the delete on disk");
+        stage_path(&instance, "a/x.txt").await;
+        removed_directory(&instance, "a");
+
+        let revision = committed_state(&instance, "Removed").await;
+        let kept = tree_paths(&instance, &revision).await;
+        assert_eq!(kept.keys().collect::<Vec<_>>(), ["other.txt"]);
+        assert_deletes(
+            &instance,
+            &revision,
+            &[held["a"], held["a/x.txt"], held["a/y.txt"]],
+        )
+        .await;
+    })
+    .await;
+}
+
+/// A commit of staged edits in a committed directory and in one below it, both gone from the
+/// working tree, deletes the upper one with everything below it.
+#[tokio::test]
+async fn a_commit_deletes_a_removed_directory_with_a_removed_directory_in_it() {
+    with_instance(|instance| async move {
+        let first = committed(&instance, &["a/b/x.txt", "a/z.txt", "other.txt"]).await;
+        let held = tree_paths(&instance, &first).await;
+        restaged(&instance, "a/b/x.txt").await;
+        restaged(&instance, "a/z.txt").await;
+        removed_directory(&instance, "a");
+
+        let revision = committed_state(&instance, "Removed").await;
+        let kept = tree_paths(&instance, &revision).await;
+        assert_eq!(kept.keys().collect::<Vec<_>>(), ["other.txt"]);
+        assert_deletes(
+            &instance,
+            &revision,
+            &[held["a"], held["a/b"], held["a/b/x.txt"], held["a/z.txt"]],
+        )
+        .await;
+    })
+    .await;
+}
+
+/// A commit of staged edits in a committed directory the working tree holds, with neither file,
+/// deletes the files and keeps the directory.
+#[tokio::test]
+async fn a_commit_keeps_a_directory_the_working_tree_holds_without_its_staged_files() {
+    with_instance(|instance| async move {
+        let first = committed(&instance, &["a/x.txt", "a/y.txt", "other.txt"]).await;
+        let held = tree_paths(&instance, &first).await;
+        restaged(&instance, "a/x.txt").await;
+        restaged(&instance, "a/y.txt").await;
+        for file in ["a/x.txt", "a/y.txt"] {
+            std::fs::remove_file(instance.path.join(file)).expect("the delete on disk");
+        }
+
+        let revision = committed_state(&instance, "Removed").await;
+        let kept = tree_paths(&instance, &revision).await;
+        assert_eq!(kept.keys().collect::<Vec<_>>(), ["a", "other.txt"]);
+        assert_eq!(kept["a"], held["a"]);
+        assert_deletes(&instance, &revision, &[held["a/x.txt"], held["a/y.txt"]]).await;
+    })
+    .await;
+}
+
+/// A commit of a staged edit in a committed directory the working tree no longer holds, where the
+/// view excludes a directory below it, keeps the directory with what the view excludes and what
+/// was not staged, and deletes the staged file alone.
+#[tokio::test]
+async fn a_commit_keeps_a_removed_directory_holding_what_the_view_excludes() {
+    with_instance(|instance| async move {
+        let first = committed(&instance, &["a/hidden/h.txt", "a/x.txt", "a/y.txt"]).await;
+        let held = tree_paths(&instance, &first).await;
+        restaged(&instance, "a/x.txt").await;
+        removed_directory(&instance, "a");
+        let mut filter = (*instance.repository.filter).clone();
+        filter
+            .view
+            .add_exclusion("/a/hidden/")
+            .expect("A view line");
+        let sparse = Arc::new(instance.repository.to_filter_context(Arc::new(filter)));
+
+        let revision = committed_through(&instance, &sparse, "Removed").await;
+        let kept = tree_paths(&instance, &revision).await;
+        assert_eq!(
+            kept.keys().collect::<Vec<_>>(),
+            ["a", "a/hidden", "a/hidden/h.txt", "a/y.txt"]
+        );
+        assert_deletes(&instance, &revision, &[held["a/x.txt"]]).await;
+    })
+    .await;
+}
+
+/// A commit of a staged deletion in a committed directory the working tree holds under another
+/// case keeps the directory with what else it holds, on a file system that folds no case.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_commit_keeps_a_directory_the_working_tree_holds_in_another_case() {
+    with_instance(|instance| async move {
+        let first = committed(&instance, &["Dir/a.txt", "Dir/b.txt", "other.txt"]).await;
+        let held = tree_paths(&instance, &first).await;
+        std::fs::remove_file(instance.path.join("Dir/a.txt")).expect("the delete on disk");
+        stage_path(&instance, "Dir/a.txt").await;
+        std::fs::rename(instance.path.join("Dir"), instance.path.join("dir"))
+            .expect("the rename on disk");
+
+        let revision = committed_state(&instance, "Deleted").await;
+        let kept = tree_paths(&instance, &revision).await;
+        assert_eq!(
+            kept.keys().collect::<Vec<_>>(),
+            ["Dir", "Dir/b.txt", "other.txt"]
+        );
+        assert_deletes(&instance, &revision, &[held["Dir/a.txt"]]).await;
+    })
+    .await;
+}
+
+/// A commit of a staged edit whose file the working tree holds under another case only is refused
+/// as not found, as the file is not gone, on a file system that folds no case.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_commit_refuses_a_staged_file_the_working_tree_holds_in_another_case() {
+    with_instance(|instance| async move {
+        committed(&instance, &["Foo.txt", "other.txt"]).await;
+        restaged(&instance, "Foo.txt").await;
+        std::fs::rename(instance.path.join("Foo.txt"), instance.path.join("foo.txt"))
+            .expect("the rename on disk");
+
+        let refused = commit_boxed(
+            instance.repository.clone(),
+            &instance.write_token,
+            CommitOptions::new("Edited".to_string()),
+        )
+        .await;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.is_file_not_found()),
+            "the commit: {:?}",
+            refused.map(|_| ())
+        );
+    })
+    .await;
+}
+
+/// A commit of staged edits whose files the working tree no longer holds, on a file system that
+/// folds no case, lists each of their directories once to tell them gone, rather than once for
+/// each file, and deletes them.
+#[tokio::test]
+async fn a_commit_lists_each_directory_of_its_gone_files_once() {
     let dir = lore_base::test_util::TempDir::new("lore-commit-test-");
-    std::fs::write(dir.path().join("gone.txt"), b"content").expect("write file");
+    let filesystem =
+        Arc::new(TestFilesystemProvider::reading(dir.path()).with_case_lookup(CaseLookup::OnMiss));
+    let gone = ["d/a.txt", "d/b.txt", "e/x.txt", "e/y.txt"];
+    for file in gone.iter().chain(&["d/c.txt", "e/z.txt", "keep.txt"]) {
+        let path = dir.path().join(file);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("the directory");
+        std::fs::write(path, b"one").expect("write file");
+    }
     let (immutable_store, mutable_store, execution) =
         test_store_create().await.expect("Making test stores");
     let root = dir.to_path_buf();
-
-    let error = runtime()
+    let counted = filesystem.clone();
+    let (listed, folded) = runtime()
         .spawn(LORE_CONTEXT.scope(execution, async move {
-            let fixture = counting_repository(&root, immutable_store, mutable_store).await;
+            let (fixture, committing) = committing_repository(
+                &root,
+                immutable_store,
+                mutable_store,
+                counted.clone(),
+                Arc::default(),
+            )
+            .await;
             stage_working_tree(&fixture, &root).await;
-            std::fs::remove_file(root.join("gone.txt")).expect("remove file");
-
-            commit_staged(&fixture.repository, &fixture.token, test_commit())
+            commit_staged(&committing, &fixture.token, test_commit())
                 .await
-                .expect_err("A commit of a file that is gone reported a revision")
+                .expect("the first commit");
+            for file in gone {
+                std::fs::write(root.join(file), b"two").expect("rewrite file");
+            }
+            stage_working_tree(&fixture, &root).await;
+            for file in gone {
+                std::fs::remove_file(root.join(file)).expect("the removal on disk");
+            }
+            let listed = counted.directory_reads.load(Ordering::Acquire);
+            let folded = counted.names_folding_count.load(Ordering::Acquire);
+            commit_staged(&committing, &fixture.token, test_commit())
+                .await
+                .expect("the commit of the gone files");
+            (
+                counted.directory_reads.load(Ordering::Acquire) - listed,
+                counted.names_folding_count.load(Ordering::Acquire) - folded,
+            )
         }))
         .await
-        .expect("Test task failed");
-
-    assert!(
-        matches!(error, CommitError::FileNotFound { .. }),
-        "The missing file was reported as {error} rather than as the file it is"
+        .expect("the test task");
+    assert_eq!(
+        (listed, folded),
+        (2, 0),
+        "directories listed and names looked up by their fold"
     );
+}
+
+/// A commit of staged edits whose files the working tree no longer holds, in sibling directories it
+/// removed, on a file system that folds no case, lists their parent once to resolve the siblings'
+/// spellings and once to tell them gone, rather than once for each sibling, and deletes them.
+#[tokio::test]
+async fn a_commit_lists_the_parent_of_removed_siblings_once() {
+    let dir = lore_base::test_util::TempDir::new("lore-commit-test-");
+    let filesystem =
+        Arc::new(TestFilesystemProvider::reading(dir.path()).with_case_lookup(CaseLookup::OnMiss));
+    let gone = ["d/e1/a.txt", "d/e2/a.txt", "d/e3/a.txt"];
+    for file in gone.iter().chain(&["d/k.txt", "keep.txt"]) {
+        let path = dir.path().join(file);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("the directory");
+        std::fs::write(path, b"one").expect("write file");
+    }
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Making test stores");
+    let root = dir.to_path_buf();
+    let counted = filesystem.clone();
+    let (listed, folded, kept) = runtime()
+        .spawn(LORE_CONTEXT.scope(execution, async move {
+            let (fixture, committing) = committing_repository(
+                &root,
+                immutable_store,
+                mutable_store,
+                counted.clone(),
+                Arc::default(),
+            )
+            .await;
+            stage_working_tree(&fixture, &root).await;
+            commit_staged(&committing, &fixture.token, test_commit())
+                .await
+                .expect("the first commit");
+            for file in gone {
+                std::fs::write(root.join(file), b"two").expect("rewrite file");
+            }
+            stage_working_tree(&fixture, &root).await;
+            for sibling in ["d/e1", "d/e2", "d/e3"] {
+                std::fs::remove_dir_all(root.join(sibling)).expect("the removal on disk");
+            }
+            let listed = counted.directory_reads.load(Ordering::Acquire);
+            let folded = counted.names_folding_count.load(Ordering::Acquire);
+            commit_staged(&committing, &fixture.token, test_commit())
+                .await
+                .expect("the commit of the gone files");
+            let current = State::deserialize(
+                fixture.repository.clone(),
+                lore_revision::instance::load_current_anchor_boxed(&fixture.repository)
+                    .await
+                    .expect("the current revision")
+                    .0,
+            )
+            .await
+            .expect("the revision");
+            let kept: Vec<bool> = {
+                let mut kept = Vec::new();
+                for path in ["d/k.txt", "d/e1", "d/e2", "d/e3"] {
+                    kept.push(
+                        current
+                            .find_node_link(fixture.repository.clone(), path)
+                            .await
+                            .is_ok(),
+                    );
+                }
+                kept
+            };
+            (
+                counted.directory_reads.load(Ordering::Acquire) - listed,
+                counted.names_folding_count.load(Ordering::Acquire) - folded,
+                kept,
+            )
+        }))
+        .await
+        .expect("the test task");
+    assert_eq!(
+        (listed, folded),
+        (2, 0),
+        "directories listed and names looked up by their fold"
+    );
+    assert_eq!(
+        kept,
+        [true, false, false, false],
+        "d/k.txt, d/e1, d/e2, d/e3"
+    );
+}
+
+/// A commit reads nothing more of a directory holding a staged deletion than the file it commits
+/// beside it: reading that file showed the directory held.
+#[tokio::test]
+async fn a_commit_reads_no_directory_a_file_it_read_shows_held() {
+    let dir = lore_base::test_util::TempDir::new("lore-commit-test-");
+    let filesystem = Arc::new(TestFilesystemProvider::reading(dir.path()));
+    for file in ["d/a.txt", "d/b.txt", "keep.txt"] {
+        let path = dir.path().join(file);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("the directory");
+        std::fs::write(path, b"one").expect("write file");
+    }
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Making test stores");
+    let root = dir.to_path_buf();
+    let counted = filesystem.clone();
+    let read = runtime()
+        .spawn(LORE_CONTEXT.scope(execution, async move {
+            let (fixture, committing) = committing_repository(
+                &root,
+                immutable_store,
+                mutable_store,
+                counted.clone(),
+                Arc::default(),
+            )
+            .await;
+            stage_working_tree(&fixture, &root).await;
+            commit_staged(&committing, &fixture.token, test_commit())
+                .await
+                .expect("the first commit");
+            std::fs::remove_file(root.join("d/a.txt")).expect("the removal on disk");
+            std::fs::write(root.join("d/b.txt"), b"two").expect("rewrite file");
+            stage_working_tree(&fixture, &root).await;
+            let before = counted.file_infos();
+            commit_staged(&committing, &fixture.token, test_commit())
+                .await
+                .expect("the commit");
+            counted.file_infos() - before
+        }))
+        .await
+        .expect("the test task");
+    assert_eq!(read, 1, "file-information reads of the commit");
+}
+
+/// A commit of a staged empty directory the working tree no longer holds leaves it out where it
+/// was staged as added, and deletes it where it was staged as moved.
+#[tokio::test]
+async fn a_commit_takes_a_staged_empty_directory_as_the_working_tree_holds_it() {
+    for moved_directory in [false, true] {
+        with_instance(|instance| async move {
+            let first = committed(&instance, &["other.txt"]).await;
+            let other = node_id_at(&instance, &first, "other.txt").await;
+            std::fs::create_dir(instance.path.join("e")).expect("the directory on disk");
+            stage_path(&instance, "e").await;
+            let (gone, deleted) = if moved_directory {
+                let revision = committed_state(&instance, "Added").await;
+                let e = node_id_at(&instance, &revision, "e").await;
+                staged_moved(&instance, "e", "f").await;
+                ("f", vec![e])
+            } else {
+                ("e", Vec::new())
+            };
+            std::fs::remove_dir(instance.path.join(gone)).expect("the delete on disk");
+            restaged(&instance, "other.txt").await;
+
+            let revision = committed_state(&instance, "Removed").await;
+            let kept = tree_paths(&instance, &revision).await;
+            assert_eq!(
+                kept.keys().collect::<Vec<_>>(),
+                ["other.txt"],
+                "moved {moved_directory}"
+            );
+            assert_eq!(kept["other.txt"], other);
+            assert_deletes(&instance, &revision, &deleted).await;
+        })
+        .await;
+    }
+}
+
+/// A commit of a staged move whose file the working tree no longer holds at its new path deletes
+/// the file where nothing stands at its committed path, where a directory does, and where another
+/// staged node holds that path; on a file system that folds no case, a file there in another case
+/// takes it back.
+#[tokio::test]
+async fn a_commit_takes_a_staged_move_gone_from_its_new_path_as_its_committed_path_holds_it() {
+    let at_source: &[&str] = if cfg!(target_os = "linux") {
+        &["nothing", "directory", "staged", "case"]
+    } else {
+        &["nothing", "directory", "staged"]
+    };
+    for &source in at_source {
+        with_instance(|instance| async move {
+            let first = committed(&instance, &["a.txt", "other.txt"]).await;
+            let held = tree_paths(&instance, &first).await;
+            staged_moved(&instance, "a.txt", "b.txt").await;
+            match source {
+                "directory" => {
+                    std::fs::create_dir(instance.path.join("a.txt")).expect("the directory");
+                }
+                "staged" => {
+                    written(&instance, &["a.txt"]);
+                    stage_path(&instance, "a.txt").await;
+                }
+                "case" => {
+                    std::fs::rename(instance.path.join("b.txt"), instance.path.join("A.txt"))
+                        .expect("the move back on disk");
+                }
+                _ => {}
+            }
+            if source != "case" {
+                std::fs::remove_file(instance.path.join("b.txt")).expect("the delete on disk");
+            }
+            restaged(&instance, "other.txt").await;
+
+            let revision = committed_state(&instance, "Edited").await;
+            let kept = tree_paths(&instance, &revision).await;
+            let (expected, deleted): (&[&str], Vec<NodeID>) = match source {
+                "staged" => (&["a.txt", "other.txt"], vec![held["a.txt"]]),
+                "case" => (&["a.txt", "other.txt"], Vec::new()),
+                _ => (&["other.txt"], vec![held["a.txt"]]),
+            };
+            assert_eq!(
+                kept.keys().collect::<Vec<_>>(),
+                expected,
+                "{source} at a.txt"
+            );
+            assert_eq!(
+                kept.get("a.txt") == Some(&held["a.txt"]),
+                source == "case",
+                "{source} at a.txt"
+            );
+            assert_deletes(&instance, &revision, &deleted).await;
+        })
+        .await;
+    }
+}
+
+/// Asserts that the delta of `revision` records the deletion of each of `nodes` once, and nothing
+/// else of them.
+async fn assert_deletes(instance: &TestRepository, revision: &State, nodes: &[NodeID]) {
+    let delta = delta_of(instance, revision).await;
+    let mut deleted: Vec<NodeID> = delta
+        .iter()
+        .filter(|(_, action)| *action == FileAction::Delete as u16)
+        .map(|&(node, _)| node)
+        .collect();
+    deleted.sort_unstable();
+    let mut expected = nodes.to_vec();
+    expected.sort_unstable();
+    assert_eq!(deleted, expected, "the deletions in the delta {delta:?}");
+    assert!(
+        delta
+            .iter()
+            .all(|(node, action)| *action == FileAction::Delete as u16 || !nodes.contains(node)),
+        "the delta records more than the deletion of a deleted node: {delta:?}"
+    );
+}
+
+/// Commits what `instance` holds staged through `repository`, a context of it, and answers the
+/// revision.
+async fn committed_through(
+    instance: &TestRepository,
+    repository: &Arc<RepositoryContext>,
+    message: &str,
+) -> Arc<State> {
+    commit_boxed(
+        repository.clone(),
+        &instance.write_token,
+        CommitOptions::new(message.to_string()),
+    )
+    .await
+    .expect("Commit failed");
+    let (revision, _) = lore_revision::instance::load_current_anchor_boxed(repository)
+        .await
+        .expect("the current anchor");
+    State::deserialize(repository.clone(), revision)
+        .await
+        .expect("the committed state")
+}
+
+/// Each node the delta of `revision` records, with its action, in the order recorded.
+async fn delta_of(instance: &TestRepository, revision: &State) -> Vec<(NodeID, u16)> {
+    let delta = revision
+        .delta_block(instance.repository.clone())
+        .await
+        .expect("the delta")
+        .to_aligned::<NodeDelta>();
+    delta
+        .as_type_slice::<NodeDelta>()
+        .iter()
+        .map(|entry| (entry.node, entry.action))
+        .collect()
 }
 
 /// The operation a commit read its files through, on a provider holding its state, is handed the

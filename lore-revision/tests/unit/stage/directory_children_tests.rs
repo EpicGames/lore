@@ -37,9 +37,9 @@ fn children(entries: &[(NodeID, u64)]) -> DirectoryChildren {
 #[test]
 fn a_claim_finds_the_child_with_that_name() {
     let mut children = children(&[(10, 0xAA), (11, 0xBB), (12, 0xCC)]);
-    assert_eq!(children.claim(0xBB), Some(11));
-    assert_eq!(children.claim(0xAA), Some(10));
-    assert_eq!(children.claim(0xCC), Some(12));
+    assert_eq!(children.claim(0xBB).map(|(node, _)| node), Some(11));
+    assert_eq!(children.claim(0xAA).map(|(node, _)| node), Some(10));
+    assert_eq!(children.claim(0xCC).map(|(node, _)| node), Some(12));
     assert_eq!(
         children.unclaimed().collect::<Vec<_>>(),
         Vec::<NodeID>::new()
@@ -49,7 +49,7 @@ fn a_claim_finds_the_child_with_that_name() {
 #[test]
 fn a_name_the_directory_does_not_hold_claims_nothing() {
     let mut children = children(&[(10, 0xAA)]);
-    assert_eq!(children.claim(0xBB), None);
+    assert_eq!(children.claim(0xBB).map(|(node, _)| node), None);
     assert_eq!(children.unclaimed().collect::<Vec<_>>(), vec![10]);
 }
 
@@ -59,10 +59,10 @@ fn a_name_the_directory_does_not_hold_claims_nothing() {
 #[test]
 fn equal_hashes_are_claimed_in_sibling_order() {
     let mut children = children(&[(10, 0xAA), (11, 0xAA), (12, 0xAA)]);
-    assert_eq!(children.claim(0xAA), Some(10));
-    assert_eq!(children.claim(0xAA), Some(11));
-    assert_eq!(children.claim(0xAA), Some(12));
-    assert_eq!(children.claim(0xAA), None);
+    assert_eq!(children.claim(0xAA).map(|(node, _)| node), Some(10));
+    assert_eq!(children.claim(0xAA).map(|(node, _)| node), Some(11));
+    assert_eq!(children.claim(0xAA).map(|(node, _)| node), Some(12));
+    assert_eq!(children.claim(0xAA).map(|(node, _)| node), None);
 }
 
 /// A run of children sharing a hash, wide enough that a sort keyed on the
@@ -95,10 +95,14 @@ fn the_index_leaves_no_ties_among_equal_hashes() {
 #[test]
 fn a_claimed_child_is_still_held() {
     let mut children = children(&[(10, 0xAA), (11, 0xAA), (12, 0xBB)]);
-    assert_eq!(children.claim(0xAA), Some(10));
+    assert_eq!(children.claim(0xAA).map(|(node, _)| node), Some(10));
     assert_eq!(children.holds(0xAA), Some(10));
-    assert_eq!(children.claim(0xAA), Some(11));
-    assert_eq!(children.claim(0xAA), None, "the listing offers no more");
+    assert_eq!(children.claim(0xAA).map(|(node, _)| node), Some(11));
+    assert_eq!(
+        children.claim(0xAA).map(|(node, _)| node),
+        None,
+        "the listing offers no more"
+    );
     assert_eq!(children.holds(0xAA), Some(10), "the listing still holds it");
     assert_eq!(children.holds(0xCC), None, "a name it never held");
 }
@@ -106,15 +110,15 @@ fn a_claimed_child_is_still_held() {
 #[test]
 fn what_nothing_claimed_comes_back_in_sibling_order() {
     let mut children = children(&[(10, 0xAA), (11, 0xBB), (12, 0xAA), (13, 0xCC)]);
-    assert_eq!(children.claim(0xAA), Some(10));
-    assert_eq!(children.claim(0xCC), Some(13));
+    assert_eq!(children.claim(0xAA).map(|(node, _)| node), Some(10));
+    assert_eq!(children.claim(0xCC).map(|(node, _)| node), Some(13));
     assert_eq!(children.unclaimed().collect::<Vec<_>>(), vec![11, 12]);
 }
 
 #[test]
 fn an_empty_directory_claims_nothing_and_deletes_nothing() {
     let mut children = children(&[]);
-    assert_eq!(children.claim(0xAA), None);
+    assert_eq!(children.claim(0xAA).map(|(node, _)| node), None);
     assert_eq!(children.unclaimed().count(), 0);
 }
 
@@ -143,7 +147,7 @@ fn the_index_answers_exactly_as_a_scan_of_the_same_children_would() {
     for step in 0..160u64 {
         let name_hash = (step * 7) % 5;
         assert_eq!(
-            indexed.claim(name_hash),
+            indexed.claim(name_hash).map(|(node, _)| node),
             scan_claim(&mut scanned, name_hash),
             "claim({name_hash}) at step {step}"
         );
@@ -202,6 +206,7 @@ async fn claim(
             .await
             .expect("the claim runs"),
     }
+    .map(|claimed| claimed.node)
 }
 
 /// Claims each of `entries` in `dir` in turn, as `stage_directory` does, and adds a file for each
@@ -310,6 +315,7 @@ async fn claims_before_the_stage_adds_answer_from_the_listing() {
         let mut children = listed(&state, &repository, dir).await;
         let mut from_listing = |index: usize| {
             claim_from_listing(&mut children, &state, &entries, entries[index].name_hash)
+                .map(|claimed| claimed.map(|claimed| claimed.node))
         };
         assert_eq!(from_listing(0), Some(Some(held)), "the listed child");
         assert_eq!(
@@ -384,6 +390,7 @@ async fn an_own_add_leaves_the_claims_of_unshared_names_to_the_listing() {
         let mut children = listed(&state, &repository, dir).await;
         let from_listing = |children: &mut DirectoryChildren, index: usize| {
             claim_from_listing(children, &state, &entries, entries[index].name_hash)
+                .map(|claimed| claimed.map(|claimed| claimed.node))
         };
         assert_eq!(
             from_listing(&mut children, 0),
@@ -415,7 +422,8 @@ async fn a_find_answers_each_entry_with_the_first_child_of_its_name_hash() {
         let mut children = listed(&state, &repository, dir).await;
         for entry in &entries {
             assert_eq!(
-                find_from_listing(&mut children, &state, &entries, entry.name_hash),
+                find_from_listing(&mut children, &state, &entries, entry.name_hash)
+                    .map(|found| found.map(|found| found.node)),
                 Some(Some(first)),
                 "{}",
                 entry.name

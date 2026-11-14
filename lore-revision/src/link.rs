@@ -1540,8 +1540,9 @@ impl ResolvedLinkChain {
 /// its parent's link node and registry, so a change made in the innermost repo
 /// is captured transitively by the top-level staged anchor.
 ///
-/// No-op when `chain.levels` is empty (plain top-level operation). The caller
-/// is responsible for serializing + anchoring the top-level state afterwards.
+/// Each state stages first the moves its staged climbs promoted ([`drain_promoted_moves`]), the
+/// top-level one included. The caller is responsible for serializing + anchoring the top-level
+/// state afterwards.
 pub async fn propagate_link_chain(
     chain: &ResolvedLinkChain,
     token: &RepositoryWriteToken,
@@ -1552,6 +1553,7 @@ pub async fn propagate_link_chain(
         let (child_state, child_repository) = chain.child_at(i);
 
         child_state.reparent_onto(level.old_signature);
+        drain_promoted_moves(&child_repository, &child_state).await?;
         let new_signature = child_state
             .serialize(child_repository, token)
             .await
@@ -1569,8 +1571,31 @@ pub async fn propagate_link_chain(
         .await
         .forward::<LinkError>("Failed to update link pin")?;
     }
+    let (top_repository, top_state) = match chain.levels.first() {
+        Some(level) => (&level.repository, &level.state),
+        None => (&chain.innermost.repository, &chain.innermost.state),
+    };
+    drain_promoted_moves(top_repository, top_state).await
+}
 
-    Ok(())
+/// Stages each whole move a staged climb in `state` promoted, a link's repin or its add among
+/// them, as staging inside the directory does
+/// ([`crate::file::stage::stage_promoted_moves_of_call`]): boxed behind
+/// [`State::holds_promoted_moves`], as only a climb through a directory marked dirty as moved
+/// queues one.
+async fn drain_promoted_moves(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+) -> Result<(), LinkError> {
+    if !state.holds_promoted_moves() {
+        return Ok(());
+    }
+    Box::pin(crate::file::stage::stage_promoted_moves_of_call(
+        repository, state, None,
+    ))
+    .await
+    .forward::<LinkError>("Failed to stage the move of a directory holding a link")
+    .map(drop)
 }
 
 /// Reserialize every link modified during a `stage`/`unstage` walk, folding

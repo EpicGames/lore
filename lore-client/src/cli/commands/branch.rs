@@ -111,7 +111,7 @@ pub struct BranchSwitchArgs {
     #[clap(long, action)]
     reset: bool,
 
-    /// Only update anchor tracking without modifying or verifying files, useful for bare repositories
+    /// Only update anchor tracking without modifying or verifying files, useful for bare repositories. Don't commit after merging, reverting or cherry-picking in such an instance: the commit can delete a directory the instance never had on disk, with everything in it
     #[clap(long, action)]
     bare: bool,
 }

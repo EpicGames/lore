@@ -1626,9 +1626,9 @@ fn reset_walk_named_path(
                             .await;
                 }
 
-                let replacement = match staged {
+                let beside = match staged {
                     Some(staged) => {
-                        replacing_dirty_add(
+                        beside_deleted(
                             &current_state_staged,
                             &target_repository,
                             staged.id,
@@ -1636,8 +1636,15 @@ fn reset_walk_named_path(
                         )
                         .await?
                     }
-                    None => None,
+                    None => Beside::Nothing,
                 };
+                if matches!(beside, Beside::Moved) {
+                    lore_trace!(
+                        "Reset leaves {} deleted, as a move took its place",
+                        relative_path.as_str()
+                    );
+                    return Ok(());
+                }
 
                 reset_walk_node(
                     ResetContext {
@@ -1660,7 +1667,7 @@ fn reset_walk_named_path(
                 )
                 .await?;
 
-                if let Some(replacement) = replacement {
+                if let Beside::Replaced(replacement) = beside {
                     stats.discards.queue(
                         current_state_staged,
                         target_repository,
@@ -1691,27 +1698,18 @@ fn reset_walk_named_path(
                     .into());
                     }
                     // The flags alone, so the record is not held across the awaits below.
-                    let (staged, dirty_add, link, directory) = state_staged
+                    let (dirty_add, link, directory) = state_staged
                         .node(repository.clone(), staged_link.node)
                         .await
                         .forward::<ResetError>("Failed to find staged node")
-                        .map(|node| {
-                            (
-                                node.is_staged(),
-                                node.is_dirty_add(),
-                                node.is_link(),
-                                node.is_directory(),
-                            )
-                        })?;
+                        .map(|node| (node.is_dirty_add(), node.is_link(), node.is_directory()))?;
 
                     // `reset_staged_links_under_paths` unstaged this link, which a dry run does not
                     // store, so the link is still staged here.
                     if link && execution_context().globals().dry_run() {
                         return Ok(());
                     }
-                    if staged {
-                        return Err(staged_node_refusal());
-                    }
+                    refuse_staged_node(&state_staged, &repository, staged_link.node).await?;
 
                     if dirty_add {
                         lore_trace!(
@@ -1756,7 +1754,7 @@ async fn base_node_at(
     state_path: &RelativePath,
 ) -> Result<Option<(NodeID, NodeID)>, ResetError> {
     let stop = staged_base
-        .find_to_link(repository, ROOT_NODE, state_path.as_str(), false)
+        .find_to_link::<true>(repository, ROOT_NODE, state_path.as_str(), false)
         .await
         .forward::<ResetError>("Finding the path in the staged tree's base")?;
     if !matches!(stop.at, state::Stop::End) {
@@ -1771,8 +1769,8 @@ async fn base_node_at(
 }
 
 /// Refuses `state_path` where the staged tree holds it as staged, found by its path through the
-/// staged tree's own links: inside a link, the staged revision can number its nodes other than
-/// the target's pin.
+/// staged tree's own links ([`refuse_staged_node`]): inside a link, the staged revision can number
+/// its nodes other than the target's pin.
 async fn refuse_staged(
     state_staged: &State,
     repository: &Arc<RepositoryContext>,
@@ -1786,15 +1784,12 @@ async fn refuse_staged(
         Err(err) if err.is_node_not_found() => return Ok(()),
         Err(err) => return Err(err).forward::<ResetError>("Failed to find staged node"),
     };
-    let staged = state_staged
-        .found_node(repository.clone(), &staged_link, held)
-        .await
-        .forward::<ResetError>("Failed to find staged node")?
-        .is_staged();
-    if staged {
-        return Err(staged_node_refusal());
+    match held {
+        Some((repository, state)) => {
+            refuse_staged_node(&state, &repository, staged_link.node).await
+        }
+        None => refuse_staged_node(state_staged, repository, staged_link.node).await,
     }
-    Ok(())
 }
 
 /// The refusal of a reset that would discard a staged change.
@@ -1805,39 +1800,96 @@ fn staged_node_refusal() -> ResetError {
     .into()
 }
 
-/// The dirty add standing beside `node_id` in `state_staged` under the same name, which took its
-/// place on disk, refused where it is staged. Only a deleted node is replaced, and the add is
-/// linked after it, so it lies ahead of `node_id` in the chain.
-async fn replacing_dirty_add(
+/// What stands beside a node marked deleted under its name, having taken its place on disk
+/// ([`beside_deleted`]).
+enum Beside {
+    /// Nothing the reset acts on, or the node is not marked deleted.
+    Nothing,
+    /// A dirty add or copy, which the reset discards to restore the deleted node.
+    Replaced(NodeID),
+    /// A node marked dirty as moved there, which the reset leaves as it leaves every move, the
+    /// deletion beside it marked.
+    Moved,
+}
+
+/// What stands beside `node_id` in `state_staged` under its name, `name_hash`, where `node_id` is
+/// marked deleted and not staged: the node of that name not deleted, on either side of it in the
+/// chain ([`State::find_subnode_beside`]). Refused where that node is staged.
+async fn beside_deleted(
     state_staged: &Arc<State>,
     repository: &Arc<RepositoryContext>,
     node_id: NodeID,
     name_hash: u64,
-) -> Result<Option<NodeID>, ResetError> {
+) -> Result<Beside, ResetError> {
     let Ok(staged_node) = state_staged.node(repository.clone(), node_id).await else {
-        return Ok(None);
+        return Ok(Beside::Nothing);
     };
-    if !staged_node.is_dirty_delete() {
-        return Ok(None);
+    if !staged_node.is_dirty_delete() || staged_node.is_staged() {
+        return Ok(Beside::Nothing);
     }
-    let Some(sibling) = state_staged
-        .find_subnode_ahead_of(repository.clone(), staged_node.parent, node_id, name_hash)
+    let Some((sibling, sibling_node)) = state_staged
+        .find_subnode_beside(
+            repository.clone(),
+            staged_node.parent,
+            (node_id, name_hash),
+            |node| !node.is_dirty_delete() && !node.is_staged_delete(),
+        )
         .await
         .forward::<ResetError>("Failed to search the staged siblings")?
     else {
-        return Ok(None);
+        return Ok(Beside::Nothing);
     };
-    let sibling_node = state_staged
-        .node(repository.clone(), sibling)
-        .await
-        .forward::<ResetError>("Failed to find staged node")?;
-    if !sibling_node.is_dirty_add() {
-        return Ok(None);
-    }
     if sibling_node.is_staged() {
         return Err(staged_node_refusal());
     }
-    Ok(Some(sibling))
+    Ok(
+        if sibling_node.is_dirty_add() || sibling_node.is_dirty_copy() {
+            Beside::Replaced(sibling)
+        } else if sibling_node.is_dirty_move() {
+            Beside::Moved
+        } else {
+            Beside::Nothing
+        },
+    )
+}
+
+/// Refuses `node_id` of `state` where it is staged, or where a node of its name staged for deletion
+/// stands beside it: one scan of its parent's children, where the parent is staged, as one holding
+/// a staged deletion is.
+async fn refuse_staged_node(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+    node_id: NodeID,
+) -> Result<(), ResetError> {
+    let node = state
+        .node(repository.clone(), node_id)
+        .await
+        .forward::<ResetError>("Failed to find staged node")?;
+    if node.is_staged() {
+        return Err(staged_node_refusal());
+    }
+    if node_id == ROOT_NODE
+        || !state
+            .node(repository.clone(), node.parent)
+            .await
+            .forward::<ResetError>("Failed to find staged node")?
+            .is_staged()
+    {
+        return Ok(());
+    }
+    let deleted = state
+        .find_subnode_beside(
+            repository.clone(),
+            node.parent,
+            (node_id, node.name_hash),
+            Node::is_staged_delete,
+        )
+        .await
+        .forward::<ResetError>("Failed to search the staged siblings")?;
+    match deleted {
+        Some(_) => Err(staged_node_refusal()),
+        None => Ok(()),
+    }
 }
 
 /// Adds to `replaced` the dirty adds of `dirty_adds`, sorted by name hash, that stand beside

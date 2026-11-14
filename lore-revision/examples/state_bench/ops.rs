@@ -663,7 +663,8 @@ pub async fn discard(state: &Arc<State>, repo: &Repo, node: NodeID) {
 /// time. The roots here are files, so the walk collected nothing below them.
 #[inline(never)]
 pub async fn discard_batch(state: &Arc<State>, repo: &Repo, roots: &[NodeID]) {
-    lore_revision::state::node_discard_free(state, repo, roots, Vec::new(), |_, _| {})
+    let roots: Vec<(NodeID, u16)> = roots.iter().map(|&root| (root, 0)).collect();
+    lore_revision::state::node_discard_free(state, repo, &roots, Vec::new(), |_, _| {})
         .await
         .expect("a discard succeeds");
 }

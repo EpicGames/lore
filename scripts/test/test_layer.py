@@ -3441,3 +3441,29 @@ def _marked(repo: Lore) -> list[tuple[str, str, bool]]:
         (entry.get("path"), entry.get("action"), entry.get("flagDirty"))
         for entry in parse_status_json(repo.status(json=True))
     ]
+
+
+@pytest.mark.smoke
+def test_layer_commit_deletes_a_staged_file_gone_from_its_mount_and_keeps_the_mount(
+    new_lore_repo,
+):
+    """A commit of a staged edit of a layer's file, the layer's whole mount removed from the
+    working tree since, deletes that file from the layer and keeps the rest of what it draws in,
+    the layer mounted: the commit of a layer never deletes the directory it draws from."""
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+    repo.write_commit_push("Base", {"root.txt": "root\n"})
+    layer_repo.write_commit_push(
+        "Layer base", {"third/a.txt": "a\n", "third/o.txt": "o\n"}
+    )
+    repo.layer_add("thr", layer_repo, "third/")
+
+    repo.write_files({os.path.join("thr", "a.txt"): "edited\n"})
+    repo.stage(os.path.join("thr", "a.txt"))
+    repo.rmtree("thr")
+    repo.commit("Remove the layer's files")
+
+    assert "third -> thr" in repo.layer_list()
+    repo.file_reset("thr")
+    assert repo.file_exists(os.path.join("thr", "o.txt"))
+    assert not repo.file_exists(os.path.join("thr", "a.txt"))

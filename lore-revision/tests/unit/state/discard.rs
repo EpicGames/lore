@@ -242,7 +242,7 @@ async fn a_walk_then_free_matches_a_fused_discard() {
         let counts = lore_revision::state::node_discard_free(
             &state,
             &repository,
-            &[tree.d],
+            &[(tree.d, NodeFlags::NoFlags.bits())],
             collected,
             |root, flags| {
                 told.push((root, flags));
@@ -279,7 +279,7 @@ async fn a_free_skips_a_slot_already_free() {
         let counts = lore_revision::state::node_discard_free(
             &state,
             &repository,
-            &[tree.d],
+            &[(tree.d, NodeFlags::NoFlags.bits())],
             vec![g, a, f, gone, e, a],
             |_, _| {},
         )
@@ -393,7 +393,7 @@ async fn a_free_of_several_roots_over_two_blocks_frees_every_slot() {
         let counts = lore_revision::state::node_discard_free(
             &state,
             &repository,
-            &roots,
+            &roots.iter().map(|&root| (root, 0)).collect::<Vec<_>>(),
             collected,
             |root, _| told.push(root),
         )
@@ -512,7 +512,7 @@ async fn a_free_skips_a_root_freed_already() {
         let counts = lore_revision::state::node_discard_free(
             &state,
             &repository,
-            &[gone, tree.keep],
+            &[(gone, 0), (tree.keep, 0)],
             Vec::new(),
             |root, _| told.push(root),
         )
@@ -821,7 +821,7 @@ async fn a_free_of_roots_whose_parents_lie_in_different_blocks_unlinks_each() {
         let counts = lore_revision::state::node_discard_free(
             &state,
             &repository,
-            &[r1, r2],
+            &[(r1, 0), (r2, 0)],
             Vec::new(),
             |root, _| told.push(root),
         )

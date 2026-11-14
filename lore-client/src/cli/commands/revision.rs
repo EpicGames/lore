@@ -206,7 +206,7 @@ pub struct RevisionSyncArgs {
     reset: bool,
 
     /// Root files for dependency-based selective sync (only sync changes for these files and their dependencies, and
-    /// the whole folder that replaces a link they lie in). A root file inside a link is skipped
+    /// the whole folder that replaces a link they lie in). A root file inside a link is skipped. Don't commit after merging, reverting or cherry-picking in such an instance: the commit can delete a directory the instance never had on disk, with everything in it
     #[clap(long = "root-file", value_name = "path")]
     root_files: Vec<String>,
 

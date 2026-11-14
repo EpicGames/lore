@@ -525,6 +525,39 @@ def test_nested_link_commit_scoped(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_nested_link_commit_keeps_the_intermediate_links_directories(new_lore_repo):
+    """`commit --link <nested-path>` commits the intermediate link's staged deletion alone.
+
+    The intermediate link's commit walks its tree from its root rather than from its mount,
+    so it must not read its directories as gone from the working tree.
+    """
+    repo_a, _repo_b, _repo_c, b_mount, nested_mount = build_nested_link_repos_at(
+        new_lore_repo, "vendor/b", "vendor/c"
+    )
+    removed = f"{b_mount}/b-data/removed.txt"
+    kept = f"{b_mount}/b-data/kept.txt"
+    repo_a.write_files({removed: "removed\n", kept: "kept\n"})
+    repo_a.stage(scan=True)
+    repo_a.commit("Add B's data")
+    repo_a.push()
+
+    repo_a.remove_file(removed)
+    repo_a.stage([removed])
+    inner_file = f"{nested_mount}/c-data/inner.txt"
+    repo_a.write_files({inner_file: "nested change\n"})
+    repo_a.stage([inner_file])
+    output = repo_a.commit("Scoped nested commit", link=nested_mount)
+    assert "Commit succeeded" in output, output
+    repo_a.commit("Record the scoped nested commit on the parent")
+    repo_a.push()
+
+    fresh = repo_a.clone()
+    assert fresh.file_exists(kept), "the rest of B's directory survives a fresh clone"
+    assert not fresh.file_exists(removed), "B's staged deletion reaches a fresh clone"
+    assert fresh.compare_file(repo_a, inner_file), "C's change reaches a fresh clone"
+
+
+@pytest.mark.smoke
 def test_nested_link_stage_delete_deep(new_lore_repo):
     """Staging a DELETE of a file two levels deep works.
 

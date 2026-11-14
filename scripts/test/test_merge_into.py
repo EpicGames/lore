@@ -5,7 +5,7 @@ import os
 import shutil
 
 import pytest
-from error_types import MergeRequired
+from error_types import FileNotFound, MergeRequired
 from lore_parsers import parse_jsonl
 
 from lore import Lore, verify_signatures
@@ -145,3 +145,48 @@ def test_merge_into_records_the_deletion_of_a_file_the_target_added(new_lore_rep
         ("delete", "added.txt")
     ], deltas
     assert not repo.file_exists("added.txt")
+
+
+@pytest.mark.smoke
+def test_merge_into_takes_the_merged_changes_alone_past_a_directory_removed_locally(
+    new_lore_repo,
+):
+    """A merge into the target takes the merged changes alone where the instance no longer
+    holds a directory they reach: a deletion the branch committed there deletes that file and
+    nothing else beside it, and a file the branch changed there fails the merge as not found."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push(
+        "Base", {"a/x.txt": "x\n", "a/y.txt": "y\n", "b/z.txt": "z\n", "o.txt": "o\n"}
+    )
+
+    repo.branch_create("feature")
+    repo.remove_file("a/x.txt")
+    repo.stage(["a/x.txt"])
+    repo.commit("Delete a file")
+    repo.push()
+    shutil.rmtree(os.path.join(repo.path, "a"))
+
+    repo.branch_merge_into("main", "Merge the deletion")
+    repo.branch_switch("main", reset=True)
+    deltas = parse_jsonl(
+        repo.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
+    )
+    changes = [
+        (delta["action"], delta["path"])
+        for delta in deltas
+        if delta["action"] != "keep"
+    ]
+    assert changes == [("delete", "a/x.txt")], deltas
+    assert repo.file_exists("a/y.txt") and not repo.file_exists("a/x.txt")
+
+    repo.branch_switch("feature", reset=True)
+    repo.branch_merge("main", message="Merge main")
+    repo.push()
+    repo.write_files({"b/z.txt": "changed\n"})
+    repo.stage(["b/z.txt"])
+    repo.commit("Change a file")
+    repo.push()
+    shutil.rmtree(os.path.join(repo.path, "b"))
+
+    with pytest.raises(FileNotFound):
+        repo.branch_merge_into("main", "Merge the change")

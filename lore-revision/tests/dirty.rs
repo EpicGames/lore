@@ -6324,13 +6324,14 @@ mod tests {
     }
 
     /// What the merge commit of a case of the merge table holds at its path, as the rulings on
-    /// merges past the view have it, or `None` for a case a gap filed apart leaves open.
+    /// merges past the view have it.
     ///
     /// An unstage that reaches the path, a forced one or one in view, takes the current
     /// revision's file back, and a commit leaves out a move it leaves unstaged, so the path a move
     /// took the file to holds nothing. A forced stage takes the working tree's file, and so does a stage
     /// in view. Without either, a commit takes the merge's change, read from the working tree in
-    /// view, where the user's edit of a merged file counts, and from the staged node past it.
+    /// view, where the user's edit of a merged file counts, and from the staged node past it. A
+    /// dirty mark leaves the merge's staged deletion as it is.
     fn table_expected(
         case: &TableMerge,
         change: TableChange,
@@ -6338,17 +6339,11 @@ mod tests {
         action: TableAction,
         unstage: TableUnstage,
         forced: bool,
-    ) -> Option<MergeCommitted> {
+    ) -> MergeCommitted {
         let unstaged = unstage != TableUnstage::None && (forced || in_view);
         let deletes = matches!(change, TableChange::Delete | TableChange::DeleteDirectory);
-        // A dirty mark over a staged delete replaces it with a modify.
-        if !unstaged && deletes && action == TableAction::DirtyMark {
-            return None;
-        }
         if unstaged {
-            return Some(MergeCommitted::unchanged(
-                case.current.filter(|_| case.source.is_none()),
-            ));
+            return MergeCommitted::unchanged(case.current.filter(|_| case.source.is_none()));
         }
         let merged = change != TableChange::None;
         let staged = match action {
@@ -6358,6 +6353,7 @@ mod tests {
         };
         let file = match action {
             TableAction::DirtyMark | TableAction::StagePlain if !merged && !staged => case.current,
+            TableAction::DirtyMark if deletes => None,
             TableAction::DirtyMark if in_view => Some(TABLE_EDIT),
             TableAction::Nothing | TableAction::StageSame | TableAction::DirtyMark => case.merged,
             TableAction::StagePlain if !in_view => case.merged,
@@ -6379,7 +6375,7 @@ mod tests {
         };
         let mut expected = MergeCommitted::unchanged(file);
         expected.change = changed;
-        Some(expected)
+        expected
     }
 
     /// A plain unstage of the tree leaves a merge's change past the view staged, and the
@@ -6491,7 +6487,7 @@ mod tests {
     /// actions a user can take there before the merge commit, each without an unstage and with a
     /// plain and a forced unstage of the path, of its directory and of the tree. The merge commit
     /// succeeds. Short of what [`table_left_out`] leaves out, it holds at the path what
-    /// [`table_expected`] says, where that says anything, and records the change's action there,
+    /// [`table_expected`] says, and records the change's action there,
     /// and its tree holds no node that keeps a staged or dirty mark, no file with a zero hash and
     /// a nonzero size, no directory whose address is not its children's rehash, and no file at the
     /// path a move took it from, where no unstage reached the move.
@@ -6547,10 +6543,9 @@ mod tests {
                                 let _permit = running.acquire().await.expect("A permit");
                                 let (case, committed, mut faults) =
                                     table_case(change, in_view, action, unstage, forced).await;
-                                if let Some(expected) =
-                                    table_expected(&case, change, in_view, action, unstage, forced)
-                                    && committed != expected
-                                {
+                                let expected =
+                                    table_expected(&case, change, in_view, action, unstage, forced);
+                                if committed != expected {
                                     faults.push(format!("holds {committed:?}, not {expected:?}"));
                                 }
                                 faults

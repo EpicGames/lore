@@ -1582,7 +1582,7 @@ mod tests {
                 lore_revision::state::node_discard_free(
                     &state,
                     &repository,
-                    &[node],
+                    &[(node, 0)],
                     Vec::new(),
                     |_, _| {},
                 )

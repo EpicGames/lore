@@ -1044,8 +1044,9 @@ impl StageDescent {
     /// Each component is staged under the name `remainder_path` spells it with, which the caller
     /// resolves against the file system, so `stage_node_from_metadata` does not look up its case
     /// again. The first component is the child `known` answers where the caller established it,
-    /// and every later one is looked up in its directory, once: the search a directory takes for
-    /// the nested repository check answers its stage as well. The final component is the staged
+    /// and every later one is looked up in its directory, once, a node not staged for deletion
+    /// before one that is ([`State::find_live_subnode`]): the search a directory takes for the
+    /// nested repository check answers its stage as well. The final component is the staged
     /// path, staged as `info`; every other one is staged as a directory. `Some` is the link of a
     /// component that was not staged, which ends the descent.
     ///
@@ -1083,14 +1084,14 @@ impl StageDescent {
                 if matches!(current_known, KnownChild::Unresolved) {
                     current_known = match self
                         .state
-                        .find_subnode(
+                        .find_live_subnode(
                             self.repository.clone(),
                             self.node,
                             hash::hash_string(current_name),
                         )
                         .await
                     {
-                        Ok(node) => KnownChild::Resolved(Some(node)),
+                        Ok((node, _)) => KnownChild::Resolved(Some(node)),
                         Err(error) if error.is_node_not_found() => KnownChild::Resolved(None),
                         Err(_) => KnownChild::Unresolved,
                     };
@@ -1561,10 +1562,9 @@ pub(crate) fn deletion_staged_already(held: NodeFlags, node_flags: NodeFlags) ->
 }
 
 /// Mark `node_id` staged for deletion, reporting the node when this call is the one that
-/// marked it so a caller walking the subtree knows whether it still has work below. The staged
-/// half keeps an add the node holds beside the deletion, an add taken back, as the revision it
-/// was staged on lacks the node; a mark that sets a dirty action too records the deletion alone,
-/// the two halves sharing their action bits.
+/// marked it so a caller walking the subtree knows whether it still has work below. A merge's
+/// stage keeps an add the node holds beside the deletion, an add taken back, as the revision it
+/// was staged on lacks the node; any other stage records the deletion alone, keeping no add.
 async fn stage_delete_node(
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
@@ -1608,7 +1608,11 @@ async fn stage_delete_node(
         stats.file_checked_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    let held_add = NodeFlags::from_bits_retain(node.flags) & NodeFlags::StagedAdd;
+    let held_add = if node_flags.contains(NodeFlags::StagedMerge) {
+        NodeFlags::from_bits_retain(node.flags) & NodeFlags::StagedAdd
+    } else {
+        NodeFlags::NoFlags
+    };
     let mark = staged_change(
         NodeFlags::StagedDelete | held_add,
         NodeFlags::DirtyDelete,
@@ -2102,18 +2106,32 @@ impl NameHashIndex {
         Self(by_name_hash)
     }
 
-    /// The children carrying `name_hash`, in sibling order, each with its sibling index.
-    fn matching(&self, name_hash: u64) -> impl Iterator<Item = (u32, NodeID)> + '_ {
-        let start = self.0.partition_point(|&(hash, _, _)| hash < name_hash);
+    /// Where the index holds the children carrying `name_hash`.
+    fn start(&self, name_hash: u64) -> usize {
+        self.0.partition_point(|&(hash, _, _)| hash < name_hash)
+    }
+
+    /// The children carrying `name_hash`, from `start`, where the index holds them
+    /// ([`Self::start`]), in sibling order, each with its sibling index.
+    fn matching_from(
+        &self,
+        start: usize,
+        name_hash: u64,
+    ) -> impl Iterator<Item = (u32, NodeID)> + Clone + '_ {
         self.0[start..]
             .iter()
             .take_while(move |&&(hash, _, _)| hash == name_hash)
             .map(|&(_, index, node)| (index, node))
     }
 
-    /// The first child carrying `name_hash`, in sibling order.
-    pub(crate) fn first(&self, name_hash: u64) -> Option<NodeID> {
-        self.matching(name_hash).next().map(|(_, node)| node)
+    /// The children carrying `name_hash`, in sibling order, each with its sibling index.
+    fn matching(&self, name_hash: u64) -> impl Iterator<Item = (u32, NodeID)> + Clone + '_ {
+        self.matching_from(self.start(name_hash), name_hash)
+    }
+
+    /// Every child carrying `name_hash`, in sibling order.
+    pub(crate) fn carrying(&self, name_hash: u64) -> impl Iterator<Item = NodeID> + Clone + '_ {
+        self.matching(name_hash).map(|(_, node)| node)
     }
 }
 
@@ -2194,29 +2212,32 @@ impl DirectoryChildren {
     }
 
     /// The first child carrying `name_hash` that nothing has claimed yet, marked
-    /// as claimed. `None` where the directory holds no such child, or holds only
+    /// as claimed, with where the listing holds the children carrying it
+    /// ([`Self::carrying_from`]). `None` where the directory holds no such child, or holds only
     /// ones already claimed.
     #[lore_macro::test_pub]
-    fn claim(&mut self, name_hash: u64) -> Option<NodeID> {
+    fn claim(&mut self, name_hash: u64) -> Option<(NodeID, usize)> {
+        let start = self.by_name_hash.start(name_hash);
         let (index, node) = self
             .by_name_hash
-            .matching(name_hash)
+            .matching_from(start, name_hash)
             .find(|&(index, _)| self.node[index as usize] != INVALID_NODE)?;
         self.node[index as usize] = INVALID_NODE;
-        Some(node)
+        Some((node, start))
     }
 
     /// The first child carrying `name_hash`, claimed or not, with every child carrying it marked
-    /// claimed, so the pass over what nothing claimed leaves each of them. `None` where the
-    /// directory holds no such child.
+    /// claimed, so the pass over what nothing claimed leaves each of them, and where the listing
+    /// holds them ([`Self::carrying_from`]). `None` where the directory holds no such child.
     #[lore_macro::test_pub]
-    fn claim_every(&mut self, name_hash: u64) -> Option<NodeID> {
+    fn claim_every(&mut self, name_hash: u64) -> Option<(NodeID, usize)> {
+        let start = self.by_name_hash.start(name_hash);
         let mut first = None;
-        for (index, node) in self.by_name_hash.matching(name_hash) {
+        for (index, node) in self.by_name_hash.matching_from(start, name_hash) {
             self.node[index as usize] = INVALID_NODE;
             first.get_or_insert(node);
         }
-        first
+        first.map(|node| (node, start))
     }
 
     /// Marks `node` claimed where the listing holds it: a child a search of the chain
@@ -2254,7 +2275,29 @@ impl DirectoryChildren {
     /// into it since.
     #[lore_macro::test_pub]
     pub(crate) fn holds(&self, name_hash: u64) -> Option<NodeID> {
-        self.by_name_hash.first(name_hash)
+        self.carrying(name_hash).next()
+    }
+
+    /// Every child the listing holds carrying `name_hash`, claimed or not, in sibling order.
+    pub(crate) fn carrying(&self, name_hash: u64) -> impl Iterator<Item = NodeID> + Clone + '_ {
+        self.carrying_from(self.by_name_hash.start(name_hash), name_hash)
+    }
+
+    /// [`Self::carrying`] from `start`, where the listing holds the children carrying
+    /// `name_hash`, as a claim answers it, or where it holds none.
+    pub(crate) fn carrying_from(
+        &self,
+        start: usize,
+        name_hash: u64,
+    ) -> impl Iterator<Item = NodeID> + Clone + '_ {
+        self.by_name_hash
+            .matching_from(start, name_hash)
+            .map(|(_, node)| node)
+    }
+
+    /// Where the listing holds the children carrying `name_hash`.
+    pub(crate) fn start_of(&self, name_hash: u64) -> usize {
+        self.by_name_hash.start(name_hash)
     }
 
     /// The children no file system entry claimed, in sibling order. Each one is a
@@ -2307,6 +2350,24 @@ pub(crate) enum KnownChild {
     Unresolved,
 }
 
+/// A child a claim found for an entry, for [`claim_live`] and the dirty walk to look for a live one
+/// among the children carrying its name hash.
+#[lore_macro::test_pub]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Claimed {
+    pub(crate) node: NodeID,
+    /// Where the listing holds the children carrying the name hash, where the listing answered;
+    /// `None` where a search did.
+    pub(crate) start: Option<usize>,
+}
+
+impl Claimed {
+    /// A child a search answered.
+    fn searched(node: NodeID) -> Self {
+        Self { node, start: None }
+    }
+}
+
 /// The listing's answer to the claim of `name_hash`, the name hash of one of `entries`, the
 /// directory's file system entries, or of a child none of them names, where the listing answers
 /// alone; `None` where only a search of the chain does ([`claim_child`]).
@@ -2326,13 +2387,16 @@ pub(crate) fn claim_from_listing(
     state: &State,
     entries: &[DirectoryEntry],
     name_hash: u64,
-) -> Option<Option<NodeID>> {
-    if let Some(node) = children.claim(name_hash) {
-        return Some(Some(node));
+) -> Option<Option<Claimed>> {
+    if let Some((node, start)) = children.claim(name_hash) {
+        return Some(Some(Claimed {
+            node,
+            start: Some(start),
+        }));
     }
     children
         .answers_alone(state, entries, name_hash)
-        .then(|| children.holds(name_hash))
+        .then(|| children.holds(name_hash).map(Claimed::searched))
 }
 
 /// The child carrying `name_hash`, the name hash of one of `entries`, the directory's file system
@@ -2351,9 +2415,12 @@ pub(crate) fn find_from_listing(
     state: &State,
     entries: &[DirectoryEntry],
     name_hash: u64,
-) -> Option<Option<NodeID>> {
-    if let Some(node) = children.claim_every(name_hash) {
-        return Some(Some(node));
+) -> Option<Option<Claimed>> {
+    if let Some((node, start)) = children.claim_every(name_hash) {
+        return Some(Some(Claimed {
+            node,
+            start: Some(start),
+        }));
     }
     children
         .answers_alone(state, entries, name_hash)
@@ -2378,9 +2445,9 @@ pub(crate) async fn claim_child(
     directory_node: NodeID,
     children: &mut DirectoryChildren,
     name_hash: u64,
-) -> Result<Option<NodeID>, StageError> {
+) -> Result<Option<Claimed>, StageError> {
     let Some(since) = children.since.as_ref() else {
-        return Ok(children.holds(name_hash));
+        return Ok(children.holds(name_hash).map(Claimed::searched));
     };
     let searched = match state
         .find_subnode_added_since(repository.clone(), since, name_hash)
@@ -2388,13 +2455,15 @@ pub(crate) async fn claim_child(
         .forward::<StageError>("Failed to search the directory node children")?
     {
         AddedSince::Found(node) => node,
-        AddedSince::Absent => return Ok(children.holds(name_hash)),
+        AddedSince::Absent => return Ok(children.holds(name_hash).map(Claimed::searched)),
         AddedSince::Stale => match state
             .find_subnode(repository.clone(), directory_node, name_hash)
             .await
         {
             Ok(node) => node,
-            Err(error) if error.is_node_not_found() => return Ok(children.holds(name_hash)),
+            Err(error) if error.is_node_not_found() => {
+                return Ok(children.holds(name_hash).map(Claimed::searched));
+            }
             Err(error) => {
                 return Err(error)
                     .forward::<StageError>("Failed to search the directory node children");
@@ -2405,7 +2474,31 @@ pub(crate) async fn claim_child(
     if since.reattached() {
         children.claim_node(searched);
     }
-    Ok(Some(searched))
+    Ok(Some(Claimed::searched(searched)))
+}
+
+/// `claimed`, the child of `children`'s directory an entry carrying `name_hash` claimed, or,
+/// where it is staged for deletion, the first other child carrying the name hash that is not,
+/// claimed now too, so the pass over what nothing claimed leaves both ([`State::live_among`]).
+async fn claim_live(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    children: &mut DirectoryChildren,
+    name_hash: u64,
+    claimed: Option<Claimed>,
+) -> Result<Option<NodeID>, StageError> {
+    let Some(Claimed { node: found, start }) = claimed else {
+        return Ok(None);
+    };
+    let start = start.unwrap_or_else(|| children.start_of(name_hash));
+    let live = state
+        .live_among(repository, children.carrying_from(start, name_hash), found)
+        .await
+        .forward::<StageError>("Failed to read a child of a listed name")?;
+    if live != found {
+        children.claim_node(live);
+    }
+    Ok(Some(live))
 }
 
 static DIRECTORY_TASK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -2606,6 +2699,21 @@ pub(crate) async fn stage_directory(
                         }
                     },
                 };
+            let claimed = match claim_live(
+                &repository,
+                &state,
+                &mut children,
+                directory.name_hash,
+                claimed,
+            )
+            .await
+            {
+                Ok(claimed) => claimed,
+                Err(err) => {
+                    fold_child(Err(err), &mut outcome);
+                    break;
+                }
+            };
 
             let uncommitted = match is_uncommitted_child(&repository, &state, claimed).await {
                 Ok(uncommitted) => uncommitted,
@@ -2759,6 +2867,15 @@ pub(crate) async fn stage_directory(
                     }
                 },
             };
+            let claimed =
+                match claim_live(&repository, &state, &mut children, file.name_hash, claimed).await
+                {
+                    Ok(claimed) => claimed,
+                    Err(err) => {
+                        fold_child(Err(err), &mut outcome);
+                        break;
+                    }
+                };
 
             let result = stage_node_from_metadata(
                 &operation,
@@ -3132,7 +3249,9 @@ async fn holds_both_spellings(
         && held.iter().any(|spelling| spelling == observed)
 }
 
-/// Stage the child `name` of `base` from the file information the caller already holds.
+/// Stage the child `name` of `base` from the file information the caller already holds, the child
+/// `known_child` answers or, unresolved, the one a search finds, a node not staged for deletion
+/// before one that is ([`State::find_live_subnode`]).
 ///
 /// `parent_states` is the filter verdict for `base`'s path, which the child named here steps from
 /// rather than folding its whole path.
@@ -3199,10 +3318,10 @@ pub(crate) async fn stage_node_from_metadata(
     let found_child = match known_child {
         KnownChild::Resolved(node) => Ok(node),
         KnownChild::Unresolved => match state
-            .find_subnode(repository.clone(), base_node, name_hash)
+            .find_live_subnode(repository.clone(), base_node, name_hash)
             .await
         {
-            Ok(node) => Ok(Some(node)),
+            Ok((node, _)) => Ok(Some(node)),
             Err(err) if err.is_node_not_found() => Ok(None),
             Err(err) => Err(err),
         },
@@ -4793,9 +4912,21 @@ async fn stage_from_parent_revision_in_operation(
             .and_then(|result| result);
         failure = failure.or(joined.err());
     }
+    let drained = if state.holds_promoted_moves() {
+        Box::pin(crate::file::stage::stage_promoted_moves_of_call(
+            &repository,
+            &state,
+            None,
+        ))
+        .await
+        .map(drop)
+    } else {
+        Ok(())
+    };
     if let Some(err) = failure {
         return Err(err);
     }
+    drained?;
 
     // TODO(vri): UCS-17955 - Merging and conflict resolution for links
     // Serialize all staged links states recursively

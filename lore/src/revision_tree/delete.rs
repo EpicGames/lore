@@ -986,14 +986,33 @@ async fn delete_batch(
             Err(rejection) => return Ok(Err(rejection)),
         };
         let applied = apply(&state, &context, &planned).await;
+        let drained = if state.holds_promoted_moves() {
+            Box::pin(lore_revision::file::stage::stage_promoted_moves_of_call(
+                &context,
+                &state,
+                Some(&permit),
+            ))
+            .await
+            .map(drop)
+        } else {
+            Ok(())
+        };
         drop(permit);
         drop(access);
         drop(guard);
-        Ok::<_, DeleteError>(Ok((planned, applied)))
+        Ok::<_, DeleteError>(Ok((planned, applied, drained)))
     }));
     let found = task.await.internal("run the delete's task")??;
     match found {
-        Ok((planned, applied)) => applied.emit(&planned),
+        Ok((planned, applied, drained)) => {
+            applied.emit(&planned)?;
+            drained.map_err(|error| {
+                DeleteError::internal_with_context(
+                    error,
+                    "stage the moves of directories the deletions were in",
+                )
+            })
+        }
         Err(rejection) => Err(rejection.emit()),
     }
 }

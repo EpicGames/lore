@@ -107,6 +107,7 @@ async fn claim(
         .await
         .expect("the claim"),
     }
+    .map(|claimed| claimed.node)
 }
 
 /// Explores `scenario`, whole or, where its whole space takes too long to run, to `preemptions`

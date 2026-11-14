@@ -730,6 +730,26 @@ impl RelativePath {
         Ok(repository_path.as_ref().join(path))
     }
 
+    /// [`Self::to_absolute_path`] written into `buffer`, whose allocation it reuses, for a caller
+    /// placing many paths below one directory.
+    pub fn place_below(
+        &self,
+        repository_path: &Path,
+        buffer: &mut PathBuf,
+    ) -> Result<(), PathError> {
+        let path = self.as_str();
+        if leaves_its_root(path) {
+            return Err(InvalidPath {
+                path: path.to_owned(),
+            }
+            .into());
+        }
+        buffer.as_mut_os_string().clear();
+        buffer.push(repository_path);
+        buffer.push(path);
+        Ok(())
+    }
+
     /// [`Self::to_absolute_path`], held in `cache` and placed there only where `cache` holds
     /// none, so a walk that never asks for it allocates nothing.
     pub fn to_absolute_path_cached<'a>(

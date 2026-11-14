@@ -10,6 +10,7 @@ from error_types import ImproperArgumentsError, NotALinkError, NothingStagedErro
 from link_helpers import make_parent_with_link, make_repo
 from lore_parsers import parse_commit_stats_json, parse_jsonl, parse_status_json
 from service_util import LORE_SERVICE_ENVIRONMENT, SERVICE_UNAVAILABLE
+from test_utils import working_tree_files
 
 from lore import Lore
 
@@ -980,3 +981,95 @@ def test_link_scoped_commit_subdirectory_source_path_translation(new_lore_repo):
     assert sync_repo.file_exists("FolderReceivingLink/SharedFile.txt"), (
         "Original linked file must still be present under the link"
     )
+
+
+@pytest.mark.smoke
+def test_link_commit_deletes_a_staged_file_gone_from_the_mount(new_lore_repo):
+    """A commit of a staged edit of a linked file that the working tree no longer holds deletes
+    the file from the linked revision, the rest of the mount kept."""
+    repo, _ = make_parent_with_link(
+        new_lore_repo, link_files={"linked.txt": "linked\n", "keep.txt": "keep\n"}
+    )
+    linked = os.path.join("vendor", "lib", "linked.txt")
+    repo.write_files({linked: "edited\n"})
+    repo.stage([linked])
+    repo.remove_file(linked)
+    repo.commit("Edit, then remove, through the link")
+
+    assert not parse_status_json(repo.status(scan=True, json=True))
+    assert repo.file_exists(os.path.join("vendor", "lib", "keep.txt"))
+
+
+@pytest.mark.smoke
+def test_link_commit_keeps_a_merged_move_moved_back_on_disk_at_its_source(
+    new_lore_repo,
+):
+    """A commit of a merge into a link drawn from a subtree, which moved a file within it, keeps
+    the file at its committed path in the link's revision where the working tree moved it back
+    there since, the merge's move left out."""
+    repo, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_files={"sub/a.txt": "a\n", "sub/k.txt": "k\n"},
+        source_path="sub/",
+    )
+    mount = "vendor/lib"
+    repo.branch_create("feature")
+    repo.write_files({f"{mount}/k.txt": "k on feature\n"})
+    repo.stage(scan=True)
+    repo.commit("Edit k.txt on feature")
+    repo.push()
+    link_repo.branch_switch("feature")
+    link_repo.move("sub/a.txt", "sub/moved.txt")
+    link_repo.stage_move("sub/a.txt", "sub/moved.txt")
+    link_repo.commit("Move a.txt")
+    link_repo.push()
+    repo.branch_switch("main")
+
+    repo.branch_merge_start("feature", link=mount, no_commit=True)
+    assert repo.file_exists(f"{mount}/moved.txt"), os.listdir(
+        os.path.join(repo.path, mount)
+    )
+    repo.move(f"{mount}/moved.txt", f"{mount}/a.txt")
+    repo.commit("Merge the move, moved back")
+    repo.push()
+
+    fresh = repo.clone()
+    assert fresh.file_exists(f"{mount}/a.txt"), "the file stays at its source"
+    assert not fresh.file_exists(f"{mount}/moved.txt"), "the move is left out"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("mount", ["vendor/lib", "vendor/deep/lib"])
+def test_commit_keeps_a_removed_directory_holding_a_link_and_the_link(
+    new_lore_repo, mount
+):
+    """A commit of a staged edit in a directory that holds a link's mount, at any depth below it,
+    the directory removed from the working tree since, deletes the edited file alone: the
+    directory, what else it holds and the link stay, as a mount leaves only by the link's
+    removal."""
+    repo, _ = make_parent_with_link(
+        new_lore_repo,
+        mount,
+        parent_files={
+            "vendor/other.txt": "other\n",
+            "vendor/keep.txt": "keep\n",
+            "o.txt": "o\n",
+        },
+    )
+    other = os.path.join("vendor", "other.txt")
+    repo.write_files({other: "edited\n"})
+    repo.stage([other])
+    repo.rmtree("vendor")
+    repo.commit("Remove the vendor directory")
+
+    deltas = parse_jsonl(
+        repo.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
+    )
+    deleted = sorted(delta["path"] for delta in deltas if delta["action"] == "delete")
+    assert deleted == ["vendor/other.txt"], deltas
+    repo.push()
+
+    fresh = repo.clone()
+    assert working_tree_files(fresh) == sorted(
+        ["o.txt", "vendor/keep.txt", f"{mount}/linked.txt"]
+    ), f"The branch keeps the link mounted, got {working_tree_files(fresh)}"

@@ -2486,6 +2486,13 @@ impl Filter {
                 || self.view.covers_subtree(states.view, lowercase, depth))
     }
 
+    /// Whether the view takes in everything at and below the directory `path`, given the verdicts
+    /// at `path` itself: a view that excludes nothing takes in everything.
+    pub fn view_covers_subtree(&self, states: FilterStates, path: &RelativePath) -> bool {
+        self.view.is_empty()
+            || self.covers_subtree(states, path, query_depth(path.as_str()), FilterMode::View)
+    }
+
     /// [`excludes_tree`](Self::excludes_tree), emitting a
     /// [`LoreEvent::FilterExclude`] when it hits.
     ///

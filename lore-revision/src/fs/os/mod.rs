@@ -58,14 +58,14 @@ use crate::util::path::RelativePath;
 /// OS-backed filesystem provider.
 #[derive(Debug)]
 pub struct OsFilesystem {
-    filesystem_root: PathBuf,
+    filesystem_root: Arc<Path>,
 }
 
 impl OsFilesystem {
     /// Create a new OS-backed filesystem provider.
     pub fn new(filesystem_root: impl AsRef<Path>) -> Self {
         Self {
-            filesystem_root: filesystem_root.as_ref().to_path_buf(),
+            filesystem_root: Arc::from(filesystem_root.as_ref()),
         }
     }
 
@@ -111,7 +111,7 @@ impl FilesystemProvider for OsFilesystem {
 pub struct OsOperation {
     /// Where the mounted filesystem starts, which every repository in it shares: a link
     /// or layer context inherits its parent's path, so this is not a repository's root.
-    filesystem_root: PathBuf,
+    filesystem_root: Arc<Path>,
 }
 
 impl OsOperation {
@@ -222,6 +222,44 @@ impl InstanceOperation for OsOperation {
         }
     }
 
+    /// Reads the paths on the blocking pool, [`DIRECTORIES_PER_TASK`] to a task and
+    /// [`DIRECTORY_TASKS_AT_ONCE`] tasks side by side, each through one path buffer
+    /// ([`directories_held_below`]).
+    async fn directories_held(
+        &self,
+        paths: Arc<[RelativePath]>,
+        held: &mut Vec<bool>,
+    ) -> Result<(), FsError> {
+        held.reserve(paths.len());
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut answered: Vec<Option<Vec<bool>>> = Vec::new();
+        let mut starts = (0..paths.len()).step_by(DIRECTORIES_PER_TASK).enumerate();
+        loop {
+            while tasks.len() < DIRECTORY_TASKS_AT_ONCE
+                && let Some((index, start)) = starts.next()
+            {
+                let root = self.filesystem_root.clone();
+                let paths = paths.clone();
+                let end = paths.len().min(start + DIRECTORIES_PER_TASK);
+                lore_base::lore_spawn_blocking!(tasks, move || {
+                    (index, directories_held_below(&root, &paths[start..end]))
+                });
+            }
+            let Some(joined) = tasks.join_next().await else {
+                break;
+            };
+            let (index, read) = joined.internal("Reading whether directories are held")?;
+            if answered.len() <= index {
+                answered.resize_with(index + 1, || None);
+            }
+            answered[index] = Some(read?);
+        }
+        for read in answered.into_iter().flatten() {
+            held.extend(read);
+        }
+        Ok(())
+    }
+
     /// The same lookup as [`file_info`](Self::file_info): the working tree is the only view
     /// this provider has, so a tracked path and an untracked one are read alike.
     async fn untracked_file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
@@ -247,12 +285,14 @@ impl InstanceOperation for OsOperation {
         lore_io::IoDriver::global().holds_name_exactly(path).await
     }
 
+    /// A path holding no directory, nothing or a file, is not found ([`listing_failure`]).
     async fn read_directory(&self, path: &RelativePath) -> Result<DirectoryListing, FsError> {
-        let path = self.absolute(path)?;
+        let entries = lore_io::IoDriver::global()
+            .read_dir(self.absolute(path)?)
+            .await
+            .map_err(|error| listing_failure(error, path))?;
         Ok(DirectoryListing::new(StaticDispatchDirectoryListing::Os(
-            Box::new(OsDirectoryListing {
-                entries: lore_io::IoDriver::global().read_dir(path).await?,
-            }),
+            Box::new(OsDirectoryListing { entries }),
         )))
     }
 
@@ -739,4 +779,46 @@ fn unify_refused_rename<'a>(
         lore_debug!("Renamed {} -> {}", from_path.display(), to_path.display());
         Ok(())
     }
+}
+
+/// What a listing of `path` answers for `error`: a path holding no directory, nothing or a file,
+/// is not found.
+fn listing_failure(error: std::io::Error, path: &RelativePath) -> FsError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+            lore_base::error::FileNotFound {
+                resource: path.to_string(),
+            }
+            .into()
+        }
+        _ => error.into(),
+    }
+}
+
+/// The paths [`InstanceOperation::directories_held`] reads on one blocking task.
+const DIRECTORIES_PER_TASK: usize = 256;
+
+/// The blocking tasks [`InstanceOperation::directories_held`] runs side by side, so a cold cache
+/// waits on several reads at once.
+const DIRECTORY_TASKS_AT_ONCE: usize = 4;
+
+/// Whether `root` holds a directory at each of `paths`, as [`InstanceOperation::directories_held`]
+/// answers, read with one path buffer: a path a stat is refused permission for holds one, a path
+/// holding nothing or through a file none.
+fn directories_held_below(root: &Path, paths: &[RelativePath]) -> Result<Vec<bool>, FsError> {
+    let mut buffer = PathBuf::new();
+    let mut held = Vec::with_capacity(paths.len());
+    for path in paths {
+        path.place_below(root, &mut buffer)
+            .forward::<FsError>("placing a path below the filesystem root")?;
+        held.push(match lore_io::stat_blocking(&buffer) {
+            Ok(stat) => matches!(stat.kind, StatKind::Directory),
+            Err(error) => match error.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => false,
+                std::io::ErrorKind::PermissionDenied => true,
+                _ => return Err(error.into()),
+            },
+        });
+    }
+    Ok(held)
 }

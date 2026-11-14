@@ -300,12 +300,26 @@ async fn apply_plan(
             Err(_) => strongest.merge(EntryFailure::Internal),
         }
     }
-
+    let state: &State = claim.state();
+    let drained = if state.holds_promoted_moves() {
+        Box::pin(lore_revision::file::stage::stage_promoted_moves_of_call(
+            &context, state, None,
+        ))
+        .await
+        .map(drop)
+    } else {
+        Ok(())
+    };
     if applied < total {
         let failed = total - applied;
         return Err(strongest.call_error(&format!("{failed}/{total} node modifies failed")));
     }
-    Ok(())
+    drained.map_err(|error| {
+        ModifyError::internal_with_context(
+            error,
+            "stage the moves of directories the modifies were in",
+        )
+    })
 }
 
 /// Rewrite a batch of file nodes' content fields.

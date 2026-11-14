@@ -197,6 +197,15 @@ pub(crate) async fn obliterate_file(
     )
     .await
     .forward::<ObliterateError>("Failed to stage deleted path")?;
+    if state.holds_promoted_moves() {
+        Box::pin(crate::file::stage::stage_promoted_moves_of_call(
+            &repository,
+            &state,
+            None,
+        ))
+        .await
+        .forward::<ObliterateError>("Failed to stage the move of a directory the path is in")?;
+    }
 
     let signature = state
         .serialize(repository.clone(), token)

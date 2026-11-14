@@ -1693,6 +1693,8 @@ that the file at that path differs from the committed revision. The two flags sh
 single per-node action - modify, add, delete, move, or copy - so a node has one
 action regardless of whether that action is dirty, staged, or both.
 
+A staged action stands until it's unstaged: marking the node dirty again sets the dirty flag beside it and leaves the action as staged.
+
 Dirty propagates to parent directories: any directory containing a dirty file is
 itself dirty. Marking a single file dirty walks up to the root and stops as soon as it
 encounters a directory already flagged, so propagation cost is bounded by the depth
@@ -1803,6 +1805,8 @@ Staging records intent in two senses. First, it pins the *path*: the user has sa
 in the next revision." Second, it does *not* freeze the content. Between staging and
 committing, the user can keep editing the file, and committing picks up whatever the
 file looks like at that moment - not whatever it looked like when it was staged.
+
+The commit takes what the working tree holds at a staged path: a staged node the working tree no longer holds, or holds a node of the other kind at, is committed as deleted, a directory with everything below it, and one staged as added is left out. A directory holding what the view excludes or a link's mount stays, as their absence from the working tree is no deletion. A node staged as moved that the working tree holds at its committed path again stays there as committed instead, a directory whatever it holds, and what was added in such a directory stays marked as added. A directory whose move or add is marked dirty takes it staged once something below it is staged.
 
 This matches how iteration actually works. A developer stages a file, keeps editing,
 runs tests, fixes, and commits. Committing captures the latest state of the staged

@@ -189,7 +189,7 @@ pub struct RepositoryCloneArgs {
     #[clap(long, value_name = "branch", conflicts_with = "revision")]
     branch: Option<String>,
 
-    /// Clone without files, only fetch latest revision tree
+    /// Clone without files, only fetch latest revision tree. Don't commit after merging, reverting or cherry-picking in such an instance: the commit can delete a directory the instance never had on disk, with everything in it
     #[clap(long, action)]
     bare: bool,
 
@@ -226,7 +226,7 @@ pub struct RepositoryCloneArgs {
     #[clap(long, action)]
     no_tracking: bool,
 
-    /// Root files for dependency-based selective clone (only clone these files and their dependencies). A root file inside a link is skipped
+    /// Root files for dependency-based selective clone (only clone these files and their dependencies). A root file inside a link is skipped. Don't commit after merging, reverting or cherry-picking in such an instance: the commit can delete a directory the instance never had on disk, with everything in it
     #[clap(long = "root-file", value_name = "path")]
     root_files: Vec<String>,
 

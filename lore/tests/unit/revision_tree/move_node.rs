@@ -690,6 +690,129 @@ async fn a_move_after_a_failed_entry_walks_its_destination_again() {
     release(handle, store_handle_id);
 }
 
+/// The C API verb that stages a change inside a directory `lore dirty move` moved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StagedInside {
+    Moved,
+    Added,
+    Modified,
+    Deleted,
+}
+
+/// A change any C API verb stages inside a directory `lore dirty move` moved stages that
+/// directory's whole move, as a stage inside it does: each file that moves with it alone takes a
+/// staged move.
+#[tokio::test]
+async fn a_staged_change_inside_a_dirty_moved_directory_stages_its_whole_move() {
+    use lore_revision::node::NodeExtFlags;
+    use lore_revision::node::NodeFlags;
+    use lore_revision::state::Ext;
+    use lore_revision::state::Mark;
+    use lore_revision::state::NameChange;
+
+    for (index, inside) in [
+        StagedInside::Moved,
+        StagedInside::Added,
+        StagedInside::Modified,
+        StagedInside::Deleted,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let partition = Partition::from([0x5d + index as u8; 16]);
+        let (handle, store_handle_id) = load_handle("staged-inside-dirty-moved", partition).await;
+        let p = seed(handle, ROOT_NODE, "p", LoreNodeType::Directory).await;
+        let f1 = seed(handle, p, "f1", LoreNodeType::File).await;
+        let f2 = seed(handle, p, "f2", LoreNodeType::File).await;
+        let x = seed(handle, ROOT_NODE, "x", LoreNodeType::File).await;
+        set_branch(handle, Context::from(uuid::Uuid::now_v7())).await;
+        run_commit(handle, 1).await;
+
+        let internal = rt_handle::lookup(handle).expect("the handle must resolve");
+        let execution = lore::call::setup_execution(LoreGlobalArgs::default(), None);
+        let marked = internal.clone();
+        lore_base::runtime::LORE_CONTEXT
+            .scope(execution, async move {
+                let state = marked.state_for_tests();
+                let repository = marked.repository_context.clone();
+                let moved =
+                    Mark::dirty(NodeFlags::DirtyMove, Ext::Set(NodeExtFlags::NoFlags), true);
+                state
+                    .node_move(
+                        repository.clone(),
+                        p,
+                        ROOT_NODE,
+                        NameChange::Rename("r"),
+                        moved,
+                    )
+                    .await
+                    .expect("the dirty move of p");
+                for child in [f1, f2] {
+                    state
+                        .node_mark(&repository, child, moved)
+                        .await
+                        .expect("the dirty move of a child");
+                }
+            })
+            .await;
+
+        match inside {
+            StagedInside::Moved => {
+                let (status, _events) = run_move(handle, vec![entry(10, x, p, "x")]).await;
+                assert_eq!(status, 0, "moving x into r must succeed");
+            }
+            StagedInside::Added => {
+                let (status, _events) = run_add(
+                    handle,
+                    vec![LoreRevisionTreeAddEntry {
+                        entry_id: 10,
+                        parent_node_id: p,
+                        parent_entry_index: 0,
+                        name: LoreString::from_str("n"),
+                        kind: LoreNodeType::File as u32,
+                        mode: 0o644,
+                        size: 10,
+                        address: address(2, file_id()),
+                    }],
+                )
+                .await;
+                assert_eq!(status, 0, "adding n into r must succeed");
+            }
+            StagedInside::Modified => run_modify(handle, f1, 20, 9).await,
+            StagedInside::Deleted => run_delete(handle, f1).await,
+        }
+
+        let execution = lore::call::setup_execution(LoreGlobalArgs::default(), None);
+        let flags = lore_base::runtime::LORE_CONTEXT
+            .scope(execution, async move {
+                let state = internal.state_for_tests();
+                let mut flags = Vec::new();
+                for node in [p, f1, f2] {
+                    let record = state
+                        .node(internal.repository_context.clone(), node)
+                        .await
+                        .expect("the node");
+                    flags.push((record.is_staged_move(), record.is_dirty()));
+                }
+                flags
+            })
+            .await;
+        assert!(
+            flags[0].0,
+            "{inside:?}: r takes its move staged, flags {flags:?}"
+        );
+        let moved_with: &[(bool, bool)] = match inside {
+            StagedInside::Moved | StagedInside::Added => &flags[1..],
+            StagedInside::Modified | StagedInside::Deleted => &flags[2..],
+        };
+        assert!(
+            moved_with.iter().all(|&flags| flags == (true, false)),
+            "{inside:?}: the files moved with r alone take staged moves, flags {flags:?}"
+        );
+        release(handle, store_handle_id);
+    }
+}
+
 /// What keeping the node buys: the delta the commit writes names it under a move
 /// action, so the revision graph carries its history across the change rather than
 /// reading as a deletion and an unrelated addition.

@@ -89,6 +89,7 @@ pub use iocp::IocpStats;
 pub use pool::PoolStats;
 pub use pool::requested_max_threads;
 pub use pool::set_max_threads;
+pub use psync::stat_blocking;
 pub use stat::Stat;
 pub use stat::StatKind;
 #[cfg(target_os = "linux")]

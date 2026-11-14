@@ -32,7 +32,10 @@ use crate::dirty_move_fixture::holds as fixture_holds;
 use crate::dirty_move_fixture::made_directory;
 use crate::dirty_move_fixture::node_at;
 use crate::dirty_move_fixture::node_id_at;
+use crate::dirty_move_fixture::removed_directory;
 use crate::dirty_move_fixture::stage_path;
+use crate::dirty_move_fixture::staged_moved;
+use crate::dirty_move_fixture::tree_paths;
 use crate::dirty_move_fixture::with_instance;
 use crate::dirty_move_fixture::written;
 use crate::fs::filesystem_provider::TestFilesystemProvider;
@@ -40,6 +43,7 @@ use crate::fs::filesystem_provider::test_store_create;
 use crate::helper::RepositoryContextCreationArgsExt;
 use crate::helper::TestRepository;
 use crate::helper::default_repository_creation_args;
+use crate::helper::test_commit;
 
 /// Every path a call names is read through the one operation it opens, whatever the call
 /// finds: a provider that freezes hands out one snapshot, and a walk opening a second
@@ -493,6 +497,69 @@ async fn marking_a_directory_dirty_keeps_the_moves_out_of_it() {
     .await;
 }
 
+/// Marking dirty the removal of a file in a directory `lore dirty move` moved marks it deleted at
+/// its moved path, which the current revision holds at its committed one.
+#[tokio::test]
+async fn marking_a_removed_file_in_a_dirty_moved_directory_dirty_marks_it_deleted() {
+    with_instance(|instance| async move {
+        committed(&instance, &["d/f.txt", "d/g.txt"]).await;
+        dirty_moved(&instance, "d", "e").await;
+        std::fs::remove_file(instance.path.join("e/f.txt")).expect("the delete on disk");
+        let staged = dirtied(&instance, "e/f.txt").await;
+        let removed = node_at(&instance, &staged, "e/f.txt").await;
+        assert!(
+            removed.is_dirty_delete() && !removed.is_staged(),
+            "e/f.txt: flags {:#x}",
+            removed.flags
+        );
+    })
+    .await;
+}
+
+/// Marking dirty a file written again at the path of a file staged for deletion keeps the staged
+/// deletion and marks the new file added beside it, so the commit deletes the committed file and
+/// the staged tree holds the new one marked added past it.
+#[tokio::test]
+async fn marking_a_file_staged_for_deletion_dirty_keeps_its_staged_deletion() {
+    with_instance(|instance| async move {
+        let first = committed(&instance, &["f.txt", "other.txt"]).await;
+        let f = first
+            .find_node_link(instance.repository.clone(), "f.txt")
+            .await
+            .expect("the committed file")
+            .node;
+        std::fs::remove_file(instance.path.join("f.txt")).expect("the delete on disk");
+        stage_path(&instance, "f.txt").await;
+        std::fs::write(instance.path.join("f.txt"), b"written again").expect("the write");
+        let staged = dirtied(&instance, "f.txt").await;
+        let deleted = staged
+            .node(instance.repository.clone(), f)
+            .await
+            .expect("the deleted file");
+        assert!(
+            deleted.is_staged_delete(),
+            "f.txt: flags {:#x}",
+            deleted.flags
+        );
+
+        let revision = test_commit(&instance, "Deleted").await;
+        let held = tree_paths(&instance, &revision).await;
+        assert!(
+            !held.contains_key("f.txt"),
+            "the revision holds {:?}",
+            held.keys()
+        );
+        let staged = dirtied(&instance, "other.txt").await;
+        let added = node_at(&instance, &staged, "f.txt").await;
+        assert!(
+            added.is_dirty_add() && !added.is_staged(),
+            "f.txt: flags {:#x}",
+            added.flags
+        );
+    })
+    .await;
+}
+
 /// A repository rooted at `path`, with the stores and execution context a walk needs.
 #[cfg(unix)]
 async fn working_tree_repository(
@@ -535,9 +602,14 @@ async fn walk_root(repository: &Arc<RepositoryContext>, state: &Arc<State>) -> A
         staged: ROOT_NODE,
     };
 
-    dirty_directory(&walk, root, &RelativePath::new(), FilterStates::ROOT)
-        .await
-        .expect("marking the working tree");
+    dirty_directory(
+        &walk,
+        root,
+        &RelativePath::new(),
+        (FilterStates::ROOT, false),
+    )
+    .await
+    .expect("marking the working tree");
 
     walk.stats
 }
@@ -642,6 +714,99 @@ async fn dirtying_a_wide_directory_steps_through_each_child_a_few_times_at_most(
         assert!(steps < 3 * N as u64, "the deleted files took {steps} steps");
         let deletes = children_marked(&instance, signature, "kept", Node::is_dirty_delete).await;
         assert_eq!(deletes, N, "the deleted files are marked deleted");
+    })
+    .await;
+}
+
+/// Marking dirty the removal of many files marked dirty as added, in a directory holding a staged
+/// file listed ahead of them, clears the marks above each removal in a few steps through the
+/// directory's children: the walk stops at the staged file, for which the directory keeps its
+/// staged bit, rather than reading every child to hash them each time.
+#[tokio::test]
+async fn reverting_adds_beside_a_staged_file_steps_through_the_directory_a_few_times_each() {
+    with_instance(|instance| async move {
+        const N: usize = 256;
+        committed(&instance, &["d/seed", "other.txt"]).await;
+        let added = files_in("d", N);
+        written(
+            &instance,
+            &added.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        dirtied(&instance, "d").await;
+        written(&instance, &["d/staged.txt"]);
+        stage_path(&instance, "d/staged.txt").await;
+        for path in &added {
+            std::fs::remove_file(instance.path.join(path)).expect("the removal on disk");
+        }
+        step_counting::set_chain_step_counting(true);
+        let before = step_counting::thread_walk_steps();
+        let signature = dirty(
+            instance.repository.clone(),
+            LoreArray::from_vec(
+                added
+                    .iter()
+                    .map(|path| LoreString::from(&instance.path.join(path)))
+                    .collect(),
+            ),
+        )
+        .await
+        .expect("the dirty marks");
+        let steps = step_counting::thread_walk_steps() - before;
+        assert!(
+            steps < 8 * N as u64,
+            "the removals took {steps} steps through children"
+        );
+        let adds = children_marked(&instance, signature, "d", |node| {
+            node.is_dirty_add() && !node.is_staged()
+        })
+        .await;
+        assert_eq!(adds, 0, "the removed files leave the staged tree");
+    })
+    .await;
+}
+
+/// Marking dirty the removal of many files marked dirty as added, in a directory a staged move took
+/// a committed file out of, clears the marks above each removal in a few steps through the
+/// directory's children: a file that leaves unstaged carried no staged bit up, so the directory's
+/// bare bit, kept for its rehash, is not weighed again for each.
+#[tokio::test]
+async fn reverting_adds_in_a_directory_a_staged_move_left_steps_through_it_a_few_times_each() {
+    with_instance(|instance| async move {
+        const N: usize = 256;
+        committed(&instance, &["d/seed", "other.txt"]).await;
+        let added = files_in("d", N);
+        written(
+            &instance,
+            &added.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        dirtied(&instance, "d").await;
+        staged_moved(&instance, "d/seed", "seed").await;
+        for path in &added {
+            std::fs::remove_file(instance.path.join(path)).expect("the removal on disk");
+        }
+        step_counting::set_chain_step_counting(true);
+        let before = step_counting::thread_walk_steps();
+        let signature = dirty(
+            instance.repository.clone(),
+            LoreArray::from_vec(
+                added
+                    .iter()
+                    .map(|path| LoreString::from(&instance.path.join(path)))
+                    .collect(),
+            ),
+        )
+        .await
+        .expect("the dirty marks");
+        let steps = step_counting::thread_walk_steps() - before;
+        assert!(
+            steps < 8 * N as u64,
+            "the removals took {steps} steps through children"
+        );
+        let adds = children_marked(&instance, signature, "d", |node| {
+            node.is_dirty_add() && !node.is_staged()
+        })
+        .await;
+        assert_eq!(adds, 0, "the removed files leave the staged tree");
     })
     .await;
 }
@@ -812,9 +977,14 @@ async fn a_directory_held_as_a_link_is_walked(count: usize) {
             staged: ROOT_NODE,
         };
 
-        dirty_directory(&walk, root, &RelativePath::new(), FilterStates::ROOT)
-            .await
-            .expect("the walk reads no linked State");
+        dirty_directory(
+            &walk,
+            root,
+            &RelativePath::new(),
+            (FilterStates::ROOT, false),
+        )
+        .await
+        .expect("the walk reads no linked State");
 
         for path in &added {
             assert!(
@@ -824,4 +994,205 @@ async fn a_directory_held_as_a_link_is_walked(count: usize) {
         }
     })
     .await;
+}
+
+/// A walk holds its current State as the base of its staged tree, so a node's return to the place
+/// the current revision holds it at reads that revision from the walk rather than again.
+#[tokio::test]
+async fn a_walk_holds_its_current_state_as_the_base_of_its_staged_tree() {
+    with_instance(|instance| async move {
+        let current = committed(&instance, &["a.txt"]).await;
+        let staged = State::deserialize(instance.repository.clone(), current.revision())
+            .await
+            .expect("a staged tree of the revision");
+        DirtyWalk::new(
+            instance
+                .repository
+                .file_system()
+                .begin_operation()
+                .await
+                .expect("beginning an operation"),
+            instance.repository.clone(),
+            current.clone(),
+            staged.clone(),
+            Arc::new(DirtyStats::default()),
+            None,
+        )
+        .await
+        .expect("a walk");
+
+        let base = staged
+            .base(&instance.repository, current.revision())
+            .await
+            .expect("the base");
+        assert!(Arc::ptr_eq(&base, &current), "the base was read again");
+    })
+    .await;
+}
+
+/// A node that went back to its committed place is spelled as the walk spells its paths: as the
+/// tree holds it for the instance's own walk, and below the mount a layer's or link's walk spells
+/// them from where the tree holds it below the mount's source, a mount whose last names are its
+/// source's among them, and nowhere elsewhere.
+#[test]
+fn a_returned_node_is_spelled_below_the_walks_mount() {
+    let path = |spelled: &str| RelativePath::new_from_initial_path(spelled).expect("a path");
+    for (mount, tree, expected) in [
+        (None, "t/x", Some("t/x")),
+        (None, "t", Some("t")),
+        (Some(("m", "src")), "src/t/x", Some("m/t/x")),
+        (Some(("m", "src")), "src", Some("m")),
+        (Some(("m", "SRC")), "src/t", Some("m/t")),
+        (Some(("m", "")), "t/x", Some("m/t/x")),
+        (Some(("m", "src")), "elsewhere/t", None),
+        (Some(("m", "src")), "srcs/t", None),
+        (
+            Some(("vendor/src", "src")),
+            "src/t/x",
+            Some("vendor/src/t/x"),
+        ),
+        (Some(("vendor/src", "src")), "elsewhere/t", None),
+    ] {
+        let mounted = mount.map(|(at, source)| Mount {
+            at: path(at),
+            source: path(source),
+        });
+        assert_eq!(
+            spelled_as_walked(mounted.as_ref(), tree)
+                .as_ref()
+                .map(RelativePath::as_str),
+            expected,
+            "mounted {mount:?}, back at {tree}"
+        );
+    }
+}
+
+/// A walk marking a directory `lore dirty move` moved deleted, once the working tree lacks it,
+/// returns it to its committed place and asks the view of its children there: below a directory
+/// whose contents the view leaves out, they stay as they are, as the working tree lacks them
+/// without their having been deleted.
+#[tokio::test]
+async fn a_returned_directory_marked_deleted_leaves_the_children_its_view_excludes() {
+    with_instance(|instance| async move {
+        let first = committed(&instance, &["t/a", "t/b", "other.txt"]).await;
+        let held = tree_paths(&instance, &first).await;
+        let viewed = Arc::new(
+            instance
+                .repository
+                .to_filter_context(Arc::new(crate::helper::test_filter(&[], &["/t/*"]))),
+        );
+        for file in ["t/a", "t/b"] {
+            std::fs::remove_file(instance.path.join(file)).expect("the view's absence on disk");
+        }
+        std::fs::rename(instance.path.join("t"), instance.path.join("u")).expect("the move");
+        lore_revision::file::dirty::dirty_move(
+            viewed.clone(),
+            instance.path.join("t").to_string_lossy().into_owned(),
+            instance.path.join("u").to_string_lossy().into_owned(),
+        )
+        .await
+        .expect("the dirty move");
+        std::fs::remove_dir(instance.path.join("u")).expect("the delete on disk");
+
+        let signature = lore_revision::file::dirty::dirty(
+            viewed,
+            LoreArray::from_vec(vec![LoreString::from(&instance.path.join("u"))]),
+        )
+        .await
+        .expect("the walk");
+        let state = State::deserialize(instance.repository.clone(), signature)
+            .await
+            .expect("the staged state");
+
+        let t = node_at(&instance, &state, "t").await;
+        assert!(t.is_dirty_delete(), "t, flags {:#x}", t.flags);
+        for file in ["t/a", "t/b"] {
+            let node = state
+                .node(instance.repository.clone(), held[file])
+                .await
+                .expect("the file");
+            assert!(
+                !node.is_dirty_delete(),
+                "{file} is marked deleted, flags {:#x}",
+                node.flags
+            );
+        }
+    })
+    .await;
+}
+
+/// A walk discarding a directory staged as added and marked dirty, once the working tree lacks
+/// it, leaves a node a staged move took into it to leave the tree with it, as a commit of the
+/// directory gone takes it, rather than return it with its staged move.
+#[tokio::test]
+async fn a_discarded_added_directory_takes_a_node_staged_as_moved_into_it() {
+    with_instance(|instance| async move {
+        let first = committed(&instance, &["a.txt", "other.txt"]).await;
+        let held = tree_paths(&instance, &first).await;
+        written(&instance, &["n/k"]);
+        stage_path(&instance, "n/k").await;
+        staged_moved(&instance, "a.txt", "n/a.txt").await;
+        written(&instance, &["n/d"]);
+        let marked = dirtied(&instance, "n/d").await;
+        let n = node_at(&instance, &marked, "n").await;
+        assert!(n.is_dirty_add() && n.is_staged(), "n, flags {:#x}", n.flags);
+        removed_directory(&instance, "n");
+
+        let state = dirtied(&instance, "n").await;
+
+        assert!(!fixture_holds(&instance, &state, "n").await, "n is held");
+        assert!(
+            !fixture_holds(&instance, &state, "a.txt").await,
+            "a.txt went back, flags {:#x}",
+            node_at(&instance, &state, "a.txt").await.flags
+        );
+        assert!(
+            state
+                .node(instance.repository.clone(), held["a.txt"])
+                .await
+                .expect("the slot")
+                .is_discarded(),
+            "a.txt's node stays in the tree"
+        );
+    })
+    .await;
+}
+
+/// A walk of a directory where a file marked dirty as added now stands as a directory marks the
+/// file's node deleted, which discards it, and adds the directory in its place, whether the walk
+/// searches the directory's chain or lists it for more entries than it searches.
+#[tokio::test]
+async fn a_walk_takes_a_directory_where_a_file_marked_added_stood() {
+    for width in [0, SEARCHED_CHILDREN + 1] {
+        with_instance(|instance| async move {
+            let mut files = vec!["a/k".to_string(), "other.txt".to_string()];
+            files.extend((0..width).map(|index| format!("a/p{index}")));
+            let files: Vec<&str> = files.iter().map(String::as_str).collect();
+            committed(&instance, &files).await;
+            written(&instance, &["a/x"]);
+            dirtied(&instance, "a/x").await;
+            std::fs::remove_file(instance.path.join("a/x")).expect("the delete on disk");
+            written(&instance, &["a/x/y"]);
+
+            let state = dirtied(&instance, "a").await;
+
+            let a = node_id_at(&instance, &state, "a").await;
+            assert_eq!(
+                children_named(&instance, &state, a, "x").await,
+                1,
+                "{width}: the nodes at a/x"
+            );
+            let x = node_at(&instance, &state, "a/x").await;
+            assert!(
+                x.is_directory() && x.is_dirty_add(),
+                "{width}: a/x, flags {:#x}",
+                x.flags
+            );
+            assert!(
+                fixture_holds(&instance, &state, "a/x/y").await,
+                "{width}: a/x/y"
+            );
+        })
+        .await;
+    }
 }

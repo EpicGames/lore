@@ -99,7 +99,7 @@ async fn a_free_whose_collected_block_fails_to_load_frees_nothing_below_its_root
         let freed = lore_revision::state::node_discard_free(
             &tree.state,
             &tree.repository,
-            &[d],
+            &[(d, 0)],
             below.clone(),
             |_, _| {},
         )

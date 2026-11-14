@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: MIT
 import logging
 import os
+import sys
 
 import pytest
-from error_types import FileNotFound
+from error_types import LoreException
 from lore_parsers import (
     parse_commit_stats_json,
     parse_jsonl,
@@ -372,6 +373,11 @@ def test_commit_dry_run(new_lore_repo):
 
 
 @pytest.mark.smoke
+@pytest.mark.skipif(
+    sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="0o000 makes a file unreadable on POSIX alone, and not for root, so the commit "
+    "would not fail where it reads the file",
+)
 def test_failed_commit_records_no_modified_times(new_lore_repo):
     """A commit reads every file it commits and records the modified time it read each at,
     but those times describe the revision it is building, not the one the working copy is
@@ -387,12 +393,12 @@ def test_failed_commit_records_no_modified_times(new_lore_repo):
 
     size = 4096
     committed = "committed-first.bin"
-    removed = "removed-before-commit.bin"
-    removed_content = os.urandom(size)
+    replaced = "replaced-before-commit.bin"
+    replaced_content = os.urandom(size)
     with repo.open_file(committed, "w+b") as f:
         f.write(os.urandom(size))
-    with repo.open_file(removed, "w+b") as f:
-        f.write(removed_content)
+    with repo.open_file(replaced, "w+b") as f:
+        f.write(replaced_content)
     repo.stage(scan=True, offline=True)
     repo.commit(offline=True)
 
@@ -401,24 +407,27 @@ def test_failed_commit_records_no_modified_times(new_lore_repo):
     )[-1]["revisionNumber"]
 
     # Same sizes, new content.
-    for name in (committed, removed):
+    for name in (committed, replaced):
         with repo.open_file(name, "w+b") as f:
             f.write(os.urandom(size))
     repo.stage(scan=True, offline=True)
 
-    # Removing a staged file fails the commit where it reads that file's metadata, after
-    # the other one has been fragmented. Unlike a killed process, this exits cleanly, so
+    # A staged file no one may read fails the commit where it reads that file's content,
+    # after the other one has been fragmented. Unlike a killed process, this exits cleanly, so
     # anything written to the mutable store along the way is flushed and survives.
-    os.remove(os.path.join(repo.path, removed))
-    with pytest.raises(FileNotFound):
+    # The read fails as an internal error, whose code, -1, a POSIX exit status reads as 255.
+    os.chmod(os.path.join(repo.path, replaced), 0o000)
+    with pytest.raises(LoreException) as failed:
         repo.commit(offline=True)
+    assert failed.value.returncode == 255, failed.value
 
     # Put the committed bytes back. `reset` cannot do it while the file is staged, and
     # unstaging would drop it from the retry altogether, so the content is restored
     # directly: the file stays staged but holds what the current revision addresses, and
     # the retry has to recognise from its content that it is not a change.
-    with repo.open_file(removed, "w+b") as f:
-        f.write(removed_content)
+    os.chmod(os.path.join(repo.path, replaced), 0o644)
+    with repo.open_file(replaced, "w+b") as f:
+        f.write(replaced_content)
 
     revision_after = parse_jsonl(
         repo.status(json=True, offline=True), "repositoryStatusRevision"
@@ -773,3 +782,87 @@ def test_commit_stats_report_deletes_and_moves(new_lore_repo):
     )
 
     repo.repository_verify(offline=True)
+
+
+@pytest.mark.smoke
+def test_commit_takes_the_working_tree_at_staged_paths_removed_since(new_lore_repo):
+    """A commit takes what the working tree holds at a staged path: a staged edit whose
+    file is removed before the commit commits the file's deletion, and a staged add whose
+    file is removed commits nothing for it: the revision records the deletion alone."""
+    repo: Lore = new_lore_repo()
+    for name in ("edited.txt", "keep.txt"):
+        with repo.open_file(name, "w+") as output_file:
+            output_file.write(name)
+    repo.stage(scan=True, offline=True)
+    repo.commit("Baseline commit", offline=True)
+
+    with repo.open_file("edited.txt", "w+") as output_file:
+        output_file.write("edited")
+    with repo.open_file("added.txt", "w+") as output_file:
+        output_file.write("added")
+    repo.stage(scan=True, offline=True)
+    repo.remove_file("edited.txt")
+    repo.remove_file("added.txt")
+
+    stats = parse_commit_stats_json(
+        repo.commit("Removed after staging", json=True, offline=True, stats=1)
+    )
+    assert stats is not None, "commit must emit its statistics event"
+    files = stats["files"]
+    assert files["added"] == 0, f"the add was dropped, got {files}"
+    assert files["modified"] == 0, f"no file was committed modified, got {files}"
+    assert files["deleted"] == 1, f"the edited file alone was deleted, got {files}"
+    deltas = parse_jsonl(
+        repo.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
+    )
+    recorded = [(delta["action"], delta["path"]) for delta in deltas if delta["path"]]
+    assert recorded == [("delete", "edited.txt")], deltas
+
+    status = repo.status(scan=True, offline=True)
+    assert "edited.txt" not in status and "added.txt" not in status, (
+        f"the revision holds what the working tree holds, got:\n{status}"
+    )
+    repo.repository_verify(offline=True)
+
+
+@pytest.mark.smoke
+def test_commit_of_a_merge_takes_the_working_tree_at_merged_paths_removed_since(
+    new_lore_repo,
+):
+    """A merge's commit takes what the working tree holds at the paths the merge staged: a file
+    the merge changed, or whose conflict was resolved, that the working tree no longer holds is
+    deleted, and a directory holding a deletion the merge staged, which the working tree no
+    longer holds, is deleted with what else it holds."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push(
+        "Base",
+        {
+            "f.txt": "f\n",
+            "c.txt": "c\n",
+            "d/x.txt": "x\n",
+            "d/y.txt": "y\n",
+            "o.txt": "o\n",
+        },
+    )
+    repo.branch_create("feature")
+    repo.write_files({"f.txt": "feature\n", "c.txt": "feature\n"})
+    repo.remove_file("d/x.txt")
+    repo.stage(["f.txt", "c.txt", "d/x.txt"])
+    repo.commit("Change on the branch")
+    repo.push()
+    repo.branch_switch("main")
+    repo.write_commit_push("Change on main", {"c.txt": "main\n", "o.txt": "main\n"})
+
+    repo.branch_merge_start("feature", no_commit=True)
+    repo.write_files({"c.txt": "resolved\n"})
+    repo.branch_merge_resolve(["c.txt"], offline=True)
+    for removed in ("f.txt", "c.txt"):
+        repo.remove_file(removed)
+    repo.rmtree("d")
+    repo.commit("Merge", offline=True)
+
+    deltas = parse_jsonl(
+        repo.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
+    )
+    deleted = sorted(delta["path"] for delta in deltas if delta["action"] == "delete")
+    assert deleted == ["c.txt", "d", "d/x.txt", "d/y.txt", "f.txt"], deltas

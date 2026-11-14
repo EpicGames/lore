@@ -3244,7 +3244,8 @@ fn verify_changes_against_filesystem<'a>(
 /// Copy the subtrees the target branch never touched into the staged tree.
 ///
 /// Node operations only, the filter playing no part, and the subtrees sit at disjoint paths
-/// so they need no ordering between them.
+/// so they need no ordering between them. A graft inside a directory marked dirty as moved stages
+/// the directory's whole move, as staging inside it does.
 async fn apply_diff_grafts(
     repository: &Arc<RepositoryContext>,
     state_staged: &Arc<State>,
@@ -3276,9 +3277,22 @@ async fn apply_diff_grafts(
             Ok(Err(err)) | Err(err) => graft_failure = graft_failure.or(Some(err)),
         }
     }
+    let drained = if state_staged.holds_promoted_moves() {
+        Box::pin(crate::file::stage::stage_promoted_moves_of_call(
+            repository,
+            state_staged,
+            None,
+        ))
+        .await
+        .forward::<MergeError>("staging the moves of directories the grafts are in")
+        .map(drop)
+    } else {
+        Ok(())
+    };
     if let Some(err) = graft_failure {
         return Err(err);
     }
+    drained?;
 
     lore_info!(
         "Grafted {} out-of-view subtrees, {} nodes touched",

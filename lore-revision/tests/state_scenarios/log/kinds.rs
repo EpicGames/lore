@@ -1719,7 +1719,7 @@ fn a_walked_discard_logs_its_frees_in_their_sections() {
                 lore_revision::state::node_discard_free(
                     &tree.state,
                     &tree.repository,
-                    &[tree.id("d")],
+                    &[(tree.id("d"), 0)],
                     collected,
                     |_, _| {},
                 )

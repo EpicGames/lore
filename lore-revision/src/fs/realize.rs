@@ -2728,6 +2728,9 @@ impl MergeCurrent {
 /// from its base; it is `None` for changes that start from the revision the working tree stands
 /// on.
 ///
+/// A change staged in `state_stage` inside a directory marked dirty as moved stages the
+/// directory's whole move, as staging inside it does.
+///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn, clippy::too_many_arguments)]
 pub fn realize_changes<'a>(
@@ -2847,6 +2850,7 @@ pub fn realize_changes<'a>(
         // A view-excluded path is staged into the tree but not written to disk.
         let view_filter = repository.filter.clone();
         let consumer_operation = operation.clone();
+        let staging = state_stage.clone();
         let consumer = lore_spawn!(sync_execute_modify_add(
             rx,
             consumer_operation,
@@ -2864,10 +2868,20 @@ pub fn realize_changes<'a>(
         event::LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(&stats))
             .send();
 
+        let drained = match staging.as_deref() {
+            Some(state) if state.holds_promoted_moves() => Box::pin(
+                crate::file::stage::stage_promoted_moves_of_call(&repository, state, None),
+            )
+            .await
+            .forward::<SyncError>("Failed to stage the move of a directory a change is in")
+            .map(drop),
+            _ => Ok(()),
+        };
         let producer_result = producer_result.internal("Recursion task failed")?;
         let consumer_result = consumer_result.internal("Recursion task failed")?;
         consumer_result?;
         producer_result?;
+        drained?;
 
         remove_directories_moved_out_of(&operation, &changes, kept_directories).await;
 
@@ -4156,8 +4170,8 @@ async fn clone_added_link(
 }
 
 /// Stages a realized move by relinking `from_node`, the staged node at `from_path`, to `to_path`,
-/// keeping its identity; marks it staged as a move and stages the directory it left. Answers with
-/// the node's new parent.
+/// keeping its identity; marks it staged as a move and stages the directory it left, where a move
+/// stages one ([`crate::node::Node::stages_when_left`]). Answers with the node's new parent.
 ///
 /// A function of its own because its locals live across several awaits: kept in
 /// [`realize_change_modify_add`] they would take space in the future of every change realized.
@@ -4196,14 +4210,23 @@ pub(crate) async fn relink_moved_node(
         .node_mark_destination(repository, new_parent_id, own)
         .await
         .forward::<SyncError>("Failed to stage change")?;
-    state_stage
-        .node_mark_left(
-            repository,
-            (left, new_parent_id),
-            Mark::staged(NodeFlags::Staged, false),
-        )
-        .await
-        .forward::<SyncError>("Failed to stage change")?;
+    if left != new_parent_id
+        && left != ROOT_NODE
+        && state_stage
+            .node(repository.clone(), left)
+            .await
+            .forward::<SyncError>("Failed to stage change")?
+            .stages_when_left()
+    {
+        state_stage
+            .node_mark_left(
+                repository,
+                (left, new_parent_id),
+                Mark::staged(NodeFlags::Staged, false),
+            )
+            .await
+            .forward::<SyncError>("Failed to stage change")?;
+    }
 
     Ok(new_parent_id)
 }

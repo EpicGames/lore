@@ -273,14 +273,31 @@ async fn add_clean(
         .expect("the node adds")
 }
 
-/// A state holding `dir/keep.txt`, `dir/a.txt` and `other/`, clean, and `dir`'s id.
-async fn dir_and_other(repository: &Arc<RepositoryContext>) -> (Arc<State>, NodeID) {
+/// A directory named `name` that a commit gave an address.
+fn committed_directory(name: &str) -> Node {
+    Node {
+        address: file(name).address,
+        ..directory(name)
+    }
+}
+
+/// A state holding `dir/keep.txt`, `dir/a.txt` and `other/`, clean, and `dir`'s id, `dir` as
+/// `make` makes it.
+async fn dir_and_other_as(
+    repository: &Arc<RepositoryContext>,
+    make: fn(&str) -> Node,
+) -> (Arc<State>, NodeID) {
     let state = State::new();
-    let dir = add_clean(repository, &state, ROOT_NODE, (directory, "dir")).await;
+    let dir = add_clean(repository, &state, ROOT_NODE, (make, "dir")).await;
     add_clean(repository, &state, dir, (file, "keep.txt")).await;
     add_clean(repository, &state, dir, (file, "a.txt")).await;
     add_clean(repository, &state, ROOT_NODE, (directory, "other")).await;
     (state, dir)
+}
+
+/// [`dir_and_other_as`] with `dir` committed.
+async fn dir_and_other(repository: &Arc<RepositoryContext>) -> (Arc<State>, NodeID) {
+    dir_and_other_as(repository, committed_directory).await
 }
 
 /// The realized move of `dir/a.txt` to `other/a.txt` in `state`.
@@ -318,6 +335,46 @@ async fn a_realized_move_out_of_a_directory_stages_the_one_it_left() {
         assert!(left.is_staged(), "flags {:#x}", left.flags);
     }))
     .await;
+}
+
+/// A realized move of a file out of a directory no commit gave an address, or out of one marked
+/// dirty for a change of its own, leaves it unstaged, as a staged move by another route does: the
+/// commit drops the one, and stages the other for its rehash once its change is left out.
+#[tokio::test]
+async fn a_realized_move_leaves_unstaged_a_directory_no_staged_move_stages() {
+    for own_change in [false, true] {
+        Box::pin(with_execution(async move {
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+            let repository = working_tree_repository(dir.path()).await;
+            let make = if own_change {
+                committed_directory
+            } else {
+                directory
+            };
+            let (state, from) = dir_and_other_as(&repository, make).await;
+            if own_change {
+                let moved = Mark::dirty(
+                    NodeFlags::DirtyMove,
+                    state::Ext::Set(lore_revision::node::NodeExtFlags::NoFlags),
+                    true,
+                );
+                state
+                    .node_mark(&repository, from, moved)
+                    .await
+                    .expect("dir marked dirty as moved");
+            }
+
+            realize_move_of_a(&repository, &state).await;
+
+            let left = state.node(repository.clone(), from).await.expect("dir");
+            assert!(
+                !left.is_staged(),
+                "own change {own_change}: flags {:#x}",
+                left.flags
+            );
+        }))
+        .await;
+    }
 }
 
 /// A realized move of a file out of a directory staged as moved keeps that directory's move: the

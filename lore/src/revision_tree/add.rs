@@ -874,14 +874,25 @@ async fn apply_plan(
             .await;
         }
     }
-
+    let state: &State = claim.state();
+    let drained = if state.holds_promoted_moves() {
+        Box::pin(lore_revision::file::stage::stage_promoted_moves_of_call(
+            &context, state, None,
+        ))
+        .await
+        .map(drop)
+    } else {
+        Ok(())
+    };
     if applied < total {
         let failed = total - applied;
         return Err(failures
             .strongest
             .call_error(&format!("{failed}/{total} node adds failed")));
     }
-    Ok(())
+    drained.map_err(|error| {
+        AddError::internal_with_context(error, "stage the moves of directories the adds were in")
+    })
 }
 
 /// Add a batch of nodes to the tree.

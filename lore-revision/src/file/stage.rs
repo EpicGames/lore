@@ -368,8 +368,10 @@ enum TargetDirectory {
 
 impl TargetDirectory {
     /// The child of `directory` carrying `name_hash`, which a target names: from the directory's
-    /// listing, listed once a second target names a child of it; unresolved for the first, and
-    /// below a node that is not a directory.
+    /// listing, listed once a second target names a child of it; unresolved for the first, below a
+    /// node that is not a directory, and where two children carry `name_hash`, so the stage walk's
+    /// search answers, which takes a node not staged for deletion before one that is
+    /// ([`State::find_live_subnode`]).
     async fn known(
         &mut self,
         repository: &Arc<RepositoryContext>,
@@ -393,9 +395,15 @@ impl TargetDirectory {
             }
             Self::Listed(_) | Self::Unlisted => {}
         }
-        Ok(match self {
-            Self::Listed(children) => KnownChild::Resolved(children.first(name_hash)),
-            _ => KnownChild::Unresolved,
+        let Self::Listed(children) = self else {
+            return Ok(KnownChild::Unresolved);
+        };
+        let mut carrying = children.carrying(name_hash);
+        let first = carrying.next();
+        Ok(if carrying.next().is_none() {
+            KnownChild::Resolved(first)
+        } else {
+            KnownChild::Unresolved
         })
     }
 }
@@ -757,15 +765,6 @@ pub async fn stage(
             options,
         };
 
-        let mut moved_above = Vec::new();
-        if state
-            .node_has_dirty_children(repository.clone(), ROOT_NODE)
-            .await
-            .forward::<StageError>("Failed reading the children of the staged tree's root")?
-        {
-            dirty_moves_above(&repository, &state, &antichain, &mut moved_above).await?;
-        }
-
         let ancestors = precreate_shared_ancestors(&walk, &shared_ancestors, &discards).await?;
 
         let mut tasks: JoinSet<Result<crate::node::NodeLink, StageError>> = JoinSet::new();
@@ -777,15 +776,19 @@ pub async fn stage(
         if let Some(err) = drain_walks(&mut tasks, &stats, &mut ticker, failure).await {
             return Err(err);
         }
-        if !moved_above.is_empty() {
-            Box::pin(stage_directory_moves(
+        if !Arc::ptr_eq(&state, &state_current) {
+            state.hold_base(state_current.clone());
+        }
+        if state.holds_promoted_moves() {
+            let promoted = Box::pin(stage_promoted_moves(
                 &repository,
-                &state_current,
+                state_current.revision(),
                 &state,
-                &moved_above,
-                &stats,
             ))
             .await?;
+            stats
+                .directory_move_count
+                .fetch_add(promoted, Ordering::Relaxed);
         }
         Ok::<_, StageError>((diff_discarded, main_count, staged_layers))
     })
@@ -1116,103 +1119,71 @@ async fn resolve_stage_target(
     Ok(ResolvedTarget::Single(relative_path))
 }
 
-/// Adds to `moved` each directory above a path of `targets` that is marked dirty as moved, the
-/// outermost first, once, as a stage of a node inside such a directory stages the directory's whole
-/// move once the walks are done ([`stage_directory_moves`]). A staged node below one gives it the
-/// bare staged bit, which its move bit then reads as a staged move beside, so the staged bit decides
-/// nothing. The lookup of a path stops at the first name `state` lacks and at a link, whose nodes
-/// another state numbers.
-///
-/// The targets come in subtree order, so a target's directories are taken from the one before it
-/// as far as their paths share them, and a directory above several targets answers its children
-/// from one listing ([`TargetDirectory`]), rather than a search of its chain for each.
-async fn dirty_moves_above(
+/// Stages whole the move of each directory marked dirty as moved whose move a staged climb in
+/// `state` staged with a node staged or arriving below it ([`State::take_promoted_moves`]), against
+/// `base`, the revision `state` is staged on ([`stage_directory_move`]), whichever route staged the
+/// node: a stage inside the directory, a staged move into it, or a dirty move of a staged node into
+/// it. A directory gone from the tree since, or no longer a staged move, is passed over. Answers
+/// how many moves it staged.
+pub async fn stage_promoted_moves(
     repository: &Arc<RepositoryContext>,
+    base: Hash,
     state: &State,
-    targets: &[RelativePath],
-    moved: &mut Vec<NodeID>,
-) -> Result<(), StageError> {
-    let mut above = vec![(ROOT_NODE, TargetDirectory::Unnamed)];
-    let mut previous = "";
-    for path in targets {
-        let parent = path.parent().unwrap_or("");
-        let shared = if parent.is_empty() || previous.is_empty() {
-            0
-        } else {
-            crate::util::path::shared_component_depth(previous, parent)
-        };
-        above.truncate(shared + 1);
-        previous = parent;
-        let segments = parent.split('/').filter(|segment| !segment.is_empty());
-        for segment in segments.skip(above.len() - 1) {
-            let Some((directory, children)) = above.last_mut() else {
-                break;
-            };
-            let name_hash = crate::hash::hash_string(segment);
-            let child = match children
-                .known(repository, state, *directory, name_hash)
-                .await?
-            {
-                KnownChild::Resolved(child) => child,
-                KnownChild::Unresolved => state
-                    .find_subnode(repository.clone(), *directory, name_hash)
-                    .await
-                    .ok(),
-            };
-            let Some(child) = child else {
-                break;
-            };
+) -> Result<u64, StageError> {
+    let mut name = String::new();
+    let mut staged = 0;
+    loop {
+        let promoted = state.take_promoted_moves();
+        if promoted.is_empty() {
+            return Ok(staged);
+        }
+        for directory in promoted {
             let node = state
-                .node(repository.clone(), child)
+                .node(repository.clone(), directory)
                 .await
-                .forward::<StageError>("Failed to read a directory above a staged path")?;
-            if node.is_link() || !node.is_directory() {
-                break;
+                .forward::<StageError>("Failed to read a directory whose move a climb staged")?;
+            if node.is_discarded() || !node.is_directory() || !node.is_staged_move() {
+                continue;
             }
-            if node.is_dirty_move() && !moved.contains(&child) {
-                moved.push(child);
-            }
-            above.push((child, TargetDirectory::Unnamed));
+            Box::pin(stage_directory_move(
+                repository, base, state, directory, &mut name,
+            ))
+            .await?;
+            staged += 1;
         }
     }
-    Ok(())
 }
 
-/// Stages the move of each of `moved`, in order, as [`stage_directory_move`] does, against
-/// `state_current`, the revision `state` is staged on, counting each in `stats`. Boxed by its
-/// caller, as only a stage inside a directory marked dirty as moved takes it.
-async fn stage_directory_moves(
+/// [`stage_promoted_moves`] of `state`, against the revision it was loaded from, under the State's
+/// moves permit, as staging a directory's move marks its children: `permit`, where the caller holds
+/// it, and one it takes otherwise. The queue is the State's, so a call stages a move another
+/// call's climb queued as well, which that call then finds staged. Boxed by its callers, which
+/// take it only where a climb promoted a move ([`State::holds_promoted_moves`]).
+pub async fn stage_promoted_moves_of_call(
     repository: &Arc<RepositoryContext>,
-    state_current: &Arc<State>,
-    state: &Arc<State>,
-    moved: &[NodeID],
-    stats: &StageStats,
-) -> Result<(), StageError> {
-    if !Arc::ptr_eq(state, state_current) {
-        state.hold_base(state_current.clone());
-    }
-    let mut name = String::new();
-    for directory in moved {
-        stage_directory_move(
-            repository,
-            state_current.revision(),
-            state,
-            *directory,
-            &mut name,
-        )
-        .await?;
-        stats.directory_move_count.fetch_add(1, Ordering::Relaxed);
-    }
-    Ok(())
+    state: &State,
+    permit: Option<&crate::state::MovesPermit<'_>>,
+) -> Result<u64, StageError> {
+    let _taken = match permit {
+        Some(_) => None,
+        None => Some(
+            state
+                .moves_permit()
+                .await
+                .forward::<StageError>("Failed to take the moves permit")?,
+        ),
+    };
+    stage_promoted_moves(repository, state.committed_revision(), state).await
 }
 
 /// Stages the move of `directory`, marked dirty as moved, whole: it and each node below it that
-/// moves with it alone, not staged and standing beside its parent where `base` holds it, take a
-/// staged move in place of their dirty one, as [`stage_move`] marks them. A change of a node's
-/// own stays dirty: a move of its own, an add, a deletion, and an edit, which a node that moves
-/// with the directory keeps as a modification alone, with no staged mark beside it, as the two
-/// halves share their action bits. `name` is a buffer kept across nodes.
-async fn stage_directory_move(
+/// moves with it alone, not staged and standing beside its parent where `base` holds it, or where
+/// `base` holds no node of its kind there, take a staged move in place of their dirty one, as
+/// [`stage_move`] marks them. A change of a node's own stays dirty: a move of its own, an add, a
+/// deletion, and an edit, which a node that moves with the directory keeps as a modification
+/// alone, with no staged mark beside it, as the two halves share their action bits. `name` is a
+/// buffer kept across nodes.
+pub(crate) async fn stage_directory_move(
     repository: &Arc<RepositoryContext>,
     base: Hash,
     state: &State,
@@ -1245,9 +1216,10 @@ async fn stage_directory_move(
             if !node.is_dirty_move()
                 || node.is_staged()
                 || !state
-                    .stands_at_base_place(repository, base, (child, &node), name)
+                    .at_base_place(repository, base, (child, &node), name)
                     .await
                     .forward::<StageError>("Failed to read the base revision")?
+                    .unwrap_or(true)
             {
                 continue;
             }
@@ -1520,7 +1492,7 @@ pub async fn stage_move(
         )));
     }
 
-    let (is_directory, is_file, added, deleted, dirty) = {
+    let (is_directory, is_file, added, deleted) = {
         let node = state
             .node(repository.clone(), from_node)
             .await
@@ -1530,7 +1502,6 @@ pub async fn stage_move(
             node.is_file(),
             node.is_added(),
             node.is_deleted(),
-            node.is_dirty(),
         )
     };
 
@@ -1606,12 +1577,15 @@ pub async fn stage_move(
     } else {
         NameChange::Keep
     };
-    let move_flag = if added {
-        NodeFlags::StagedAdd
+    let (move_flag, dirty_flag) = if added {
+        (NodeFlags::StagedAdd, NodeFlags::DirtyAdd)
     } else {
-        NodeFlags::StagedMove
+        (NodeFlags::StagedMove, NodeFlags::DirtyMove)
     };
-    let own = Mark::staged(move_flag, true);
+    let own = Mark {
+        staged: Some((move_flag, true)),
+        dirty: Some((dirty_flag, Ext::Keep, true)),
+    };
     let left = state
         .node_move(repository.clone(), from_node, parent, name, own)
         .await
@@ -1632,17 +1606,8 @@ pub async fn stage_move(
         )
         .await?;
     }
-    // The climb takes a dirty half too where the node moved is dirty, as a dirty node's ancestors
-    // are, which a walk of the dirty flags relies on to reach it.
     state
-        .node_mark_destination(
-            &repository,
-            parent,
-            Mark {
-                dirty: dirty.then_some((NodeFlags::Dirty, Ext::Keep, false)),
-                ..own
-            },
-        )
+        .node_mark_destination(&repository, parent, own)
         .await
         .forward::<StageError>("Failed to mark node as staged")?;
 
@@ -1658,17 +1623,13 @@ pub async fn stage_move(
         .await
         .forward::<StageError>("Failed to mark node as staged")?;
     }
-    // A directory with no address, as a scan, `lore dirty` or the VFS adds one and no commit or
-    // realize has given it one, is left as it is: unstaged, the commit drops it, which a staged
-    // mark would make it keep; staged, it holds the mark already.
     let left_committed = left != parent
         && left != ROOT_NODE
-        && !state
+        && state
             .node(repository.clone(), left)
             .await
             .forward::<StageError>("Failed deserializing state node block")?
-            .address
-            .is_zero();
+            .stages_when_left();
     if left_committed {
         state
             .node_mark_left(
@@ -1679,6 +1640,10 @@ pub async fn stage_move(
             .await
             .forward::<StageError>("Failed to stage the directory the node left")?;
     }
+    let promoted = stage_promoted_moves(&repository, current_revision, &state).await?;
+    stats
+        .directory_move_count
+        .fetch_add(promoted, Ordering::Relaxed);
 
     #[allow(clippy::collapsible_else_if)]
     if added {

@@ -2497,7 +2497,7 @@ async fn claim_child(
     (marked, distinct): (&Marked, bool),
     name_hash: u64,
 ) -> Result<Option<NodeID>, Outcome> {
-    if let Some(node) = children.claim(name_hash) {
+    if let Some((node, _)) = children.claim(name_hash) {
         return Ok(Some(node));
     }
     let (state, dir, prepends) = (&tree.state, marked.dir, marked.prepends);

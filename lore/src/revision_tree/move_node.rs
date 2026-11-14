@@ -629,6 +629,17 @@ async fn apply_plan(
         }
     }
 
+    let drained = if state.holds_promoted_moves() {
+        Box::pin(lore_revision::file::stage::stage_promoted_moves_of_call(
+            &context,
+            state,
+            Some(permit),
+        ))
+        .await
+        .map(drop)
+    } else {
+        Ok(())
+    };
     if let Some(error) = failure {
         let failed = total - applied;
         return Err(state_failure(
@@ -636,6 +647,9 @@ async fn apply_plan(
             &format!("{failed}/{total} node moves failed"),
         ));
     }
+    drained.map_err(|error| {
+        MoveError::internal_with_context(error, "stage the moves of directories moves landed in")
+    })?;
     Ok(())
 }
 

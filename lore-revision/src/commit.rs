@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
-use std::ops::Range;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -22,7 +21,6 @@ use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio_util::task::AbortOnDropHandle;
 use zerocopy::FromBytes;
-use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 
 use crate::branch;
@@ -34,6 +32,7 @@ use crate::event;
 use crate::event::EventError;
 use crate::file::dirty::MovedNode;
 use crate::filter::FilterMode;
+use crate::fs::filesystem_provider::CaseLookup;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
@@ -91,6 +90,7 @@ use crate::state::NodeMapping;
 use crate::state::OwnFlags;
 use crate::state::RecordedModifiedTimes;
 use crate::state::Return;
+use crate::state::ReturnOptions;
 use crate::state::State;
 use crate::state::StateNodeChildrenIterator;
 use crate::state::StateNodeChildrenWithNameIterator;
@@ -813,6 +813,8 @@ async fn commit_staged_with_layers(
     state_staged.hold_base(state_current.clone());
     let pruned =
         prune_dirty_for_commit(state_staged.clone(), repository.clone(), current_revision).await?;
+    let left_out: Vec<NodeID> = pruned.left_out().collect();
+    let mut added = Vec::new();
 
     let mut signature = current_revision;
     if current_revision != staged_revision {
@@ -835,6 +837,9 @@ async fn commit_staged_with_layers(
                 link_messages.clone(),
                 current_branch,
                 reporting.clone(),
+                MissingPaths::Settle,
+                left_out,
+                Some(&mut added),
             )
             .await
             {
@@ -862,10 +867,13 @@ async fn commit_staged_with_layers(
         }
     }
 
-    let (dirty_paths, carried) = dirty.carried(pruned);
+    let (dirty_paths, carried) = dirty.carried(pruned, added);
     if !dry_run
         && signature != current_revision
-        && (!dirty_paths.is_empty() || !carried.moves.is_empty() || !carried.marks.is_empty())
+        && (!dirty_paths.is_empty()
+            || !carried.moves.is_empty()
+            || !carried.marks.is_empty()
+            || !carried.added.is_empty())
         && let Err(error) = crate::file::dirty::dirty_relative_paths_in_operation(
             operation,
             repository.clone(),
@@ -944,6 +952,9 @@ async fn commit_staged_with_layers(
             Arc::new(HashMap::new()),
             current_branch,
             reporting.clone(),
+            MissingPaths::Settle,
+            Vec::new(),
+            None,
         )
         .await;
 
@@ -1142,6 +1153,9 @@ async fn commit_layer_only(
         Arc::new(HashMap::new()),
         parent_current_branch,
         reporting.clone(),
+        MissingPaths::Settle,
+        Vec::new(),
+        None,
     )
     .await?;
 
@@ -1362,6 +1376,9 @@ async fn commit_link_only(
         Arc::new(HashMap::new()),
         link_branch,
         reporting.clone(),
+        MissingPaths::Settle,
+        Vec::new(),
+        None,
     )
     .await?;
 
@@ -1458,6 +1475,9 @@ async fn commit_link_only(
             Arc::new(HashMap::new()),
             level.branch,
             reporting.clone(),
+            MissingPaths::Refuse,
+            Vec::new(),
+            None,
         )
         .await?;
 
@@ -1501,6 +1521,15 @@ async fn commit_link_only(
             .forward::<CommitError>("Failed to mark intermediate link node staged")?;
     }
 
+    if state_parent_staged.holds_promoted_moves() {
+        Box::pin(crate::file::stage::stage_promoted_moves_of_call(
+            &repository,
+            &state_parent_staged,
+            None,
+        ))
+        .await
+        .forward::<CommitError>("Failed to stage the move of a directory holding the link")?;
+    }
     if !execution_context().globals().dry_run() {
         let parent_signature = state_parent_staged
             .serialize(repository.clone(), &token)
@@ -1723,7 +1752,9 @@ async fn layer_commit_root(
 /// Commits `state_staged` as the next revision after `state_current`. `built_on` is the revision
 /// the state names as its self parent before any caller moved it onto `state_current`: the one it
 /// was staged on, but for a merge reconciling divergent history, which is staged on its second
-/// parent.
+/// parent. `missing` says what the commit makes of a staged path the working tree no longer holds
+/// ([`MissingPaths`]), and `left_out` names the directories whose dirty-only moves a prune before
+/// this one left out ([`Gone::left_out`]).
 #[allow(clippy::too_many_arguments)]
 async fn commit_staged_revision(
     operation: &Arc<InstanceOperationImpl>,
@@ -1738,6 +1769,9 @@ async fn commit_staged_revision(
     link_messages: Arc<HashMap<String, String>>,
     parent_branch: BranchId,
     reporting: CommitReporting,
+    missing: MissingPaths,
+    left_out: Vec<NodeID>,
+    added: Option<&mut Vec<crate::file::dirty::AddedNode>>,
 ) -> Result<(Hash, Arc<RecordedModifiedTimes>), CommitError> {
     let context = execution_context();
     let globals = context.globals();
@@ -1767,7 +1801,15 @@ async fn commit_staged_revision(
     };
 
     state_staged.hold_base(state_current.clone());
-    prune_dirty_for_commit(state_staged.clone(), repository.clone(), revision_current).await?;
+    let pruned =
+        prune_dirty_for_commit(state_staged.clone(), repository.clone(), revision_current).await?;
+    let gone = (missing == MissingPaths::Settle).then(|| {
+        Arc::new(Gone {
+            added: added.is_some().then(parking_lot::Mutex::default),
+            ..Gone::left_out(left_out, &pruned)
+        })
+    });
+    let carried = gone.clone().filter(|_| added.is_some());
 
     // Per-operation tracker for background fragment uploads. Write-producing
     // calls below dispatch leader tasks into it; await_all drains every
@@ -1804,6 +1846,7 @@ async fn commit_staged_revision(
             collected.clone(),
             reporting.stats.clone(),
             reporting.interval,
+            gone,
         )
         .await?;
 
@@ -1867,6 +1910,11 @@ async fn commit_staged_revision(
         Ok((signature, collected))
     }
     .await;
+    if let (Some(added), Some(carried)) = (added, carried)
+        && let Some(found) = &carried.added
+    {
+        added.append(&mut found.lock());
+    }
 
     // ALWAYS drain the tracker, regardless of whether the work above
     // succeeded. Dropping the tracker while leaders are still running would
@@ -1931,8 +1979,13 @@ pub async fn store_branch_latest_and_make_current(
 /// and layers included: their paths are the parent's and so is their filesystem. A file the
 /// state holds as a resolved merge conflict has the copies that merge left beside it removed,
 /// so the operation is one finalized as having changed the filesystem. Where its provider holds
-/// its state, it is handed each directory the walk adds or moves
-/// ([`InstanceOperationImpl::hand_directory`]).
+/// its state, it is handed each directory the walk adds or moves that the tree still holds once
+/// the commit settles what the working tree no longer holds ([`hand_directories`]).
+///
+/// `progress_interval` is how often the walk reports its progress. `gone` collects the staged
+/// paths the working tree no longer holds for [`commit_gone`] to settle, a commit of the instance's
+/// staged changes; without it, as for the rehash of a tree a caller assembled and a nested link's
+/// intermediate level, such a path is refused as not found ([`MissingPaths`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_files_and_rehash(
     operation: Arc<InstanceOperationImpl>,
@@ -1949,6 +2002,7 @@ pub(crate) async fn commit_files_and_rehash(
     modified_times: Arc<RecordedModifiedTimes>,
     stats: Arc<CommitStats>,
     progress_interval: std::time::Duration,
+    gone: Option<Arc<Gone>>,
 ) -> Result<(), CommitError> {
     lore_info!("Fragmenting files and updating tree hashes");
 
@@ -1978,6 +2032,7 @@ pub(crate) async fn commit_files_and_rehash(
         stats.clone(),
         parent_branch,
         tracker.clone(),
+        gone,
     );
     let delta = commit_walks(
         walk,
@@ -2001,7 +2056,9 @@ pub(crate) async fn commit_files_and_rehash(
 }
 
 /// Commits the staged nodes of `walk`'s state from `node_id`, the node at `relative_path` in the
-/// working tree, then frees the nodes staged for deletion, and answers the delta.
+/// working tree, settles what the working tree no longer holds where the walk collects it
+/// ([`commit_gone`]), hands its provider the directories the walk adds or moves that stay
+/// ([`hand_directories`]), then frees the nodes staged for deletion, and answers the delta.
 ///
 /// Where `node_id` is below the root, as for a link or a layer mounting a subtree, the staged nodes
 /// outside it are frozen first ([`freeze_directory`]), so that a refusal of a node the freeze
@@ -2020,13 +2077,19 @@ async fn commit_walks(
     modified_times: Arc<RecordedModifiedTimes>,
     reports_discovery: bool,
 ) -> Result<Arc<parking_lot::RwLock<BytesMut>>, CommitError> {
-    let walk = Arc::new(walk);
+    let walk = Arc::new(CommitWalk {
+        root: node_id,
+        ..walk
+    });
+    let operation = walk.operation.clone();
     let repository = walk.repository.clone();
     let state = walk.state.clone();
     let stats = walk.stats.clone();
     let delta = walk.delta.clone();
     let discard = walk.discard.clone();
     let subnodes_to_discard = walk.subnodes_to_discard.clone();
+    let handed = walk.handed.clone();
+    let gone = walk.gone.clone();
     let base = DeletionBase::of(state.committed_revision(), state.parent_self(), based_on);
 
     if node_id != ROOT_NODE {
@@ -2050,10 +2113,11 @@ async fn commit_walks(
     }
 
     let consumer = {
-        let operation = walk.operation.clone();
+        let operation = operation.clone();
         let repository = repository.clone();
         let state = state.clone();
         let delta = delta.clone();
+        let gone = gone.clone();
         let stats = stats.clone();
         let tracker = walk.tracker.clone();
         lore_spawn!(crate::subtask!(async move {
@@ -2063,6 +2127,7 @@ async fn commit_walks(
                 repository,
                 state,
                 delta,
+                gone,
                 stats,
                 tracker,
                 modified_times,
@@ -2091,6 +2156,24 @@ async fn commit_walks(
 
     join_commit_tasks(producer, consumer).await?;
 
+    let leaving = match &gone {
+        Some(gone) => {
+            commit_gone(
+                &operation,
+                &repository,
+                &state,
+                (&relative_path, node_id),
+                &delta,
+                gone,
+                &discard,
+                &subnodes_to_discard,
+                &stats,
+            )
+            .await?
+        }
+        None => Vec::new(),
+    };
+    hand_directories(&operation, &handed, &leaving);
     commit_discard(
         repository,
         state,
@@ -2181,6 +2264,7 @@ pub(crate) async fn rehash_tree_in_operation(
             modified_times.clone(),
             CommitStats::new(),
             execution_context().globals().event_interval(),
+            None,
         )
         .await
     })
@@ -2281,8 +2365,11 @@ async fn unresolved_link_conflict(
 #[lore_macro::test_pub]
 struct CommitWalk {
     /// Whether each directory the walk adds or moves goes to `operation`
-    /// ([`InstanceOperationImpl::hand_directory`]): a link's walk keeps its own.
+    /// ([`InstanceOperationImpl::hand_directories`]): a link's walk keeps its own.
     hands_directories: bool,
+    /// Each directory the walk adds or moves, with its path, where it hands directories: handed
+    /// once the commit settles what the working tree no longer holds ([`hand_directories`]).
+    handed: Arc<parking_lot::RwLock<Vec<(NodeID, RelativePath)>>>,
     operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     token: RepositoryWriteToken,
@@ -2292,6 +2379,10 @@ struct CommitWalk {
     discard: Arc<parking_lot::RwLock<Vec<(NodeID, u16)>>>,
     /// The nodes below the directories staged for deletion, with their flags.
     subnodes_to_discard: Arc<parking_lot::RwLock<Vec<(NodeID, u16)>>>,
+    /// What the walk finds for [`commit_gone`], for a commit that takes what the working tree holds
+    /// at the staged paths it no longer holds ([`MissingPaths::Settle`]); `None` for the rehash of a
+    /// tree a caller assembled and a nested link's intermediate level, which refuse such a path.
+    gone: Option<Arc<Gone>>,
     file_tx: mpsc::Sender<FileToCommit>,
     metadata: Arc<Metadata>,
     link_messages: Arc<HashMap<String, String>>,
@@ -2299,10 +2390,13 @@ struct CommitWalk {
     parent_branch: BranchId,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
     dir_semaphore: Arc<Semaphore>,
+    /// The node the walk starts at, set by [`commit_walks`].
+    root: NodeID,
 }
 
 impl CommitWalk {
     /// A walk handing each directory it adds or moves to `operation` where `hands_directories`,
+    /// collecting for [`commit_gone`] what the working tree no longer holds where `gone` is given,
     /// and the receiving end of the files it sends.
     #[lore_macro::test_pub]
     #[allow(clippy::too_many_arguments)]
@@ -2317,10 +2411,12 @@ impl CommitWalk {
         stats: Arc<CommitStats>,
         parent_branch: BranchId,
         tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+        gone: Option<Arc<Gone>>,
     ) -> (Self, mpsc::Receiver<FileToCommit>) {
         let (file_tx, file_rx) = mpsc::channel(DEFAULT_WORK_CHANNEL_CAPACITY);
         let walk = Self {
             hands_directories,
+            handed: Arc::default(),
             operation,
             repository,
             token,
@@ -2328,6 +2424,7 @@ impl CommitWalk {
             delta: Arc::default(),
             discard: Arc::default(),
             subnodes_to_discard: Arc::default(),
+            gone,
             file_tx,
             metadata,
             link_messages,
@@ -2335,8 +2432,15 @@ impl CommitWalk {
             parent_branch,
             tracker,
             dir_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DIRECTORY_TASKS)),
+            root: ROOT_NODE,
         };
         (walk, file_rx)
+    }
+
+    /// What the walk makes of a staged path the working tree no longer holds
+    /// ([`MissingPaths::of`]).
+    fn missing(&self) -> MissingPaths {
+        MissingPaths::of(self.gone.as_deref())
     }
 }
 
@@ -2368,6 +2472,7 @@ fn commit_directory(
     async move {
         let mut frame = CommitFrame::enter(&walk, relative_path, node_id).await?;
         let mut ancestors = Vec::new();
+        let mut left = Left::default();
         let mut tasks = CommitTasks::new();
         let mut failure = None;
         loop {
@@ -2375,10 +2480,10 @@ fn commit_directory(
                 Ok(Some(child)) => ancestors.push(std::mem::replace(&mut frame, child)),
                 Ok(None) => {
                     let Some(parent) = ancestors.pop() else {
-                        frame.leave(&walk.stats);
+                        frame.leave(&walk, &mut left);
                         break;
                     };
-                    std::mem::replace(&mut frame, parent).leave(&walk.stats);
+                    std::mem::replace(&mut frame, parent).leave(&walk, &mut left);
                 }
                 Err(err) => {
                     failure = Some(err);
@@ -2400,9 +2505,21 @@ fn commit_directory(
         while let Some(task) = tasks.join_next().await {
             collect_commit_task(task, &mut failure);
         }
+        if let Some(gone) = &walk.gone {
+            gone.take(left);
+        }
         drop(permit);
         failure.map_or(Ok(()), Err)
     }
+}
+
+/// What a walk task leaves for [`commit_gone`] as it leaves each directory, handed to [`Gone`]
+/// once the task ends ([`Gone::take`]). Inline for a task that counts two directories at most and
+/// leaves one `Holder` to the climb, as most do, so a task allocates nothing for it.
+#[derive(Default)]
+struct Left {
+    counted: smallvec::SmallVec<[NodeID; 2]>,
+    directories: smallvec::SmallVec<[Holder; 1]>,
 }
 
 /// A directory a commit walk has entered and not yet left.
@@ -2411,18 +2528,26 @@ struct CommitFrame {
     node_id: NodeID,
     children: StateNodeChildrenWithNameIterator,
     updated: bool,
+    /// Whether a child of the directory is staged for deletion.
+    holds_deletion: bool,
+    /// Whether the directory sent a file to [`commit_file`].
+    sent_file: bool,
+    /// Whether the directory is staged only for what lies below it.
+    bare: bool,
+    /// Whether a staged child of the directory was met.
+    holds_staged: bool,
 }
 
 impl CommitFrame {
     /// Enters the staged directory `node_id` at `relative_path`, adding the directory to the delta
-    /// when it is staged itself, and handing it to the walk's operation when it is staged added
-    /// or moved.
+    /// where it is staged, and, where the walk hands directories and the directory is staged as
+    /// added or moved, noting it in `walk.handed` for [`hand_directories`].
     async fn enter(
         walk: &CommitWalk,
         relative_path: RelativePath,
         node_id: NodeID,
     ) -> Result<Self, CommitError> {
-        {
+        let bare = {
             let block = walk
                 .state
                 .block_with_nametable(walk.repository.clone(), NodeBlock::index(node_id))
@@ -2439,10 +2564,11 @@ impl CommitFrame {
             if node.is_staged() {
                 delta_add(walk.delta.clone(), node_id, node.flags);
                 if walk.hands_directories && (node.is_staged_add() || node.is_staged_move()) {
-                    walk.operation.hand_directory(&relative_path);
+                    walk.handed.write().push((node_id, relative_path.clone()));
                 }
             }
-        }
+            state::is_staged_for_descendants_only(&node)
+        };
         let children = StateNodeChildrenWithNameIterator::new(
             walk.state.clone(),
             walk.repository.clone(),
@@ -2455,13 +2581,34 @@ impl CommitFrame {
             node_id,
             children,
             updated: false,
+            holds_deletion: false,
+            sent_file: false,
+            bare,
+            holds_staged: false,
         })
     }
 
-    /// Leaves the directory, counting it when a child of it was committed or discarded.
-    fn leave(self, stats: &CommitStats) {
+    /// Leaves the directory, counting it when a child of it was committed or discarded. A
+    /// directory holding a staged deletion, and one holding no staged child, staged as added or
+    /// moved or for its rehash, go to the climb of [`commit_gone`], which reads whether the
+    /// working tree still holds them, through the task's `left`.
+    fn leave(self, walk: &CommitWalk, left: &mut Left) {
         if self.updated {
-            stats.count_directory();
+            walk.stats.count_directory();
+        }
+        if walk.gone.is_none() {
+            return;
+        }
+        if self.updated {
+            left.counted.push(self.node_id);
+        }
+        if self.holds_deletion || !self.holds_staged {
+            left.directories.push(Holder {
+                node: self.node_id,
+                path: self.relative_path,
+                sent_file: self.sent_file,
+                bare: self.bare && !self.holds_staged,
+            });
         }
     }
 }
@@ -2491,6 +2638,7 @@ async fn commit_directory_entries(
             Some(ChildRest::File(node_id, relative_path, size)) => {
                 collect_file(node_id, relative_path, &walk.file_tx, &walk.stats, size).await?;
                 frame.updated = true;
+                frame.sent_file = true;
             }
             Some(ChildRest::Directory(node_id, relative_path)) => {
                 return CommitFrame::enter(walk, relative_path, node_id)
@@ -2543,6 +2691,7 @@ fn commit_child(
     if !child_node.is_staged() {
         return Ok(None);
     }
+    frame.holds_staged = true;
 
     // Takes the name by value so its block read lock ends here, rather than reaching the
     // commit of the child below (see NodeNameLock docs).
@@ -2583,6 +2732,7 @@ fn commit_child(
             frame.updated = true;
         }
         walk.discard.write().push((child_node_id, child_node.flags));
+        frame.holds_deletion = true;
         if child_node.flags & NodeFlags::File != 0 {
             walk.stats
                 .complete
@@ -2616,7 +2766,7 @@ fn commit_child(
                 walk.repository.clone(),
                 walk.token.share(),
                 walk.state.clone(),
-                child_node_id,
+                (walk.root, child_node_id),
                 relative_path,
                 walk.delta.clone(),
                 walk.metadata.clone(),
@@ -2624,6 +2774,7 @@ fn commit_child(
                 walk.stats.clone(),
                 walk.parent_branch,
                 walk.tracker.clone(),
+                walk.missing(),
             ))
         );
     } else if child_node.is_file() {
@@ -2653,23 +2804,1446 @@ async fn collect_discard_subnodes(
         move |discarded_node_id, flags| {
             lore_trace!("Committing raw deletion of node {discarded_node_id}");
             subnodes_to_discard.write().push((discarded_node_id, flags));
-            if flags & NodeFlags::File != 0 {
-                stats.complete.file_total.fetch_add(1, Ordering::Relaxed);
-            } else {
-                stats
-                    .complete
-                    .directory_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+            count_totals(&stats, std::iter::once(flags));
         },
     )
     .await
     .forward::<CommitError>("Failed discarding node staged for delete")
 }
 
+/// What a commit makes of a staged path the working tree no longer holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MissingPaths {
+    /// Takes what the working tree holds there ([`commit_gone`]): a commit of the instance's staged
+    /// changes, of a layer's and of a link's walked from its mount.
+    Settle,
+    /// Refuses the commit as not found: the rehash of a tree a caller assembled, and a nested
+    /// link's intermediate level, walked from its root rather than from its mount.
+    Refuse,
+}
+
+impl MissingPaths {
+    /// [`Self::Settle`] for a walk that collects in `gone` what [`commit_gone`] settles, and
+    /// [`Self::Refuse`] for one that collects nothing.
+    fn of(gone: Option<&Gone>) -> Self {
+        if gone.is_some() {
+            Self::Settle
+        } else {
+            Self::Refuse
+        }
+    }
+}
+
+/// What a commit walk leaves for [`commit_gone`] to settle against the working tree.
+#[lore_macro::test_pub]
+#[derive(Default)]
+pub(crate) struct Gone {
+    /// Each staged file [`commit_file`] found the working tree no longer holds, with its path.
+    files: parking_lot::RwLock<Vec<(NodeID, RelativePath)>>,
+    /// Each directory the walk leaves to the climb: one holding a staged deletion, and one staged
+    /// that holds no staged child, as one staged as added or moved, or one a staged move left,
+    /// staged for its rehash.
+    directories: parking_lot::RwLock<Vec<Holder>>,
+    /// Each directory the walk counted as it left it, in the total and as done, which a gone
+    /// directory may take with it to count again ([`commit_gone`]).
+    counted: parking_lot::RwLock<Vec<NodeID>>,
+    /// The directories, sorted, whose moves marked dirty alone the commit left out
+    /// ([`prune_dirty_for_commit`]): the working tree holds them, and what they hold, elsewhere
+    /// than the walk spells.
+    left_out: Vec<NodeID>,
+    /// Each staged add the commit leaves out below a directory that went back to its committed
+    /// place, with its path there, for a commit of the instance's own tree to add again
+    /// past it, marked dirty alone ([`crate::file::dirty::CarriedMarks::added`]); `None` for a
+    /// walk whose tree another commit marks again, as a link's or a layer's.
+    added: Option<parking_lot::Mutex<Vec<crate::file::dirty::AddedNode>>>,
+}
+
+impl Gone {
+    /// Takes what a walk task left as it left its directories.
+    fn take(&self, left: Left) {
+        if !left.counted.is_empty() {
+            self.counted.write().extend(left.counted);
+        }
+        if !left.directories.is_empty() {
+            self.directories.write().extend(left.directories);
+        }
+    }
+
+    /// What a walk leaves to settle where the commit left out the moves `left_out`, found by an
+    /// earlier prune, and those of `pruned` ([`Self::left_out`]).
+    fn left_out(mut left_out: Vec<NodeID>, pruned: &Pruned) -> Self {
+        left_out.extend(pruned.left_out());
+        left_out.sort_unstable();
+        left_out.dedup();
+        Self {
+            left_out,
+            ..Self::default()
+        }
+    }
+}
+
+/// Commits a staged node the working tree no longer holds as deleted, as `gone` finds them,
+/// reading the working tree through `operation`. A gone file the working tree holds under another
+/// case refuses the commit as not found ([`refuse_case_variants`]). A file staged as moved goes
+/// back to its committed path where the working tree holds a file there, the move left out
+/// ([`return_moved_files`]), and so does a directory staged as moved where the working tree holds a
+/// directory there ([`return_moved_directories`]), with what moved with it, which stays as
+/// committed. A staged directory the working tree no longer holds leaves with everything below
+/// it, the topmost one above each gone file and each directory the walk leaves to the climb
+/// ([`Gone::directories`], [`gone_directories`]), and the delta drops what the walk recorded of
+/// what leaves with it or goes back. What leaves goes to `discard` and `subnodes_to_discard`,
+/// staged for deletion, in place of what they listed below such a directory, for
+/// [`commit_discard`] to record and free. `walk_root` is the node the walk starts at, which never
+/// leaves, and its working-tree path. Answers the sorted nodes the revision holds nothing at the
+/// walk's path of: those that leave and the directories that go back.
+#[allow(clippy::too_many_arguments)]
+async fn commit_gone(
+    operation: &InstanceOperationImpl,
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    walk_root: (&RelativePath, NodeID),
+    delta: &parking_lot::RwLock<BytesMut>,
+    gone: &Gone,
+    discard: &parking_lot::RwLock<Vec<(NodeID, u16)>>,
+    subnodes_to_discard: &parking_lot::RwLock<Vec<(NodeID, u16)>>,
+    stats: &CommitStats,
+) -> Result<Vec<NodeID>, CommitError> {
+    let files = std::mem::take(&mut *gone.files.write());
+    let directories = std::mem::take(&mut *gone.directories.write());
+    if files.is_empty() && directories.is_empty() {
+        return Ok(Vec::new());
+    }
+    if lists_missed_files(operation) && !files.is_empty() {
+        Box::pin(refuse_case_variants(operation, &files)).await?;
+    }
+    lore_debug!(
+        "Committing {} staged files the working tree no longer holds, and {} directories it may \
+         not hold",
+        files.len(),
+        directories.len()
+    );
+    let base = state.committed_revision();
+    let mut starts = if gone.left_out.is_empty() {
+        directories
+    } else {
+        Box::pin(outside_left_out(
+            repository,
+            state,
+            &gone.left_out,
+            directories,
+        ))
+        .await?
+    };
+    starts.reserve(files.len());
+    let mut roots = Vec::with_capacity(files.len());
+    let mut moved = Vec::new();
+    for (node, path) in files {
+        let record = state
+            .node(repository.clone(), node)
+            .await
+            .forward::<CommitError>("Failed reading a staged file gone from the working tree")?;
+        starts.push(Holder {
+            node: record.parent,
+            path: path.parent_path(),
+            sent_file: false,
+            bare: false,
+        });
+        let candidate = if record.is_staged_move() && !record.is_staged_add() {
+            Box::pin(moved_back_source(
+                operation,
+                repository,
+                state,
+                (base, walk_root),
+                (node, &record),
+            ))
+            .await?
+        } else {
+            None
+        };
+        match candidate {
+            Some(candidate) => moved.push(candidate),
+            None => roots.push((node, record.parent, deleted_flags(record.flags))),
+        }
+    }
+    if !moved.is_empty() {
+        Box::pin(return_moved_files(
+            operation, repository, state, moved, &mut roots, stats,
+        ))
+        .await?;
+    }
+    let mut on_disk = Box::pin(gone_directories(
+        operation,
+        repository,
+        state,
+        walk_root.1,
+        starts,
+    ))
+    .await?;
+    let (returned, added_tops) = if on_disk.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        Box::pin(return_moved_directories(
+            operation,
+            repository,
+            state,
+            (base, walk_root),
+            &mut on_disk,
+        ))
+        .await?
+    };
+    let mut topmost: Vec<NodeID> = on_disk
+        .values()
+        .filter_map(|known| match known {
+            OnDisk::Below(top) => Some(*top),
+            _ => None,
+        })
+        .collect();
+    topmost.sort_unstable();
+    topmost.dedup();
+    let (gone_below, kept) = if returned.is_empty() {
+        drop(added_tops);
+        let mut gone_below = Vec::new();
+        let mut kept = Vec::with_capacity(roots.len());
+        for (node, parent, flags) in roots {
+            match on_disk.get(&parent) {
+                Some(OnDisk::Below(_)) => gone_below.push(node),
+                _ => kept.push((node, flags)),
+            }
+        }
+        (gone_below, kept)
+    } else {
+        Box::pin(settle_returned_roots(
+            repository,
+            state,
+            (base, gone),
+            roots,
+            (&on_disk, added_tops),
+            stats,
+        ))
+        .await?
+    };
+    if !returned.is_empty() {
+        let mut delta = delta.write();
+        delta_retain(&mut delta, |node| returned.binary_search(&node).is_err());
+        for &directory in &returned {
+            delta_push(&mut delta, directory, NodeFlags::Staged.bits());
+        }
+    }
+    if topmost.is_empty() {
+        discard.write().extend(kept);
+        return Ok(returned);
+    }
+    let below = Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let mut tops = Vec::with_capacity(topmost.len());
+    for &top in &topmost {
+        let record = state
+            .node(repository.clone(), top)
+            .await
+            .forward::<CommitError>("Failed reading a directory gone from the working tree")?;
+        tops.push((top, deleted_flags(record.flags), record.parent));
+        let below = below.clone();
+        state::node_discard_walk(
+            state.clone(),
+            repository.clone(),
+            top,
+            move |node, flags| {
+                below.write().push((node, flags));
+            },
+        )
+        .await
+        .forward::<CommitError>("Failed collecting a directory gone from the working tree")?;
+    }
+    let mut below = std::mem::take(&mut *below.write());
+    let mut leaving: Vec<NodeID> = below
+        .iter()
+        .map(|&(node, _)| node)
+        .chain(topmost.iter().copied())
+        .collect();
+    leaving.sort_unstable();
+    let stays = |&(node, _): &(NodeID, u16)| leaving.binary_search(&node).is_err();
+    delta_retain(&mut delta.write(), |node| {
+        leaving.binary_search(&node).is_err()
+    });
+    let mut counted = gone_below;
+    {
+        let mut subnodes = subnodes_to_discard.write();
+        counted.extend(
+            subnodes
+                .iter()
+                .filter(|entry| !stays(entry))
+                .map(|&(node, _)| node),
+        );
+        subnodes.retain(stays);
+    }
+    {
+        let mut discard = discard.write();
+        counted.extend(
+            discard
+                .iter()
+                .filter(|entry| !stays(entry))
+                .map(|&(node, _)| node),
+        );
+        discard.retain(stays);
+        discard.extend(kept);
+        discard.extend(tops.iter().map(|&(top, flags, _)| (top, flags)));
+    }
+    counted.sort_unstable();
+    count_totals(
+        stats,
+        below
+            .iter()
+            .filter(|&&(node, _)| counted.binary_search(&node).is_err())
+            .map(|&(_, flags)| flags),
+    );
+    for entry in &mut below {
+        entry.1 = deleted_flags(entry.1);
+    }
+    subnodes_to_discard.write().extend(below);
+    let above = tops.into_iter().map(|(_, _, parent)| parent).collect();
+    count_gone_directories(stats, &leaving, &mut gone.counted.write(), &topmost, above);
+    if !returned.is_empty() {
+        leaving.extend(returned);
+        leaving.sort_unstable();
+    }
+    Ok(leaving)
+}
+
+/// `holders` without each bare one ([`Holder::bare`]) inside a directory of `left_out`, sorted,
+/// whose dirty-only move the commit left out: the working tree holds it elsewhere than the walk
+/// spells. Each bare holder's ancestors are read once, each looked up in `left_out`.
+async fn outside_left_out(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    left_out: &[NodeID],
+    holders: Vec<Holder>,
+) -> Result<Vec<Holder>, CommitError> {
+    let mut kept = Vec::with_capacity(holders.len());
+    'holders: for holder in holders {
+        if holder.bare {
+            let mut at = holder.node;
+            while at.is_valid_node_id() {
+                if left_out.binary_search(&at).is_ok() {
+                    continue 'holders;
+                }
+                at = state
+                    .node(repository.clone(), at)
+                    .await
+                    .forward::<CommitError>("Failed reading a directory's place")?
+                    .parent;
+            }
+        }
+        kept.push(holder);
+    }
+    Ok(kept)
+}
+
+/// What a staged file gone from the walk's path below a directory that went back to its committed
+/// place ([`return_moved_directories`]) is to the commit ([`went_back_with`]).
+enum WentBack {
+    /// It stands where `base` holds it, having moved with that directory alone, and stays as
+    /// committed, as [`return_moved_file`] leaves a file.
+    Committed,
+    /// An add, a copy staged as one among them, which `base` holds nowhere: it leaves the
+    /// revision, and stays below the directory as an add marked dirty alone ([`Gone::added`]).
+    Added,
+    /// A node a move took there from elsewhere: it leaves.
+    Elsewhere,
+}
+
+/// Splits `roots`, the gone files [`commit_gone`] deletes, by what `on_disk` found of their parents:
+/// those that leave with their directory, and those deleted where they stand. One below a directory
+/// that went back stays as committed, is left out as added, or is deleted, as [`went_back_with`]
+/// answers, and each add left out, with `added_tops`, the added directories that leave so, goes to
+/// `gone` to carry past the commit ([`added_at_returned`]). Boxed by its caller, which takes it only
+/// where a directory went back.
+async fn settle_returned_roots(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    (base, gone): (Hash, &Gone),
+    roots: Vec<(NodeID, NodeID, u16)>,
+    (on_disk, added_tops): (&HashMap<NodeID, OnDisk>, Vec<NodeID>),
+    stats: &CommitStats,
+) -> Result<(Vec<NodeID>, Vec<(NodeID, u16)>), CommitError> {
+    let mut gone_below = Vec::new();
+    let mut kept = Vec::with_capacity(roots.len());
+    let mut added = Vec::new();
+    for (node, parent, flags) in roots {
+        match on_disk.get(&parent) {
+            Some(OnDisk::Below(_)) => gone_below.push(node),
+            Some(OnDisk::Returned) => {
+                match Box::pin(went_back_with(repository, state, base, node)).await? {
+                    WentBack::Committed => {
+                        stats.complete.file_count.fetch_add(1, Ordering::Release);
+                    }
+                    WentBack::Added => {
+                        added.push(node);
+                        kept.push((node, flags));
+                    }
+                    WentBack::Elsewhere => kept.push((node, flags)),
+                }
+            }
+            _ => kept.push((node, flags)),
+        }
+    }
+    if let Some(carried) = &gone.added
+        && (!added.is_empty() || !added_tops.is_empty())
+    {
+        let mut found = Vec::new();
+        for node in added.into_iter().chain(added_tops) {
+            Box::pin(added_at_returned(repository, state, node, &mut found)).await?;
+        }
+        carried.lock().extend(found);
+    }
+    Ok((gone_below, kept))
+}
+
+/// What `node`, a staged file gone from the walk's path below a directory that went back, is to
+/// the commit ([`WentBack`]), its staged change cleared where it stays as committed.
+async fn went_back_with(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    base: Hash,
+    node: NodeID,
+) -> Result<WentBack, CommitError> {
+    let record = state
+        .node(repository.clone(), node)
+        .await
+        .forward::<CommitError>("Failed reading a staged file gone from the working tree")?;
+    match state
+        .at_base_place(repository, base, (node, &record), &mut String::new())
+        .await
+        .forward::<CommitError>("Failed reading where the revision holds a file")?
+    {
+        Some(true) => {}
+        Some(false) => return Ok(WentBack::Elsewhere),
+        None => return Ok(WentBack::Added),
+    }
+    let block = state
+        .block(repository.clone(), NodeBlock::index(node))
+        .await
+        .forward::<CommitError>("Failed deserializing state block")?;
+    state.node_clear_own(&block, node, OwnFlags::Change);
+    Ok(WentBack::Committed)
+}
+
+/// Records in `added` `node`, a staged add that went back with a directory, and for an added
+/// directory each add below it, with the path the staged tree holds each at, the place it went back
+/// to, parents first, for the commit to mark them dirty again past it ([`Gone::added`]). A node a
+/// move brought in below an added directory leaves with it.
+async fn added_at_returned(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    node: NodeID,
+    added: &mut Vec<crate::file::dirty::AddedNode>,
+) -> Result<(), CommitError> {
+    let Some(path) = state
+        .node_path_below(repository.clone(), node, ROOT_NODE)
+        .await
+        .forward::<CommitError>("Failed reading the path of an add that went back")?
+    else {
+        return Ok(());
+    };
+    let record = state
+        .node(repository.clone(), node)
+        .await
+        .forward::<CommitError>("Failed reading an add that went back")?;
+    added.push(crate::file::dirty::AddedNode {
+        path: path.clone(),
+        directory: record.is_directory(),
+    });
+    if !record.is_directory() {
+        return Ok(());
+    }
+    let mut pending = vec![(node, path)];
+    while let Some((directory, path)) = pending.pop() {
+        let mut children =
+            StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), directory)
+                .await
+                .forward::<CommitError>("Failed reading the children of an add that went back")?;
+        while let Some((child, record, name)) = children
+            .next()
+            .await
+            .forward::<CommitError>("Failed reading a child of an add that went back")?
+        {
+            if !record.is_added() {
+                continue;
+            }
+            let child_path = RelativePath::new_from_clean_parts(path.as_str(), &name);
+            drop(name);
+            added.push(crate::file::dirty::AddedNode {
+                path: child_path.clone(),
+                directory: record.is_directory(),
+            });
+            if record.is_directory() {
+                pending.push((child, child_path));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Counts the directories a gone directory takes with it, `leaving`, its `topmost` among them,
+/// each once in the total and once as done, as a commit of the topmost's staged deletion counts
+/// them: the topmost in the total, as [`commit_discard`] counts them done, each the walk counted
+/// as it left it (`counted`) no more, and each directory `above` a topmost one as changed, where
+/// the walk did not count it.
+fn count_gone_directories(
+    stats: &CommitStats,
+    leaving: &[NodeID],
+    counted: &mut [NodeID],
+    topmost: &[NodeID],
+    mut above: Vec<NodeID>,
+) {
+    counted.sort_unstable();
+    let walked = counted
+        .iter()
+        .filter(|node| leaving.binary_search(node).is_ok())
+        .count() as u64;
+    let complete = &stats.complete;
+    complete
+        .directory_total
+        .fetch_add(topmost.len() as u64, Ordering::Relaxed);
+    complete
+        .directory_total
+        .fetch_sub(walked, Ordering::Relaxed);
+    complete
+        .directory_count
+        .fetch_sub(walked, Ordering::Release);
+    above.sort_unstable();
+    above.dedup();
+    for parent in above {
+        if leaving.binary_search(&parent).is_err() && counted.binary_search(&parent).is_err() {
+            stats.count_directory();
+        }
+    }
+}
+
+/// Counts each node of `flags` in the totals of the work `stats` reports, a file or a directory,
+/// each total that takes one with a single add.
+fn count_totals(stats: &CommitStats, flags: impl Iterator<Item = u16>) {
+    let (mut files, mut directories) = (0, 0);
+    for flags in flags {
+        if flags & NodeFlags::File != 0 {
+            files += 1;
+        } else {
+            directories += 1;
+        }
+    }
+    let complete = &stats.complete;
+    if files != 0 {
+        complete.file_total.fetch_add(files, Ordering::Relaxed);
+    }
+    if directories != 0 {
+        complete
+            .directory_total
+            .fetch_add(directories, Ordering::Relaxed);
+    }
+}
+
+/// `flags`, of a node the working tree no longer holds, staged for deletion. The deletion of a node
+/// staged as added is recorded as [`recorded_deletions`] answers: as nothing where the revision
+/// the tree was built on lacks it.
+fn deleted_flags(flags: u16) -> u16 {
+    (flags & !NodeFlags::ActionBits.bits()) | NodeFlags::StagedDelete.bits()
+}
+
+/// A staged file the working tree no longer holds at its staged path that may go back to the place
+/// the base revision holds it at ([`moved_back_source`]): the node and its record, that place, its
+/// name and its path there, and whether the working tree holds a file there, `None` where a stat
+/// missed it, for [`listed_files`] to answer.
+struct MovedBack {
+    node: NodeID,
+    record: Node,
+    place: (NodeID, u64),
+    name: String,
+    source: RelativePath,
+    held: Option<bool>,
+}
+
+/// Where `node`, with its record `record`, a staged file the working tree no longer holds, may go
+/// back to: staged as moved, it goes back to the place `base` holds it at where the working tree
+/// holds a file at that path and nothing else holds that place, as committed ([`return_moved_file`]).
+/// `walk_root` is the node the walk starts at and its working-tree path, below which `base` holds the
+/// place. A file standing under its committed parent by its committed name moved only with a
+/// directory, and is none. One file-info read of that path. Boxed by its caller, which takes it for
+/// a staged move alone.
+async fn moved_back_source(
+    operation: &InstanceOperationImpl,
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    (base, walk_root): (Hash, (&RelativePath, NodeID)),
+    (node, record): (NodeID, &Node),
+) -> Result<Option<MovedBack>, CommitError> {
+    let (root_path, root) = walk_root;
+    let flags = NodeFlags::from_bits_retain(record.flags);
+    let mut name = String::new();
+    let Some((place, below)) = state
+        .base_place_below(
+            repository,
+            (base, node, root),
+            (flags, record.address.context),
+            &mut name,
+        )
+        .await
+        .forward::<CommitError>("Failed reading where the revision holds a moved file")?
+    else {
+        return Ok(None);
+    };
+    if record.parent == place.0
+        && record.name_hash == place.1
+        && state
+            .node_name_is(repository.clone(), node, &name)
+            .await
+            .forward::<CommitError>("Failed reading a moved file's name")?
+    {
+        return Ok(None);
+    }
+    let source = RelativePath::new_from_clean_parts(root_path.as_str(), below.as_str());
+    let info = operation
+        .file_info(&source)
+        .await
+        .forward_with::<CommitError, _>(|| format!("Failed to get metadata for file {source}"))?;
+    Ok(Some(MovedBack {
+        node,
+        record: *record,
+        place,
+        name,
+        source,
+        held: info.exists().then(|| !info.is_dir()),
+    }))
+}
+
+/// Returns `moved`, a staged file whose committed path the working tree holds a file at, there,
+/// the move left out, its staged change cleared, and answers whether it went back. Its content
+/// there is not read, and the commit keeps the committed content: a later scan marks an edit as a
+/// modification.
+async fn return_moved_file(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    moved: &MovedBack,
+) -> Result<bool, CommitError> {
+    let MovedBack {
+        node,
+        record,
+        place,
+        name,
+        ..
+    } = moved;
+    let flags = NodeFlags::from_bits_retain(record.flags);
+    let (returned, _) = state
+        .node_return_into(
+            repository,
+            (*node, record.parent, record.name_hash, flags),
+            (*place, name),
+            ReturnOptions::default(),
+        )
+        .await
+        .forward::<CommitError>("Failed returning a moved file to its committed path")?;
+    let returned = returned == Return::Back;
+    if returned {
+        let block = state
+            .block(repository.clone(), NodeBlock::index(*node))
+            .await
+            .forward::<CommitError>("Failed deserializing state block")?;
+        state.node_clear_own(&block, *node, OwnFlags::Change);
+    }
+    Ok(returned)
+}
+
+/// Returns each of `moved` whose committed path the working tree holds a file at
+/// ([`return_moved_file`]), a stat's miss answered from its parent's listing where a file system
+/// may miss it so ([`listed_files`]), each distinct parent listed once; one that does not go back is
+/// pushed to `roots`, gone. Counts each one that goes back done in `stats`.
+async fn return_moved_files(
+    operation: &InstanceOperationImpl,
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    moved: Vec<MovedBack>,
+    roots: &mut Vec<(NodeID, NodeID, u16)>,
+    stats: &CommitStats,
+) -> Result<(), CommitError> {
+    let missed: Vec<RelativePath> = moved
+        .iter()
+        .filter(|moved| moved.held.is_none())
+        .map(|moved| moved.source.clone())
+        .collect();
+    let listed = if missed.is_empty() || !lists_missed_files(operation) {
+        Vec::new()
+    } else {
+        listed_files(operation, &missed).await?
+    };
+    let mut listed = listed.into_iter();
+    for candidate in moved {
+        let held = match candidate.held {
+            Some(held) => held,
+            None => listed.next().unwrap_or(false),
+        };
+        if held && return_moved_file(repository, state, &candidate).await? {
+            stats.complete.file_count.fetch_add(1, Ordering::Release);
+        } else {
+            let record = candidate.record;
+            roots.push((candidate.node, record.parent, deleted_flags(record.flags)));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a stat of `operation`'s working tree may miss a file it lists: on a file system that
+/// folds no case, one held under another case ([`CaseLookup::OnMiss`]), and on Windows one a stat is
+/// refused permission for, as of a path mid-deletion or one the user may not read.
+fn lists_missed_files(operation: &InstanceOperationImpl) -> bool {
+    operation.case_lookup() == CaseLookup::OnMiss || cfg!(target_family = "windows")
+}
+
+/// Which of `paths`, files a stat missed, the working tree lists, as a file of a name folding to
+/// theirs below their parent, in the spelling the working tree holds the parent in
+/// ([`HeldSpellings`]). Each distinct parent is listed once, each name hashed once.
+async fn listed_files(
+    operation: &InstanceOperationImpl,
+    paths: &[RelativePath],
+) -> Result<Vec<bool>, CommitError> {
+    let mut listed = vec![false; paths.len()];
+    let mut by_parent = by_parent_and_name(paths, |_| true);
+    by_parent.sort_unstable_by(by_path_then_hash);
+    let mut spellings = HeldSpellings::default();
+    for group in by_parent.chunk_by(|left, right| left.0.as_str() == right.0.as_str()) {
+        let parent = &group[0].0;
+        let held = if parent.is_empty() {
+            Some(RelativePath::new())
+        } else {
+            spellings.of(operation, parent).await?.map(|(held, _)| held)
+        };
+        let Some(held) = held else {
+            continue;
+        };
+        let mut listing = match operation.read_directory(&held).await {
+            Ok(listing) => listing,
+            Err(error) if error.is_file_not_found() => continue,
+            Err(error) => {
+                return Err(error)
+                    .forward_with::<CommitError, _>(|| format!("Failed to list {held}"));
+            }
+        };
+        while let Some(entry) = listing.next().await {
+            let entry =
+                entry.forward_with::<CommitError, _>(|| format!("Failed to list {held}"))?;
+            if entry.info.is_dir() {
+                continue;
+            }
+            for &(_, _, index) in carrying(group, entry.name_hash) {
+                listed[index] = true;
+            }
+        }
+    }
+    Ok(listed)
+}
+
+/// Each of `paths` `keeps` answers true for, by its index, with its parent and the hash of its
+/// name, for a listing of each parent to find them by.
+fn by_parent_and_name(
+    paths: &[RelativePath],
+    keeps: impl Fn(usize) -> bool,
+) -> Vec<(RelativePath, u64, usize)> {
+    paths
+        .iter()
+        .enumerate()
+        .filter(|&(index, path)| keeps(index) && !path.is_empty())
+        .map(|(index, path)| {
+            (
+                path.parent_path(),
+                crate::hash::hash_string(path.name()),
+                index,
+            )
+        })
+        .collect()
+}
+
+/// The order [`by_parent_and_name`]'s entries are grouped in: by parent, then by name hash.
+fn by_path_then_hash(
+    left: &(RelativePath, u64, usize),
+    right: &(RelativePath, u64, usize),
+) -> std::cmp::Ordering {
+    left.0
+        .as_str()
+        .cmp(right.0.as_str())
+        .then(left.1.cmp(&right.1))
+}
+
+/// The entries of `group`, one parent's sorted by name hash, carrying `name_hash`.
+fn carrying(group: &[(RelativePath, u64, usize)], name_hash: u64) -> &[(RelativePath, u64, usize)] {
+    let start = group.partition_point(|&(_, hash, _)| hash < name_hash);
+    let end = start + group[start..].partition_point(|&(_, hash, _)| hash == name_hash);
+    &group[start..end]
+}
+
+/// What [`gone_directories`] finds the working tree holds of a directory.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnDisk {
+    /// The working tree holds it, or it does not leave: a climb stops at it.
+    Held,
+    /// The working tree no longer holds it, and the directory it leaves with is not yet known.
+    Gone,
+    /// It leaves with the directory named, the topmost gone one above it, or itself.
+    Below(NodeID),
+    /// It went back to its committed place with a directory staged as moved, itself or one above
+    /// it ([`return_moved_directories`]), and stays as committed.
+    Returned,
+    /// A directory staged as moved that the working tree no longer holds, which does not leave
+    /// only as it holds a link's mount or what the view excludes: it goes back where the working
+    /// tree holds a directory at its committed path ([`return_moved_directories`]), and is held
+    /// otherwise.
+    Kept,
+}
+
+/// A directory the walk leaves to [`commit_gone`]'s climb, with its path, and whether its frame
+/// sent a file to [`commit_file`]: one whose read succeeded shows the directory held, unless it is
+/// also the parent of a gone file. So does a merged file past the view, which the commit reads
+/// from the node rather than the disk ([`takes_staged_content`]): the working tree lacks what the
+/// view excludes without its having been deleted. A bare one inside a directory whose dirty move
+/// the commit left out is no start: the working tree holds it elsewhere ([`Gone::left_out`]).
+struct Holder {
+    node: NodeID,
+    path: RelativePath,
+    sent_file: bool,
+    /// Whether the directory is staged only for what lies below it, as for its rehash after a
+    /// staged move left it, and holds no staged child.
+    bare: bool,
+}
+
+/// Finds what the working tree holds of each directory of `starts`, and of those above it: the
+/// directories of `starts` read side by side ([`directories_held`]), but for one a file it sent
+/// showed held ([`Holder`]), then the parents of those it no longer holds, a level at a time, up
+/// to the first held one. Answers what it found of each directory, nothing where the working tree
+/// holds every one of `starts`. `walk_root`, the node the walk starts at, and the root are held.
+/// Boxed by [`commit_gone`], whose future it would outgrow.
+///
+/// A directory the working tree no longer holds leaves only where it is staged, if only for a node
+/// below it, the view takes in everything below it
+/// ([`crate::filter::Filter::view_covers_subtree`]), and it holds no link's mount
+/// ([`linked_directories`]): a working tree lacks what the view excludes without its having been
+/// deleted, and a link leaves only by its removal. Elsewhere it counts as held, but for one staged
+/// as moved, which may go back ([`OnDisk::Kept`]). A file at its path counts as gone.
+async fn gone_directories(
+    operation: &InstanceOperationImpl,
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    walk_root: NodeID,
+    mut starts: Vec<Holder>,
+) -> Result<HashMap<NodeID, OnDisk>, CommitError> {
+    starts.sort_unstable_by_key(|holder| holder.node);
+    starts.dedup_by(|later, kept| {
+        let same = later.node == kept.node;
+        if same {
+            kept.sent_file &= later.sent_file;
+        }
+        same
+    });
+    starts.retain(|holder| holder.node != walk_root && holder.node != ROOT_NODE);
+    let mut on_disk = HashMap::new();
+    let mut frontier: Vec<(NodeID, RelativePath)> = Vec::with_capacity(starts.len());
+    for holder in starts {
+        if holder.sent_file {
+            on_disk.insert(holder.node, OnDisk::Held);
+        } else {
+            frontier.push((holder.node, holder.path));
+        }
+    }
+    let mut frontier = read_held(operation, frontier, &mut on_disk).await?;
+    if frontier.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut up = HashMap::new();
+    let mut linked = None;
+    let filter = &repository.filter;
+    while !frontier.is_empty() {
+        let mut parents = Vec::new();
+        for (directory, path) in frontier {
+            let node = state
+                .node(repository.clone(), directory)
+                .await
+                .forward::<CommitError>("Failed reading a directory gone from the working tree")?;
+            let staged = node.is_directory() && node.is_staged();
+            let leaves = staged
+                && filter.view_covers_subtree(filter.exclusion_states(&path), &path)
+                && !holds_link(repository, state, &mut linked, directory).await?;
+            if !leaves {
+                let kept = staged && node.is_staged_move() && !node.is_staged_add();
+                on_disk.insert(directory, if kept { OnDisk::Kept } else { OnDisk::Held });
+                continue;
+            }
+            up.insert(directory, node.parent);
+            let parent = node.parent;
+            if parent != walk_root && parent != ROOT_NODE && !on_disk.contains_key(&parent) {
+                parents.push((parent, path.parent_path()));
+            }
+        }
+        parents.sort_unstable_by_key(|&(node, _)| node);
+        parents.dedup_by_key(|(node, _)| *node);
+        frontier = read_held(operation, parents, &mut on_disk).await?;
+    }
+    let mut chain = Vec::new();
+    let gone: Vec<NodeID> = up.keys().copied().collect();
+    for directory in gone {
+        if matches!(on_disk.get(&directory), Some(OnDisk::Below(_))) {
+            continue;
+        }
+        chain.clear();
+        let mut at = directory;
+        let top = loop {
+            chain.push(at);
+            let Some(&parent) = up.get(&at) else {
+                break at;
+            };
+            match on_disk.get(&parent) {
+                Some(OnDisk::Below(top)) => break *top,
+                Some(OnDisk::Gone) => at = parent,
+                _ => break at,
+            }
+        };
+        for &below in &chain {
+            on_disk.insert(below, OnDisk::Below(top));
+        }
+    }
+    Ok(on_disk)
+}
+
+/// Reads whether the working tree holds each directory of `directories` ([`directories_held`]),
+/// recording each in `on_disk`, and answers those it no longer holds.
+async fn read_held(
+    operation: &InstanceOperationImpl,
+    directories: Vec<(NodeID, RelativePath)>,
+    on_disk: &mut HashMap<NodeID, OnDisk>,
+) -> Result<Vec<(NodeID, RelativePath)>, CommitError> {
+    if directories.is_empty() {
+        return Ok(directories);
+    }
+    let paths: Arc<[RelativePath]> = directories.iter().map(|(_, path)| path.clone()).collect();
+    let held = directories_held(operation, paths).await?;
+    let mut gone = Vec::new();
+    for ((directory, path), held) in directories.into_iter().zip(held) {
+        if held {
+            on_disk.insert(directory, OnDisk::Held);
+        } else {
+            on_disk.insert(directory, OnDisk::Gone);
+            gone.push((directory, path));
+        }
+    }
+    Ok(gone)
+}
+
+/// Whether the directory `directory` holds a link's mount below it, from `linked`, the
+/// directories that do, sorted, read once from the tree's links the first time it is asked
+/// ([`linked_directories`], boxed, as one read serves the climb).
+async fn holds_link(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    linked: &mut Option<Vec<NodeID>>,
+    directory: NodeID,
+) -> Result<bool, CommitError> {
+    if linked.is_none() {
+        *linked = Some(Box::pin(linked_directories(repository, state)).await?);
+    }
+    Ok(linked
+        .as_ref()
+        .is_some_and(|linked| linked.binary_search(&directory).is_ok()))
+}
+
+/// The directories that hold a link's mount below them, sorted: the ancestors of each link node
+/// the tree registers, but for one staged for deletion, which leaves by its removal.
+async fn linked_directories(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+) -> Result<Vec<NodeID>, CommitError> {
+    let links = state
+        .link_list(repository.clone())
+        .await
+        .forward::<CommitError>("Failed to read link registry")?;
+    let mut linked = Vec::new();
+    for link in links {
+        let mut at = link.local_node();
+        if !at.is_valid_node_id() {
+            continue;
+        }
+        let node = state
+            .node(repository.clone(), at)
+            .await
+            .forward::<CommitError>("Failed reading a link node")?;
+        if node.is_discarded() || node.is_staged_delete() {
+            continue;
+        }
+        at = node.parent;
+        while at.is_valid_node_id() && at != ROOT_NODE {
+            linked.push(at);
+            at = state
+                .node(repository.clone(), at)
+                .await
+                .forward::<CommitError>("Failed reading a directory above a link")?
+                .parent;
+        }
+    }
+    linked.sort_unstable();
+    linked.dedup();
+    Ok(linked)
+}
+
+/// Returns each directory staged as moved that `on_disk` finds gone, leaving or kept
+/// ([`OnDisk::Kept`]), to its committed place, where the working tree holds a directory there
+/// ([`moved_directory_source`]), as [`return_moved_file`] returns a file, the shallowest
+/// committed place first and then by node, so the outcome follows no map's order: one
+/// file-information read of the committed path per such directory, side by side
+/// ([`directories_held`]). One inside a directory that went back goes back to its own place where
+/// that is held. A directory standing under its committed parent by its committed name moved only
+/// with one above it. Each directory that went back is recorded [`OnDisk::Returned`] in `on_disk`,
+/// as is each gone one below it that stands where `base` holds it, having moved with it alone,
+/// each with its own staged change cleared; any other gone one below, as one added or moved there
+/// from elsewhere, leaves with what it holds ([`settle_below_returned`]). The gone files below them
+/// the caller settles. Answers what [`settle_below_returned`] answers.
+async fn return_moved_directories(
+    operation: &InstanceOperationImpl,
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    (base, walk_root): (Hash, (&RelativePath, NodeID)),
+    on_disk: &mut HashMap<NodeID, OnDisk>,
+) -> Result<(Vec<NodeID>, Vec<NodeID>), CommitError> {
+    let mut moved = Vec::new();
+    let mut name = String::new();
+    for (&directory, known) in on_disk.iter() {
+        if !matches!(known, OnDisk::Below(_) | OnDisk::Kept) {
+            continue;
+        }
+        let record = state
+            .node(repository.clone(), directory)
+            .await
+            .forward::<CommitError>("Failed reading a directory gone from the working tree")?;
+        if let Some((place, source)) = moved_directory_source(
+            repository,
+            state,
+            (base, (walk_root.0.as_str(), walk_root.1)),
+            (directory, &record),
+            &mut name,
+        )
+        .await?
+        {
+            moved.push((directory, record, place, name.clone(), source));
+        }
+    }
+    if moved.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    moved.sort_unstable_by_key(|(directory, _, _, _, source)| {
+        (source.as_str().matches('/').count(), *directory)
+    });
+    let sources: Arc<[RelativePath]> = moved.iter().map(|moved| moved.4.clone()).collect();
+    let held = directories_held(operation, sources).await?;
+    let mut returned: Vec<NodeID> = Vec::new();
+    for ((directory, record, place, name, _), held) in moved.into_iter().zip(held) {
+        if !held {
+            continue;
+        }
+        let flags = NodeFlags::from_bits_retain(record.flags);
+        let (went, _) = state
+            .node_return_into(
+                repository,
+                (directory, record.parent, record.name_hash, flags),
+                (place, &name),
+                ReturnOptions::default(),
+            )
+            .await
+            .forward::<CommitError>("Failed returning a moved directory to its committed path")?;
+        if went == Return::Back {
+            returned.push(directory);
+        }
+    }
+    if returned.is_empty() {
+        return Ok((returned, Vec::new()));
+    }
+    returned.sort_unstable();
+    Box::pin(settle_below_returned(
+        repository, state, base, &returned, on_disk,
+    ))
+    .await
+}
+
+/// Where the directory `directory`, staged as moved, goes back to ([`return_moved_directories`]):
+/// its committed place, its name there copied into `name`, and its committed path below
+/// `walk_root`'s path. `None` for one not staged as moved, one `base` holds nowhere below
+/// `walk_root`'s node, and one standing at its committed place by its committed name, which moved
+/// only with a directory above it.
+async fn moved_directory_source(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    (base, (root_path, root)): (Hash, (&str, NodeID)),
+    (directory, record): (NodeID, &Node),
+    name: &mut String,
+) -> Result<Option<((NodeID, u64), RelativePath)>, CommitError> {
+    if !record.is_staged_move() || record.is_staged_add() {
+        return Ok(None);
+    }
+    let flags = NodeFlags::from_bits_retain(record.flags);
+    let Some((place, below)) = state
+        .base_place_below(
+            repository,
+            (base, directory, root),
+            (flags, record.address.context),
+            name,
+        )
+        .await
+        .forward::<CommitError>("Failed reading where the revision holds a moved directory")?
+    else {
+        return Ok(None);
+    };
+    if record.parent == place.0
+        && record.name_hash == place.1
+        && state
+            .node_name_is(repository.clone(), directory, name)
+            .await
+            .forward::<CommitError>("Failed reading a moved directory's name")?
+    {
+        return Ok(None);
+    }
+    Ok(Some((
+        place,
+        RelativePath::new_from_clean_parts(root_path, below.as_str()),
+    )))
+}
+
+/// Settles in `on_disk` each gone directory at or below one of `returned`, the directories that
+/// went back, sorted: one of them, and one that stands where `base` holds it below one that did,
+/// is [`OnDisk::Returned`], its own staged change cleared and left staged for its rehash, as what
+/// it holds may have changed; any other below is the topmost gone directory it leaves with, or
+/// below that, and its subtree leaves with it, but for one [`OnDisk::Kept`], which stays so with
+/// what it holds. Answers the directories recorded returned, sorted,
+/// and the added directories directly below them that leave so, which `base` holds nowhere.
+async fn settle_below_returned(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    base: Hash,
+    returned: &[NodeID],
+    on_disk: &mut HashMap<NodeID, OnDisk>,
+) -> Result<(Vec<NodeID>, Vec<NodeID>), CommitError> {
+    let mut gone: Vec<NodeID> = on_disk
+        .iter()
+        .filter(|(_, known)| matches!(known, OnDisk::Below(_) | OnDisk::Kept))
+        .map(|(&directory, _)| directory)
+        .collect();
+    gone.sort_unstable();
+    let mut at_base: Vec<NodeID> = Vec::new();
+    let mut added: Vec<NodeID> = Vec::new();
+    let mut parents: HashMap<NodeID, NodeID> = HashMap::new();
+    let mut name = String::new();
+    for &directory in &gone {
+        let record = state
+            .node(repository.clone(), directory)
+            .await
+            .forward::<CommitError>("Failed reading a directory gone from the working tree")?;
+        parents.insert(directory, record.parent);
+        if returned.binary_search(&directory).is_ok() {
+            continue;
+        }
+        match state
+            .at_base_place(repository, base, (directory, &record), &mut name)
+            .await
+            .forward::<CommitError>("Failed reading where the revision holds a directory")?
+        {
+            Some(true) => at_base.push(directory),
+            None if record.is_added() => added.push(directory),
+            _ => {}
+        }
+    }
+    let mut added_tops = Vec::new();
+    let mut chain = Vec::new();
+    let mut back = Vec::new();
+    for &directory in &gone {
+        chain.clear();
+        let mut at = directory;
+        let mut above = None;
+        loop {
+            if returned.binary_search(&at).is_ok() {
+                above = Some(OnDisk::Returned);
+                break;
+            }
+            chain.push(at);
+            match parents.get(&at) {
+                Some(&parent) => at = parent,
+                None => break,
+            }
+        }
+        let Some(mut known) = above else {
+            continue;
+        };
+        for &below in chain.iter().rev() {
+            known = match known {
+                OnDisk::Returned if at_base.binary_search(&below).is_ok() => OnDisk::Returned,
+                OnDisk::Returned if on_disk.get(&below) == Some(&OnDisk::Kept) => break,
+                OnDisk::Returned => {
+                    if added.binary_search(&below).is_ok() {
+                        added_tops.push(below);
+                    }
+                    OnDisk::Below(below)
+                }
+                other => other,
+            };
+            on_disk.insert(below, known);
+        }
+    }
+    for &directory in returned {
+        on_disk.insert(directory, OnDisk::Returned);
+    }
+    for (&directory, known) in on_disk.iter() {
+        if *known == OnDisk::Returned {
+            back.push(directory);
+        }
+    }
+    back.sort_unstable();
+    for &directory in &back {
+        let block = state
+            .block(repository.clone(), NodeBlock::index(directory))
+            .await
+            .forward::<CommitError>("Failed deserializing state block")?;
+        state.node_clear_own(&block, directory, OwnFlags::ChangeToBare);
+    }
+    added_tops.sort_unstable();
+    added_tops.dedup();
+    Ok((back, added_tops))
+}
+
+/// Whether the working tree holds a directory at each of `paths`, in order, read side by side
+/// ([`InstanceOperation::directories_held`]). On a file system that folds no case, a path missed
+/// in its own spelling is held where its parent, in the spelling the working tree holds it in,
+/// lists a directory of its name in another ([`held_in_other_cases`]).
+async fn directories_held(
+    operation: &InstanceOperationImpl,
+    paths: Arc<[RelativePath]>,
+) -> Result<Vec<bool>, CommitError> {
+    let mut held = Vec::with_capacity(paths.len());
+    operation
+        .directories_held(paths.clone(), &mut held)
+        .await
+        .forward::<CommitError>("Failed to read whether directories are held")?;
+    if operation.case_lookup() == CaseLookup::OnMiss && held.iter().any(|&held| !held) {
+        Box::pin(held_in_other_cases(operation, &paths, &mut held)).await?;
+    }
+    Ok(held)
+}
+
+/// Marks held each path of `paths` that `held` misses, where its parent, in the spelling the
+/// working tree holds it in ([`HeldSpellings`]), lists a directory of its name in another
+/// spelling, or in its own where the parent's differs. Each distinct parent is listed once, each
+/// name hashed once.
+async fn held_in_other_cases(
+    operation: &InstanceOperationImpl,
+    paths: &[RelativePath],
+    held: &mut [bool],
+) -> Result<(), CommitError> {
+    let mut missed = by_parent_and_name(paths, |index| !held[index]);
+    missed.sort_unstable_by(by_path_then_hash);
+    let mut spellings = HeldSpellings::default();
+    for group in missed.chunk_by(|left, right| left.0.as_str() == right.0.as_str()) {
+        let parent = &group[0].0;
+        let spelled = if parent.is_empty() {
+            Some((parent.clone(), false))
+        } else {
+            spellings.of(operation, parent).await?
+        };
+        let Some((spelled, varied)) = spelled else {
+            continue;
+        };
+        let mut listing = match operation.read_directory(&spelled).await {
+            Ok(listing) => listing,
+            Err(error) if error.is_file_not_found() => continue,
+            Err(error) => {
+                return Err(error)
+                    .forward_with::<CommitError, _>(|| format!("Failed to list {spelled}"));
+            }
+        };
+        while let Some(entry) = listing.next().await {
+            let entry =
+                entry.forward_with::<CommitError, _>(|| format!("Failed to list {spelled}"))?;
+            if !entry.info.is_dir() {
+                continue;
+            }
+            for &(_, _, index) in carrying(group, entry.name_hash) {
+                if varied || entry.name != paths[index].name() {
+                    held[index] = true;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every spelling of `name` the directory at `directory` holds that folds to the same name
+/// ([`InstanceOperation::names_folding_to`]); none where the working tree holds no directory there.
+async fn names_folding(
+    operation: &InstanceOperationImpl,
+    directory: &RelativePath,
+    name: &str,
+) -> Result<Vec<String>, CommitError> {
+    match operation.names_folding_to(directory, name).await {
+        Ok(names) => Ok(names),
+        Err(error) if error.is_file_not_found() => Ok(Vec::new()),
+        Err(error) => {
+            Err(error).forward_with::<CommitError, _>(|| format!("Failed to list {directory}"))
+        }
+    }
+}
+
+/// The spellings the working tree holds paths in on a file system that folds no case, asked one
+/// after another in sorted order: the spelling of each, not empty, with whether it differs from
+/// its own, each component a stat misses looked up by its fold, and `None` where some component is
+/// held in no spelling. It keeps what it found of each component of the last path asked, so a
+/// path that shares a prefix with it reads none of the prefix again, and one below a prefix held
+/// in no spelling reads nothing; and it keeps the folded names of the last directory it listed, so
+/// siblings a stat missed list their parent once.
+#[derive(Default)]
+struct HeldSpellings {
+    /// The last path asked.
+    last: RelativePath,
+    /// What the working tree holds the last path in up to each of its components, as far as it
+    /// was resolved: the spelling and whether it differs, `None` from the first held in no
+    /// spelling.
+    held: Vec<Option<(RelativePath, bool)>>,
+    /// The directory last listed for a component a stat missed, as held, with the hashes of the
+    /// folded names it holds, sorted.
+    listed: Option<(RelativePath, Vec<u64>)>,
+}
+
+impl HeldSpellings {
+    /// The spelling the working tree holds `path`, not empty, in, with whether it differs from
+    /// `path`'s; `None` where some component is held in no spelling.
+    async fn of(
+        &mut self,
+        operation: &InstanceOperationImpl,
+        path: &RelativePath,
+    ) -> Result<Option<(RelativePath, bool)>, CommitError> {
+        let shared = path
+            .as_str()
+            .split('/')
+            .zip(self.last.as_str().split('/'))
+            .take_while(|(asked, last)| asked == last)
+            .count()
+            .min(self.held.len());
+        self.held.truncate(shared);
+        self.last = path.clone();
+        let (mut held, mut varied) = match self.held.last() {
+            Some(None) => return Ok(None),
+            Some(Some((held, varied))) => (held.clone(), *varied),
+            None => (RelativePath::new(), false),
+        };
+        for component in path.as_str().split('/').skip(shared) {
+            let exact = RelativePath::new_from_clean_parts(held.as_str(), component);
+            let info = operation
+                .file_info(&exact)
+                .await
+                .forward_with::<CommitError, _>(|| format!("Failed to get metadata for {exact}"))?;
+            if info.exists() {
+                held = exact;
+            } else {
+                let Some(variant) = self.variant(operation, &held, component).await? else {
+                    self.held.push(None);
+                    return Ok(None);
+                };
+                held = RelativePath::new_from_clean_parts(held.as_str(), &variant);
+                varied = true;
+            }
+            self.held.push(Some((held.clone(), varied)));
+        }
+        Ok(Some((held, varied)))
+    }
+
+    /// A spelling other than `component` that the directory held at `directory` holds a name
+    /// folding to it in: answered from its folded names, listed once for the siblings asked one
+    /// after another, and its names read by their fold only where it holds one.
+    async fn variant(
+        &mut self,
+        operation: &InstanceOperationImpl,
+        directory: &RelativePath,
+        component: &str,
+    ) -> Result<Option<String>, CommitError> {
+        if self
+            .listed
+            .as_ref()
+            .is_none_or(|(listed, _)| listed.as_str() != directory.as_str())
+        {
+            let mut folded = Vec::new();
+            match operation.read_directory(directory).await {
+                Ok(mut listing) => {
+                    while let Some(entry) = listing.next().await {
+                        let entry = entry.forward_with::<CommitError, _>(|| {
+                            format!("Failed to list {directory}")
+                        })?;
+                        folded.push(entry.name_hash);
+                    }
+                }
+                Err(error) if error.is_file_not_found() => {}
+                Err(error) => {
+                    return Err(error)
+                        .forward_with::<CommitError, _>(|| format!("Failed to list {directory}"));
+                }
+            }
+            folded.sort_unstable();
+            self.listed = Some((directory.clone(), folded));
+        }
+        let name_hash = crate::hash::hash_string(component);
+        if self
+            .listed
+            .as_ref()
+            .is_none_or(|(_, folded)| folded.binary_search(&name_hash).is_err())
+        {
+            return Ok(None);
+        }
+        let names = names_folding(operation, directory, component).await?;
+        Ok(names.into_iter().find(|name| name != component))
+    }
+}
+
+/// Refuses as not found the first of `files`, staged files a stat missed, that the working tree
+/// still lists as a file ([`listed_files`]): under another case, on a file system that folds no
+/// case, or on Windows one a stat was refused permission for, as such a file is not gone. Each
+/// distinct directory is listed once. Boxed by its caller, as only such a file system takes it
+/// ([`lists_missed_files`]).
+async fn refuse_case_variants(
+    operation: &InstanceOperationImpl,
+    files: &[(NodeID, RelativePath)],
+) -> Result<(), CommitError> {
+    let paths: Vec<RelativePath> = files.iter().map(|(_, path)| path.clone()).collect();
+    let listed = listed_files(operation, &paths).await?;
+    if let Some(index) = listed.iter().position(|&listed| listed) {
+        return Err(FileNotFound {
+            resource: paths[index].as_str().to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Hands `operation` the directories of `handed`, those the walk adds or moves, that the tree still
+/// holds once the commit has settled what the working tree no longer holds
+/// ([`InstanceOperationImpl::hand_directories`]): one of `leaving`, the sorted nodes that left with
+/// a gone directory and the directories that went back to their committed paths, is not handed,
+/// as the revision holds nothing at the path the walk spelled for it.
+fn hand_directories(
+    operation: &InstanceOperationImpl,
+    handed: &parking_lot::RwLock<Vec<(NodeID, RelativePath)>>,
+    leaving: &[NodeID],
+) {
+    let handed = std::mem::take(&mut *handed.write());
+    if handed.is_empty() {
+        return;
+    }
+    operation.hand_directories(
+        handed
+            .into_iter()
+            .filter(|(node, _)| leaving.binary_search(node).is_err())
+            .map(|(_, path)| path)
+            .collect(),
+    );
+}
+
 /// Frees the nodes staged for deletion, `discard`, and the nodes below them a walk collected,
 /// `subnodes_to_discard`, each with its flags, recording each deletion in the delta as `base` says
-/// ([`recorded_deletions`]): each root is detached before anything below it is freed (H6).
+/// ([`recorded_deletions`]) under the flags it is listed with: each root is detached before
+/// anything below it is freed (H6).
 ///
 /// Refuses an unresolved conflict among the nodes below them, which no walk visits, named by its
 /// working-tree path below `walk_root`, the node the walk starts at and its working-tree path.
@@ -2684,7 +4258,7 @@ async fn commit_discard(
     subnodes_to_discard: &parking_lot::RwLock<Vec<(NodeID, u16)>>,
     stats: Arc<CommitStats>,
 ) -> Result<(), CommitError> {
-    let (roots, below, recorded, records) = {
+    let (roots, below, recorded, records, mut dropped) = {
         let roots = std::mem::take(&mut *discard.write());
         if roots.is_empty() {
             return Ok(());
@@ -2709,24 +4283,27 @@ async fn commit_discard(
 
         let records = !matches!(base, DeletionBase::Unrecorded);
         let recorded = recorded_deletions(&state, &repository, base, &roots, &collected).await?;
+        let mut dropped = Dropped::default();
         if records {
             let mut delta = delta.write();
             delta.reserve(collected.len() * size_of::<NodeDelta>());
             for &(node, flags) in &collected {
-                if let Some(recorded) = recorded_as(&recorded, records, node) {
-                    delta_push(&mut delta, recorded, flags);
+                match recorded_as(&recorded, records, node) {
+                    Some(recorded) => delta_push(&mut delta, recorded, flags),
+                    None => dropped.count(flags),
                 }
             }
         }
         let below: Vec<NodeID> = collected.into_iter().map(|(node, _)| node).collect();
-        let roots: Vec<NodeID> = roots.into_iter().map(|(node, _)| node).collect();
-        (roots, below, recorded, records)
+        (roots, below, recorded, records, dropped)
     };
 
     let counts = state::node_discard_free(&state, &repository, &roots, below, |root, flags| {
         lore_trace!("Committing deletion of node {root}");
-        if let Some(recorded) = recorded_as(&recorded, records, root) {
-            delta_add(delta.clone(), recorded, flags);
+        match recorded_as(&recorded, records, root) {
+            Some(recorded) => delta_add(delta.clone(), recorded, flags),
+            None if records => dropped.count(flags),
+            None => {}
         }
     })
     .await
@@ -2735,16 +4312,39 @@ async fn commit_discard(
     complete
         .file_count
         .fetch_add(counts.file_count, Ordering::Release);
-    complete
-        .file_delete_count
-        .fetch_add(counts.file_count, Ordering::Relaxed);
+    complete.file_delete_count.fetch_add(
+        counts.file_count.saturating_sub(u64::from(dropped.files)),
+        Ordering::Relaxed,
+    );
     complete
         .directory_count
         .fetch_add(counts.directory_count, Ordering::Release);
-    complete
-        .directory_delete_count
-        .fetch_add(counts.directory_count, Ordering::Relaxed);
+    complete.directory_delete_count.fetch_add(
+        counts
+            .directory_count
+            .saturating_sub(u64::from(dropped.directories)),
+        Ordering::Relaxed,
+    );
     Ok(())
+}
+
+/// The nodes a commit discards that it records no deletion of, as the revision it was built on
+/// lacks them ([`recorded_deletions`]): an add dropped, which the counts of deletions leave out.
+#[derive(Default)]
+struct Dropped {
+    files: u32,
+    directories: u32,
+}
+
+impl Dropped {
+    /// Counts a node of `flags`, a file or a directory.
+    fn count(&mut self, flags: u16) {
+        if flags & NodeFlags::File != 0 {
+            self.files += 1;
+        } else {
+            self.directories += 1;
+        }
+    }
 }
 
 /// The ID a commit records the deletion of `node` under, from `recorded`, the exceptions
@@ -2922,18 +4522,22 @@ async fn collect_file(
 /// The most tasks a commit's walk or file stage keeps running before it waits for one to finish.
 const MAX_CONCURRENT_TASKS: usize = 10000;
 
-/// Folds a finished task of a commit into the first failure seen.
-fn collect_commit_task(
-    result: Result<Result<(), CommitError>, tokio::task::JoinError>,
+/// Folds a finished task of a commit into the first failure seen, answering what it answered where
+/// it succeeded.
+fn collect_commit_task<T>(
+    result: Result<Result<T, CommitError>, tokio::task::JoinError>,
     failure: &mut Option<CommitError>,
-) {
-    if let Err(err) = result
+) -> Option<T> {
+    match result
         .internal("Recursion task failed")
         .map_err(CommitError::from)
         .flatten()
-        && failure.is_none()
     {
-        *failure = Some(err);
+        Ok(answer) => Some(answer),
+        Err(err) => {
+            failure.get_or_insert(err);
+            None
+        }
     }
 }
 
@@ -2963,12 +4567,15 @@ async fn commit_execute(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     delta: Arc<parking_lot::RwLock<BytesMut>>,
+    gone: Option<Arc<Gone>>,
     stats: Arc<CommitStats>,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
     modified_times: Arc<RecordedModifiedTimes>,
 ) -> Result<(), CommitError> {
     let mut tasks = JoinSet::new();
     let mut commit_failure = None;
+    let mut found = Vec::new();
+    let missing = MissingPaths::of(gone.as_deref());
 
     while let Some(file_to_commit) = file_rx.recv().await {
         lore_spawn!(
@@ -2980,6 +4587,7 @@ async fn commit_execute(
                 file_to_commit.node_id,
                 file_to_commit.relative_path,
                 delta.clone(),
+                missing,
                 stats.clone(),
                 tracker.clone(),
                 modified_times.clone(),
@@ -2987,12 +4595,12 @@ async fn commit_execute(
         );
 
         while let Some(result) = tasks.try_join_next() {
-            collect_commit_task(result, &mut commit_failure);
+            found.extend(collect_commit_task(result, &mut commit_failure).flatten());
         }
         while tasks.len() > MAX_CONCURRENT_TASKS
             && let Some(result) = tasks.join_next().await
         {
-            collect_commit_task(result, &mut commit_failure);
+            found.extend(collect_commit_task(result, &mut commit_failure).flatten());
         }
 
         if commit_failure.is_some() {
@@ -3001,7 +4609,10 @@ async fn commit_execute(
     }
 
     while let Some(result) = tasks.join_next().await {
-        collect_commit_task(result, &mut commit_failure);
+        found.extend(collect_commit_task(result, &mut commit_failure).flatten());
+    }
+    if let Some(gone) = gone.filter(|_| !found.is_empty()) {
+        gone.files.write().extend(found);
     }
 
     if let Some(err) = commit_failure {
@@ -3017,22 +4628,36 @@ async fn commit_execute(
 /// that was committed, costing that one file a hash on the next scan. A time read afterwards
 /// would describe content that was never committed, and the next scan would trust it.
 ///
-/// A path holding nothing is reported here, ahead of the read that would fail on it anyway.
+/// `None` where the path holds nothing or a directory, which the commit takes alike
+/// ([`gone_file`]), ahead of the read that would fail on it.
 async fn info_before_fragmenting(
     operation: &InstanceOperationImpl,
     path: &RelativePath,
-) -> Result<FileInfo, CommitError> {
+) -> Result<Option<FileInfo>, CommitError> {
     let info = operation
         .file_info(path)
         .await
         .forward_with::<CommitError, _>(|| format!("Failed to get metadata for file {path}"))?;
-    if !info.exists() {
+    Ok((info.exists() && !info.is_dir()).then_some(info))
+}
+
+/// What [`commit_file`] answers for the staged file `node` the working tree no longer holds at
+/// `path`, nothing or a directory standing there: the path, for [`commit_gone`], which refuses one
+/// the working tree still lists ([`refuse_case_variants`]), where `missing` settles such paths, and
+/// not found elsewhere.
+fn gone_file(
+    node: NodeID,
+    path: RelativePath,
+    missing: MissingPaths,
+) -> Result<Option<(NodeID, RelativePath)>, CommitError> {
+    if missing == MissingPaths::Refuse {
         return Err(FileNotFound {
             resource: path.as_str().to_string(),
         }
         .into());
     }
-    Ok(info)
+    lore_trace!("Staged file gone from the working tree: {path}");
+    Ok(Some((node, path)))
 }
 
 /// Whether a commit takes the content of the staged file `node` at `path` from the node rather
@@ -3073,7 +4698,10 @@ pub(crate) fn merged_past_the_view(
 
 /// Commits one file node, recording the modified time it read the file at and telling the
 /// operation what it stored ([`InstanceOperation::stored`]). A file whose content is taken from
-/// the staged node ([`takes_staged_content`]) records and tells nothing.
+/// the staged node ([`takes_staged_content`]) records and tells nothing. A file the working tree
+/// no longer holds at its spelling, a directory standing there or nothing, is answered as gone
+/// ([`gone_file`]), for [`commit_gone`], which refuses one held under another case
+/// ([`refuse_case_variants`]).
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -3084,10 +4712,11 @@ fn commit_file(
     node_id: NodeID,
     relative_path: RelativePath,
     delta: Arc<parking_lot::RwLock<BytesMut>>,
+    missing: MissingPaths,
     stats: Arc<CommitStats>,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
     modified_times: Arc<RecordedModifiedTimes>,
-) -> impl Future<Output = Result<(), CommitError>> {
+) -> impl Future<Output = Result<Option<(NodeID, RelativePath)>, CommitError>> {
     async move {
         let block_index = NodeBlock::index(node_id);
         let node_index = Node::index(node_id);
@@ -3142,7 +4771,9 @@ fn commit_file(
                 );
             }
 
-            let info = info_before_fragmenting(&operation, &relative_path).await?;
+            let Some(info) = info_before_fragmenting(&operation, &relative_path).await? else {
+                return gone_file(node_id, relative_path, missing);
+            };
 
             let source = operation
                 .content_source(&relative_path)
@@ -3227,8 +4858,81 @@ fn commit_file(
 
         stats.complete.file_count.fetch_add(1, Ordering::Release);
 
-        Ok(())
+        Ok(None)
     }
+}
+
+/// Refuses the commit of the link `node_id`, at `relative_path`, whose linked tree holds a staged
+/// change, inside a directory staged as moved below `walk_root` that went back: the working tree
+/// holds a directory at its committed path and none at its staged one, so
+/// [`return_moved_directories`] takes it back. The link's commit runs in the walk, before
+/// [`commit_gone`]'s climb, and would read the linked tree at the staged path. One
+/// file-information read of each such directory's two paths, side by side.
+async fn refuse_link_moved_back(
+    operation: &InstanceOperationImpl,
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    (walk_root, node_id): (NodeID, NodeID),
+    relative_path: &RelativePath,
+) -> Result<(), CommitError> {
+    let mut moved: Vec<(NodeID, Node, usize)> = Vec::new();
+    let mut path = relative_path.as_str();
+    let mut at = state
+        .node(repository.clone(), node_id)
+        .await
+        .forward::<CommitError>("Failed reading a link node")?
+        .parent;
+    while at != walk_root && at != ROOT_NODE {
+        path = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+        let record = state
+            .node(repository.clone(), at)
+            .await
+            .forward::<CommitError>("Failed reading a directory above a link")?;
+        if record.is_staged_move() && !record.is_staged_add() {
+            moved.push((at, record, path.len()));
+        }
+        at = record.parent;
+    }
+    if moved.is_empty() {
+        return Ok(());
+    }
+    let root_path = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+    let base = state.committed_revision();
+    let mut name = String::new();
+    let mut paths = Vec::with_capacity(moved.len() * 2);
+    for (directory, record, length) in moved {
+        if let Some((_, source)) = moved_directory_source(
+            repository,
+            state,
+            (base, (root_path, walk_root)),
+            (directory, &record),
+            &mut name,
+        )
+        .await?
+        {
+            paths.push(RelativePath::new_from_clean_parts(
+                &relative_path.as_str()[..length],
+                "",
+            ));
+            paths.push(source);
+        }
+    }
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let held = directories_held(operation, paths.into()).await?;
+    if held
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .any(|&[staged, committed]| !staged && committed)
+    {
+        return Err(CommitError::internal(
+            "a staged link lies inside a directory moved back to its committed path; stage the \
+             move back or unstage it",
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3237,7 +4941,7 @@ async fn commit_link_node(
     repository: Arc<RepositoryContext>,
     token: RepositoryWriteToken,
     state: Arc<State>,
-    node_id: NodeID,
+    (walk_root, node_id): (NodeID, NodeID),
     relative_path: RelativePath,
     delta: Arc<parking_lot::RwLock<BytesMut>>,
     metadata: Arc<Metadata>,
@@ -3245,6 +4949,7 @@ async fn commit_link_node(
     stats: Arc<CommitStats>,
     parent_branch: BranchId,
     parent_tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+    missing: MissingPaths,
 ) -> Result<(), CommitError> {
     let block_index = NodeBlock::index(node_id);
     let node_index = Node::index(node_id);
@@ -3270,6 +4975,22 @@ async fn commit_link_node(
         delta_add(delta, node_id, node.flags);
         state.node_clear_own(&block, node_id, OwnFlags::Change);
         return Ok(());
+    }
+
+    if missing == MissingPaths::Settle
+        && link_state.revision_number() == 0
+        && first_staged_node(&link_repository, &link_state, |_| true)
+            .await?
+            .is_some()
+    {
+        Box::pin(refuse_link_moved_back(
+            &operation,
+            &repository,
+            &state,
+            (walk_root, node_id),
+            &relative_path,
+        ))
+        .await?;
     }
 
     // Link, recurse and check if there are changes inside the link to commit, and if so update the
@@ -3306,6 +5027,7 @@ async fn commit_link_node(
         link_messages,
         stats,
         parent_tracker,
+        missing,
     )
     .await?;
 
@@ -3394,6 +5116,7 @@ async fn commit_link(
     link_messages: Arc<HashMap<String, String>>,
     stats: Arc<CommitStats>,
     parent_tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+    missing: MissingPaths,
 ) -> Result<(Hash, NodeID), CommitError> {
     // Per-link tracker: a linked sub-repo is a logically independent commit
     // and must carry its own durability gate. If we reused the parent's
@@ -3405,7 +5128,9 @@ async fn commit_link(
     lore_debug!("Committing link node {node_id} at {relative_path}");
 
     let base = state.committed_revision();
-    prune_dirty_for_commit(state.clone(), repository.clone(), base).await?;
+    let pruned = prune_dirty_for_commit(state.clone(), repository.clone(), base).await?;
+    let gone =
+        (missing == MissingPaths::Settle).then(|| Arc::new(Gone::left_out(Vec::new(), &pruned)));
     let link_modified_times = Arc::new(RecordedModifiedTimes::below(
         operation.clock_floor(&repository).await,
     ));
@@ -3447,6 +5172,7 @@ async fn commit_link(
                 stats,
                 branch,
                 work_tracker.clone(),
+                gone,
             );
             let delta = commit_walks(
                 walk,
@@ -3550,50 +5276,12 @@ async fn commit_link(
     Ok((signature, node_id))
 }
 
-/// The key a directory's address is hashed under in BLAKE3's keyed mode. A revision may also hold
-/// unkeyed directory addresses, hashed from the children without their names, and the key keeps
-/// the two apart.
-const DIRECTORY_HASH_KEY: [u8; 32] = *b"lore directory exact child names";
-
-/// What a child contributes to its directory's address besides its name.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, IntoBytes, FromBytes, Immutable)]
-struct NodeHashData {
-    name_hash: u64,
-    mode: u32,
-    address: Address,
-    /// A link's mount source, which its address does not express. Zero for
-    /// every other node and for a link mounting the repository root, so only a
-    /// subtree mount reaches a hash it did not before.
-    mount_source: u32,
-    size: u64,
-}
-
-impl NodeHashData {
-    fn from_node(node: &Node) -> Self {
-        NodeHashData {
-            name_hash: node.name_hash,
-            mode: node.mode as u32,
-            address: node.address,
-            mount_source: node.mount_source().unwrap_or(ROOT_NODE),
-            size: node.size,
-        }
-    }
-}
-
-/// A child of a directory [`rehash_directory`] hashes: what it contributes besides its name, and
-/// where its name lies among the names read for the directory.
-struct ChildHashData {
-    data: NodeHashData,
-    name: Range<u32>,
-}
-
 /// Rehash the directory `node_id`, when it is the root or staged, and every staged directory below
 /// it, clearing their staged flags.
 ///
-/// A directory's address is the hash, keyed with [`DIRECTORY_HASH_KEY`], of every child in the
-/// order of their name hashes: for each, its [`NodeHashData`], then the length and the bytes of
-/// the name it stores, unchecked against the name rules. A rename that changes only case
+/// A directory's address is the keyed hash of every child in the order of their name hashes
+/// ([`state::directory_hash`]): for each, its [`state::NodeHashData`], then the length and the
+/// bytes of the name it stores, unchecked against the name rules. A rename that changes only case
 /// therefore changes the address. The names are read from the name table of each block holding a
 /// child of a rehashed directory.
 pub async fn rehash_directory(
@@ -3616,7 +5304,7 @@ pub async fn rehash_directory(
     lore_trace!("Rehash directory node {} address {}", node_id, node.address);
     debug_assert!(node.is_directory());
 
-    let mut child_data: Vec<ChildHashData> = vec![];
+    let mut child_data: Vec<state::ChildHashData> = vec![];
     let mut names: Vec<u8> = vec![];
 
     let mut total_size = 0;
@@ -3674,8 +5362,8 @@ pub async fn rehash_directory(
             break;
         }
 
-        let child = ChildHashData {
-            data: NodeHashData::from_node(&child_node),
+        let child = state::ChildHashData {
+            data: state::NodeHashData::from_node(&child_node),
             name: name_end - child_node.name_length..name_end,
         };
 
@@ -3740,7 +5428,7 @@ pub async fn rehash_directory(
     while let Some(task) = tasks.join_next().await {
         match task {
             Ok(Ok((index, result))) => {
-                total_size += result.size;
+                total_size += result.size();
                 child_data[index as usize].data = result;
             }
             Ok(Err(err)) => {
@@ -3756,20 +5444,11 @@ pub async fn rehash_directory(
     }
     task_failure.internal("Recursion task failed")?;
 
-    child_data.sort_unstable_by_key(|child| child.data.name_hash);
-
-    let mut hasher = blake3::Hasher::new_keyed(&DIRECTORY_HASH_KEY);
-    for child in child_data.iter() {
-        // Assumes little endian
-        hasher.update(child.data.as_bytes());
-        hasher.update(&(child.name.end - child.name.start).to_le_bytes());
-        hasher.update(&names[child.name.start as usize..child.name.end as usize]);
-    }
-    let blake3_hash = hasher.finalize();
+    let directory_hash = state::directory_hash(&mut child_data, &names);
 
     state.node_change_owned(&block, node_id, |held| {
         let prev_hash = held.address.hash;
-        held.set_hash_and_size(Hash::from(*blake3_hash.as_bytes()), total_size);
+        held.set_hash_and_size(directory_hash, total_size);
         held.clear_staged_and_action_bits();
 
         lore_trace!(
@@ -3789,7 +5468,7 @@ pub async fn rehash_directory(
 
 /// What the rehash of a subdirectory returns: its index among the children of the directory
 /// being rehashed, and what it contributes to that directory's address.
-type ChildRehash = Result<(u32, NodeHashData), CommitError>;
+type ChildRehash = Result<(u32, state::NodeHashData), CommitError>;
 
 /// Rehash the directory `node_id`, the child at `index` of the directory being rehashed, and
 /// return what it contributes to that directory's address with the index.
@@ -3810,7 +5489,7 @@ fn rehash_directory_recurse(
             .forward::<CommitError>("Failed deserializing state block")?;
         let node = block.node(node_index);
 
-        Ok((index, NodeHashData::from_node(&node)))
+        Ok((index, state::NodeHashData::from_node(&node)))
     })
 }
 
@@ -3866,6 +5545,21 @@ fn delta_push(delta: &mut BytesMut, node_id: NodeID, flags: u16) {
     let node_delta = NodeDelta::from_node_and_flags(node_id, flags);
     lore_trace!("Record node delta {node_delta:?}");
     delta.extend_from_slice(node_delta.as_bytes());
+}
+
+/// Keeps in `delta` only the entries of the nodes `keeps` answers true for, in their order.
+fn delta_retain(delta: &mut BytesMut, keeps: impl Fn(NodeID) -> bool) {
+    let size = size_of::<NodeDelta>();
+    let mut kept = 0;
+    let mut start = 0;
+    while let Ok((entry, _)) = NodeDelta::read_from_prefix(&delta[start..]) {
+        if keeps(entry.node) {
+            delta.copy_within(start..start + size, kept);
+            kept += size;
+        }
+        start += size;
+    }
+    delta.truncate(kept);
 }
 
 async fn generate_delta_block(
@@ -4618,13 +6312,17 @@ pub(crate) async fn prune_dirty_for_commit(
                 .block(repository.clone(), NodeBlock::index(child_id))
                 .await
                 .forward::<CommitError>("Failed deserializing state block")?;
-            let (next_sibling, child_is_dirty, child_is_staged) = {
+            let (next_sibling, child_is_dirty, child_is_staged, child_content) = {
                 let child = child_block.node(Node::index(child_id));
-                (child.sibling, child.is_dirty(), child.is_staged())
+                let staged = child.is_staged();
+                let content =
+                    staged && (!child.is_dirty() || !state::is_staged_for_descendants_only(&child));
+                (child.sibling, child.is_dirty(), staged, content)
             };
             if let Some(level) = levels.last_mut() {
                 level.next_child = next_sibling;
                 level.holds_staged |= child_is_staged;
+                level.holds_content |= child_content;
             }
             if child_is_dirty {
                 levels.push(PruneLevel::new(child_id, child_block));
@@ -4633,10 +6331,12 @@ pub(crate) async fn prune_dirty_for_commit(
         }
 
         let Some(level) = levels.pop() else { break };
-        let (node_id, holds_staged) = (level.node_id, level.holds_staged);
+        let (node_id, holds_staged, holds_content) =
+            (level.node_id, level.holds_staged, level.holds_content);
         let discard = prune_dirty_leave(&state, &repository, level, &mut context).await?;
         if let Some(parent) = levels.last_mut() {
             parent.holds_staged |= holds_staged;
+            parent.holds_content |= holds_content;
             if discard {
                 parent.to_discard.push(node_id);
             }
@@ -4644,6 +6344,15 @@ pub(crate) async fn prune_dirty_for_commit(
     }
     settle_waiting(&state, &repository, &mut context).await?;
     stage_left(&state, &repository, &mut context.left).await?;
+    if state.holds_promoted_moves() {
+        Box::pin(crate::file::stage::stage_promoted_moves_of_call(
+            &repository,
+            &state,
+            None,
+        ))
+        .await
+        .forward::<CommitError>("Failed to stage the move of a directory the commit stages")?;
+    }
     Ok(Pruned {
         moves: context.returned,
     })
@@ -4676,11 +6385,16 @@ impl state::DirtyPathSink for DirtyOnly {
 
 impl DirtyOnly {
     /// The paths to mark again past the commit, and the marks carried beside them, once the prune
-    /// left out the moves of `pruned`.
-    fn carried(self, pruned: Pruned) -> (Vec<RelativePath>, crate::file::dirty::CarriedMarks) {
+    /// left out the moves of `pruned` and the commit the staged adds of `added`.
+    fn carried(
+        self,
+        pruned: Pruned,
+        added: Vec<crate::file::dirty::AddedNode>,
+    ) -> (Vec<RelativePath>, crate::file::dirty::CarriedMarks) {
         let carried = crate::file::dirty::CarriedMarks {
             moves: pruned.moves,
             marks: self.marks,
+            added,
         };
         (self.paths, carried)
     }
@@ -4691,6 +6405,16 @@ pub(crate) struct Pruned {
     /// Each dirty-only move, gone back or left out, with the path the staged tree held its node at,
     /// in the order the walk left them.
     pub moves: Vec<MovedNode>,
+}
+
+impl Pruned {
+    /// The directories of [`Self::moves`] ([`Gone::left_out`]).
+    fn left_out(&self) -> impl Iterator<Item = NodeID> + '_ {
+        self.moves
+            .iter()
+            .filter(|moved| moved.node_type == crate::interface::LoreNodeType::Directory)
+            .map(|moved| moved.node)
+    }
 }
 
 /// A dirty node [`prune_dirty_for_commit`] has entered and not yet left.
@@ -4704,6 +6428,9 @@ struct PruneLevel {
     to_discard: Vec<NodeID>,
     /// Whether a staged node lies below it.
     holds_staged: bool,
+    /// Whether staged content lies below it: a node staged in its own right, or a staged node the
+    /// walk does not enter, which may hold one.
+    holds_content: bool,
     /// Whether it was staged when entered.
     entered_staged: bool,
 }
@@ -4723,6 +6450,7 @@ impl PruneLevel {
             next_child,
             to_discard: Vec::new(),
             holds_staged: false,
+            holds_content: false,
             entered_staged,
         }
     }
@@ -4749,8 +6477,11 @@ struct PruneContext {
 /// revision holds it at where it is an unstaged dirty move ([`State::node_return_unstaged_move`]),
 /// recording it in `context`, clears its dirty flags unless it is an unstaged dirty add to be
 /// discarded, and returns `true` when its parent should discard it. A node that was not staged and
-/// holds a staged node is staged first, its ancestors with it, as staging that node would have
-/// staged it ([`stage_holder`]).
+/// holds staged content, or a dirty add that holds a staged node, is staged first, its ancestors
+/// with it, as staging that node would have staged it ([`stage_holder`]), its dirty move or add
+/// with it. One that holds only staged directories that no staged content lies below, as a
+/// staged move out of them leaves them for the rehash, keeps its dirty move out and is staged
+/// once its dirty flags are cleared, so the commit reaches them.
 ///
 /// `clear_dirty_flags` preserves Staged and the action bits when Staged is set,
 /// so clearing both restores dirty-only nodes and strips a stale Dirty
@@ -4771,6 +6502,7 @@ async fn prune_dirty_leave(
         block,
         to_discard,
         holds_staged,
+        holds_content,
         entered_staged,
         ..
     } = level;
@@ -4791,6 +6523,8 @@ async fn prune_dirty_leave(
         )
     };
     let is_staged = flags.contains(NodeFlags::Staged) || holds_staged;
+    let takes_move = flags.contains(NodeFlags::Staged) || holds_content;
+    let promotes = holds_content || (holds_staged && flags.contains(NodeFlags::DirtyAdd));
     if is_staged
         && !is_root
         && let Some(left) = state
@@ -4802,7 +6536,7 @@ async fn prune_dirty_leave(
     {
         context.left.push(left);
     }
-    if holds_staged && !entered_staged && !is_root {
+    if promotes && !entered_staged && !is_root {
         Box::pin(stage_holder(state, repository, node_id)).await?;
     }
 
@@ -4810,7 +6544,7 @@ async fn prune_dirty_leave(
         return Ok(true);
     }
 
-    if !is_staged
+    if !takes_move
         && flags.contains(NodeFlags::DirtyMove)
         && !is_root
         && return_unstaged_move(state, repository, context, node_id, flags).await?
@@ -4823,6 +6557,9 @@ async fn prune_dirty_leave(
             restore_committed_link_pin(state, repository, node_id, link).await?;
         }
         state.node_clear_own(&block, node_id, OwnFlags::Dirty);
+    }
+    if holds_staged && !promotes && !entered_staged && !is_root {
+        Box::pin(stage_holder(state, repository, node_id)).await?;
     }
 
     if is_staged
@@ -4864,7 +6601,16 @@ async fn return_unstaged_move(
     flags: NodeFlags,
 ) -> Result<bool, CommitError> {
     let (returned, path) = state
-        .node_return_unstaged_move(repository, context.base, node_id, &mut context.name, true)
+        .node_return_unstaged_move(
+            repository,
+            context.base,
+            node_id,
+            &mut context.name,
+            ReturnOptions {
+                want_path: true,
+                park: true,
+            },
+        )
         .await
         .forward::<CommitError>("Failed returning an unstaged move")?;
     let moved = path.map(|path| MovedNode {
@@ -4898,11 +6644,20 @@ async fn settle_waiting(
             index -= 1;
             let node = context.waiting[index];
             let (returned, _) = state
-                .node_return_unstaged_move(repository, context.base, node, &mut context.name, false)
+                .node_return_unstaged_move(
+                    repository,
+                    context.base,
+                    node,
+                    &mut context.name,
+                    ReturnOptions {
+                        park: true,
+                        ..ReturnOptions::default()
+                    },
+                )
                 .await
                 .forward::<CommitError>("Failed returning an unstaged move")?;
             match returned {
-                Return::Parked => continue,
+                Return::Parked | Return::Held => continue,
                 Return::Displaced => discard_displaced(state, repository, node).await?,
                 Return::Stays | Return::Back | Return::Gone => {}
             }

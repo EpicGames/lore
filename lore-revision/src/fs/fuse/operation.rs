@@ -16,7 +16,6 @@ use crossbeam_epoch as epoch;
 use crossbeam_epoch::Atomic;
 use crossbeam_epoch::Owned;
 use crossbeam_epoch::Shared;
-use crossbeam_queue::SegQueue;
 use crossbeam_utils::atomic::AtomicCell;
 use dashmap::DashMap;
 use lore_base::error::FileNotFound;
@@ -88,10 +87,9 @@ pub struct FuseOperation {
     revision: tokio::sync::OnceCell<Arc<State>>,
     /// The deletion list as the last write that asked read it.
     deletions_read: ListedDeletions,
-    /// The directories the commit adds or moves, as its walk's parallel tasks hand them over
-    /// ([`Self::hand_directory`]); made by the first, as most operations hand none and the queue
-    /// is two cache lines.
-    handed: std::sync::OnceLock<Box<SegQueue<RelativePath>>>,
+    /// The directories the commit adds or moves, handed over after each walk, in sequence
+    /// ([`Self::hand_directories`]).
+    handed: parking_lot::Mutex<Vec<RelativePath>>,
     /// The committed State's blocks as its serialize wrote them, held until the settle against
     /// that State returns, so the settle reads them from memory.
     serialized: AtomicCell<Option<Box<SerializedBlocks>>>,
@@ -213,7 +211,7 @@ impl FuseOperation {
             reading: std::sync::OnceLock::new(),
             revision: tokio::sync::OnceCell::new(),
             deletions_read: ListedDeletions::default(),
-            handed: std::sync::OnceLock::new(),
+            handed: parking_lot::Mutex::new(Vec::new()),
             serialized: AtomicCell::new(None),
             owed: AtomicCell::new(None),
         }
@@ -223,18 +221,19 @@ impl FuseOperation {
         &self.filesystem
     }
 
-    /// Collects `path`, a directory the commit adds or moves, for its settle.
-    pub(crate) fn hand_directory(&self, path: &RelativePath) {
-        self.handed
-            .get_or_init(|| Box::new(SegQueue::new()))
-            .push(path.clone());
+    /// Collects `paths`, directories the commit adds or moves, for its settle.
+    pub(crate) fn hand_directories(&self, paths: Vec<RelativePath>) {
+        let mut handed = self.handed.lock();
+        if handed.is_empty() {
+            *handed = paths;
+        } else {
+            handed.extend(paths);
+        }
     }
 
     /// The directories handed over so far, taken.
     fn take_handed(&self) -> Vec<RelativePath> {
-        self.handed
-            .get()
-            .map_or_default(|handed| std::iter::from_fn(|| handed.pop()).collect())
+        std::mem::take(&mut *self.handed.lock())
     }
 
     pub(crate) fn keep_serialized_blocks(&self, blocks: SerializedBlocks) {

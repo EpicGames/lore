@@ -723,6 +723,24 @@ impl ChainWalk {
     }
 }
 
+/// What [`State::find_subnode_in`] answers for the node it found, given whether that node is
+/// staged for deletion.
+trait FoundSubnode {
+    fn found(node: NodeID, deleted: bool) -> Self;
+}
+
+impl FoundSubnode for NodeID {
+    fn found(node: NodeID, _deleted: bool) -> Self {
+        node
+    }
+}
+
+impl FoundSubnode for (NodeID, bool) {
+    fn found(node: NodeID, deleted: bool) -> Self {
+        (node, deleted)
+    }
+}
+
 /// A find by name over one directory's chain, stepped by its caller, which reads each node from
 /// a block it obtains its own way.
 struct NameSearch {
@@ -790,6 +808,12 @@ impl NameSearch {
             }
             self.restart = true;
         }
+    }
+
+    /// Goes on past `node`, which holds the name, to the next node of the chain.
+    #[inline]
+    fn pass(&mut self, node: &Node) {
+        self.next = node.sibling();
     }
 
     /// Steps over `node`, read for the node [`Self::next`] answered: whether it holds the name.
@@ -909,6 +933,7 @@ impl StateNodeChildrenWithNameIterator {
     /// type docs) — copy it out with [`NodeNameLock::freeze`] if needed.
     pub async fn next(&mut self) -> Result<Option<(NodeID, Node, NodeNameLock)>, StateError> {
         let mut restart = false;
+        let mut steps = step_counting::Steps::walk();
         loop {
             #[cfg(feature = "state-hooks")]
             crate::state::node::hooks::reached_reader(crate::state::node::hooks::Point::IterStep)
@@ -937,6 +962,7 @@ impl StateNodeChildrenWithNameIterator {
 
             let block = self.current_block.as_ref().unwrap();
             let (node, name) = block.node_and_name_ref(Node::index(node_id));
+            steps.step();
             match self.walk.step(node_id, &node)? {
                 ChainStep::Restart => {
                     restart = true;
@@ -972,6 +998,7 @@ impl StateNodeChildrenWithNameIterator {
         name: &mut Vec<u8>,
     ) -> Result<Option<(NodeID, Node)>, StateError> {
         let mut restart = false;
+        let mut steps = step_counting::Steps::walk();
         loop {
             #[cfg(feature = "state-hooks")]
             crate::state::node::hooks::reached_reader(crate::state::node::hooks::Point::IterStep)
@@ -1003,6 +1030,7 @@ impl StateNodeChildrenWithNameIterator {
             let node = block
                 .node_and_name_bytes(Node::index(node_id), name)
                 .forward::<StateError>("Node name")?;
+            steps.step();
             match self.walk.step(node_id, &node)? {
                 ChainStep::Restart => {
                     name.truncate(start);
@@ -1145,6 +1173,7 @@ impl StateNodeChildrenIterator {
     /// Get the next child node.
     pub async fn next(&mut self) -> Result<Option<(NodeID, Node)>, StateError> {
         let mut restart = false;
+        let mut steps = step_counting::Steps::walk();
         loop {
             #[cfg(feature = "state-hooks")]
             crate::state::node::hooks::reached_reader(crate::state::node::hooks::Point::IterStep)
@@ -1169,6 +1198,7 @@ impl StateNodeChildrenIterator {
 
             let block = self.current_block.as_ref().unwrap();
             let node = block.node(Node::index(node_id));
+            steps.step();
             match self.walk.step(node_id, &node)? {
                 ChainStep::Restart => restart = true,
                 ChainStep::Skip => self.current_node_id = node.sibling(),
@@ -1272,6 +1302,10 @@ pub struct State {
     /// them ([`Self::node_free_pending`]); made by the first, as most States are never deleted
     /// from through the C API and the queue is 256 bytes.
     pending: std::sync::OnceLock<Box<crossbeam_queue::SegQueue<NodeID>>>,
+    /// The directories marked dirty as moved whose move a staged climb staged with a node below
+    /// them, kept until a caller stages each whole move ([`Self::take_promoted_moves`]); made by
+    /// the first, as most States never promote one.
+    promoted: std::sync::OnceLock<Box<crossbeam_queue::SegQueue<NodeID>>>,
     /// How many times a find by name walked a chain again, read by tests.
     find_restarts: AtomicU64,
     /// How many times an attach looked its name up again, read by tests.
@@ -1965,6 +1999,7 @@ impl State {
                 unused: _,
                 moves: _,
                 pending: _,
+                promoted: _,
                 find_restarts: _,
                 attach_retries: _,
                 served_refusals: _,
@@ -1999,6 +2034,7 @@ impl State {
             (&raw mut (*fields).unused).write(tokio::sync::Semaphore::new(1));
             (&raw mut (*fields).moves).write(tokio::sync::Semaphore::new(1));
             (&raw mut (*fields).pending).write(std::sync::OnceLock::new());
+            (&raw mut (*fields).promoted).write(std::sync::OnceLock::new());
             (&raw mut (*fields).find_restarts).write(AtomicU64::new(0));
             (&raw mut (*fields).attach_retries).write(AtomicU64::new(0));
             (&raw mut (*fields).served_refusals).write(AtomicU64::new(0));
@@ -2149,6 +2185,11 @@ impl State {
             self.runtime_read().fresh_blocks_from.is_none(),
             "a State taking new nodes from fresh blocks is never serialized: its stored unused \
              chain would leave out the tree's free slots"
+        );
+        debug_assert!(
+            !self.holds_promoted_moves(),
+            "a State is serialized with a move a staged climb promoted still queued: the route \
+             that staged it stages each whole move first (`stage_promoted_moves_of_call`)"
         );
         let is_dirty = self.is_dirty();
         if !is_dirty {
@@ -3794,8 +3835,36 @@ impl State {
         *self.base.lock() = Some((base.revision(), base));
     }
 
+    /// Notes `directory`, marked dirty as moved, whose move a staged climb from a node below it
+    /// staged ([`Self::node_mark`]), for its caller to stage the whole move.
+    pub(in crate::state) fn note_promoted_move(&self, directory: NodeID) {
+        self.promoted
+            .get_or_init(|| Box::new(crossbeam_queue::SegQueue::new()))
+            .push(directory);
+    }
+
+    /// Whether a staged climb staged the move of a directory marked dirty as moved since the last
+    /// [`Self::take_promoted_moves`].
+    pub fn holds_promoted_moves(&self) -> bool {
+        self.promoted.get().is_some_and(|queue| !queue.is_empty())
+    }
+
+    /// The directories marked dirty as moved whose move a staged climb staged since the last
+    /// call, each once, sorted by node ID. A caller stages each whole move, as a stage inside the
+    /// directory does (`stage_directory_move`).
+    pub fn take_promoted_moves(&self) -> Vec<NodeID> {
+        let Some(queue) = self.promoted.get() else {
+            return Vec::new();
+        };
+        let mut promoted: Vec<NodeID> = std::iter::from_fn(|| queue.pop()).collect();
+        promoted.sort_unstable();
+        promoted.dedup();
+        promoted
+    }
+
     /// The State of `revision`, a revision this tree shares its node IDs with, read once for as
     /// long as it is the one asked for.
+    #[lore_macro::test_pub]
     async fn base(
         &self,
         repository: &Arc<RepositoryContext>,
@@ -3850,26 +3919,29 @@ impl State {
         Ok(node.map(|node| (node, block)))
     }
 
-    /// Moves `id`, which this tree holds marked dirty as moved and not staged, back to the parent
-    /// and name `base` holds it at, `base` being the revision this tree shares its node IDs with,
-    /// and answers what became of it, with the path it stood at where `want_path` asks for it and
-    /// it does not stand there already. `name` is a buffer the caller keeps across nodes.
+    /// Moves `id`, which this tree holds moved, back to the parent and name `base` holds it at,
+    /// `base` being the revision this tree shares its node IDs with, and answers what became of it,
+    /// with the path it stood at where `options` asks for it and it does not stand there already.
+    /// `name` is a buffer the caller keeps across nodes. The node's flags do not change.
     ///
-    /// Where a node that may still leave holds the name, the node waits under the parent by a name
-    /// of its own ([`Return::Parked`]), so its own place, or a directory that is to be discarded,
-    /// holds it no longer. Asked again, it goes back once the name is free. A directory marked
-    /// dirty as added and not staged is such a holder: the caller discards it, unless it holds a
-    /// staged node, which stages it. A staged node holding the name, or a parent that is no live
-    /// directory, keeps the node out for good ([`Return::Displaced`]). A file marked dirty as added
-    /// and not staged does not keep it out: the caller discards each such file before it asks of
-    /// the name there again, so the two hold one name only until then.
+    /// Where a node that may still leave holds the name and `options` parks, the node waits under
+    /// the parent by a name of its own ([`Return::Parked`]), so its own place, or a directory that
+    /// is to be discarded, holds it no longer. Asked again, it goes back once the name is free. A
+    /// directory marked dirty as added and not staged is such a holder: the caller discards it,
+    /// unless it holds a staged node, which stages it. A file marked dirty as added and not staged
+    /// does not keep it out: the caller discards each such file before it asks of the name there
+    /// again, so the two hold one name only until then. Without parking, any such holder, and a
+    /// parent inside the node's own subtree, leave the node where it stands ([`Return::Held`]). A
+    /// staged node holding the name, or a parent that is no live directory, keeps the node out for
+    /// good ([`Return::Displaced`]). A node staged for deletion holds no name: the node goes back
+    /// beside it.
     ///
-    /// The caller asks of a node that holds no staged node, once it has asked of every node below
-    /// it. Each of those then stands under the directory `base` holds it in, is no node of `base`,
-    /// or has left the tree: only a move takes a node from that directory, and none below is
-    /// staged, so each moved one has gone back, waits there, or has left the tree. So the parent,
-    /// which `base` holds above the node, lies inside the node's subtree only where `base` holds a
-    /// cycle, which is an internal error.
+    /// A caller that parks asks of a node that holds no staged node, once it has asked of every
+    /// node below it. Each of those then stands under the directory `base` holds it in, is no node
+    /// of `base`, or has left the tree: only a move takes a node from that directory, and none
+    /// below is staged, so each moved one has gone back, waits there, or has left the tree. So the
+    /// parent, which `base` holds above the node, lies inside the node's subtree only where `base`
+    /// holds a cycle, which is an internal error.
     ///
     /// Nothing else changes the tree while this runs, so what the checks read stands when the
     /// node moves ([`Self::node_move`] checks nothing). Only a node that does not stand where
@@ -3881,7 +3953,7 @@ impl State {
         base: Hash,
         id: NodeID,
         name: &mut String,
-        want_path: bool,
+        options: ReturnOptions,
     ) -> Result<(Return, Option<RelativePath>), StateError> {
         let (parent, name_hash, flags, context) = {
             let node = self.node(repository.clone(), id).await?;
@@ -3901,12 +3973,31 @@ impl State {
         else {
             return Ok((Return::Stays, None));
         };
+        self.node_return_into(
+            repository,
+            (id, parent, name_hash, flags),
+            (committed, name),
+            options,
+        )
+        .await
+    }
+
+    /// [`Self::node_return_unstaged_move`] of `id`, standing under `parent` by a name of hash
+    /// `name_hash` and carrying `flags`, once the place `base` holds it at is found: `committed`,
+    /// its parent and name hash, and `name`, its name there.
+    pub(crate) async fn node_return_into(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        (id, parent, name_hash, flags): (NodeID, NodeID, u64, NodeFlags),
+        (committed, name): ((NodeID, u64), &str),
+        options: ReturnOptions,
+    ) -> Result<(Return, Option<RelativePath>), StateError> {
         let renamed =
             name_hash != committed.1 || !self.node_name_is(repository.clone(), id, name).await?;
         if parent == committed.0 && !renamed {
             return Ok((Return::Stays, None));
         }
-        let path = if want_path {
+        let path = if options.want_path {
             self.node_path_below(repository.clone(), id, ROOT_NODE)
                 .await?
         } else {
@@ -3914,38 +4005,42 @@ impl State {
         };
         let is_directory = !flags.intersects(NodeFlags::File | NodeFlags::Link);
         let moved = (id, parent, is_directory);
-        let name = renamed.then_some(name.as_str());
-        let returned = Box::pin(self.node_return_to(repository, moved, committed, name)).await?;
+        let name = renamed.then_some(name);
+        let returned =
+            Box::pin(self.node_return_to(repository, moved, committed, (name, options.park)))
+                .await?;
         Ok((returned, path))
     }
 
     /// Whether `id`, this tree's node `node`, stands where `base`, the revision this tree shares
-    /// its node IDs with, holds it, under the same parent by the same name, or `base` holds no
-    /// node of its kind and context at `id`, as [`Self::node_return_unstaged_move`] finds a node
-    /// that stays. `name` is a buffer the caller keeps across nodes.
-    pub(crate) async fn stands_at_base_place(
+    /// its node IDs with, holds it, under the same parent by the same name, or `None` where `base`
+    /// holds no node of its kind and context at `id`. `name` is a buffer the caller keeps across
+    /// nodes.
+    pub(crate) async fn at_base_place(
         &self,
         repository: &Arc<RepositoryContext>,
         base: Hash,
         (id, node): (NodeID, &Node),
         name: &mut String,
-    ) -> Result<bool, StateError> {
+    ) -> Result<Option<bool>, StateError> {
         let flags = NodeFlags::from_bits_retain(node.flags);
         let Some(committed) = self
             .base_place(repository, (base, id), (flags, node.address.context), name)
             .await?
         else {
-            return Ok(true);
+            return Ok(None);
         };
-        Ok(node.parent == committed.0
-            && node.name_hash == committed.1
-            && self.node_name_is(repository.clone(), id, name).await?)
+        Ok(Some(
+            node.parent == committed.0
+                && node.name_hash == committed.1
+                && self.node_name_is(repository.clone(), id, name).await?,
+        ))
     }
 
     /// Moves `node` to the directory `parent`, renamed to `name` where one is given, or parks it
-    /// there, as [`Self::node_return_unstaged_move`] describes. `from` is the directory that holds
-    /// the node now, `is_directory` whether the node is one, and `name_hash` the hash of the name
-    /// it takes.
+    /// there where `park` allows, as [`Self::node_return_unstaged_move`] describes. `from` is the
+    /// directory that holds the node now, `is_directory` whether the node is one, and `name_hash`
+    /// the hash of the name it takes.
     ///
     /// Flags neither directory, where the unserved tier's reattach ([`Self::node_reattach`]) flags
     /// both before it moves a node: the node goes back to the place the base revision holds it at,
@@ -3956,7 +4051,7 @@ impl State {
         repository: &Arc<RepositoryContext>,
         (node, from, is_directory): (NodeID, NodeID, bool),
         (parent, name_hash): (NodeID, u64),
-        name: Option<&str>,
+        (name, park): (Option<&str>, bool),
     ) -> Result<Return, StateError> {
         if !self.is_live_directory(repository, parent).await? {
             return Ok(Return::Displaced);
@@ -3967,15 +4062,18 @@ impl State {
                 .is_inside_subtree(repository.clone(), parent, node)
                 .await?
         {
+            if !park {
+                return Ok(Return::Held);
+            }
             return Err(StateError::internal(
                 "A move marked dirty would return into its own subtree",
             ));
         }
         let holder = match self
-            .find_subnode(repository.clone(), parent, name_hash)
+            .find_live_subnode(repository.clone(), parent, name_hash)
             .await
         {
-            Ok(holder) => (holder != node).then_some(holder),
+            Ok((holder, deleted)) => (holder != node && !deleted).then_some(holder),
             Err(error) if error.is_node_not_found() => None,
             Err(error) => return Err(error),
         };
@@ -3989,6 +4087,9 @@ impl State {
             };
             if staged {
                 return Ok(Return::Displaced);
+            }
+            if !park {
+                return Ok(Return::Held);
             }
             if !added_file {
                 let parked = ParkedName::of(node);
@@ -4013,6 +4114,30 @@ impl State {
         self.node_move(repository.clone(), node, parent, change, Mark::NONE)
             .await?;
         Ok(Return::Back)
+    }
+
+    /// Where `base`, the revision this tree shares its node IDs with, holds `id`, a node of this
+    /// tree carrying `flags` and the address `context`: its parent and name hash, with its name
+    /// copied into `name`, and its path below `below` in `base`'s tree. `None` where `base` holds
+    /// no node of the same kind and context at `id`, or holds it outside `below`.
+    pub(crate) async fn base_place_below(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        (base, id, below): (Hash, NodeID, NodeID),
+        (flags, context): (NodeFlags, Context),
+        name: &mut String,
+    ) -> Result<Option<((NodeID, u64), RelativePath)>, StateError> {
+        let Some(place) = self
+            .base_place(repository, (base, id), (flags, context), name)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let base = self.base(repository, base).await?;
+        Ok(base
+            .node_path_below(repository.clone(), id, below)
+            .await?
+            .map(|path| (place, path)))
     }
 
     /// Where `base` holds `id`, a node of this tree carrying `flags` and the address `context`: its
@@ -4049,7 +4174,7 @@ impl State {
     }
 
     /// Whether `node` is a directory this tree holds, not discarded.
-    async fn is_live_directory(
+    pub(crate) async fn is_live_directory(
         &self,
         repository: &Arc<RepositoryContext>,
         node: NodeID,
@@ -4673,16 +4798,16 @@ impl State {
         Ok(name_hashes)
     }
 
-    /// The first child of `parent_node` carrying `name_hash` ahead of `stop_at` in its chain. A
-    /// child is prepended, so one linked after `stop_at` lies ahead of it. `None` where
+    /// The first child of `parent_node` carrying `name_hash` but `beside`, on either side of it in
+    /// the chain, that `matches`, with its node: one scan of the chain. `None` where
     /// `parent_node` is no directory.
-    pub(crate) async fn find_subnode_ahead_of(
+    pub(crate) async fn find_subnode_beside(
         &self,
         repository: Arc<RepositoryContext>,
         parent_node: NodeID,
-        stop_at: NodeID,
-        name_hash: u64,
-    ) -> Result<Option<NodeID>, StateError> {
+        (beside, name_hash): (NodeID, u64),
+        matches: impl Fn(&Node) -> bool,
+    ) -> Result<Option<(NodeID, Node)>, StateError> {
         let block = self
             .block(repository.clone(), NodeBlock::index(parent_node))
             .await?;
@@ -4695,8 +4820,11 @@ impl State {
                 repository,
                 parent.child(),
                 ChainWalk::new(parent_node, block, changes),
-                Some(stop_at),
-                |child_id, child| (child.name_hash == name_hash).then_some(child_id),
+                None,
+                |child_id, child| {
+                    (child_id != beside && child.name_hash == name_hash && matches(child))
+                        .then_some((child_id, *child))
+                },
             )
             .await?;
         Ok(walked.answer)
@@ -4857,6 +4985,51 @@ impl State {
         parent_node: NodeID,
     ) -> impl Future<Output = Result<bool, StateError>> + Send + '_ {
         self.holds_child(repository, parent_node, Node::is_staged)
+    }
+
+    /// Whether the directory `directory` holds a node staged in its own right below it, through
+    /// directories staged only for what lies below them ([`is_staged_for_descendants_only`]): a
+    /// bare staged bit that a node since gone carried up holds no staged content. Each directory is
+    /// read as [`Self::holds_child`] reads one, from a worklist, so a deep tree takes no recursion.
+    pub(crate) async fn holds_staged_content(
+        &self,
+        repository: Arc<RepositoryContext>,
+        directory: NodeID,
+    ) -> Result<bool, StateError> {
+        let mut pending = vec![directory];
+        while let Some(parent) = pending.pop() {
+            let block = self
+                .block(repository.clone(), NodeBlock::index(parent))
+                .await?;
+            let (node, changes) = block.node_with_chain_head(parent);
+            if !node.is_directory() {
+                continue;
+            }
+            let walked = self
+                .walk_children(
+                    repository.clone(),
+                    node.child(),
+                    ChainWalk::new(parent, block, changes),
+                    None,
+                    |child_id, child| {
+                        if !child.is_staged() {
+                            return None;
+                        }
+                        if !is_staged_for_descendants_only(child) {
+                            return Some(());
+                        }
+                        if child.is_directory() {
+                            pending.push(child_id);
+                        }
+                        None
+                    },
+                )
+                .await?;
+            if walked.answer.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Whether a child of the directory `parent_node` carries the Dirty flag, as
@@ -5109,17 +5282,32 @@ impl State {
         parent_node: NodeID,
         name_hash: u64,
     ) -> impl Future<Output = Result<NodeID, StateError>> + Send + '_ {
-        self.find_subnode_in(repository, parent_node, name_hash)
+        self.find_subnode_in::<false, NodeID>(repository, parent_node, name_hash)
     }
 
-    /// The find of [`Self::find_subnode`]: the parent's block loaded, its head read with its
-    /// chain change count, and its chain walked.
-    async fn find_subnode_in(
+    /// [`Self::find_subnode`], preferring a node not staged for deletion where the directory holds
+    /// two of the name, as it does while a new node of the name stands beside one staged for
+    /// deletion until a commit drops that one. Answers the node staged for deletion where it holds
+    /// no other, with whether the node it answers is staged for deletion.
+    pub fn find_live_subnode(
         &self,
         repository: Arc<RepositoryContext>,
         parent_node: NodeID,
         name_hash: u64,
-    ) -> Result<NodeID, StateError> {
+    ) -> impl Future<Output = Result<(NodeID, bool), StateError>> + Send + '_ {
+        self.find_subnode_in::<true, (NodeID, bool)>(repository, parent_node, name_hash)
+    }
+
+    /// The find of [`Self::find_subnode`]: the parent's block loaded, its head read with its
+    /// chain change count, and its chain walked; past a node staged for deletion where `LIVE`, a
+    /// parameter so the plain find carries no test of it. Answers `T`, so a caller that takes the
+    /// node alone holds no wrapper of the future.
+    async fn find_subnode_in<const LIVE: bool, T: FoundSubnode>(
+        &self,
+        repository: Arc<RepositoryContext>,
+        parent_node: NodeID,
+        name_hash: u64,
+    ) -> Result<T, StateError> {
         let mut block = self
             .block(repository.clone(), NodeBlock::index(parent_node))
             .await?;
@@ -5131,9 +5319,14 @@ impl State {
             NameSearch::new(parent_node, &parent, block.clone(), changes, name_hash)
         };
         let mut iblock = NodeBlock::index(parent_node);
+        let mut deleted = INVALID_NODE;
         loop {
             let Some(node_id) = search.next(self)? else {
-                return Err(NodeNotFound.into());
+                return if deleted == INVALID_NODE {
+                    Err(NodeNotFound.into())
+                } else {
+                    Ok(T::found(deleted, true))
+                };
             };
             #[cfg(feature = "state-hooks")]
             crate::state::node::hooks::reached(crate::state::node::hooks::Point::FindStep).await;
@@ -5143,9 +5336,48 @@ impl State {
             }
             let node = *block.read().node(Node::index(node_id));
             if search.found(node_id, &node)? {
-                return Ok(node_id);
+                if !LIVE || !node.is_staged_delete() {
+                    return Ok(T::found(node_id, false));
+                }
+                if deleted == INVALID_NODE {
+                    deleted = node_id;
+                }
+                search.pass(&node);
             }
         }
+    }
+
+    /// `found`, a child of a directory a listing answered for a name, or, where it is staged for
+    /// deletion, the first other of `carrying`, the children the listing holds carrying that name's
+    /// hash in sibling order, that is not, as [`Self::find_live_subnode`] prefers one. Reads a node
+    /// only where the listing holds two such children.
+    pub(crate) async fn live_among(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        carrying: impl Iterator<Item = NodeID> + Clone,
+        found: NodeID,
+    ) -> Result<NodeID, StateError> {
+        if !found.is_valid_node_id() || carrying.clone().nth(1).is_none() {
+            return Ok(found);
+        }
+        if !self
+            .node(repository.clone(), found)
+            .await?
+            .is_staged_delete()
+        {
+            return Ok(found);
+        }
+        for child in carrying {
+            if child != found
+                && !self
+                    .node(repository.clone(), child)
+                    .await?
+                    .is_staged_delete()
+            {
+                return Ok(child);
+            }
+        }
+        Ok(found)
     }
 
     /// [`Self::find_subnode`] through blocks in memory only, for a request that reads nothing
@@ -5265,7 +5497,9 @@ impl State {
         root: NodeID,
         path: &str,
     ) -> Result<(NodeLink, Option<LinkedState>), StateError> {
-        let stop = self.find_to_link(&repository, root, path, false).await?;
+        let stop = self
+            .find_to_link::<true>(&repository, root, path, false)
+            .await?;
         self.find_relative_from(repository, path, stop).await
     }
 
@@ -5322,8 +5556,11 @@ impl State {
     /// Where a walk of `path` below `root` stops: at its end, at the first link it crosses, or
     /// at a link it ends at where `ends_at_links` says, or at the deepest node it reaches where
     /// the tree holds nothing at the next component or the component is a name no node may
-    /// carry.
-    pub(crate) async fn find_to_link(
+    /// carry. Each component prefers a node not staged for deletion beside one that is
+    /// ([`Self::find_live_subnode`]): one below goes on under the live directory, and a path names
+    /// the live node. Where not `LIVE`, the last component stops at the first node of its name, for
+    /// a caller that asks only whether the path is held, as that search ends at a deleted node.
+    pub(crate) async fn find_to_link<const LIVE: bool>(
         &self,
         repository: &Arc<RepositoryContext>,
         root: NodeID,
@@ -5342,7 +5579,13 @@ impl State {
             // Under `state-hooks` the log borrows the find's answer; the block ends that borrow
             // before the awaits after it.
             let found = {
-                let found = self.find_subnode(repository.clone(), node, name_hash).await;
+                let found = if LIVE || !tail.is_empty() {
+                    self.find_subnode_in::<true, NodeID>(repository.clone(), node, name_hash)
+                        .await
+                } else {
+                    self.find_subnode_in::<false, NodeID>(repository.clone(), node, name_hash)
+                        .await
+                };
                 #[cfg(feature = "state-hooks")]
                 crate::state::node::hooks::log::hop(&self.hooks, (node, name_hash), &found);
                 found
@@ -6552,7 +6795,7 @@ pub(crate) async fn rebase_staged_state_in(
     }
 
     let root = RelativePath::default();
-    let (source, paths, mask) = match layer {
+    let (mount, source, paths, mask) = match layer {
         None => {
             let paths = dirty_paths
                 .into_iter()
@@ -6562,7 +6805,7 @@ pub(crate) async fn rebase_staged_state_in(
                 .await
                 .forward::<StateError>("Failed to list layers")?;
             let mask = (!layers.is_empty()).then(|| Arc::new(crate::layer::mount_paths(&layers)));
-            (&root, paths, mask)
+            (&root, &root, paths, mask)
         }
         // A path outside the source is one the layer does not draw into the working tree.
         Some(layer) => {
@@ -6576,7 +6819,7 @@ pub(crate) async fn rebase_staged_state_in(
                     ))
                 })
                 .collect::<Vec<_>>();
-            (layer.source, paths, None)
+            (layer.mount, layer.source, paths, None)
         }
     };
 
@@ -6586,7 +6829,7 @@ pub(crate) async fn rebase_staged_state_in(
         repository,
         state_current.clone(),
         state_current,
-        source,
+        (mount, source),
         &paths,
         mask,
         realized,
@@ -6660,10 +6903,24 @@ pub(crate) enum Return {
     Back,
     /// It waits under its committed parent, by a name of its own, for the name there to come free.
     Parked,
+    /// It stays where it stands, as a node that may still leave holds the name, for a caller that
+    /// does not park.
+    Held,
     /// It cannot go back: a staged node holds its name, or its committed parent is gone.
     Displaced,
     /// It is no longer in the tree.
     Gone,
+}
+
+/// What [`State::node_return_unstaged_move`] answers besides what became of a node, and what it
+/// does with one a node that may still leave keeps from its place.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ReturnOptions {
+    /// Answers the path the node stood at, where it does not stand at its place already.
+    pub(crate) want_path: bool,
+    /// Parks the node by a name of its own ([`Return::Parked`]), rather than leave it where it
+    /// stands ([`Return::Held`]).
+    pub(crate) park: bool,
 }
 
 /// The name a node waits under while another node holds its own, which its ID spells, so no other
@@ -8144,7 +8401,7 @@ impl DiffSide {
             return Ok(PathStop::NONE);
         }
         self.state
-            .find_to_link(&self.repository, self.node, path, true)
+            .find_to_link::<true>(&self.repository, self.node, path, true)
             .await
     }
 
@@ -9007,29 +9264,123 @@ pub(crate) async fn diff_filesystem_queuing(
     ))
 }
 
+/// The key a directory's address is hashed under in BLAKE3's keyed mode. A revision may also hold
+/// unkeyed directory addresses, hashed from the children without their names, and the key keeps
+/// the two apart.
+const DIRECTORY_HASH_KEY: [u8; 32] = *b"lore directory exact child names";
+
+/// What a child contributes to its directory's address besides its name.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, IntoBytes, FromBytes, Immutable)]
+pub(crate) struct NodeHashData {
+    name_hash: u64,
+    mode: u32,
+    address: Address,
+    /// A link's mount source, which its address does not express. Zero for
+    /// every other node and for a link mounting the repository root, so only a
+    /// subtree mount reaches a hash it did not before.
+    mount_source: u32,
+    size: u64,
+}
+
+impl NodeHashData {
+    pub(crate) fn from_node(node: &Node) -> Self {
+        NodeHashData {
+            name_hash: node.name_hash,
+            mode: node.mode as u32,
+            address: node.address,
+            mount_source: node.mount_source().unwrap_or(ROOT_NODE),
+            size: node.size,
+        }
+    }
+
+    /// The size of the node it describes.
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+/// A child of a directory whose address [`directory_hash`] derives: what it contributes besides
+/// its name, and where its name lies among the names read for the directory.
+pub(crate) struct ChildHashData {
+    pub(crate) data: NodeHashData,
+    pub(crate) name: std::ops::Range<u32>,
+}
+
+/// The address hash of a directory whose children are `children`, each name in `names`: every
+/// child in the order of their name hashes, which this sorts them into, each its [`NodeHashData`],
+/// then the length and the bytes of its name, hashed in BLAKE3's keyed mode.
+pub(crate) fn directory_hash(children: &mut [ChildHashData], names: &[u8]) -> Hash {
+    children.sort_unstable_by_key(|child| child.data.name_hash);
+    let mut hasher = blake3::Hasher::new_keyed(&DIRECTORY_HASH_KEY);
+    for child in children.iter() {
+        // Assumes little endian
+        hasher.update(child.data.as_bytes());
+        hasher.update(&(child.name.end - child.name.start).to_le_bytes());
+        hasher.update(&names[child.name.start as usize..child.name.end as usize]);
+    }
+    Hash::from(*hasher.finalize().as_bytes())
+}
+
+/// Whether a staged move took a child the base revision holds in `directory` out of it: the tree
+/// holds that node elsewhere, staged, so the commit moves it and rehashes `directory`, which keeps
+/// its bare staged bit for that, and a commit that finds it gone deletes it. A child moved only by a
+/// move marked dirty, or renamed in place, leaves the bit to clear, as the commit takes neither.
+/// One walk of the base's children of `directory`, each read in this tree by its ID, with no names.
+/// Boxed by its caller, which takes it only for a bare staged bit it would clear.
+async fn left_by_staged_move(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    directory: NodeID,
+) -> Result<bool, StateError> {
+    let revision = state.committed_revision();
+    if revision.is_zero() {
+        return Ok(false);
+    }
+    let base = state.base(repository, revision).await?;
+    let Some((held, _)) = base.node_in_use(repository, directory).await? else {
+        return Ok(false);
+    };
+    if held.is_discarded() || !held.is_directory() {
+        return Ok(false);
+    }
+    let mut children = StateNodeChildrenIterator::new(base, repository.clone(), directory).await?;
+    while let Some((child, committed)) = children.next().await? {
+        let Some((node, _)) = state.node_in_use(repository, child).await? else {
+            continue;
+        };
+        if node.is_staged()
+            && !node.is_discarded()
+            && node.parent != directory
+            && node.node_type() == committed.node_type()
+            && node.address.context == committed.address.context
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Whether `node` is staged only because something below it is: the bare `Staged` bit
-/// [`State::node_mark`] carries up to the ancestors of the node it marks. An action bit can be the
-/// node's own staged action or its dirty one, so a node carrying one, a merge flag, or a link is
-/// taken to be staged in its own right.
-fn is_staged_for_descendants_only(node: &Node) -> bool {
+/// [`State::node_mark`] carries up to the ancestors of the node it marks. The action bits under a
+/// `Staged` bit are the node's staged action, so a node carrying one, a merge flag, or a link is
+/// staged in its own right.
+pub(crate) fn is_staged_for_descendants_only(node: &Node) -> bool {
     node.is_staged()
         && !node.is_link()
         && node.flags & (NodeFlags::ActionBits.bits() | NodeFlags::MergeBits.bits()) == 0
 }
 
-/// Whether `node` is marked dirty for a change of its own, an action bit with no staged change to
-/// claim it, as a directory marked dirty as added or moved is, rather than by the bare `Dirty` bit
-/// a mark below carries up.
-fn is_dirty_in_own_right(node: &Node) -> bool {
-    node.is_dirty() && !node.is_staged() && node.flags & NodeFlags::ActionBits.bits() != 0
-}
-
 /// Clear the `Dirty` and `Staged` bits that marking a node carried up to `ancestor` and the nodes
-/// above it, for a node that has since left the tree, in one walk up the chain. `Dirty` is cleared
-/// up to the first node that still has a dirty child or is [dirty in its own
-/// right](is_dirty_in_own_right), as a directory marked dirty as added is however little it holds,
-/// `Staged` up to the first that still has a staged child or is not [staged for descendants
-/// only](is_staged_for_descendants_only).
+/// above it, for a node that has since left the tree, which carried `departed`, in one walk up the
+/// chain. `Dirty` is cleared up to the first node that still has a dirty child or is [dirty in its
+/// own right](Node::is_dirty_in_own_right), as a directory marked dirty as added is however little
+/// it holds. `Staged` is cleared up to the first that still has a staged child, is not [staged for
+/// descendants only](is_staged_for_descendants_only), or that a staged move took a committed child
+/// out of ([`left_by_staged_move`]), which the commit must rehash. A node that left unstaged carried
+/// no staged bit up, so its leaving keeps every one above it. Each ancestor's children are walked
+/// once, until they show what keeps both bits, and the base's children of one whose bare bit would
+/// clear once more.
 ///
 /// Must not run while a walk reads or marks the tree. Marking stops at the first ancestor already
 /// carrying the bit, so a node marked between this checking an ancestor's children and clearing its
@@ -9038,8 +9389,9 @@ pub(crate) async fn clear_propagation(
     state: &Arc<State>,
     repository: &Arc<RepositoryContext>,
     mut ancestor: NodeID,
+    departed: u16,
 ) -> Result<(), StateError> {
-    let (mut dirty, mut staged) = (true, true);
+    let (mut dirty, mut staged) = (true, departed & NodeFlags::Staged.bits() != 0);
     while ancestor.is_valid_or_root_node_id() {
         let block_index = NodeBlock::index(ancestor);
         let node_index = Node::index(ancestor);
@@ -9052,7 +9404,7 @@ pub(crate) async fn clear_propagation(
                 block.clone(),
             );
             staged &= is_staged_for_descendants_only(&node);
-            dirty &= !is_dirty_in_own_right(&node);
+            dirty &= !node.is_dirty_in_own_right();
             (node.parent, children)
         };
         while (dirty || staged)
@@ -9060,6 +9412,10 @@ pub(crate) async fn clear_propagation(
         {
             dirty &= !child.is_dirty();
             staged &= !child.is_staged();
+        }
+        drop(children);
+        if staged && ancestor != ROOT_NODE {
+            staged = !Box::pin(left_by_staged_move(state, repository, ancestor)).await?;
         }
         if !dirty && !staged {
             break;

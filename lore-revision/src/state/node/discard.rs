@@ -576,16 +576,17 @@ where
 }
 
 /// Frees, under an exclusive claim, `roots` and the nodes below them a walk collected
-/// ([`node_discard_walk`]), with no parent marked. Each root is detached first and `on_root` told
-/// its flags: a directory marked `Discarded` (H6), the rest freed, having nothing below them. Then
-/// every block a collected node or a directory root lies in is loaded, so a load error frees
-/// nothing below a root, and those nodes are freed a block at a time, under one write lock each,
-/// skipping a slot already free (`discard_node` has no guard against a second free). A root
-/// already `Discarded` is skipped. The counts cover every node freed.
+/// ([`node_discard_walk`]), with no parent marked. Each root, listed with flags of the caller's, is
+/// detached first and `on_root` told it with those flags: a directory marked `Discarded` (H6), the
+/// rest freed, having nothing below them. Then every block a collected node or a directory root
+/// lies in is loaded, so a load error frees nothing below a root, and those nodes are freed a
+/// block at a time, under one write lock each, skipping a slot already free (`discard_node` has
+/// no guard against a second free). A root already `Discarded` is skipped. The counts cover every
+/// node freed.
 pub async fn node_discard_free<F>(
     state: &Arc<State>,
     repository: &Arc<RepositoryContext>,
-    roots: &[NodeID],
+    roots: &[(NodeID, u16)],
     mut collected: Vec<NodeID>,
     mut on_root: F,
 ) -> Result<DiscardCounts, StateError>
@@ -597,7 +598,7 @@ where
     // The blocks of the last root and of its parent, as consecutive roots mostly share them.
     let mut held: Option<(usize, Arc<NodeBlock>)> = None;
     let mut parent_held: Option<(usize, Arc<NodeBlock>)> = None;
-    for &root in roots {
+    for &(root, listed) in roots {
         let block_index = NodeBlock::index(root);
         let block = match &held {
             Some((index, block)) if *index == block_index => block,
@@ -625,7 +626,7 @@ where
             &mut parent_held,
         )
         .await?;
-        on_root(root, node.flags);
+        on_root(root, listed);
     }
     #[cfg(feature = "state-hooks")]
     crate::state::node::hooks::reached(crate::state::node::hooks::Point::Discard).await;
@@ -794,7 +795,7 @@ async fn discard_pending(
         } else {
             discard_node.parent
         };
-        clear_propagation(&state, &repository, stays).await?;
+        clear_propagation(&state, &repository, stays, discard_node.flags).await?;
     }
     Ok(())
 }

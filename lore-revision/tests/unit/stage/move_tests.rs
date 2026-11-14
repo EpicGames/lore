@@ -31,7 +31,8 @@ use crate::dirty_move_fixture::removed_directory;
 use crate::dirty_move_fixture::rename;
 use crate::dirty_move_fixture::restaged;
 use crate::dirty_move_fixture::stage_path;
-use crate::dirty_move_fixture::staged;
+use crate::dirty_move_fixture::staged_move;
+use crate::dirty_move_fixture::staged_moved;
 use crate::dirty_move_fixture::staged_tree;
 use crate::dirty_move_fixture::with_instance;
 use crate::dirty_move_fixture::written;
@@ -61,26 +62,6 @@ fn nested(instance: &TestRepository) {
     rename(instance, "a", "tmp");
     std::fs::create_dir(instance.path.join("a")).expect("mkdir");
     rename(instance, "tmp", "a/b");
-}
-
-/// Renames `from` to `to` below `instance`'s working tree, then stages the move.
-async fn moved(instance: &TestRepository, from: &str, to: &str) -> Arc<State> {
-    rename(instance, from, to);
-    staged_move(instance, from, to).await
-}
-
-/// Stages the move of `from` to `to`, which the working tree holds moved.
-async fn staged_move(instance: &TestRepository, from: &str, to: &str) -> Arc<State> {
-    let signature = lore_revision::file::stage::stage_move(
-        instance.repository.clone(),
-        &instance.write_token,
-        instance.path.join(from).to_string_lossy().into_owned(),
-        instance.path.join(to).to_string_lossy().into_owned(),
-        StageOptions::default(),
-    )
-    .await
-    .expect("the staged move");
-    staged(instance, signature).await
 }
 
 /// Clears the dirty half of the flags of each of `nodes` in the staged `state`, and of each
@@ -259,13 +240,14 @@ async fn merge_added(instance: &TestRepository, path: &str) -> NodeID {
 }
 
 /// A file staged as moved into a committed directory stages that directory, with the base
-/// `Staged` bit alone, and dirties nothing: the commit rehashes it, holding the file there.
+/// `Staged` bit alone, and marks it dirty with the moved file, as the C API's move marks them: the
+/// commit rehashes it, holding the file there.
 #[tokio::test]
 async fn a_staged_move_into_a_committed_directory_stages_it() {
     with_instance(|instance| async move {
         committed(&instance, &["dir/keep.txt", "a.txt"]).await;
 
-        let state = moved(&instance, "a.txt", "dir/a.txt").await;
+        let state = staged_moved(&instance, "a.txt", "dir/a.txt").await;
         assert!(
             node_at(&instance, &state, "dir/a.txt")
                 .await
@@ -277,7 +259,7 @@ async fn a_staged_move_into_a_committed_directory_stages_it() {
             "flags {:#x}",
             dir.flags
         );
-        assert!(!dir.is_dirty(), "a staged move dirties nothing");
+        assert!(dir.is_dirty(), "flags {:#x}", dir.flags);
     })
     .await;
 }
@@ -291,7 +273,7 @@ async fn a_staged_move_out_of_a_committed_directory_stages_the_one_it_left() {
         let first = committed(&instance, &["dir/keep.txt", "dir/a.txt", "other/o.txt"]).await;
         let before = node_at(&instance, &first, "dir").await.address;
 
-        let state = moved(&instance, "dir/a.txt", "other/a.txt").await;
+        let state = staged_moved(&instance, "dir/a.txt", "other/a.txt").await;
         let left = node_at(&instance, &state, "dir").await;
 
         let revision = test_commit(&instance, "Moved").await;
@@ -325,7 +307,7 @@ async fn a_staged_move_out_of_a_directory_marked_dirty_leaves_it_unstaged() {
         );
         assert!(before.address.is_zero(), "no commit recorded it");
 
-        let state = moved(&instance, "new/f.txt", "other/f.txt").await;
+        let state = staged_moved(&instance, "new/f.txt", "other/f.txt").await;
         let left = node_at(&instance, &state, "new").await;
         assert!(!left.is_staged(), "flags {:#x}", left.flags);
         let revision = test_commit(&instance, "Moved").await;
@@ -350,7 +332,7 @@ async fn a_staged_move_out_of_a_dirty_added_directory_leaves_it_unstaged() {
             before.flags
         );
 
-        let state = moved(&instance, "new/f.txt", "other/f.txt").await;
+        let state = staged_moved(&instance, "new/f.txt", "other/f.txt").await;
         let left = node_at(&instance, &state, "new").await;
         assert!(
             left.is_dirty_add() && !left.is_staged(),
@@ -370,9 +352,9 @@ async fn a_staged_move_out_of_a_dirty_added_directory_leaves_it_unstaged() {
 async fn a_staged_move_out_of_a_moved_directory_keeps_its_move() {
     with_instance(|instance| async move {
         committed(&instance, &["dir/a.txt", "dir/b.txt"]).await;
-        moved(&instance, "dir", "moved").await;
+        staged_moved(&instance, "dir", "moved").await;
 
-        let state = moved(&instance, "moved/a.txt", "a.txt").await;
+        let state = staged_moved(&instance, "moved/a.txt", "a.txt").await;
         let left = node_at(&instance, &state, "moved").await;
         assert!(left.is_staged_move(), "flags {:#x}", left.flags);
     })
@@ -386,7 +368,7 @@ async fn a_staged_move_of_a_directory_out_of_a_committed_one_marks_both() {
     with_instance(|instance| async move {
         committed(&instance, &["dir/keep.txt", "dir/sub/x.txt", "other/o.txt"]).await;
 
-        let state = moved(&instance, "dir/sub", "other/sub").await;
+        let state = staged_moved(&instance, "dir/sub", "other/sub").await;
         let left = node_at(&instance, &state, "dir").await;
         assert!(left.is_staged(), "flags {:#x}", left.flags);
         let x = node_at(&instance, &state, "other/sub/x.txt").await;
@@ -406,7 +388,7 @@ async fn a_staged_move_over_a_committed_file_replaces_it() {
         let b = node_id_at(&instance, &first, "b.txt").await;
         let content = node_of(&instance, &first, a).await.address;
 
-        let state = moved(&instance, "a.txt", "b.txt").await;
+        let state = staged_moved(&instance, "a.txt", "b.txt").await;
         let target = node_of(&instance, &state, b).await;
         assert!(target.is_staged_delete(), "flags {:#x}", target.flags);
         let node = node_of(&instance, &state, a).await;
@@ -428,7 +410,7 @@ async fn a_staged_move_of_a_directory_keeps_a_staged_deleted_child() {
     with_instance(|instance| async move {
         let b = child_staged_deleted(&instance).await;
 
-        let state = moved(&instance, "dir", "moved").await;
+        let state = staged_moved(&instance, "dir", "moved").await;
         let after = node_of(&instance, &state, b).await;
         assert!(after.is_staged_delete(), "flags {:#x}", after.flags);
     })
@@ -442,7 +424,7 @@ async fn a_staged_move_of_a_directory_keeps_a_dirty_deleted_child() {
     with_instance(|instance| async move {
         let b = child_dirty_deleted(&instance).await;
 
-        let state = moved(&instance, "dir", "moved").await;
+        let state = staged_moved(&instance, "dir", "moved").await;
         let after = node_of(&instance, &state, b).await;
         assert!(after.is_dirty_delete(), "flags {:#x}", after.flags);
     })
@@ -531,24 +513,20 @@ async fn a_staged_move_of_a_directory_over_its_parent_keeps_its_childrens_change
     .await;
 }
 
-/// A file or a directory staged as renamed in case alone stays, the directory with its subtree,
-/// and dirties nothing: the target the move looks up, by a name's hash, which the case leaves
-/// alone, is the node itself, which the move does not delete. What a commit then makes of the
-/// case alone is the directory hash's to settle.
+/// A file or a directory staged as renamed in case alone stays, the directory with its subtree:
+/// the target the move looks up, by a name's hash, which the case leaves alone, is the node itself,
+/// which the move does not delete. What a commit then makes of the case alone is the directory
+/// hash's to settle.
 #[tokio::test]
 async fn a_case_only_staged_rename_of_a_file_or_a_directory_deletes_nothing() {
     with_instance(|instance| async move {
         committed(&instance, &["File.txt", "Dir/a.txt"]).await;
 
-        moved(&instance, "File.txt", "file.txt").await;
-        let state = moved(&instance, "Dir", "dir").await;
+        staged_moved(&instance, "File.txt", "file.txt").await;
+        let state = staged_moved(&instance, "Dir", "dir").await;
         for path in ["file.txt", "dir", "dir/a.txt"] {
             let node = node_at(&instance, &state, path).await;
-            assert!(
-                !node.is_staged_delete() && !node.is_dirty(),
-                "{path}: flags {:#x}",
-                node.flags
-            );
+            assert!(!node.is_staged_delete(), "{path}: flags {:#x}", node.flags);
         }
     })
     .await;
@@ -591,7 +569,7 @@ async fn a_staged_move_of_a_dirty_file_into_a_clean_directory_dirties_it() {
         test_file_write(&instance.path.join("dir/a.txt"), b"edited");
         dirtied(&instance, "dir/a.txt").await;
 
-        let state = moved(&instance, "dir/a.txt", "other/deep/a.txt").await;
+        let state = staged_moved(&instance, "dir/a.txt", "other/deep/a.txt").await;
         let a = node_at(&instance, &state, "other/deep/a.txt").await;
         assert!(
             a.is_dirty(),
@@ -614,7 +592,7 @@ async fn a_staged_move_of_a_dirty_added_file_keeps_it_added() {
         committed(&instance, &["dir/keep.txt"]).await;
         let new = dirty_added(&instance, "new.txt").await;
 
-        let state = moved(&instance, "new.txt", "dir/new.txt").await;
+        let state = staged_moved(&instance, "new.txt", "dir/new.txt").await;
         let after = node_of(&instance, &state, new).await;
         assert!(after.is_staged_add(), "flags {:#x}", after.flags);
         let revision = test_commit(&instance, "Added").await;
@@ -631,7 +609,7 @@ async fn a_staged_move_of_a_directory_keeps_a_dirty_added_file_added() {
         committed(&instance, &["dir/a.txt"]).await;
         let new = dirty_added(&instance, "dir/new.txt").await;
 
-        let state = moved(&instance, "dir", "moved").await;
+        let state = staged_moved(&instance, "dir", "moved").await;
         let after = node_of(&instance, &state, new).await;
         assert!(after.is_staged_add(), "flags {:#x}", after.flags);
     })
@@ -724,17 +702,17 @@ async fn a_dirty_move_of_a_dirty_deleted_directory_moves_its_subtree() {
     .await;
 }
 
-/// A directory staged as deleted with no dirty half, then moved with `lore dirty move`, takes the
-/// deletion off its subtree all the same.
+/// A directory staged as deleted with no dirty half, then moved with `lore dirty move`, keeps the
+/// staged deletion of its subtree: a dirty mark leaves a staged action as it is.
 #[tokio::test]
-async fn a_dirty_move_of_a_staged_deleted_directory_moves_its_subtree() {
+async fn a_dirty_move_of_a_staged_deleted_directory_keeps_its_subtrees_deletion() {
     with_instance(|instance| async move {
         let below = dir_staged_deleted(&instance).await;
 
         let state = dirty_move(&instance, "dir", "moved").await;
         for node in below {
             let after = node_of(&instance, &state, node).await;
-            assert!(after.is_dirty_move(), "flags {:#x}", after.flags);
+            assert!(after.is_staged_delete(), "flags {:#x}", after.flags);
         }
     })
     .await;

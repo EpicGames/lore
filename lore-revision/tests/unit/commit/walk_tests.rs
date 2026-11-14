@@ -333,6 +333,7 @@ impl WalkFixture {
             self.stats.clone(),
             BranchId::from(uuid::Uuid::now_v7()),
             Arc::new(WriteTracker::new()),
+            None,
         )
     }
 
@@ -367,6 +368,7 @@ impl WalkFixture {
         let (file_tx, mut file_rx) = mpsc::channel(16);
         let walk = Arc::new(CommitWalk {
             hands_directories: false,
+            handed: Arc::default(),
             operation: FilesystemProvider::begin_operation(&OsFilesystem::new(&self.root))
                 .await
                 .expect("Opening an operation"),
@@ -376,6 +378,7 @@ impl WalkFixture {
             delta: Arc::new(parking_lot::RwLock::new(BytesMut::new())),
             discard: Arc::default(),
             subnodes_to_discard: Arc::default(),
+            gone: None,
             file_tx,
             metadata: Arc::new(Metadata::new()),
             link_messages: Arc::new(HashMap::new()),
@@ -383,6 +386,7 @@ impl WalkFixture {
             parent_branch: BranchId::from(uuid::Uuid::now_v7()),
             tracker: Arc::new(WriteTracker::new()),
             dir_semaphore: Arc::new(Semaphore::new(0)),
+            root: ROOT_NODE,
         });
         let result = commit_directory(walk, RelativePath::new(), ROOT_NODE, None).await;
         let mut sent = Vec::new();

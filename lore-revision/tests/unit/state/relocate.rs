@@ -11,6 +11,7 @@ use lore_base::types::Hash;
 use lore_revision::node::*;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
+use lore_revision::state::Ext;
 use lore_revision::state::LinkPin;
 use lore_revision::state::Mark;
 use lore_revision::state::NameChange;
@@ -263,6 +264,78 @@ async fn a_rename_counts_a_changed_hash_and_not_a_respelling() {
         assert!(
             !record(&state, &repository, dir).await.is_dirty(),
             "a rename marks nothing"
+        );
+    })
+    .await;
+}
+
+/// A staged move out of a directory marked dirty as moved and not staged marks that directory
+/// dirty alone, so its move stays dirty, and so it marks one no commit gave an address, which the
+/// commit drops unstaged; a committed directory with no change of its own is staged.
+#[tokio::test]
+async fn a_staged_move_out_of_a_dirty_moved_directory_leaves_its_move_dirty() {
+    with_state(|repository, state| async move {
+        let moved = add(
+            &state,
+            &repository,
+            ROOT_NODE,
+            committed_directory("moved"),
+            "moved",
+        )
+        .await;
+        let plain = add(
+            &state,
+            &repository,
+            ROOT_NODE,
+            committed_directory("plain"),
+            "plain",
+        )
+        .await;
+        let new = add(&state, &repository, ROOT_NODE, directory("new"), "new").await;
+        let a = add(&state, &repository, moved, file("a"), "a").await;
+        let b = add(&state, &repository, plain, file("b"), "b").await;
+        let c = add(&state, &repository, new, file("c"), "c").await;
+        state
+            .node_mark(
+                &repository,
+                moved,
+                Mark::dirty(NodeFlags::DirtyMove, Ext::Keep, true),
+            )
+            .await
+            .expect("the dirty move");
+        let permit = state.moves_permit().await.expect("the moves permit");
+        for (node, name) in [(a, "a"), (b, "b"), (c, "c")] {
+            state
+                .node_move_staged(
+                    repository.clone(),
+                    node,
+                    ROOT_NODE,
+                    (name, hash_string(name)),
+                    &permit,
+                    false,
+                )
+                .await
+                .expect("the staged move");
+        }
+        drop(permit);
+
+        let left = record(&state, &repository, moved).await;
+        assert!(
+            left.is_dirty_move() && !left.is_staged(),
+            "moved: flags {:#x}",
+            left.flags
+        );
+        let left = record(&state, &repository, plain).await;
+        assert!(
+            left.is_staged() && left.is_dirty(),
+            "plain: flags {:#x}",
+            left.flags
+        );
+        let left = record(&state, &repository, new).await;
+        assert!(
+            left.is_dirty() && !left.is_staged(),
+            "new: flags {:#x}",
+            left.flags
         );
     })
     .await;
@@ -983,6 +1056,18 @@ async fn a_moved_directorys_resolved_child_stays_resolved() {
     .await;
 }
 
+/// A directory record named `name` that a commit gave an address, which a staged move out of it
+/// stages ([`Node::stages_when_left`]).
+fn committed_directory(name: &str) -> Node {
+    Node {
+        address: Address {
+            hash: Hash::from([7u8; 32]),
+            ..Address::default()
+        },
+        ..directory(name)
+    }
+}
+
 /// Whether `dir` carries neither a staged nor a dirty mark.
 async fn unmarked(state: &State, repository: &Arc<RepositoryContext>, dir: NodeID) -> bool {
     let held = record(state, repository, dir).await;
@@ -995,7 +1080,7 @@ async fn unmarked(state: &State, repository: &Arc<RepositoryContext>, dir: NodeI
 async fn a_staged_move_marks_both_directories_and_their_ancestors() {
     with_state(|repository, state| async move {
         let top = add(&state, &repository, ROOT_NODE, directory("top"), "top").await;
-        let source = add(&state, &repository, top, directory("src"), "src").await;
+        let source = add(&state, &repository, top, committed_directory("src"), "src").await;
         let destination = add(&state, &repository, ROOT_NODE, directory("dst"), "dst").await;
         let node = add(&state, &repository, source, file("x"), "x").await;
 
@@ -1217,7 +1302,14 @@ async fn a_staged_move_takes_the_last_room_of_its_name_table() {
 #[tokio::test]
 async fn a_staged_move_into_the_root_marks_the_directory_it_leaves() {
     with_state(|repository, state| async move {
-        let source = add(&state, &repository, ROOT_NODE, directory("src"), "src").await;
+        let source = add(
+            &state,
+            &repository,
+            ROOT_NODE,
+            committed_directory("src"),
+            "src",
+        )
+        .await;
         let tracked = add(&state, &repository, source, file("x"), "x").await;
         let added = add(&state, &repository, source, file("y"), "y").await;
         state

@@ -778,6 +778,28 @@ pub trait InstanceOperation: Send + Sync {
         path: &RelativePath,
     ) -> impl Future<Output = Result<FileInfo, FsError>> + Send;
 
+    /// Whether the working tree holds a directory at each of `paths`, as a stat of each path
+    /// answers, which folds case where the file system does, pushed to `held` in order: a file,
+    /// nothing, or a path through a file holds none. A failure is answered.
+    ///
+    /// The default reads [`file_info`](Self::file_info) one path at a time, and takes a path as
+    /// that answers it, a refused stat included. A provider whose stats permission refuses
+    /// overrides it, as the OS provider does: it reads the paths side by side, and takes a path a
+    /// stat is refused permission for as holding a directory.
+    fn directories_held(
+        &self,
+        paths: Arc<[RelativePath]>,
+        held: &mut Vec<bool>,
+    ) -> impl Future<Output = Result<(), FsError>> + Send {
+        async move {
+            held.reserve(paths.len());
+            for path in paths.iter() {
+                held.push(self.file_info(path).await?.is_dir());
+            }
+            Ok(())
+        }
+    }
+
     /// Whether the directory holding `path` holds a child named exactly as `path` spells it.
     ///
     /// The question a case resolution nearly always has, and one lookup answers it: no
@@ -1282,15 +1304,13 @@ impl InstanceOperationImpl {
         }
     }
 
-    /// Hands the provider `path`, a directory the commit adds or moves, which the provider settles
-    /// once the revision is current. Other providers ignore it.
-    pub(crate) fn hand_directory(&self, path: &RelativePath) {
+    /// Hands the provider `paths`, directories the commit adds or moves, which the provider settles
+    /// once the revision is current. Other providers ignore them.
+    pub(crate) fn hand_directories(&self, paths: Vec<RelativePath>) {
         match &self.dispatch {
             #[cfg(target_os = "linux")]
-            StaticDispatchInstanceOperation::Fuse(this) => this.hand_directory(path),
-            _ => {
-                let _ = path;
-            }
+            StaticDispatchInstanceOperation::Fuse(this) => this.hand_directories(paths),
+            _ => drop(paths),
         }
     }
 
@@ -1518,6 +1538,21 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Swfs(this) => this.untracked_file_info(path).await,
             #[cfg(target_os = "linux")]
             StaticDispatchInstanceOperation::Fuse(this) => this.untracked_file_info(path).await,
+        }
+    }
+
+    async fn directories_held(
+        &self,
+        paths: Arc<[RelativePath]>,
+        held: &mut Vec<bool>,
+    ) -> Result<(), FsError> {
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(this) => this.directories_held(paths, held).await,
+            StaticDispatchInstanceOperation::Os(this) => this.directories_held(paths, held).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.directories_held(paths, held).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.directories_held(paths, held).await,
         }
     }
 

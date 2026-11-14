@@ -318,6 +318,10 @@ pub enum OwnFlags {
     Dirty,
     /// Every change flag and its extension flags ([`Node::clear_all_change_flags`]).
     Change,
+    /// Every change flag and its extension flags but the bare staged bit, so a commit rehashes the
+    /// node as a directory staged for what lies below it alone
+    /// ([`crate::state::is_staged_for_descendants_only`]).
+    ChangeToBare,
 }
 
 impl State {
@@ -399,6 +403,10 @@ impl State {
                 OwnFlags::Staged => node.clear_staged_flags(),
                 OwnFlags::Dirty => node.clear_dirty_flags(),
                 OwnFlags::Change => node.clear_all_change_flags(),
+                OwnFlags::ChangeToBare => {
+                    node.clear_all_change_flags();
+                    node.flags |= NodeFlags::Staged.bits();
+                }
             }
             if (node.flags, node.ext_flags) == was {
                 #[cfg(feature = "state-hooks")]

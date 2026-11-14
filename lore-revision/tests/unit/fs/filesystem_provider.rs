@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
+use lore_revision::fs::filesystem_provider::CaseLookup;
 use lore_revision::fs::filesystem_provider::DirectoryEntry;
 use lore_revision::fs::filesystem_provider::FileInfo;
 use lore_revision::fs::filesystem_provider::FilesystemDiffIntent;
@@ -72,6 +73,8 @@ pub struct TestFilesystemProvider {
     holds_paths: bool,
     holds_state: bool,
     hold_refuses: bool,
+    /// What its operations answer for `case_lookup`.
+    case_lookup: CaseLookup,
 }
 
 impl TestFilesystemProvider {
@@ -83,6 +86,15 @@ impl TestFilesystemProvider {
     /// says.
     pub fn with_identity(self, identity: TestIdentity) -> TestFilesystemProvider {
         Self { identity, ..self }
+    }
+
+    /// The provider, its operations answering `case_lookup` for how a walk finds a name held in
+    /// another case.
+    pub fn with_case_lookup(self, case_lookup: CaseLookup) -> TestFilesystemProvider {
+        Self {
+            case_lookup,
+            ..self
+        }
     }
 
     /// A provider that fails to begin an operation, as one whose filesystem will not freeze.
@@ -255,7 +267,7 @@ impl FilesystemProvider for TestFilesystemProvider {
                 stale_on_scan: self.stale_on_scan.clone(),
                 removed: self.removed.clone(),
                 identity: self.identity,
-                case_lookup: Default::default(),
+                case_lookup: self.case_lookup,
                 directory_reads: self.directory_reads.clone(),
             }),
             self.holds_state,

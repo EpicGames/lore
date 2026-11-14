@@ -10,25 +10,22 @@
 //! own case or another. A sequence runs three times, on instances of its own: as the commit's walk
 //! meets the children of each directory the moves touch unaided, and with them moved to the front
 //! of the directory in ascending and in descending order of name ([`to_front`]). Every run then
-//! stages an edit of `other.txt`, which no operation touches, and commits. The commit must
-//! succeed, store directories whose addresses hash their children, one child per folded name, and
-//! leave one revision in all three runs; the unaided run is checked against the base, the staged
-//! tree it took and the working tree as well ([`assert_kept`], [`assert_marked`]).
+//! stages an edit of `other.txt`, which no operation touches, checks that the removed directories
+//! its staged tree takes for their rehash alone are those the model derives
+//! ([`Model::settle_bare`]), and commits. The commit must succeed, store directories whose
+//! addresses hash their children, one child per folded name, and leave one revision in all three
+//! runs; the unaided run is checked against the base, the staged tree it took and the working tree
+//! as well ([`assert_kept`], [`assert_marked`]).
 //!
-//! The sequences leave out the shapes the commit does not handle yet:
-//! - Marking dirty a new node at a path a moved committed node left: no new node is
-//!   added or moved there, and where a move the commit leaves out had its path at such a path, what
-//!   the working tree holds there is not checked.
-//! - A name the staged tree holds twice below a directory, as a node staged for deletion
-//!   and one moved to its name, which `lore dirty move` and `lore stage` take the first of: such a
-//!   name is neither moved to the front nor staged.
-//! - Marking dirty the removal of a directory that holds a new node or one moved into
-//!   it, or of a new directory that holds a committed node, which replaces their marks.
-//! - A move of a directory holding a node whose removal is marked dirty, which loses
-//!   that mark past a commit that leaves the move out.
-//! - Marking dirty the removal of a directory below which a removal is staged, which
-//!   then reads as staged.
-//! - A new node at the name of a node staged for deletion.
+//! The sequences leave out the shape the commit does not handle yet: marking dirty a new node at
+//! a path a moved committed node left. No new node is added or moved there, and where a move the
+//! commit leaves out had its path at such a path, what the working tree holds there is not
+//! checked. A name the staged tree holds twice below a directory, as a node staged for deletion and
+//! one moved to its name, is drawn as any other: `lore dirty move` and `lore stage` take the live
+//! one.
+//!
+//! A removal marked dirty is drawn where nothing at or below it is staged and every committed
+//! node a move took there is a file whose committed path is free, which it goes back to.
 //!
 //! A path that spells a committed path in another case is not staged either: a stage refuses it as
 //! a case mismatch.
@@ -39,6 +36,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 use lore_revision::node::Node;
+use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::state::State;
@@ -57,6 +55,7 @@ use crate::to_front;
 use crate::tree_paths;
 use crate::warnings_of;
 use crate::with_instance;
+use crate::without_front;
 use crate::written;
 
 /// The committed tree every sequence starts from.
@@ -116,6 +115,19 @@ struct Model {
     edited: BTreeSet<String>,
     /// The base path of each committed node a move took from it.
     moved_from: BTreeSet<String>,
+    /// The paths of the directories removed and marked dirty that hold a node staged for deletion
+    /// below them, or that the commit takes staged for what lies below them alone
+    /// ([`Self::settle_bare`]), which the staged tree holds and does not mark deleted, and which the
+    /// commit deletes with everything below them, as the working tree no longer holds them.
+    unmarked: BTreeSet<String>,
+    /// Each committed file a removal marked dirty took from the working tree while another node held
+    /// its committed path, with its path in the staged tree and its committed path: it keeps its
+    /// move, for the commit to take it back once that path frees.
+    homeward: Vec<(String, String)>,
+    /// The committed paths of the directories a staged deletion took a committed node out of that
+    /// stood under another directory than its committed one, which the commit stages for their
+    /// rehash ([`Model::left_directories`]).
+    left_by_deletion: BTreeSet<String>,
 }
 
 impl Model {
@@ -158,7 +170,142 @@ impl Model {
         self.paths
             .keys()
             .chain(&self.dirty_deleted)
+            .chain(&self.unmarked)
             .any(|held| held.eq_ignore_ascii_case(path))
+    }
+
+    /// Whether every committed node at or below `removed` that a move took there is a file not
+    /// staged, whose committed path lies below a directory the working tree holds, so its removal
+    /// marked dirty takes it back there, marked deleted. Where `taken` allows, and nothing below
+    /// `removed` is staged for deletion, another node may hold that path, the file then keeping its
+    /// move ([`Self::homeward`]); elsewhere nothing holds it.
+    fn goes_home(&self, removed: &str, taken: bool) -> bool {
+        let taken = taken && below_in(&self.staged_deleted, removed).is_empty();
+        self.subtree(removed).iter().all(|held| {
+            let entry = &self.paths[held];
+            let Some(origin) = entry.origin.as_deref().filter(|origin| origin != held) else {
+                return true;
+            };
+            let parent = parent_of(origin);
+            !entry.directory
+                && !entry.staged
+                && (taken || !self.holds(origin))
+                && !below_or_at(parent, removed)
+                && (parent.is_empty() || self.paths.get(parent).is_some_and(|at| at.directory))
+        })
+    }
+
+    /// Whether a stage of `path`, a path a move took a node to, finds a change at or below it to
+    /// stage: a new file, a file edited and marked dirty, or a removal marked dirty. A move marked
+    /// dirty alone is none, so the stage leaves it as it is.
+    fn changes_at_or_below(&self, path: &str) -> bool {
+        self.subtree(path).iter().any(|held| {
+            let entry = &self.paths[held];
+            !entry.directory && (entry.origin.is_none() || self.edited.contains(held))
+        }) || !self.dirty_deleted_below(path).is_empty()
+    }
+
+    /// Whether the node at `at`, committed at `origin`, stands under another directory than the
+    /// one it was committed in.
+    fn moved_out(&self, at: &str, origin: &str) -> bool {
+        let (from, under) = (parent_of(origin), parent_of(at));
+        if under.is_empty() {
+            !from.is_empty()
+        } else {
+            self.paths
+                .get(under)
+                .and_then(|parent| parent.origin.as_deref())
+                != Some(from)
+        }
+    }
+
+    /// The committed paths of the directories a staged change took a committed node out of, which
+    /// the commit stages for their rehash: the committed parent of each staged node standing under
+    /// another directory, and of each a staged deletion took from under another one.
+    fn left_directories(&self) -> BTreeSet<String> {
+        let mut left = self.left_by_deletion.clone();
+        for (at, entry) in &self.paths {
+            if let Some(origin) = entry.origin.as_deref().filter(|_| entry.staged)
+                && self.moved_out(at, origin)
+            {
+                left.insert(parent_of(origin).to_string());
+            }
+        }
+        left.remove("");
+        left
+    }
+
+    /// Takes each directory removed and marked dirty at or above a directory a staged change took a
+    /// committed node out of ([`Self::left_directories`]) as gone: the commit stages it for its
+    /// rehash, if only for one below it, and deletes it with everything below it, as for one
+    /// holding a node staged for deletion ([`Self::unmarked`]). Asserts that the directories the
+    /// commit stages so for what lies below them alone are those: each `before`, the staged tree
+    /// the commit takes, holds staged that way, and each the commit stages, holding in `base` a
+    /// staged node marked dirty that `before` holds elsewhere.
+    fn settle_bare(
+        &mut self,
+        ops: &[Op],
+        base: &BTreeMap<NodeID, Placed>,
+        before: &BTreeMap<NodeID, Placed>,
+    ) {
+        let left = self.left_directories();
+        let modelled: BTreeSet<String> = self
+            .dirty_deleted
+            .iter()
+            .filter(|removed| left.iter().any(|left| below_or_at(left, removed)))
+            .cloned()
+            .collect();
+        let staging: BTreeSet<NodeID> = before
+            .iter()
+            .filter(|(_, at)| at.node.is_staged() && at.node.is_dirty())
+            .filter_map(|(id, at)| {
+                let committed = base.get(id)?;
+                (committed.parent != at.parent && committed.parent != ROOT_NODE)
+                    .then_some(committed.parent)
+            })
+            .collect();
+        let held: BTreeSet<String> = before
+            .iter()
+            .filter(|(id, at)| {
+                let bare = at.node.is_staged()
+                    && at.node.flags & (NodeFlags::ActionBits.bits() | NodeFlags::MergeBits.bits())
+                        == 0;
+                at.node.is_directory()
+                    && (bare || staging.contains(id))
+                    && self.dirty_deleted.contains(&at.path)
+            })
+            .map(|(_, at)| at.path.clone())
+            .collect();
+        assert_eq!(
+            modelled, held,
+            "{ops:?}: the removed directories the commit stages for their rehash"
+        );
+        for removed in modelled {
+            self.dirty_deleted.remove(&removed);
+            self.unmarked.insert(removed);
+        }
+    }
+
+    /// Marks the removal of `path` and everything below it, as marking it dirty does: a new node
+    /// leaves, a committed node a move took there goes back to be marked deleted, a committed node
+    /// standing at its committed path is marked deleted there, and a directory holding a node staged
+    /// for deletion below it is not.
+    fn mark_removed(&mut self, path: &str) {
+        for held in self.subtree(path) {
+            let Some(origin) = self.paths[&held].origin.clone() else {
+                continue;
+            };
+            if origin != held && self.holds(&origin) {
+                self.homeward.push((held, origin));
+            } else if origin != held {
+                self.dirty_deleted.insert(origin);
+            } else if below_in(&self.staged_deleted, &held).is_empty() {
+                self.dirty_deleted.insert(held);
+            } else {
+                self.unmarked.insert(held);
+            }
+        }
+        self.remove(path);
     }
 
     /// Each new path below a directory, the root among them, that nothing holds.
@@ -213,13 +360,6 @@ impl Model {
         })
     }
 
-    /// Whether `path`, folded, is the path of a node the staged tree holds staged for deletion.
-    fn names_staged_deleted(&self, path: &str) -> bool {
-        self.staged_deleted
-            .iter()
-            .any(|deleted| deleted.eq_ignore_ascii_case(path))
-    }
-
     /// Whether `path`, one of its ancestors or a path below it spells a committed path in another
     /// case, which a stage refuses as a name case mismatch.
     fn recased(&self, path: &str) -> bool {
@@ -264,6 +404,9 @@ impl Model {
     fn apply(&mut self, op: &Op) {
         match op {
             Op::Move(from, to) => {
+                let staged_whole = self.holds_staged_below(from);
+                let moves_staged =
+                    staged_whole || self.paths.get(from).is_some_and(|entry| entry.staged);
                 for held in self.subtree(from) {
                     let entry = self.paths.remove(&held).expect("a held path");
                     self.moved_from.extend(entry.origin.clone());
@@ -274,12 +417,28 @@ impl Model {
                     }
                     self.paths.insert(renamed, entry);
                 }
-                for deleted in below_in(&self.staged_deleted, from) {
-                    self.staged_deleted.remove(&deleted);
-                    self.staged_deleted
-                        .insert(format!("{to}{}", &deleted[from.len()..]));
+                for marks in [
+                    &mut self.staged_deleted,
+                    &mut self.dirty_deleted,
+                    &mut self.unmarked,
+                ] {
+                    for deleted in below_in(marks, from) {
+                        marks.remove(&deleted);
+                        marks.insert(format!("{to}{}", &deleted[from.len()..]));
+                    }
+                }
+                for (staged, _) in &mut self.homeward {
+                    if below_or_at(staged, from) {
+                        *staged = format!("{to}{}", &staged[from.len()..]);
+                    }
                 }
                 self.moved.insert(to.clone());
+                if staged_whole {
+                    self.stage_directory_move(to);
+                }
+                if moves_staged {
+                    self.stage_destination(to);
+                }
             }
             Op::AddFile(path) | Op::AddDirectory(path) => {
                 let entry = Entry {
@@ -297,6 +456,7 @@ impl Model {
                 entry.content_staged = true;
                 self.edited.remove(path);
             }
+            Op::StageMoved(path) if !self.changes_at_or_below(path) => {}
             Op::StageMoved(path) => {
                 self.stage_moves_above(path);
                 for held in self.subtree(path) {
@@ -316,17 +476,21 @@ impl Model {
             }
             Op::StageDelete(path) => {
                 self.stage_moves_above(path);
+                for held in self.subtree(path) {
+                    if let Some(origin) = self.paths[&held].origin.clone()
+                        && self.moved_out(&held, &origin)
+                    {
+                        self.left_by_deletion.insert(parent_of(&origin).to_string());
+                    }
+                }
+                let committed = self.committed_at_or_below(path);
                 self.remove(path);
                 for deleted in self.dirty_deleted_below(path) {
                     self.dirty_deleted.remove(&deleted);
                 }
-                self.staged_deleted.insert(path.clone());
+                self.staged_deleted.extend(committed);
             }
-            Op::RevertAdd(path) => self.remove(path),
-            Op::DirtyDelete(path) => {
-                self.remove(path);
-                self.dirty_deleted.insert(path.clone());
-            }
+            Op::RevertAdd(path) | Op::DirtyDelete(path) => self.mark_removed(path),
         }
     }
 
@@ -352,6 +516,66 @@ impl Model {
             });
             if moved {
                 self.stage_directory_move(&directory);
+            }
+        }
+    }
+
+    /// The topmost committed nodes at or below `path`, whose deletion a stage of its removal
+    /// records: a new node leaves the staged tree with nothing to delete.
+    fn committed_at_or_below(&self, path: &str) -> Vec<String> {
+        let mut committed: Vec<String> = Vec::new();
+        for held in self.subtree(path) {
+            if self.paths[&held].origin.is_some()
+                && !committed.iter().any(|above| below_or_at(&held, above))
+            {
+                committed.push(held);
+            }
+        }
+        committed
+    }
+
+    /// Whether `path` is a directory not staged that holds a node staged in its own right below
+    /// it, a staged deletion included, so `lore dirty move` of it stages its whole move, as a stage
+    /// inside it does ([`Self::stage_directory_move`]).
+    fn holds_staged_below(&self, path: &str) -> bool {
+        self.paths
+            .get(path)
+            .is_some_and(|entry| entry.directory && !entry.staged)
+            && (self
+                .subtree(path)
+                .iter()
+                .any(|held| held != path && self.paths[held].staged)
+                || below_in(&self.staged_deleted, path)
+                    .iter()
+                    .any(|deleted| deleted != path))
+    }
+
+    /// Stages the directories above `path`, where a move took a node holding staged content, as
+    /// the move's climb does, up to the first staged one: a new directory takes a staged add, and
+    /// a directory a move took there its whole move ([`Self::stage_directory_move`]).
+    fn stage_destination(&mut self, path: &str) {
+        let mut above = Vec::new();
+        let mut at = parent_of(path);
+        while !at.is_empty() {
+            let Some(entry) = self.paths.get(at) else {
+                break;
+            };
+            if entry.staged {
+                break;
+            }
+            above.push(at.to_string());
+            at = parent_of(at);
+        }
+        for directory in above {
+            match self.paths[&directory].origin.clone() {
+                None => {
+                    self.paths
+                        .get_mut(&directory)
+                        .expect("a held directory")
+                        .staged = true;
+                }
+                Some(origin) if origin != directory => self.stage_directory_move(&directory),
+                Some(_) => {}
             }
         }
     }
@@ -390,6 +614,41 @@ impl Model {
         }
     }
 
+    /// Whether the removal of `path`, marked dirty, is drawn: nothing at or below it is staged, and
+    /// every committed node a move took there goes back ([`Self::goes_home`]), past a node holding
+    /// its committed path where `taken` allows.
+    fn removable(&self, path: &str, taken: bool) -> bool {
+        self.subtree(path)
+            .iter()
+            .all(|held| !self.paths[held].staged)
+            && self.goes_home(path, taken)
+    }
+
+    /// What the commit makes of each of [`Self::homeward`], as this working tree holds its
+    /// committed path: each whose committed path a node holds with nothing staged at or below it
+    /// keeps its move past the commit, at the path the staged tree holds it at; each whose
+    /// committed path nothing holds goes back, marked deleted there. One a staged node keeps out
+    /// leaves the revision, as a move left out that cannot go back does.
+    fn homeward_after(&self) -> (Vec<&str>, Vec<&str>) {
+        let mut kept = Vec::new();
+        let mut home = Vec::new();
+        for (staged, origin) in &self.homeward {
+            let holder = self
+                .paths
+                .keys()
+                .find(|path| path.eq_ignore_ascii_case(origin));
+            match holder {
+                Some(holder) => {
+                    if self.subtree(holder).iter().all(|at| !self.paths[at].staged) {
+                        kept.push(staged.as_str());
+                    }
+                }
+                None => home.push(origin.as_str()),
+            }
+        }
+        (kept, home)
+    }
+
     /// Every operation of `kind` valid in this working tree.
     fn ops(&self, kind: usize) -> Vec<Op> {
         let mut ops = Vec::new();
@@ -402,9 +661,6 @@ impl Model {
                     self.freed_paths()
                 };
                 for from in movable() {
-                    if !self.dirty_deleted_below(&from).is_empty() {
-                        continue;
-                    }
                     let new = self
                         .subtree(&from)
                         .iter()
@@ -418,7 +674,7 @@ impl Model {
             }
             2 | 3 => {
                 for path in self.free_paths() {
-                    if self.left_by_a_move(&path) || self.names_staged_deleted(&path) {
+                    if self.left_by_a_move(&path) {
                         continue;
                     }
                     ops.push(if kind == 2 {
@@ -431,16 +687,13 @@ impl Model {
             4 => ops.extend(
                 self.files()
                     .into_iter()
-                    .filter(|file| !self.recased(file) && !self.names_staged_deleted(file))
+                    .filter(|file| !self.recased(file))
                     .map(Op::StageEdit),
             ),
             5 => ops.extend(movable().map(Op::StageDelete)),
             6 => {
                 for path in &self.moved {
-                    if self.paths.contains_key(path)
-                        && !self.recased(path)
-                        && !self.names_staged_deleted(path)
-                    {
+                    if self.paths.contains_key(path) && !self.recased(path) {
                         ops.push(Op::StageMoved(path.clone()));
                     }
                 }
@@ -448,24 +701,15 @@ impl Model {
             7 => ops.extend(self.files().into_iter().map(Op::DirtyEdit)),
             8 => {
                 for path in movable() {
-                    let subtree = self.subtree(&path);
-                    let unmoved = subtree.iter().all(|held| {
-                        self.paths[held].origin.as_deref() == Some(held.as_str())
-                            && !self.paths[held].staged
-                    });
-                    if unmoved && below_in(&self.staged_deleted, &path).is_empty() {
+                    let in_place = self.paths[&path].origin.as_deref() == Some(path.as_str());
+                    if in_place && self.removable(&path, true) {
                         ops.push(Op::DirtyDelete(path));
                     }
                 }
             }
             _ => {
                 for path in movable() {
-                    let entry = &self.paths[&path];
-                    let holds_base = self
-                        .subtree(&path)
-                        .iter()
-                        .any(|held| self.paths[held].origin.is_some());
-                    if entry.origin.is_none() && !entry.staged && !holds_base {
+                    if self.paths[&path].origin.is_none() && self.removable(&path, false) {
                         ops.push(Op::RevertAdd(path));
                     }
                 }
@@ -682,6 +926,7 @@ async fn run(instance: &TestRepository, ops: &[Op], order: Order) -> Run {
     let state = restaged(instance, "other.txt").await;
     edited.insert(crate::node_id_at(instance, &state, "other.txt").await);
     let before = placed(instance, &*staged_tree(instance).await).await;
+    model.settle_bare(ops, &base, &before);
 
     let (committed, warnings) = warnings_of(lore_revision::commit::commit_boxed(
         instance.repository.clone(),
@@ -697,10 +942,16 @@ async fn run(instance: &TestRepository, ops: &[Op], order: Order) -> Run {
     assert!(warnings <= 1, "{ops:?} {order:?}: {warnings} warnings");
 
     if matches!(order, Order::Unaided) {
+        let gone: BTreeSet<NodeID> = before
+            .iter()
+            .filter(|(_, at)| model.unmarked.contains(&at.path))
+            .map(|(id, _)| *id)
+            .collect();
         let kept = Kept {
             base: &base,
             before: &before,
             after: &after,
+            gone: &gone,
         };
         let displaced = assert_kept(ops, &kept, &edited, warnings);
         let staged = staged_or_current(instance).await;
@@ -732,9 +983,10 @@ fn removed(instance: &TestRepository, model: &Model, path: &str) {
 }
 
 /// Moves the children of each directory a move of `ops` took a node from or to, where `model`
-/// holds that directory, to the front of it in `order` of name ([`to_front`]). A name the staged
-/// tree holds twice below one directory is left where it is; the two must be a node staged for
-/// deletion and one moved to its name.
+/// holds that directory, to the front of it in `order` of name ([`to_front`]), then removes the
+/// directory they moved through ([`without_front`]). A name the staged tree holds twice below one
+/// directory must be a node staged for deletion and one moved to its name, of which the move takes
+/// the live one.
 async fn to_front_where_moved(instance: &TestRepository, ops: &[Op], model: &Model, order: Order) {
     let mut parents = BTreeSet::new();
     for op in ops {
@@ -776,11 +1028,11 @@ async fn to_front_where_moved(instance: &TestRepository, ops: &[Op], model: &Mod
                     named.len(),
                     named.iter().map(|at| at.node.flags).collect::<Vec<_>>()
                 );
-                continue;
             }
             to_front(instance, child).await;
         }
     }
+    without_front(instance).await;
 }
 /// The staged tree the instance holds, or its current revision where it holds none.
 async fn staged_or_current(instance: &TestRepository) -> std::sync::Arc<State> {
@@ -798,21 +1050,23 @@ async fn test_revision(instance: &TestRepository) -> std::sync::Arc<State> {
     current
 }
 
-/// The trees a commit is checked by: the base revision, the staged tree it took, and the revision
-/// it stored.
+/// The trees a commit is checked by: the base revision, the staged tree it took, the revision it
+/// stored, and the directories of the staged tree the working tree no longer holds, which the
+/// commit deletes with everything below them.
 struct Kept<'a> {
     base: &'a BTreeMap<NodeID, Placed>,
     before: &'a BTreeMap<NodeID, Placed>,
     after: &'a BTreeMap<NodeID, Placed>,
+    gone: &'a BTreeSet<NodeID>,
 }
 
 /// Asserts that the revision `after` holds the base `base` with the staged changes of `before`,
 /// the staged tree the commit took, and nothing else: a node staged or holding a staged node
 /// stands where `before` holds it, every other base node where `base` does, a new node only where
 /// it is staged or holds a staged node, and every such node is there, a file edited only where
-/// its edit was staged, no node staged for deletion, and a base node gone only under a staged
-/// deletion or in the subtree of a move left out, which the commit warns of, once. Answers the
-/// moves left out.
+/// its edit was staged, no node staged for deletion or in a directory gone from the working tree,
+/// and a base node gone only under a staged deletion, in such a directory, or in the subtree of a
+/// move left out, which the commit warns of, once. Answers the moves left out.
 fn assert_kept(
     ops: &[Op],
     kept: &Kept<'_>,
@@ -823,6 +1077,7 @@ fn assert_kept(
         base,
         before,
         after,
+        gone,
     } = *kept;
     let staged = staged_or_holding(before);
     for (id, at) in after {
@@ -862,6 +1117,12 @@ fn assert_kept(
                 "{ops:?}: {} is staged for deletion and stays",
                 at.path
             );
+        } else if within(before, *id, gone) {
+            assert!(
+                !after.contains_key(id),
+                "{ops:?}: {} lies in a directory gone from the working tree and stays",
+                at.path
+            );
         } else if staged.contains(id) && !base.contains_key(id) && !deleted_with(before, *id) {
             assert!(
                 after.contains_key(id),
@@ -884,7 +1145,9 @@ fn assert_kept(
         if after.contains_key(id) {
             continue;
         }
-        let deleted = deleted_with(before, *id) || deleted_with_base(base, before, *id);
+        let deleted = deleted_with(before, *id)
+            || deleted_with_base(base, before, *id)
+            || within(before, *id, gone);
         assert!(
             deleted || within(before, *id, &displaced),
             "{ops:?}: {} left the revision with no staged deletion and no move left out",
@@ -980,6 +1243,7 @@ fn assert_marked(
         base,
         before,
         after,
+        gone: _,
     } = *kept;
     let aspc: Vec<&str> = displaced
         .iter()
@@ -1000,15 +1264,24 @@ fn assert_marked(
         .filter(|at| !at.node.is_dirty_delete() && !excused(&at.path))
         .map(|at| (at.path.as_str(), at.node.is_directory()))
         .collect();
+    let (kept, home) = model.homeward_after();
     let expected: BTreeMap<&str, bool> = model
         .paths
         .iter()
         .filter(|(path, _)| !excused(path))
         .map(|(path, entry)| (path.as_str(), entry.directory))
+        .chain(kept.iter().map(|path| (*path, false)))
         .collect();
     assert_eq!(held, expected, "{ops:?}: the staged tree's paths");
     let at_path = |path: &str| marked.values().find(|at| at.path == path);
-    for path in &model.dirty_deleted {
+    let gone_with = |path: &str| model.unmarked.iter().any(|gone| below_or_at(path, gone));
+    let left_with = |path: &str| {
+        before
+            .iter()
+            .any(|(id, at)| at.path == path && within(before, *id, displaced))
+    };
+    let deleted = model.dirty_deleted.iter().map(String::as_str).chain(home);
+    for path in deleted.filter(|path| !gone_with(path) && !left_with(path)) {
         assert!(
             at_path(path).is_some_and(|at| at.node.is_dirty_delete()),
             "{ops:?}: {path} is not marked deleted"
@@ -1064,10 +1337,17 @@ fn assert_marked(
     }
 }
 
-/// Runs sequences `first` to `first + SEQUENCES_PER_TEST`, each in every [`Order`], and asserts
-/// that the orders leave one revision.
+/// Runs sequences `first` to `first + SEQUENCES_PER_TEST`, each as [`sequence_of`] runs it.
 async fn sequences_from(first: u64) {
     for seed in first..first + SEQUENCES_PER_TEST {
+        sequence_of(seed).await;
+    }
+}
+
+/// Runs the sequence `seed` draws in every [`Order`], and asserts that the orders leave one
+/// revision.
+async fn sequence_of(seed: u64) {
+    {
         let ops = sequence(seed);
         let mut runs = Vec::new();
         for order in [Order::Unaided, Order::Ascending, Order::Descending] {
@@ -1089,6 +1369,43 @@ async fn sequences_from(first: u64) {
             );
         }
     }
+}
+
+/// The sequences of seeds past the ones the tests above draw that remove a directory holding a
+/// committed file moved into it while another node holds that file's committed path.
+#[tokio::test]
+async fn generated_sequences_removing_past_a_taken_place() {
+    for seed in [3216, 6043] {
+        sequence_of(seed).await;
+    }
+}
+
+/// The sequences of seeds past the ones the tests above draw that move a directory holding a
+/// staged change with `lore dirty move`, which stages its whole move, and then edit a file that
+/// moved with it, which the commit takes, as it takes the content of every file staged as moved.
+#[tokio::test]
+async fn generated_sequences_moving_a_directory_holding_a_staged_change() {
+    for seed in [3406, 6929] {
+        sequence_of(seed).await;
+    }
+}
+
+/// The sequences of seeds past the ones the tests above draw that stage the removal of a new file,
+/// which leaves nothing staged, and that remove a file in a directory a staged move displaces,
+/// whose removal leaves the revision with the directory.
+#[tokio::test]
+async fn generated_sequences_past_a_dropped_add_and_a_displaced_removal() {
+    for seed in [4132, 9591] {
+        sequence_of(seed).await;
+    }
+}
+
+/// The sequence of a seed past the ones the tests above draw that removes a directory a staged
+/// move took a file out of, which the commit deletes with everything below it, as the directory is
+/// staged for its rehash and gone.
+#[tokio::test]
+async fn generated_sequences_removing_a_directory_a_staged_move_left() {
+    sequence_of(8543).await;
 }
 
 #[tokio::test]

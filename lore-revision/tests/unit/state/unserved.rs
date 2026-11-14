@@ -1160,18 +1160,16 @@ async fn an_unserved_mark_keeps_a_clean_directorys_staged_action() {
         assert!(held.is_staged_move(), "the staged move stands");
         assert!(held.is_dirty());
 
-        // A forced base mark of a dirty node replaces its action, as before.
+        // A forced mark keeps it too.
         mark(
             &state,
             &repository,
             t.c,
-            Mark::dirty(NodeFlags::Dirty, Ext::Keep, true),
+            Mark::dirty(NodeFlags::DirtyDelete, Ext::Keep, true),
         )
         .await;
-        assert_eq!(
-            record(&state, &repository, t.c).await.flags & NodeFlags::ActionBits.bits(),
-            0
-        );
+        let held = record(&state, &repository, t.c).await;
+        assert!(held.is_staged_move() && !held.is_staged_delete());
     })
     .await;
 }

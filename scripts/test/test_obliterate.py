@@ -7,6 +7,7 @@ import shutil
 
 import pytest
 from error_types import AddressNotFound, LoreException
+from test_utils import status_by_path
 
 from lore import Lore
 
@@ -122,7 +123,9 @@ def test_obliterate(new_lore_repo, scratch_dir):
 @pytest.mark.parametrize(
     "by_path,superseded", [(False, False), (True, False), (False, True)]
 )
-@pytest.mark.own_vfs("expects a clone or sync to fail on obliterated content, which a virtual clone reads only when a file is read")
+@pytest.mark.own_vfs(
+    "expects a clone or sync to fail on obliterated content, which a virtual clone reads only when a file is read"
+)
 def test_obliterate_warns_before_reporting_deletion_and_still_removes_content(
     new_lore_repo, by_path, superseded
 ):
@@ -168,7 +171,9 @@ def test_obliterate_warns_before_reporting_deletion_and_still_removes_content(
             repo.clone()
 
 
-@pytest.mark.own_vfs("expects a clone or sync to fail on obliterated content, which a virtual clone reads only when a file is read")
+@pytest.mark.own_vfs(
+    "expects a clone or sync to fail on obliterated content, which a virtual clone reads only when a file is read"
+)
 @pytest.mark.smoke
 def test_clone_and_sync_materialize_available_files_after_obliteration(
     new_lore_repo, scratch_dir
@@ -285,6 +290,39 @@ def test_obliterate_removes_only_the_addressed_instance(new_lore_repo):
             "the same content elsewhere in the repository survives"
         )
     with open(os.path.join(repo_b.clone().path, "twin.txt"), "rb") as kept:
-        assert kept.read() == shared, (
-            "the same content in another repository survives"
-        )
+        assert kept.read() == shared, "the same content in another repository survives"
+
+
+@pytest.mark.smoke
+def test_obliterate_in_a_dirty_moved_directory_stages_its_whole_move(new_lore_repo):
+    """An obliterate of a file inside a directory `lore file dirty move` moved stages the
+    directory's whole move, as staging inside it does: the directory takes a staged move, and
+    nothing below it is left marked dirty alone.
+    """
+    repo: Lore = new_lore_repo()
+    for path, content in {
+        "a/x.txt": "x\n",
+        "a/f.txt": "f\n",
+        "a/sub/g.txt": "g\n",
+    }.items():
+        repo.make_dirs(os.path.dirname(path))
+        with repo.open_file(path, "w+") as output_file:
+            output_file.write(content)
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+    os.rename(os.path.join(repo.path, "a"), os.path.join(repo.path, "b"))
+    repo.dirty_move("a", "b", offline=True)
+
+    repo.file_obliterate(path="b/x.txt", offline=True)
+
+    entries = status_by_path(repo, offline=True)
+    moved = entries.get("b")
+    assert moved is not None, f"b is not in the status: {sorted(entries)}"
+    assert moved["action"] == "move" and moved.get("fromPath") == "a", (
+        f"b must be a move from a: {moved}"
+    )
+    assert moved["flagStaged"] is True, f"b's whole move must be staged: {moved}"
+    below = {path: entry for path, entry in entries.items() if path.startswith("b/")}
+    assert all(entry["flagStaged"] for entry in below.values()), (
+        f"nothing below b may be left marked dirty alone: {below}"
+    )

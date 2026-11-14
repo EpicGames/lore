@@ -1571,7 +1571,9 @@ async fn resolve_scan_targets(
 }
 
 /// Where `path` stands before it is scanned, or `None` where neither the tree nor the working
-/// tree holds it, which is reported ignored here where `report_ignored` asks.
+/// tree holds it, which is reported ignored here where `report_ignored` asks. Only whether the
+/// tree holds the path is asked, so its last name stops at the first node of it
+/// ([`state::State::find_to_link`]).
 ///
 /// The filter verdict is the one [`state::diff_filesystem`] reaches for the path, asked without
 /// reporting it: the scan reports it, and only a path the scan keeps creates directory nodes.
@@ -1587,7 +1589,7 @@ fn resolve_scan_target(
 ) -> impl Future<Output = Option<ScanTarget>> + Send {
     async move {
         let (tracked, missing_below) = match state
-            .find_to_link(&repository, ROOT_NODE, path.as_str(), false)
+            .find_to_link::<false>(&repository, ROOT_NODE, path.as_str(), false)
             .await
         {
             Ok(state::PathStop {
