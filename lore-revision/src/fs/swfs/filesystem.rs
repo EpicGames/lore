@@ -7,6 +7,7 @@ use bytes::Bytes;
 use dashmap::DashSet;
 use lore_base::types::Address;
 use lore_base::types::Fragment;
+use lore_error_set::ForwardAny;
 use lore_error_set::WrapInternal;
 use lore_error_set::error_set;
 
@@ -61,10 +62,11 @@ impl SwfsFilesystem {
         // Held until the operation has thawed, so no other command freezes the mount, or thaws it,
         // while this one reads it (ADR-00026).
         let guard = self.mount.lock_operation().await?;
-        self.mount
-            .freeze(SwfsExecutionToken {})
+        let guard = self
+            .mount
+            .freeze(SwfsExecutionToken {}, guard)
             .await
-            .internal("Freezing SWFS file system")?;
+            .forward_any::<FsError>("Freezing SWFS file system")?;
         Ok(SwfsOperation {
             mount: self.mount.clone(),
             operation: parking_lot::Mutex::new(Some(guard)),
@@ -119,17 +121,27 @@ impl SwfsOperation {
     }
 
     /// Thaws the frozen filesystem, clearing the write cache where the operation wrote.
+    ///
+    /// Always attempts the thaw, whatever failed before it, as every caller that begins an
+    /// operation finalizes it, [`with_operation`] among them: an operation's freeze is ended here
+    /// or, as a last resort where SWFS couldn't finish the thaw, by the next command's freeze.
+    /// Where the files the operation wrote can't be described, the thaw applies none and the
+    /// failure is returned.
+    ///
+    /// [`with_operation`]: crate::fs::filesystem_provider::with_operation
     pub(crate) async fn finalize(&self, changes_made: bool) -> Result<(), FsError> {
         let token = SwfsExecutionToken {};
+        // The thaw releases the operation once SWFS has answered.
+        let Some(operation) = self.operation.lock().take() else {
+            return Err(FsError::internal("SWFS operation already thawed"));
+        };
         let result = self
             .mount
-            .thaw(token, changes_made, &self.touched_nodes)
+            .thaw(token, changes_made, &self.touched_nodes, operation)
             .await;
-        // Whatever the outcome, none of these writes are pending any longer, and the next command
-        // may begin its operation, which a mount still frozen will fail to freeze.
+        // Whatever the outcome, none of these writes are pending any longer.
         self.touched_nodes.clear();
-        self.operation.lock().take();
-        result.internal("Thawing SWFS file system")?;
+        result.forward_any::<FsError>("Thawing SWFS file system")?;
         Ok(())
     }
 }

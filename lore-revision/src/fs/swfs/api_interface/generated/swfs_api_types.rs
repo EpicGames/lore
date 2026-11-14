@@ -12,6 +12,7 @@ pub const SWFS_MAX_PATH: u32 = 32768;
 pub const SWFS_MAX_FILENAME_UTF16: u32 = 255;
 pub const SWFS_MAX_FILENAME_LENGTH: u32 = 765;
 pub const SWFS_BUFF_ALIGN_LG2: u32 = 16;
+pub const SWFS_STORAGE_RETRY_FOREVER: u32 = 4294967295;
 pub const SWFS_MIN_COMMIT_LG2: u32 = 16;
 pub const SWFS_MAX_COMMIT_LG2: u32 = 30;
 pub type swfs_ubyte = ::std::os::raw::c_uchar;
@@ -159,6 +160,158 @@ const _: () = {
     ["Offset of field: SWFSCallbacks::notify_delete"]
         [::std::mem::offset_of!(SWFSCallbacks, notify_delete) - 48usize];
 };
+pub const SWFSStorageMode_Enum_SWFSStorageMode_Blocks: SWFSStorageMode_Enum = 0;
+pub const SWFSStorageMode_Enum_SWFSStorageMode_Files: SWFSStorageMode_Enum = 1;
+pub type SWFSStorageMode_Enum = ::std::os::raw::c_int;
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct SWFSStorage {
+    pub mode: SWFSStorageMode_Enum,
+    pub user_data: *mut ::std::os::raw::c_void,
+    pub __bindgen_anon_1: SWFSStorage__bindgen_ty_1,
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union SWFSStorage__bindgen_ty_1 {
+    pub block: SWFSStorage__bindgen_ty_1__bindgen_ty_1,
+    pub file: SWFSStorage__bindgen_ty_1__bindgen_ty_2,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct SWFSStorage__bindgen_ty_1__bindgen_ty_1 {
+    pub read: ::std::option::Option<
+        unsafe extern "C" fn(
+            swfs_handle: SWFSHandle,
+            user_data: *mut ::std::os::raw::c_void,
+            offset: swfs_u64,
+            buff: *mut ::std::os::raw::c_void,
+            num_bytes: swfs_u32,
+        ) -> bool,
+    >,
+    pub write: ::std::option::Option<
+        unsafe extern "C" fn(
+            swfs_handle: SWFSHandle,
+            user_data: *mut ::std::os::raw::c_void,
+            offset: swfs_u64,
+            buff: *const ::std::os::raw::c_void,
+            num_bytes: swfs_u32,
+        ) -> bool,
+    >,
+    pub flush: ::std::option::Option<
+        unsafe extern "C" fn(
+            swfs_handle: SWFSHandle,
+            user_data: *mut ::std::os::raw::c_void,
+        ) -> bool,
+    >,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of SWFSStorage__bindgen_ty_1__bindgen_ty_1"]
+        [::std::mem::size_of::<SWFSStorage__bindgen_ty_1__bindgen_ty_1>() - 24usize];
+    ["Alignment of SWFSStorage__bindgen_ty_1__bindgen_ty_1"]
+        [::std::mem::align_of::<SWFSStorage__bindgen_ty_1__bindgen_ty_1>() - 8usize];
+    ["Offset of field: SWFSStorage__bindgen_ty_1__bindgen_ty_1::read"]
+        [::std::mem::offset_of!(SWFSStorage__bindgen_ty_1__bindgen_ty_1, read) - 0usize];
+    ["Offset of field: SWFSStorage__bindgen_ty_1__bindgen_ty_1::write"]
+        [::std::mem::offset_of!(SWFSStorage__bindgen_ty_1__bindgen_ty_1, write) - 8usize];
+    ["Offset of field: SWFSStorage__bindgen_ty_1__bindgen_ty_1::flush"]
+        [::std::mem::offset_of!(SWFSStorage__bindgen_ty_1__bindgen_ty_1, flush) - 16usize];
+};
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct SWFSStorage__bindgen_ty_1__bindgen_ty_2 {
+    pub root_path: *const swfs_utf8,
+    pub read: ::std::option::Option<
+        unsafe extern "C" fn(
+            swfs_handle: SWFSHandle,
+            user_data: *mut ::std::os::raw::c_void,
+            path: *const swfs_utf8,
+            offset: swfs_u64,
+            buff: *mut ::std::os::raw::c_void,
+            num_bytes: swfs_u32,
+        ) -> bool,
+    >,
+    pub write: ::std::option::Option<
+        unsafe extern "C" fn(
+            swfs_handle: SWFSHandle,
+            user_data: *mut ::std::os::raw::c_void,
+            path: *const swfs_utf8,
+            offset: swfs_u64,
+            buff: *const ::std::os::raw::c_void,
+            num_bytes: swfs_u32,
+        ) -> bool,
+    >,
+    pub flush: ::std::option::Option<
+        unsafe extern "C" fn(
+            swfs_handle: SWFSHandle,
+            user_data: *mut ::std::os::raw::c_void,
+            path: *const swfs_utf8,
+        ) -> bool,
+    >,
+    pub remove: ::std::option::Option<
+        unsafe extern "C" fn(
+            swfs_handle: SWFSHandle,
+            user_data: *mut ::std::os::raw::c_void,
+            path: *const swfs_utf8,
+        ) -> bool,
+    >,
+    pub write_event: ::std::option::Option<
+        unsafe extern "C" fn(
+            swfs_handle: SWFSHandle,
+            user_data: *mut ::std::os::raw::c_void,
+            bytes: *const ::std::os::raw::c_void,
+            num_bytes: swfs_u32,
+        ) -> bool,
+    >,
+    pub read_events: ::std::option::Option<
+        unsafe extern "C" fn(
+            swfs_handle: SWFSHandle,
+            user_data: *mut ::std::os::raw::c_void,
+            out_bytes: *mut *const ::std::os::raw::c_void,
+            out_num_bytes: *mut swfs_u32,
+        ) -> bool,
+    >,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of SWFSStorage__bindgen_ty_1__bindgen_ty_2"]
+        [::std::mem::size_of::<SWFSStorage__bindgen_ty_1__bindgen_ty_2>() - 56usize];
+    ["Alignment of SWFSStorage__bindgen_ty_1__bindgen_ty_2"]
+        [::std::mem::align_of::<SWFSStorage__bindgen_ty_1__bindgen_ty_2>() - 8usize];
+    ["Offset of field: SWFSStorage__bindgen_ty_1__bindgen_ty_2::root_path"]
+        [::std::mem::offset_of!(SWFSStorage__bindgen_ty_1__bindgen_ty_2, root_path) - 0usize];
+    ["Offset of field: SWFSStorage__bindgen_ty_1__bindgen_ty_2::read"]
+        [::std::mem::offset_of!(SWFSStorage__bindgen_ty_1__bindgen_ty_2, read) - 8usize];
+    ["Offset of field: SWFSStorage__bindgen_ty_1__bindgen_ty_2::write"]
+        [::std::mem::offset_of!(SWFSStorage__bindgen_ty_1__bindgen_ty_2, write) - 16usize];
+    ["Offset of field: SWFSStorage__bindgen_ty_1__bindgen_ty_2::flush"]
+        [::std::mem::offset_of!(SWFSStorage__bindgen_ty_1__bindgen_ty_2, flush) - 24usize];
+    ["Offset of field: SWFSStorage__bindgen_ty_1__bindgen_ty_2::remove"]
+        [::std::mem::offset_of!(SWFSStorage__bindgen_ty_1__bindgen_ty_2, remove) - 32usize];
+    ["Offset of field: SWFSStorage__bindgen_ty_1__bindgen_ty_2::write_event"]
+        [::std::mem::offset_of!(SWFSStorage__bindgen_ty_1__bindgen_ty_2, write_event) - 40usize];
+    ["Offset of field: SWFSStorage__bindgen_ty_1__bindgen_ty_2::read_events"]
+        [::std::mem::offset_of!(SWFSStorage__bindgen_ty_1__bindgen_ty_2, read_events) - 48usize];
+};
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of SWFSStorage__bindgen_ty_1"]
+        [::std::mem::size_of::<SWFSStorage__bindgen_ty_1>() - 56usize];
+    ["Alignment of SWFSStorage__bindgen_ty_1"]
+        [::std::mem::align_of::<SWFSStorage__bindgen_ty_1>() - 8usize];
+    ["Offset of field: SWFSStorage__bindgen_ty_1::block"]
+        [::std::mem::offset_of!(SWFSStorage__bindgen_ty_1, block) - 0usize];
+    ["Offset of field: SWFSStorage__bindgen_ty_1::file"]
+        [::std::mem::offset_of!(SWFSStorage__bindgen_ty_1, file) - 0usize];
+};
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of SWFSStorage"][::std::mem::size_of::<SWFSStorage>() - 72usize];
+    ["Alignment of SWFSStorage"][::std::mem::align_of::<SWFSStorage>() - 8usize];
+    ["Offset of field: SWFSStorage::mode"][::std::mem::offset_of!(SWFSStorage, mode) - 0usize];
+    ["Offset of field: SWFSStorage::user_data"]
+        [::std::mem::offset_of!(SWFSStorage, user_data) - 8usize];
+};
 pub const SWFSInitFlag_IncludeInspection: swfs_u32 = 1;
 pub const SWFSInitFlag_DontRunDriver: swfs_u32 = 2;
 pub const SWFSInitFlag_ReadOnly: swfs_u32 = 4;
@@ -240,10 +393,12 @@ pub struct SWFSInit {
     pub log_path: *const ::std::os::raw::c_char,
     pub driver_cache_mb: swfs_u32,
     pub commit_lg2: SWFSCommitLg2,
+    pub storage: *mut SWFSStorage,
+    pub storage_retry_ms: swfs_u32,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of SWFSInit"][::std::mem::size_of::<SWFSInit>() - 192usize];
+    ["Size of SWFSInit"][::std::mem::size_of::<SWFSInit>() - 208usize];
     ["Alignment of SWFSInit"][::std::mem::align_of::<SWFSInit>() - 8usize];
     ["Offset of field: SWFSInit::name"][::std::mem::offset_of!(SWFSInit, name) - 0usize];
     ["Offset of field: SWFSInit::write_dir"][::std::mem::offset_of!(SWFSInit, write_dir) - 8usize];
@@ -261,6 +416,9 @@ const _: () = {
         [::std::mem::offset_of!(SWFSInit, driver_cache_mb) - 112usize];
     ["Offset of field: SWFSInit::commit_lg2"]
         [::std::mem::offset_of!(SWFSInit, commit_lg2) - 116usize];
+    ["Offset of field: SWFSInit::storage"][::std::mem::offset_of!(SWFSInit, storage) - 192usize];
+    ["Offset of field: SWFSInit::storage_retry_ms"]
+        [::std::mem::offset_of!(SWFSInit, storage_retry_ms) - 200usize];
 };
 pub type SWFSDataCBFn = ::std::option::Option<
     unsafe extern "C" fn(

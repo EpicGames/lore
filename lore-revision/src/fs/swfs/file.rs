@@ -57,6 +57,12 @@ impl SwfsFileArray {
     }
 }
 
+impl std::fmt::Debug for SwfsFileArray {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SwfsFileArray({} files)", self.files.len())
+    }
+}
+
 /// Binary equivalent wrapper of an `SWFSFile` that owns the memory for the file name.
 #[repr(C)]
 pub struct SwfsFile {

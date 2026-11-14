@@ -54,9 +54,9 @@ SWFS_API_START
 //Error codes under SWFSResult_FirstError are HRESULTS
 typedef enum {
 	SWFSResult_Success,
-	
+
 	SWFSResult_FirstError		= 0x80000000,
-	
+
 	SWFSResult_FileNotFound,
 	SWFSResult_BufferNotAligned,				//IO buffers must be aligned to 2^SWFS_BUFF_ALIGN_LG2 bytes (64kb)
 	SWFSResult_BufferTooSmall,					//IO buffers must hold what the callback's first call asked for: the range read, rounded up to whole blocks
@@ -89,7 +89,7 @@ typedef enum {
 										NODE_MOD_FLAG_XM(BlockReserve				, 'V', 13)	\
 										NODE_MOD_FLAG_XM(BlockAlloc					, 'M', 14)	\
 										NODE_MOD_FLAG_XM(ChangedWhileFrozen			, 'F', 15)	\
-										
+
 
 #define NODE_MOD_FLAG_XM(name, flag_char, bit,  ...)	static const swfs_u32 SWFSNodeModFlag_##name = 1u << (bit);
 NODE_MOD_FLAG_XM_LIST
@@ -176,6 +176,68 @@ typedef struct {
 	SWFSNotifyDeleteFn *		notify_delete;
 } SWFSCallbacks;
 
+//optional (SWFSInit::storage): all of swfs's file writing, overridden, in one of two modes.
+//
+//SWFSStorageMode_Blocks - the store's own I/O.  Every read and write of the store (file data, the event log, block hashes) goes
+//through storage.block instead of the swfs_datablock_* files in write_dir, the bytes exactly as swfs would have written
+//them.  offset is a byte offset into the whole store: block index << 16, plus an offset inside the block for the event
+//log's partial commits.  The store has no size: a write may land at any offset, and anything never written reads as
+//zeros (a sparse file, or a blob store that returns zeros for what it does not hold, does both).  A new store is one
+//nothing was ever written to.
+//  read		num_bytes at offset into buff, all of them: zeros for whatever was never written
+//  write		num_bytes from buff at offset
+//  flush		everything written so far made durable
+//
+//SWFSStorageMode_Files - one ordinary file per volume file, through storage.file.  The I/O is block mode's, addressed by
+//file instead of by store offset: everything swfs keeps about the volume - the tree, names, sizes, which blocks of a file
+//hold data - is in the event log, and a file's data is at root_path\<n>, n its node index in decimal, block i of it at byte
+//offset i << 16.  swfs writes whole 64 KiB blocks, so a file in root_path is at least its volume file's size rounded up to
+//a block, and a truncate does not shorten it: the bytes past the new size are what a crash may still need, as block mode
+//keeps a freed block until the event that frees it is durable.  The file is removed once its node is freed and that is
+//durable.  Directories have no file and no directory is made: root_path has to exist.  path is root_path, the platform's
+//separator and the number.
+//The event log is a byte stream of its own, never a file.  After a crash root_path may hold files no node has any more
+//(the free was durable, the removal not).  They are harmless: swfs only reads the blocks the log says it wrote, and a node
+//that gets the number again writes over them.
+//  read		num_bytes at offset into buff, all of them; zeros past the end of the file, or with no file
+//  write		num_bytes from buff at offset; creates the file if it does not exist, a write past its end extends it
+//  flush		the file's data made durable; true if there is no file
+//  remove		the file; true if there is none
+//  write_event	num_bytes appended to the event log, durable when it returns
+//  read_events	at swfsInit(): the event log back, in order - exactly the bytes write_event was given, keeping them is the
+//				client's responsibility.  Each call sets *out_bytes and *out_num_bytes to the bytes of one or more whole
+//				write_event calls (all of them at once is fine: a file mapped or read whole), in the client's memory until
+//				the next call; *out_num_bytes 0 at the end.  A write_event a crash cut short may be handed back as it is
+//
+//Either mode: called from swfs's io threads (SWFSInit::num_write_threads), synchronously, so they have to be thread-safe.
+#define SWFS_STORAGE_RETRY_FOREVER	0xFFFFFFFFu
+
+typedef enum {
+	SWFSStorageMode_Blocks,
+	SWFSStorageMode_Files,
+} SWFSStorageMode_Enum;
+
+typedef struct {
+	SWFSStorageMode_Enum		mode;		//which of block and file below is set
+	void *						user_data;
+	union {
+		struct {
+			bool	(*read)		(SWFSHandle swfs_handle, void *user_data, swfs_u64 offset, void *buff, swfs_u32 num_bytes);
+			bool	(*write)	(SWFSHandle swfs_handle, void *user_data, swfs_u64 offset, const void *buff, swfs_u32 num_bytes);
+			bool	(*flush)	(SWFSHandle swfs_handle, void *user_data);
+		} block;
+		struct {
+			const swfs_utf8 *	root_path;
+			bool	(*read)			(SWFSHandle swfs_handle, void *user_data, const swfs_utf8 *path, swfs_u64 offset, void *buff, swfs_u32 num_bytes);
+			bool	(*write)		(SWFSHandle swfs_handle, void *user_data, const swfs_utf8 *path, swfs_u64 offset, const void *buff, swfs_u32 num_bytes);
+			bool	(*flush)		(SWFSHandle swfs_handle, void *user_data, const swfs_utf8 *path);
+			bool	(*remove)		(SWFSHandle swfs_handle, void *user_data, const swfs_utf8 *path);
+			bool	(*write_event)	(SWFSHandle swfs_handle, void *user_data, const void *bytes, swfs_u32 num_bytes);
+			bool	(*read_events)	(SWFSHandle swfs_handle, void *user_data, const void **out_bytes, swfs_u32 *out_num_bytes);
+		} file;
+	};
+} SWFSStorage;
+
 static const swfs_u32 SWFSInitFlag_IncludeInspection				= 1;
 static const swfs_u32 SWFSInitFlag_DontRunDriver					= 2;	//used for tools that don't want to mount a drive but want it loaded
 static const swfs_u32 SWFSInitFlag_ReadOnly							= 4;	//drive is mounted but no writes can happen.  No backing store is created
@@ -240,6 +302,13 @@ typedef struct {
 
 	//optional: the state tables' commit steps (SWFSCommitLg2 above); any left 0 take their defaults
 	SWFSCommitLg2				commit_lg2;
+
+	//optional: swfs's file writing, overridden (SWFSStorage above); NULL keeps the swfs_datablock_* files in write_dir.
+	//Copied at swfsInit(); every function of the mode's struct is required
+	SWFSStorage *				storage;
+	//optional: how long a failing storage call is retried before it is a fatal error, in ms; 0 takes 10000,
+	//SWFS_STORAGE_RETRY_FOREVER never gives up
+	swfs_u32					storage_retry_ms;
 } SWFSInit;
 
 //To use: call 2x. Once with start_buff == NULL to ask for a buffer of num_bytes, and once with
@@ -253,13 +322,25 @@ SWFS_API_FN	void		swfsInit				(SWFSInit *init, SWFSHandle *out_swfs_handle);
 //a client still writing through the mount is given 10 s, then what it has not finished is lost
 SWFS_API_FN	void		swfsClose				(SWFSHandle swfs_handle);
 SWFS_API_FN bool		swfsIsBusy				(SWFSHandle swfs_handle);
-SWFS_API_FN	bool		swfsFreeze				(SWFSHandle swfs_handle, SWFSDataCBFn *cb_fn, void *cb_user_data);		//cb_fn is called once with a linked list of SWFSFile *.  Set mod_flags bit SWFSNodeModFlag_DontFreeze for each file you don't want included in a freeze. SWFS owns the data, do not free it
+//swfsFreeze() and swfsThaw() queue the work and the work thread does it: wait_ms says whether the call waits for that.
+//  wait_ms < 0   no wait: true means queued, swfsIsFrozen() turns once the work is done
+//  wait_ms == 0  wait until it is done, however long
+//  wait_ms > 0   wait at most that many milliseconds
+//With a wait, true means done: the freeze taken, or the thaw over and the driver caught up with it (swfsIsFrozen() false).
+//false is one of two things:
+//  refused       nothing was queued and nothing will happen (already frozen or a freeze queued, the driver's writes not
+//                getting through, ...); there is no wait
+//  not done yet  queued, but the wait ended first: the time ran out, the store is closing (or has no driver attached),
+//                or the call was made on swfs's own work thread (a callback), which a wait would deadlock.  The queued
+//                work is still done: swfsIsFrozen() tells when
+//A freeze's snapshot is what applications had completed at the call: they are held from the call until it is taken
+SWFS_API_FN	bool		swfsFreeze				(SWFSHandle swfs_handle, SWFSDataCBFn *cb_fn, void *cb_user_data, int wait_ms);		//cb_fn is called once with a linked list of SWFSFile *.  Set mod_flags bit SWFSNodeModFlag_DontFreeze for each file you don't want included in a freeze. SWFS owns the data, do not free it
 //files: a linked list of what the client committed to the source, by path, in the source's terms (a directory has
 //A named file takes the source's state and comes off the modified list.  A named directory is relisted against the
 //source: its unmodified files are refreshed, names the source added or removed come and go - but nothing below it is
 //committed: a modified file in it, held by the freeze or not, stays modified until a thaw names the file itself.  A name the user
 //touched while frozen keeps the swfs version.  NULL names nothing: the freeze ends and the list is as it was.
-SWFS_API_FN	bool		swfsThaw				(SWFSHandle swfs_handle, const SWFSFile *files);
+SWFS_API_FN	bool		swfsThaw				(SWFSHandle swfs_handle, const SWFSFile *files, int wait_ms);	//wait_ms: as swfsFreeze()'s
 SWFS_API_FN bool		swfsIsFrozen			(SWFSHandle swfs_handle);
 SWFS_API_FN swfs_u32	swfsGetFrozenFileList	(SWFSHandle swfs_handle, SWFSDataCBFn *cb_fn, void *cb_user_data);
 //num_bytes of a frozen file's snapshot from offset, both multiples of 2^SWFS_BUFF_ALIGN_LG2 (SWFSResult_RangeNotAligned
