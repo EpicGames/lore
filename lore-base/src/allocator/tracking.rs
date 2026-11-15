@@ -151,6 +151,19 @@ pub fn spawn_allocation_file_dump(receiver: std::sync::mpsc::Receiver<(u64, u64,
     });
 }
 
+/// Runs `f` with allocation counting and tracking suspended on the calling thread, then restores
+/// the previous state, also when `f` unwinds.
+pub(crate) fn untracked<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            IN_ALLOCATOR.with(|internal| internal.set(self.0));
+        }
+    }
+    let _restore = Restore(IN_ALLOCATOR.with(|internal| internal.replace(true)));
+    f()
+}
+
 /// Count or record, as the `tracking` options select, the allocation of `size` bytes at `ptr`.
 pub(crate) fn track_alloc(tracking: u8, ptr: *mut u8, size: usize) {
     IN_ALLOCATOR.with(|internal| {

@@ -114,6 +114,29 @@ unsafe impl GlobalAlloc for RpmallocAllocator {
 
 pub(crate) static RPMALLOC_ALLOCATOR: RpmallocAllocator = RpmallocAllocator;
 
+#[cfg(feature = "test-util")]
+thread_local! {
+    static HEAP_LOCK_WAIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `wait` the next time this thread waits for a private heap's lock, inside the wait, with
+/// tracking suspended, before the thread blocks.
+#[cfg(feature = "test-util")]
+pub fn on_next_heap_lock_wait(wait: impl FnOnce() + 'static) {
+    HEAP_LOCK_WAIT.with(|armed| *armed.borrow_mut() = Some(Box::new(wait)));
+}
+
+/// Runs the callback [`on_next_heap_lock_wait`] armed on this thread, if any.
+#[cfg(feature = "test-util")]
+fn heap_lock_wait() {
+    // A thread can allocate after its thread-locals are destroyed, so `with` would panic there.
+    if let Ok(Some(wait)) = HEAP_LOCK_WAIT.try_with(|armed| armed.borrow_mut().take()) {
+        wait();
+    }
+}
+
+#[lore_macro::test_pub]
 #[derive(Default)]
 pub struct RpmallocHeapAllocator {
     pub(crate) heap: parking_lot::Mutex<*mut std::ffi::c_void>,
@@ -134,10 +157,27 @@ impl Drop for RpmallocHeapAllocator {
     }
 }
 
+impl RpmallocHeapAllocator {
+    /// Locks the heap. Waiting for the lock parks the thread, and parking allocates `parking_lot`'s
+    /// global wait table the first time any thread parks and when a thread's first park outgrows
+    /// it. Those allocations are `parking_lot`'s own, so a wait runs untracked. An uncontended lock
+    /// is taken without touching the tracking state.
+    fn lock_heap(&self) -> parking_lot::MutexGuard<'_, *mut std::ffi::c_void> {
+        if let Some(heap) = self.heap.try_lock() {
+            return heap;
+        }
+        tracking::untracked(|| {
+            #[cfg(feature = "test-util")]
+            heap_lock_wait();
+            self.heap.lock()
+        })
+    }
+}
+
 unsafe impl GlobalAlloc for RpmallocHeapAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe {
-            let mut heap = self.heap.lock();
+            let mut heap = self.lock_heap();
             if heap.is_null() {
                 *heap = rpmalloc_heap_acquire();
             }
@@ -155,7 +195,7 @@ unsafe impl GlobalAlloc for RpmallocHeapAllocator {
             tracking::track_dealloc(ptr);
         }
         unsafe {
-            let heap = self.heap.lock();
+            let heap = self.lock_heap();
             if !heap.is_null() {
                 rpmalloc_heap_free(*heap, ptr.cast::<std::ffi::c_void>());
             }
@@ -164,7 +204,7 @@ unsafe impl GlobalAlloc for RpmallocHeapAllocator {
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe {
-            let mut heap = self.heap.lock();
+            let mut heap = self.lock_heap();
             if heap.is_null() {
                 *heap = rpmalloc_heap_acquire();
             }
@@ -179,7 +219,7 @@ unsafe impl GlobalAlloc for RpmallocHeapAllocator {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let new_ptr = unsafe {
-            let mut heap = self.heap.lock();
+            let mut heap = self.lock_heap();
             if heap.is_null() {
                 *heap = rpmalloc_heap_acquire();
             }

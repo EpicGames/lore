@@ -23,6 +23,8 @@ pub use heapbuf::HeapBuf;
 pub use rpmalloc::RpmallocGlobalStatistics;
 pub use rpmalloc::RpmallocHeapAllocator;
 pub use rpmalloc::RpmallocHeapStatistics;
+#[cfg(feature = "test-util")]
+pub use rpmalloc::on_next_heap_lock_wait;
 
 /// Function that allocates a block of memory with the given alignment and size.
 pub type LoreAllocFn = unsafe extern "C" fn(align: usize, size: usize) -> *mut std::ffi::c_void;
