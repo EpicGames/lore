@@ -7,6 +7,7 @@
 use lore_base::types::Hash;
 use lore_revision::branch;
 use lore_revision::branch::BranchLatestStatus;
+use lore_revision::branch::push::RecordedLocalLatest;
 use lore_revision::branch::push::record_pushed_latest;
 use lore_revision::find;
 
@@ -60,11 +61,16 @@ async fn store_records_as_on_disk(instance: &Instance, previous: Hash, latest: H
     branch::store_last_sync(repository.clone(), instance.main, latest).await;
 }
 
-/// Records `pushed`, answering whether the local latest is `pushed` or on its history.
-async fn record(instance: &Instance, pushed: Hash) -> bool {
-    record_pushed_latest(&instance.repository, instance.main, pushed, false)
+/// Records `pushed` over a local latest `accepted` names, answering whether the local latest is one.
+async fn record_over(instance: &Instance, pushed: Hash, accepted: RecordedLocalLatest) -> bool {
+    record_pushed_latest(&instance.repository, instance.main, pushed, accepted, false)
         .await
         .expect("Failed to record the pushed revision")
+}
+
+/// Records `pushed`, answering whether the local latest is `pushed` or on its history.
+async fn record(instance: &Instance, pushed: Hash) -> bool {
+    record_over(instance, pushed, RecordedLocalLatest::AtOrBehind).await
 }
 
 #[tokio::test]
@@ -173,9 +179,15 @@ async fn a_dry_run_records_nothing() {
         store_records_as_on_disk(&instance, pushed, parent).await;
         let before = records(&instance).await;
 
-        let covered = record_pushed_latest(&instance.repository, instance.main, pushed, true)
-            .await
-            .expect("Failed to check the pushed revision");
+        let covered = record_pushed_latest(
+            &instance.repository,
+            instance.main,
+            pushed,
+            RecordedLocalLatest::AtOrBehind,
+            true,
+        )
+        .await
+        .expect("Failed to check the pushed revision");
 
         assert!(covered);
         assert_eq!(records(&instance).await, before);
@@ -260,6 +272,42 @@ async fn a_history_walk_stops_at_its_search_limit() {
             assert!(
                 !find::is_on_history(repository.clone(), latest, ancestor, number, Some(3)).await
             );
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_local_latest_behind_the_pushed_revision_is_advanced_where_only_behind_is_accepted() {
+    run(
+        "interrupted-push-behind-only",
+        &TREE,
+        |instance| async move {
+            let (parent, _, _) = records(&instance).await;
+            let pushed = commit_change(&instance, "a.txt", "Second").await;
+            store_records_as_on_disk(&instance, pushed, parent).await;
+
+            assert!(record_over(&instance, pushed, RecordedLocalLatest::Behind).await);
+
+            assert_eq!(records(&instance).await, (pushed, false, pushed));
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_local_latest_at_the_pushed_revision_is_kept_where_only_behind_is_accepted() {
+    run(
+        "interrupted-push-at-behind-only",
+        &TREE,
+        |instance| async move {
+            let pushed = commit_change(&instance, "a.txt", "Second").await;
+            let before = records(&instance).await;
+            assert!(before.1, "A commit marks the local latest divergent");
+
+            assert!(!record_over(&instance, pushed, RecordedLocalLatest::Behind).await);
+
+            assert_eq!(records(&instance).await, before);
         },
     )
     .await;

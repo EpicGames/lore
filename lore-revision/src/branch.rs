@@ -1172,6 +1172,14 @@ pub async fn load_latest_divergent(
         .is_some())
 }
 
+/// The last synchronized revision stored for `branch`, without the branch point [`load_last_sync`]
+/// answers where none is stored. Zero where none is stored or it cannot be read.
+pub async fn load_stored_last_sync(repository: Arc<RepositoryContext>, branch: BranchId) -> Hash {
+    mutable_load(repository, LAST_SYNC, branch)
+        .await
+        .unwrap_or_default()
+}
+
 pub async fn load_last_sync(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
@@ -1289,6 +1297,19 @@ pub async fn store_latest(
 
 pub async fn store_last_sync(repository: Arc<RepositoryContext>, branch: BranchId, revision: Hash) {
     let _ = mutable_store(repository, LAST_SYNC, branch, revision).await;
+}
+
+/// Swaps the stored last synchronized revision of `branch` from `expected` to `revision`, an
+/// absent one holding zero. Answers whether it held `expected`.
+pub async fn swap_last_sync(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    expected: Hash,
+    revision: Hash,
+) -> Result<bool, BranchError> {
+    mutable_try_store(repository, LAST_SYNC, branch, expected, revision)
+        .await
+        .map(|held| held == expected)
 }
 
 /// Stores `latest`, a revision on the history the remote holds for `branch`, as the branch's local

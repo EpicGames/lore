@@ -858,6 +858,9 @@ impl FragmentProgress {
 
 pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 {
     let response_message = Arc::new(Mutex::new(String::new()));
+    // Reported once the push succeeds: a push that finds the remote past its revision can still
+    // fail as diverged.
+    let remote_moved_forward = Arc::new(Mutex::new(false));
 
     // The push events identify a branch by ID, so keep the names reported by the
     // `BranchPush` event of every branch the cascade visits — it precedes that
@@ -911,8 +914,13 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
                     if data.flag_link == 0 && data.flag_layer == 0 {
                         println!("Revision is already pushed and at remote latest");
                     }
-                } else if data.local_history == 0 && main_branch_prints {
-                    println!("Revision is already pushed and remote has moved forward");
+                } else if data.local_history == 0
+                    && !data.remote_revision.is_zero()
+                    && globals.force == 0
+                {
+                    if data.flag_link == 0 && data.flag_layer == 0 {
+                        *remote_moved_forward.lock() = true;
+                    }
                 } else if data.remote_history == 0 && main_branch_prints {
                     println!(
                         "Local branch is {} revision(s) ahead of remote, pushing all revisions",
@@ -1027,6 +1035,9 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
             }
             LoreEvent::Complete(data)
                 if data.status == 0 => {
+                    if *remote_moved_forward.lock() {
+                        println!("Revision is already pushed and remote has moved forward");
+                    }
                     let message = response_message.lock();
                     if !message.is_empty() {
                         println!("{}", *message);

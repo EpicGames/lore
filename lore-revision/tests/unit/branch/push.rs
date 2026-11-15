@@ -668,6 +668,7 @@ mod place {
     use std::collections::HashSet;
 
     use lore_base::types::BranchId;
+    use lore_revision::branch::BranchLatestStatus;
     use lore_revision::metadata::Metadata;
     use lore_revision::state::LinkReference;
     use lore_revision::state::State;
@@ -675,9 +676,13 @@ mod place {
     use super::*;
     use crate::branch::with_execution;
     use crate::branch::write_branch_revision;
+    use crate::paged_remote::Anchor;
+    use crate::paged_remote::ClientStores;
     use crate::paged_remote::PagedRemote;
+    use crate::paged_remote::RemoteRevision;
     use crate::paged_remote::client_on;
     use crate::paged_remote::client_stores;
+    use crate::paged_remote::remote_revision;
     use crate::paged_remote::writing_client_on;
 
     fn branch() -> BranchId {
@@ -705,6 +710,7 @@ mod place {
             remote_history: 0,
             local_history: local.len(),
             diverged: false,
+            record: None,
             revisions: local
                 .iter()
                 .map(|&revision| TargetRevision {
@@ -956,6 +962,329 @@ mod place {
                 .await
                 .unwrap_or_default();
             assert_eq!((run.is_none(), last_sync), (true, latest));
+        }))
+        .await;
+    }
+
+    /// A diverged target at `offered`, the local latest of `branch()` marked divergent, whose plan
+    /// pushes `local` and whose peer is at `remote_latest` on the branch, past it.
+    async fn diverged_target(
+        stores: &ClientStores,
+        offered: Hash,
+        local: &[Hash],
+        remote_latest: Hash,
+    ) -> PushTarget {
+        lore_revision::branch::store_latest(
+            stores.writer.clone(),
+            branch(),
+            Hash::default(),
+            offered,
+            BranchLatestStatus::Divergent,
+        )
+        .await
+        .expect("storing the local latest");
+        let client = writing_client_on(
+            stores,
+            Some(Arc::new(PagedRemote::new(branch(), remote_latest))),
+        );
+        let mut target = target(client, offered, local, vec![]).await;
+        target.plan.diverged = true;
+        target.plan.remote_latest = remote_latest;
+        target.plan.remote_metadata = Hash::from([1; 32]);
+        target
+    }
+
+    /// Refuse or recover `targets` as a push plans them, then start the push of each recovered one
+    /// with a record to write, which writes it.
+    async fn settle(targets: &mut [PushTarget]) -> Result<(), PushError> {
+        refuse_diverged_targets(targets, false).await?;
+        for target in targets.iter() {
+            if target.plan.record.is_some() {
+                start_target(target).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The local latest of `branch()`, whether it is marked divergent, and its last synchronized
+    /// revision, zero when there is none.
+    async fn records(writer: &Arc<RepositoryContext>) -> (Hash, bool, Hash) {
+        let latest = lore_revision::branch::load_latest(writer.clone(), branch())
+            .await
+            .expect("loading the local latest");
+        let divergent = lore_revision::branch::load_latest_divergent(writer.clone(), branch())
+            .await
+            .expect("loading the local latest status");
+        let last_sync = lore_revision::branch::load_last_sync(writer.clone(), branch())
+            .await
+            .unwrap_or_default();
+        (latest, divergent, last_sync)
+    }
+
+    /// How a local latest at the revision pushed is left.
+    #[derive(Clone, Copy)]
+    enum LeftBy {
+        /// A push the peer accepted, killed before it recorded the answer: divergent, as the
+        /// commit stored it, with the revision as the last synchronized one.
+        KilledPush,
+        /// A reset: divergent, with no last synchronized revision.
+        Reset,
+        /// A sync back to it: convergent, with the revision as the last synchronized one.
+        SyncBack,
+    }
+
+    /// A diverged target with nothing to send, at a local latest left as `left` says at the revision
+    /// pushed, which the remote moved past: whether the push fails, the records after it, and the
+    /// revision pushed.
+    async fn pushed_and_moved_past(left: LeftBy) -> (bool, (Hash, bool, Hash), Hash) {
+        let stores = client_stores().await;
+        let writer = &stores.writer;
+        let base = write_on_branch(writer, Hash::default(), Hash::default(), 1, "base").await;
+        let pushed = write_on_branch(writer, base, Hash::default(), 2, "pushed").await;
+        let on_top = write_on_branch(writer, pushed, Hash::default(), 3, "on top").await;
+        let mut target = diverged_target(&stores, pushed, &[], on_top).await;
+        target.plan.local_history = 0;
+        match left {
+            LeftBy::KilledPush => {
+                lore_revision::branch::store_last_sync(writer.clone(), branch(), pushed).await;
+            }
+            LeftBy::Reset => {
+                lore_revision::branch::store_last_sync(writer.clone(), branch(), Hash::default())
+                    .await;
+            }
+            LeftBy::SyncBack => {
+                lore_revision::branch::store_latest(
+                    writer.clone(),
+                    branch(),
+                    pushed,
+                    pushed,
+                    BranchLatestStatus::Convergent,
+                )
+                .await
+                .expect("storing the local latest convergent");
+                lore_revision::branch::store_last_sync(writer.clone(), branch(), pushed).await;
+            }
+        }
+        let mut targets = [target];
+
+        let refused = settle(&mut targets).await;
+
+        (refused.is_err(), records(writer).await, pushed)
+    }
+
+    /// A local latest a push the peer accepted left unrecorded, killed before another instance
+    /// pushed on top, is recorded convergent.
+    #[tokio::test]
+    async fn a_revision_a_killed_push_left_that_the_remote_moved_past_is_recorded() {
+        Box::pin(with_execution(async {
+            let (refused, records, pushed) = pushed_and_moved_past(LeftBy::KilledPush).await;
+            assert_eq!((refused, records), (false, (pushed, false, pushed)));
+        }))
+        .await;
+    }
+
+    /// The same local latest left by a reset, or by a sync back to it, still fails as diverged.
+    #[tokio::test]
+    async fn a_revision_reset_or_synced_back_to_that_the_remote_moved_past_diverges() {
+        Box::pin(with_execution(async {
+            let (reset, reset_records, pushed) = pushed_and_moved_past(LeftBy::Reset).await;
+            let (synced, synced_records, _) = pushed_and_moved_past(LeftBy::SyncBack).await;
+            assert_eq!(
+                (reset, reset_records.1, synced, synced_records.1),
+                (true, true, true, false),
+                "{pushed}"
+            );
+        }))
+        .await;
+    }
+
+    /// The revisions a remote changed after planning is built from: `base`, the parent of the
+    /// revision pushed; `planned`, the remote latest planning found, past the revision pushed; and
+    /// two revisions only the remote holds: `further`, past `planned`, and `beside`, on a line off
+    /// `base` without the revision pushed.
+    struct Lines {
+        base: Hash,
+        planned: Hash,
+        further: RemoteRevision,
+        beside: RemoteRevision,
+    }
+
+    impl Lines {
+        /// The remote at `latest` on the branch, with metadata.
+        fn at(latest: Hash) -> PagedRemote {
+            PagedRemote::new(branch(), latest).metadata(Hash::from([1; 32]))
+        }
+
+        /// The remote at `further`, which it lists above `planned`.
+        fn moved_further(&self) -> PagedRemote {
+            let further = self.further.signature;
+            Self::at(further).holding([&self.further]).page(
+                Anchor::Signature(further),
+                vec![(4, further)],
+                self.planned,
+            )
+        }
+
+        /// The remote force-pushed to `beside`, which it lists above `base`.
+        fn force_pushed(&self) -> PagedRemote {
+            let beside = self.beside.signature;
+            Self::at(beside).holding([&self.beside]).page(
+                Anchor::Signature(beside),
+                vec![(3, beside)],
+                self.base,
+            )
+        }
+    }
+
+    /// How a target recovered from a killed push at a revision the remote moved past starts, on the
+    /// remote `changed` builds from [`Lines`] after planning.
+    struct Started {
+        /// Whether the remote holds the revision pushed, `None` where asking fails.
+        held: Option<bool>,
+        refused: bool,
+        records: (Hash, bool, Hash),
+        pushed: Hash,
+    }
+
+    /// Recover a target, put it on the remote `changed` builds, and start its push ([`Started`]).
+    async fn recovered_then_changed(changed: impl FnOnce(&Lines) -> PagedRemote) -> Started {
+        let stores = client_stores().await;
+        let writer = &stores.writer;
+        let base = write_on_branch(writer, Hash::default(), Hash::default(), 1, "base").await;
+        let pushed = write_on_branch(writer, base, Hash::default(), 2, "pushed").await;
+        let planned = write_on_branch(writer, pushed, Hash::default(), 3, "on top").await;
+        let lines = Lines {
+            base,
+            planned,
+            further: remote_revision(4, planned, Hash::from([0xA0; 32])).await,
+            beside: remote_revision(3, base, Hash::from([0xB0; 32])).await,
+        };
+        let mut target = diverged_target(&stores, pushed, &[], planned).await;
+        target.plan.local_history = 0;
+        lore_revision::branch::store_last_sync(writer.clone(), branch(), pushed).await;
+        let mut targets = [target];
+        refuse_diverged_targets(&mut targets, false)
+            .await
+            .expect("a killed push left the revision unrecorded");
+        let [mut target] = targets;
+        target.repository = writing_client_on(&stores, Some(Arc::new(changed(&lines))));
+        target.plan.remote = target
+            .repository
+            .remote()
+            .await
+            .expect("the client is connected");
+
+        let held = remote_holds_recorded(&target, pushed).await.ok();
+        let started = start_target(&target).await;
+
+        Started {
+            held,
+            refused: started.is_err_and(|err| err.is_internal()),
+            records: records(writer).await,
+            pushed,
+        }
+    }
+
+    /// A recovered target whose remote is still at the planned latest, or moved further on to a
+    /// revision only the remote holds, as its push starts is recorded convergent.
+    #[tokio::test]
+    async fn a_recovered_target_the_remote_still_holds_is_recorded() {
+        Box::pin(with_execution(async {
+            let unchanged = recovered_then_changed(|lines| Lines::at(lines.planned)).await;
+            let further = recovered_then_changed(Lines::moved_further).await;
+            for started in [unchanged, further] {
+                assert_eq!(
+                    (started.held, started.refused, started.records),
+                    (Some(true), false, (started.pushed, false, started.pushed))
+                );
+            }
+        }))
+        .await;
+    }
+
+    /// A recovered target whose remote, between planning and the start of its push, is
+    /// force-pushed to a line without its revision, archived, gone, emptied, moved to a revision it
+    /// does not list, or reset behind the revision fails as diverged and keeps its local latest
+    /// divergent.
+    #[tokio::test]
+    async fn a_recovered_target_the_remote_dropped_since_planning_diverges() {
+        Box::pin(with_execution(async {
+            let force_pushed = recovered_then_changed(Lines::force_pushed).await;
+            let archived = recovered_then_changed(|lines| Lines::at(lines.planned).deleted()).await;
+            let gone = recovered_then_changed(|_lines| {
+                Lines::at(Hash::default()).refusing(ProtocolError::from(lore_base::error::NotFound))
+            })
+            .await;
+            let emptied = recovered_then_changed(|_lines| Lines::at(Hash::default())).await;
+            let unlisted = recovered_then_changed(|lines| Lines::at(lines.further.signature)).await;
+            let behind = recovered_then_changed(|lines| Lines::at(lines.base)).await;
+            for started in [force_pushed, archived, gone, emptied, unlisted, behind] {
+                assert_eq!(
+                    (started.held, started.refused, started.records.1),
+                    (Some(false), true, true)
+                );
+            }
+        }))
+        .await;
+    }
+
+    /// Planning a push that then fails writes no record: a target recovered from a killed push,
+    /// beside a layer that has diverged, keeps its local latest as it was.
+    #[tokio::test]
+    async fn a_push_that_fails_while_it_plans_records_nothing() {
+        Box::pin(with_execution(async {
+            let stores = client_stores().await;
+            let writer = &stores.writer;
+            let base = write_on_branch(writer, Hash::default(), Hash::default(), 1, "base").await;
+            let pushed = write_on_branch(writer, base, Hash::default(), 2, "pushed").await;
+            let on_top = write_on_branch(writer, pushed, Hash::default(), 3, "on top").await;
+            let mut root = diverged_target(&stores, pushed, &[], on_top).await;
+            root.plan.local_history = 0;
+            lore_revision::branch::store_last_sync(writer.clone(), branch(), pushed).await;
+
+            let layered = client_stores().await;
+            let lone = write_on_branch(&layered.writer, base, Hash::default(), 2, "lone").await;
+            let other = write_on_branch(&layered.writer, base, Hash::default(), 2, "other").await;
+            let mut layer = diverged_target(&layered, lone, &[lone], other).await;
+            layer.repository = layer.repository.to_layer_context(layer.repository.id).await;
+            layer.mount = Some(Mount::Layer("lay".into()));
+            let mut targets = [root, layer];
+
+            let refused = refuse_diverged_targets(&mut targets, false).await;
+
+            assert_eq!(
+                (refused.is_err(), records(writer).await),
+                (true, (pushed, true, pushed))
+            );
+        }))
+        .await;
+    }
+
+    /// A target recorded at a revision the remote moved past, then extended to a revision a link
+    /// names on top of it, fails as diverged before anything is pushed.
+    #[tokio::test]
+    async fn a_recorded_target_the_remote_moved_past_is_not_extended() {
+        Box::pin(with_execution(async {
+            let stores = client_stores().await;
+            let writer = &stores.writer;
+            let base = write_on_branch(writer, Hash::default(), Hash::default(), 1, "base").await;
+            let pushed_revision = write_on_branch(writer, base, Hash::default(), 2, "pushed").await;
+            let on_top =
+                write_on_branch(writer, pushed_revision, Hash::default(), 3, "on top").await;
+            let newer = write_on_branch(writer, pushed_revision, Hash::default(), 3, "newer").await;
+            let mut target = diverged_target(&stores, pushed_revision, &[], on_top).await;
+            target.plan.local_history = 0;
+            lore_revision::branch::store_last_sync(writer.clone(), branch(), pushed_revision).await;
+            let mut targets = [target];
+            settle(&mut targets)
+                .await
+                .expect("a killed push left the revision unrecorded");
+            let [mut target] = targets;
+            target.pending = vec![newer];
+
+            let extended = place_pending(&mut target).await;
+
+            assert!(extended.is_err_and(|err| err.is_internal()));
         }))
         .await;
     }

@@ -647,6 +647,9 @@ struct TargetPlan {
     local_history: usize,
     /// Whether the peer holds revisions on the branch that the local history does not.
     diverged: bool,
+    /// The local latest a target recovered from a killed push records as its push starts, so that
+    /// planning a push that fails writes nothing. Boxed: a plan rarely holds one.
+    record: Option<Box<Record>>,
     /// The revisions to push, each line a merge names before the local revisions that name it.
     revisions: Vec<TargetRevision>,
     pushed: HashSet<Hash>,
@@ -742,7 +745,7 @@ async fn collect_targets(
     };
 
     plan_requests(&mut collection).await?;
-    refuse_diverged_targets(&collection.targets, fast_forward_merge).await?;
+    refuse_diverged_targets(&mut collection.targets, fast_forward_merge).await?;
     join_latest_links(&mut collection).await?;
     loop {
         let placed = place_all_pending(&mut collection.targets).await?;
@@ -969,6 +972,21 @@ async fn extend_plan(
         target.latest
     );
     let plan = &mut target.plan;
+    // A plan with no local revisions to send, as one recovered from a killed push is, lands the
+    // revisions it is extended to on its revision, which must be the peer's latest; a plan the
+    // peer has moved past is diverged.
+    if !plan.diverged
+        && !plan.remote_latest.is_zero()
+        && target.latest != plan.remote_latest
+        && !plan.revisions.iter().any(|pushed| pushed.local)
+    {
+        lore_debug!(
+            "Not extending the push to {revision}, onto {} where the remote is at {}",
+            target.latest,
+            plan.remote_latest
+        );
+        return Err(diverged_error());
+    }
     let (local, merges) = read_history(&target.repository, line).await?;
     let mut visited = plan.pushed.clone();
     visited.extend(line.iter().copied());
@@ -1199,27 +1217,61 @@ fn order_targets(targets: Vec<PushTarget>) -> (Vec<PushTarget>, Vec<TargetOrder>
 /// diverged: the peer holds revisions on its branch that the local history does not. A forced push
 /// or a fast-forward merge leaves that to the peer, as does a linked repository, whose refusal
 /// fails as [`LinkDivergent`].
+///
+/// A target whose revision the peer holds already, as a killed push leaves it, records that
+/// revision and pushes nothing, rather than failing ([`recover_diverged`]).
+#[lore_macro::test_pub]
 async fn refuse_diverged_targets(
-    targets: &[PushTarget],
+    targets: &mut [PushTarget],
     fast_forward_merge: bool,
 ) -> Result<(), PushError> {
     if fast_forward_merge || execution_context().globals().force() {
         return Ok(());
     }
     let mut failures = vec![];
-    for (position, target) in targets.iter().enumerate() {
+    for position in 0..targets.len() {
+        let target = &targets[position];
         if target.repository.is_link() || !target.plan.diverged {
             continue;
         }
-        send_branch_push_event(target);
-        lore_debug!("Branch divergence detected on branch {}", target.branch);
-        let err = PushError::internal("Branch has diverged, sync to merge remote changes");
+        let err = match Box::pin(recover_diverged(&mut targets[position])).await {
+            Ok(true) => continue,
+            Ok(false) => {
+                lore_debug!(
+                    "Branch divergence detected on branch {}",
+                    targets[position].branch
+                );
+                diverged_error()
+            }
+            Err(err) => err,
+        };
+        send_branch_push_event(&targets[position]);
         failures.push(failed_push(err, targets, position).await);
     }
     if failures.is_empty() {
         return Ok(());
     }
     Err(report_failures(failures))
+}
+
+/// Recover `target`, a diverged target of the pushing repository or a layer, where the peer holds
+/// its revision already ([`record_pushed_divergent`]): leave it pushing nothing. Answers whether it
+/// did; a target it did not recover is left diverged.
+///
+/// Boxed by its callers as the cold path: it runs only where a push would fail as diverged.
+async fn recover_diverged(target: &mut PushTarget) -> Result<bool, PushError> {
+    let outcome = Box::pin(record_pushed_divergent(target)).await;
+    let plan = &mut target.plan;
+    match outcome? {
+        DivergedTarget::Diverged => Ok(false),
+        DivergedTarget::Recorded { record } => {
+            plan.diverged = false;
+            plan.record = Some(Box::new(record));
+            plan.revisions.clear();
+            plan.pushed.clear();
+            Ok(true)
+        }
+    }
 }
 
 /// Push every target, [`MAX_CONCURRENT_TARGETS`] at once. A failed target holds back the targets
@@ -1734,6 +1786,7 @@ async fn plan_target(
         remote_history: remote_history.len(),
         local_history: local_history.len(),
         diverged: !branch_remote.is_empty(),
+        record: None,
         revisions: vec![],
         pushed: HashSet::new(),
         peer_latest: vec![(branch, created_latest)],
@@ -1845,6 +1898,8 @@ async fn push_target(
 
 /// Start the push of `target`: announce it, and create its branch on the peer where the peer holds
 /// none, or holds it deleted. Returns what pushing its revisions keeps, or `None` when it has none.
+/// A target recovered from a killed push writes its record where the peer's branch still holds
+/// the recorded revision ([`remote_holds_recorded`]), and fails as diverged where it does not.
 #[lore_macro::test_pub]
 async fn start_target(target: &PushTarget) -> Result<Option<TargetRun>, PushError> {
     let repository = &target.repository;
@@ -1869,11 +1924,30 @@ async fn start_target(target: &PushTarget) -> Result<Option<TargetRun>, PushErro
                 repository,
                 branch,
                 target.latest,
+                RecordedLocalLatest::AtOrBehind,
                 dry_run,
             ))
             .await?;
         }
         return Ok(None);
+    }
+
+    if let Some(record) = &plan.record {
+        if !Box::pin(remote_holds_recorded(target, record.pushed)).await? {
+            lore_debug!(
+                "Branch divergence detected on branch {branch}, the remote no longer holds {}",
+                record.pushed
+            );
+            return Err(diverged_error());
+        }
+        Box::pin(record_pushed_latest(
+            repository,
+            branch,
+            record.pushed,
+            record.accepted,
+            dry_run,
+        ))
+        .await?;
     }
 
     let mut remote_latest = plan.remote_latest;
@@ -2147,16 +2221,146 @@ async fn finish_target(target: &PushTarget, run: &TargetRun) -> Result<(), PushE
     Ok(())
 }
 
+/// What a target that would fail as diverged does instead.
+#[lore_macro::test_pub]
+#[derive(Debug, PartialEq, Eq)]
+enum DivergedTarget {
+    /// It fails as diverged.
+    Diverged,
+    /// The peer holds its revision, and it pushes nothing. `record` is written as the push starts.
+    Recorded { record: Record },
+}
+
+/// A local latest a push records over: `pushed`, a revision the peer holds, over a local latest
+/// `accepted` names ([`record_pushed_latest`]).
+#[lore_macro::test_pub]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Record {
+    pushed: Hash,
+    accepted: RecordedLocalLatest,
+}
+
+impl Record {
+    /// Whether the local latest of `branch` is one this records over, writing nothing.
+    async fn check(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        branch: BranchId,
+    ) -> Result<bool, PushError> {
+        record_pushed_latest(repository, branch, self.pushed, self.accepted, true).await
+    }
+}
+
+/// What `target`, a target that would fail as diverged, does instead.
+///
+/// With nothing local to send, the remote latest descends from the target's revision: the remote
+/// moved on past it. A local latest behind that revision is what a killed commit or sync, then a
+/// killed push of it, leaves. So is a local latest at that revision, marked divergent, with that
+/// revision as the last synchronized one ([`accepted_unrecorded`]). Any other local latest is an
+/// ordinary push of a revision the remote is past, which diverges.
+///
+/// Boxed by its caller as the cold path: it runs only where a push would fail as diverged.
+async fn record_pushed_divergent(target: &PushTarget) -> Result<DivergedTarget, PushError> {
+    let repository = &target.repository;
+    let branch = target.branch;
+    let plan = &target.plan;
+    let current = target.latest;
+    if current.is_zero()
+        || plan.remote_deleted
+        || !records_branch_latest(repository)
+        || plan.local_history != 0
+    {
+        return Ok(DivergedTarget::Diverged);
+    }
+    // Planning only asks whether the records would be written; the push writes them as it starts.
+    let accepted = if accepted_unrecorded(repository, branch, current).await {
+        RecordedLocalLatest::AtOrBehind
+    } else {
+        RecordedLocalLatest::Behind
+    };
+    let record = Record {
+        pushed: current,
+        accepted,
+    };
+    if !Box::pin(record.check(repository, branch)).await? {
+        return Ok(DivergedTarget::Diverged);
+    }
+    lore_debug!(
+        "Revision {current} is already pushed and the remote moved to {}",
+        plan.remote_latest
+    );
+    Ok(DivergedTarget::Recorded { record })
+}
+
+/// Whether the peer's branch holds `pushed`, the revision `target` was planned to record, on its
+/// history as the push starts. A force-push since planning can leave it off the history, and an
+/// archive leaves the branch deleted. A remote latest still at the planned one holds it, as
+/// planning found. A branch the peer no longer answers for, a zero remote latest, and a remote
+/// latest behind `pushed` don't hold it, so the push fails and the next one plans afresh.
+///
+/// Boxed by its caller as the cold path: it runs only for a target recovered from a killed push.
+#[lore_macro::test_pub]
+async fn remote_holds_recorded(target: &PushTarget, pushed: Hash) -> Result<bool, PushError> {
+    let plan = &target.plan;
+    let status =
+        match branch::load_remote(plan.remote.clone(), target.repository.id, target.branch).await {
+            Ok(status) => status,
+            Err(err) if err.is_branch_not_found() => return Ok(false),
+            Err(err) => return Err(err).forward::<PushError>("loading remote branch info"),
+        };
+    if status.deleted || status.latest.is_zero() {
+        return Ok(false);
+    }
+    if status.latest == plan.remote_latest {
+        return Ok(true);
+    }
+    let (_branch_point, _remote_history, local_history) =
+        history::find_branch_point(target.repository.clone(), status.latest, pushed)
+            .await
+            .forward::<PushError>("reconciling branch history")?;
+    Ok(local_history.is_empty())
+}
+
+/// Whether `current`, the local latest of `branch` that the peer holds on the branch's history, was
+/// accepted from a push from here that was killed before it recorded the answer: still marked
+/// divergent, as a commit leaves it, with `current` as its last synchronized revision, which a push
+/// stores once the peer accepts a revision. Only a stored last sync counts, not the branch point
+/// [`branch::load_last_sync`] answers in its place, so a reset, which clears it, and a sync, which
+/// stores the latest convergent, are not taken for one. Three other states read the same and are
+/// recorded too: a new branch pushed with nothing of its own, a switch with `--local` to a
+/// revision pushed before, and the revision a fast-forward merge on the remote answered with. Each
+/// local latest is a revision the peer holds on the branch's history.
+async fn accepted_unrecorded(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    current: Hash,
+) -> bool {
+    branch::load_latest_divergent(repository.clone(), branch)
+        .await
+        .unwrap_or(false)
+        && branch::load_stored_last_sync(repository.clone(), branch).await == current
+}
+
 /// Whether a push records the local latest of the branch it pushes. A layer or a link records
 /// only the last synchronized revision.
 fn records_branch_latest(repository: &RepositoryContext) -> bool {
     !repository.is_layer() && !repository.is_link()
 }
 
+/// The local latest of a branch a push records its revision over.
+#[lore_macro::test_pub]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordedLocalLatest {
+    /// The pushed revision itself, or a revision on its history.
+    AtOrBehind,
+    /// A revision on the history of the pushed revision, not the revision itself.
+    Behind,
+}
+
 /// Records `pushed`, a revision the peer holds on `branch`, as the branch's local latest and last
-/// synchronized revision where the local latest is `pushed` or on its history
-/// ([`find::is_on_history`]). Answers whether `pushed` is now, or was already, the recorded local
-/// latest. A dry run records nothing.
+/// synchronized revision where the local latest is at `pushed` or behind it, as `accepted` says,
+/// behind being on its history ([`find::is_on_history`]). Answers whether `pushed` is now, or was
+/// already, the recorded local latest. A dry run records nothing.
 ///
 /// A layer or a link records `pushed` as the last synchronized revision alone, and answers `false`.
 /// A local latest that cannot be read, or that another command moves while this records, is left
@@ -2168,6 +2372,7 @@ async fn record_pushed_latest(
     repository: &Arc<RepositoryContext>,
     branch: BranchId,
     pushed: Hash,
+    accepted: RecordedLocalLatest,
     dry_run: bool,
 ) -> Result<bool, PushError> {
     if !records_branch_latest(repository) {
@@ -2192,6 +2397,9 @@ async fn record_pushed_latest(
         }
     };
     if local_latest == pushed {
+        if accepted == RecordedLocalLatest::Behind {
+            return Ok(false);
+        }
         let diverged = branch::load_latest_divergent(repository.clone(), branch)
             .await
             .unwrap_or(true);
@@ -2246,6 +2454,12 @@ async fn local_latest_on_history(
         Some(branch::MAX_DIVERGENT_HISTORY_LENGTH),
     )
     .await
+}
+
+/// The error of a push that fails because the peer holds revisions on the branch that the local
+/// history does not.
+fn diverged_error() -> PushError {
+    PushError::internal("Branch has diverged, sync to merge remote changes")
 }
 
 /// The error of a revision offer that failed with `err`. The peer refuses an offer as an internal

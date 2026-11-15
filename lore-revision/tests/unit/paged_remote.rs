@@ -68,12 +68,13 @@ struct Page {
 /// anchor and counts the revision lists it is asked for. An anchor with no page is not found, a
 /// list for an anchor registered as failing fails, and a list for an anchor registered as stalling
 /// is never answered. A page item carries the state of a revision the remote holds, and no state
-/// otherwise. A remote with a `refusal` answers every branch query with it. It records each name a
-/// branch query asks for.
+/// otherwise. A remote with a `refusal` answers every branch query with it, and one built
+/// `deleted` answers that its branch is deleted. It records each name a branch query asks for.
 pub(crate) struct PagedRemote {
     branch: BranchId,
     latest: Hash,
     metadata: Hash,
+    deleted: bool,
     pages: Vec<Page>,
     failures: Vec<(Anchor, ProtocolError)>,
     stalls: Vec<Anchor>,
@@ -221,6 +222,7 @@ impl PagedRemote {
             branch,
             latest,
             metadata: Hash::default(),
+            deleted: false,
             pages: Vec::new(),
             failures: Vec::new(),
             stalls: Vec::new(),
@@ -237,6 +239,12 @@ impl PagedRemote {
     /// Hold the branch's metadata at `metadata`.
     pub(crate) fn metadata(mut self, metadata: Hash) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    /// Answer that the branch is deleted, as an archived branch is.
+    pub(crate) fn deleted(mut self) -> Self {
+        self.deleted = true;
         self
     }
 
@@ -755,6 +763,7 @@ impl Revision for PagedRemote {
             id: self.branch,
             latest: self.latest,
             metadata: self.metadata,
+            deleted: self.deleted,
             ..Default::default()
         })
     }

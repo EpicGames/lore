@@ -4949,6 +4949,295 @@ async fn reset_and_switch_onto_a_branch_whose_name_another_branch_holds_leave_th
     }
 }
 
+/// What happens to a branch reset's swap of the latest.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ResetSwap {
+    /// Another instance over the same store advances the branch after each read of the latest, so
+    /// the swap fails with `BranchAdvanced`.
+    Advanced,
+    /// Another instance over the same store resets the branch to the same revision once the reset
+    /// clears the last sync, so the swap fails with `BranchAdvanced`.
+    ResetAlongside,
+    /// [`ResetSwap::Advanced`], and another instance stores the revision reset to as the latest
+    /// once the reset puts the last sync back.
+    PutBackOvertaken,
+    /// The store fails the reset's clear of the last sync before its swap of the latest.
+    ClearFailed,
+    /// Another instance stores a last sync at another revision once the reset reads it.
+    ClearLost,
+    /// The store fails the swap before it lands.
+    Failed,
+    /// The swap succeeds.
+    Stored,
+}
+
+/// What [`reset_with_last_sync`] answers.
+struct ResetOutcome {
+    reset: Result<(), reset::ResetError>,
+    /// The stored last sync before the reset.
+    before: Hash,
+    /// The stored last sync after the reset.
+    after: Hash,
+    /// The latest before the reset.
+    latest_before: Hash,
+    /// The latest after the reset.
+    latest_after: Hash,
+    /// Whether the reset wrote the last sync before it swapped the latest.
+    cleared_before_swap: bool,
+}
+
+/// A write another instance makes from a [`reset_with_last_sync`] hook.
+enum PeerWrite {
+    /// The latest, and whether the last sync is then cleared, as a reset clears it.
+    Latest(Hash, bool),
+    LastSync(Hash),
+}
+
+/// A branch reset of the target of [`instance_whose_target_name_another_branch_holds`] to its
+/// branch point, the default branch's latest, which the instance is on, so the reset runs no sync.
+/// The stored last sync is at the branch point where `at_reset_revision`, and at the target's
+/// latest otherwise, and the reset goes as `swap` says.
+async fn reset_with_last_sync(at_reset_revision: bool, swap: ResetSwap) -> ResetOutcome {
+    let target = branch_id(8);
+    let (instance, _tempdir, _main, latest, target_latest) =
+        instance_whose_target_name_another_branch_holds(target).await;
+    let before = if at_reset_revision {
+        latest
+    } else {
+        target_latest
+    };
+    lore_revision::branch::store_last_sync(instance.clone(), target, before).await;
+    let token = instance
+        .try_write_token()
+        .expect("The repository was opened for writing");
+    let shared = instance
+        .try_mutable_store_arc()
+        .expect("the instance holds a write token");
+    let other = Arc::new(
+        RepositoryContext::new_with_state(
+            None,
+            instance.immutable_store(),
+            shared.clone(),
+            instance.id,
+            lore_revision::instance::InstanceId::generate(),
+            lore_revision::repository::RemoteState::Offline,
+            Arc::default(),
+            None,
+        )
+        .with_write_token(token.share()),
+    );
+    let (latest_key, _key_type) = mutable_key(instance.salt(), LATEST, instance.id, target);
+    let (last_sync_key, _key_type) = mutable_key(instance.salt(), LAST_SYNC, instance.id, target);
+    let last_sync_written = Arc::new(AtomicBool::new(false));
+    let cleared_before_swap = Arc::new(AtomicBool::new(false));
+    let seen_cleared = cleared_before_swap.clone();
+    let last_sync_swaps = Arc::new(AtomicUsize::new(0));
+    let last_sync_loads = Arc::new(AtomicUsize::new(0));
+    let clear_failures = Arc::new(AtomicUsize::new(0));
+    let advances = Arc::new(AtomicUsize::new(0));
+    let resetting = Arc::new(
+        RepositoryContext::new_with_state(
+            instance.paths.clone(),
+            instance.immutable_store(),
+            HookedStore::wrap(
+                shared,
+                move |call, key, _key_type| {
+                    let write = matches!(call, StoreCall::Store | StoreCall::CompareAndSwap);
+                    if write && key == last_sync_key {
+                        if swap == ResetSwap::ClearFailed
+                            && clear_failures.fetch_add(1, Ordering::SeqCst) == 0
+                        {
+                            return Err(StoreError::from(Disconnected));
+                        }
+                        last_sync_written.store(true, Ordering::SeqCst);
+                    }
+                    if call == StoreCall::CompareAndSwap && key == latest_key {
+                        seen_cleared
+                            .fetch_or(last_sync_written.load(Ordering::SeqCst), Ordering::SeqCst);
+                        if swap == ResetSwap::Failed {
+                            return Err(StoreError::from(Disconnected));
+                        }
+                    }
+                    Ok(())
+                },
+                answered(move |_inner, _partition, call, key, _key_type| {
+                    let other = other.clone();
+                    let advancing =
+                        matches!(swap, ResetSwap::Advanced | ResetSwap::PutBackOvertaken);
+                    let write = if advancing && call == StoreCall::Load && key == latest_key {
+                        let advance = advances.fetch_add(1, Ordering::SeqCst) as u8;
+                        Some(PeerWrite::Latest(revision(0x40 + advance), false))
+                    } else if call == StoreCall::CompareAndSwap && key == last_sync_key {
+                        match (swap, last_sync_swaps.fetch_add(1, Ordering::SeqCst)) {
+                            (ResetSwap::ResetAlongside, 0) => Some(PeerWrite::Latest(latest, true)),
+                            (ResetSwap::PutBackOvertaken, 1) => {
+                                Some(PeerWrite::Latest(latest, false))
+                            }
+                            _ => None,
+                        }
+                    } else if swap == ResetSwap::ClearLost
+                        && call == StoreCall::Load
+                        && key == last_sync_key
+                        && last_sync_loads.fetch_add(1, Ordering::SeqCst) == 0
+                    {
+                        Some(PeerWrite::LastSync(target_latest))
+                    } else {
+                        None
+                    };
+                    async move {
+                        match write {
+                            Some(PeerWrite::Latest(advance, clear)) => {
+                                let held = load_latest(other.clone(), target)
+                                    .await
+                                    .expect("the other instance reads the latest");
+                                store_latest(
+                                    other.clone(),
+                                    target,
+                                    held,
+                                    advance,
+                                    BranchLatestStatus::Divergent,
+                                )
+                                .await
+                                .expect("the other instance advances the branch");
+                                if clear {
+                                    store_last_sync(other, target, Hash::default()).await;
+                                }
+                            }
+                            Some(PeerWrite::LastSync(last_sync)) => {
+                                store_last_sync(other, target, last_sync).await;
+                            }
+                            None => {}
+                        }
+                        Ok(())
+                    }
+                }),
+            ),
+            instance.id,
+            instance.instance_id,
+            lore_revision::repository::RemoteState::Offline,
+            instance.filter.clone(),
+            Some(instance.file_system()),
+        )
+        .with_write_token(token.share()),
+    );
+
+    let reset = reset::reset(resetting, token, target.to_string(), latest.to_string()).await;
+
+    ResetOutcome {
+        reset,
+        before,
+        after: load_stored_last_sync(instance.clone(), target).await,
+        latest_before: target_latest,
+        latest_after: load_latest(instance.clone(), target)
+            .await
+            .expect("the latest reads"),
+        cleared_before_swap: cleared_before_swap.load(Ordering::SeqCst),
+    }
+}
+
+/// A branch reset whose swap of the latest another instance over the same store wins fails with
+/// `BranchAdvanced` and leaves the stored last sync as it was: one at another revision, and one at
+/// the revision reset to, which the reset clears before the swap.
+#[tokio::test]
+async fn a_reset_that_another_instance_advances_the_branch_under_keeps_the_last_sync() {
+    for at_reset_revision in [false, true] {
+        Box::pin(LORE_CONTEXT.scope(setup_test_execution(), async {
+            let outcome = reset_with_last_sync(at_reset_revision, ResetSwap::Advanced).await;
+
+            let case = format!("last sync at the reset revision {at_reset_revision}");
+            assert!(
+                outcome
+                    .reset
+                    .as_ref()
+                    .is_err_and(|err| err.is_branch_advanced()),
+                "{case}: got {:?}",
+                outcome.reset
+            );
+            assert_eq!(outcome.after, outcome.before, "{case}");
+        }))
+        .await;
+    }
+}
+
+/// A branch reset whose swap of the latest loses to another instance's reset to the same revision,
+/// before the reset puts the last sync back or after, fails with `BranchAdvanced` and leaves no
+/// stored last sync, so the latest the other instance stored does not read as a push the peer
+/// accepted and never recorded.
+#[tokio::test]
+async fn a_reset_that_loses_to_a_reset_to_the_same_revision_leaves_no_last_sync() {
+    for swap in [ResetSwap::ResetAlongside, ResetSwap::PutBackOvertaken] {
+        Box::pin(LORE_CONTEXT.scope(setup_test_execution(), async {
+            let outcome = reset_with_last_sync(true, swap).await;
+
+            assert!(
+                outcome
+                    .reset
+                    .as_ref()
+                    .is_err_and(|err| err.is_branch_advanced()),
+                "{swap:?}: got {:?}",
+                outcome.reset
+            );
+            assert_eq!(outcome.after, Hash::default(), "{swap:?}");
+        }))
+        .await;
+    }
+}
+
+/// A branch reset whose clear of a last sync at the revision reset to fails fails before it stores
+/// the latest, and leaves both records as they were.
+#[tokio::test]
+async fn a_reset_whose_clear_of_the_last_sync_fails_stores_no_latest() {
+    Box::pin(LORE_CONTEXT.scope(setup_test_execution(), async {
+        let outcome = reset_with_last_sync(true, ResetSwap::ClearFailed).await;
+
+        assert!(
+            outcome
+                .reset
+                .as_ref()
+                .is_err_and(|err| err.is_disconnected()),
+            "got {:?}",
+            outcome.reset
+        );
+        assert_eq!(
+            (outcome.latest_after, outcome.after),
+            (outcome.latest_before, outcome.before)
+        );
+    }))
+    .await;
+}
+
+/// A branch reset whose swap of the latest succeeds, or fails other than as `BranchAdvanced`,
+/// leaves no stored last sync, whether it was at the revision reset to or at another. One at the
+/// revision reset to is cleared before the swap, so a reset stopped at the swap leaves none. One
+/// another instance moves off the revision reset to before the clear is cleared after the swap.
+#[tokio::test]
+async fn a_reset_that_stores_or_fails_to_store_the_latest_clears_the_last_sync() {
+    for (swap, at_reset_revision) in [
+        (ResetSwap::Stored, false),
+        (ResetSwap::Stored, true),
+        (ResetSwap::Failed, false),
+        (ResetSwap::Failed, true),
+        (ResetSwap::ClearLost, true),
+    ] {
+        Box::pin(LORE_CONTEXT.scope(setup_test_execution(), async {
+            let outcome = reset_with_last_sync(at_reset_revision, swap).await;
+
+            let case = format!("{swap:?}, last sync at the reset revision {at_reset_revision}");
+            assert_eq!(
+                outcome.reset.is_ok(),
+                swap != ResetSwap::Failed,
+                "{case}: got {:?}",
+                outcome.reset
+            );
+            assert_eq!(outcome.after, Hash::default(), "{case}");
+            if swap != ResetSwap::ClearLost {
+                assert_eq!(outcome.cleared_before_swap, at_reset_revision, "{case}");
+            }
+        }))
+        .await;
+    }
+}
+
 /// A claim unless another branch holds the name, whose read of the mapping fails other than as not
 /// found, fails with that error and claims nothing.
 #[tokio::test]
