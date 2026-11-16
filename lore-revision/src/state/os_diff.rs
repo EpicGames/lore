@@ -3519,12 +3519,13 @@ async fn diff_filesystem_missing(
             return Ok(stats);
         }
 
-        // A file `from` holds that the revision does not, with nothing on disk, is an unstaged
-        // add the user reverted by removing it, which the walk of the directory above discards
-        // rather than reports deleted (`diff_filesystem_missing_nodes`). A walk of the path on
-        // its own, such as one a scan answered from the SWFS record makes, does the same.
+        // A file `from` holds that the revision does not, or a directory it holds as added, with
+        // nothing on disk, is an add the user reverted by removing it, which the walk of the
+        // directory above discards rather than reports deleted (`diff_filesystem_missing_nodes`).
+        // A walk of the path on its own, such as one a scan answered from the SWFS record makes,
+        // does the same.
         if intent.marks_dirty()
-            && from_node.is_file()
+            && (from_node.is_file() || (from_node.is_directory() && from_node.is_added()))
             && !in_current
             && let Some(discards) = &discards
         {

@@ -174,6 +174,14 @@ fn node_for(path: &str) -> NodeID {
         .fold(1, |node, byte| node * 31 + NodeID::from(byte))
 }
 
+/// A preparation answering nothing for each ancestor of a level.
+fn unprepared(
+    _: &[DepthPath],
+    _: &AncestorNodes<'_>,
+) -> std::future::Ready<Result<std::iter::Repeat<()>, CreateError>> {
+    std::future::ready(Ok(std::iter::repeat(())))
+}
+
 /// Each ancestor and the deepest one above it a creation was handed a node for.
 type Started = Vec<(String, Option<String>)>;
 
@@ -199,7 +207,8 @@ async fn each_level_is_created_from_the_nodes_of_the_level_above() {
             let mut record = Started::new();
             let nodes = create_shared_ancestors(
                 &ancestors,
-                |path, nodes| {
+                unprepared,
+                |path, nodes, ()| {
                     started(path, nodes, &mut record);
                     let node = node_for(path);
                     async move { Ok(Some(node)) }.boxed()
@@ -241,7 +250,8 @@ async fn an_ancestor_created_with_no_node_is_left_out() {
             let mut record = Started::new();
             let nodes = create_shared_ancestors(
                 &ancestors,
-                |path, nodes| {
+                unprepared,
+                |path, nodes, ()| {
                     started(path, nodes, &mut record);
                     let node = (path != "a").then(|| node_for(path));
                     async move { Ok(node) }.boxed()
@@ -262,6 +272,113 @@ async fn an_ancestor_created_with_no_node_is_left_out() {
         .await;
 }
 
+/// What a test of the preparation saw: a level prepared, with the ancestors the
+/// nodes handed to it name, or an ancestor's creation, with what its level's
+/// preparation answered for it.
+#[derive(Debug, PartialEq)]
+enum Prepared {
+    Level(Vec<String>, Vec<String>),
+    Created(String, String),
+}
+
+/// Prepares each level with what the nodes of the levels above name, answering
+/// each ancestor's path with `!` for its creation, recording each into `record`.
+fn prepare_recorded<'a>(
+    level: &'a [DepthPath],
+    nodes: &AncestorNodes<'a>,
+    record: &std::cell::RefCell<Vec<Prepared>>,
+) -> std::future::Ready<Result<Vec<String>, CreateError>> {
+    let mut above: Vec<String> = nodes.keys().map(|path| path.to_string()).collect();
+    above.sort_unstable();
+    let paths: Vec<String> = level
+        .iter()
+        .map(|ancestor| ancestor.path().to_string())
+        .collect();
+    let answered = paths.iter().map(|path| format!("{path}!")).collect();
+    record.borrow_mut().push(Prepared::Level(paths, above));
+    std::future::ready(Ok(answered))
+}
+
+/// Each level is prepared before any creation of it starts, with the nodes of the
+/// levels above, and each creation takes what the preparation answered for its
+/// ancestor.
+#[tokio::test]
+async fn each_level_is_prepared_before_its_creations_from_the_nodes_above() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let ancestors = shared_ancestors(&antichain(&[
+                "a/p/x", "a/p/y", "a/q/x", "a/q/y", "b/p/x", "b/p/y",
+            ]));
+            let record = std::cell::RefCell::new(Vec::new());
+            create_shared_ancestors(
+                &ancestors,
+                |level, nodes| prepare_recorded(level, nodes, &record),
+                |path, _, prepared| -> Creation {
+                    record
+                        .borrow_mut()
+                        .push(Prepared::Created(path.to_string(), prepared));
+                    let node = node_for(path);
+                    async move { Ok(Some(node)) }.boxed()
+                },
+                |_| CreateError::Joined,
+            )
+            .await
+            .expect("Every creation succeeded");
+
+            let strings = |paths: &[&str]| paths.iter().map(|path| path.to_string()).collect();
+            let created = |path: &str| Prepared::Created(path.to_string(), format!("{path}!"));
+            assert_eq!(
+                record.into_inner(),
+                vec![
+                    Prepared::Level(strings(&["a", "b"]), Vec::new()),
+                    created("a"),
+                    created("b"),
+                    Prepared::Level(strings(&["a/p", "a/q", "b/p"]), strings(&["a", "b"])),
+                    created("a/p"),
+                    created("a/q"),
+                    created("b/p"),
+                ]
+            );
+        })
+        .await;
+}
+
+/// A preparation that fails starts no creation of its level, and is the failure
+/// returned.
+#[tokio::test]
+async fn a_failed_preparation_starts_no_creation_of_its_level() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let ancestors = shared_ancestors(&antichain(&["a/p/x", "a/p/y", "b/p/x", "b/p/y"]));
+            let mut record = Started::new();
+            let result = create_shared_ancestors(
+                &ancestors,
+                |level, _| {
+                    let failed = level.iter().find(|ancestor| ancestor.depth() == 2);
+                    std::future::ready(match failed {
+                        Some(ancestor) => Err(CreateError::Failed(ancestor.path().to_string())),
+                        None => Ok(std::iter::repeat(())),
+                    })
+                },
+                |path, nodes, ()| {
+                    started(path, nodes, &mut record);
+                    let node = node_for(path);
+                    async move { Ok(Some(node)) }.boxed()
+                },
+                |_| CreateError::Joined,
+            )
+            .await;
+
+            assert_eq!(result, Err(CreateError::Failed("a/p".to_string())));
+            assert_eq!(
+                record,
+                vec![("a".to_string(), None), ("b".to_string(), None)],
+                "the level above the failed preparation was created, and none of its own"
+            );
+        })
+        .await;
+}
+
 /// A failure stops every level below it, since those would be created under a
 /// parent that may not exist.
 #[tokio::test]
@@ -272,7 +389,8 @@ async fn the_first_failure_is_returned_and_no_level_below_it_starts() {
             let mut record = Started::new();
             let result = create_shared_ancestors(
                 &ancestors,
-                |path, nodes| {
+                unprepared,
+                |path, nodes, ()| {
                     started(path, nodes, &mut record);
                     let outcome = if path == "b" {
                         Err(CreateError::Failed(path.to_string()))
@@ -312,7 +430,8 @@ async fn a_creation_in_flight_finishes_after_another_fails() {
 
             let result = create_shared_ancestors(
                 &ancestors,
-                |path, _| -> Creation {
+                unprepared,
+                |path, _, ()| -> Creation {
                     if path == "a" {
                         let (survivor_asked_for, failed) =
                             pending_failure.take().expect("One creation of a");
@@ -354,7 +473,8 @@ async fn a_creation_that_panics_is_reported_through_the_join_failure() {
             let ancestors = shared_ancestors(&antichain(&["a/x", "a/y"]));
             let result = create_shared_ancestors(
                 &ancestors,
-                |_, _| -> Creation { async { panic!("the creation panicked") }.boxed() },
+                unprepared,
+                |_, _, ()| -> Creation { async { panic!("the creation panicked") }.boxed() },
                 |_| CreateError::Joined,
             )
             .await;

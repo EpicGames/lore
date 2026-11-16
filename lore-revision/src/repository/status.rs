@@ -1686,7 +1686,8 @@ async fn create_shared_untracked_ancestors(
 
     fan_out::create_shared_ancestors(
         &ancestors,
-        |ancestor, nodes| {
+        |_, _| std::future::ready(Ok(std::iter::repeat(()))),
+        |ancestor, nodes, ()| {
             let (start, below) = match fan_out::longest_ancestor(ancestor, nodes) {
                 Some((prefix, node)) => (*node, &ancestor[prefix.len() + 1..]),
                 None => (ROOT_NODE, ancestor),

@@ -28,10 +28,33 @@ use helper::test_store_create;
 /// How many files each directory of the test holds.
 const FILES: usize = 256;
 
-/// The chain steps every thread's finds have taken.
-fn chain_steps() -> u64 {
-    step_counting::set_chain_step_counting(true);
-    step_counting::total_chain_steps()
+/// The steps every thread's finds and children walks have taken.
+#[derive(Clone, Copy)]
+struct Steps {
+    /// The steps of the finds by name.
+    finds: u64,
+    /// The steps of the children walks: the listings and the scans of a directory's children.
+    walks: u64,
+}
+
+impl Steps {
+    /// The steps taken so far.
+    fn now() -> Self {
+        step_counting::set_chain_step_counting(true);
+        Self {
+            finds: step_counting::total_chain_steps(),
+            walks: step_counting::total_walk_steps(),
+        }
+    }
+
+    /// The steps taken since `before`.
+    fn since(before: Self) -> Self {
+        let now = Self::now();
+        Self {
+            finds: now.finds - before.finds,
+            walks: now.walks - before.walks,
+        }
+    }
 }
 
 /// Writes [`FILES`] files into `dir` below `instance`.
@@ -56,16 +79,22 @@ async fn staged_steps(instance: &TestRepository, dir: &str) -> (u64, Hash) {
     lore_revision::file::dirty::dirty(instance.repository.clone(), named(instance, dir))
         .await
         .expect("the dirty marks");
-    let before = chain_steps();
+    let (steps, signature) = stage_steps(instance, named(instance, dir)).await;
+    (steps.finds, signature)
+}
+
+/// Stages `paths`, answering with the steps the stage took and the staged revision.
+async fn stage_steps(instance: &TestRepository, paths: LoreArray<LoreString>) -> (Steps, Hash) {
+    let before = Steps::now();
     let signature = lore_revision::file::stage::stage(
         instance.repository.clone(),
         &instance.write_token,
-        named(instance, dir),
+        paths,
         StageOptions::default(),
     )
     .await
     .expect("the stage");
-    (chain_steps() - before, signature)
+    (Steps::since(before), signature)
 }
 
 /// The staged revision `signature` names.
@@ -209,6 +238,109 @@ async fn staging_a_directorys_dirty_files_searches_its_chain_for_none_of_them() 
                     children_staged(&instance, &staged, &dir, LoreNodeStagedAction::Delete).await;
                 assert_eq!(deletes, 1, "the file in {dir} is staged deleted");
             }
+        })
+        .await;
+}
+
+/// How many files the committed directory of the shared directories test holds.
+const ENTRIES: usize = 4096;
+
+/// How many new directories, each holding two new files, the shared directories test makes in
+/// its committed directory.
+const FOLDERS: usize = 64;
+
+/// Writes [`FOLDERS`] new directories into `dir` below `instance`, each holding two new files,
+/// answering with the paths of the files.
+fn write_folders(instance: &TestRepository, dir: &str) -> Vec<LoreString> {
+    let mut files = Vec::with_capacity(2 * FOLDERS);
+    for index in (0..FOLDERS).rev() {
+        let folder = instance.path.join(dir).join(format!("d{index}"));
+        std::fs::create_dir(&folder).expect("the directory");
+        for name in ["a", "b"] {
+            test_file_write(&folder.join(name), name.as_bytes());
+            files.push(LoreString::from(&folder.join(name)));
+        }
+    }
+    files
+}
+
+/// Whether `dir` in `staged` holds [`FOLDERS`] directories staged as added, one per name, each
+/// holding its two files staged as added.
+async fn folders_staged(instance: &TestRepository, staged: &State, dir: &str) -> bool {
+    if children_staged(instance, staged, dir, LoreNodeStagedAction::Add).await != FOLDERS {
+        return false;
+    }
+    for index in 0..FOLDERS {
+        let folder = format!("{dir}/d{index}");
+        if children_staged(instance, staged, &folder, LoreNodeStagedAction::Add).await != 2 {
+            return false;
+        }
+    }
+    true
+}
+
+/// A stage of new directories in a committed directory, each holding two new files, creates the
+/// directories from one listing of the committed directory, where a search or a scan of its chain
+/// for each new directory costs N steps for N entries, and creates each directory once, with its
+/// files, whether the stage names the files or the directory their dirty marks are below.
+///
+/// The bound of 4N steps for each of the finds and the walks of the stage of the marked files holds
+/// a few listings of the directory, and a few steps for each new directory and file.
+#[tokio::test]
+async fn staging_new_directories_of_a_committed_directory_lists_it_once() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("the stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let instance = test_repository_create(
+                immutable_store,
+                mutable_store,
+                RepositoryId::from(uuid::Uuid::now_v7()),
+            )
+            .await;
+            for dir in ["named", "marked"] {
+                std::fs::create_dir_all(instance.path.join(dir)).expect("the directory");
+                for index in 0..ENTRIES {
+                    test_file_write(
+                        &instance.path.join(dir).join(format!("f{index}")),
+                        index.to_string().as_bytes(),
+                    );
+                }
+            }
+            test_commit_tree(&instance, "First").await;
+
+            let files = write_folders(&instance, "named");
+            let (_, signature) = stage_steps(&instance, LoreArray::from_vec(files)).await;
+            let staged = staged_state(&instance, signature).await;
+            assert!(
+                folders_staged(&instance, &staged, "named").await,
+                "the new directories of the named files are staged once, with their files"
+            );
+
+            write_folders(&instance, "marked");
+            lore_revision::file::dirty::dirty(
+                instance.repository.clone(),
+                named(&instance, "marked"),
+            )
+            .await
+            .expect("the dirty marks");
+            let (steps, signature) = stage_steps(&instance, named(&instance, "marked")).await;
+            let bound = 4 * (ENTRIES + FOLDERS) as u64;
+            assert!(
+                steps.finds < bound,
+                "the marked files took {} find steps",
+                steps.finds
+            );
+            assert!(
+                steps.walks < bound,
+                "the marked files took {} walk steps",
+                steps.walks
+            );
+            let staged = staged_state(&instance, signature).await;
+            assert!(
+                folders_staged(&instance, &staged, "marked").await,
+                "the new directories of the marked files are staged once, with their files"
+            );
         })
         .await;
 }

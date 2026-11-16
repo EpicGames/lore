@@ -378,10 +378,10 @@ pub mod lock_counting {
 
 /// Counts of the chain nodes a find by name ([`State::find_subnode`],
 /// [`State::find_subnode_resident`]) steps through, while enabled, per thread and process-wide,
-/// so a test can show what a path's finds cost, and apart from them, per thread, those a children
-/// walk steps through (a listing, a search since a mark). A find or a walk counts its steps
-/// locally and adds them once as it ends, on the thread it ends on. Disabled, it costs one relaxed
-/// load of a flag nothing writes. Built with `test-util` only.
+/// so a test can show what a path's finds cost, and apart from them those a children walk steps
+/// through (a listing, a search since a mark). A find or a walk counts its steps locally and adds
+/// them once as it ends, on the thread it ends on. Disabled, it costs one relaxed load of a flag
+/// nothing writes. Built with `test-util` only.
 #[cfg(feature = "test-util")]
 pub mod step_counting {
     use std::cell::Cell;
@@ -391,6 +391,7 @@ pub mod step_counting {
 
     static COUNTING: AtomicBool = AtomicBool::new(false);
     static TOTAL: AtomicU64 = AtomicU64::new(0);
+    static WALK_TOTAL: AtomicU64 = AtomicU64::new(0);
 
     thread_local! {
         static THREAD: Cell<u64> = const { Cell::new(0) };
@@ -415,6 +416,11 @@ pub mod step_counting {
     /// Children walk steps counted on the calling thread.
     pub fn thread_walk_steps() -> u64 {
         WALK_THREAD.with(Cell::get)
+    }
+
+    /// Children walk steps counted on every thread.
+    pub fn total_walk_steps() -> u64 {
+        WALK_TOTAL.load(Ordering::Relaxed)
     }
 
     /// One find's or walk's steps, added to its counts when it drops, however it ends.
@@ -452,6 +458,7 @@ pub mod step_counting {
             }
             if self.walk {
                 WALK_THREAD.with(|count| count.set(count.get() + self.count));
+                WALK_TOTAL.fetch_add(self.count, Ordering::Relaxed);
             } else {
                 THREAD.with(|count| count.set(count.get() + self.count));
                 TOTAL.fetch_add(self.count, Ordering::Relaxed);

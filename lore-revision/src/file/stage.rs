@@ -260,6 +260,16 @@ async fn resolve_shared_prefixes(
     Ok(Some(prefixes))
 }
 
+/// What the creation of a shared ancestor starts from.
+struct AncestorWalk {
+    /// The walk to the ancestor.
+    walk: TreeWalkPath,
+    /// The child of the walk's start that the first component of its remainder names.
+    known: KnownChild,
+    /// The path the ancestor resolved to before it was staged.
+    resolved: RelativePath,
+}
+
 /// Create the node for every directory the targets share, by staging it without its
 /// children, as [`fan_out::create_shared_ancestors`] orders it.
 async fn precreate_shared_ancestors<'a>(
@@ -271,10 +281,28 @@ async fn precreate_shared_ancestors<'a>(
     options.no_children = true;
     fan_out::create_shared_ancestors(
         shared_ancestors,
-        |ancestor, nodes| {
-            let given = RelativePath::new_from_clean_parts(ancestor, "");
-            let resolved = resolved_or_given(&given, walk.prefixes.as_deref());
-            let walk_path = walk.walk(given, nodes);
+        |level, nodes| {
+            resolve_level_children(
+                level
+                    .iter()
+                    .map(|ancestor| {
+                        let given = RelativePath::new_from_clean_parts(ancestor.path(), "");
+                        AncestorWalk {
+                            resolved: resolved_or_given(&given, walk.prefixes.as_deref()),
+                            walk: walk.walk(given, nodes),
+                            known: KnownChild::Unresolved,
+                        }
+                    })
+                    .collect(),
+            )
+        },
+        |_,
+         _,
+         AncestorWalk {
+             walk: walk_path,
+             known,
+             resolved,
+         }| {
             let start = walk_path.at.clone();
             let operation = walk.operation.clone();
             let stats = walk.stats.clone();
@@ -286,7 +314,7 @@ async fn precreate_shared_ancestors<'a>(
                     operation,
                     walk_path.at,
                     walk_path.remainder,
-                    KnownChild::Unresolved,
+                    known,
                     stats,
                     options,
                     Some(link_tracker),
@@ -308,6 +336,31 @@ async fn precreate_shared_ancestors<'a>(
         |err| StageError::internal_with_context(err, "Failed to join pre-create task"),
     )
     .await
+}
+
+/// The child each walk of a level of shared ancestors names below its start, from one listing of
+/// each node two or more of the walks start at, as [`TargetDirectory`] lists a directory several
+/// targets name a child of; a walk alone at its start is left to search. The level is in path
+/// order, so the walks below one directory follow each other. Each creation of the level adds only
+/// the child its own walk names, so the listing, taken before any of them starts, answers for the
+/// rest.
+async fn resolve_level_children(
+    mut level: Vec<AncestorWalk>,
+) -> Result<Vec<AncestorWalk>, StageError> {
+    for run in level.chunk_by_mut(|left, right| left.walk.at.node == right.walk.at.node) {
+        let [first, _, ..] = &*run else {
+            continue;
+        };
+        let at = &first.walk.at;
+        let directory = TargetDirectory::listed(
+            stage::directory_children(&at.repository, &at.state, at.node).await,
+        )?;
+        for ancestor in run.iter_mut() {
+            ancestor.known =
+                directory.child(crate::hash::hash_string(ancestor.walk.remainder.root()));
+        }
+    }
+    Ok(level)
 }
 
 /// `given` in the case `prefixes` resolved it to, where it resolved as a whole: a shorter match
@@ -368,10 +421,8 @@ enum TargetDirectory {
 
 impl TargetDirectory {
     /// The child of `directory` carrying `name_hash`, which a target names: from the directory's
-    /// listing, listed once a second target names a child of it; unresolved for the first, below a
-    /// node that is not a directory, and where two children carry `name_hash`, so the stage walk's
-    /// search answers, which takes a node not staged for deletion before one that is
-    /// ([`State::find_live_subnode`]).
+    /// listing, listed once a second target names a child of it; unresolved for the first, and as
+    /// [`Self::child`] answers.
     async fn known(
         &mut self,
         repository: &Arc<RepositoryContext>,
@@ -385,26 +436,41 @@ impl TargetDirectory {
                 return Ok(KnownChild::Unresolved);
             }
             Self::NamedOnce => {
-                *self = match stage::directory_children(repository, state, directory)
-                    .await
-                    .forward::<StageError>("Failed to list a directory the targets share")?
-                {
-                    Some((listed, _)) => Self::Listed(NameHashIndex::new(listed)),
-                    None => Self::Unlisted,
-                };
+                *self =
+                    Self::listed(stage::directory_children(repository, state, directory).await)?;
             }
             Self::Listed(_) | Self::Unlisted => {}
         }
+        Ok(self.child(name_hash))
+    }
+
+    /// The directory a [`stage::directory_children`] answer lists: its children by name hash, or
+    /// [`Self::Unlisted`] for a node that is not a directory.
+    fn listed(
+        listing: Result<Option<stage::DirectoryListing>, state::StateError>,
+    ) -> Result<Self, StageError> {
+        Ok(
+            match listing.forward::<StageError>("Failed to list a directory the targets share")? {
+                Some((listed, _)) => Self::Listed(NameHashIndex::new(listed)),
+                None => Self::Unlisted,
+            },
+        )
+    }
+
+    /// The child carrying `name_hash` in the listing; unresolved where nothing is listed and
+    /// where two children carry `name_hash`, so the stage walk's search answers, which takes a node
+    /// not staged for deletion before one that is ([`State::find_live_subnode`]).
+    fn child(&self, name_hash: u64) -> KnownChild {
         let Self::Listed(children) = self else {
-            return Ok(KnownChild::Unresolved);
+            return KnownChild::Unresolved;
         };
         let mut carrying = children.carrying(name_hash);
         let first = carrying.next();
-        Ok(if carrying.next().is_none() {
+        if carrying.next().is_none() {
             KnownChild::Resolved(first)
         } else {
             KnownChild::Unresolved
-        })
+        }
     }
 }
 
@@ -1066,8 +1132,9 @@ impl ResolvedTarget {
 
 /// Resolve `relative_path` to the concrete set of repository-relative paths to
 /// stage. Without `scan`, a directory resolves to its dirty descendants (empty
-/// when none); `scan`, single files, and paths with no node resolve to the path
-/// itself.
+/// when none); `scan`, single files, paths with no node, and a directory marked
+/// dirty as deleted resolve to the path itself, the last so that its deletion is
+/// staged whole, as [`State::collect_dirty_paths`] records one below.
 ///
 /// The lookup follows link mounts, and a node it reaches through a link is read
 /// in the state holding it, otherwise a colliding block at the same coordinates
@@ -1101,7 +1168,7 @@ async fn resolve_stage_target(
                 resolved_state,
                 resolved_repository,
                 node_link.node,
-                node.is_directory(),
+                node.is_directory() && !node.is_dirty_delete(),
             ))
         } else {
             None

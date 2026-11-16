@@ -320,10 +320,11 @@ async fn a_path_the_operation_cannot_describe_fails_the_walk() {
 }
 
 /// Marking dirty the paths below a committed file the working tree holds as a directory, a file and
-/// a directory below a missing name and below the file itself, leaves them unmarked and adds
-/// nothing below the file, while a path beside them is marked.
+/// a directory below a missing name and below the file itself, marks the file deleted and adds one
+/// directory beside it, which holds them marked added, adding nothing below the file, and marks a
+/// path beside them.
 #[tokio::test]
-async fn paths_below_a_committed_file_are_left_unmarked_beside_the_others() {
+async fn paths_below_a_committed_file_mark_one_directory_beside_it() {
     with_instance(|instance| async move {
         let first = committed(&instance, &["f.txt", "other.txt"]).await;
         let file = first
@@ -374,6 +375,20 @@ async fn paths_below_a_committed_file_are_left_unmarked_beside_the_others() {
             .await
             .expect("other.txt's record");
         assert!(marked.is_dirty(), "flags {:#x}", marked.flags);
+        let replaced = staged
+            .node(instance.repository.clone(), file)
+            .await
+            .expect("the file's record");
+        assert!(replaced.is_dirty_delete(), "flags {:#x}", replaced.flags);
+        assert_eq!(
+            children_named(&instance, &staged, ROOT_NODE, "f.txt").await,
+            2,
+            "the nodes named f.txt"
+        );
+        for path in ["f.txt", "f.txt/sub", "f.txt/sub/new.txt", "f.txt/new.txt"] {
+            let node = node_at(&instance, &staged, path).await;
+            assert!(node.is_dirty_add(), "{path}'s flags {:#x}", node.flags);
+        }
     })
     .await;
 }

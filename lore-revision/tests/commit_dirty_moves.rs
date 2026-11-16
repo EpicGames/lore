@@ -1103,36 +1103,25 @@ async fn rebased_through_a_file(
     (state, warnings, file)
 }
 
-/// A staged tree's dirty marks carried onto a revision holding a file where a marked path runs
-/// through a directory: that path is left unmarked, with one warning naming it and the file, and
-/// the other mark carries over.
+/// Dirty marks of paths through a directory the working tree holds, carried onto a revision
+/// holding the file `f` there, mark the type change: the file deleted, one directory beside it
+/// added, and each path below it added, with no warning, and the other mark carries over.
 #[tokio::test]
-async fn a_rebase_leaves_a_path_through_a_file_unmarked_and_carries_the_rest() {
+async fn a_rebase_marks_the_type_change_of_a_file_marked_paths_run_through() {
     with_instance(|instance| async move {
-        let (_, warnings, _) = rebased_through_a_file(&instance, &["f/sub/x"]).await;
+        let (state, warnings, file) = rebased_through_a_file(&instance, &["f/sub/x", "f/y"]).await;
+        assert!(warnings.is_empty(), "the warnings: {warnings:?}");
+        let file = node_of(&instance, &state, file).await;
+        assert!(file.is_dirty_delete(), "the file's flags {:#x}", file.flags);
         assert_eq!(
-            warnings,
-            ["Cannot mark f/sub/x dirty: f is not a directory"],
-            "the warnings"
+            children_named(&instance, &state, ROOT_NODE, "f").await,
+            2,
+            "the nodes named f"
         );
-    })
-    .await;
-}
-
-/// Dirty marks of two paths through a file, carried onto a revision holding that file, leave both
-/// unmarked, with one warning naming the first and counting the other.
-#[tokio::test]
-async fn a_rebase_warns_once_of_the_paths_through_a_file_it_leaves_unmarked() {
-    with_instance(|instance| async move {
-        let (_, warnings, _) = rebased_through_a_file(&instance, &["f/sub/x", "f/y"]).await;
-        assert_eq!(
-            warnings,
-            [
-                "Cannot mark f/y dirty: f is not a directory; 1 more path through a node that \
-                 is not a directory is not marked"
-            ],
-            "the warnings"
-        );
+        for path in ["f", "f/sub", "f/sub/x", "f/y"] {
+            let node = node_at(&instance, &state, path).await;
+            assert!(node.is_dirty_add(), "{path}'s flags {:#x}", node.flags);
+        }
     })
     .await;
 }

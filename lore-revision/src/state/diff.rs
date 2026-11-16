@@ -839,6 +839,10 @@ fn diff_subtree_node_walk(
                 to_index += 1;
             }
 
+            for _ in 0..same_node_offset(to_nodes, to_index, from_named_node) {
+                add_change_for_solo_to_node(context, from, to_index).await?;
+                to_index += 1;
+            }
             let paired = to_nodes
                 .children
                 .get(to_index)
@@ -914,6 +918,26 @@ fn diff_subtree_node_walk(
 
         Ok(())
     }
+}
+
+/// How far past `to_index` the to child that is `from_named_node`'s own node stands among the to
+/// children from there that carry its name, 0 where none does. A to tree holds a name twice where a
+/// node it adds stands beside the node of the other kind it replaces, which is the from side's
+/// node: the from node pairs with itself, deleted, and the added one is reported on its own,
+/// whatever order the sort left them in.
+fn same_node_offset(
+    to_nodes: &StateChildrenNodes,
+    to_index: usize,
+    from_named_node: &StateNamedNode,
+) -> usize {
+    to_nodes
+        .children
+        .get(to_index..)
+        .unwrap_or_default()
+        .iter()
+        .take_while(|to_named_node| to_named_node.name == from_named_node.name)
+        .position(|to_named_node| to_named_node.node == from_named_node.node)
+        .unwrap_or(0)
 }
 
 /// What every child of one directory is reported against: where the walk stands, what it

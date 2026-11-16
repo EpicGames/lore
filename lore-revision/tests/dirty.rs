@@ -4179,6 +4179,637 @@ mod tests {
         }
     }
 
+    /// A dirty mark of a tracked file the working tree replaced with a directory a directory-only
+    /// rule names marks the file's removal and nothing the directory holds, which a stage of the
+    /// same path then stages and the commit takes out of the tree: naming the path, or its
+    /// directory, which the walk searches or lists by how many entries it holds.
+    #[tokio::test]
+    // Test fixture writes; not subject to repository write-token discipline.
+    #[allow(clippy::disallowed_methods)]
+    async fn a_dirty_mark_of_a_file_replaced_by_a_directory_a_directory_only_rule_names_marks_its_removal()
+     {
+        use lore_revision::file::dirty::SEARCHED_CHILDREN;
+        for (named, siblings) in [
+            ("src/Intermediate", 0),
+            ("src", 0),
+            ("src", SEARCHED_CHILDREN),
+        ] {
+            in_execution(async move {
+                let committed: Vec<String> = std::iter::once("src/Intermediate".to_string())
+                    .chain((0..siblings).map(|index| format!("src/{index}.txt")))
+                    .collect();
+                let committed: Vec<&str> = committed.iter().map(String::as_str).collect();
+                let (ruled, _, tempdir) = ignoring_repository(&committed, "Intermediate/\n").await;
+                let root = tempdir.to_path_buf();
+                std::fs::remove_file(root.join("src/Intermediate")).expect("Delete failed");
+                std::fs::create_dir_all(root.join("src/Intermediate"))
+                    .expect("Create directory failed");
+                test_file_write(root.join("src/Intermediate/a.txt").as_path(), b"directory");
+                file::dirty::dirty(ruled.clone(), path_arguments(&root, &[named]))
+                    .await
+                    .expect("Dirty failed");
+                let reported = async || -> Vec<(String, bool)> {
+                    status_reported(&ruled, None, false)
+                        .await
+                        .into_iter()
+                        .filter(|(line, _)| line.contains("Intermediate"))
+                        .collect()
+                };
+                assert_eq!(
+                    reported().await,
+                    [("D src/Intermediate".to_string(), false)],
+                    "the dirty mark of {named}, beside {siblings} files, marked other than the \
+                     removal of the file"
+                );
+                stage_paths(&ruled, &root, &[named], false, false).await;
+                assert_eq!(
+                    reported().await,
+                    [("D src/Intermediate".to_string(), true)],
+                    "the stage of {named}, beside {siblings} files, staged other than the \
+                     removal of the file"
+                );
+                commit::commit_boxed(
+                    ruled.clone(),
+                    ruled
+                        .try_write_token()
+                        .expect("The repository was opened for writing"),
+                    CommitOptions::new("Remove".to_string()),
+                )
+                .await
+                .expect("Commit failed");
+                let revision = next_tree(&ruled).await;
+                let src = revision
+                    .find_node_link(ruled.clone(), "src")
+                    .await
+                    .expect("The revision holds src")
+                    .node;
+                assert!(
+                    children_named(&ruled, &revision, src, "Intermediate")
+                        .await
+                        .is_empty(),
+                    "the commit of {named}, beside {siblings} files, kept src/Intermediate"
+                );
+            })
+            .await;
+        }
+    }
+
+    /// A dirty mark of a directory a directory-only rule names, standing where a tracked file was
+    /// before `lore dirty move` moved it away, leaves the move as it is, naming the path or its
+    /// directory: the file is held elsewhere, not replaced.
+    #[tokio::test]
+    // Test fixture writes; not subject to repository write-token discipline.
+    #[allow(clippy::disallowed_methods)]
+    async fn a_dirty_mark_of_an_ignored_directory_where_a_moved_file_stood_keeps_the_move() {
+        for named in ["src/Intermediate", "src"] {
+            in_execution(async move {
+                let (ruled, _, tempdir) =
+                    ignoring_repository(&["src/Intermediate"], "Intermediate/\n").await;
+                let root = tempdir.to_path_buf();
+                let at = |path: &str| root.join(path).to_string_lossy().into_owned();
+                std::fs::rename(root.join("src/Intermediate"), root.join("src/moved"))
+                    .expect("Move failed");
+                file::dirty::dirty_move(ruled.clone(), at("src/Intermediate"), at("src/moved"))
+                    .await
+                    .expect("Dirty move failed");
+                std::fs::create_dir_all(root.join("src/Intermediate"))
+                    .expect("Create directory failed");
+                test_file_write(root.join("src/Intermediate/a.txt").as_path(), b"directory");
+                file::dirty::dirty(ruled.clone(), path_arguments(&root, &[named]))
+                    .await
+                    .expect("Dirty failed");
+                assert!(
+                    next_node(&ruled, "src/moved").await.is_dirty_move(),
+                    "the dirty mark of {named} undid the move"
+                );
+                let reported = status_reported(&ruled, None, false).await;
+                assert!(
+                    reported
+                        .iter()
+                        .all(|(line, _)| line != "D src/Intermediate"),
+                    "the dirty mark of {named} marked the moved file deleted: {reported:?}"
+                );
+            })
+            .await;
+        }
+    }
+
+    /// A stage of a tracked file the working tree replaced with a directory a rule naming both
+    /// kinds leaves out stages the file's removal, as the status scans report it: the file is in
+    /// the tree, past the ignore slot. With a scan or after a dirty mark, naming the path or its
+    /// directory.
+    #[tokio::test]
+    async fn a_stage_of_a_file_replaced_by_a_directory_a_rule_naming_both_kinds_stages_its_removal()
+    {
+        for (named, scan) in [
+            ("src/Intermediate", true),
+            ("src", true),
+            ("src/Intermediate", false),
+            ("src", false),
+        ] {
+            in_execution(async move {
+                let (ruled, tempdir) = replaced_intermediate_repository("Intermediate\n").await;
+                if !scan {
+                    file::dirty::dirty(ruled.clone(), path_arguments(&tempdir, &[named]))
+                        .await
+                        .expect("Dirty failed");
+                }
+                stage_paths(&ruled, &tempdir, &[named], scan, false).await;
+                assert_eq!(
+                    status_reported(&ruled, None, false).await,
+                    [("D src/Intermediate".to_string(), true)],
+                    "the stage of {named}, scanning {scan}, staged other than the removal"
+                );
+            })
+            .await;
+        }
+    }
+
+    /// A status scan of a directory marked dirty as added and then removed from the working tree
+    /// reports nothing, naming the directory or scanning the whole tree.
+    #[tokio::test]
+    // Test fixture writes; not subject to repository write-token discipline.
+    #[allow(clippy::disallowed_methods)]
+    async fn a_status_of_a_removed_directory_marked_added_reports_nothing() {
+        for paths in [Some(vec![relative_path("fresh")]), None] {
+            in_execution(async move {
+                let (repository, tempdir) = committed_repository("", &[]).await;
+                let root = tempdir.to_path_buf();
+                std::fs::create_dir_all(root.join("fresh/sub")).expect("Create directory failed");
+                test_file_write(root.join("fresh/a.txt").as_path(), b"a");
+                test_file_write(root.join("fresh/sub/b.txt").as_path(), b"b");
+                file::dirty::dirty(repository.clone(), path_arguments(&root, &["fresh"]))
+                    .await
+                    .expect("Dirty failed");
+                std::fs::remove_dir_all(root.join("fresh")).expect("Delete failed");
+                let named = paths.is_some();
+                let reported = status_reported(&repository, paths, true).await;
+                assert!(
+                    reported.is_empty(),
+                    "the status, named {named}, reported the removed directory: {reported:?}"
+                );
+            })
+            .await;
+        }
+    }
+
+    /// A dirty mark of a path below a tracked file the working tree replaced with a directory marks
+    /// the type change: the file deleted, a directory beside it added, and the path below added,
+    /// which a stage of the path without a scan then commits as the directory alone.
+    #[tokio::test]
+    // Test fixture writes; not subject to repository write-token discipline.
+    #[allow(clippy::disallowed_methods)]
+    async fn a_dirty_mark_below_a_file_replaced_by_a_directory_marks_the_type_change() {
+        in_execution(async {
+            let (repository, tempdir) = committed_repository("", &["f.txt".to_string()]).await;
+            let root = tempdir.to_path_buf();
+            std::fs::remove_file(root.join("f.txt")).expect("Delete failed");
+            std::fs::create_dir_all(root.join("f.txt/sub")).expect("Create directory failed");
+            test_file_write(root.join("f.txt/sub/new.txt").as_path(), b"new");
+            file::dirty::dirty(
+                repository.clone(),
+                path_arguments(&root, &["f.txt/sub/new.txt"]),
+            )
+            .await
+            .expect("Dirty failed");
+            let tree = next_tree(&repository).await;
+            let mut marked = Vec::new();
+            for node in children_named(&repository, &tree, ROOT_NODE, "f.txt").await {
+                let node = tree
+                    .node(repository.clone(), node)
+                    .await
+                    .expect("Failed to read f.txt");
+                marked.push((node.is_file(), node.is_dirty_delete(), node.is_dirty_add()));
+            }
+            marked.sort_unstable();
+            assert_eq!(
+                marked,
+                [(false, false, true), (true, true, false)],
+                "f.txt is not a directory marked added beside the file marked deleted"
+            );
+            for path in ["f.txt/sub", "f.txt/sub/new.txt"] {
+                assert!(
+                    next_node(&repository, path).await.is_dirty_add(),
+                    "{path} is not marked added"
+                );
+            }
+            stage_paths(&repository, &root, &["f.txt/sub/new.txt"], false, false).await;
+            commit::commit_boxed(
+                repository.clone(),
+                repository
+                    .try_write_token()
+                    .expect("The repository was opened for writing"),
+                CommitOptions::new("Replace".to_string()),
+            )
+            .await
+            .expect("Commit failed");
+            let revision = next_tree(&repository).await;
+            assert_eq!(
+                children_named(&repository, &revision, ROOT_NODE, "f.txt")
+                    .await
+                    .len(),
+                1,
+                "the commit holds f.txt twice"
+            );
+            assert!(
+                holds(&repository, &revision, "f.txt/sub/new.txt").await,
+                "the commit left out f.txt/sub/new.txt"
+            );
+        })
+        .await;
+    }
+
+    /// A stage without a scan of a tracked file the working tree replaced with a directory, its
+    /// type change marked dirty, stages the file deleted beside the directory added, naming the
+    /// path, a path below it or the root, and the commit holds the directory alone.
+    #[tokio::test]
+    // Test fixture writes; not subject to repository write-token discipline.
+    #[allow(clippy::disallowed_methods)]
+    async fn a_stage_of_a_marked_type_change_stages_the_file_deleted_beside_the_directory() {
+        for named in ["f.txt", "f.txt/sub/new.txt", "."] {
+            in_execution(async move {
+                let (repository, tempdir) = committed_repository("", &["f.txt".to_string()]).await;
+                let root = tempdir.to_path_buf();
+                std::fs::remove_file(root.join("f.txt")).expect("Delete failed");
+                std::fs::create_dir_all(root.join("f.txt/sub")).expect("Create directory failed");
+                test_file_write(root.join("f.txt/sub/new.txt").as_path(), b"new");
+                file::dirty::dirty(repository.clone(), path_arguments(&root, &["f.txt"]))
+                    .await
+                    .expect("Dirty failed");
+                stage_paths(&repository, &root, &[named], false, false).await;
+                let tree = next_tree(&repository).await;
+                let mut staged = Vec::new();
+                for node in children_named(&repository, &tree, ROOT_NODE, "f.txt").await {
+                    let node = tree
+                        .node(repository.clone(), node)
+                        .await
+                        .expect("Failed to read f.txt");
+                    staged.push((
+                        node.is_file(),
+                        node.is_staged_delete(),
+                        node.is_staged_add(),
+                    ));
+                }
+                staged.sort_unstable();
+                assert_eq!(
+                    staged,
+                    [(false, false, true), (true, true, false)],
+                    "the stage of {named} staged other than the file deleted beside the directory \
+                     added"
+                );
+                commit::commit_boxed(
+                    repository.clone(),
+                    repository
+                        .try_write_token()
+                        .expect("The repository was opened for writing"),
+                    CommitOptions::new("Replace".to_string()),
+                )
+                .await
+                .expect("Commit failed");
+                let revision = next_tree(&repository).await;
+                let committed = children_named(&repository, &revision, ROOT_NODE, "f.txt").await;
+                assert_eq!(
+                    committed.len(),
+                    1,
+                    "the commit of {named} holds f.txt twice"
+                );
+                assert!(
+                    holds(&repository, &revision, "f.txt/sub/new.txt").await,
+                    "the commit of {named} left out f.txt/sub/new.txt"
+                );
+            })
+            .await;
+        }
+    }
+
+    /// A stage without a scan of a file staged as added, or as moved, into a directory staged as
+    /// added, which the working tree then replaced with a directory, its type change marked dirty,
+    /// stages the file deleted beside the directory added, and the commit holds the directory
+    /// alone, also where the directory staged as added was unstaged and the path staged again.
+    #[tokio::test]
+    // Test fixture writes; not subject to repository write-token discipline.
+    #[allow(clippy::disallowed_methods)]
+    async fn a_stage_of_a_marked_type_change_below_a_staged_added_directory_stages_the_file_deleted()
+     {
+        for (moved, unstaged) in [(false, false), (true, false), (false, true), (true, true)] {
+            in_execution(async move {
+                let (repository, tempdir) = committed_repository("", &["a.txt".to_string()]).await;
+                let root = tempdir.to_path_buf();
+                std::fs::create_dir_all(root.join("newdir")).expect("Create directory failed");
+                if moved {
+                    test_file_write(root.join("newdir/keep.txt").as_path(), b"keep");
+                    stage_paths(&repository, &root, &["newdir/keep.txt"], false, false).await;
+                    std::fs::rename(root.join("a.txt"), root.join("newdir/x"))
+                        .expect("Move failed");
+                    file::stage::stage_move(
+                        repository.clone(),
+                        repository
+                            .try_write_token()
+                            .expect("The repository was opened for writing"),
+                        root.join("a.txt").to_string_lossy().into_owned(),
+                        root.join("newdir/x").to_string_lossy().into_owned(),
+                        StageOptions::default(),
+                    )
+                    .await
+                    .expect("Stage of the move failed");
+                } else {
+                    test_file_write(root.join("newdir/x").as_path(), b"file");
+                    stage_paths(&repository, &root, &["newdir/x"], false, false).await;
+                }
+                std::fs::remove_file(root.join("newdir/x")).expect("Delete failed");
+                std::fs::create_dir_all(root.join("newdir/x")).expect("Create directory failed");
+                test_file_write(root.join("newdir/x/f.txt").as_path(), b"new");
+                file::dirty::dirty(repository.clone(), path_arguments(&root, &["newdir/x"]))
+                    .await
+                    .expect("Dirty failed");
+                stage_paths(&repository, &root, &["newdir/x"], false, false).await;
+
+                let tree = next_tree(&repository).await;
+                let newdir = tree
+                    .find_node_link(repository.clone(), "newdir")
+                    .await
+                    .expect("The tree holds newdir")
+                    .node;
+                let mut staged = Vec::new();
+                for node in children_named(&repository, &tree, newdir, "x").await {
+                    let node = tree
+                        .node(repository.clone(), node)
+                        .await
+                        .expect("Failed to read x");
+                    staged.push((
+                        node.is_file(),
+                        node.is_staged_delete(),
+                        node.is_staged_add(),
+                    ));
+                }
+                staged.sort_unstable();
+                assert_eq!(
+                    staged,
+                    [(false, false, true), (true, true, false)],
+                    "the stage, moved {moved}, staged other than the file deleted beside the \
+                     directory added"
+                );
+                if unstaged {
+                    file::unstage::unstage(
+                        repository.clone(),
+                        repository
+                            .try_write_token()
+                            .expect("The repository was opened for writing"),
+                        path_arguments(&root, &["newdir"]),
+                        file::unstage::UnstageOptions::default(),
+                    )
+                    .await
+                    .expect("Unstage failed");
+                    stage_paths(&repository, &root, &["newdir/x"], false, false).await;
+                }
+                commit::commit_boxed(
+                    repository.clone(),
+                    repository
+                        .try_write_token()
+                        .expect("The repository was opened for writing"),
+                    CommitOptions::new("Replace".to_string()),
+                )
+                .await
+                .expect("Commit failed");
+                let revision = next_tree(&repository).await;
+                let newdir = revision
+                    .find_node_link(repository.clone(), "newdir")
+                    .await
+                    .expect("The revision holds newdir")
+                    .node;
+                assert_eq!(
+                    children_named(&repository, &revision, newdir, "x")
+                        .await
+                        .len(),
+                    1,
+                    "the commit, moved {moved}, unstaged {unstaged}, holds newdir/x other than once"
+                );
+                assert!(
+                    holds(&repository, &revision, "newdir/x/f.txt").await,
+                    "the commit, moved {moved}, unstaged {unstaged}, left out newdir/x/f.txt"
+                );
+            })
+            .await;
+        }
+    }
+
+    /// A stage without a scan of a directory staged as added into a directory staged as added,
+    /// which the working tree then replaced with a file, its type change marked dirty, commits the
+    /// file alone, also where the directory staged as added above it was unstaged and the path
+    /// staged again.
+    #[tokio::test]
+    // Test fixture writes; not subject to repository write-token discipline.
+    #[allow(clippy::disallowed_methods)]
+    async fn a_stage_of_a_marked_type_change_to_a_file_below_a_staged_added_directory_commits_the_file()
+     {
+        for unstaged in [false, true] {
+            in_execution(async move {
+                let (repository, tempdir) = committed_repository("", &[]).await;
+                let root = tempdir.to_path_buf();
+                std::fs::create_dir_all(root.join("newdir/x")).expect("Create directory failed");
+                test_file_write(root.join("newdir/x/y.txt").as_path(), b"y");
+                stage_paths(&repository, &root, &["newdir/x/y.txt"], false, false).await;
+                std::fs::remove_dir_all(root.join("newdir/x")).expect("Delete failed");
+                test_file_write(root.join("newdir/x").as_path(), b"file");
+                file::dirty::dirty(repository.clone(), path_arguments(&root, &["newdir/x"]))
+                    .await
+                    .expect("Dirty failed");
+                stage_paths(&repository, &root, &["newdir/x"], false, false).await;
+                if unstaged {
+                    file::unstage::unstage(
+                        repository.clone(),
+                        repository
+                            .try_write_token()
+                            .expect("The repository was opened for writing"),
+                        path_arguments(&root, &["newdir"]),
+                        file::unstage::UnstageOptions::default(),
+                    )
+                    .await
+                    .expect("Unstage failed");
+                    stage_paths(&repository, &root, &["newdir/x"], false, false).await;
+                }
+                commit::commit_boxed(
+                    repository.clone(),
+                    repository
+                        .try_write_token()
+                        .expect("The repository was opened for writing"),
+                    CommitOptions::new("Replace".to_string()),
+                )
+                .await
+                .expect("Commit failed");
+                let revision = next_tree(&repository).await;
+                let newdir = revision
+                    .find_node_link(repository.clone(), "newdir")
+                    .await
+                    .expect("The revision holds newdir")
+                    .node;
+                assert_eq!(
+                    children_named(&repository, &revision, newdir, "x")
+                        .await
+                        .len(),
+                    1,
+                    "the commit, unstaged {unstaged}, holds newdir/x other than once"
+                );
+                assert!(
+                    next_node(&repository, "newdir/x").await.is_file(),
+                    "the commit, unstaged {unstaged}, holds newdir/x as other than the file"
+                );
+            })
+            .await;
+        }
+    }
+
+    /// A stage without a scan of a tracked directory the working tree replaced with a file, its
+    /// type change marked dirty, stages the directory deleted beside the file added, naming the
+    /// path or the root, and the commit holds the file alone.
+    #[tokio::test]
+    // Test fixture writes; not subject to repository write-token discipline.
+    #[allow(clippy::disallowed_methods)]
+    async fn a_stage_of_a_marked_type_change_stages_the_directory_deleted_beside_the_file() {
+        for named in ["d", "."] {
+            in_execution(async move {
+                let (repository, tempdir) =
+                    committed_repository("", &["d/x.txt".to_string()]).await;
+                let root = tempdir.to_path_buf();
+                std::fs::remove_dir_all(root.join("d")).expect("Delete failed");
+                test_file_write(root.join("d").as_path(), b"file");
+                file::dirty::dirty(repository.clone(), path_arguments(&root, &["d"]))
+                    .await
+                    .expect("Dirty failed");
+                stage_paths(&repository, &root, &[named], false, false).await;
+                let tree = next_tree(&repository).await;
+                let mut staged = Vec::new();
+                for node in children_named(&repository, &tree, ROOT_NODE, "d").await {
+                    let node = tree
+                        .node(repository.clone(), node)
+                        .await
+                        .expect("Failed to read d");
+                    staged.push((
+                        node.is_file(),
+                        node.is_staged_delete(),
+                        node.is_staged_add(),
+                    ));
+                }
+                staged.sort_unstable();
+                assert_eq!(
+                    staged,
+                    [(false, true, false), (true, false, true)],
+                    "the stage of {named} staged other than the directory deleted beside the file \
+                     added"
+                );
+                commit::commit_boxed(
+                    repository.clone(),
+                    repository
+                        .try_write_token()
+                        .expect("The repository was opened for writing"),
+                    CommitOptions::new("Replace".to_string()),
+                )
+                .await
+                .expect("Commit failed");
+                let revision = next_tree(&repository).await;
+                let committed = children_named(&repository, &revision, ROOT_NODE, "d").await;
+                assert_eq!(committed.len(), 1, "the commit of {named} holds d twice");
+                assert!(
+                    next_node(&repository, "d").await.is_file(),
+                    "the commit of {named} holds no file d"
+                );
+            })
+            .await;
+        }
+    }
+
+    /// A status of a type change marked dirty, and then staged, reports the node the working tree
+    /// replaced deleted, a directory as one change as for any directory removed, and the node
+    /// replacing it added, a file replaced by a directory and a directory replaced by a file.
+    #[tokio::test]
+    // Test fixture writes; not subject to repository write-token discipline.
+    #[allow(clippy::disallowed_methods)]
+    async fn a_status_of_a_marked_type_change_reports_the_deletion_and_the_add() {
+        in_execution(async {
+            let files = ["f.txt".to_string(), "d/x.txt".to_string()];
+            let (repository, tempdir) = committed_repository("", &files).await;
+            let root = tempdir.to_path_buf();
+            std::fs::remove_file(root.join("f.txt")).expect("Delete failed");
+            std::fs::create_dir_all(root.join("f.txt/sub")).expect("Create directory failed");
+            test_file_write(root.join("f.txt/sub/new.txt").as_path(), b"new");
+            std::fs::remove_dir_all(root.join("d")).expect("Delete failed");
+            test_file_write(root.join("d").as_path(), b"file");
+            file::dirty::dirty(repository.clone(), path_arguments(&root, &["f.txt", "d"]))
+                .await
+                .expect("Dirty failed");
+            let expected = |staged: bool| -> Vec<(String, bool)> {
+                [
+                    "A d",
+                    "A f.txt/",
+                    "A f.txt/sub/",
+                    "A f.txt/sub/new.txt",
+                    "D d/",
+                    "D f.txt",
+                ]
+                .iter()
+                .map(|line| (line.to_string(), staged))
+                .collect()
+            };
+            assert_eq!(
+                status_reported(&repository, None, false).await,
+                expected(false),
+                "the status of the marks"
+            );
+            stage_paths(&repository, &root, &["."], false, false).await;
+            assert_eq!(
+                status_reported(&repository, None, false).await,
+                expected(true),
+                "the status of the stage"
+            );
+        })
+        .await;
+    }
+
+    /// A stage of a removed directory, its removal marked dirty or found by a scan, stages the
+    /// directory deleted whole, and the commit takes it out of the tree.
+    #[tokio::test]
+    // Test fixture writes; not subject to repository write-token discipline.
+    #[allow(clippy::disallowed_methods)]
+    async fn a_stage_of_a_removed_directory_marked_dirty_stages_it_deleted() {
+        for scan in [true, false] {
+            in_execution(async move {
+                let files: Vec<String> = ["dir/a.txt", "dir/b.txt", "dir/sub/c.txt", "keep.txt"]
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect();
+                let (repository, tempdir) = committed_repository("", &files).await;
+                let root = tempdir.to_path_buf();
+                std::fs::remove_dir_all(root.join("dir")).expect("Delete failed");
+                if !scan {
+                    file::dirty::dirty(repository.clone(), path_arguments(&root, &["dir"]))
+                        .await
+                        .expect("Dirty failed");
+                }
+                stage_paths(&repository, &root, &["dir"], scan, false).await;
+                assert_eq!(
+                    status_reported(&repository, None, false).await,
+                    [("D dir/".to_string(), true)],
+                    "the stage, scanning {scan}, staged other than the deletion of dir"
+                );
+                commit::commit_boxed(
+                    repository.clone(),
+                    repository
+                        .try_write_token()
+                        .expect("The repository was opened for writing"),
+                    CommitOptions::new("Remove".to_string()),
+                )
+                .await
+                .expect("Commit failed");
+                let tree = next_tree(&repository).await;
+                assert!(
+                    !holds(&repository, &tree, "dir").await,
+                    "the commit of the stage, scanning {scan}, kept dir"
+                );
+            })
+            .await;
+        }
+    }
+
     /// A diff between a revision holding the file `src/Intermediate` and one holding a directory
     /// there asks about each side as what it holds: `Intermediate/` leaves out the directory and
     /// reports the file's removal, and `Intermediate` with `!Intermediate/` leaves out the file

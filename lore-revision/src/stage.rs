@@ -661,7 +661,7 @@ pub(crate) async fn stage_filesystem_path(
                     .parent_exclusion_states(&full_relative_path),
                 &full_relative_path,
                 !info.is_dir(),
-                FilterMode::Full,
+                FilterMode::TRACKED,
             );
             if !replaced_excluded {
                 Box::pin(async {
@@ -1050,6 +1050,14 @@ impl StageDescent {
     /// path, staged as `info`; every other one is staged as a directory. `Some` is the link of a
     /// component that was not staged, which ends the descent.
     ///
+    /// A node a search found marked dirty as added and not staged, other than a link, has the node
+    /// of the other kind it replaced beside it staged deleted, a file for a directory and a
+    /// directory for a file, as a dirty mark of a type change leaves the two, where the view keeps
+    /// that kind at the path ([`stage_replaced_node`]). That costs one scan of the directory's
+    /// children for each such node on the path; a node a listing answered costs none. A link on
+    /// either side is left to the commit, which takes the deletion of a node marked dirty as
+    /// deleted beside a staged one of its name.
+    ///
     /// Its own future: inline, what a step holds across its awaits would be reserved in the
     /// directory walk's state of [`stage_filesystem_path`].
     #[allow(clippy::too_many_arguments)]
@@ -1070,6 +1078,7 @@ impl StageDescent {
             if current_name == "." {
                 continue;
             }
+            let searched = matches!(current_known, KnownChild::Unresolved);
 
             let current_info = if is_final_component {
                 info
@@ -1116,6 +1125,7 @@ impl StageDescent {
                 states,
                 added,
                 prepended: _,
+                marked_added,
             } = stage_node_from_metadata(
                 operation,
                 NodeMapping {
@@ -1161,6 +1171,7 @@ impl StageDescent {
                 self.relative_path.push(&final_name);
             }
 
+            let parent = (self.node, self.states);
             self.states = states;
 
             let node = self
@@ -1172,6 +1183,56 @@ impl StageDescent {
                 )?;
 
             self.node = node_link.node;
+
+            let replaced = if searched && marked_added && !node.is_link() {
+                let replaced_directory = !node.is_directory();
+                let (replaced_states, out_of_view) = self.repository.filter.child_excludes_tree(
+                    parent.1,
+                    &self.relative_path,
+                    replaced_directory,
+                    FilterMode::TRACKED,
+                );
+                if out_of_view {
+                    None
+                } else {
+                    self.state
+                        .find_subnode_beside(
+                            self.repository.clone(),
+                            parent.0,
+                            (node_link.node, hash::hash_string(current_name)),
+                            |held| {
+                                !held.is_staged_delete()
+                                    && if replaced_directory {
+                                        held.is_directory()
+                                    } else {
+                                        held.is_file()
+                                    }
+                            },
+                        )
+                        .await
+                        .forward::<StageError>(
+                            "Failed to search for a node a type change replaced",
+                        )?
+                        .map(|(replaced, _)| (replaced, replaced_directory, replaced_states))
+                }
+            } else {
+                None
+            };
+            if let Some((replaced, replaced_directory, replaced_states)) = replaced {
+                Box::pin(stage_replaced_node(
+                    self.repository.clone(),
+                    self.state.clone(),
+                    self.relative_path.clone().freeze(),
+                    KnownChild::Resolved(Some(replaced)),
+                    parent.0,
+                    replaced_directory,
+                    replaced_states,
+                    options.node_flags,
+                    stats.clone(),
+                    link_tracker.cloned(),
+                ))
+                .await?;
+            }
 
             // Transition into the link
             if node.is_link() {
@@ -1744,10 +1805,12 @@ fn stage_delete_recurse(
 /// Stages the deletion of the node the tree holds at `path` where it is of the kind the working
 /// tree does not hold there, `replaced_directory` saying whether that kind is a directory. The
 /// filter leaves out what the working tree holds and keeps a node of the other kind, whose
-/// verdict is `states`, so the node is asked about as what it is, as a node no listing entry
-/// claims is. `known_child` is the node as the caller established it, and `base_node` the
-/// directory a node it left unresolved is looked up in. Nothing is staged where the tree holds
-/// no node there or one of the kind the working tree holds.
+/// verdict is `states`, so the node is asked about as what it is: the callers ask in
+/// [`FilterMode::TRACKED`], the view alone, as for a node the tree holds, which is past the ignore
+/// slot, and [`stage_absent_delete`] leaves out one only marked added. `known_child` is the node as
+/// the caller established it, and `base_node` the directory a node it left unresolved is looked up
+/// in. Nothing is staged where the tree holds no node there or one of the kind the working tree
+/// holds.
 ///
 /// A cold path, which its caller boxes: a stage meets it only where the filter tells a file from a
 /// directory at a path, as a directory-only rule does.
@@ -2321,15 +2384,19 @@ impl DirectoryChildren {
     }
 }
 
-/// The children of `node`, each with the name hash it carries, and the mark of the chain the
-/// listing began from, where `node` is a directory; `None` for any other node, which holds no
-/// children of its own: a link's listing would follow it into the State it names.
+/// A directory's children, each with the name hash it carries, and the mark of the chain the
+/// listing began from.
+#[lore_macro::test_pub]
+pub(crate) type DirectoryListing = (Vec<(NodeID, u64)>, ChainMark);
+
+/// The children of `node` listed, where `node` is a directory; `None` for any other node, which
+/// holds no children of its own: a link's listing would follow it into the State it names.
 #[lore_macro::test_pub]
 pub(crate) async fn directory_children(
     repository: &Arc<RepositoryContext>,
     state: &State,
     node: NodeID,
-) -> Result<Option<(Vec<(NodeID, u64)>, ChainMark)>, StateError> {
+) -> Result<Option<DirectoryListing>, StateError> {
     if !state.node(repository.clone(), node).await?.is_directory() {
         return Ok(None);
     }
@@ -3199,6 +3266,9 @@ pub(crate) struct StagedChild {
     /// A directory no commit holds whose add this call staged, which the caller records once it
     /// keeps it.
     pub added: bool,
+    /// Whether the stage found the child's node marked dirty as added and not staged, as a dirty
+    /// mark of a type change leaves the node it adds beside the node it replaces.
+    pub marked_added: bool,
 }
 
 impl StagedChild {
@@ -3209,6 +3279,7 @@ impl StagedChild {
             states: FilterStates::ROOT,
             prepended: false,
             added: false,
+            marked_added: false,
         }
     }
 }
@@ -3293,6 +3364,7 @@ pub(crate) async fn stage_node_from_metadata(
             states: parent_states,
             prepended: false,
             added: false,
+            marked_added: false,
         });
     }
 
@@ -3377,7 +3449,7 @@ pub(crate) async fn stage_node_from_metadata(
                 parent_states,
                 &filter_path,
                 !info.is_dir(),
-                FilterMode::Full,
+                FilterMode::TRACKED,
             );
             if !replaced_excluded {
                 Box::pin(stage_replaced_node(
@@ -3543,6 +3615,7 @@ pub(crate) async fn stage_node_from_metadata(
             states,
             prepended: true,
             added: info.is_dir(),
+            marked_added: false,
         });
     }
 
@@ -3808,6 +3881,7 @@ pub(crate) async fn stage_node_from_metadata(
         states,
         prepended: false,
         added,
+        marked_added: node.is_dirty_add() && !node.is_staged(),
     })
 }
 

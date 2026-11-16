@@ -80,36 +80,51 @@ pub(crate) fn shared_ancestors<P: AsRef<str>>(targets: &[P]) -> Vec<DepthPath> {
 /// answer the node of each one created.
 ///
 /// `ancestors` is a [`shared_ancestors`] list, so a level's nodes are the next
-/// level's parents: each level is drained before the next starts, and `create` is
-/// handed the nodes of the levels above to start from. At most
-/// [`MAX_CONCURRENT_TREE_TASKS`] creations of a level run at once. A creation
-/// answers the node it created or found, with whatever else a walk below it starts
-/// from, or `None` where it has none.
+/// level's parents: each level is drained before the next starts. `prepare` is
+/// handed a level and the nodes of the levels above before any creation of the
+/// level starts, and answers what `create` takes for each of its ancestors, in
+/// the level's order. `create` is handed that, with the nodes of the levels above
+/// to start from. At most [`MAX_CONCURRENT_TREE_TASKS`] creations of a level run
+/// at once. A creation answers the node it created or found, with whatever else a
+/// walk below it starts from, or `None` where it has none.
 ///
 /// A creation in flight is allocating nodes and is drained even where an earlier
 /// one failed, rather than cancelled part way through. No creation starts after
 /// the first failure, which is the one returned.
 #[lore_macro::test_pub]
-pub(crate) async fn create_shared_ancestors<'a, T, E, Fut>(
+pub(crate) async fn create_shared_ancestors<'a, T, E, P, Prepared, Fut>(
     ancestors: &'a [DepthPath],
-    mut create: impl FnMut(&'a str, &AncestorNodes<'a, T>) -> Fut,
+    mut prepare: impl FnMut(&'a [DepthPath], &AncestorNodes<'a, T>) -> Prepared,
+    mut create: impl FnMut(&'a str, &AncestorNodes<'a, T>, P::Item) -> Fut,
     join_failure: impl Fn(JoinError) -> E,
 ) -> Result<AncestorNodes<'a, T>, E>
 where
     T: Send + 'static,
     E: Send + 'static,
+    P: IntoIterator,
+    Prepared: Future<Output = Result<P, E>>,
     Fut: Future<Output = Result<Option<T>, E>> + Send + 'static,
 {
     let mut nodes = AncestorNodes::with_capacity(ancestors.len());
     let mut failure: Option<E> = None;
 
     for level in ancestors.chunk_by(|left, right| left.depth() == right.depth()) {
+        let prepared = match prepare(level, &nodes).await {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        };
         let mut level_tasks = JoinSet::new();
-        for (index, ancestor) in level.iter().enumerate() {
+        for (index, prepared) in prepared.into_iter().enumerate() {
+            let Some(ancestor) = level.get(index) else {
+                break;
+            };
             if failure.is_some() {
                 break;
             }
-            let created = create(ancestor.path(), &nodes);
+            let created = create(ancestor.path(), &nodes, prepared);
             lore_spawn!(level_tasks, created.map(move |created| (index, created)));
             join_below(
                 &mut level_tasks,

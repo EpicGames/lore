@@ -2555,6 +2555,68 @@ async fn a_tracked_file_replaced_by_a_directory_commits_when_status_and_stage_na
     Box::pin(replace_a_tracked_file_by_a_directory_and_commit(Some("x"))).await;
 }
 
+/// Marks `paths` dirty through `w`'s provider, as `lore file dirty` does.
+async fn dirty_paths(w: &Working, paths: &[PathBuf]) {
+    let token = RepositoryWriteToken::acquire(&w.path).await;
+    let context = w.command_context(&w.fs, Some(token.share()));
+    LORE_CONTEXT
+        .scope(
+            fuse_fixture::setup_test_execution(),
+            lore_revision::file::dirty::dirty(
+                context,
+                LoreArray::from_vec(paths.iter().map(LoreString::from).collect()),
+            ),
+        )
+        .await
+        .expect("the paths are marked");
+}
+
+/// A tracked file replaced through the mount by a directory, its type change marked dirty, stages
+/// without a scan as the file deleted beside the directory added, and commits as the directory
+/// alone.
+#[tokio::test]
+async fn a_stage_of_a_marked_type_change_stages_the_file_deleted_beside_the_directory() {
+    let w = working(&[("x", b"a file first"), ("keep.txt", b"keep")]).await;
+    w.fs.unlink(&req(), ROOT_INO, b"x").await.expect("unlink");
+    let x = mkdir(&w.fs, ROOT_INO, "x").await;
+    write_new(&w.fs, x, "f.txt", b"content below").await;
+    dirty_paths(&w, &[w.path.join("x")]).await;
+    stage_paths(&w, &[w.path.join("x")], false).await;
+
+    let staged = w.staged().await;
+    let name_hash = lore_storage::hash::hash_string("x");
+    let mut held = Vec::new();
+    for child in staged
+        .node_children(w.repository.clone(), lore_revision::node::ROOT_NODE)
+        .await
+        .expect("the root's children")
+    {
+        let node = staged
+            .node(w.repository.clone(), child)
+            .await
+            .expect("a child");
+        if node.name_hash == name_hash {
+            held.push((
+                node.is_file(),
+                node.is_staged_delete(),
+                node.is_staged_add(),
+            ));
+        }
+    }
+    held.sort_unstable();
+    assert_eq!(
+        held,
+        [(false, false, true), (true, true, false)],
+        "x is not the file staged deleted beside the directory staged added"
+    );
+    let committed = stage_and_commit(&w, &[w.path.join("x")]).await;
+    assert_eq!(
+        children_named(&w.repository, &committed, "", "x").await,
+        1,
+        "the revision holds one node named x"
+    );
+}
+
 /// A tracked directory replaced through the mount by a file commits as the file: the directory's
 /// deletes and the file's add, after which status is clean.
 #[tokio::test]
@@ -3161,6 +3223,24 @@ async fn fastest_quiet_diff(w: &Working, from: &Arc<State>) -> std::time::Durati
     fastest
 }
 
+/// A stage of a directory removed through the provider stages it deleted whole, with a scan or
+/// without one.
+#[tokio::test]
+async fn a_stage_of_a_removed_directory_stages_it_deleted_with_or_without_a_scan() {
+    for scan in [true, false] {
+        let w = Box::pin(working(FIXTURE)).await;
+        let dir = lookup_ino(&w.fs, ROOT_INO, "dir").await.expect("dir");
+        w.fs.unlink(&req(), dir, b"c.txt").await.expect("unlink");
+        w.fs.rmdir(&req(), ROOT_INO, b"dir").await.expect("rmdir");
+        stage_paths(&w, &[w.path.join("dir")], scan).await;
+        assert_eq!(
+            staged_at(&w, &["dir"]).await,
+            [("dir".to_string(), 1, "delete")],
+            "the stage, scanning {scan}, did not stage dir deleted"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_diff_over_a_staged_deleted_directory_walks_none_of_its_children() {
     const FILES: usize = 2000;
@@ -3181,9 +3261,6 @@ async fn a_diff_over_a_staged_deleted_directory_walks_none_of_its_children() {
             .expect("unlink");
     }
     w.fs.rmdir(&req(), ROOT_INO, b"dir").await.expect("rmdir");
-    // A scan stages the missing directory's deletion whole. Staged through its dirty children
-    // instead, each child is staged deleted and the directory only located, as for named paths
-    // under a missing ancestor.
     stage_paths(&w, &[w.path.join("dir")], true).await;
     let staged = w.staged().await;
     let link = staged
