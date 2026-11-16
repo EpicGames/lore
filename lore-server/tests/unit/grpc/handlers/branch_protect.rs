@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Changing branch protection is repository administration: `owner` or
-//! `admin`, or `write` for the repository's creator, through the protect
-//! RPCs and through `BranchMetadataSet` alike.
+//! Changing branch protection needs `owner`, `admin` or `set-protected`, or
+//! `write` for the repository's creator, through the protect RPCs and
+//! through `BranchMetadataSet` alike.
 use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
@@ -172,6 +172,15 @@ async fn owner_or_admin_administers_a_repository_they_did_not_create() {
 }
 
 #[tokio::test]
+async fn set_protected_lets_a_non_creator_protect() {
+    for tier in TIERS {
+        protect_and_unprotect("alice", Some(tier), &["set-protected"])
+            .await
+            .unwrap_or_else(|err| panic!("{tier:?}: {err}"));
+    }
+}
+
+#[tokio::test]
 async fn the_creator_needs_write() {
     for tier in TIERS {
         protect_and_unprotect(CALLER, Some(tier), &["write"])
@@ -185,7 +194,7 @@ async fn write_does_not_let_a_non_creator_protect() {
     for tier in TIERS {
         let err = protect_and_unprotect("alice", Some(tier), &["read", "write"])
             .await
-            .expect_err("a non-creator without owner or admin is refused");
+            .expect_err("a non-creator without owner, admin or set-protected is refused");
         assert_eq!(err.code(), Code::PermissionDenied, "{tier:?}");
     }
 }
@@ -303,7 +312,8 @@ async fn write_still_sets_other_metadata_keys() {
 }
 
 /// Metadata set is a write in any case, since one call can change any key;
-/// a protection change additionally needs `owner`, `admin` or creatorship.
+/// a protection change additionally needs `owner`, `admin`, `set-protected`
+/// or creatorship.
 #[tokio::test]
 async fn owner_or_the_creator_with_write_changes_protection_through_metadata_set() {
     for tier in TIERS {
@@ -313,6 +323,32 @@ async fn owner_or_the_creator_with_write_changes_protection_through_metadata_set
         set_metadata(CALLER, tier, &["write"], Change::Protection)
             .await
             .unwrap_or_else(|err| panic!("{tier:?} creator: {err}"));
+    }
+}
+
+/// Metadata set needs `write` before it looks at the change, as for any key.
+/// `Tier::Global` is left out: its authorizer grants `write` to every token.
+#[tokio::test]
+async fn set_protected_without_write_does_not_set_metadata() {
+    for tier in [Tier::Resource, Tier::AuthClient] {
+        let err = set_metadata("alice", tier, &["set-protected"], Change::Protection)
+            .await
+            .expect_err("metadata set needs write");
+        assert_eq!(err.code(), Code::PermissionDenied, "{tier:?}");
+    }
+}
+
+#[tokio::test]
+async fn set_protected_with_write_changes_protection_through_metadata_set() {
+    for tier in TIERS {
+        set_metadata(
+            "alice",
+            tier,
+            &["write", "set-protected"],
+            Change::Protection,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{tier:?}: {err}"));
     }
 }
 

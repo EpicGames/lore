@@ -5,7 +5,7 @@ authors:
   - Hannes Muurinen
 status: Approved
 created: 2026-08-20
-updated: 2026-11-06
+updated: 2026-11-16
 discussion: https://crowd.urc.internal.epicgames.net/epic/Lore/change-request/412
 ---
 
@@ -690,7 +690,7 @@ The vocabulary starts with two ordinary actions, `read` and `write`, which `UrcA
 already list. `read` is implied by any grant on a partition: a caller who reaches it may read
 it, so reads make no check beyond reaching the partition. `write` has to be granted. Every
 operation that changes partition state asks `write` (D9), and an operation that needs one of the
-privileged actions (`obliterate`, `owner`, `admin`, `migrate`, `push-protected`, `presign`)
+privileged actions (`obliterate`, `owner`, `admin`, `migrate`, `push-protected`, `set-protected`, `presign`)
 asks that action.
 
 `resources` is a list of `{resource_id, permission}` pairs, and the server reads the permission
@@ -1071,7 +1071,7 @@ Tier 1 makes one decision per *action*, not per action-and-partition. Any princi
 authentication reads every partition the server holds and, unless the deployment moves `write`
 into the role claim (`implicit_actions`, below), writes it, and a small number of
 principals hold extra actions that apply everywhere: `obliterate`, `owner`, `admin`, `migrate`, `push-protected`,
-`presign`. There is
+`set-protected`, `presign`. There is
 no way to say "obliterate, but only in this partition." That is what distinguishes Tier 1 from
 Tier 2, and per-partition narrowing is exactly what P4 and Tier 2 exist to provide.
 
@@ -1106,7 +1106,7 @@ admits `owner` or `admin`, or `write` for the repository's creator (D9), and wit
 is no identity to compare: every caller is `<unknown>`, while the recorded creator is whatever
 identity the client sent at create. So the creator path needs only `write` there, which keeps a
 local server protecting branches as it does today. It also lets any caller delete a repository
-created by a client with an `identity` configured, which no caller could delete before. `admin`, `migrate` and `push-protected` are not
+created by a client with an `identity` configured, which no caller could delete before. `admin`, `migrate`, `push-protected` and `set-protected` are not
 in the set either, so admin lock stays refused and protected branches stay protected. Stating the
 set in the authorizer replaces the call sites that currently special-case "no token" to get the
 same answer.
@@ -1212,7 +1212,7 @@ it names and admits the request unless the partition is unreachable. It asks no 
 operation needs. Operations that need a privileged action ask it instead of `write`: admin lock
 asks `migrate`, obliterate asks `obliterate`, presign asks `presign`. Repository administration,
 delete and branch protect and unprotect, admits `owner` or `admin`, or `write` for the
-repository's creator. Where a privileged action waives an ordinary check, as on unlocking another
+repository's creator. Protect and unprotect also admit `set-protected`. Where a privileged action waives an ordinary check, as on unlocking another
 user's lock or pushing to a protected branch, the handler accepts the privileged action or falls
 back to `write` with the ordinary check applied. Other operations that change partition state ask `write`: storage put, put-resolved, copy
 destination, the mutable store and compare-and-swap, and a verify that heals, on gRPC and QUIC alike; branch create,
@@ -1298,7 +1298,7 @@ than requiring a claim for a partition that does not exist.
 - **Read-only grants start meaning what they say** — Today any entry naming a partition gives
   full access to it. Once every operation that changes state asks `write` (D9), a grant without
   `write` can no longer push, lock or edit metadata. Any grant still reads. Branch protect and unprotect, which any caller with access could use, need
-  `owner` or `admin`, or `write` for the repository's creator. `UrcAuthApi` already lists the two separately, so no grant has to change. Tier 1
+  `owner`, `admin` or `set-protected`, or `write` for the repository's creator. `UrcAuthApi` already lists the two separately, so no grant has to change. Tier 1
   read and write are unaffected by default, since `implicit_actions` grants both. A server with no
   `[server.auth]` keeps its permissions, except that any caller can delete a repository created
   by a client with an `identity` configured (D8).

@@ -133,7 +133,7 @@ lore push
 lore branch unprotect main
 ```
 
-The server refuses both. `lore branch unprotect` needs `admin`, unless you created the repository.
+The server refuses both. `lore branch unprotect` needs `admin` or `set-protected`, unless you created the repository.
 
 ### As the CI client
 

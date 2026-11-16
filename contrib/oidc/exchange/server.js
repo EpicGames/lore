@@ -48,7 +48,8 @@ const ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token";
 const REPOSITORY_ID = /^[0-9a-f]{32}$/;
 const IDENTITY_CLAIMS = ["identity", "https://lore.org/claims/identity"];
 const LORE_ACTIONS = new Set([
-  "read", "write", "owner", "admin", "migrate", "push-protected", "obliterate", "presign",
+  "read", "write", "owner", "admin", "migrate", "push-protected", "set-protected", "obliterate",
+  "presign",
 ]);
 
 for (const [name, value] of [["LOGIN_ISSUERS", LOGIN_ISSUERS.length], ["GRANTS_FILE", GRANTS_FILE]]) {

@@ -19,7 +19,7 @@ use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
-use crate::grpc::require_repository_administration;
+use crate::grpc::require_branch_protection_administration;
 use crate::util::setup_execution;
 
 #[tracing::instrument(name = "BranchUnprotect::handle", skip_all)]
@@ -48,7 +48,7 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            require_repository_administration(
+            require_branch_protection_administration(
                 authorizer,
                 &extensions,
                 repository.clone(),

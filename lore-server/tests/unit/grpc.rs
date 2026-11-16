@@ -430,6 +430,34 @@ mod may_administer {
         assert!(recording.asked.lock().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn the_layers_grants_answer_set_protected() {
+        let (immutable_store, mutable_store, _execution) =
+            crate::store::test_support::test_store_create()
+                .await
+                .expect("Failed to create stores");
+        let recording = Recording::new(false, &[]);
+        let authorizer: Arc<dyn RepositoryAuthorizer> = recording.clone();
+        let mut extensions = extensions_with_token();
+        extensions.insert(
+            lore_server::authnz::repository_authorizer::PartitionGrants {
+                repository_id: RepositoryId::default(),
+                grants: Grants::Actions(["set-protected".to_string()].into()),
+            },
+        );
+        let repository = Arc::new(
+            lore_revision::repository::RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                RepositoryId::default(),
+            ),
+        );
+        require_branch_protection_administration(&authorizer, &extensions, repository, "mallory")
+            .await
+            .expect("set-protected permits");
+        assert!(recording.asked.lock().unwrap().is_empty());
+    }
+
     /// No verified token means no identity to compare, as on a server with
     /// no `[server.auth]` where every caller is `<unknown>` and the recorded
     /// creator is whatever the client sent: `write` alone decides.

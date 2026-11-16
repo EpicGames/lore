@@ -34,6 +34,7 @@ pub enum Action {
     Admin,
     Migrate,
     PushProtected,
+    SetProtected,
     Obliterate,
     Presign,
 }
@@ -47,6 +48,7 @@ impl Action {
             Self::Admin => "admin",
             Self::Migrate => "migrate",
             Self::PushProtected => "push-protected",
+            Self::SetProtected => "set-protected",
             Self::Obliterate => "obliterate",
             Self::Presign => "presign",
         }

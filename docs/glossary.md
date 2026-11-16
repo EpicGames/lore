@@ -526,7 +526,7 @@ Compare to: lazy fetch.
 
 ### Protected branch
 
-A branch that only users with the push-protected permission can push to (`lore branch protect`). Other branches need only the write permission.
+A branch that only users with the push-protected permission can push to (`lore branch protect`). Other branches need only the write permission. From the CLI, protecting or unprotecting a branch needs the write permission and the set-protected, admin or owner permission, or only the write permission for the repository's creator.
 
 Also see: branch, push.
 

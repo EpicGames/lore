@@ -173,6 +173,32 @@ async fn owner_not_service_account_lets_a_non_creator_delete() {
     .await;
 }
 
+/// `set-protected` delegates branch protection only, not deleting the
+/// repository.
+#[tokio::test]
+async fn set_protected_does_not_let_a_non_creator_delete() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let id = random::<RepositoryId>();
+        seed_repository(immutable_store.clone(), mutable_store.clone(), id, "alice").await;
+
+        let status = handler(
+            verified_delete_request(id, &["write", "set-protected"], false),
+            &RepositoryRegistry::Unregistered,
+            &global_grants(),
+            immutable_store,
+            mutable_store,
+            &TestInstrumentProvider,
+        )
+        .await
+        .expect_err("set-protected does not administer the repository");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    }))
+    .await;
+}
+
 /// The creator may delete only while they hold `write` on the repository:
 /// on Tier 2 a creator whose token grants another repository only is
 /// refused, and `write` on this one restores the creator's right.

@@ -96,7 +96,7 @@ entries:
       scope_name: lore
       description: Lore access
       expression: |
-        lore_actions = {"owner", "admin", "migrate", "push-protected", "obliterate", "presign"}
+        lore_actions = {"owner", "admin", "migrate", "push-protected", "set-protected", "obliterate", "presign"}
         return {
             # The Lore client sends a token only to a server whose host `aud` names.
             "aud": ["https://localhost"],

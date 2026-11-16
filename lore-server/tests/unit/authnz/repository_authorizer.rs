@@ -56,6 +56,7 @@ async fn allow_all_grants_its_fixed_set_with_or_without_a_token() {
             Action::Admin,
             Action::Migrate,
             Action::PushProtected,
+            Action::SetProtected,
         ] {
             let err = AllowAllRepositoryAuthorizer
                 .check_repository_access(token, repository, action)

@@ -564,14 +564,20 @@ pub async fn repository_creator(
 }
 
 /// Refuses with `permission_denied` unless the caller may administer
-/// `repository`. The recorded creator is read only when the decision rests
-/// on it.
-pub async fn require_repository_administration(
+/// `repository` or holds [`Action::SetProtected`]. The recorded creator is
+/// read only when the decision rests on it.
+pub async fn require_branch_protection_administration(
     authorizer: &Arc<dyn RepositoryAuthorizer>,
     extensions: &Extensions,
     repository: Arc<lore_revision::repository::RepositoryContext>,
     user_id: &str,
 ) -> Result<(), Status> {
+    if authorizer
+        .permits(extensions, repository.id, Action::SetProtected)
+        .await
+    {
+        return Ok(());
+    }
     let permitted = match repository_administration(authorizer, extensions, repository.id).await {
         RepositoryAdministration::Permitted => true,
         RepositoryAdministration::CreatorOnly => repository_creator(repository).await? == user_id,
@@ -581,7 +587,9 @@ pub async fn require_repository_administration(
         Ok(())
     } else {
         info!(user_id, "Repository administration refused");
-        Err(Status::permission_denied("Not repository owner"))
+        Err(Status::permission_denied(
+            "Not permitted to change branch protection",
+        ))
     }
 }
 
