@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
+use lore_transport::StorageSession;
 
 use crate::branch;
 use crate::errors::AddressNotFound;
@@ -157,24 +158,41 @@ async fn fetch_metadata_hash(
         .forward_any::<BranchMetadataError>("loading branch metadata hash")
 }
 
-/// Collect all addresses referenced by a metadata blob: the blob itself plus any binary
-/// (Address-typed) values it contains.
+/// The first of `addresses` the remote lacks, from one existence query on the storage session of
+/// `repository`, and `None` where the remote holds them all. No addresses answer `None` before any
+/// remote check, so a context without a remote fails with [`NoRemote`] only given addresses.
+///
+/// The session is the one `immutable::resolve_session` gives, over
+/// `RepositoryContext::session_pool`.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn first_missing_remote<'a>(
+    repository: &'a Arc<RepositoryContext>,
+    addresses: &'a [Address],
+) -> impl Future<Output = Result<Option<Address>, BranchMetadataError>> + 'a {
+    async move {
+        if addresses.is_empty() {
+            return Ok(None);
+        }
+        let storage = immutable::resolve_session(repository)
+            .ok_or_else(|| BranchMetadataError::from(NoRemote))?;
+        let missing = immutable::missing_remote(&storage, addresses)
+            .await
+            .forward::<BranchMetadataError>("querying the remote for the addresses it lacks")?;
+        Ok(missing.first().copied())
+    }
+}
+
+/// Collect all addresses referenced by a metadata blob: any binary (Address-typed) values it
+/// contains, then the blob itself, so [`ensure_remote_blobs`] uploads each payload before the
+/// blob that names it.
 fn collect_metadata_addresses(metadata: &Metadata, metadata_hash: Hash) -> Vec<Address> {
-    let mut addresses = vec![Address {
+    let mut addresses = metadata.address_values();
+    addresses.push(Address {
         hash: metadata_hash,
         context: Context::default(),
-    }];
-
-    metadata.walk(|_key: &[u8], value: &[u8], value_type: MetadataType| {
-        if value_type == MetadataType::Address && value.len() == std::mem::size_of::<Address>() {
-            let address: Address = value.into();
-            // Empty content is stored as the zero hash, which names no blob to upload.
-            if !address.hash.is_zero() {
-                addresses.push(address);
-            }
-        }
     });
-
     addresses
 }
 
@@ -182,25 +200,16 @@ fn collect_metadata_addresses(metadata: &Metadata, metadata_hash: Hash) -> Vec<A
 /// the local immutable store.
 async fn ensure_remote_blobs(
     repo: Arc<RepositoryContext>,
-    storage: Arc<lore_transport::StorageSession>,
+    storage: Arc<StorageSession>,
     addresses: &[Address],
 ) -> Result<(), BranchMetadataError> {
     if addresses.is_empty() {
         return Ok(());
     }
 
-    let status = storage
-        .query(addresses)
+    let missing = immutable::missing_remote(&storage, addresses)
         .await
-        .forward::<BranchMetadataError>("querying server for metadata blob existence")?;
-
-    let mut missing = vec![];
-    for (index, value) in status.iter().enumerate() {
-        if *value != 0 && index < addresses.len() {
-            missing.push(addresses[index]);
-        }
-    }
-
+        .forward::<BranchMetadataError>("querying the remote for metadata blob existence")?;
     for address in missing {
         let (fragment, payload) =
             immutable::load_raw_store_retry(repo.immutable_store(), repo.id, address)

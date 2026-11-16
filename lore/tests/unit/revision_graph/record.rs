@@ -8,28 +8,38 @@ use lore::revision_graph::locations::local_read_context;
 use lore::revision_graph::locations::local_write_context;
 use lore::revision_graph::record::BranchRecordOut;
 use lore::revision_graph::record::emit_branch;
+use lore::revision_graph::record::emit_branch_metadata;
 use lore::revision_graph::record::emit_local_branch;
 use lore::revision_graph::record::emit_location_complete;
 use lore::revision_graph::record::emit_revision;
 use lore::revision_graph::record::local_branch_record;
 use lore::revision_graph::record::remote_branch_record;
 use lore::storage::store::in_memory_for_tests;
+use lore_base::error::AddressNotFound;
 use lore_base::error::BranchAdvanced;
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::Address;
 use lore_base::types::BranchId;
 use lore_base::types::BranchPoint;
+use lore_base::types::Context;
 use lore_base::types::Hash;
+use lore_error_set::prelude::*;
 use lore_revision::branch;
 use lore_revision::branch::BranchLatestStatus;
 use lore_revision::event::LoreEvent;
+use lore_revision::event::revision_graph::LoreRevisionGraphBranchMetadataEventData;
 use lore_revision::instance::InstanceId;
 use lore_revision::instance::InstanceRecord;
 use lore_revision::instance::InstanceStaleness;
 use lore_revision::interface::ExecutionContext;
 use lore_revision::interface::LoreArray;
+use lore_revision::interface::LoreBinary;
 use lore_revision::interface::LoreBranchLocation;
 use lore_revision::interface::LoreBranchPoint;
+use lore_revision::interface::LoreMetadata;
 use lore_revision::interface::LoreString;
+use lore_revision::metadata::Metadata;
+use lore_revision::metadata::MetadataType;
 use lore_revision::relay::EventDispatcher;
 use lore_revision::repository::RepositoryContext;
 use lore_storage::test_util::HookedStore;
@@ -520,8 +530,8 @@ async fn remote_branch_record_reads_protect_from_the_blob_it_names() {
     assert!(!record.divergent);
 }
 
-/// A remote record naming a metadata blob the store doesn't hold fails, rather than reading as
-/// unprotected.
+/// A remote record naming a metadata blob the store doesn't hold fails with `AddressNotFound`,
+/// rather than reading as unprotected.
 #[tokio::test]
 async fn remote_branch_record_fails_without_the_blob_it_names() {
     let (_, read) = contexts("record-remote-no-blob").await;
@@ -539,8 +549,9 @@ async fn remote_branch_record_fails_without_the_blob_it_names() {
 
     let record = in_setup_context(remote_branch_record(read.clone(), remote)).await;
 
-    assert!(
-        matches!(&record, Err(err) if err.is_internal()),
+    assert_eq!(
+        record.as_ref().err().map(|err| err.ffi_code()),
+        Some(AddressNotFound::FFI_CODE),
         "{record:?}"
     );
 }
@@ -709,4 +720,170 @@ async fn emit_location_complete_reports_records_and_the_error_code() {
     assert_eq!(failed.records, 0);
     assert_eq!(failed.error.error_code, BranchAdvanced::FFI_CODE);
     assert!(!failed.error.message.is_empty());
+}
+
+/// Appends an entry with type tag `tag`, which no setter can write, to `metadata`, which must
+/// already hold an entry so its header is written.
+fn append_raw_entry(metadata: &mut Metadata, key: &[u8], value: &[u8], tag: u32) {
+    for field in [key.len() as u32, value.len() as u32, tag] {
+        metadata.buffer.extend_from_slice(&field.to_ne_bytes());
+    }
+    metadata.buffer.extend_from_slice(key);
+    metadata.buffer.extend_from_slice(value);
+}
+
+/// The branch metadata records in `events`, which must hold nothing else but log lines and the
+/// drain's `End`, in order.
+fn metadata_records(events: &[LoreEvent]) -> Vec<&LoreRevisionGraphBranchMetadataEventData> {
+    let events = without_log_lines(events);
+    let Some((LoreEvent::End(_), records)) = events.split_last() else {
+        panic!("expected End last, got {} events", events.len());
+    };
+    records
+        .iter()
+        .map(|&event| match event {
+            LoreEvent::RevisionGraphBranchMetadata(data) => data,
+            _ => panic!("expected only branch metadata records before End"),
+        })
+        .collect()
+}
+
+/// The key and value of each of `records`, in order.
+fn entries(records: &[&LoreRevisionGraphBranchMetadataEventData]) -> Vec<(Vec<u8>, LoreMetadata)> {
+    records
+        .iter()
+        .map(|record| (record.key.as_bytes().to_vec(), record.value.clone()))
+        .collect()
+}
+
+/// Each entry is one record carrying the call's id, the location and the branch, with the entry's
+/// key and its value as the type it's stored with, in the order the metadata holds the entries.
+#[tokio::test]
+async fn branch_metadata_records_follow_the_stored_order() {
+    let branch = new_branch();
+    let address = Address {
+        hash: hash(3),
+        context: Context::from([4; 16]),
+    };
+    let context = Context::from([5; 16]);
+    let mut metadata = Metadata::new();
+    metadata
+        .set_string("name", "feature")
+        .expect("sets the entry");
+    metadata.set_u64("created", 42).expect("sets the entry");
+    metadata.set_bool("protect", true).expect("sets the entry");
+    metadata.set_hash("hash", hash(2)).expect("sets the entry");
+    metadata
+        .set_address("address", address)
+        .expect("sets the entry");
+    metadata
+        .set_context("context", context)
+        .expect("sets the entry");
+    metadata
+        .set_binary("binary", &[0, 0xff, 7])
+        .expect("sets the entry");
+
+    let (sent, events) = recorded(async {
+        emit_branch_metadata(7, LoreBranchLocation::Remote, branch, &metadata, None)
+    })
+    .await;
+
+    assert_eq!(sent, 7);
+    let records = metadata_records(&events);
+    for record in &records {
+        assert_eq!(
+            (record.id, record.location, record.branch),
+            (7, LoreBranchLocation::Remote, branch)
+        );
+    }
+    assert_eq!(
+        entries(&records),
+        vec![
+            (
+                b"name".to_vec(),
+                LoreMetadata::String(LoreString::from("feature"))
+            ),
+            (b"created".to_vec(), LoreMetadata::Numeric(42)),
+            (b"protect".to_vec(), LoreMetadata::Boolean(1)),
+            (b"hash".to_vec(), LoreMetadata::Hash(hash(2))),
+            (b"address".to_vec(), LoreMetadata::Address(address)),
+            (b"context".to_vec(), LoreMetadata::Context(context)),
+            (
+                b"binary".to_vec(),
+                LoreMetadata::Binary(LoreBinary::from_bytes(&[0, 0xff, 7]))
+            ),
+        ]
+    );
+}
+
+/// With a key, only the entry with that key is reported, where it can be: another key's entry,
+/// readable or not, isn't.
+#[tokio::test]
+async fn a_key_selects_one_record_or_none() {
+    let branch = new_branch();
+    let mut metadata = Metadata::new();
+    metadata
+        .set_string("name", "feature")
+        .expect("sets the entry");
+    metadata.set_bool("protect", false).expect("sets the entry");
+    metadata
+        .set(b"short", &[1; 31], MetadataType::Hash)
+        .expect("sets the entry");
+
+    let (sent, events) = recorded(async {
+        [Some("protect"), Some("absent"), Some("short")]
+            .map(|key| emit_branch_metadata(7, LoreBranchLocation::Local, branch, &metadata, key))
+    })
+    .await;
+
+    assert_eq!(sent, [1, 0, 0]);
+    let records = metadata_records(&events);
+    assert_eq!(
+        entries(&records),
+        vec![(b"protect".to_vec(), LoreMetadata::Boolean(0))]
+    );
+    assert_eq!(
+        (records[0].id, records[0].location, records[0].branch),
+        (7, LoreBranchLocation::Local, branch)
+    );
+}
+
+/// An entry whose key isn't UTF-8, whose value doesn't decode as its type, or whose type tag no
+/// metadata type defines is left out, and the entries around it are still reported.
+#[tokio::test]
+async fn entries_that_cannot_be_reported_are_skipped() {
+    let branch = new_branch();
+    let mut metadata = Metadata::new();
+    metadata.set_string("first", "one").expect("sets the entry");
+    metadata
+        .set(b"\xe4\xb8", b"value", MetadataType::String)
+        .expect("sets the entry");
+    metadata
+        .set(b"short", &[1; 31], MetadataType::Hash)
+        .expect("sets the entry");
+    append_raw_entry(&mut metadata, b"unknown", b"value", 9);
+    metadata.set_string("last", "two").expect("sets the entry");
+    metadata
+        .check_buffer()
+        .expect("the entries are well formed");
+
+    let (sent, events) = recorded(async {
+        emit_branch_metadata(3, LoreBranchLocation::Remote, branch, &metadata, None)
+    })
+    .await;
+
+    assert_eq!(sent, 2);
+    assert_eq!(
+        entries(&metadata_records(&events)),
+        vec![
+            (
+                b"first".to_vec(),
+                LoreMetadata::String(LoreString::from("one"))
+            ),
+            (
+                b"last".to_vec(),
+                LoreMetadata::String(LoreString::from("two"))
+            ),
+        ]
+    );
 }

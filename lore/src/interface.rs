@@ -9075,6 +9075,7 @@ pub type LoreRevisionGraphRevisionResolveArgs =
 /// - error code 111 (no remote) where `remote` is set in `globals` and `args->store` has no remote;
 /// - error code 88 (revision not found) where no location consulted holds the revision, and
 ///   error code 87 (branch not found) in its place where none holds `args->revision.branch`;
+/// - error code 118 (oversized) where a location holds a revision metadata blob over 1 MiB;
 /// - error code 16 (not authenticated) where the call has no login or tokens the remote accepts.
 ///   The call starts no login: the caller logs in, with `lore_auth_login_interactive` or
 ///   `lore_auth_login_with_token`, and calls again, and a storage handle's open connection picks
@@ -9139,6 +9140,9 @@ pub type LoreRevisionGraphBranchResolveArgs =
 ///   contradict each other or those `args->store` was opened with;
 /// - error code 111 (no remote) where `remote` is set in `globals` and `args->store` has no remote;
 /// - error code 87 (branch not found) where the name names no branch at any location consulted;
+/// - error code 80 (address not found) where the remote lacks the metadata blob it names for the
+///   branch, whose address the error detail names;
+/// - error code 118 (oversized) where a location holds a metadata blob larger than 1 MiB;
 /// - error code 16 (not authenticated) where the call has no login or tokens the remote accepts.
 ///   The call starts no login: the caller logs in, with `lore_auth_login_interactive` or
 ///   `lore_auth_login_with_token`, and calls again, and a storage handle's open connection picks
@@ -9205,6 +9209,9 @@ pub type LoreRevisionGraphBranchListArgs =
 ///   `args->store`, and location flags that contradict each other or those `args->store` was
 ///   opened with;
 /// - error code 111 (no remote) where `remote` is set in `globals` and `args->store` has no remote;
+/// - error code 80 (address not found) where the remote lacks the metadata blob it names for a
+///   branch, whose address the error detail names;
+/// - error code 118 (oversized) where a location holds a metadata blob larger than 1 MiB;
 /// - error code 16 (not authenticated) where the call has no login or tokens the remote accepts.
 ///   The call starts no login: the caller logs in, with `lore_auth_login_interactive` or
 ///   `lore_auth_login_with_token`, and calls again, and a storage handle's open connection picks
@@ -9235,6 +9242,184 @@ pub extern "C" fn lore_revision_graph_branch_list(
 pub extern "C" fn lore_revision_graph_branch_list_async(
     globals: &LoreGlobalArgs,
     args: &LoreRevisionGraphBranchListArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, dispatch_command);
+}
+
+pub type LoreRevisionGraphBranchMetadataGetArgs =
+    crate::revision_graph::branch_metadata_get::LoreRevisionGraphBranchMetadataGetArgs;
+
+/// Read the metadata of `args->branch` at each location the call consults.
+///
+/// The call consults the locations, works at each, and fails as
+/// `lore_revision_graph_revision_resolve` describes. It sends a
+/// `LORE_EVENT_REVISION_GRAPH_BRANCH_METADATA` for each entry of the branch's metadata at each
+/// location that holds the branch, built-in entries included, in the order the location stores
+/// them, or only for the entry `args->key` names where `args->key` isn't empty. A location without
+/// metadata for the branch doesn't hold it, and in the local store a metadata blob the store lacks
+/// counts as none. Lore Server answers a failed read of the branch's metadata key as a missing key,
+/// which reads as a remote that doesn't hold the branch. An archived branch reads like a live one.
+/// A `protect` entry is reported with the type it's stored with: Lore and Lore Server read a
+/// one-byte value of any type by its byte, and any other value as unprotected. The `archived` and
+/// `restored` entries alone don't say whether the branch is archived, since a restore keeps
+/// `archived` beside `restored` and an older version's archive wrote no `archived` entry;
+/// `lore_revision_graph_branch_list` with `include_archived` set says whether it is. An entry whose
+/// key isn't UTF-8, whose type this build doesn't define, or whose value doesn't decode as its type
+/// is left out, with one `LORE_EVENT_LOG` warning from each location that leaves any out. Each
+/// location the call consults ends with its
+/// `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE`, which carries no error and no records where the
+/// location doesn't hold the branch, or, for a non-empty `args->key`, holds it without that key.
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_REVISION_GRAPH_BRANCH_METADATA` | `lore_revision_graph_branch_metadata_event_data_t` | One entry of the branch's metadata, as one location holds it |
+/// | `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE` | `lore_revision_graph_location_complete_event_data_t` | One location's outcome, after its records |
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | A log line |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` on success or the error code, with its detail in `error` |
+///
+/// Fails with:
+/// - error code 3 (invalid arguments) for a zero `args->branch`, an `args->key` that is not UTF-8,
+///   an unknown or closed `args->store`, and location flags that contradict each other or those
+///   `args->store` was opened with;
+/// - error code 111 (no remote) where `remote` is set in `globals` and `args->store` has no remote;
+/// - error code 87 (branch not found) where no location consulted holds the branch;
+/// - error code 80 (address not found) where the remote lacks the metadata blob it names for the
+///   branch, whose address the error detail names;
+/// - error code 118 (oversized) where a location holds a metadata blob larger than 1 MiB;
+/// - error code 16 (not authenticated) where the call has no login or tokens the remote accepts.
+///   The call starts no login: the caller logs in, with `lore_auth_login_interactive` or
+///   `lore_auth_login_with_token`, and calls again, and a storage handle's open connection picks
+///   up the new login within a minute. A caller that passes its own tokens in `globals` opens a
+///   new storage handle with fresh ones, since an open connection keeps the tokens it connected
+///   with;
+/// - error codes 17 (not authorized), 28 (disconnected), 29 (not connected), 30 (maintenance) and
+///   31 (slow down) where the remote refuses the call or can't be reached;
+/// - error code -1 (internal) for any other failure, such as a corrupt block.
+///
+/// An event's strings, binary values, arrays and error detail are valid only during the callback
+/// invocation that delivers it. This call and `lore_revision_graph_branch_metadata_get_async` copy
+/// `args` before they return, so an `_async` caller can free `args` and its strings once the call
+/// returns. A caller that passes the same `globals.correlation_id` on every call over one storage
+/// handle reuses one storage session per connection, as with the `lore_storage_*` calls.
+/// `args->id`, which every `LORE_EVENT_REVISION_GRAPH_*` event echoes, is separate from it.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_graph_branch_metadata_get(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionGraphBranchMetadataGetArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, run_command)
+}
+
+/// Read the metadata of a branch at each location the call consults (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_graph_branch_metadata_get_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionGraphBranchMetadataGetArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, dispatch_command);
+}
+
+pub type LoreRevisionGraphBranchMetadataEntry =
+    crate::revision_graph::branch_metadata_set::LoreRevisionGraphBranchMetadataEntry;
+pub type LoreRevisionGraphBranchMetadataSetArgs =
+    crate::revision_graph::branch_metadata_set::LoreRevisionGraphBranchMetadataSetArgs;
+
+/// Edit the metadata of `args->branch` at each location the call consults: set each of
+/// `args->entries`, replacing the value its key holds, and remove each key of `args->remove`.
+///
+/// The call consults the locations `lore_revision_graph_revision_resolve` describes, the remote
+/// first, and checks its arguments before it reads either. Neither list may name a read-only key:
+/// `id`, `name`, `category`, `creator`, `created`, `stack`, `parent`, `branch-point`, `archived`,
+/// `restored`, `restoring` or `released`. `protect` can be set, with a
+/// `LORE_METADATA_TYPE_BOOLEAN` value, but not removed. Each value's `tag` must be a
+/// `LORE_METADATA_TYPE_*` value; any other is undefined behavior, which no error code reports. The
+/// call ignores `globals.force` and `globals.dry_run`, and `lore_storage_close` waits for it.
+///
+/// At each location, the call reads the metadata as `lore_revision_graph_branch_metadata_get`
+/// does and applies the edits to it. Where they change it, the call checks its address values,
+/// writes it, and swaps it in for the metadata it read. Where another writer swapped first, the
+/// call applies the edits to that writer's metadata and swaps again, at most eight swaps at one
+/// location, so the last writer wins, key by key. Where the edits leave the metadata as it was,
+/// the call checks and writes nothing there. The call edits no location that doesn't hold the
+/// branch, or whose metadata another writer removed.
+///
+/// At the remote, the check covers every address value of the new metadata, and in the local
+/// store the addresses `args->entries` sets, whose payloads the local store must hold. An address
+/// with a zero hash needs no check. The call sends no address payload: the caller puts it at the
+/// remote first, with `lore_storage_put` and an item with `remote_write` set. The call writes the
+/// new metadata at the remote through the local store of `args->store`, which it queries and where
+/// it records each fragment it stores, adding a payload only for a fragment list or a fragment
+/// whose upload failed. Its other work at one location never reads or writes the other.
+///
+/// Each location that holds the branch then sends a `LORE_EVENT_REVISION_GRAPH_BRANCH_METADATA`
+/// for each entry of the metadata it holds after the call, other writers' entries included, and
+/// leaves entries out as `lore_revision_graph_branch_metadata_get` does. Each location the call
+/// consults ends with its `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE`, which carries no error and
+/// no records where the location doesn't hold the branch. A failure at the remote fails the call
+/// before it reaches the local store, so no complete event for the local store follows. A call that
+/// fails in the local store after the remote succeeded can be retried with `local` set. Since a
+/// failed read of the metadata key at the remote reads as a miss there, a caller that needs both
+/// locations edited checks that each location's complete event reports records.
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_REVISION_GRAPH_BRANCH_METADATA` | `lore_revision_graph_branch_metadata_event_data_t` | One entry of the branch's metadata, as one location holds it after the call |
+/// | `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE` | `lore_revision_graph_location_complete_event_data_t` | One location's outcome, after its records |
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | A log line |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` on success or the error code, with its detail in `error` |
+///
+/// Fails with:
+/// - error code 3 (invalid arguments) for a zero `args->branch`; an empty or read-only key, or a
+///   key the two lists name more than once between them; `protect` in `args->remove` or with a
+///   value that isn't Boolean; a key or a `LORE_METADATA_TYPE_STRING` value that is not UTF-8; an
+///   unknown or closed `args->store`; and location flags that contradict each other or those
+///   `args->store` was opened with;
+/// - error code 111 (no remote) where `remote` is set in `globals` and `args->store` has no remote;
+/// - error code 87 (branch not found) where no location consulted holds the branch;
+/// - error code 118 (oversized) where the edited metadata is larger than 1 MiB, or a location holds
+///   a metadata blob larger than that;
+/// - error code 80 (address not found) where an address value the call checks names a payload the
+///   location doesn't hold, or the remote lacks a metadata blob it names for the branch. The error
+///   detail names the address;
+/// - error code 41 (branch advanced) where another writer changed the metadata at a location before
+///   each of the call's eight swaps there. The error's message speaks of a branch's latest, while
+///   its trace names the metadata swap;
+/// - error code 16 (not authenticated) where the call has no login or tokens the remote accepts.
+///   The call starts no login: the caller logs in, with `lore_auth_login_interactive` or
+///   `lore_auth_login_with_token`, and calls again, and a storage handle's open connection picks
+///   up the new login within a minute. A caller that passes its own tokens in `globals` opens a
+///   new storage handle with fresh ones, since an open connection keeps the tokens it connected
+///   with;
+/// - error code 17 (not authorized) where the remote refuses the call, among them a change to
+///   `protect` without repository administration, and error codes 28 (disconnected), 29 (not
+///   connected), 30 (maintenance) and 31 (slow down) where the remote can't be reached;
+/// - error code -1 (internal) for any other failure, such as a corrupt block, or new metadata whose
+///   upload failed and that the remote then can't read.
+///
+/// An event's strings, binary values, arrays and error detail are valid only during the callback
+/// invocation that delivers it. This call and `lore_revision_graph_branch_metadata_set_async` copy
+/// `args` before they return, so an `_async` caller can free `args`, its arrays, strings and binary
+/// values once the call returns. A caller that passes the same `globals.correlation_id` on every
+/// call over one storage handle reuses one storage session per connection, as with the
+/// `lore_storage_*` calls. `args->id`, which every `LORE_EVENT_REVISION_GRAPH_*` event echoes, is
+/// separate from it.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_graph_branch_metadata_set(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionGraphBranchMetadataSetArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, run_command)
+}
+
+/// Edit the metadata of a branch at each location the call consults (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_graph_branch_metadata_set_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionGraphBranchMetadataSetArgs,
     callback: LoreEventCallbackConfig,
 ) {
     run_asynchronously(globals, args, callback, dispatch_command);

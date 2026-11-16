@@ -8,6 +8,8 @@
 //! caller names a revision.
 
 pub mod branch_list;
+pub mod branch_metadata_get;
+pub mod branch_metadata_set;
 pub mod branch_resolve;
 #[cfg(not(feature = "test-util"))]
 pub(crate) mod call;
@@ -23,6 +25,7 @@ pub(crate) mod record;
 pub mod record;
 pub mod revision_resolve;
 
+use lore_base::error::AddressNotFound;
 use lore_base::error::BranchAdvanced;
 use lore_base::error::BranchAlreadyExists;
 use lore_base::error::BranchNotFound;
@@ -37,6 +40,7 @@ use lore_base::error::NoRemote;
 use lore_base::error::NotAuthenticated;
 use lore_base::error::NotAuthorized;
 use lore_base::error::NotConnected;
+use lore_base::error::Oversized;
 use lore_base::error::RevisionNotFound;
 use lore_base::error::SlowDown;
 use lore_base::types::BranchId;
@@ -59,9 +63,21 @@ pub enum RevisionGraphError {
     DeleteCurrent,
     DeleteDefault,
     BranchAlreadyExists,
+    AddressNotFound,
     BranchNotFound,
     RevisionNotFound,
     NoRemote,
+    Oversized,
+}
+
+impl RevisionGraphError {
+    /// A rejection the arguments earned, alongside the generated `internal` constructor for a
+    /// failure of ours.
+    pub(crate) fn invalid(reason: impl Into<String>) -> Self {
+        Self::from(InvalidArguments {
+            reason: reason.into(),
+        })
+    }
 }
 
 /// A revision identifier in its structured form: the revision with `hash`, or revision
@@ -98,9 +114,7 @@ impl LoreRevisionIdentifier {
     #[lore_macro::test_pub]
     pub(crate) fn form(&self) -> Result<RevisionForm, RevisionGraphError> {
         let malformed = |names: &str| {
-            RevisionGraphError::from(InvalidArguments {
-                reason: format!("the revision identifier names {names}"),
-            })
+            RevisionGraphError::invalid(format!("the revision identifier names {names}"))
         };
         match (
             !self.hash.is_zero(),

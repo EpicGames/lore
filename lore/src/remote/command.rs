@@ -180,4 +180,10 @@ pub enum LoreCommand {
     RevisionGraphBranchResolve(
         crate::revision_graph::branch_resolve::LoreRevisionGraphBranchResolveArgs,
     ),
+    RevisionGraphBranchMetadataGet(
+        crate::revision_graph::branch_metadata_get::LoreRevisionGraphBranchMetadataGetArgs,
+    ),
+    RevisionGraphBranchMetadataSet(
+        crate::revision_graph::branch_metadata_set::LoreRevisionGraphBranchMetadataSetArgs,
+    ),
 }

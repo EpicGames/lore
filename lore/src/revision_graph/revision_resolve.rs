@@ -216,7 +216,7 @@ pub(crate) fn resolve_at<'a>(
 
 /// The number and branch of `revision`, a hash an identifier names, at the location `ctx` reads, as
 /// [`state_record`] reads them. `None` where the location holds no state under the hash, a blob
-/// that is not a revision state included, since an identifier can name any blob.
+/// of any size that is not a revision state included, since an identifier can name any blob.
 ///
 /// # Errors
 ///
@@ -231,7 +231,9 @@ pub(crate) fn revision_record_at(
 
 /// The number and branch of `revision` at the location `ctx` reads, or why the location holds no
 /// state under it ([`find::revision_state`]): the number its state records, and the branch its
-/// metadata names ([`revision_branch`]).
+/// metadata names ([`revision_branch`]). A blob larger than a revision state, whose read the
+/// state's size refuses with `Oversized`, is [`StateMiss::NotAState`], as a blob without the
+/// state's magic is.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 ///
@@ -245,12 +247,14 @@ fn state_record(
 ) -> impl Future<Output = Result<Result<(u64, BranchId), StateMiss>, RevisionGraphError>> + '_ {
     async move {
         let (number, metadata) =
-            match find::revision_state(ctx, revision, read_options_from_repository(ctx))
-                .await
-                .forward_any::<RevisionGraphError>("reading the revision's state")?
-            {
-                Ok(state) => (state.revision_number, state.metadata_hash()),
-                Err(miss) => return Ok(Err(miss)),
+            match find::revision_state(ctx, revision, read_options_from_repository(ctx)).await {
+                Ok(Ok(state)) => (state.revision_number, state.metadata_hash()),
+                Ok(Err(miss)) => return Ok(Err(miss)),
+                Err(err) if err.is_oversized() => return Ok(Err(StateMiss::NotAState)),
+                Err(err) => {
+                    return Err(err)
+                        .forward_any::<RevisionGraphError>("reading the revision's state");
+                }
             };
         let branch = revision_branch(ctx.clone(), metadata).await?;
         Ok(Ok((number, branch)))

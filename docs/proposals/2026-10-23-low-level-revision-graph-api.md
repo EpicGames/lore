@@ -5,7 +5,7 @@ authors:
   - mattias.jansson
 status: Accepted
 created: 2026-10-23
-updated: 2026-11-13
+updated: 2026-11-16
 discussion: change-request/994
 ---
 
@@ -87,7 +87,7 @@ Together, these gaps leave a caller that wants nothing on disk making a clone fo
 - **New RPCs, Lore Server protocol messages, or on-disk structures:** Every verb uses RPCs, message fields, and mutable keys that exist today. The Lore service IPC gains a command for each verb and an event for each event data type, as every C API addition does (see Compatibility).
 - **A stateful repository handle:** See Alternatives Considered.
 - **The string form of [revision identifiers](../glossary.md#revision-identifier):** This surface takes a revision identifier only in its structured form (see "Revision identifier" under "Conventions"), never as a string such as `main@latest`, `main@25`, or `main@25~2`. Converting a string is the caller's job.
-- **A merging sync:** `branch_sync` doesn't merge a divergent local latest with its target the way `lore sync` does when it produces a [merge revision](../glossary.md#merge-revision). A merging sync is a candidate for a later verb.
+- **A merging sync:** `branch_sync` doesn't merge a divergent local latest with its target the way `lore sync` does when it produces a [merge revision](../glossary.md#merge). A merging sync is a candidate for a later verb.
 - **Cascading to [layers](../glossary.md#layer) and [links](../glossary.md#link):** The file-system push always pushes linked repositories' revisions, and the file-system create and archive can act on layers and links. Each verb here acts on the one repository it names. `branch_create` creates no layer or link branches, `branch_archive` archives none, and `branch_push` publishes no linked repository's revision.
 - **Changing the revision tree API:** `lore_revision_tree_commit` stays local-only, and publishing is a separate call on this surface.
 - **Separating event emission from the cores:** The cores keep sending the file-system verbs' events, and the verbs drop all but log lines and the push's progress and statistics (see "Changes beneath the verbs"). A later refactor makes the cores pure: each returns its outcome and sends no events, and the API layer sends the events. The file-system verbs then send theirs, and this surface becomes one more API over the same cores that sends only the events this proposal names. That refactor changes every file-system verb, so it's a change of its own.
@@ -146,6 +146,8 @@ The verbs that report per location (`revision_resolve`, `branch_resolve`, `branc
 
 Either would let the local answer find a branch or revision only because the remote answer fetched it.
 
+The amendment "Branch metadata get and set" under "Extensions" changes this rule for one kind of work: a write at the remote through the immutable data pipeline, which branch metadata set makes. The pipeline works through the storage handle's local store, with the `remote` flag too. So such a write may read the local store and leave entries there for what it uploads. All other work at the remote keeps the rule.
+
 **Records per location.** A verb that reports objects emits one record event per object per location consulted, remote first, tagged with `location: LoreBranchLocation` (`Local` or `Remote`, `lore-revision/src/interface.rs:1431-1436`). With no flag the verb reports both locations, and with a flag only that one, so the surface never merges two answers or picks one over the other.
 
 Each location the call consults ends with a `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE` event after its records, which carries the number of records the call emitted for that location and the location's own `LoreErrorDetail`. Each storage item ends with its own complete event the same way ([ADR-00020](../developing/decisions/00020-storage-per-item-error-detail.md)). A caller tells three cases apart:
@@ -202,9 +204,11 @@ Exactly one of `hash` and `branch` is non-zero, and `revision_number` is zero wi
 | 48 | `DeleteCurrent` | A `branch_archive` that would archive the branch locally while a live repository instance over the store has it as its current branch |
 | 49 | `DeleteDefault` | `branch_archive` of the repository's default branch, or of a branch with an empty stack |
 | 57 | `BranchAlreadyExists` | `branch_create` with a name a live branch holds at a location the call creates on, including the loser of two concurrent creates, a first `branch_push` of a branch whose name a different remote branch holds, a `branch_push` that would restore an archived branch whose name another branch now holds, or a `branch_sync` that would bring in a branch whose name a different local branch holds |
+| 80 | `AddressNotFound` | A blob the remote's answer names, such as a branch's metadata, is missing at the remote; in the local store, such a blob is a miss. Branch metadata set: an address value names a payload the location doesn't hold. Added by the amendment "Branch metadata get and set" |
 | 87 | `BranchNotFound` | The branch is absent from every location consulted, `branch_sync` names a branch absent from the location it looks the target up in, or `branch_push` names a branch with no local latest |
 | 88 | `RevisionNotFound` | The revision a revision identifier names is absent from every location consulted, `branch_create`'s branch point doesn't resolve at a location it creates on, a revision `branch_push` would offer points at a linked repository's revision the remote lacks, or `branch_sync`'s ancestry walk stops at a revision the local store lacks with no remote to read it from |
 | 111 | `NoRemote` | The call needs the remote, and the storage handle has none |
+| 118 | `Oversized` | A blob a location holds is larger than its read allows, or branch metadata set's result exceeds 1 MiB. Added by the amendment "Branch metadata get and set" |
 | -1 | `Internal` | A remote refusal the verb can't attribute to a row above. The detail carries the remote's message |
 
 The verbs produce these codes for refusals that come back from the remote too. Lore Server reports refusals as gRPC statuses, and today's client folds several of them into `Internal` (`lore-transport/src/error.rs:30-49`). A status alone doesn't always identify the refusal:
@@ -817,4 +821,123 @@ None.
 
 ## Extensions
 
-None yet. Verbs that amendments add under "Extending the surface" land here.
+Verbs that amendments add under "Extending the surface" land here.
+
+### Amendment (2026-11-13): Branch metadata get and set
+
+**Status:** Accepted. Proposed and accepted in change-request/1286, which implements the verbs.
+
+This amendment adds the candidate "Reading and editing branch metadata and protection." The two verbs are stateless, take `(store, repository)`, use RPCs and mutable keys that exist today, and leave Lore Server's behavior and the trust model unchanged. Accepting the amendment also accepts three changes to this proposal, which "Extending the surface" would otherwise send to a new proposal:
+
+- **Locations:** A write at the remote through the immutable data pipeline may read and write the local store, as "Locations" under "Conventions" now says.
+- **Errors:** `AddressNotFound` (80) and `Oversized` (118) join the error table.
+- **Order of acceptance:** Reviewers accept an amendment before its implementation merges, as `GOVERNANCE.md`'s LEP rule has it, rather than before anyone implements it.
+
+**Why.** A branch's metadata holds the entries Lore writes, such as its name, category, creator and protection, and the entries a user or tool adds with `lore branch metadata set`. Today a pipeline reads or edits them only through a repository instance: `lore_branch_metadata_get`, `lore_branch_metadata_set`, `lore_branch_metadata_clear`, `lore_branch_protect` and `lore_branch_unprotect` run on the instance call path (`lore/src/branch.rs:1045-1061, 1100-1116, 1516-1548, 1560-1714`).
+
+**Verbs.**
+
+| Verb | Input beyond `id, store, repository` | Emits before `COMPLETE` |
+| --- | --- | --- |
+| `lore_revision_graph_branch_metadata_get` | `branch`, `key` | A metadata record per entry per location that holds the branch, and each location's complete event |
+| `lore_revision_graph_branch_metadata_set` | `branch`, `entries`, `remove` | A metadata record per entry of the metadata each location holds after the call, and each location's complete event |
+
+```rust
+#[repr(C)]
+pub struct LoreRevisionGraphBranchMetadataGetArgs {
+    pub id: u64,
+    pub store: LoreStore,
+    pub repository: Partition,
+    pub branch: BranchId,
+    pub key: LoreString,                    // empty: every entry
+}
+
+#[repr(C)]
+pub struct LoreRevisionGraphBranchMetadataEntry {
+    pub key: LoreString,
+    pub value: LoreMetadata,                // typed, as the revision tree's metadata verbs take it
+}
+
+#[repr(C)]
+pub struct LoreRevisionGraphBranchMetadataSetArgs {
+    pub id: u64,
+    pub store: LoreStore,
+    pub repository: Partition,
+    pub branch: BranchId,
+    pub entries: LoreArray<LoreRevisionGraphBranchMetadataEntry>, // set, replacing a key's value
+    pub remove: LoreArray<LoreString>,                             // keys to remove
+}
+```
+
+`entries` and `remove` are one edit, applied together at each location. They aren't a batch as "Arguments" means one, and their items carry no `id`.
+
+**Record.** Both verbs report entries in one record type, under a new tag appended to `lore_event_id_t`:
+
+```rust
+/// LORE_EVENT_REVISION_GRAPH_BRANCH_METADATA: one metadata entry of a branch, as one location holds it.
+pub struct LoreRevisionGraphBranchMetadataEventData {
+    pub id: u64,                            // the call's `id`, echoed back
+    pub location: LoreBranchLocation,
+    pub branch: BranchId,
+    pub key: LoreString,
+    pub value: LoreMetadata,
+}
+```
+
+A location reports its entries in the order its metadata holds them, with typed values. Another tool or a newer Lore may write an entry this build can't report: a key that isn't UTF-8, or a type or value it can't decode. The verbs leave such entries out of their records, with one `LORE_EVENT_LOG` warning per location that left any out, and set keeps them in the metadata it writes.
+
+**Get.** Get reports the branch's metadata at each location it consults, under "Locations" and "Records per location": every entry, or with a non-empty `key` only that one. A location without metadata for the branch doesn't hold it. An archived branch reads like a live one, and `branch_list` with `include_archived` says whether it's archived. The call fails with `BranchNotFound` when no location it consulted holds the branch.
+
+Lore Server answers a failed read of a branch's metadata key as it answers a missing key (`lore-server/src/grpc/revision/v1/branch_metadata_get.rs:55-61`), as its `BranchGet` by id does. Such a failure therefore reads as a remote that doesn't hold the branch. Telling the two apart would change Lore Server, which an amendment can't do.
+
+**Set.** Set applies the edit to the branch's metadata at each location it consults, remote first, and writes the result with one compare-and-swap per location.
+
+- **Refusals:** Before any read, set refuses with `InvalidArguments` a zero `branch`, an empty key, and a key that `entries` and `remove` name more than once between them. It also refuses the keys Lore maintains itself, the ones the file-system set refuses (`lore-revision/src/metadata/branch.rs:40-62`): `id`, `name`, `category`, `creator`, `created`, `stack`, the deprecated `parent` and `branch-point`, and the archive keys. So set neither renames, archives nor restores a branch. `protect` can be set to a Boolean but not removed, as `lore branch unprotect` stores `false` rather than removing it (`lore-revision/src/branch.rs:4135-4141, 4149-4156`).
+- **Checks:** A result over 1 MiB fails the location with `Oversized`. An address value that names a payload the location doesn't hold fails it with `AddressNotFound`. The local store checks only the addresses the edit sets, since nothing copies the payloads other writers' addresses name into it. Both checks run before the location's write. Set writes only the metadata blob, so a caller puts an address's payload at each location before it sets an address that names it.
+- **Concurrent writers:** Where another writer changed the metadata after set read it, set applies its edit to the metadata that writer left. The other writer's entries stay, and for a key both edit, the later swap's value stays. After eight lost swaps the location fails with `BranchAdvanced`, so a call ends while another writer keeps changing the metadata. A location whose metadata went in the meantime is a miss.
+- **Permissions:** Changing `protect` at the remote needs repository administration (`lore-server/src/grpc/revision/v1/branch_metadata_set.rs:133-141`). In the local store it needs none, as `lore branch protect` needs none without a remote (`lore-revision/src/branch.rs:4165-4184`). An edit that leaves a location's metadata as it was writes nothing there, so it needs only read access.
+- **Failures:** A failure at the remote stops the call before the local store, as for `branch_create` and `branch_archive`. When set succeeds at the remote and fails in the local store, the local store's complete event carries the error, and the caller retries with the `local` flag.
+- **Records:** Each location that holds the branch reports the metadata it holds after the call, then its complete event. After a lost swap, the records show the other writer's entries too.
+
+An archived branch is edited like a live one. Since a failed read at the remote reads as a miss there (see Get), a set with no flag can succeed having edited only the local store. A caller that needs both locations edited checks that each location reported records.
+
+At the remote, set uploads the new metadata blob through the immutable data pipeline with the remote's session, then calls `BranchMetadataSet` with the value it read and the new one. It makes that call whether or not the upload succeeded, because the pipeline doesn't report why an upload failed and the server's answer does: Lore Server checks the caller's access first, then refuses a new blob it lacks (`lore-server/src/grpc/revision/v1/branch_metadata_set.rs:59, 121-130`). The pipeline works through the storage handle's local store, which is the change to "Locations": the upload may read the local store and leave entries there for what it uploads.
+
+**Errors.** The verbs use these rows of the error table. The two marked new join the table for every verb:
+
+| Code | Name | Raised when |
+| --- | --- | --- |
+| 3 | `InvalidArguments` | Invalid location flags, a zero `branch`, text that isn't UTF-8, or a set refused as "Set" lists |
+| 17 | `NotAuthorized` | The caller lacks the access the call needs: read, write for a set that changes the metadata, and repository administration for a set that changes `protect` at the remote |
+| 41 | `BranchAdvanced` | Set: another writer changed the metadata before each of a location's eight swaps |
+| 80 | `AddressNotFound` (new) | Set: an address value names a payload the location doesn't hold. Any verb: a blob the remote's answer names, such as a branch's metadata, is missing at the remote |
+| 87 | `BranchNotFound` | No location consulted holds the branch |
+| 111 | `NoRemote` | The call needs the remote, and the storage handle has none |
+| 118 | `Oversized` (new) | Set: the metadata after the edit exceeds 1 MiB. Any verb: a blob a location holds is larger than its read allows |
+
+`NotAuthenticated` (16), the connectivity codes (28 to 31) and `Internal` (-1) apply as the error table says.
+
+**Cost.** Get reads the metadata once per location. Set reads, writes and swaps it once per location, and again after each lost swap. Each works on one location's metadata at a time, which is 1 MiB at most.
+
+**Compatibility.** The C API gains the two verbs with their `_async` variants, their argument and entry types, and the event tag with its data type. The Lore service IPC gains two `LoreCommand` variants and one `LoreEvent` variant, appended after the last existing ones. The file-system verbs keep their behavior.
+
+The two new error rows change accepted verbs on `main`:
+
+- `lore_revision_graph_branch_resolve` and `lore_revision_graph_branch_list` report `AddressNotFound` where they reported `Internal` (-1) for a metadata blob the remote lacks.
+- All three read verbs report `Oversized` where they reported `Internal` for a metadata blob over 1 MiB.
+
+No release has shipped the read verbs: they joined `main` after v0.14.0, the latest release in `docs/release-notes.md`. If this amendment lands before a release ships them, no released caller sees a code change, and Compatibility and Migration Plan stay as they are. If a release ships them first, the amendment adds the change to both before it merges.
+
+**Security and privacy.** Get reports no more than `lore branch metadata get` does, through the same access check at the remote. Set changes `protect` at the remote only with repository administration. A `protect` set in the local store binds nothing at the remote, as without a remote today.
+
+**Alternatives considered.**
+
+- **Three verbs with text values, as the file-system API has:** The text form reads a binary value as a file path, and a set followed by a clear is two swaps.
+- **One entry per call:** A pipeline that edits several keys makes a swap for each, and a reader can see half its edit.
+- **One swap per location, no retry:** Two pipelines that edit different keys of one branch fail each other.
+- **Conditional writes:** An expected value per entry would catch a lost update of one key. It adds a field and a way to fail per entry, for pipelines that mostly own their keys. A later amendment can add it.
+- **Copying the remote's result into the local store:** The local store would lose the entries only it holds.
+- **Writing at the remote without the local store:** Work at the remote would keep the "Locations" rule, but the write would need an upload path of its own beside the pipeline.
+- **Refusing `protect`:** A pipeline couldn't protect a branch it creates without an instance.
+- **Refusing address values:** Get still reports the address entries other tools write, and a pipeline can put a payload at each location and reference it.
+- **Failing a location on an entry the verbs can't report:** The branch would be unusable there through this surface, with no way to remove the entry.

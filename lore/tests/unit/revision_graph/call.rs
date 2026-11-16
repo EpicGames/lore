@@ -24,12 +24,14 @@ use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::LoreLogEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphBranchEventData;
+use lore_revision::event::revision_graph::LoreRevisionGraphBranchMetadataEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphInstanceEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphLocationCompleteEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphRevisionEventData;
 use lore_revision::instance::InstanceId;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreBranchLocation;
+use lore_revision::interface::LoreMetadata;
 use lore_revision::interface::LoreString;
 use lore_revision::logging::LoreLogLevel;
 use lore_revision::lore::execution_context;
@@ -58,6 +60,7 @@ fn kinds(events: &Mutex<Vec<LoreEvent>>) -> Vec<&'static str> {
             LoreEvent::RevisionGraphBranch(_) => Some("branch"),
             LoreEvent::RevisionGraphInstance(_) => Some("instance"),
             LoreEvent::RevisionGraphRevision(_) => Some("revision"),
+            LoreEvent::RevisionGraphBranchMetadata(_) => Some("branch metadata"),
             LoreEvent::RevisionGraphLocationComplete(_) => Some("location complete"),
             LoreEvent::Complete(_) => Some("complete"),
             LoreEvent::End(_) => Some("end"),
@@ -68,7 +71,7 @@ fn kinds(events: &Mutex<Vec<LoreEvent>>) -> Vec<&'static str> {
 
 /// One event of each kind a revision graph call passes, after the events it drops: one a core
 /// sends and those of an interactive login.
-fn events_a_verb_sends() -> [LoreEvent; 8] {
+fn events_a_verb_sends() -> [LoreEvent; 9] {
     [
         LoreEvent::BranchCreate(LoreBranchCreateEventData {
             name: LoreString::from("core"),
@@ -118,6 +121,13 @@ fn events_a_verb_sends() -> [LoreEvent; 8] {
             revision_number: 0,
             branch: BranchId::default(),
         }),
+        LoreEvent::RevisionGraphBranchMetadata(LoreRevisionGraphBranchMetadataEventData {
+            id: 0,
+            location: LoreBranchLocation::Local,
+            branch: BranchId::default(),
+            key: LoreString::from("owner"),
+            value: LoreMetadata::String(LoreString::from("ci")),
+        }),
         LoreEvent::RevisionGraphLocationComplete(LoreRevisionGraphLocationCompleteEventData {
             id: 0,
             location: LoreBranchLocation::Local,
@@ -158,6 +168,7 @@ async fn call_drops_core_events_and_passes_log_and_complete() {
             "branch",
             "instance",
             "revision",
+            "branch metadata",
             "location complete",
             "complete",
             "end",

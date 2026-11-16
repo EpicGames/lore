@@ -5,15 +5,19 @@
 //! and metadata blobs written through a context, a branch created and archived in a handle's local
 //! store, a handle's state over other stores, a handle whose mutable store fails chosen calls, an
 //! immutable store that counts its reads, a remote revision service whose answers a test chooses,
-//! a registered instance that reads as live, and the record and location complete events a call
-//! sends.
+//! a metadata blob held by a remote storage peer alone, a registered instance that reads as live,
+//! and the record and location complete events a call sends.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use lore::interface::LoreGlobalArgs;
+use lore::revision_graph::locations::local_read_context;
 use lore::revision_graph::locations::local_write_context;
 use lore::storage::close::LoreStorageCloseArgs;
 use lore::storage::close::close;
@@ -23,10 +27,12 @@ use lore::storage::open::LoreStorageOpenArgs;
 use lore::storage::open::open;
 use lore::storage::store::BoundFlags;
 use lore::storage::store::StoreInternal;
+use lore::storage::store::in_memory_for_tests;
 use lore_base::error::Disconnected;
 use lore_base::error::NotFound;
 use lore_base::error::SlowDown;
 use lore_base::test_util::TempDir;
+use lore_base::types::Address;
 use lore_base::types::BranchId;
 use lore_base::types::BranchPoint;
 use lore_base::types::Context;
@@ -36,12 +42,15 @@ use lore_base::types::Partition;
 use lore_revision::branch;
 use lore_revision::branch::BranchLatestStatus;
 use lore_revision::event::LoreEvent;
+use lore_revision::event::LoreMetadataEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphBranchEventData;
+use lore_revision::event::revision_graph::LoreRevisionGraphBranchMetadataEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphLocationCompleteEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphRevisionEventData;
 use lore_revision::immutable;
 use lore_revision::instance::InstanceId;
 use lore_revision::interface::LoreBranchLocation;
+use lore_revision::interface::LoreMetadata;
 use lore_revision::metadata::Metadata;
 use lore_revision::protocol::RemoteConnections;
 use lore_revision::protocol::RemoteEndpoint;
@@ -64,6 +73,8 @@ use lore_transport::ProtocolError;
 use lore_transport::Revision;
 use lore_transport::RevisionListResponse;
 use lore_transport::RevisionListStart;
+use lore_transport::Storage;
+use lore_transport::test_util::MemoryPeer;
 
 use crate::call::test_support::opened_handle_id;
 use crate::call::test_support::recording_callback;
@@ -249,13 +260,17 @@ pub(crate) async fn store_metadata(
         .expect("stores the metadata key");
 }
 
-/// Writes bytes that aren't a metadata blob through `write` and points the metadata key of
-/// `branch` at them.
-pub(crate) async fn store_corrupt_metadata(write: &Arc<RepositoryContext>, branch: BranchId) {
+/// Writes `bytes` as a blob through `write` and points the metadata key of `branch` at it. Returns
+/// the blob's address.
+pub(crate) async fn store_bytes_as_metadata(
+    write: &Arc<RepositoryContext>,
+    branch: BranchId,
+    bytes: &[u8],
+) -> Address {
     let address = immutable::write_borrowed(
         write.clone(),
         Context::default(),
-        b"not metadata",
+        bytes,
         immutable::write_options_from_repository(write.clone()),
     )
     .await
@@ -263,6 +278,76 @@ pub(crate) async fn store_corrupt_metadata(write: &Arc<RepositoryContext>, branc
     branch::mutable_store_metadata(write.clone(), branch, address.hash)
         .await
         .expect("stores the metadata key");
+    address
+}
+
+/// Writes bytes that aren't a metadata blob through `write` and points the metadata key of
+/// `branch` at them.
+pub(crate) async fn store_corrupt_metadata(write: &Arc<RepositoryContext>, branch: BranchId) {
+    store_bytes_as_metadata(write, branch, b"not metadata").await;
+}
+
+/// The metadata of `branch` in the local store of `store`.
+pub(crate) async fn local_metadata(
+    store: &StoreInternal,
+    repository: Partition,
+    branch: BranchId,
+) -> Metadata {
+    in_setup_context(branch::local_metadata(
+        local_read_context(store, repository),
+        branch,
+    ))
+    .await
+    .expect("reads the metadata")
+    .expect("the branch has metadata")
+    .1
+}
+
+/// Puts `metadata`, as a blob of one fragment (256 KiB at most), into `peer` alone: written
+/// through a scratch store of its own, so no store a test reads holds it. Returns the blob's hash.
+pub(crate) async fn put_metadata_blob(peer: &Arc<MemoryPeer>, metadata: &Metadata) -> Hash {
+    let scratch = in_memory_for_tests("graph-remote-metadata-blob").await;
+    let repository = new_repository();
+    let write = local_write_context(&scratch, repository);
+    in_setup_context(async {
+        let hash = metadata
+            .serialize(write.clone())
+            .await
+            .expect("writes the blob");
+        let address = Address {
+            hash,
+            context: Context::default(),
+        };
+        let (fragment, payload) =
+            immutable::load_raw_store_retry(scratch.immutable.clone(), repository, address)
+                .await
+                .expect("loads the blob");
+        peer.put(0, address, fragment, Some(payload))
+            .await
+            .expect("the peer keeps the blob");
+        hash
+    })
+    .await
+}
+
+/// Puts into `peer` the root fragment of the blob at `address` in the local store of `store`, with
+/// its payload: for a blob over 256 KiB, its fragment list alone.
+pub(crate) async fn put_root_fragment(
+    peer: &Arc<MemoryPeer>,
+    store: &StoreInternal,
+    repository: Partition,
+    address: Address,
+) {
+    let (fragment, payload) = in_setup_context(immutable::load_raw_store_retry(
+        store.immutable.clone(),
+        repository,
+        address,
+    ))
+    .await
+    .expect("loads the root fragment");
+    peer.put(0, address, fragment, Some(payload))
+        .await
+        .expect("the peer keeps the root fragment");
 }
 
 /// The state of a new handle over `immutable` and `mutable`: it keeps the identity, the remote, the
@@ -372,13 +457,49 @@ pub(crate) enum ListAnswer {
     SlowDown,
 }
 
-/// A remote revision service that answers every branch query as `query` says and every revision
-/// list as `list` says, records what each branch query asked for, and serves no other request.
+/// How [`NamingRevision`] answers a branch metadata get.
+pub(crate) enum MetadataAnswer {
+    /// The service doesn't serve it.
+    NotServed,
+    /// The branch's metadata hash, zero for a branch without metadata.
+    Hash(Hash),
+    /// No branch holds the id.
+    NotFound,
+    /// The request fails with this error.
+    Fails(ProtocolError),
+}
+
+/// How [`NamingRevision`] answers a branch metadata set.
+pub(crate) enum SetAnswer {
+    /// The swap stores the new metadata.
+    Won,
+    /// Another writer stored this hash first, which the swap answers.
+    Lost(Hash),
+    /// The branch's metadata went before the set: the set answers `NotFound`, and so does every
+    /// later metadata get.
+    NotFound,
+    /// The set fails with this error.
+    Refused(ProtocolError),
+}
+
+/// A remote revision service that answers every branch query as `query` says, every revision list
+/// as `list` says, every branch metadata get as `metadata` says and each branch metadata set as the
+/// next of its set answers says, records what each branch query, metadata get and metadata set
+/// asked for, and serves no other request.
 pub(crate) struct NamingRevision {
     query: QueryAnswer,
     list: ListAnswer,
+    metadata: MetadataAnswer,
     /// The id and the name each branch query asked for, in order.
     pub(crate) queries: Mutex<Vec<(Option<BranchId>, Option<String>)>>,
+    /// The branch each metadata get asked for, in order.
+    pub(crate) metadata_gets: Mutex<Vec<BranchId>>,
+    /// The answers to the metadata sets still to come, in order; none left refuses a set.
+    set_answers: Mutex<VecDeque<SetAnswer>>,
+    /// The expected and the updated hash each metadata set asked for, in order.
+    pub(crate) metadata_sets: Mutex<Vec<(Hash, Hash)>>,
+    /// Whether a set answered [`SetAnswer::NotFound`].
+    metadata_went: AtomicBool,
 }
 
 impl NamingRevision {
@@ -389,10 +510,36 @@ impl NamingRevision {
 
     /// A service that answers branch queries as `query` says, and revision lists as `list` says.
     pub(crate) fn listing(query: QueryAnswer, list: ListAnswer) -> Arc<Self> {
+        Self::answering(query, list, MetadataAnswer::NotServed)
+    }
+
+    /// A service that answers branch metadata gets as `metadata` says, every branch query
+    /// `NotFound`, and serves no revision list.
+    pub(crate) fn serving_metadata(metadata: MetadataAnswer) -> Arc<Self> {
+        Self::answering(QueryAnswer::NotFound, ListAnswer::NotServed, metadata)
+    }
+
+    /// A service that answers branch metadata gets as `metadata` says and its branch metadata sets
+    /// with `sets` in order, every branch query `NotFound`, and serves no revision list.
+    pub(crate) fn setting_metadata(
+        metadata: MetadataAnswer,
+        sets: impl IntoIterator<Item = SetAnswer>,
+    ) -> Arc<Self> {
+        let service = Self::serving_metadata(metadata);
+        service.set_answers.lock().unwrap().extend(sets);
+        service
+    }
+
+    fn answering(query: QueryAnswer, list: ListAnswer, metadata: MetadataAnswer) -> Arc<Self> {
         Arc::new(Self {
             query,
             list,
+            metadata,
             queries: Mutex::default(),
+            metadata_gets: Mutex::default(),
+            set_answers: Mutex::default(),
+            metadata_sets: Mutex::default(),
+            metadata_went: AtomicBool::new(false),
         })
     }
 }
@@ -469,17 +616,44 @@ impl Revision for NamingRevision {
         })
     }
 
-    async fn branch_metadata_get(&self, _: BranchId) -> Result<Hash, ProtocolError> {
-        Err(not_served())
+    async fn branch_metadata_get(&self, branch: BranchId) -> Result<Hash, ProtocolError> {
+        self.metadata_gets.lock().unwrap().push(branch);
+        if self.metadata_went.load(Ordering::SeqCst) {
+            return Err(ProtocolError::from(NotFound));
+        }
+        match &self.metadata {
+            MetadataAnswer::NotServed => Err(not_served()),
+            MetadataAnswer::Hash(hash) => Ok(*hash),
+            MetadataAnswer::NotFound => Err(ProtocolError::from(NotFound)),
+            MetadataAnswer::Fails(err) => Err(err.clone()),
+        }
     }
 
     async fn branch_metadata_set(
         &self,
         _: BranchId,
-        _: Hash,
-        _: Hash,
+        expected: Hash,
+        updated: Hash,
     ) -> Result<MetadataSetResult, ProtocolError> {
-        Err(not_served())
+        self.metadata_sets.lock().unwrap().push((expected, updated));
+        let Some(answer) = self.set_answers.lock().unwrap().pop_front() else {
+            return Err(not_served());
+        };
+        match answer {
+            SetAnswer::Won => Ok(MetadataSetResult {
+                success: true,
+                current_hash: updated,
+            }),
+            SetAnswer::Lost(current_hash) => Ok(MetadataSetResult {
+                success: false,
+                current_hash,
+            }),
+            SetAnswer::NotFound => {
+                self.metadata_went.store(true, Ordering::SeqCst);
+                Err(ProtocolError::from(NotFound))
+            }
+            SetAnswer::Refused(err) => Err(err),
+        }
     }
 }
 
@@ -489,7 +663,17 @@ pub(crate) async fn store_with_remote(
     repository: Partition,
     service: Arc<NamingRevision>,
 ) -> StoreInternal {
-    let connection = Connection::detached_revision(Vec::new(), Ok(()), repository, service);
+    store_with_remote_storage(repository, service, Vec::new()).await
+}
+
+/// A new in-memory store whose remote reaches `service` as its revision service for `repository`,
+/// over a connection whose storage is `storage`.
+pub(crate) async fn store_with_remote_storage(
+    repository: Partition,
+    service: Arc<NamingRevision>,
+    storage: Vec<Arc<dyn Storage>>,
+) -> StoreInternal {
+    let connection = Connection::detached_revision(storage, Ok(()), repository, service);
     let endpoint = RemoteEndpoint::over(RemoteConnections::with_connection(repository, connection));
     in_memory_store(Some(Arc::new(endpoint)), BoundFlags::default()).await
 }
@@ -500,6 +684,50 @@ pub(crate) fn branch_records(events: &[LoreEvent]) -> Vec<&LoreRevisionGraphBran
         .iter()
         .filter_map(|event| match event {
             LoreEvent::RevisionGraphBranch(data) => Some(data),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A branch metadata record as a test compares it: its location, key and value.
+pub(crate) type Reported = (LoreBranchLocation, String, LoreMetadata);
+
+/// The branch metadata records among `events`, in order, each echoing `id`, the call's id, and
+/// naming `branch`.
+pub(crate) fn reported(events: &[LoreEvent], id: u64, branch: BranchId) -> Vec<Reported> {
+    branch_metadata_records(events)
+        .into_iter()
+        .map(|record| {
+            assert_eq!((record.id, record.branch), (id, branch));
+            (
+                record.location,
+                record.key.as_str().to_owned(),
+                record.value.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Each entry of `metadata` as a branch metadata record at `location` reports it, in stored order.
+pub(crate) fn entries_at(location: LoreBranchLocation, metadata: &Metadata) -> Vec<Reported> {
+    let mut entries = Vec::new();
+    metadata.walk(|key, value, value_type| {
+        let key = std::str::from_utf8(key).expect("a UTF-8 key");
+        let entry =
+            LoreMetadataEventData::new(key, value, value_type).expect("a value of its type");
+        entries.push((location, key.to_owned(), entry.value));
+    });
+    entries
+}
+
+/// The branch metadata record events among `events`, in order.
+pub(crate) fn branch_metadata_records(
+    events: &[LoreEvent],
+) -> Vec<&LoreRevisionGraphBranchMetadataEventData> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            LoreEvent::RevisionGraphBranchMetadata(data) => Some(data),
             _ => None,
         })
         .collect()

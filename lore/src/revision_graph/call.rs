@@ -30,6 +30,7 @@ pub fn revision_graph_events(event: &LoreEvent) -> bool {
             | LoreEvent::RevisionGraphInstance(_)
             | LoreEvent::RevisionGraphRevision(_)
             | LoreEvent::RevisionGraphLocationComplete(_)
+            | LoreEvent::RevisionGraphBranchMetadata(_)
     )
 }
 

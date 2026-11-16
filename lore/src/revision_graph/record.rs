@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use futures::FutureExt;
+use lore_base::lore_warn;
 use lore_base::types::BranchId;
 use lore_base::types::BranchPoint;
 use lore_base::types::Hash;
@@ -18,7 +19,9 @@ use lore_error_set::prelude::*;
 use lore_revision::branch;
 use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
+use lore_revision::event::LoreMetadataEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphBranchEventData;
+use lore_revision::event::revision_graph::LoreRevisionGraphBranchMetadataEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphInstanceEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphLocationCompleteEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphRevisionEventData;
@@ -28,6 +31,7 @@ use lore_revision::interface::LoreBranchLocation;
 use lore_revision::interface::LoreBranchPoint;
 use lore_revision::interface::LoreString;
 use lore_revision::metadata::Metadata;
+use lore_revision::metadata::MetadataType;
 use lore_revision::repository::RepositoryContext;
 use lore_transport::BranchRecord;
 
@@ -279,6 +283,51 @@ pub fn emit_revision(
     })
     .send();
     1
+}
+
+/// Sends a branch metadata record event of call `id` at `location` for each entry of `metadata`,
+/// the metadata of `branch`, in stored order, or only for the entries whose key is `key` where it's
+/// `Some`. Returns the number of record events sent.
+///
+/// Passes over an entry no record can carry: one whose key isn't UTF-8, whose type tag
+/// [`MetadataType`] doesn't define, or whose value doesn't decode as its type. Where it passes over
+/// any, it logs one warning that names `location` and how many.
+pub fn emit_branch_metadata(
+    id: u64,
+    location: LoreBranchLocation,
+    branch: BranchId,
+    metadata: &Metadata,
+    key: Option<&str>,
+) -> u64 {
+    let (mut records, mut skipped) = (0, 0);
+    metadata.walk_tags(|stored_key, value, tag| {
+        if key.is_some_and(|key| key.as_bytes() != stored_key) {
+            return;
+        }
+        let Some(entry) = MetadataType::try_from(tag).ok().and_then(|value_type| {
+            LoreMetadataEventData::from_stored(stored_key, value, value_type)
+        }) else {
+            skipped += 1;
+            return;
+        };
+        LoreEvent::RevisionGraphBranchMetadata(LoreRevisionGraphBranchMetadataEventData {
+            id,
+            location,
+            branch,
+            key: entry.key,
+            value: entry.value,
+        })
+        .send();
+        records += 1;
+    });
+    if skipped > 0 {
+        lore_warn!(
+            "Left out {skipped} {location} metadata entries of branch {branch} whose key isn't \
+             UTF-8, whose type this build doesn't define, or whose value doesn't decode as its \
+             type"
+        );
+    }
+    records
 }
 
 /// Sends the location complete event of call `id` at `location`, which follows the `records`

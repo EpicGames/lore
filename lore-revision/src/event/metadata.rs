@@ -10,8 +10,8 @@ pub(crate) fn send(metadata: &Metadata) {
 
     metadata.walk(
         |key_slice: &[u8], value_slice: &[u8], value_type: MetadataType| {
-            if let Ok(key) = std::str::from_utf8(key_slice)
-                && let Ok(entry) = LoreMetadataEventData::new(key, value_slice, value_type)
+            if let Some(entry) =
+                LoreMetadataEventData::from_stored(key_slice, value_slice, value_type)
             {
                 entries.push(entry);
             }
@@ -29,9 +29,9 @@ pub(crate) fn send_keyed(metadata: &Metadata, key: &str) {
     // TODO: Need to be able to get an item from Metadata and also know its type!
     metadata.walk(
         |key_slice: &[u8], value_slice: &[u8], value_type: MetadataType| {
-            if let Ok(stored_key) = std::str::from_utf8(key_slice)
-                && stored_key == key
-                && let Ok(entry) = LoreMetadataEventData::new(key, value_slice, value_type)
+            if key_slice == key.as_bytes()
+                && let Some(entry) =
+                    LoreMetadataEventData::from_stored(key_slice, value_slice, value_type)
             {
                 entries.push(entry);
             }

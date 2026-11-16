@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! What each read verb reads in the local store in one call with no location flag: its loads and
-//! lists of each key type and its payload reads, counted on a handle over the fixture handle's
-//! local stores. Each count is exact, a number walk's included: on a line without merges, the walk
-//! reads one state per revision from the latest down to the number.
+//! What each read verb reads, and what a branch metadata set reads and writes, its retry after a
+//! lost swap included, in the local store in one call with no location flag: the loads, lists and
+//! compare-and-swaps of each key type, and the payload reads, queries and puts, counted on a handle
+//! over the fixture handle's local stores. Each count is exact, a number walk's included: on a line
+//! without merges, the walk reads one state per revision from the latest down to the number.
+
+use std::sync::Mutex;
 
 use lore::storage::handle::LoreStore;
 use lore_base::error::BranchNotFound;
@@ -14,6 +17,7 @@ use lore_base::types::KeyType;
 use lore_revision::branch;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreBranchLocation;
+use lore_revision::interface::LoreMetadata;
 use lore_storage::test_util::ImmutableCall;
 use lore_storage::test_util::StoreCall;
 
@@ -22,6 +26,7 @@ use super::counting::CountingMutable;
 use super::counting::open_counted_handle;
 use super::support::*;
 use crate::common::net_common::close_handle;
+use crate::common::net_common::put_content;
 
 /// Mutable store calls of one kind, by the key type they name.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -68,10 +73,16 @@ struct LocalCalls {
     loads: ByKeyType,
     /// Its lists.
     lists: ByKeyType,
+    /// Its compare-and-swaps.
+    swaps: ByKeyType,
     /// Its payload reads.
     gets: usize,
-    /// Its other calls on either store: stores, compare-and-swaps, loads and lists of other key
-    /// types, and content calls other than payload reads.
+    /// The addresses its content queries named, one query of several addresses counting each.
+    queries: usize,
+    /// Its content puts.
+    puts: usize,
+    /// Its other calls on either store: stores, loads, lists and compare-and-swaps of other key
+    /// types, and content calls other than payload reads, queries and puts.
     others: usize,
 }
 
@@ -80,12 +91,21 @@ impl LocalCalls {
     fn of(mutable: &CountingMutable, immutable: &CountingImmutable) -> Self {
         let loads = ByKeyType::of(mutable, StoreCall::Load);
         let lists = ByKeyType::of(mutable, StoreCall::List);
-        let gets = immutable.count(ImmutableCall::Get);
-        let others = mutable.total() - loads.total() - lists.total() + immutable.total() - gets;
+        let swaps = ByKeyType::of(mutable, StoreCall::CompareAndSwap);
+        let [gets, queries, puts] = [ImmutableCall::Get, ImmutableCall::Query, ImmutableCall::Put]
+            .map(|call| immutable.count(call));
+        let others = mutable.total() - loads.total() - lists.total() - swaps.total()
+            + immutable.total()
+            - gets
+            - queries
+            - puts;
         Self {
             loads,
             lists,
+            swaps,
             gets,
+            queries,
+            puts,
             others,
         }
     }
@@ -97,7 +117,7 @@ async fn counted<F: Future<Output = (i32, Vec<LoreEvent>)>>(
     f: &Fixture,
     call: impl FnOnce(LoreStore) -> F,
 ) -> (i32, Vec<LoreEvent>, LocalCalls) {
-    let (store, mutable, immutable) = open_counted_handle(f, None);
+    let (store, mutable, immutable) = open_counted_handle(f, None, None);
     let (status, events) = call(store).await;
     let calls = LocalCalls::of(&mutable, &immutable);
     close_handle(store).await;
@@ -135,6 +155,22 @@ async fn map_name_without_metadata(f: &Fixture, name: &str) {
     ))
     .await
     .expect("maps the name");
+}
+
+/// Asserts that a call's events report no record and no error at the remote, then records and no
+/// error in the local store.
+fn assert_local_records(events: &[LoreEvent]) {
+    let outcomes = location_outcomes(events);
+    assert!(
+        matches!(
+            outcomes[..],
+            [
+                (LoreBranchLocation::Remote, 0, 0),
+                (LoreBranchLocation::Local, records, 0),
+            ] if records > 0
+        ),
+        "expected records in the local store alone, got {outcomes:?}"
+    );
 }
 
 /// A `branch_resolve` of a name that maps to a branch, with no instance registered, loads the
@@ -175,6 +211,7 @@ async fn branch_resolve_local_costs_four_loads_and_one_blob() {
             },
             gets: 1,
             others: 0,
+            ..Default::default()
         }
     );
     f.close().await;
@@ -251,6 +288,7 @@ async fn branch_resolve_pays_for_a_derived_id_and_for_a_mapping_without_metadata
             },
             gets: 1 + 1,
             others: 0,
+            ..Default::default()
         }
     );
     assert_eq!(
@@ -319,6 +357,7 @@ async fn branch_resolve_reads_the_current_revision_of_instances_on_its_branch_al
             },
             gets: 1 + 2,
             others: 0,
+            ..Default::default()
         }
     );
     f.close().await;
@@ -369,6 +408,7 @@ async fn branch_list_with_include_archived_reads_live_blobs_once() {
             },
             gets: 3 + 1,
             others: 0,
+            ..Default::default()
         }
     );
     f.close().await;
@@ -417,6 +457,7 @@ async fn branch_list_lists_registered_instances_once() {
             },
             gets: 3 + 3,
             others: 0,
+            ..Default::default()
         }
     );
     f.close().await;
@@ -534,6 +575,164 @@ async fn revision_resolve_latest_and_hash_read_a_state_and_its_metadata() {
         hash_calls,
         LocalCalls {
             gets: 2,
+            ..Default::default()
+        }
+    );
+    f.close().await;
+}
+
+/// A `branch_metadata_get` of every entry of a branch the local store holds loads the branch's
+/// metadata key and reads the blob it names, and nothing more.
+#[tokio::test]
+async fn branch_metadata_get_local_costs_one_load_and_one_blob() {
+    let f = fixture().await;
+    seed_main(&f).await;
+    let feature = create_local_branch(&f, "feature", f.default_branch, CREATOR).await;
+
+    let (status, events, calls) = counted(&f, |store| {
+        get_branch_metadata(&f, store, graph_globals(), feature, "")
+    })
+    .await;
+
+    assert_eq!(status, 0);
+    assert_local_records(&events);
+    assert_eq!(
+        calls,
+        LocalCalls {
+            loads: ByKeyType {
+                branch_metadata: 1,
+                ..Default::default()
+            },
+            gets: 1,
+            ..Default::default()
+        }
+    );
+    f.close().await;
+}
+
+/// A `branch_metadata_set` that changes the metadata of a branch the local store holds loads the
+/// branch's metadata key and reads its blob, writes the edited blob with one query and one put, and
+/// swaps the metadata key once. An entry that sets an address adds one query, which asks whether the
+/// local store holds the payload the address names.
+#[tokio::test]
+async fn branch_metadata_set_local_costs_one_swap() {
+    let f = fixture().await;
+    seed_main(&f).await;
+    let feature = create_local_branch(&f, "feature", f.default_branch, CREATOR).await;
+    let held = put_content(
+        f.store,
+        f.repository,
+        Context::default(),
+        b"a payload the local store holds",
+        0,
+        0,
+    )
+    .await;
+
+    let (value_status, value_events, value_calls) = counted(&f, |store| {
+        set_branch_metadata(
+            &f,
+            store,
+            graph_globals(),
+            feature,
+            vec![("build", string("green"))],
+            &[],
+        )
+    })
+    .await;
+    let (address_status, address_events, address_calls) = counted(&f, |store| {
+        set_branch_metadata(
+            &f,
+            store,
+            graph_globals(),
+            feature,
+            vec![("artifact", LoreMetadata::Address(held))],
+            &[],
+        )
+    })
+    .await;
+
+    assert_eq!([value_status, address_status], [0, 0]);
+    for events in [&value_events, &address_events] {
+        assert_local_records(events);
+    }
+    let one_swap = LocalCalls {
+        loads: ByKeyType {
+            branch_metadata: 1,
+            ..Default::default()
+        },
+        swaps: ByKeyType {
+            branch_metadata: 1,
+            ..Default::default()
+        },
+        gets: 1,
+        queries: 1,
+        puts: 1,
+        ..Default::default()
+    };
+    assert_eq!(value_calls, one_swap);
+    assert_eq!(
+        address_calls,
+        LocalCalls {
+            queries: 1 + 1,
+            ..one_swap
+        }
+    );
+    f.close().await;
+}
+
+/// A `branch_metadata_set` whose swap another writer overtakes, by storing its blob in the metadata
+/// key after the set loads the key, reads the blob the swap answers, writes the edit of it with one
+/// query and one put, and swaps again, with no second load: 1 load, 2 blob reads, 2 queries, 2 puts
+/// and 2 swaps. The metadata then holds both writers' entries.
+#[tokio::test]
+async fn branch_metadata_set_retry_costs_a_read_a_write_and_a_swap() {
+    let f = fixture().await;
+    seed_main(&f).await;
+    let feature = create_local_branch(&f, "feature", f.default_branch, CREATOR).await;
+    let (_, other) = in_client(metadata_with_entry(
+        &local_writer(&f),
+        feature,
+        "reviewer",
+        "other",
+    ))
+    .await;
+    let overtake = Overtake::new(Mutex::new(Some((metadata_key(&f, feature), other))));
+    let (store, mutable, immutable) = open_counted_handle(&f, None, overtaking_load(overtake));
+
+    let (status, events) = set_branch_metadata(
+        &f,
+        store,
+        graph_globals(),
+        feature,
+        vec![("build", string("green"))],
+        &[],
+    )
+    .await;
+    let calls = LocalCalls::of(&mutable, &immutable);
+    close_handle(store).await;
+
+    let metadata = local_branch_metadata(&f, feature).await;
+    assert_eq!(status, 0);
+    assert_local_records(&events);
+    assert_eq!(
+        ["build", "reviewer"].map(|key| metadata.get_string(key).ok()),
+        [Some("green"), Some("other")]
+    );
+    assert_eq!(
+        calls,
+        LocalCalls {
+            loads: ByKeyType {
+                branch_metadata: 1,
+                ..Default::default()
+            },
+            swaps: ByKeyType {
+                branch_metadata: 1 + 1,
+                ..Default::default()
+            },
+            gets: 1 + 1,
+            queries: 1 + 1,
+            puts: 1 + 1,
             ..Default::default()
         }
     );

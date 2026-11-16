@@ -10,7 +10,6 @@
 use std::sync::Arc;
 
 use lore_base::error::BranchNotFound;
-use lore_base::error::InvalidArguments;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
@@ -81,12 +80,10 @@ fn branch_resolve_impl(
         branch_resolve,
         async move |store, args| {
             if !branch::is_valid_name(args.name.as_str()) {
-                return Err(RevisionGraphError::from(InvalidArguments {
-                    reason: format!(
-                        "the branch name is empty, longer than {} bytes, or reads as a branch id",
-                        branch::MAX_NAME_LEN
-                    ),
-                }));
+                return Err(RevisionGraphError::invalid(format!(
+                    "the branch name is empty, longer than {} bytes, or reads as a branch id",
+                    branch::MAX_NAME_LEN
+                )));
             }
             let locations = locations(&store, per_call)?;
             let mut outcome = CallOutcome::default();

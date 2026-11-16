@@ -5,11 +5,13 @@
 //!
 //! The helpers connect to the server, commit through the handle, read at the remote through the
 //! handle, collect the events of a call, and run work in a client execution or on the server's
-//! stores. They create branches, read their latests and archive branches at each location, publish
-//! revisions on the server, register instances, and register storage handles over the fixture's
-//! local stores. They give a revision graph call its global arguments, its arguments and its
-//! revision identifier, make the calls of the read verbs, and pick a call's records, its location
-//! complete events and their order out of its events.
+//! stores. They create branches, read their latests and metadata, write metadata blobs and archive
+//! branches at each location, publish revisions on the server, register instances, and register
+//! storage handles over the fixture's local stores. They have a mutable store take another
+//! writer's metadata once it answers a load, the server's included. They give a revision graph
+//! call its global arguments, its arguments and its revision identifier, make the calls of the
+//! read verbs and the branch metadata verbs, and pick a call's records, its location complete
+//! events and their order out of its events.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -20,6 +22,11 @@ use lore::revision_graph::LoreRevisionIdentifier;
 use lore::revision_graph::RevisionGraphError;
 use lore::revision_graph::branch_list::LoreRevisionGraphBranchListArgs;
 use lore::revision_graph::branch_list::branch_list;
+use lore::revision_graph::branch_metadata_get::LoreRevisionGraphBranchMetadataGetArgs;
+use lore::revision_graph::branch_metadata_get::branch_metadata_get;
+use lore::revision_graph::branch_metadata_set::LoreRevisionGraphBranchMetadataEntry;
+use lore::revision_graph::branch_metadata_set::LoreRevisionGraphBranchMetadataSetArgs;
+use lore::revision_graph::branch_metadata_set::branch_metadata_set;
 use lore::revision_graph::branch_resolve::LoreRevisionGraphBranchResolveArgs;
 use lore::revision_graph::branch_resolve::branch_resolve;
 use lore::revision_graph::locations::local_write_context;
@@ -63,6 +70,7 @@ use lore_revision::branch;
 use lore_revision::branch::BranchLatestStatus;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_graph::LoreRevisionGraphBranchEventData;
+use lore_revision::event::revision_graph::LoreRevisionGraphBranchMetadataEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphInstanceEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphLocationCompleteEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphRevisionEventData;
@@ -76,6 +84,7 @@ use lore_revision::interface::LoreMetadata;
 use lore_revision::interface::LoreNodeType;
 use lore_revision::interface::LoreString;
 use lore_revision::metadata::BRANCH;
+use lore_revision::metadata::Metadata;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::protocol::RemoteConnections;
 use lore_revision::protocol::RemoteEndpoint;
@@ -90,6 +99,10 @@ use lore_storage::MutableStore;
 use lore_storage::StoreMatch;
 use lore_storage::immutable_store::query_one;
 use lore_storage::local::store_lock::StoreHold;
+use lore_storage::test_util::Answered;
+use lore_storage::test_util::HookedStore;
+use lore_storage::test_util::StoreCall;
+use lore_storage::test_util::answered;
 use lore_transport::Connection;
 
 use crate::common::net_common::CountingStore;
@@ -128,7 +141,8 @@ pub(crate) struct Fixture {
     /// The immutable store the server serves, which counts its `get`s in
     /// [`server_gets`](Self::server_gets).
     pub server_immutable: Arc<dyn ImmutableStore>,
-    /// The mutable store the server serves.
+    /// The mutable store the server serves, which takes another writer's value once
+    /// [`overtake_on_server`] arms it.
     pub server_mutable: Arc<dyn MutableStore>,
     /// The `get`s made on [`server_immutable`](Self::server_immutable): those the server makes as
     /// it serves calls, and those a test makes on that store. Reads through [`on_server`] are not
@@ -137,6 +151,9 @@ pub(crate) struct Fixture {
     /// The store [`server_immutable`](Self::server_immutable) wraps, which [`on_server`] reads
     /// through.
     uncounted_immutable: Arc<dyn ImmutableStore>,
+    /// What [`server_mutable`](Self::server_mutable) stores once it answers a load, as
+    /// [`overtake_on_server`] arms it.
+    server_overtake: Overtake,
     _stop: TestServerStop,
 }
 
@@ -173,10 +190,16 @@ pub(crate) async fn fixture_without_remote() -> Fixture {
 }
 
 async fn set_up(with_remote: bool) -> Fixture {
-    let (uncounted_immutable, server_mutable) = make_backends(Partitions::Isolated).await;
+    let (uncounted_immutable, backend_mutable) = make_backends(Partitions::Isolated).await;
     let counting = CountingStore::new(uncounted_immutable.clone());
     let server_gets = counting.gets();
     let server_immutable: Arc<dyn ImmutableStore> = counting;
+    let server_overtake = Overtake::default();
+    let server_mutable: Arc<dyn MutableStore> = HookedStore::wrap(
+        backend_mutable,
+        |_, _, _| Ok(()),
+        overtaking_load(server_overtake.clone()),
+    );
 
     let (url, stop) = start_grpc_server(server_immutable.clone(), server_mutable.clone());
     let store = open_handle(with_remote.then_some(url.as_str())).await;
@@ -191,6 +214,7 @@ async fn set_up(with_remote: bool) -> Fixture {
         server_mutable,
         server_gets,
         uncounted_immutable,
+        server_overtake,
         _stop: stop,
     };
     on_server(&fixture, async |context| {
@@ -198,6 +222,35 @@ async fn set_up(with_remote: bool) -> Fixture {
     })
     .await;
     fixture
+}
+
+/// A mutable store key and the value another writer stores in it once the store answers a load of
+/// the key, as [`overtaking_load`] reads it. `None` stores nothing.
+pub(crate) type Overtake = Arc<Mutex<Option<(Hash, Hash)>>>;
+
+/// An `answered` hook for `HookedStore::wrap` that, once the store answers a load of the key
+/// `overtake` holds, stores the value it holds in that key, as another writer would after that
+/// load, and clears `overtake`.
+pub(crate) fn overtaking_load(overtake: Overtake) -> Option<Answered> {
+    answered(move |inner, partition, call, key, key_type| {
+        let write = if call == StoreCall::Load {
+            overtake.lock().unwrap().take_if(|(armed, _)| *armed == key)
+        } else {
+            None
+        };
+        async move {
+            if let Some((_, value)) = write {
+                inner.store(partition, key, value, key_type).await?;
+            }
+            Ok(())
+        }
+    })
+}
+
+/// Arms the server's mutable store to store `value` in the metadata key of `branch` once it
+/// answers the next load of that key, as another writer would after that load.
+pub(crate) fn overtake_on_server(f: &Fixture, branch: BranchId, value: Hash) {
+    *f.server_overtake.lock().unwrap() = Some((metadata_key(f, branch), value));
 }
 
 /// Creates the fixture repository on `context` in the steps Lore Server's repository create takes,
@@ -404,6 +457,11 @@ pub(crate) fn by_hash(hash: Hash) -> LoreRevisionIdentifier {
     }
 }
 
+/// `value` as a String metadata value.
+pub(crate) fn string(value: &str) -> LoreMetadata {
+    LoreMetadata::String(LoreString::from(value))
+}
+
 /// The arguments of a `revision_resolve` call of `identifier` in `f`'s repository, on `store`.
 pub(crate) fn revision_resolve_args(
     f: &Fixture,
@@ -500,6 +558,55 @@ pub(crate) async fn list_branches(
         )
     })
     .await
+}
+
+/// The status and events of a `branch_metadata_get` call of the metadata of `branch` in `f`'s
+/// repository, on `store` under `globals`, as [`status_and_events_of`] reports them: of the entry
+/// `key` names, or of every entry where it is empty.
+pub(crate) async fn get_branch_metadata(
+    f: &Fixture,
+    store: LoreStore,
+    globals: LoreGlobalArgs,
+    branch: BranchId,
+    key: &str,
+) -> (i32, Vec<LoreEvent>) {
+    let args = LoreRevisionGraphBranchMetadataGetArgs {
+        id: 1,
+        store,
+        repository: f.repository,
+        branch,
+        key: LoreString::from(key),
+    };
+    status_and_events_of(|callback| branch_metadata_get(globals, args, callback)).await
+}
+
+/// The status and events of a `branch_metadata_set` call that sets `entries`, each a key and its
+/// value, and removes the keys of `remove` in the metadata of `branch` in `f`'s repository, on
+/// `store` under `globals`, as [`status_and_events_of`] reports them.
+pub(crate) async fn set_branch_metadata(
+    f: &Fixture,
+    store: LoreStore,
+    globals: LoreGlobalArgs,
+    branch: BranchId,
+    entries: Vec<(&str, LoreMetadata)>,
+    remove: &[&str],
+) -> (i32, Vec<LoreEvent>) {
+    let entries = entries
+        .into_iter()
+        .map(|(key, value)| LoreRevisionGraphBranchMetadataEntry {
+            key: LoreString::from(key),
+            value,
+        })
+        .collect();
+    let args = LoreRevisionGraphBranchMetadataSetArgs {
+        id: 1,
+        store,
+        repository: f.repository,
+        branch,
+        entries: LoreArray::from_vec(entries),
+        remove: LoreArray::from_vec(remove.iter().map(|&key| LoreString::from(key)).collect()),
+    };
+    status_and_events_of(|callback| branch_metadata_set(globals, args, callback)).await
 }
 
 /// The events of a read of `address` at the remote through `f`'s storage handle, under
@@ -849,6 +956,50 @@ pub(crate) async fn server_latest(f: &Fixture, branch: BranchId) -> Hash {
     .latest
 }
 
+/// The metadata of `branch` the server holds, read on its stores with `branch::local_metadata`.
+/// Panics unless the server holds metadata for the branch.
+pub(crate) async fn server_branch_metadata(f: &Fixture, branch: BranchId) -> Metadata {
+    on_server(f, async |context| {
+        branch::local_metadata(context, branch).await
+    })
+    .await
+    .expect("reads the branch metadata on the server")
+    .expect("the server holds metadata for the branch")
+    .1
+}
+
+/// The metadata of `branch` in the local store of `f`'s storage handle, read with
+/// `branch::local_metadata`. Panics unless the local store holds metadata for the branch.
+pub(crate) async fn local_branch_metadata(f: &Fixture, branch: BranchId) -> Metadata {
+    in_client(branch::local_metadata(local_writer(f), branch))
+        .await
+        .expect("reads the branch metadata in the local store")
+        .expect("the local store holds metadata for the branch")
+        .1
+}
+
+/// Writes, through `context`, the metadata of `branch` that the stores of `context` hold with the
+/// String `value` set under `key`, as a new blob. Returns the hash the branch's metadata key holds
+/// and the new blob's hash, and leaves the key as it is. Panics unless the stores hold metadata for
+/// the branch.
+pub(crate) async fn metadata_with_entry(
+    context: &Arc<RepositoryContext>,
+    branch: BranchId,
+    key: &str,
+    value: &str,
+) -> (Hash, Hash) {
+    let (held, mut metadata) = branch::local_metadata(context.clone(), branch)
+        .await
+        .expect("reads the branch metadata")
+        .expect("the stores hold metadata for the branch");
+    metadata.set_string(key, value).expect("sets the entry");
+    let written = metadata
+        .serialize(context.clone())
+        .await
+        .expect("writes the metadata");
+    (held, written)
+}
+
 /// The latest of `branch` of `repository` in the local store of the storage handle `store`, read
 /// with [`latest_by_key`]: zero where the store holds none.
 pub(crate) async fn local_latest(
@@ -909,6 +1060,12 @@ pub(crate) fn latest_key_load(
             key_type,
         }]),
     }
+}
+
+/// The key that holds the metadata of `branch` of `f`'s repository, as Lore's key scheme derives
+/// it.
+pub(crate) fn metadata_key(f: &Fixture, branch: BranchId) -> Hash {
+    branch::mutable_key(SALT_LORE, branch::METADATA, f.repository, branch).0
 }
 
 /// Registers a new instance of the fixture repository at `dir` in the local store of `f`'s storage
@@ -995,6 +1152,7 @@ fn graph_event_location(event: &LoreEvent) -> Option<LoreBranchLocation> {
         LoreEvent::RevisionGraphBranch(data) => Some(data.location),
         LoreEvent::RevisionGraphInstance(data) => Some(data.location),
         LoreEvent::RevisionGraphRevision(data) => Some(data.location),
+        LoreEvent::RevisionGraphBranchMetadata(data) => Some(data.location),
         LoreEvent::RevisionGraphLocationComplete(data) => Some(data.location),
         _ => None,
     }
@@ -1033,6 +1191,12 @@ payloads!(
     revision_records,
     RevisionGraphRevision,
     LoreRevisionGraphRevisionEventData
+);
+payloads!(
+    /// The branch metadata records among a call's events, in order.
+    branch_metadata_records,
+    RevisionGraphBranchMetadata,
+    LoreRevisionGraphBranchMetadataEventData
 );
 payloads!(
     /// The location complete events among a call's events, in order.

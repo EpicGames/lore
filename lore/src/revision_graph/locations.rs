@@ -3,10 +3,10 @@
 //! The locations a revision graph call consults, and the contexts it reaches them through.
 //!
 //! Each builder makes a context over the storage handle's stores, which the call drops when it
-//! returns: [`local_read_context`] and `local_write_context` for the local store,
+//! returns: [`local_read_context`] and [`local_write_context`] for the local store,
 //! [`remote_read_context`] for the remote, with its revision service in
-//! [`remote_revision_service`], and `full_context` for both. The two that write are built only
-//! with the `test-util` feature.
+//! [`remote_revision_service`], and `full_context` for both, which is built only with the
+//! `test-util` feature.
 //! The local store's context is offline, so work through it never reaches the remote. The remote's
 //! context reads immutable data from the remote alone and stores none of it in the local store, in
 //! each read that takes its options from the context
@@ -18,7 +18,7 @@
 //! holds its session pools itself or takes them from the storage handle's endpoint, so none stays
 //! pinned on the process-wide connection.
 //!
-//! A read verb that resolves one object takes its outcome from what each location answers
+//! A call that resolves one object takes its outcome from what each location answers
 //! ([`LocationAnswer`]) through [`CallOutcome`].
 
 #[cfg(feature = "test-util")]
@@ -92,7 +92,7 @@ pub fn locations(
     }
 }
 
-/// Why a location holds no object a read call asks for.
+/// Why a location holds no object a call asks for.
 #[lore_macro::test_pub]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LocationMiss {
@@ -124,13 +124,13 @@ impl LocationMiss {
     }
 }
 
-/// What one location answers a read call: the `T` it found or why it holds none, or the failure
-/// that ends its work.
+/// What one location answers a call: the `T` it found or why it holds none, or the failure that
+/// ends its work.
 #[lore_macro::test_pub]
 pub(crate) type LocationAnswer<T> = Result<Result<T, LocationMiss>, RevisionGraphError>;
 
-/// The outcome of a read call that resolves one object, from the answers of the locations it
-/// consults, added remote first.
+/// The outcome of a call that resolves one object, from the answers of the locations it consults,
+/// added remote first.
 ///
 /// A failure at any location fails the call with that location's error, the remote's where both
 /// failed, even where the other location found the object. Otherwise the call succeeds where a
@@ -182,7 +182,6 @@ pub fn local_read_context(store: &StoreInternal, repository: Partition) -> Arc<R
 }
 
 /// [`local_read_context`] with the in-memory write token.
-#[cfg(feature = "test-util")]
 pub fn local_write_context(store: &StoreInternal, repository: Partition) -> Arc<RepositoryContext> {
     for_writing(offline_context(store, repository))
 }
@@ -266,7 +265,6 @@ fn offline_context(store: &StoreInternal, repository: Partition) -> RepositoryCo
 }
 
 /// `context` with strict local reads and the in-memory write token.
-#[cfg(feature = "test-util")]
 fn for_writing(context: RepositoryContext) -> Arc<RepositoryContext> {
     Arc::new(
         context

@@ -9,6 +9,7 @@ use lore_revision::commit::LoreRevisionCommitStatsEventData;
 use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_graph::LoreRevisionGraphBranchEventData;
+use lore_revision::event::revision_graph::LoreRevisionGraphBranchMetadataEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphInstanceEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphLocationCompleteEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphRevisionEventData;
@@ -16,6 +17,7 @@ use lore_revision::instance::InstanceId;
 use lore_revision::instance::LoreRepositoryInstanceCloneCompleteEventData;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreBranchLocation;
+use lore_revision::interface::LoreMetadata;
 use lore_revision::interface::LoreString;
 
 /// The largest payload among the variants ahead of the revision graph ones, as
@@ -36,11 +38,12 @@ fn lore_event_is_sized_by_an_existing_payload() {
         event <= tagged,
         "LoreEvent holds {event} bytes, the largest existing payload with its tag {tagged}; the \
          graph event data's (size, alignment): branch {:?}, instance {:?}, revision {:?}, \
-         location complete {:?}",
+         location complete {:?}, branch metadata {:?}",
         layout::<LoreRevisionGraphBranchEventData>(),
         layout::<LoreRevisionGraphInstanceEventData>(),
         layout::<LoreRevisionGraphRevisionEventData>(),
         layout::<LoreRevisionGraphLocationCompleteEventData>(),
+        layout::<LoreRevisionGraphBranchMetadataEventData>(),
     );
 }
 
@@ -67,8 +70,9 @@ fn graph_variants_are_appended_after_the_last_existing_variant() {
         LoreEvent::RevisionGraphInstance(instance()).discriminant(),
         LoreEvent::RevisionGraphRevision(revision()).discriminant(),
         LoreEvent::RevisionGraphLocationComplete(location_complete()).discriminant(),
+        LoreEvent::RevisionGraphBranchMetadata(branch_metadata()).discriminant(),
     ];
-    assert_eq!(graph, [last + 1, last + 2, last + 3, last + 4]);
+    assert_eq!(graph, [last + 1, last + 2, last + 3, last + 4, last + 5]);
 }
 
 fn branch() -> LoreRevisionGraphBranchEventData {
@@ -116,5 +120,15 @@ fn location_complete() -> LoreRevisionGraphLocationCompleteEventData {
         location: LoreBranchLocation::Local,
         records: 0,
         error: LoreErrorDetail::default(),
+    }
+}
+
+fn branch_metadata() -> LoreRevisionGraphBranchMetadataEventData {
+    LoreRevisionGraphBranchMetadataEventData {
+        id: 0,
+        location: LoreBranchLocation::Local,
+        branch: BranchId::default(),
+        key: LoreString::default(),
+        value: LoreMetadata::Boolean(0),
     }
 }

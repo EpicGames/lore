@@ -261,6 +261,52 @@ fn a_batch_entry_name_that_is_not_utf8_is_rejected() {
     assert!(!handler_ran, "the verb must not run on a rejected call");
 }
 
+/// Each text field of a branch metadata set: an entry's key, an entry's value under the string tag,
+/// which the check reaches only through the value's tag, and a key to remove. The same set with
+/// valid text reaches the verb.
+#[test]
+fn metadata_set_text_that_is_not_utf8_is_rejected() {
+    use lore::revision_graph::branch_metadata_set::LoreRevisionGraphBranchMetadataEntry;
+    use lore::revision_graph::branch_metadata_set::LoreRevisionGraphBranchMetadataSetArgs;
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreMetadata;
+
+    let set = |key: LoreString, value: LoreString, removed: LoreString| {
+        LoreRevisionGraphBranchMetadataSetArgs {
+            entries: LoreArray::from_vec(vec![LoreRevisionGraphBranchMetadataEntry {
+                key,
+                value: LoreMetadata::String(value),
+            }]),
+            remove: LoreArray::from_vec(vec![removed]),
+            ..Default::default()
+        }
+    };
+    let text = LoreString::from_str;
+
+    for (field, args) in [
+        (
+            "an entry's key",
+            set(invalid_utf8(), text("nightly"), text("reviewer")),
+        ),
+        (
+            "an entry's string value",
+            set(text("pipeline"), invalid_utf8(), text("reviewer")),
+        ),
+        (
+            "a key to remove",
+            set(text("pipeline"), text("nightly"), invalid_utf8()),
+        ),
+    ] {
+        let (status, handler_ran) = dispatch(&LoreGlobalArgs::default(), &args);
+
+        assert_eq!(status, rejected_status(), "{field} must be rejected");
+        assert!(!handler_ran, "the verb must not run on a rejected call");
+    }
+
+    let valid = set(text("pipeline"), text("nightly"), text("reviewer"));
+    assert_eq!(dispatch(&LoreGlobalArgs::default(), &valid), (0, true));
+}
+
 /// A text field of a nested struct, reached by descending one field deep.
 #[test]
 fn a_text_field_of_a_nested_argument_struct_that_is_not_utf8_is_rejected() {

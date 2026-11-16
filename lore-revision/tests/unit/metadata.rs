@@ -1,6 +1,17 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use lore_base::types::Address;
+use lore_base::types::Context;
+use lore_base::types::Fragment;
+use lore_base::types::Hash;
+use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::metadata::*;
+use lore_revision::repository::RemoteState;
+use lore_revision::test_util::context_with_state;
+use lore_transport::Connection;
+use lore_transport::test_util::MemoryPeer;
+
+use crate::immutable::session_tests::under_globals;
 
 /// A number that names no type is refused rather than defaulted: a buffer
 /// carrying one was written by something that disagrees with this build
@@ -131,6 +142,32 @@ fn set_refuses_an_entry_larger_than_the_whole_cap() {
     );
 }
 
+/// The limit is on the whole buffer, exact at the byte: metadata of exactly the limit passes, and
+/// one entry more fails.
+#[test]
+fn check_size_refuses_metadata_over_one_mebibyte() {
+    let key = "blob";
+    let mut metadata = Metadata::new();
+    metadata
+        .set_binary(
+            key,
+            &vec![0u8; METADATA_MAX_SIZE - Metadata::stored_size(key.len(), 0)],
+        )
+        .expect("the largest pair that fits is accepted");
+    assert_eq!(metadata.buffer.len(), METADATA_MAX_SIZE);
+    metadata
+        .check_size()
+        .expect("metadata of exactly the limit passes");
+
+    metadata.set_binary("more", &[]).expect("sets the entry");
+    let checked = metadata.check_size();
+
+    assert!(
+        checked.as_ref().is_err_and(|err| err.is_oversized()),
+        "got {checked:?}"
+    );
+}
+
 /// An entry this build cannot type must not cost the caller the entries
 /// around it: a walk that stopped there would hand back a prefix, and every
 /// caller that ignores the outcome would read it as the whole buffer.
@@ -146,6 +183,28 @@ fn walk_passes_over_an_entry_it_cannot_type() {
         keys,
         vec![b"first".to_vec(), b"third".to_vec()],
         "the entries either side of an unreadable one must still be visited"
+    );
+}
+
+/// `walk_tags` hands over every entry with the tag it's stored under, so a
+/// caller can count the entries `walk` passes over.
+#[test]
+fn walk_tags_hands_over_unknown_tags_that_walk_passes_over() {
+    let entries = [("first", "one"), ("second", "two"), ("third", "three")];
+    let mut metadata = metadata_of(&entries);
+    plant_unknown_tag(&mut metadata, &entries, 1);
+
+    let mut walked: Vec<(Vec<u8>, Vec<u8>, u32)> = Vec::new();
+    metadata.walk_tags(|key, value, tag| walked.push((key.to_vec(), value.to_vec(), tag)));
+
+    let string = MetadataType::String as u32;
+    assert_eq!(
+        walked,
+        vec![
+            (b"first".to_vec(), b"one".to_vec(), string),
+            (b"second".to_vec(), b"two".to_vec(), 99),
+            (b"third".to_vec(), b"three".to_vec(), string),
+        ]
     );
 }
 
@@ -215,6 +274,34 @@ fn set_typed_overwrites_a_key_and_its_type() {
     let mut keys = 0;
     metadata.walk(|_, _, _| keys += 1);
     assert_eq!(keys, 1, "an overwrite must not leave the old entry behind");
+}
+
+/// A set of the value and type a key holds answers false and leaves the buffer byte-identical; a
+/// new value, a new type of the same length and a new key answer true.
+#[test]
+fn set_typed_answers_whether_it_changed_the_buffer() {
+    let mut metadata = metadata_of(&[("key", "value"), ("other", "text")]);
+    let before = metadata.buffer.clone();
+
+    let held = metadata
+        .set_typed("key", b"value", MetadataType::String)
+        .expect("sets the value the key holds");
+    assert!(!held, "the value and type the key holds change nothing");
+    assert_eq!(metadata.buffer, before);
+
+    for (key, value, value_type) in [
+        ("key", &b"VALUE"[..], MetadataType::String),
+        ("key", &b"VALUE"[..], MetadataType::Binary),
+        ("new", &b"x"[..], MetadataType::String),
+    ] {
+        let changed = metadata
+            .set_typed(key, value, value_type)
+            .expect("sets the entry");
+        assert!(
+            changed,
+            "{key} as {value:?} {value_type:?} changes the buffer"
+        );
+    }
 }
 
 #[test]
@@ -573,4 +660,92 @@ fn decode_to_value_string() {
 fn decode_to_value_binary() {
     let result = Metadata::decode_to_value("raw data", &MetadataType::Binary).unwrap();
     assert_eq!(result, b"raw data");
+}
+
+fn address(byte: u8) -> Address {
+    Address {
+        hash: Hash::from([byte; 32]),
+        context: Context::from([byte; 16]),
+    }
+}
+
+fn globals() -> LoreGlobalArgs {
+    LoreGlobalArgs {
+        correlation_id: "branch-metadata-addresses".into(),
+        ..LoreGlobalArgs::default()
+    }
+}
+
+/// Only address values name blobs, and an address with a zero hash names empty content, which no
+/// store holds a blob for.
+#[test]
+fn address_values_skip_zero_hashes() {
+    let named = address(0x62);
+    let mut metadata = Metadata::new();
+    metadata
+        .set_address("named", named)
+        .expect("sets the entry");
+    metadata
+        .set_address(
+            "empty",
+            Address {
+                hash: Hash::default(),
+                context: Context::from([0x63; 16]),
+            },
+        )
+        .expect("sets the entry");
+    metadata
+        .set_hash("hash", Hash::from([0x64; 32]))
+        .expect("sets the entry");
+    metadata
+        .set_string("text", "no address")
+        .expect("sets the entry");
+
+    assert_eq!(metadata.address_values(), vec![named]);
+}
+
+/// No address needs no query, and the remote is asked about any number of addresses in one.
+#[tokio::test]
+async fn first_missing_remote_makes_no_query_for_no_addresses() {
+    let peer = MemoryPeer::new();
+    let repository = context_with_state(RemoteState::Connected(Connection::detached(vec![
+        peer.clone(),
+    ])))
+    .await;
+    let held = address(0x68);
+    peer.session(repository.id)
+        .put(held, Fragment::default(), None)
+        .await
+        .expect("the peer takes the put");
+    let addresses = [held, address(0x69), address(0x6a)];
+
+    let none = under_globals(globals(), || branch::first_missing_remote(&repository, &[]))
+        .await
+        .expect("no address needs no answer");
+    assert_eq!(none, None);
+    assert_eq!(peer.queries(), 0);
+
+    let first = under_globals(globals(), || {
+        branch::first_missing_remote(&repository, &addresses)
+    })
+    .await
+    .expect("the peer answers the query");
+    assert_eq!(first, Some(addresses[1]));
+    assert_eq!(peer.queries(), 1);
+}
+
+#[tokio::test]
+async fn first_missing_remote_without_a_remote_fails_no_remote() {
+    let repository = context_with_state(RemoteState::Offline).await;
+    let addresses = [address(0x6b)];
+
+    let first = under_globals(globals(), || {
+        branch::first_missing_remote(&repository, &addresses)
+    })
+    .await;
+
+    assert!(
+        first.as_ref().is_err_and(|err| err.is_no_remote()),
+        "got {first:?}"
+    );
 }

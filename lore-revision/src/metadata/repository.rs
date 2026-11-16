@@ -134,21 +134,14 @@ async fn fetch_metadata_hash(
 /// Collect all addresses referenced by a metadata blob: the blob itself plus any binary
 /// (Address-typed) values it contains.
 fn collect_metadata_addresses(metadata: &Metadata, metadata_hash: Hash) -> Vec<Address> {
-    let mut addresses = vec![Address {
-        hash: metadata_hash,
-        context: Context::default(),
-    }];
-
-    metadata.walk(|_key: &[u8], value: &[u8], value_type: MetadataType| {
-        if value_type == MetadataType::Address && value.len() == std::mem::size_of::<Address>() {
-            let address: Address = value.into();
-            // Empty content is stored as the zero hash, which names no blob to upload.
-            if !address.hash.is_zero() {
-                addresses.push(address);
-            }
-        }
-    });
-
+    let mut addresses = metadata.address_values();
+    addresses.insert(
+        0,
+        Address {
+            hash: metadata_hash,
+            context: Context::default(),
+        },
+    );
     addresses
 }
 
@@ -164,17 +157,9 @@ async fn ensure_remote_blobs(
         return Ok(());
     }
 
-    let status = storage
-        .query(addresses)
+    let missing = immutable::missing_remote(&storage, addresses)
         .await
         .forward::<RepositoryMetadataError>("querying server for metadata blob existence")?;
-
-    let mut missing = vec![];
-    for (index, value) in status.iter().enumerate() {
-        if *value != 0 && index < addresses.len() {
-            missing.push(addresses[index]);
-        }
-    }
 
     for address in missing {
         let (fragment, payload) =

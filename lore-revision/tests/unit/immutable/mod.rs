@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 mod cache_tests;
+mod remote_metadata_tests;
 mod remote_store_tests;
 pub(crate) mod serving;
 pub(crate) mod session_tests;

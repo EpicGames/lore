@@ -119,6 +119,8 @@ include = [
     "LoreRevisionGraphRevisionResolveArgs",
     "LoreRevisionGraphBranchResolveArgs",
     "LoreRevisionGraphBranchListArgs",
+    "LoreRevisionGraphBranchMetadataGetArgs",
+    "LoreRevisionGraphBranchMetadataSetArgs",
 ]
 
 [export.rename]
@@ -588,6 +590,7 @@ include = [
 "LoreRevisionGraphInstanceEventData" = "lore_revision_graph_instance_event_data_t"
 "LoreRevisionGraphRevisionEventData" = "lore_revision_graph_revision_event_data_t"
 "LoreRevisionGraphLocationCompleteEventData" = "lore_revision_graph_location_complete_event_data_t"
+"LoreRevisionGraphBranchMetadataEventData" = "lore_revision_graph_branch_metadata_event_data_t"
 "LoreRevisionTree" = "lore_revision_tree_t"
 "LoreRevisionTreeLoadArgs" = "lore_revision_tree_load_args_t"
 "LoreRevisionTreeCloseArgs" = "lore_revision_tree_close_args_t"
@@ -623,6 +626,10 @@ include = [
 "LoreRevisionGraphRevisionResolveArgs" = "lore_revision_graph_revision_resolve_args_t"
 "LoreRevisionGraphBranchResolveArgs" = "lore_revision_graph_branch_resolve_args_t"
 "LoreRevisionGraphBranchListArgs" = "lore_revision_graph_branch_list_args_t"
+"LoreRevisionGraphBranchMetadataGetArgs" = "lore_revision_graph_branch_metadata_get_args_t"
+"LoreRevisionGraphBranchMetadataEntry" = "lore_revision_graph_branch_metadata_entry_t"
+"LoreArray_lore_revision_graph_branch_metadata_entry" = "lore_revision_graph_branch_metadata_entry_array_t"
+"LoreRevisionGraphBranchMetadataSetArgs" = "lore_revision_graph_branch_metadata_set_args_t"
 "LoreString" = "lore_string_t"
 "LoreArray_instance_id" = "lore_instance_id_array_t"
 "LoreStringArray" = "lore_string_array_t"

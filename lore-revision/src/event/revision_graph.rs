@@ -13,6 +13,7 @@ use crate::instance::InstanceId;
 use crate::interface::LoreArray;
 use crate::interface::LoreBranchLocation;
 use crate::interface::LoreBranchPoint;
+use crate::interface::LoreMetadata;
 use crate::interface::LoreString;
 use crate::util::serde::u8_as_bool;
 
@@ -88,6 +89,23 @@ pub struct LoreRevisionGraphRevisionEventData {
     pub revision_number: u64,
     /// The branch the revision was created on. Zero when the location doesn't record it.
     pub branch: BranchId,
+}
+
+/// One metadata entry of a branch, as one location holds it.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreRevisionGraphBranchMetadataEventData {
+    /// The `id` from the call's arguments.
+    pub id: u64,
+    /// The location that holds the entry.
+    pub location: LoreBranchLocation,
+    /// Branch identifier.
+    pub branch: BranchId,
+    /// The entry's key.
+    pub key: LoreString,
+    /// The entry's value, with the type it's stored with.
+    pub value: LoreMetadata,
 }
 
 /// The call's outcome at one location, after that location's record events.

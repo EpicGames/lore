@@ -51,6 +51,8 @@ mod fuse_test_util;
 mod helper;
 #[path = "fuse_mount/integration.rs"]
 mod integration;
+#[path = "support/xorshift.rs"]
+mod xorshift;
 
 use fuse_service::*;
 use lore_storage::FlushOptions;

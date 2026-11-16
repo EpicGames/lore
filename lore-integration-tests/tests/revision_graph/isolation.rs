@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! What each read verb reads and writes in the local store, by the location it consults, and how a
-//! failed local read ends that location: work at the remote touches no local store, a read verb
-//! writes nothing to the local store, a block only the remote holds is absent from the local store's
+//! What each verb reads and writes in the local store, by the location it consults, and how a
+//! failed local read ends that location: work at the remote touches no local store, except the
+//! query and the entries of a branch metadata set's write through the immutable data pipeline,
+//! a branch metadata set in the local store writes nothing at the remote, a read verb writes
+//! nothing to the local store, a block only the remote holds is absent from the local store's
 //! answer, a failed local read fails the local location alone, the remote's error is the call's
 //! where both locations fail, and invalid arguments end a call before it reaches any store.
 
@@ -12,9 +14,12 @@ use lore::revision_graph::LoreRevisionIdentifier;
 use lore_base::error::InvalidArguments;
 use lore_base::error::RevisionNotFound;
 use lore_base::test_util::TempDir;
+use lore_base::types::Address;
 use lore_revision::branch;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreBranchLocation;
+use lore_storage::StoreMatch;
+use lore_storage::immutable_store::query_one;
 use lore_storage::test_util::ImmutableCall;
 
 use super::counting::open_counted_handle;
@@ -41,7 +46,7 @@ async fn work_at_the_remote_reads_no_local_key_and_writes_nothing() {
     let seeded = seed_main(&f).await;
     let remote_only = create_remote_branch(&f, "remote-only", f.default_branch, CREATOR).await;
     let published = publish_from_another_handle(&f, remote_only, seeded).await;
-    let (counted, mutable, immutable) = open_counted_handle(&f, None);
+    let (counted, mutable, immutable) = open_counted_handle(&f, None, None);
     let gets = f.server_gets.load(Ordering::SeqCst);
 
     let remote = || graph_globals_at(LoreBranchLocation::Remote);
@@ -51,6 +56,7 @@ async fn work_at_the_remote_reads_no_local_key_and_writes_nothing() {
         resolve_revision(&f, counted, remote(), by_hash(published)).await,
         resolve_branch(&f, counted, remote(), "remote-only").await,
         list_branches(&f, counted, remote(), true, "").await,
+        get_branch_metadata(&f, counted, remote(), remote_only, "").await,
     ];
     close_handle(counted).await;
 
@@ -64,7 +70,7 @@ async fn work_at_the_remote_reads_no_local_key_and_writes_nothing() {
 
 /// Every read verb with the `local` flag writes nothing to the local store: it stores and swaps no
 /// key, and puts, copies, obliterates and heals no content, while it reads branches, archived ones
-/// and instances included, and revisions there.
+/// and instances included, branch metadata, and revisions there.
 #[tokio::test]
 async fn a_read_verb_writes_nothing_locally() {
     let f = fixture().await;
@@ -74,7 +80,7 @@ async fn a_read_verb_writes_nothing_locally() {
     archive_locally(&f, archived).await;
     let dir = TempDir::new("revision-graph-isolation-instance-");
     register_instance_at(&f, local, seeded, &dir).await;
-    let (counted, mutable, immutable) = open_counted_handle(&f, None);
+    let (counted, mutable, immutable) = open_counted_handle(&f, None, None);
 
     let in_local_store = || graph_globals_at(LoreBranchLocation::Local);
     let calls = [
@@ -83,6 +89,7 @@ async fn a_read_verb_writes_nothing_locally() {
         resolve_revision(&f, counted, in_local_store(), by_hash(seeded)).await,
         resolve_branch(&f, counted, in_local_store(), "local").await,
         list_branches(&f, counted, in_local_store(), true, "").await,
+        get_branch_metadata(&f, counted, in_local_store(), local, "").await,
     ];
     close_handle(counted).await;
 
@@ -104,6 +111,101 @@ async fn a_read_verb_writes_nothing_locally() {
     f.close().await;
 }
 
+/// A `branch_metadata_set` with the `remote` flag makes no call on the local mutable store, and on
+/// the local immutable store only the write pipeline's query and put of the new blob's one
+/// fragment, which the store then records as stored at the remote, without its payload.
+#[tokio::test]
+async fn metadata_set_at_the_remote_leaves_only_the_pipelines_entries_locally() {
+    let f = fixture().await;
+    seed_main(&f).await;
+    let remote_only = create_remote_branch(&f, "remote-only", f.default_branch, CREATOR).await;
+    let (counted, mutable, immutable) = open_counted_handle(&f, None, None);
+
+    let answered = set_branch_metadata(
+        &f,
+        counted,
+        graph_globals_at(LoreBranchLocation::Remote),
+        remote_only,
+        vec![("build", string("green"))],
+        &[],
+    )
+    .await;
+    close_handle(counted).await;
+
+    assert_answered_at(LoreBranchLocation::Remote, &answered);
+    assert_eq!(
+        (
+            mutable.total(),
+            immutable.count(ImmutableCall::Query),
+            immutable.count(ImmutableCall::Put),
+            immutable.total(),
+        ),
+        (0, 1, 1, 2)
+    );
+    let written = Address::zero_context_hash(
+        on_server(&f, async |context| {
+            branch::metadata_hash(context, remote_only).await
+        })
+        .await
+        .expect("the server holds the branch's metadata"),
+    );
+    let state = handle_state(&f);
+    let entry = in_client(query_one(&state.immutable, f.repository, written))
+        .await
+        .expect("the local store answers the query");
+    drop(state);
+    assert!(
+        entry.match_made == StoreMatch::MatchFull && entry.stored_durable && !entry.stored_local,
+        "expected an entry of the upload without its payload, got {entry:?}"
+    );
+    f.close().await;
+}
+
+/// A `branch_metadata_set` of a branch the local store alone holds, through a handle whose remote
+/// is the server, writes its blob in the local store alone, with the `local` flag and with no flag:
+/// the server's store holds no blob the set wrote.
+#[tokio::test]
+async fn metadata_set_in_the_local_store_writes_nothing_at_the_remote() {
+    let f = fixture().await;
+    seed_main(&f).await;
+    let local = create_local_branch(&f, "local", f.default_branch, CREATOR).await;
+
+    for (globals, value) in [
+        (graph_globals_at(LoreBranchLocation::Local), "local flag"),
+        (graph_globals(), "no flag"),
+    ] {
+        let (status, _) = set_branch_metadata(
+            &f,
+            f.store,
+            globals,
+            local,
+            vec![("build", string(value))],
+            &[],
+        )
+        .await;
+        let (written, metadata) = in_client(branch::local_metadata(local_writer(&f), local))
+            .await
+            .expect("reads the local metadata")
+            .expect("the local store holds the branch's metadata");
+        let at_server = in_client(query_one(
+            &f.server_immutable,
+            f.repository,
+            Address::zero_context_hash(written),
+        ))
+        .await
+        .expect("the server's store answers the query");
+
+        assert_eq!(status, 0, "the set with {value} succeeds");
+        assert_eq!(metadata.get_string("build").ok(), Some(value));
+        assert_eq!(
+            at_server.match_made,
+            StoreMatch::MatchNone,
+            "the server holds the blob the set with {value} wrote"
+        );
+    }
+    f.close().await;
+}
+
 /// A revision only the remote holds is absent from the local store's answer: a `local` resolve of
 /// its hash asks the local store, fetches nothing from the remote, and fails `RevisionNotFound`
 /// with a local location complete event that reports no record and no error.
@@ -112,7 +214,7 @@ async fn a_lazy_fetch_miss_counts_as_absent_locally() {
     let f = fixture().await;
     let seeded = seed_main(&f).await;
     let remote_only = publish_from_another_handle(&f, f.default_branch, seeded).await;
-    let (counted, _, immutable) = open_counted_handle(&f, None);
+    let (counted, _, immutable) = open_counted_handle(&f, None, None);
     let gets = f.server_gets.load(Ordering::SeqCst);
 
     let (status, events) = resolve_revision(
@@ -149,7 +251,7 @@ async fn a_failed_local_read_fails_the_local_location() {
         CREATOR,
     )
     .await;
-    let (counted, _, immutable) = open_counted_handle(&f, None);
+    let (counted, _, immutable) = open_counted_handle(&f, None, None);
     immutable.fail_gets();
 
     let (status, events) = resolve_branch(&f, counted, graph_globals(), "both").await;
@@ -181,7 +283,7 @@ async fn when_both_locations_fail_complete_carries_the_remotes_code() {
     let f = fixture().await;
     seed_main(&f).await;
     let remote = closed_port_remote(&f);
-    let (counted, _, immutable) = open_counted_handle(&f, Some(remote));
+    let (counted, _, immutable) = open_counted_handle(&f, Some(remote), None);
     immutable.fail_gets();
 
     let (status, events) =
@@ -212,7 +314,7 @@ async fn when_both_locations_fail_complete_carries_the_remotes_code() {
 async fn malformed_identifiers_and_invalid_names_touch_no_store() {
     let f = fixture().await;
     let seeded = seed_main(&f).await;
-    let (counted, mutable, immutable) = open_counted_handle(&f, None);
+    let (counted, mutable, immutable) = open_counted_handle(&f, None, None);
     let gets = f.server_gets.load(Ordering::SeqCst);
 
     let hash_and_branch = LoreRevisionIdentifier {

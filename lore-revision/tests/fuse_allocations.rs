@@ -41,6 +41,8 @@ mod fuse_fixture;
 mod fuse_test_util;
 #[path = "helper.rs"]
 mod helper;
+#[path = "support/xorshift.rs"]
+mod xorshift;
 
 use fuse_test_util::PAGE;
 

@@ -1396,6 +1396,63 @@ fn keep_store_failure(
     }
 }
 
+/// The first of `addresses` whose payload the local store of `repository` lacks, from one query
+/// of the store, and `None` where it holds every payload. No addresses make no query. An entry
+/// without its payload, as eviction leaves one, lacks it. A failed query is the error, where
+/// [`is_stored_local`] reads one as lacking.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn first_not_held_locally<'a>(
+    repository: &'a RepositoryContext,
+    addresses: &'a [Address],
+) -> impl Future<Output = Result<Option<Address>, ImmutableError>> + 'a {
+    async move {
+        if addresses.is_empty() {
+            return Ok(None);
+        }
+        let mut resolved = vec![StoreMatchResult::default(); addresses.len()];
+        repository
+            .immutable_store()
+            .query(repository.id, addresses, &mut resolved)
+            .await
+            .forward::<ImmutableError>("querying the local store for the payloads it holds")?;
+        Ok(addresses
+            .iter()
+            .zip(&resolved)
+            .find(|(_, resolved)| !held_locally(resolved))
+            .map(|(address, _)| *address))
+    }
+}
+
+/// The addresses of `addresses` the remote lacks, in order, from one existence query on
+/// `storage`. An answer whose status count differs from the addresses' fails as internal: its
+/// statuses can't be matched to the addresses.
+///
+/// Returns the query's future mapped to the addresses, without a future of its own.
+pub fn missing_remote<'a>(
+    storage: &'a StorageSession,
+    addresses: &'a [Address],
+) -> impl Future<Output = Result<Vec<Address>, ImmutableError>> + 'a {
+    storage.query(addresses).map(move |status| {
+        let status =
+            status.forward::<ImmutableError>("querying the remote for the addresses it holds")?;
+        if status.len() != addresses.len() {
+            return Err(ImmutableError::internal(format!(
+                "the remote answered {} statuses for {} addresses",
+                status.len(),
+                addresses.len()
+            )));
+        }
+        Ok(addresses
+            .iter()
+            .zip(status.iter())
+            .filter(|(_, lacking)| **lacking != 0)
+            .map(|(address, _)| *address)
+            .collect())
+    })
+}
+
 pub async fn is_stored_local(repository: Arc<RepositoryContext>, address: Address) -> bool {
     lore_trace!("Check if {} is cached in local store", address);
     if let Ok(resolved) = query_one(&repository.immutable_store(), repository.id, address).await {

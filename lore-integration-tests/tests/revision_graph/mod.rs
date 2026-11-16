@@ -5,6 +5,7 @@
 mod counting;
 mod isolation;
 mod list;
+mod metadata;
 mod perf;
 mod read_costs;
 mod resolve;

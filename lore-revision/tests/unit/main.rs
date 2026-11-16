@@ -52,6 +52,9 @@ mod stage;
 mod state;
 mod store;
 mod util;
+/// The seeded xorshift these tests share with the FUSE tests' own binaries.
+#[path = "../support/xorshift.rs"]
+mod xorshift;
 
 /// Points the unit tests at a global data and config directory of their own, rather than the
 /// machine's, so a test's external `.lore` lookups and shared store registry stay inside it

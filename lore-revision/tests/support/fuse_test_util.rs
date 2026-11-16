@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 //! Helpers the FUSE tests and benchmarks share: a seeded xorshift, `O_DIRECT` reads, READDIR
 //! reply decoding, a mock session that sends raw requests through the dispatcher, and
-//! mount-table probes.
+//! mount-table probes. The xorshift is `xorshift.rs`'s, which every binary that includes this
+//! file includes as `crate::xorshift`.
 #![allow(dead_code)]
 
 use std::os::fd::AsRawFd as _;
@@ -16,28 +17,13 @@ use lore_revision::fs::fuse::filesystem::FuseFilesystem;
 use lore_revision::fs::fuse::inode::ROOT_INO;
 use lore_revision::fs::mount_manager_state::MountManagerState;
 
+#[allow(unused_imports)]
+pub use crate::xorshift::XorShift;
+#[allow(unused_imports)]
+pub use crate::xorshift::incompressible;
+
 /// The page size `O_DIRECT` aligns to.
 pub const PAGE: usize = 4096;
-
-/// A seeded xorshift64. A zero state stays zero, so seeds are made odd where they may be zero.
-pub struct XorShift(pub u64);
-
-impl XorShift {
-    pub fn next_u64(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-}
-
-/// `len` incompressible bytes, distinct per `seed`: the low byte of each xorshift step.
-pub fn incompressible(len: usize, seed: u64) -> Vec<u8> {
-    let mut rng = XorShift(seed | 1);
-    (0..len).map(|_| rng.next_u64() as u8).collect()
-}
 
 /// A zeroed page-aligned buffer, as `O_DIRECT` requires.
 pub struct Aligned {

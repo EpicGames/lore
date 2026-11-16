@@ -21,6 +21,7 @@ use lore_revision::protocol::RemoteEndpoint;
 use lore_storage::StoreError;
 use lore_storage::fragment_flags::FragmentFlags;
 use lore_storage::hash;
+use lore_storage::test_util::Answered;
 use lore_storage::test_util::HookedImmutableStore;
 use lore_storage::test_util::HookedStore;
 use lore_storage::test_util::ImmutableCall;
@@ -123,11 +124,14 @@ impl CountingImmutable {
 
 /// A storage handle over the local stores of `f`'s handle, with `remote` as its remote, or the
 /// remote of `f`'s handle where it is `None`, and the counts of the calls it makes on each store.
+/// Its mutable store runs `answered`, if any, after each load, store and compare-and-swap the
+/// store answers, as `HookedStore::wrap` does; what that hook does on the store goes uncounted.
 /// It is registered with [`register_handle`]; a test closes it with `close_handle` before
 /// [`Fixture::close`].
 pub(crate) fn open_counted_handle(
     f: &Fixture,
     remote: Option<Arc<RemoteEndpoint>>,
+    answered: Option<Answered>,
 ) -> (LoreStore, Arc<CountingMutable>, Arc<CountingImmutable>) {
     let state = handle_state(f);
     let mutable = Arc::new(CountingMutable::default());
@@ -145,7 +149,7 @@ pub(crate) fn open_counted_handle(
                 counted_mutable.record(call, key, key_type);
                 Ok(())
             },
-            None,
+            answered,
         ),
         remote.or_else(|| state.remote.clone()),
     );
@@ -158,7 +162,7 @@ pub(crate) fn open_counted_handle(
 #[tokio::test]
 async fn a_counted_handle_counts_each_call_on_its_stores() {
     let f = fixture().await;
-    let (counted, mutable, immutable) = open_counted_handle(&f, None);
+    let (counted, mutable, immutable) = open_counted_handle(&f, None, None);
     let state = handle::lookup(counted).expect("the counted handle is open");
     let [stored, swapped] = [1, 2].map(|byte| Hash::from([byte; 32]));
     let payload = Bytes::from_static(b"counted payload");

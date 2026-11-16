@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! A stub peer for tests that drive a [`StorageSession`] without a server behind it.
+//! Stub peers for tests that drive a [`StorageSession`] without a server behind it.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -211,5 +212,191 @@ impl Storage for StubPeer {
             ));
         }
         Ok(())
+    }
+}
+
+/// A peer that holds what it is sent: it keeps each put's fragment and payload by address, serves
+/// gets of them, and answers a get of anything else `NotFound`, as a server does, which a read
+/// reports as the address not found. It answers a query with one byte per address, zero where it
+/// holds the address, and refuses copies and verifications. A peer built with
+/// [`refusing_puts`](Self::refusing_puts), or told to with [`refuse_puts`](Self::refuse_puts),
+/// answers every put with its refusal and keeps nothing, and one built with
+/// [`answering_queries_short`](Self::answering_queries_short) leaves the last address of each query
+/// unanswered.
+pub struct MemoryPeer {
+    held: Mutex<BTreeMap<Address, (Fragment, Option<Bytes>)>>,
+    put_refusal: Mutex<Option<ProtocolError>>,
+    short_queries: bool,
+    puts: AtomicUsize,
+    gets: AtomicUsize,
+    queries: AtomicUsize,
+}
+
+impl MemoryPeer {
+    /// A peer that holds nothing yet and keeps every put.
+    pub fn new() -> Arc<Self> {
+        Self::built(None, false)
+    }
+
+    /// A peer that answers every put with `refusal`.
+    pub fn refusing_puts(refusal: ProtocolError) -> Arc<Self> {
+        Self::built(Some(refusal), false)
+    }
+
+    /// A peer that answers each query with one status fewer than the addresses it names.
+    pub fn answering_queries_short() -> Arc<Self> {
+        Self::built(None, true)
+    }
+
+    fn built(put_refusal: Option<ProtocolError>, short_queries: bool) -> Arc<Self> {
+        Arc::new(Self {
+            held: Mutex::default(),
+            put_refusal: Mutex::new(put_refusal),
+            short_queries,
+            puts: AtomicUsize::new(0),
+            gets: AtomicUsize::new(0),
+            queries: AtomicUsize::new(0),
+        })
+    }
+
+    /// A session on `partition` whose requests all reach this peer.
+    pub fn session(self: &Arc<Self>, partition: Partition) -> StorageSession {
+        StorageSession::resolved(
+            self.clone(),
+            Connection::detached(Vec::new()),
+            1,
+            partition,
+            Arc::from("memory-peer"),
+        )
+    }
+
+    /// The fragment and payload the peer holds at `address`.
+    pub fn held(&self, address: &Address) -> Option<(Fragment, Option<Bytes>)> {
+        self.stored().get(address).cloned()
+    }
+
+    /// Every address the peer holds, in address order.
+    pub fn addresses(&self) -> Vec<Address> {
+        self.stored().keys().copied().collect()
+    }
+
+    /// What the peer holds, even where a panicking test thread poisoned the lock.
+    fn stored(&self) -> MutexGuard<'_, BTreeMap<Address, (Fragment, Option<Bytes>)>> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Answers every later put with `refusal`, so that a test can set the peer up with puts first.
+    pub fn refuse_puts(&self, refusal: ProtocolError) {
+        *self
+            .put_refusal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(refusal);
+    }
+
+    /// Puts received so far, refused ones included.
+    pub fn puts(&self) -> usize {
+        self.puts.load(Ordering::SeqCst)
+    }
+
+    /// Gets received so far, of payloads and of fragments alone.
+    pub fn gets(&self) -> usize {
+        self.gets.load(Ordering::SeqCst)
+    }
+
+    /// Queries received so far.
+    pub fn queries(&self) -> usize {
+        self.queries.load(Ordering::SeqCst)
+    }
+
+    fn fragment_at(&self, address: &Address) -> Result<(Fragment, Option<Bytes>), ProtocolError> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        self.held(address)
+            .ok_or_else(|| ProtocolError::from(NotFound))
+    }
+}
+
+#[async_trait]
+impl Storage for MemoryPeer {
+    async fn session_start(
+        &self,
+        _partition: Partition,
+        _correlation_id: &str,
+    ) -> Result<u32, ProtocolError> {
+        Ok(1)
+    }
+
+    async fn session_stop(&self, _session_id: u32) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+
+    async fn get(
+        &self,
+        _session_id: u32,
+        address: &Address,
+    ) -> Result<(Fragment, Bytes), ProtocolError> {
+        match self.fragment_at(address)? {
+            (fragment, Some(payload)) => Ok((fragment, payload)),
+            (_, None) => Err(ProtocolError::internal(
+                "the memory peer holds no payload at the address",
+            )),
+        }
+    }
+
+    async fn get_metadata(
+        &self,
+        _session_id: u32,
+        address: &Address,
+    ) -> Result<Fragment, ProtocolError> {
+        Ok(self.fragment_at(address)?.0)
+    }
+
+    async fn put(
+        &self,
+        _session_id: u32,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<(), ProtocolError> {
+        self.puts.fetch_add(1, Ordering::SeqCst);
+        if let Some(refusal) = &*self
+            .put_refusal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            return Err(refusal.clone());
+        }
+        self.stored().insert(address, (fragment, payload));
+        Ok(())
+    }
+
+    async fn query(&self, _session_id: u32, addresses: &[Address]) -> Result<Bytes, ProtocolError> {
+        self.queries.fetch_add(1, Ordering::SeqCst);
+        let answered = addresses
+            .len()
+            .saturating_sub(usize::from(self.short_queries));
+        let held = self.stored();
+        Ok(addresses[..answered]
+            .iter()
+            .map(|address| u8::from(!held.contains_key(address)))
+            .collect())
+    }
+
+    async fn verify(
+        &self,
+        _session_id: u32,
+        _address: &Address,
+        _heal: bool,
+    ) -> Result<VerifyResult, ProtocolError> {
+        Err(ProtocolError::internal("the memory peer verifies nothing"))
+    }
+
+    async fn copy(
+        &self,
+        _session_id: u32,
+        _source_partition: Partition,
+        _source_address: Address,
+        _target_context: Context,
+    ) -> Result<(), ProtocolError> {
+        Err(ProtocolError::internal("the memory peer takes no copies"))
     }
 }

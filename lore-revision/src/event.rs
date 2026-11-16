@@ -83,6 +83,7 @@ use crate::dependency::LoreFileDependencyRemoveBeginEventData;
 use crate::dependency::LoreFileDependencyRemoveEndEventData;
 use crate::dependency::LoreFileDependencyRemoveEntryEventData;
 use crate::event::revision_graph::LoreRevisionGraphBranchEventData;
+use crate::event::revision_graph::LoreRevisionGraphBranchMetadataEventData;
 use crate::event::revision_graph::LoreRevisionGraphInstanceEventData;
 use crate::event::revision_graph::LoreRevisionGraphLocationCompleteEventData;
 use crate::event::revision_graph::LoreRevisionGraphRevisionEventData;
@@ -576,6 +577,12 @@ impl LoreMetadataEventData {
         };
 
         Ok(LoreMetadataEventData { key, value })
+    }
+
+    /// The entry stored with `key` and `value` under `value_type`, as an event carries it. `None`
+    /// where `key` isn't UTF-8 or `value` doesn't decode as `value_type`.
+    pub fn from_stored(key: &[u8], value: &[u8], value_type: MetadataType) -> Option<Self> {
+        Self::new(std::str::from_utf8(key).ok()?, value, value_type).ok()
     }
 }
 
@@ -1363,6 +1370,8 @@ pub enum LoreEvent {
     RevisionGraphRevision(LoreRevisionGraphRevisionEventData),
     /// A revision graph call's outcome at one location.
     RevisionGraphLocationComplete(LoreRevisionGraphLocationCompleteEventData),
+    /// One metadata entry of a branch, as one location holds it.
+    RevisionGraphBranchMetadata(LoreRevisionGraphBranchMetadataEventData),
 }
 
 /// Encodes as the event it refers to, so that a sender can encode an event it only borrows.

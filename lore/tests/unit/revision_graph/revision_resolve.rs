@@ -56,10 +56,12 @@ use lore_revision::metadata::BRANCH;
 use lore_revision::metadata::Metadata;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::StateData;
 use lore_revision::test_util::write_not_a_state;
 use lore_revision::test_util::write_state_revision;
 use lore_storage::test_util::StoreCall;
 use lore_transport::RevisionItem;
+use lore_transport::test_util::MemoryPeer;
 
 use crate::call::test_support::recording_callback;
 use crate::call::test_support::take_without_log_lines;
@@ -76,9 +78,11 @@ use crate::revision_graph::support::new_branch;
 use crate::revision_graph::support::new_repository;
 use crate::revision_graph::support::open_in_memory_handle;
 use crate::revision_graph::support::partial_metadata;
+use crate::revision_graph::support::put_root_fragment;
 use crate::revision_graph::support::revision_records;
 use crate::revision_graph::support::store_corrupt_metadata;
 use crate::revision_graph::support::store_with_remote;
+use crate::revision_graph::support::store_with_remote_storage;
 use crate::revision_tree::support::load_tree;
 
 /// The `id` every call in this file passes.
@@ -189,6 +193,19 @@ async fn write_line(write: &Arc<RepositoryContext>, branch: BranchId, count: u64
         line.push(parent);
     }
     line
+}
+
+/// Writes through `write` a blob one byte larger than a revision state, which a read of a state
+/// refuses for its size, and returns its address.
+async fn write_larger_than_a_state(write: &Arc<RepositoryContext>) -> Address {
+    immutable::write_borrowed(
+        write.clone(),
+        Context::default(),
+        &[7; size_of::<StateData>() + 1],
+        immutable::write_options_from_repository(write.clone()),
+    )
+    .await
+    .expect("writes the blob")
 }
 
 /// Creates `branch`, named `name`, in the local store through `write`, at `latest`.
@@ -578,25 +595,56 @@ async fn a_hash_naming_a_blob_that_is_not_a_revision_state_is_a_miss() {
     assert_eq!(local_outcome(&events), (0, 0));
 }
 
+/// A hash the identifier names, whose blob is larger than a revision state, names no revision at
+/// either location, though the read of a state refuses the blob for its size: the call fails with
+/// `RevisionNotFound`, a miss at the remote and at the local store.
+#[tokio::test]
+async fn a_hash_naming_a_blob_larger_than_a_revision_state_is_a_miss() {
+    let repository = new_repository();
+    let peer = MemoryPeer::new();
+    let service = NamingRevision::new(QueryAnswer::NotFound);
+    let store = store_with_remote_storage(repository, service, vec![peer.clone()]).await;
+    let write = local_write_context(&store, repository);
+    let blob = in_setup_context(write_larger_than_a_state(&write)).await;
+    put_root_fragment(&peer, &store, repository, blob).await;
+    let handle = handle::register(Arc::new(store));
+
+    let (status, events) = resolve(handle, repository, by_hash(blob.hash)).await;
+    close_handle(handle).await;
+
+    assert_eq!(status, RevisionNotFound::FFI_CODE);
+    assert!(resolved(&events).is_empty());
+    assert_eq!(
+        location_outcomes(&events, CALL_ID),
+        [
+            (LoreBranchLocation::Remote, 0, 0),
+            (LoreBranchLocation::Local, 0, 0)
+        ]
+    );
+}
+
 /// A blob that isn't a revision state, as the branch's latest or reached by a walk through a
 /// parent link, fails the local store's location with `Internal` rather than reading as a miss:
-/// a latest and a parent link name a revision state.
+/// a latest and a parent link name a revision state. A latest whose blob is larger than a state
+/// fails the same way.
 #[tokio::test]
 async fn a_latest_or_parent_that_is_not_a_revision_state_fails_the_local_location() {
     let (store, handle) = open_in_memory_handle().await;
     let repository = new_repository();
-    let (at_latest, walked) = (new_branch(), new_branch());
+    let (at_latest, at_larger, walked) = (new_branch(), new_branch(), new_branch());
     let write = local_write_context(&store, repository);
     in_setup_context(async {
         let not_a_state = write_not_a_state(&write).await;
         create_at(&write, at_latest, "at-latest", not_a_state).await;
+        let larger = write_larger_than_a_state(&write).await;
+        create_at(&write, at_larger, "at-larger", larger.hash).await;
         let metadata = metadata_naming(&write, walked).await;
         let above = write_state_revision(&write, not_a_state, 2, metadata).await;
         create_at(&write, walked, "walked", above).await;
     })
     .await;
 
-    for identifier in [latest(at_latest), numbered(walked, 1)] {
+    for identifier in [latest(at_latest), latest(at_larger), numbered(walked, 1)] {
         let (status, events) = resolve(handle, repository, identifier).await;
 
         assert_eq!(status, Internal::FFI_CODE, "{identifier:?}");
