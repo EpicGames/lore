@@ -108,7 +108,6 @@ lore-credential = { path = "lore-credential" }
 lore-error-set = { path = "lore-error-set" }
 lore-error-set-macro = { path = "lore-error-set-macro" }
 lore-hashicorp = { path = "lore-hashicorp" }
-lore-integration-tests = { path = "lore-integration-tests" }
 lore-io = { path = "lore-io" }
 lore-macro = { path = "lore-macro" }
 lore-notification = { path = "lore-notification" }
