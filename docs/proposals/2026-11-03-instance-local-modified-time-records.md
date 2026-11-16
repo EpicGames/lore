@@ -5,7 +5,7 @@ authors:
   - Zack Neyland
 status: Accepted
 created: 2026-11-03
-updated: 2026-11-14
+updated: 2026-11-15
 discussion: https://web.lore.internal.epicgames.net/epic/Lore/change-request/1110
 ---
 
@@ -113,13 +113,13 @@ superseding [ADR-00029](../developing/decisions/00029-instance-local-modified-ti
   or switch writes no file in a virtual clone, so no file takes a new time from the filesystem: the *swap*
   that puts the revision in place in the mount records its time for each path it changes, and writes the
   records back before it publishes, synced under `--sync-data`. A commit records the modification time it read
-  for each file it stores, however recent, so a committed file keeps the time it showed. The mount and the
-  instance's commands, which all run in the Lore service, share one loaded set of records. The provider tells
-  a changed file by address and content and reads no record to do so, so in a virtual clone a record is the
-  time the mount reports, not an observation a scan verifies. A missing record makes the mount report the base
-  time, older than the content, and a build tool that compares times can then skip a rebuild. A copy of
-  `.lore/`, as the [copy-on-write instance clone](2026-10-31-copy-on-write-instance-clone.md) makes, carries
-  the times.
+  for each file it stores, however recent, so a committed file keeps the time it showed, and writes the records
+  back, synced under `--sync-data`, before it serves those files from the store. The mount and the instance's
+  commands, which all run in the Lore service, share one loaded set of records. The provider tells a changed
+  file by address and content and reads no record to do so, so in a virtual clone a record is the time the
+  mount reports, not an observation a scan verifies. A missing record makes the mount report the base time,
+  older than the content, and a build tool that compares times can then skip a rebuild. A copy of `.lore/`,
+  as the [copy-on-write instance clone](2026-10-31-copy-on-write-instance-clone.md) makes, carries the times.
 
 ## Compatibility
 
@@ -174,31 +174,33 @@ superseding [ADR-00029](../developing/decisions/00029-instance-local-modified-ti
 - **Statelessness** — The loaded records belong to the instance's repository lock, which the process
   caches and shares between commands that hold it at once (`REPOSITORY_LOCK_CACHE` in
   `lore-revision/src/repository.rs`). In the Lore service they therefore live while any command in the
-  instance runs. Lore writes the changed shards back, side by side and alongside the store flushes, in
+  instance runs. Lore writes the changed shards back, side by side and after the store flushes, in
   the flush that follows each command with write access, and keeps the repository lock until those
-  writes have landed. A read-only command's changes, the times it adopts from the store and the shards
+  writes have landed; in a virtual clone, a swap and a commit also write them back during the command.
+  A read-only command's changes, the times it adopts from the store and the shards
   it could not read, are written by the flush of a later command with write access that shares the
   lock, and otherwise are dropped with the lock; the next command reads them again. A virtual clone's
   mount holds its set for as long as it serves, so its changes stay loaded between commands, and the
   instance's commands share that set.
 - **Write-back latency** — The flush after each command with write access rewrites every shard the
-  command changed, whole, and the command keeps the repository lock until the writes land. A command
-  that changes a record in every shard rewrites all of `.lore/records/`, 26 MB for the tree measured
-  here. The writes run alongside the store flushes, so they lengthen the flush only where they take
-  longer than the store's. A read-only command writes nothing.
+  command changed, whole, after the store flushes, synced to disk under `--sync-data` as the stores are,
+  and the command keeps the repository lock until the writes land. A command that changes a record in
+  every shard rewrites all of `.lore/records/`, 26 MB for the tree measured here, which adds to the
+  flush's duration. In a virtual clone, a swap and a commit write every changed shard back before they
+  serve the files they change, and wait for the write. A read-only command writes nothing.
 - **Determinism** — Preserved, apart from the cases Durability and Risks name: in an instance on disk, records
   change only which files a scan hashes. In a virtual clone they decide the time the mount reports for a file
   it serves from the store, and change nothing a scan finds. In those cases a store record can match a file
   whose content changed, and an older client's scan after a downgrade then reports the file unchanged.
 - **Durability** — A crash before Lore writes the records back loses the records changed since the last
-  command's flush. A lost record costs a hash. For an instance an older client created, the `.lore/`
+  write-back. A lost record costs a hash. For an instance an older client created, the `.lore/`
   records and the store's zeroing are written separately, so a crash between them can leave an older
   client's store record for content the path no longer holds; it answers only if the file's time is set
   back to the recorded one, and an upgraded client never reads it once the path has a record of its own.
-  In a virtual clone a lost record makes the mount report an older time. A swap's times are written back
-  before it publishes, synced under `--sync-data`; a commit's are written back with the command's flush,
-  after the commit serves its files from the store, so a crash between the two keeps the commit and loses
-  its times.
+  In a virtual clone a lost record makes the mount report an older time. Lore writes a swap's times back
+  before the swap publishes, and a commit's after the commit's store flush and before it serves its files
+  from the store, each synced under `--sync-data`. A commit whose records cannot be written back serves none
+  of its files from the store, as one whose store flush fails does.
 - **Lookup latency** — A virtual clone's lookup of a new inode reads its time from a shard in memory. The
   first lookup in a shard loads its file, up to 256 KB in one read, where v0.14.0 loaded a store bucket.
 

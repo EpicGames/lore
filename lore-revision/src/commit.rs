@@ -857,7 +857,7 @@ async fn commit_staged_with_layers(
                 signature,
                 current_branch,
                 token,
-                Some(operation),
+                Some((operation, &modified_times)),
             )
             .await?;
 
@@ -1598,12 +1598,13 @@ async fn build_commit_metadata(
 /// link commit can advance the branch without committing the parent, which
 /// leaves that pin stale.
 ///
-/// `reconciling` is the operation the commit read its files through, `None` for a link's own
-/// commit, which makes no revision of the instance current. Outside a dry run, where its provider
-/// holds its state, it owes the provider's settle from before the revision may become current
-/// ([`InstanceOperationImpl::owe_settle`]), released at once where the branch's latest was not
-/// stored, and is handed `state_staged` as stored once the revision is current
-/// ([`hand_over_committed`]), before it is reused as the staged anchor.
+/// `reconciling` is the operation the commit read its files through, with the times it collected,
+/// `None` for a link's own commit, which makes no revision of the instance current. Outside a dry
+/// run, where its provider holds its state, it owes the provider's settle from before the revision
+/// may become current ([`InstanceOperationImpl::owe_settle`]), released at once where the
+/// branch's latest was not stored, and, once the revision is current and the times are stored in
+/// the instance's records, is handed `state_staged` as stored ([`hand_over_committed`]), before it
+/// is reused as the staged anchor.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_commit(
     repository: Arc<RepositoryContext>,
@@ -1613,12 +1614,12 @@ async fn finalize_commit(
     signature: Hash,
     branch: BranchId,
     token: &RepositoryWriteToken,
-    reconciling: Option<&InstanceOperationImpl>,
+    reconciling: Option<(&InstanceOperationImpl, &RecordedModifiedTimes)>,
 ) -> Result<(), CommitError> {
     let dry_run = execution_context().globals().dry_run();
 
     if !dry_run {
-        if let Some(operation) = reconciling {
+        if let Some((operation, _)) = reconciling {
             operation.owe_settle().await;
         }
         // The halves of `store_branch_latest_and_make_current`, apart: only a failure of the
@@ -1632,7 +1633,7 @@ async fn finalize_commit(
         )
         .await
         {
-            if let Some(operation) = reconciling {
+            if let Some((operation, _)) = reconciling {
                 operation.release_settle_owed();
             }
             return Err(error).forward::<CommitError>("Failed to store current branch latest");
@@ -1640,13 +1641,15 @@ async fn finalize_commit(
         crate::instance::store_current_anchor(&repository, signature)
             .await
             .forward::<CommitError>("Failed to serialize current revision anchor")?;
-        if let Some(operation) = reconciling
+        if let Some((operation, modified_times)) = reconciling
             && operation.holds_state()
-            && let Err(error) = hand_over_committed(&repository, operation, state_staged).await
         {
-            lore_warn!(
-                "The filesystem provider did not take revision {signature} as committed: {error}"
-            );
+            modified_times.store(repository.clone()).await;
+            if let Err(error) = hand_over_committed(&repository, operation, state_staged).await {
+                lore_warn!(
+                    "The filesystem provider did not take revision {signature} as committed: {error}"
+                );
+            }
         }
 
         if state_staged.parent_other() == state_current.revision()
@@ -1694,9 +1697,11 @@ async fn finalize_commit(
 }
 
 /// Hands `committed` to `operation`, whose provider holds its state, once the stores are flushed
-/// ([`InstanceOperation::committed`]). The provider may then drop the copies it kept of the files
-/// the commit read, which only a revision on disk replaces after a crash. A failed flush drops the
-/// blocks kept for the settle ([`InstanceOperationImpl::keep_serialized_blocks`]).
+/// and the instance's records written back after them ([`RepositoryContext::flush`]): the provider
+/// then serves the files the commit read from the store, and reports the times the records hold
+/// for them. The provider may then drop the copies it kept of those files, which only a revision on
+/// disk replaces after a crash. A failed flush, or records left unwritten, hand nothing over and
+/// drop the blocks kept for the settle ([`InstanceOperationImpl::keep_serialized_blocks`]).
 async fn hand_over_committed(
     repository: &Arc<RepositoryContext>,
     operation: &InstanceOperationImpl,
@@ -1708,6 +1713,15 @@ async fn hand_over_committed(
     {
         operation.drop_serialized_blocks();
         return Err(error).forward_any::<CommitError>("flushing the commit");
+    }
+    if repository
+        .instance_records()
+        .is_some_and(|records| records.is_dirty())
+    {
+        operation.drop_serialized_blocks();
+        return Err(CommitError::internal(
+            "writing the commit's modified-time records back",
+        ));
     }
     operation
         .committed(repository.clone(), committed.clone())

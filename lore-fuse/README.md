@@ -939,9 +939,11 @@ State is rebuilt at every mount.
   `lore-revision/src/records.rs`). A swap records its time for each path it changes and writes the
   records back before it publishes, synced under `--sync-data`. A commit records the modification
   time it read for each file it stores, however recent, so a committed file keeps the time it
-  showed; the times are written back with the commit's flush, after the commit serves the files from
-  the store. Until the records hold a shard file or a time is set, no inode creation looks a time
-  up. An instance clone carries the records.
+  showed, and writes the records back after its store flush and before it serves the files from the
+  store, synced under `--sync-data`; a commit whose records cannot be written back serves none of
+  them from the store (`hand_over_committed`, `lore-revision/src/commit.rs`). Until the records hold
+  a shard file or a time is set, no inode creation looks a time up. An instance clone carries the
+  records.
 - A virtual clone tells a changed file by address and content, never by a recorded time: its
   scan is the diff of the filesystem State (see "Status and diff"), a single file is compared
   through `file_holds_content`, and no comparison records a time (`file_modification` and

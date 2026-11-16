@@ -962,7 +962,7 @@ impl RepositoryContext {
     /// tries it again.
     pub(crate) async fn write_back_instance_records(&self) -> std::io::Result<()> {
         match (&self.repo_lock, &self.write_token) {
-            (Some(lock), Some(token)) => lock.write_back_records(token).await,
+            (Some(lock), Some(token)) => lock.write_back_records(token, false).await,
             _ => Ok(()),
         }
     }
@@ -1220,6 +1220,7 @@ impl RepositoryContext {
                 as Arc<dyn std::any::Any + Send + Sync>,
             || {
                 lore_spawn_guarded!(async move {
+                    let durable = options.sync_data;
                     // A flag, so that the flush's result is not held across the write-back.
                     let flushed = lore_storage::flush_stores(
                         immutable_store,
@@ -1234,7 +1235,7 @@ impl RepositoryContext {
                     })
                     .is_ok();
                     if flushed && let (Some(lock), Some(token)) = (&repo_lock, records_token) {
-                        lock.write_back_records_or_warn(&token).await;
+                        lock.write_back_records_or_warn(&token, durable).await;
                     }
                     // The repository flock first, then the store claims it was taken inside.
                     drop(repo_lock);
@@ -1521,10 +1522,11 @@ impl RepositoryContext {
     }
 
     /// Flushes the stores through [`lore_storage::flush_stores`], then writes back the instance's
-    /// records, where this context holds a write token. The records wait for the stores: written
-    /// ahead of a flush that fails, they would describe content the instance's anchors on disk do
-    /// not name, and a scan would trust them. A failed write-back is logged and does not fail the
-    /// flush: the records are advisory.
+    /// records, synced under `options.sync_data` as the stores are, where this context holds a
+    /// write token. The records wait for the stores: written ahead of a flush that fails, they
+    /// would describe content the instance's anchors on disk do not name, and a scan would trust
+    /// them. A failed write-back is logged and does not fail the flush: the records are advisory,
+    /// and a shard that failed stays changed.
     pub async fn flush(&self, options: lore_storage::FlushOptions) -> Result<(), RepositoryError> {
         lore_storage::flush_stores(
             self.immutable_store.clone(),
@@ -1534,7 +1536,8 @@ impl RepositoryContext {
         .await
         .forward::<RepositoryError>("flushing the stores")?;
         if let (Some(lock), Some(token)) = (&self.repo_lock, &self.write_token) {
-            lock.write_back_records_or_warn(token).await;
+            lock.write_back_records_or_warn(token, options.sync_data)
+                .await;
         }
         Ok(())
     }
@@ -2118,7 +2121,8 @@ impl RepositoryLock {
         self.records.as_ref()
     }
 
-    /// Writes back the instance's records, keeping this lock until every write has landed.
+    /// Writes back the instance's records, each shard synced to disk where `durable`, keeping this
+    /// lock until every write has landed.
     ///
     /// # Errors
     ///
@@ -2127,9 +2131,10 @@ impl RepositoryLock {
     async fn write_back_records(
         self: &Arc<Self>,
         token: &RepositoryWriteToken,
+        durable: bool,
     ) -> std::io::Result<()> {
         match &self.records {
-            Some(records) => records.write_back(token, false, Arc::clone(self)).await,
+            Some(records) => records.write_back(token, durable, Arc::clone(self)).await,
             None => Ok(()),
         }
     }
@@ -2142,8 +2147,9 @@ impl RepositoryLock {
     fn write_back_records_or_warn<'a>(
         self: &'a Arc<Self>,
         token: &'a RepositoryWriteToken,
+        durable: bool,
     ) -> impl Future<Output = ()> + 'a {
-        futures::FutureExt::map(self.write_back_records(token), |written| {
+        futures::FutureExt::map(self.write_back_records(token, durable), |written| {
             if let Err(err) = written {
                 lore_warn!("Failed to write modified time records: {err}");
             }

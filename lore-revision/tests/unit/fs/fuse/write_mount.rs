@@ -177,10 +177,44 @@ impl Instance {
         fs: &Arc<FuseFilesystem>,
         token: Option<lore_revision::repository::RepositoryWriteToken>,
     ) -> Arc<lore_revision::repository::RepositoryContext> {
+        let context = self.unshared_command_context(fs);
+        Arc::new(match token {
+            Some(token) => context.with_write_token(token),
+            None => context,
+        })
+    }
+
+    /// [`Self::command_context`] holding `token` and the instance's repository lock, and with it
+    /// the instance's modified-time records, as a command relayed to the service holds them.
+    async fn locked_command_context(
+        &self,
+        fs: &Arc<FuseFilesystem>,
+        token: lore_revision::repository::RepositoryWriteToken,
+    ) -> Arc<lore_revision::repository::RepositoryContext> {
+        let (lock, stores) = lore_revision::repository::get_or_create_repository_lock(
+            self.fixture.path.join(".lore"),
+            lore_storage::local::store_lock::StoreHold::default(),
+            true,
+            lore_revision::repository::LockSharing::Shared,
+        )
+        .await
+        .expect("the repository lock");
+        Arc::new(
+            self.unshared_command_context(fs)
+                .with_repository_lock(lock, stores)
+                .with_write_token(token),
+        )
+    }
+
+    /// The instance's context with `fs` as its filesystem, holding no token or lock.
+    fn unshared_command_context(
+        &self,
+        fs: &Arc<FuseFilesystem>,
+    ) -> lore_revision::repository::RepositoryContext {
         use fuse_fixture::RepositoryContextCreationArgsExt as _;
 
         let fixture = &self.fixture;
-        let context = lore_revision::repository::RepositoryContext::new(
+        lore_revision::repository::RepositoryContext::new(
             fuse_fixture::default_repository_creation_args(
                 fixture.immutable.clone(),
                 fixture.mutable.clone(),
@@ -189,11 +223,7 @@ impl Instance {
             .with_id(fixture.repository.id)
             .with_instance_id(fixture.repository.instance_id)
             .with_filesystem_provider(Arc::new(FuseProvider(fs.clone()))),
-        );
-        Arc::new(match token {
-            Some(token) => context.with_write_token(token),
-            None => context,
-        })
+        )
     }
 
     /// Mounts a fresh provider over the instance read-write, as the service does.
@@ -11154,21 +11184,49 @@ async fn commit_through(
     fs: &Arc<FuseFilesystem>,
     dry_run: bool,
 ) -> Result<Hash, String> {
+    let token =
+        lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    commit_in(
+        instance,
+        instance.command_context(fs, Some(token.share())),
+        &token,
+        dry_run,
+    )
+    .await
+}
+
+/// [`commit_through`] under the instance's repository lock, as the service runs a command, so
+/// the commit records its times in the instance's records.
+async fn commit_locked_through(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+) -> Result<Hash, String> {
+    let token =
+        lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    let context = instance.locked_command_context(fs, token.share()).await;
+    commit_in(instance, context, &token, false).await
+}
+
+/// Stages the working tree and commits it through `context`, which holds `token`; answers the
+/// stored revision, or the error as text.
+async fn commit_in(
+    instance: &Instance,
+    context: Arc<lore_revision::repository::RepositoryContext>,
+    token: &lore_revision::repository::RepositoryWriteToken,
+    dry_run: bool,
+) -> Result<Hash, String> {
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
     use lore_revision::relay::EventDispatcher;
-    use lore_revision::repository::RepositoryWriteToken;
 
-    let token = RepositoryWriteToken::acquire(&instance.fixture.path).await;
-    let context = instance.command_context(fs, Some(token.share()));
     LORE_CONTEXT
         .scope(
             fuse_fixture::setup_test_execution(),
             lore_revision::file::stage::stage(
                 context.clone(),
-                &token,
+                token,
                 LoreArray::from_vec(vec![LoreString::from(&instance.fixture.path)]),
                 lore_revision::stage::StageOptions::default(),
             ),
@@ -11188,7 +11246,7 @@ async fn commit_through(
             execution,
             lore_revision::commit::commit_boxed(
                 context,
-                &token,
+                token,
                 lore_revision::commit::CommitOptions::new("commit through the mount".to_string()),
             ),
         )
@@ -13432,6 +13490,93 @@ async fn a_commit_records_the_modification_time_of_a_local_file_written_after_it
             assert_eq!(recorded_time(&instance, &fs, "a.txt").await, modified);
         })
         .await;
+}
+
+/// A commit writes its times back to the instance's records before it hands the mount the
+/// revision, which then serves the committed file from the store: a crash after the hand-over
+/// keeps the time the file reports.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_writes_its_times_back_before_the_mount_serves_its_files_from_the_store() {
+    use lore_revision::fs::fuse::filesystem::WriteStep;
+    use lore_revision::records::InstanceRecords;
+    use lore_revision::records::Lookup;
+    use lore_revision::records::RECORDS_DIR;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            create_with(&fs, ROOT_INO, "n.txt", b"new").await;
+            let modified = lore_revision::util::fs::file_mtime(
+                &std::fs::metadata(instance.write_dir().join("n.txt")).expect("n.txt"),
+            );
+            let records = instance.fixture.path.join(".lore").join(RECORDS_DIR);
+            let at_hand_over = TempDir::new("lore-fuse-records-at-hand-over-");
+            let copied = at_hand_over.path().join(RECORDS_DIR);
+            fs.set_write_hook(Arc::new(move |step| {
+                if step == WriteStep::Reconcile {
+                    copy_files(&records, &copied);
+                }
+                true
+            }));
+
+            commit_locked_through(&instance, &fs).await.expect("commit");
+            assert!(!instance.write_dir().join("n.txt").exists());
+            let key = lore_revision::state::file_modified_time_record_key(
+                instance.fixture.repository.salt(),
+                &lore_revision::util::path::RelativePath::new_from_initial_path("n.txt")
+                    .expect("a path"),
+            );
+            assert_eq!(
+                InstanceRecords::open(at_hand_over.path())
+                    .await
+                    .lookup(&key)
+                    .await,
+                Lookup::Recorded(modified),
+                "the records on disk at the hand-over hold n.txt's time"
+            );
+        })
+        .await;
+}
+
+/// A commit whose times cannot be written back to the instance's records hands the mount nothing:
+/// the committed file stays local, reporting its own time, rather than served from the store with
+/// a time no record on disk holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_whose_times_cannot_be_written_back_leaves_its_files_local() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            create_with(&fs, ROOT_INO, "n.txt", b"new").await;
+            let records = instance
+                .fixture
+                .path
+                .join(".lore")
+                .join(lore_revision::records::RECORDS_DIR);
+            std::fs::remove_dir_all(&records).expect("the records directory removed");
+            std::fs::write(&records, b"not a directory").expect("its path taken by a file");
+
+            let revision = commit_locked_through(&instance, &fs).await.expect("commit");
+            assert_eq!(
+                revision_content(&instance, revision, "n.txt").await,
+                Some(b"new".to_vec())
+            );
+            assert!(instance.write_dir().join("n.txt").exists());
+        })
+        .await;
+}
+
+/// Copies the files directly in `from`, where it exists, into `to`.
+fn copy_files(from: &Path, to: &Path) {
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return;
+    };
+    std::fs::create_dir_all(to).expect("the copy's directory");
+    for entry in entries {
+        let entry = entry.expect("an entry");
+        std::fs::copy(entry.path(), to.join(entry.file_name())).expect("a copy");
+    }
 }
 
 /// The modified time recorded for `path`, 0 for none.
