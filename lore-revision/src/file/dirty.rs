@@ -44,6 +44,7 @@ use crate::path::emit_path_ignore;
 use crate::repository::RepositoryContext;
 use crate::repository::is_reserved_node_name;
 use crate::stage::DirectoryChildren;
+use crate::stage::KnownChild;
 use crate::stage::NameHashIndex;
 use crate::stage::claim_child;
 use crate::stage::directory_children;
@@ -2597,8 +2598,8 @@ impl ListedChildren {
     ) -> Result<DirtyNodes, DirtyError> {
         let found =
             match find_from_listing(&mut self.staged, &walk.state_staged, entries, name_hash) {
-                Some(found) => found,
-                None => claim_child(
+                KnownChild::Resolved(found) => found,
+                KnownChild::Unresolved => claim_child(
                     &walk.repository,
                     &walk.state_staged,
                     self.staged_directory,
@@ -2615,9 +2616,10 @@ impl ListedChildren {
         let current = match &mut self.current {
             CurrentChildren::Shared => staged,
             CurrentChildren::Listed(children) => {
-                find_from_listing(children, &walk.state_current, entries, name_hash)
-                    .flatten()
-                    .map_or(INVALID_NODE, |found| found.node)
+                match find_from_listing(children, &walk.state_current, entries, name_hash) {
+                    KnownChild::Resolved(Some(found)) => found.node,
+                    KnownChild::Resolved(None) | KnownChild::Unresolved => INVALID_NODE,
+                }
             }
             CurrentChildren::Absent => INVALID_NODE,
         };

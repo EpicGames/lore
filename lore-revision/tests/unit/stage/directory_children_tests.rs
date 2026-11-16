@@ -201,12 +201,20 @@ async fn claim(
     name_hash: u64,
 ) -> Option<NodeID> {
     match claim_from_listing(children, state, entries, name_hash) {
-        Some(claimed) => claimed,
-        None => claim_child(repository, state, dir, children, name_hash)
+        KnownChild::Resolved(claimed) => claimed,
+        KnownChild::Unresolved => claim_child(repository, state, dir, children, name_hash)
             .await
             .expect("the claim runs"),
     }
     .map(|claimed| claimed.node)
+}
+
+/// The node of the child a listing's answer names.
+fn node_of(known: KnownChild<Claimed>) -> KnownChild {
+    match known {
+        KnownChild::Resolved(claimed) => KnownChild::Resolved(claimed.map(|claimed| claimed.node)),
+        KnownChild::Unresolved => KnownChild::Unresolved,
+    }
 }
 
 /// Claims each of `entries` in `dir` in turn, as `stage_directory` does, and adds a file for each
@@ -314,16 +322,24 @@ async fn claims_before_the_stage_adds_answer_from_the_listing() {
         let entries = file_entries(&["Rock.mesh", "rock.mesh", "new.file"]);
         let mut children = listed(&state, &repository, dir).await;
         let mut from_listing = |index: usize| {
-            claim_from_listing(&mut children, &state, &entries, entries[index].name_hash)
-                .map(|claimed| claimed.map(|claimed| claimed.node))
+            node_of(claim_from_listing(
+                &mut children,
+                &state,
+                &entries,
+                entries[index].name_hash,
+            ))
         };
-        assert_eq!(from_listing(0), Some(Some(held)), "the listed child");
+        assert_eq!(
+            from_listing(0),
+            KnownChild::Resolved(Some(held)),
+            "the listed child"
+        );
         assert_eq!(
             from_listing(1),
-            Some(Some(held)),
+            KnownChild::Resolved(Some(held)),
             "the listed child, claimed"
         );
-        assert_eq!(from_listing(2), Some(None), "no child");
+        assert_eq!(from_listing(2), KnownChild::Resolved(None), "no child");
         assert_eq!(
             children.shared_hashes, None,
             "no claim checked the entries' name hashes"
@@ -389,22 +405,30 @@ async fn an_own_add_leaves_the_claims_of_unshared_names_to_the_listing() {
         let entries = file_entries(&["Rock.mesh", "rock.mesh", "new.file"]);
         let mut children = listed(&state, &repository, dir).await;
         let from_listing = |children: &mut DirectoryChildren, index: usize| {
-            claim_from_listing(children, &state, &entries, entries[index].name_hash)
-                .map(|claimed| claimed.map(|claimed| claimed.node))
+            node_of(claim_from_listing(
+                children,
+                &state,
+                &entries,
+                entries[index].name_hash,
+            ))
         };
         assert_eq!(
             from_listing(&mut children, 0),
-            Some(None),
+            KnownChild::Resolved(None),
             "the first is new"
         );
         add(&state, &repository, dir, file("Rock.mesh"), "Rock.mesh").await;
         children.count_own_add();
         assert_eq!(
             from_listing(&mut children, 2),
-            Some(None),
+            KnownChild::Resolved(None),
             "no child, from the listing"
         );
-        assert_eq!(from_listing(&mut children, 1), None, "its variant searches");
+        assert_eq!(
+            from_listing(&mut children, 1),
+            KnownChild::Unresolved,
+            "its variant searches"
+        );
     })
     .await;
 }
@@ -422,9 +446,13 @@ async fn a_find_answers_each_entry_with_the_first_child_of_its_name_hash() {
         let mut children = listed(&state, &repository, dir).await;
         for entry in &entries {
             assert_eq!(
-                find_from_listing(&mut children, &state, &entries, entry.name_hash)
-                    .map(|found| found.map(|found| found.node)),
-                Some(Some(first)),
+                node_of(find_from_listing(
+                    &mut children,
+                    &state,
+                    &entries,
+                    entry.name_hash
+                )),
+                KnownChild::Resolved(Some(first)),
                 "{}",
                 entry.name
             );

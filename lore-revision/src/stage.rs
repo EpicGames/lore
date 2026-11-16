@@ -2406,13 +2406,13 @@ pub(crate) async fn directory_children(
     Ok(mark.map(|mark| (listed, mark)))
 }
 
-/// Whether the caller has established which child of a directory a name belongs
-/// to.
+/// Whether it is established which child of a directory a name belongs to. `T` is the child, its
+/// node by default.
 #[lore_macro::test_pub]
-#[derive(Clone, Copy)]
-pub(crate) enum KnownChild {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KnownChild<T = NodeID> {
     /// The child, or that the directory holds none. Taken as given.
-    Resolved(Option<NodeID>),
+    Resolved(Option<T>),
     /// Nothing established; search the directory's chain.
     Unresolved,
 }
@@ -2437,7 +2437,7 @@ impl Claimed {
 
 /// The listing's answer to the claim of `name_hash`, the name hash of one of `entries`, the
 /// directory's file system entries, or of a child none of them names, where the listing answers
-/// alone; `None` where only a search of the chain does ([`claim_child`]).
+/// alone; [`KnownChild::Unresolved`] where only a search of the chain does ([`claim_child`]).
 ///
 /// The listing answers with the first listed child carrying `name_hash` that nothing claimed,
 /// claimed now. Failing that, it answers with the listed child carrying it, claimed or not, where
@@ -2454,21 +2454,24 @@ pub(crate) fn claim_from_listing(
     state: &State,
     entries: &[DirectoryEntry],
     name_hash: u64,
-) -> Option<Option<Claimed>> {
+) -> KnownChild<Claimed> {
     if let Some((node, start)) = children.claim(name_hash) {
-        return Some(Some(Claimed {
+        return KnownChild::Resolved(Some(Claimed {
             node,
             start: Some(start),
         }));
     }
-    children
-        .answers_alone(state, entries, name_hash)
-        .then(|| children.holds(name_hash).map(Claimed::searched))
+    if children.answers_alone(state, entries, name_hash) {
+        KnownChild::Resolved(children.holds(name_hash).map(Claimed::searched))
+    } else {
+        KnownChild::Unresolved
+    }
 }
 
 /// The child carrying `name_hash`, the name hash of one of `entries`, the directory's file system
 /// entries, or of a child none of them names, as a search of the whole chain finds it, where the
-/// listing answers alone; `None` where only a search of the chain does ([`claim_child`]).
+/// listing answers alone; [`KnownChild::Unresolved`] where only a search of the chain does
+/// ([`claim_child`]).
 ///
 /// The listing answers with the first listed child carrying `name_hash`, claimed or not, and
 /// claims every child carrying it ([`DirectoryChildren::claim_every`]). That is the child a search
@@ -2482,16 +2485,18 @@ pub(crate) fn find_from_listing(
     state: &State,
     entries: &[DirectoryEntry],
     name_hash: u64,
-) -> Option<Option<Claimed>> {
+) -> KnownChild<Claimed> {
     if let Some((node, start)) = children.claim_every(name_hash) {
-        return Some(Some(Claimed {
+        return KnownChild::Resolved(Some(Claimed {
             node,
             start: Some(start),
         }));
     }
-    children
-        .answers_alone(state, entries, name_hash)
-        .then_some(None)
+    if children.answers_alone(state, entries, name_hash) {
+        KnownChild::Resolved(None)
+    } else {
+        KnownChild::Unresolved
+    }
 }
 
 /// The child of `directory_node` that `name_hash` belongs to, where its listing does not answer
@@ -2749,8 +2754,8 @@ pub(crate) async fn stage_directory(
 
             let claimed =
                 match claim_from_listing(&mut children, &state, &items, directory.name_hash) {
-                    Some(claimed) => claimed,
-                    None => match claim_child(
+                    KnownChild::Resolved(claimed) => claimed,
+                    KnownChild::Unresolved => match claim_child(
                         &repository,
                         &state,
                         directory_node,
@@ -2917,8 +2922,8 @@ pub(crate) async fn stage_directory(
             );
 
             let claimed = match claim_from_listing(&mut children, &state, &items, file.name_hash) {
-                Some(claimed) => claimed,
-                None => match claim_child(
+                KnownChild::Resolved(claimed) => claimed,
+                KnownChild::Unresolved => match claim_child(
                     &repository,
                     &state,
                     directory_node,

@@ -47,6 +47,7 @@ use lore_revision::node::NodeBlock;
 use lore_revision::node::NodeID;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::stage::DirectoryChildren;
+use lore_revision::stage::KnownChild;
 use lore_revision::stage::claim_child;
 use lore_revision::stage::claim_from_listing;
 use lore_revision::state::ChainMark;
@@ -96,8 +97,8 @@ async fn claim(
         .collect();
     let name_hash = hash_string(name);
     match claim_from_listing(children, &tree.state, &entries, name_hash) {
-        Some(claimed) => claimed,
-        None => claim_child(
+        KnownChild::Resolved(claimed) => claimed,
+        KnownChild::Unresolved => claim_child(
             &tree.repository,
             &tree.state,
             tree.id("d"),
