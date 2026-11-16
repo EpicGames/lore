@@ -9,5 +9,5 @@ type: improvement
   `lore repository instance clone` carries the times to the new instance. A virtual clone's commands tell whether a file
   changed by its content alone, never by a recorded time. A virtual clone made by v0.14.0 keeps its times, which v0.14.0
   recorded in `.lore/records/` too. After a downgrade, v0.14.0 reports older times, or the virtual clone's creation time, for the
-  files this client's syncs and switches changed, so a build tool that compares times can skip a rebuild those files
+  files this client's syncs and switches changed or its resets served from the store again, so a build tool that compares times can skip a rebuild those files
   need: run a clean build in each virtual clone after a downgrade.

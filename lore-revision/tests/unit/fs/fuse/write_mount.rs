@@ -13588,6 +13588,238 @@ async fn recorded_time(instance: &Instance, fs: &Arc<FuseFilesystem>, path: &str
     .await
 }
 
+/// The modification time GETATTR reports for inode `ino`, in milliseconds.
+async fn reported_time(fs: &FuseFilesystem, ino: u64) -> u64 {
+    let attr = fs.getattr(&request(), ino).await.expect("getattr").attr;
+    attr.mtime * 1000 + u64::from(attr.mtimensec) / 1_000_000
+}
+
+/// Edits each of `names` through a provider over `instance` with a time an hour old, resets them
+/// in one reset to `revision`, the served one where `None`, and checks that the reset serves each
+/// from the store again with one time, later than the edits', which the inodes held across the
+/// reset, lookups after a FORGET and a remount report.
+async fn reset_reports_a_time_later_than_the_edits(
+    instance: &Instance,
+    names: &[&str],
+    revision: Option<Hash>,
+) {
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(instance).await;
+            let mut held = Vec::new();
+            let mut edited = 0;
+            for name in names {
+                let ino = lookup(&fs, ROOT_INO, name).await.expect(name);
+                fs.write(&request(), ino, 0, 0, b"EDITED", 0)
+                    .await
+                    .expect("write");
+                set_host_time(
+                    instance,
+                    name,
+                    std::time::SystemTime::now() - Duration::from_secs(3600),
+                );
+                edited = edited.max(reported_time(&fs, ino).await);
+                held.push(ino);
+            }
+
+            reset_through(instance, &fs, names, revision, false)
+                .await
+                .expect("reset");
+            let reset = reported_time(&fs, held[0]).await;
+            assert!(
+                (edited + 1..=lore_revision::util::fs::modified_millis(None)).contains(&reset),
+                "the reset reports {reset}, the edits {edited}"
+            );
+            for (name, &ino) in names.iter().zip(&held) {
+                assert!(!instance.write_dir().join(name).exists(), "{name}");
+                assert_eq!(reported_time(&fs, ino).await, reset, "{name} held");
+                fs.forget(ino, 1);
+                let ino = lookup(&fs, ROOT_INO, name).await.expect(name);
+                assert_eq!(
+                    reported_time(&fs, ino).await,
+                    reset,
+                    "{name} after a FORGET"
+                );
+            }
+            drop(fs);
+            let remounted = provider(instance).await;
+            for name in names {
+                let ino = lookup(&remounted, ROOT_INO, name).await.expect(name);
+                assert_eq!(
+                    reported_time(&remounted, ino).await,
+                    reset,
+                    "{name} after a remount"
+                );
+            }
+        })
+        .await;
+}
+
+/// A reset of a file edited through the mount to the content the mount serves from the store
+/// reports a time later than the edit's, so a build tool rebuilds what the edit built.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_to_the_served_content_reports_a_time_later_than_the_edit() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    reset_reports_a_time_later_than_the_edits(&instance, &["a.txt"], None).await;
+}
+
+/// A reset of files to another revision that holds the content the mount serves for them reports
+/// one time for them, later than the edits', though the reset's collector discards its times for
+/// a revision other than the current one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_of_files_to_another_revision_holding_their_served_content_reports_one_later_time()
+{
+    let instance = Instance::with_revisions(&[
+        &[("a.txt", b"alpha"), ("b.txt", b"bee"), ("c.txt", b"one")],
+        &[("c.txt", b"two")],
+    ])
+    .await;
+    let first = instance.fixture.state.parent_self();
+    reset_reports_a_time_later_than_the_edits(&instance, &["a.txt", "b.txt"], Some(first)).await;
+}
+
+/// An inode made of a file an operation serves from the store again, before the operation ends,
+/// reports the time the operation answers for the file, not the time recorded before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inode_made_before_a_restoring_operation_ends_reports_its_time() {
+    use lore_revision::fs::filesystem_provider::InstanceOperation as _;
+    use lore_revision::fs::fuse::operation::FuseOperation;
+    use lore_revision::util::path::RelativePath;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let revision_node = fs_node(&instance, &fs, "a.txt").await;
+            let a = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            fs.write(&request(), a, 0, 0, b"EDITED", 0)
+                .await
+                .expect("write");
+            set_host_time(
+                &instance,
+                "a.txt",
+                std::time::SystemTime::now() - Duration::from_secs(3600),
+            );
+            fs.forget(a, 1);
+
+            let operation = FuseOperation::new(fs.clone());
+            let restored = operation
+                .write_node(
+                    instance.fixture.repository.clone(),
+                    &revision_node,
+                    &RelativePath::new_from_initial_path("a.txt").expect("path"),
+                )
+                .await
+                .expect("the restore");
+            assert!(
+                !instance.write_dir().join("a.txt").exists(),
+                "a.txt is served from the store"
+            );
+            let a = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            assert_eq!(reported_time(&fs, a).await, restored.mtime());
+        })
+        .await;
+}
+
+/// An operation reads the time it records for the files it serves from the store again as it
+/// first serves one, not as it first writes a file of the mounted revision: the first file it
+/// serves from the store after it writes another local reports a later time than that file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restoring_operation_reads_its_time_as_it_first_serves_a_file_from_the_store() {
+    use lore_revision::fs::filesystem_provider::InstanceOperation as _;
+    use lore_revision::fs::fuse::operation::FuseOperation;
+    use lore_revision::util::path::RelativePath;
+
+    let instance = Instance::new(&[("a.txt", b"alpha"), ("b.txt", b"bee")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let revision_node = fs_node(&instance, &fs, "b.txt").await;
+            let b = lookup(&fs, ROOT_INO, "b.txt").await.expect("b.txt");
+            fs.write(&request(), b, 0, 0, b"EDITED", 0)
+                .await
+                .expect("write");
+            fs.forget(b, 1);
+
+            let operation = FuseOperation::new(fs.clone());
+            let path = |name| RelativePath::new_from_initial_path(name).expect("path");
+            operation
+                .write_node(
+                    instance.fixture.repository.clone(),
+                    &revision_node,
+                    &path("a.txt"),
+                )
+                .await
+                .expect("the local write");
+            assert!(
+                instance.write_dir().join("a.txt").exists(),
+                "a.txt is local"
+            );
+            let a = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            let written = reported_time(&fs, a).await;
+            let dot_dir = instance.fixture.repository.dot_dir_path().ok();
+            while lore_revision::state::time_before_next_write(dot_dir).await <= written {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let restored = operation
+                .write_node(
+                    instance.fixture.repository.clone(),
+                    &revision_node,
+                    &path("b.txt"),
+                )
+                .await
+                .expect("the restore");
+            assert!(
+                !instance.write_dir().join("b.txt").exists(),
+                "b.txt is served from the store"
+            );
+            assert!(
+                restored.mtime() > written,
+                "b.txt reports {}, a.txt {written}",
+                restored.mtime()
+            );
+        })
+        .await;
+}
+
+/// An inode the kernel holds at a file edited locally across a sync resetting local changes
+/// reports the time the sync records for the path, which a lookup after a FORGET reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inode_held_across_a_reset_sync_reports_the_time_the_sync_records() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let k = lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            fs.write(&request(), k, 0, 0, b"KEPT!", 0)
+                .await
+                .expect("write");
+            set_host_time(
+                &instance,
+                "keep/k.txt",
+                std::time::SystemTime::now() - Duration::from_secs(3600),
+            );
+            let edited = reported_time(&fs, k).await;
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            assert!(!instance.write_dir().join("keep/k.txt").exists());
+            let held = reported_time(&fs, k).await;
+            assert!(
+                held > edited,
+                "the held inode reports {held}, the edit {edited}"
+            );
+            fs.forget(k, 1);
+            let k = lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            assert_eq!(reported_time(&fs, k).await, held);
+        })
+        .await;
+}
+
 /// A save over a file inside a commit, after the commit read the file's time and in the same
 /// timestamp tick, at the same size, is staged by the next commit: a virtual clone compares files
 /// by content. The tick is forced, as a coarse clock makes it.
@@ -18670,11 +18902,13 @@ async fn cherry_pick_through(
         .await
 }
 
-/// Runs `lore reset <paths>` through `fs`, purging untracked files where `purge`.
+/// Runs `lore reset <paths>` through `fs` to `revision`, the served one where `None`, purging
+/// untracked files where `purge`, under the instance's repository lock.
 async fn reset_through(
     instance: &Instance,
     fs: &Arc<FuseFilesystem>,
     paths: &[&str],
+    revision: Option<Hash>,
     purge: bool,
 ) -> Result<(), String> {
     use lore_revision::interface::LoreArray;
@@ -18682,7 +18916,7 @@ async fn reset_through(
     use lore_revision::repository::RepositoryWriteToken;
 
     let token = RepositoryWriteToken::acquire(&instance.fixture.path).await;
-    let context = instance.command_context(fs, Some(token.share()));
+    let context = instance.locked_command_context(fs, token.share()).await;
     let paths = LoreArray::from_vec(
         paths
             .iter()
@@ -18696,7 +18930,11 @@ async fn reset_through(
                 context,
                 &token,
                 paths,
-                lore_revision::interface::LoreString::default(),
+                LoreString::from(
+                    revision
+                        .map_or_else(String::new, |revision| revision.to_string())
+                        .as_str(),
+                ),
                 lore_revision::file::reset::ResetOptions {
                     purge,
                     single_node: false,
@@ -18737,7 +18975,7 @@ async fn reset_of_an_edited_file_serves_the_revision_to_an_open_reader_and_statu
                 .expect("write");
             assert_eq!(read(&fs, a, 64).await, b"ALPHA!");
 
-            reset_through(&instance, &fs, &["a.txt"], false)
+            reset_through(&instance, &fs, &["a.txt"], None, false)
                 .await
                 .expect("the reset");
 
@@ -18760,7 +18998,7 @@ async fn reset_of_an_edited_file_leaves_nothing_under_write() {
                 .await
                 .expect("write");
 
-            reset_through(&instance, &fs, &["a.txt"], false)
+            reset_through(&instance, &fs, &["a.txt"], None, false)
                 .await
                 .expect("the reset");
 
@@ -18836,7 +19074,7 @@ async fn reset_of_a_file_made_again_over_its_deletion_survives_a_remount() {
                 }
                 let held = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt again");
 
-                reset_through(&instance, &fs, &["a.txt"], false)
+                reset_through(&instance, &fs, &["a.txt"], None, false)
                     .await
                     .expect("the reset");
 
@@ -18898,7 +19136,7 @@ async fn reset_of_a_tracked_file_a_symlink_replaced_serves_the_revisions_file() 
                 };
                 assert_eq!(kind("a.txt").await, libc::S_IFLNK, "{how:?}");
 
-                reset_through(&instance, &fs, &["a.txt"], false)
+                reset_through(&instance, &fs, &["a.txt"], None, false)
                     .await
                     .expect("the reset");
 
@@ -18938,7 +19176,7 @@ async fn reset_of_a_tracked_file_a_symlink_replaced_through_the_mount_reads_the_
     })
     .await;
 
-    reset_through(&instance, &m.fs, &["a.txt"], false)
+    reset_through(&instance, &m.fs, &["a.txt"], None, false)
         .await
         .expect("the reset");
 
@@ -19077,7 +19315,7 @@ async fn reset_purge_removes_added_files_and_restores_deleted_ones() {
             lookup(&fs, dir, "b.txt").await.expect("b.txt");
             fs.unlink(&request(), dir, b"b.txt").await.expect("unlink");
 
-            reset_through(&instance, &fs, &[""], true)
+            reset_through(&instance, &fs, &[""], None, true)
                 .await
                 .expect("the reset");
 
@@ -19730,7 +19968,7 @@ async fn status_after_write_commit_edit_sync_and_reset_matches_what_the_mount_se
     found.extend(disagreements(&instance, &m, &working, "sync").await);
     m = remount(m, &working, "sync", &mut found).await;
 
-    reset_through(&instance, &m.fs, &["dir/b.txt", "keep.txt"], false)
+    reset_through(&instance, &m.fs, &["dir/b.txt", "keep.txt"], None, false)
         .await
         .expect("the reset");
     working.insert("dir/b.txt".into(), Some(b"bee".to_vec()));

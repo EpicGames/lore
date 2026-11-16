@@ -39,6 +39,7 @@ use crate::fs::filesystem_provider::FsError;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::ListedEntry;
 use crate::fs::filesystem_provider::StaticDispatchDirectoryListing;
+use crate::fs::fuse::FuseProviderError;
 use crate::fs::fuse::filesystem::CommitReading;
 use crate::fs::fuse::filesystem::FuseFilesystem;
 use crate::fs::fuse::filesystem::LookupCase;
@@ -96,6 +97,13 @@ pub struct FuseOperation {
     /// The settle the commit owes, from before its revision may become current
     /// ([`Self::owe_settle`]).
     owed: AtomicCell<Option<Box<SettleOwed>>>,
+    /// The time of the files the operation serves from the store again
+    /// ([`Self::restore_time`]).
+    restored_at: tokio::sync::OnceCell<u64>,
+    /// The command's context, which holds the write token that writing the records back takes,
+    /// set once the operation serves a file from the store again
+    /// ([`Self::restore_revision_content`]), for [`Self::finalize`].
+    restored: parking_lot::Mutex<Option<Arc<RepositoryContext>>>,
 }
 
 /// The deletion list as one read parsed it, swapped whole once the list has changed: a lookup
@@ -214,6 +222,8 @@ impl FuseOperation {
             handed: parking_lot::Mutex::new(Vec::new()),
             serialized: AtomicCell::new(None),
             owed: AtomicCell::new(None),
+            restored_at: tokio::sync::OnceCell::new(),
+            restored: parking_lot::Mutex::new(None),
         }
     }
 
@@ -258,6 +268,41 @@ impl FuseOperation {
         if let Some(owed) = self.owed.take() {
             owed.release();
         }
+    }
+
+    /// Writes back the records holding the time of the files the operation served from the store
+    /// again ([`RecordedTimes::write_back`](crate::fs::fuse::attr::RecordedTimes::write_back)),
+    /// synced under `--sync-data`. A failure is logged: the files stay served from the store, and a
+    /// remount before the records are written back reports their earlier time. Only the write-back
+    /// is boxed: it is the cold path, and inline it would grow the future of every command's
+    /// operation.
+    pub(crate) async fn finalize(&self) {
+        let Some(repository) = self.restored.lock().take() else {
+            return;
+        };
+        if let Err(error) = Box::pin(self.filesystem.recorded_times().write_back(&repository)).await
+        {
+            lore_warn!(
+                "FUSE writing back the time of files served from the store again failed: {error}"
+            );
+        }
+    }
+
+    /// The time the operation records for the files it serves from the store again, read once, as
+    /// it first serves one, in the staging directory, as a swap reads its time: a write after any
+    /// of the files reports a later time. The read is boxed: it runs once per operation, and inline
+    /// it would grow the future of every file the operation writes.
+    async fn restore_time(&self) -> u64 {
+        *self
+            .restored_at
+            .get_or_init(|| {
+                Box::pin(crate::state::time_before_next_write(
+                    self.filesystem
+                        .local_files()
+                        .map(|local| local.staging_dir()),
+                ))
+            })
+            .await
     }
 
     /// The listing entry `path` names, a symlink included.
@@ -816,19 +861,22 @@ impl FuseOperation {
     /// forced sync overwrites a local file, where the State holds the mounted revision's own node
     /// there and the revision holds that content: nothing is copied, and `write/` keeps nothing of
     /// it. A node made at the path since, by a create or a rename onto it, stands over a deletion
-    /// the list records, which only its local copy survives at the next mount. Answers whether it
-    /// did.
+    /// the list records, which only its local copy survives at the next mount. Answers the time
+    /// the file reports where it did ([`Self::restore_time`]), set in the records before the file
+    /// is served from the store, so an inode made of it meanwhile reports it, and written back as
+    /// the operation ends.
     async fn restore_revision_content(
         &self,
         changed: &mut Invalidations,
+        repository: &Arc<RepositoryContext>,
         node: &Node,
         path: &RelativePath,
-    ) -> Result<bool, FsError> {
+    ) -> Result<Option<u64>, FsError> {
         let Some(located) = self.located(path).await? else {
-            return Ok(false);
+            return Ok(None);
         };
         if is_dir(&located.entry) {
-            return Ok(false);
+            return Ok(None);
         }
         let served = self.filesystem.served();
         let revision = self
@@ -839,7 +887,7 @@ impl FuseOperation {
             .await
             .forward_any::<FsError>("loading the mounted revision")?;
         if revision.revision() != served.revision() {
-            return Ok(false);
+            return Ok(None);
         }
         let held = match revision
             .find_relative_node_link(
@@ -855,7 +903,7 @@ impl FuseOperation {
                     .await
                     .forward_any::<FsError>("reading the mounted revision")?
             }
-            _ => return Ok(false),
+            _ => return Ok(None),
         };
         if !held.is_file()
             || held.address.hash != node.address.hash
@@ -863,28 +911,57 @@ impl FuseOperation {
             || held.mode != node.mode
             || self.deletion_listed(&located.spelled)
         {
-            return Ok(false);
+            return Ok(None);
         }
         let target = StoredContent {
             address: held.address,
             size: held.size,
             mode: held.mode,
         };
-        let restored = self
+        let Some(mtime) = self
+            .serve_restored(repository, &served, &located, &target)
+            .await
+            .forward_any_with::<FsError, _>(|| format!("restoring '{path}' to the revision"))?
+        else {
+            return Ok(None);
+        };
+        if let Some(ino) = self.filesystem.live_inode(&located.spelled) {
+            changed.inodes.push(ino);
+        }
+        self.restored
+            .lock()
+            .get_or_insert_with(|| repository.clone());
+        Ok(Some(mtime))
+    }
+
+    /// Sets the operation's time ([`Self::restore_time`]) for the file `located` names in the
+    /// records, where a lookup sees it at once, then gives the file `target` over its local content
+    /// ([`FuseFilesystem::overwrite_local_file`]), and answers the time where the file changed. Its
+    /// own future, so [`Self::restore_revision_content`] holds its locals across one await.
+    async fn serve_restored(
+        &self,
+        repository: &RepositoryContext,
+        served: &Served,
+        located: &Located,
+        target: &StoredContent,
+    ) -> Result<Option<u64>, FuseProviderError> {
+        let mtime = self.restore_time().await;
+        self.filesystem
+            .recorded_times()
+            .set(repository, &located.spelled, mtime)
+            .await;
+        let changed = self
             .filesystem
             .overwrite_local_file(
-                &served,
+                served,
                 &located.spelled,
                 located.node,
                 (located.dir, located.entry.name_hash),
-                &target,
+                target,
+                mtime,
             )
-            .await
-            .forward_any_with::<FsError, _>(|| format!("restoring '{path}' to the revision"))?;
-        if restored && let Some(ino) = self.filesystem.live_inode(&located.spelled) {
-            changed.inodes.push(ino);
-        }
-        Ok(restored)
+            .await?;
+        Ok(changed.then_some(mtime))
     }
 
     /// Whether the deletion list holds `path` or a directory above it, which the next mount
@@ -1426,11 +1503,11 @@ impl InstanceOperation for FuseOperation {
         self.writable(ACTION)?;
         let mut changed = self.changes();
         let wrote = Box::pin(async {
-            if self
-                .restore_revision_content(&mut changed.batch, node, path)
+            if let Some(mtime) = self
+                .restore_revision_content(&mut changed.batch, &repository, node, path)
                 .await?
             {
-                return Ok(());
+                return Ok(Some(mtime));
             }
             let (staged, _) = self.stage_stored(repository, node.address, path).await?;
             let executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
@@ -1445,11 +1522,14 @@ impl InstanceOperation for FuseOperation {
                 ACTION,
                 path,
             )
+            .map(|()| None)
         })
         .await;
         changed.send().await;
-        wrote?;
-        InstanceOperation::file_info(self, path).await
+        match wrote? {
+            Some(mtime) => Ok(FileInfo::from_node_and_mtime(node, mtime)),
+            None => InstanceOperation::file_info(self, path).await,
+        }
     }
 
     async fn set_file_to_immutable_store_contents(

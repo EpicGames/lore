@@ -1276,6 +1276,8 @@ impl InstanceOperationImpl {
     /// - **`OsOperation`**: Nothing to finish, the writes having gone to the filesystem the
     ///   reads come from.
     /// - **`SWFS`**: Thaws the filesystem, clearing the write cache where writes were made.
+    /// - **`FuseOperation`**: Records the time of the files the operation served from the store
+    ///   again.
     pub async fn finalize(&self) -> Result<(), FsError> {
         if !self.claim_finalize() {
             return Err(FsError::internal("Operation already finalized"));
@@ -1287,7 +1289,10 @@ impl InstanceOperationImpl {
             StaticDispatchInstanceOperation::Os(_this) => Ok(()),
             StaticDispatchInstanceOperation::Swfs(this) => this.finalize(changes_made).await,
             #[cfg(target_os = "linux")]
-            StaticDispatchInstanceOperation::Fuse(_this) => Ok(()),
+            StaticDispatchInstanceOperation::Fuse(this) => {
+                this.finalize().await;
+                Ok(())
+            }
         }
     }
 

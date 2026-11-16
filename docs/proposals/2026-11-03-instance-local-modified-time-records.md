@@ -5,7 +5,7 @@ authors:
   - Zack Neyland
 status: Accepted
 created: 2026-11-03
-updated: 2026-11-15
+updated: 2026-11-16
 discussion: https://web.lore.internal.epicgames.net/epic/Lore/change-request/1110
 ---
 
@@ -43,7 +43,8 @@ superseding [ADR-00029](../developing/decisions/00029-instance-local-modified-ti
   (`RecordedTimes` in `lore-revision/src/fs/fuse/attr.rs`), and reads the store for each new inode. A copy
   given a new instance ID reports the base time for every such file, older than its content, and a build
   tool comparing times can skip a rebuild. A committed file reports the base time again once the kernel
-  forgets its inode.
+  forgets its inode, and a file a reset serves from the store again reports the time it had before the edit
+  the reset discards, older than the outputs built from the edit, so a build tool skips their rebuild.
 
 ## Goals / Non-Goals
 
@@ -53,8 +54,9 @@ superseding [ADR-00029](../developing/decisions/00029-instance-local-modified-ti
 - A copy of an instance's directory starts with records that describe its files.
 - Neither an upgraded client nor, after a downgrade, an older one trusts a record for content the path no
   longer holds, outside the cases Durability and Risks name.
-- A copy of a virtual clone reports the times its source reports, and a committed file in one keeps the time
-  it showed.
+- A copy of a virtual clone reports the times its source reports, a committed file in one keeps the time it
+  showed, and a file a reset serves from the store again reports a time later than the files written before
+  the reset.
 
 ### Non-Goals
 
@@ -101,7 +103,8 @@ superseding [ADR-00029](../developing/decisions/00029-instance-local-modified-ti
   Each shard is an array of records sorted by key, and its file is a header followed by the same bytes
   (Compatibility gives the layout). Loading a shard copies its file into memory without decoding, in one
   read for a tree of up to about 2.8 million files and in two above, and writing it back is one gathered
-  write from its memory. A lookup is a binary search. A new time for a key the shard holds is changed in
+  write from its memory. A lookup is a binary search, then, for a key the array does not hold, a scan of the
+  new keys not merged yet. A new time for a key the shard holds is changed in
   place; new keys are collected and merged into the array in one pass. A removed record is marked with
   time 0 and left out when the shard is written back.
 - **Records are advisory.** A record that is missing or cannot be read costs one hash, never a wrong
@@ -114,7 +117,13 @@ superseding [ADR-00029](../developing/decisions/00029-instance-local-modified-ti
   that puts the revision in place in the mount records its time for each path it changes, and writes the
   records back before it publishes, synced under `--sync-data`. A commit records the modification time it read
   for each file it stores, however recent, so a committed file keeps the time it showed, and writes the records
-  back, synced under `--sync-data`, before it serves those files from the store. The mount and the instance's
+  back, synced under `--sync-data`, before it serves those files from the store. A write that serves a file
+  from the store again, as a reset of an edited file to the content the mount serves does, records one time
+  per operation, read from the filesystem's clock as the operation first serves such a file, as a swap reads
+  its time. The file then reports a time later than the files written before the reset, the outputs built
+  from the edit it discards among them, apart from any written in the clock's last tick before the read. The
+  operation sets the time in the records before it serves each file, and writes the records back, synced
+  under `--sync-data`, as it ends. The mount and the instance's
   commands, which all run in the Lore service, share one loaded set of records. The provider tells a changed
   file by address and content and reads no record to do so, so in a virtual clone a record is the time the
   mount reports, not an observation a scan verifies. A missing record makes the mount report the base time,
@@ -142,7 +151,7 @@ superseding [ADR-00029](../developing/decisions/00029-instance-local-modified-ti
   moved to `.lore/` and finds the rest in the store as before. It does not misread a file, since an
   upgraded client zeroes every store record it makes stale, apart from the crash case under Durability
   and the downgrade under Risks. In a virtual clone, a shard file treated as absent makes the mount report
-  the base time for the paths it held, until a swap or commit records them again, so a later format
+  the base time for the paths it held, until a swap, a reset or a commit records them again, so a later format
   version costs a virtual clone a clean build after a downgrade.
 - **FUSE swap times** — v0.14.0's FUSE mount also stored each swap's times in the mutable store, under
   keys taken from a hash of the salt, `fuse-recorded-time`, the instance ID and the lowercased path, beside
@@ -152,7 +161,8 @@ superseding [ADR-00029](../developing/decisions/00029-instance-local-modified-ti
   (`swap_through` in `lore-revision/src/fs/fuse/swap.rs` called `record_modified_time` for each path it
   recorded), where an upgraded client finds them, apart from the times of a sync or switch that failed after
   its swap published. After a downgrade, v0.14.0 reads only its store keys, so it reports an older time, or
-  the base time, for each path an upgraded client's swap changed; see Migration Plan.
+  the base time, for each path an upgraded client's swap changed or reset served from the store again; see
+  Migration Plan.
 - **`.lore/` contents** — Backup and copy tools see the new directory, about 24 bytes per file of the
   working tree. Copying it with the working tree, keeping modification times, is what lets a copy skip
   hashing.
@@ -176,7 +186,8 @@ superseding [ADR-00029](../developing/decisions/00029-instance-local-modified-ti
   `lore-revision/src/repository.rs`). In the Lore service they therefore live while any command in the
   instance runs. Lore writes the changed shards back, side by side and after the store flushes, in
   the flush that follows each command with write access, and keeps the repository lock until those
-  writes have landed; in a virtual clone, a swap and a commit also write them back during the command.
+  writes have landed; in a virtual clone, a swap, a commit and a reset that serves files from the store
+  again also write them back during the command.
   A read-only command's changes, the times it adopts from the store and the shards
   it could not read, are written by the flush of a later command with write access that shares the
   lock, and otherwise are dropped with the lock; the next command reads them again. A virtual clone's
@@ -187,7 +198,8 @@ superseding [ADR-00029](../developing/decisions/00029-instance-local-modified-ti
   and the command keeps the repository lock until the writes land. A command that changes a record in
   every shard rewrites all of `.lore/records/`, 26 MB for the tree measured here, which adds to the
   flush's duration. In a virtual clone, a swap and a commit write every changed shard back before they
-  serve the files they change, and wait for the write. A read-only command writes nothing.
+  serve the files they change, and wait for the write. A reset that serves files from the store again
+  writes its shards back as its operation ends, and waits for the write. A read-only command writes nothing.
 - **Determinism** — Preserved, apart from the cases Durability and Risks name: in an instance on disk, records
   change only which files a scan hashes. In a virtual clone they decide the time the mount reports for a file
   it serves from the store, and change nothing a scan finds. In those cases a store record can match a file
@@ -200,7 +212,11 @@ superseding [ADR-00029](../developing/decisions/00029-instance-local-modified-ti
   In a virtual clone a lost record makes the mount report an older time. Lore writes a swap's times back
   before the swap publishes, and a commit's after the commit's store flush and before it serves its files
   from the store, each synced under `--sync-data`. A commit whose records cannot be written back serves none
-  of its files from the store, as one whose store flush fails does.
+  of its files from the store, as one whose store flush fails does. A reset that serves files from the store
+  again sets their time in memory as it serves each, and writes the times back once per operation rather
+  than once per file, synced under `--sync-data`, as the operation ends. A crash between the two, or a
+  write-back that fails, which the reset logs, and that the command's flush does not repeat, leaves the files
+  served from the store with their earlier time once the mount restarts, so a build tool can skip a rebuild.
 - **Lookup latency** — A virtual clone's lookup of a new inode reads its time from a shard in memory. The
   first lookup in a shard loads its file, up to 256 KB in one read, where v0.14.0 loaded a store bucket.
 
@@ -214,7 +230,7 @@ client reads and writes depends on which client created the instance:
 | An older client | Upgraded | `.lore/records/`, then the store for a path with no record | `.lore/records/`, and zeroes the path's store record |
 | An upgraded client (marked) | Upgraded | `.lore/records/` | `.lore/records/` |
 | Either | Older, after a downgrade | The store | The store |
-| An upgraded client or v0.14.0, virtual clone | Upgraded | `.lore/records/`, for the times its mount reports only | `.lore/records/`, from swaps and commits |
+| An upgraded client or v0.14.0, virtual clone | Upgraded | `.lore/records/`, for the times its mount reports only | `.lore/records/`, from swaps, resets and commits |
 | An upgraded client or v0.14.0, virtual clone | v0.14.0, after a downgrade | `.lore/records/` for scans, and its store keys for the times its mount reports | `.lore/records/`, and its swaps the store keys |
 
 v0.14.0 already keeps records in `.lore/records/`, so it is not the older client of the third row; only
@@ -230,10 +246,10 @@ misreads a file only in the cases Durability and Risks name. Upgrading again rea
 was left, which the third risk covers.
 
 A virtual clone needs a clean build after a downgrade to v0.14.0: until a sync changes a path again, v0.14.0
-reports a time older than its content for each path an upgraded client's swap changed, and a build tool that
-compares times can skip a rebuild such a path needs, and nothing signals it. The release note says so. An
-instance an upgraded client cloned from a virtual clone reports the base time for every path under v0.14.0,
-which finds no store keys under its ID; the [copy-on-write instance
+reports a time older than its content for each path an upgraded client's swap changed or reset served from the
+store again, and a build tool that compares times can skip a rebuild such a path needs, and nothing signals
+it. The release note says so. An instance an upgraded client cloned from a virtual clone reports the base
+time for every path under v0.14.0, which finds no store keys under its ID; the [copy-on-write instance
 clone](2026-10-31-copy-on-write-instance-clone.md) proposal covers it. Upgrading again reads `.lore/records/`,
 where v0.14.0's swaps recorded their times too.
 
@@ -282,15 +298,12 @@ they do today: deleting an instance removes only its registration and anchor key
 - **Risk:** records for paths the tree no longer holds accumulate in `.lore/records/` — *mitigation:*
   clearing a path removes its record; what remains is bounded by the paths the instance has held.
 - **Risk:** a virtual clone downgraded to v0.14.0 reports times older than the content of the paths an
-  upgraded client's swaps changed, and a build skips a rebuild — *mitigation:* the release note asks for a
-  clean build after a downgrade.
+  upgraded client's swaps changed or resets served from the store again, and a build skips a rebuild —
+  *mitigation:* the release note asks for a clean build after a downgrade.
 - **Risk:** a sync or switch that v0.14.0 ran on a virtual clone failed after its swap published, so its
   times reached only v0.14.0's store keys, and an upgraded client reports the path's older record —
   *accepted:* it takes a failed sync before the upgrade, and the next sync that changes the path records it
   again.
-- **Risk:** a `lore reset` that puts back the content a virtual clone's mount serves from the store records
-  no new time, so the path reports its earlier record, older than outputs built from the content the reset
-  replaced — *accepted:* v0.14.0 behaves the same; recording a fresh time for such a path is follow-up work.
 
 ## Drawbacks
 
@@ -316,7 +329,8 @@ add a format's worth of loading, sharing and write-back for no gain.
 ### Write a virtual clone's swap times to the store as well
 
 Writing each swap time to the mutable store too, under v0.14.0's keys, would keep a downgrade correct for the
-paths a swap changed, though not for a commit's times or for an instance an upgraded client cloned.
+paths a swap changed, though not for a commit's or a reset's times or for an instance an upgraded client
+cloned.
 *Rejected because:* each swap would cost one store write per path it changes, and the store would grow with
 every path every virtual clone swaps, which keeping the records in the instance avoids. A downgrade's cost, a
 clean build, is accepted instead.

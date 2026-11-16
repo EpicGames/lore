@@ -551,6 +551,25 @@ async fn notifications_are_sent_after_publish_with_no_table_lock_held() {
     .await;
 }
 
+/// An inode the kernel holds across a swap that changes its file's content reports the time the
+/// swap records for the path.
+#[tokio::test]
+async fn an_inode_held_across_a_swap_that_changes_its_content_reports_the_swaps_time() {
+    swapping(&[("a.txt", b"one")], async |s: Swapping| {
+        let ino = s.lookup(ROOT_INO, "a.txt").await.expect("lookup");
+        let second = s.commit(&[("a.txt", Some(b"two"))]).await;
+        s.swap_to(&second, Arc::new(RecordingSink::default())).await;
+
+        let attr = s.getattr(ino).await;
+        assert_eq!(attr.size, 3);
+        assert_eq!(
+            attr.mtime * 1000 + u64::from(attr.mtimensec) / 1_000_000,
+            s.recorded_time("a.txt").await
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn swap_records_modified_time_for_directories_whose_entry_set_changed() {
     swapping(

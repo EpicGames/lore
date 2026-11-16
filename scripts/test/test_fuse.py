@@ -692,6 +692,39 @@ def test_a_committed_file_keeps_its_time_across_a_service_restart(
 
 
 @pytest.mark.smoke
+def test_a_reset_file_reports_a_time_later_than_its_edit_across_a_service_restart(
+    new_lore_repo, fuse_mounts, lore_service_runner
+):
+    """A tracked file edited through a virtual clone and reset to its revision, which the mount
+    then serves from the store, reports a time later than the edit's to a process holding it open
+    across the reset, and once a replacement service remounts the instance: the reset records a
+    new time in the instance's records, as a build tool needs to rebuild what the edit built."""
+    repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    repo.write_commit_push("initial", {"readme.txt": b"tracked\n"})
+    fuse = fuse_clone(repo, fuse_mounts)
+    tracked = os.path.join(fuse.path, "readme.txt")
+    with open(tracked, "wb") as written:
+        written.write(b"edited through the mount\n")
+        os.fsync(written.fileno())
+    edited = os.stat(tracked).st_mtime_ns
+
+    with open(tracked, "rb") as held:
+        fuse.reset(["readme.txt"])
+        reset = os.fstat(held.fileno()).st_mtime_ns
+    assert reset > edited, "the file held open reports a time later than the edit's"
+    with open(tracked, "rb") as served:
+        assert served.read() == b"tracked\n"
+
+    killed = lore_service_runner.service_processes[None]
+    killed.kill()
+    killed.wait()
+    repo.status()
+    assert os.stat(tracked).st_mtime_ns == reset, (
+        "the replacement reports the time the reset recorded"
+    )
+
+
+@pytest.mark.smoke
 def test_two_service_starts_succeed_while_the_winner_is_still_mounting(
     new_lore_repo,
     fuse_mounts,

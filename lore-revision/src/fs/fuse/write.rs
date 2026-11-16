@@ -4513,77 +4513,85 @@ impl FuseFilesystem {
 
     /// Gives local file `node_id`, at `path` as the State spells it and held at `place`, the
     /// content `target` over its local content, as a forced sync does: its node takes `target`
-    /// clean, the inode the kernel holds at the path turns store-served under its write guard,
-    /// which a WRITE holds across its host operation, and the host file leaves `write/` under the
-    /// same guard. The name is claimed throughout and recorded settled, as a commit's flip of a
-    /// file no inode holds is ([`Self::settle_unheld`]), so a lookup that read the file local
-    /// before makes no inode of it. Answers whether the node changed; a symbolic link, or a node
-    /// moved meanwhile, is left as it stands.
-    pub(crate) async fn overwrite_local_file(
-        &self,
-        current: &Served,
-        path: &RelativePath,
+    /// clean, the inode the kernel holds at the path turns store-served at `mtime`, the time the
+    /// caller records for the path, under its write guard, which a WRITE holds across its host
+    /// operation, and the host file leaves `write/` under the same guard. The name is claimed
+    /// throughout and recorded settled, as a commit's flip of a file no inode holds is
+    /// ([`Self::settle_unheld`]), so a lookup that read the file local before makes no inode of
+    /// it. Answers whether the node changed; a symbolic link, or a node moved meanwhile, is left
+    /// as it stands.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
+    #[allow(clippy::manual_async_fn)]
+    pub(crate) fn overwrite_local_file<'a>(
+        &'a self,
+        current: &'a Served,
+        path: &'a RelativePath,
         node_id: NodeID,
         place: (NodeID, u64),
-        target: &StoredContent,
-    ) -> Result<bool, FuseProviderError> {
-        let Some(local) = self.local_files() else {
-            return Ok(false);
-        };
-        let block = current
-            .state
-            .block(current.repository.clone(), NodeBlock::index(node_id))
-            .await
-            .forward_any::<FuseProviderError>("reading a node a sync overwrites")?;
-        let take = |held: &mut NodeContent<'_>| {
-            if !held.is_file() || held.ext_flags().contains(NodeExtFlags::Symlink) {
-                return false;
-            }
-            held.set_content(target.address, target.size, target.mode);
-            held.clear_dirty_flags()
-        };
-        let remove_host = || {
-            if let Some(host) = relative_host_path(path) {
-                match local.remove_path(&host, false) {
-                    Ok(()) | Err(Errno::ENOENT) => {}
-                    Err(errno) => {
-                        lore_warn!(
-                            "FUSE could not remove the overwritten '{path}' from write/: {errno:?}"
-                        );
+        target: &'a StoredContent,
+        mtime: u64,
+    ) -> impl Future<Output = Result<bool, FuseProviderError>> + 'a {
+        async move {
+            let Some(local) = self.local_files() else {
+                return Ok(false);
+            };
+            let block = current
+                .state
+                .block(current.repository.clone(), NodeBlock::index(node_id))
+                .await
+                .forward_any::<FuseProviderError>("reading a node a sync overwrites")?;
+            let take = |held: &mut NodeContent<'_>| {
+                if !held.is_file() || held.ext_flags().contains(NodeExtFlags::Symlink) {
+                    return false;
+                }
+                held.set_content(target.address, target.size, target.mode);
+                held.clear_dirty_flags()
+            };
+            let remove_host = || {
+                if let Some(host) = relative_host_path(path) {
+                    match local.remove_path(&host, false) {
+                        Ok(()) | Err(Errno::ENOENT) => {}
+                        Err(errno) => {
+                            lore_warn!(
+                                "FUSE could not remove the overwritten '{path}' from write/: {errno:?}"
+                            );
+                        }
                     }
                 }
-            }
-        };
-        let _settling = Settling {
-            claim: Some(local.settling.claim(place)),
-            settled: &local.settled,
-        };
-        let held = self.live_inode(path);
-        let changed = if let Some(mut entry) = held.and_then(|ino| self.inodes().get_mut(ino)) {
-            let changed = current
-                .state
-                .node_change_in_place(&block, node_id, place, take);
-            if changed {
-                entry.kind = committed_kind(target);
-                entry.host_epoch += 1;
-                entry.host_file = 0;
-                remove_host();
-                let ino = entry.ino;
-                drop(entry);
-                self.fragment_cache().forget(ino);
-            }
-            changed
-        } else {
-            let changed = current
-                .state
-                .node_change_in_place(&block, node_id, place, take);
-            if changed {
-                remove_host();
-            }
-            changed
-        };
-        local.settle_log.record(place);
-        Ok(changed)
+            };
+            let _settling = Settling {
+                claim: Some(local.settling.claim(place)),
+                settled: &local.settled,
+            };
+            let held = self.live_inode(path);
+            let changed = if let Some(mut entry) = held.and_then(|ino| self.inodes().get_mut(ino)) {
+                let changed = current
+                    .state
+                    .node_change_in_place(&block, node_id, place, take);
+                if changed {
+                    entry.kind = committed_kind(target);
+                    entry.host_epoch += 1;
+                    entry.host_file = 0;
+                    entry.mtime = mtime;
+                    remove_host();
+                    let ino = entry.ino;
+                    drop(entry);
+                    self.fragment_cache().forget(ino);
+                }
+                changed
+            } else {
+                let changed = current
+                    .state
+                    .node_change_in_place(&block, node_id, place, take);
+                if changed {
+                    remove_host();
+                }
+                changed
+            };
+            local.settle_log.record(place);
+            Ok(changed)
+        }
     }
 
     /// Removes the host file of `path`, a local file a forced sync detached.

@@ -148,7 +148,7 @@ struct Shard {
     /// Sorted by key, with no key twice: the shard file's body, byte for byte.
     records: GrowVec<Record, RECORD_CHUNK>,
     /// Times set for keys `records` does not hold, to be merged into it in one pass. A later
-    /// entry for a key replaces an earlier one. Lookups do not see them.
+    /// entry for a key replaces an earlier one, for a lookup as for the merge.
     pending: Vec<Record>,
     /// Times read from the mutable store for keys `records` does not hold, merged with
     /// `pending`, whose entry for a key wins. Lookups do not see them.
@@ -175,12 +175,25 @@ impl Shard {
     }
 
     fn lookup(&self, key: &RecordKey) -> Lookup {
-        match self.search(key) {
-            Ok(index) if self.records[index].mtime() != 0 => {
-                Lookup::Recorded(self.records[index].mtime())
-            }
-            _ => Lookup::Missing(self.generation),
+        let mtime = match self.search(key) {
+            Ok(index) => self.records[index].mtime(),
+            Err(_) => self.pending_time(key),
+        };
+        if mtime == 0 {
+            Lookup::Missing(self.generation)
+        } else {
+            Lookup::Recorded(mtime)
         }
+    }
+
+    /// The latest time `pending` holds for `key`, 0 where it holds none. `pending` is empty once
+    /// the shard has merged, so only a lookup while times wait to be merged scans it.
+    fn pending_time(&self, key: &RecordKey) -> u64 {
+        self.pending
+            .iter()
+            .rev()
+            .find(|record| record.key == *key)
+            .map_or(0, Record::mtime)
     }
 
     /// Records `mtime` for `key`, in place where `records` holds the key, and reports whether
@@ -343,8 +356,7 @@ impl InstanceRecords {
         !self.no_store_records
     }
 
-    /// What is recorded for `key`. A time set for a new key, or adopted, is seen once the shard
-    /// has merged it.
+    /// What is recorded for `key`. A time adopted is seen once the shard has merged it.
     pub async fn lookup(&self, key: &RecordKey) -> Lookup {
         let slot = &self.shards[key[0] as usize];
         if slot.loaded.load(Ordering::Acquire)
@@ -375,8 +387,9 @@ impl InstanceRecords {
         })
     }
 
-    /// Records every time in `batch`, and merges each shard it reaches. The shards are loaded
-    /// and merged side by side, one task each.
+    /// Records every time in `batch`, and merges each shard it reaches. A shard whose records the
+    /// batch does not change is not marked changed. The shards are loaded and merged side by side, one
+    /// task each.
     ///
     /// # Errors
     ///
@@ -397,16 +410,20 @@ impl InstanceRecords {
     /// Records every time in `records`, all of shard `index`, and merges the shard.
     async fn set_shard(self: Arc<Self>, index: u8, records: Vec<Record>) -> std::io::Result<()> {
         let mut shard = self.write_shard(index).await;
+        let mut changed = true;
         if shard.records.is_empty() && shard.pending.is_empty() {
             shard.pending = records;
         } else {
+            changed = false;
             for record in records {
-                shard.set(record.key, record.mtime());
+                changed |= shard.set(record.key, record.mtime());
             }
         }
-        shard.generation += 1;
+        if changed {
+            shard.generation += 1;
+            self.mark_dirty(index);
+        }
         shard.merge();
-        self.mark_dirty(index);
         Ok(())
     }
 

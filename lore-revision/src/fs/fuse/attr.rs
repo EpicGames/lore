@@ -20,6 +20,7 @@ use crate::records::Lookup;
 use crate::records::Record;
 use crate::records::RecordBatch;
 use crate::repository::RepositoryContext;
+use crate::repository::RepositoryWriteToken;
 use crate::state::file_modified_time_record_key;
 use crate::state::stored_modified_time;
 use crate::store::KeyType;
@@ -133,11 +134,13 @@ const RECORDED_TIME: &str = "fuse-recorded-time";
 /// took the content it holds.
 ///
 /// They are the instance's modified-time records ([`InstanceRecords`]), the set its commands
-/// share: a swap records its time for each path it changes, before it publishes, and a commit
-/// records the time it read for each file it stores. The mount's scans compare addresses and read
-/// no record, so a record only answers what the mount reports. A copy of the Lore directory
-/// carries them. A mount over a context without a Lore directory, as a test's, keeps them in the
-/// mutable store, keyed by the instance, beside a marker.
+/// share: a swap records its time for each path it changes, before it publishes, an operation
+/// that serves files from the store again sets its time for each before it serves it and writes
+/// them back as it ends, and a commit records the time it read for each file it stores. The
+/// mount's scans compare addresses and read no record, so a record only answers what the mount
+/// reports. A copy of the Lore directory carries them. A mount over a context without a Lore
+/// directory, as a test's, keeps a swap's in the mutable store, keyed by the instance, beside a
+/// marker.
 ///
 /// A new instance records none, so until a time is recorded every path reports the base time and
 /// no lookup is made. The gate opens at mount where the records hold a shard file, or the store
@@ -218,6 +221,43 @@ impl RecordedTimes {
         }
     }
 
+    /// Sets `mtime` for `path` in the instance's records, where a lookup sees it at once, ahead of
+    /// [`Self::write_back`]. A mount without a Lore directory keeps no time for it. Awaited per
+    /// file an operation serves from the store again.
+    ///
+    /// Not an `async fn`: the key is taken before the first await, so the future holds no path.
+    #[allow(clippy::manual_async_fn)]
+    pub fn set<'a>(
+        &'a self,
+        repository: &RepositoryContext,
+        path: &RelativePath,
+        mtime: u64,
+    ) -> impl Future<Output = ()> + 'a {
+        let key = file_modified_time_record_key(repository.salt(), path);
+        async move {
+            if let Some(records) = &self.records {
+                records.set(key, mtime).await;
+            }
+        }
+    }
+
+    /// Writes the instance's records back to its Lore directory ([`write_back_records`]), with the
+    /// times [`Self::set`] set, as an operation that serves files from the store again ends. Does
+    /// nothing for a mount without a Lore directory. Fails without a write token, and on a write
+    /// that fails.
+    pub async fn write_back(&self, repository: &RepositoryContext) -> Result<(), FsError> {
+        let Some(records) = &self.records else {
+            return Ok(());
+        };
+        let token = repository
+            .try_write_token()
+            .ok_or_else(|| FsError::internal("writing recorded times back needs a write token"))?;
+        write_back_records(records, token)
+            .await
+            .internal("writing the recorded times back")?;
+        Ok(())
+    }
+
     /// The time recorded for `path`, else `base_time`. Awaited per new inode and per listing
     /// entry.
     ///
@@ -258,8 +298,7 @@ enum SwapTimeKeys<'a> {
     Store(Vec<Hash>),
 }
 
-/// Sets `batch` in `records` and writes them back to the Lore directory, synced under
-/// `--sync-data`, holding the records until the write has landed.
+/// Sets `batch` in `records` and writes them back ([`write_back_records`]).
 async fn store_in_records(
     repository: &RepositoryContext,
     records: &Arc<InstanceRecords>,
@@ -269,17 +308,26 @@ async fn store_in_records(
     let token = repository
         .try_write_token()
         .ok_or_else(|| FsError::internal("storing swap-recorded times needs a write token"))?;
-    let durable = crate::runtime::try_execution_context()
-        .is_some_and(|context| context.globals().flush_options().sync_data);
     records
         .set_all(batch)
         .await
         .internal_with(|| format!("recording the swap's time {mtime}"))?;
-    records
-        .write_back(token, durable, Arc::clone(records))
+    write_back_records(records, token)
         .await
         .internal("writing the swap-recorded times back")?;
     Ok(())
+}
+
+/// Writes `records` back to the Lore directory, synced under `--sync-data`, holding the records
+/// until the write has landed. Answers the write-back's own future, which each caller awaits, so
+/// it adds nothing to the caller's future beside it.
+fn write_back_records<'a>(
+    records: &'a Arc<InstanceRecords>,
+    token: &'a RepositoryWriteToken,
+) -> impl Future<Output = std::io::Result<()>> + Send + 'a {
+    let durable = crate::runtime::try_execution_context()
+        .is_some_and(|context| context.globals().flush_options().sync_data);
+    records.write_back(token, durable, Arc::clone(records))
 }
 
 /// Stores `mtime` under each of `keys` in the mutable store, then the marker. Fails on the first

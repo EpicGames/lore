@@ -941,9 +941,15 @@ State is rebuilt at every mount.
   time it read for each file it stores, however recent, so a committed file keeps the time it
   showed, and writes the records back after its store flush and before it serves the files from the
   store, synced under `--sync-data`; a commit whose records cannot be written back serves none of
-  them from the store (`hand_over_committed`, `lore-revision/src/commit.rs`). Until the records hold
-  a shard file or a time is set, no inode creation looks a time up. An instance clone carries the
-  records.
+  them from the store (`hand_over_committed`, `lore-revision/src/commit.rs`). A write that serves a
+  file from the store again, as a reset of an edited file to the content the mount serves does, sets
+  one time, read before the first such file, for each of them in the records before it serves the
+  file, where a lookup sees it at once, and writes them back as its operation ends, synced under
+  `--sync-data` (`restore_revision_content`, `FuseOperation::finalize`, `fs/fuse/operation.rs`). A
+  `lore reset --force` writes each file it names, a clean one included, so each takes a new time, as
+  in an instance on disk. An inode the kernel holds across a swap or such a write takes the time
+  recorded for its path. Until the records hold a shard file or a time is set, no inode creation
+  looks a time up. An instance clone carries the records.
 - A virtual clone tells a changed file by address and content, never by a recorded time: its
   scan is the diff of the filesystem State (see "Status and diff"), a single file is compared
   through `file_holds_content`, and no comparison records a time (`file_modification` and

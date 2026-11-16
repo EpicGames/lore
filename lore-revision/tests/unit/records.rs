@@ -361,21 +361,44 @@ async fn a_time_is_not_adopted_over_a_change_since_the_lookup() {
     .await;
 }
 
-/// A time set for a key and not merged yet, which a lookup does not see, wins over a time
-/// adopted after that lookup.
+/// A time set for a key the shard does not hold, and its removal, are seen by a lookup before the
+/// shard merges them, the latest for the key first.
 #[tokio::test]
-async fn a_time_set_wins_over_one_adopted_after_it() {
+async fn a_time_set_for_a_new_key_is_seen_before_the_shard_merges_it() {
     in_context(async {
-        let dir = TempDir::new("records-set-then-adopt-");
+        let dir = TempDir::new("records-set-seen-");
+        let records = InstanceRecords::open(dir.path()).await;
+        records.set(key(5, 1), 200).await;
+        assert_eq!(records.lookup(&key(5, 1)).await, Lookup::Recorded(200));
+        records.set(key(5, 1), 300).await;
+        assert_eq!(records.lookup(&key(5, 1)).await, Lookup::Recorded(300));
+        records.remove(&key(5, 1)).await;
+        assert!(matches!(
+            records.lookup(&key(5, 1)).await,
+            Lookup::Missing(_)
+        ));
+    })
+    .await;
+}
+
+/// A removal not merged yet wins over a time adopted after the lookup that missed.
+#[tokio::test]
+async fn a_removal_waiting_to_be_merged_wins_over_a_time_adopted_after_it() {
+    in_context(async {
+        let dir = TempDir::new("records-remove-then-adopt-");
         let token = token(&dir).await;
         let records = InstanceRecords::open(dir.path()).await;
         records.set(key(5, 1), 200).await;
+        records.remove(&key(5, 1)).await;
         let Lookup::Missing(generation) = records.lookup(&key(5, 1)).await else {
-            panic!("a new key is seen once merged");
+            panic!("the removal is seen before the merge");
         };
         records.adopt(key(5, 1), 100, generation).await;
         write_back(&records, &token).await;
-        assert_eq!(records.lookup(&key(5, 1)).await, Lookup::Recorded(200));
+        assert!(matches!(
+            records.lookup(&key(5, 1)).await,
+            Lookup::Missing(_)
+        ));
     })
     .await;
 }
@@ -397,6 +420,32 @@ async fn removing_a_key_not_held_changes_nothing_to_write() {
             !records.is_dirty(),
             "the time read before the removal is not adopted"
         );
+    })
+    .await;
+}
+
+/// A batch of the times the records already hold changes no shard, and leaves nothing to write
+/// back.
+#[tokio::test]
+async fn a_batch_of_the_times_held_changes_nothing_to_write() {
+    in_context(async {
+        let dir = TempDir::new("records-batch-held-");
+        let token = token(&dir).await;
+        let records = InstanceRecords::open(dir.path()).await;
+        let batch = || {
+            let mut batch = RecordBatch::with_capacity(2);
+            batch.push(Record::new(key(3, 1), 100));
+            batch.push(Record::new(key(3, 2), 200));
+            batch
+        };
+        records.set_all(batch()).await.expect("set the records");
+        write_back(&records, &token).await;
+        records
+            .set_all(batch())
+            .await
+            .expect("set the records again");
+        assert!(!records.is_dirty(), "the same times change no shard");
+        assert_eq!(records.lookup(&key(3, 2)).await, Lookup::Recorded(200));
     })
     .await;
 }

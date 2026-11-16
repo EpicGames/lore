@@ -1754,7 +1754,8 @@ A FUSE virtual clone compares no file by time. It holds the working tree as a st
 a scan diffs addresses and descends only where either side is dirty, and a single file is
 compared by address, or by content where it was written. Its records instead hold the time the
 mount reports for each file it serves from the store: a sync or switch records its time for
-the paths it changes, and a commit the time of each file it stores.
+the paths it changes, a reset to the content the mount serves a time read as it serves the first
+such file, and a commit the time of each file it stores.
 
 #### 15.3 Paths into the dirty set
 

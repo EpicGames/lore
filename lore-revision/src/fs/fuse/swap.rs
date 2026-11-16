@@ -86,7 +86,8 @@ pub struct SwapPlan {
     pub orphaned: Vec<u64>,
     /// Kernel-known directories whose entry set changed; their inode takes the swap time.
     pub touched_directories: Vec<u64>,
-    /// Live file inodes whose content the swap changed, with what they now hold.
+    /// Live file inodes whose content the swap changed, with what they now hold; each takes the
+    /// swap time.
     pub rewritten: Vec<(u64, NodeChangeState)>,
     spellings: Vec<(u64, Spellings)>,
     live: Vec<u64>,
@@ -497,11 +498,12 @@ async fn swap_through(
                 .forward_any::<FsError>("diffing what the served and the target views show")?,
         )
     };
-    let host = Host {
+    let mut host = Host {
         fs,
         served: &served,
         operation,
         repository: fs.provider_repository(&repository),
+        now: None,
     };
     let matching = fs
         .scoped(hold::check((&host, &mut paths), &shown, options))
@@ -522,6 +524,7 @@ async fn swap_through(
         None => repository.dot_dir_path().ok(),
     };
     let now = crate::state::time_before_next_write(probe_dir).await;
+    host.now = Some(now);
     let mut directories: Vec<RelativePath> = Vec::new();
     for change in applied.iter().filter(|change| changes_entry_set(change)) {
         directories.push(change.path().parent_path());
@@ -656,6 +659,7 @@ async fn swap_through(
             *address = written.address;
             *size = written.size;
             *executable = is_executable(after);
+            entry.mtime = now;
         }
     }
     rewritten.clear();
@@ -849,12 +853,15 @@ async fn send(plan: &mut SwapPlan, pending: Pending<'_>) {
 }
 
 /// The host side of a hold on a mount: the files under `write/` beside the served State, compared
-/// through `operation` under `repository`, the provider's context.
+/// through `operation` under `repository`, the provider's context, and overwritten at `now`.
 struct Host<'a> {
     fs: &'a FuseFilesystem,
     served: &'a Served,
     operation: &'a InstanceOperationImpl,
     repository: Arc<RepositoryContext>,
+    /// The time the swap records, read after the check, so a dry run, which ends at the check,
+    /// reads none. `None` until then.
+    now: Option<u64>,
 }
 
 impl HoldHost for Host<'_> {
@@ -873,13 +880,16 @@ impl HoldHost for Host<'_> {
         place: (NodeID, u64),
         wanted: &Node,
     ) -> Result<bool, FsError> {
+        let now = self
+            .now
+            .ok_or_else(|| FsError::internal("overwriting a local file before the swap's time"))?;
         let target = StoredContent {
             address: wanted.address,
             size: wanted.size,
             mode: wanted.mode,
         };
         self.fs
-            .overwrite_local_file(self.served, path, node, place, &target)
+            .overwrite_local_file(self.served, path, node, place, &target, now)
             .await
             .forward_any::<FsError>("overwriting a local file")
     }
