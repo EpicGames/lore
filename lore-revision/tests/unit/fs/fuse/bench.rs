@@ -7,7 +7,6 @@
 //! fs::fuse::bench::`
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::Barrier;
 use std::time::Duration;
@@ -16,16 +15,17 @@ use std::time::Instant;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::text::fold_eq;
 use lore_base::types::Address;
+use lore_revision::fs::fuse::attr::RecordedTimes;
 use lore_revision::fs::fuse::inode::InodeKind;
 use lore_revision::fs::fuse::inode::InodeTable;
 use lore_revision::fs::fuse::inode::NewChild;
 use lore_revision::fs::fuse::inode::ROOT_INO;
-use lore_revision::instance::InstanceId;
-use lore_revision::lore::RepositoryId;
+use lore_revision::records::InstanceRecords;
+use lore_revision::records::Record;
+use lore_revision::records::RecordBatch;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::util::path::RelativePath;
-use lore_storage::FlushOptions;
 use lore_storage::hash::hash_string;
 use smallvec::SmallVec;
 
@@ -261,49 +261,16 @@ fn bench_inode_table_dashmap_vs_mutex_hashmap_16_threads() {
     );
 }
 
-/// A repository over an on-disk mutable store at `store_dir`, keyed like the instance whose
-/// times were recorded.
-async fn repository_over(
-    store_dir: &Path,
-    path: &Path,
-    id: RepositoryId,
-    instance_id: InstanceId,
-    token: Option<&RepositoryWriteToken>,
-) -> (Arc<RepositoryContext>, Arc<dyn lore_storage::MutableStore>) {
-    let (immutable, _, _) = fuse_fixture::test_store_create()
-        .await
-        .expect("in-memory immutable store");
-    let mutable: Arc<dyn lore_storage::MutableStore> = lore_storage::local::mutable_store::create(
-        Some(store_dir),
-        lore_storage::MutableStoreSettings::default(),
-        immutable.clone(),
-    )
-    .await
-    .expect("on-disk mutable store");
-    let repository = RepositoryContext::new(
-        fuse_fixture::default_repository_creation_args(immutable, mutable.clone())
-            .with_path(path)
-            .with_id(id)
-            .with_instance_id(instance_id),
-    );
-    let repository = match token {
-        Some(token) => repository.with_write_token(token.share()),
-        None => repository,
-    };
-    (Arc::new(repository), mutable)
-}
-
-/// A store lookup of the kind a mount makes per inode creation once a swap has recorded times.
-async fn mtime_for(repository: Arc<RepositoryContext>, path: &RelativePath, base_time: u64) -> u64 {
-    let recorded = lore_revision::state::file_modified_time(repository, path).await;
-    lore_revision::fs::fuse::attr::recorded_or_base(recorded, base_time)
-}
-
-async fn time_pass(repository: &Arc<RepositoryContext>, paths: &[RelativePath]) -> Summary {
+/// The lookup a mount makes per inode creation once a swap has recorded times, timed per path.
+async fn time_pass(
+    times: &RecordedTimes,
+    repository: &RepositoryContext,
+    paths: &[RelativePath],
+) -> Summary {
     let mut samples = Vec::with_capacity(paths.len());
     for path in paths {
         let started = Instant::now();
-        let mtime = mtime_for(repository.clone(), path, BASE_TIME).await;
+        let mtime = times.mtime_for(repository, path, BASE_TIME).await;
         samples.push(started.elapsed().as_nanos() as u64);
         std::hint::black_box(mtime);
     }
@@ -323,23 +290,19 @@ async fn bench_recorded_mtime_lookup_per_inode_creation() {
     let execution = fuse_fixture::setup_test_execution();
     LORE_CONTEXT
         .scope(execution, async move {
-            let store_dir = fuse_fixture::generate_tempdir();
             let work_dir = fuse_fixture::generate_tempdir();
             let path = work_dir.to_path_buf();
-            let id = RepositoryId::from(uuid::Uuid::now_v7());
             let token = RepositoryWriteToken::acquire(&path).await;
-            let created = lore_revision::repository::create_local(
-                &path,
-                &token,
-                id,
-                lore_base::types::Context::from(uuid::Uuid::now_v7()),
-                lore_revision::branch::DEFAULT_DEFAULT_NAME.to_string(),
-                lore_revision::repository::RepositoryConfig::default(),
-                false,
-            )
-            .await
-            .expect("instance created");
-            let instance_id = created.instance_id;
+            let (immutable, mutable, _) = fuse_fixture::test_store_create()
+                .await
+                .expect("in-memory stores");
+            let repository = RepositoryContext::new(
+                fuse_fixture::default_repository_creation_args(immutable, mutable).with_path(&path),
+            );
+            let dot_path = repository
+                .dot_dir_path()
+                .expect("a Lore directory")
+                .to_path_buf();
 
             let paths: Vec<RelativePath> = (0..MTIME_PATHS)
                 .map(|i| {
@@ -355,50 +318,48 @@ async fn bench_recorded_mtime_lookup_per_inode_creation() {
                 .collect();
 
             {
-                let (repository, mutable) =
-                    repository_over(store_dir.path(), &path, id, instance_id, Some(&token)).await;
+                let records = InstanceRecords::open(&dot_path).await;
                 let started = Instant::now();
+                let mut batch = RecordBatch::with_capacity(MTIME_PATHS);
                 for (i, path) in paths.iter().enumerate() {
-                    lore_revision::state::file_modified_time_store(
-                        repository.clone(),
-                        path,
+                    batch.push(Record::new(
+                        lore_revision::state::file_modified_time_record_key(
+                            repository.salt(),
+                            path,
+                        ),
                         BASE_TIME + 1 + i as u64,
-                    )
-                    .await;
+                    ));
                 }
+                records.set_all(batch).await.expect("record the times");
+                records
+                    .write_back(&token, true, ())
+                    .await
+                    .expect("write the records back");
                 println!("recorded {MTIME_PATHS} mtimes in {:?}", started.elapsed());
-                assert_eq!(
-                    mtime_for(repository.clone(), &paths[7], BASE_TIME).await,
-                    BASE_TIME + 8
-                );
-                mutable.flush(FlushOptions::SYNC_DATA).await.expect("flush");
             }
-            // Let the first store's background work release its files.
-            tokio::time::sleep(Duration::from_millis(200)).await;
 
-            let (repository, _mutable) =
-                repository_over(store_dir.path(), &path, id, instance_id, None).await;
-            println!("mtime_for over {MTIME_PATHS} paths, store reopened from disk:");
+            let times = RecordedTimes::load(&dot_path).await;
+            println!("mtime_for over {MTIME_PATHS} paths, records reopened from disk:");
             print_pass(
                 "recorded, cold (first pass)",
-                &time_pass(&repository, &paths).await,
+                &time_pass(&times, &repository, &paths).await,
             );
             print_pass(
                 "recorded, warm (second pass)",
-                &time_pass(&repository, &paths).await,
+                &time_pass(&times, &repository, &paths).await,
             );
             print_pass(
                 "unrecorded, first pass",
-                &time_pass(&repository, &unrecorded).await,
+                &time_pass(&times, &repository, &unrecorded).await,
             );
             print_pass(
                 "unrecorded, second pass",
-                &time_pass(&repository, &unrecorded).await,
+                &time_pass(&times, &repository, &unrecorded).await,
             );
             assert_eq!(
-                mtime_for(repository.clone(), &paths[7], BASE_TIME).await,
+                times.mtime_for(&repository, &paths[7], BASE_TIME).await,
                 BASE_TIME + 8,
-                "the reopened store holds the recorded time"
+                "the reopened records hold the recorded time"
             );
             println!("LOOKUP budget: p50 < 20000ns, p99 < 100000ns round trip");
         })
@@ -548,7 +509,9 @@ async fn bench_readdirplus_per_entry_breakdown() {
                 for (path, _) in &tree {
                     let path = RelativePath::new_from_initial_path(path.as_str()).expect("path");
                     std::hint::black_box(
-                        mtime_for(fixture.repository.clone(), &path, BASE_TIME).await,
+                        fs.recorded_times()
+                            .mtime_for(&fixture.repository, &path, BASE_TIME)
+                            .await,
                     );
                 }
                 per_entry(

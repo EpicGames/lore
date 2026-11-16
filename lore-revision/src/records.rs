@@ -293,6 +293,8 @@ pub struct InstanceRecords {
     shards: Box<[ShardSlot]>,
     #[cfg(feature = "test-util")]
     loads: AtomicUsize,
+    #[cfg(feature = "test-util")]
+    lookup_pause: crate::test_util::ArmedPause,
 }
 
 impl InstanceRecords {
@@ -335,6 +337,8 @@ impl InstanceRecords {
                 .collect(),
             #[cfg(feature = "test-util")]
             loads: AtomicUsize::new(0),
+            #[cfg(feature = "test-util")]
+            lookup_pause: crate::test_util::ArmedPause::default(),
         });
         let mut open = OPEN_RECORDS.lock();
         if let Some(opened) = open_records(&open, &records.directory) {
@@ -358,6 +362,8 @@ impl InstanceRecords {
 
     /// What is recorded for `key`. A time adopted is seen once the shard has merged it.
     pub async fn lookup(&self, key: &RecordKey) -> Lookup {
+        #[cfg(feature = "test-util")]
+        self.lookup_pause.pass().await;
         let slot = &self.shards[key[0] as usize];
         if slot.loaded.load(Ordering::Acquire)
             && let Ok(shard) = slot.shard.try_read()
@@ -533,6 +539,12 @@ impl InstanceRecords {
     #[cfg(feature = "test-util")]
     pub fn loads(&self) -> usize {
         self.loads.load(Ordering::Relaxed)
+    }
+
+    /// The pause armed in this set's lookups, before a lookup reads its shard. Test builds only.
+    #[cfg(feature = "test-util")]
+    pub fn lookup_pause(&self) -> &crate::test_util::ArmedPause {
+        &self.lookup_pause
     }
 
     fn mark_dirty(&self, index: u8) {

@@ -20,6 +20,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use dashmap::DashMap;
 use dashmap::DashSet;
+use futures::future::Either;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::text::fold_eq;
 use lore_base::types::Address;
@@ -1036,6 +1037,10 @@ impl FuseFilesystem {
         writable: Option<Writable>,
     ) -> Result<Arc<Self>, FuseProviderError> {
         let repository = provider_context(&repository, stores.as_ref(), &remote);
+        let dot_path = repository
+            .dot_dir_path()
+            .internal("opening the mounted instance's modified-time records")?;
+        let recorded = RecordedTimes::load(dot_path).await;
         let (local, deletions, served_state) = match writable {
             Some(writable) => (
                 Some(writable.local),
@@ -1045,7 +1050,6 @@ impl FuseFilesystem {
             None => (None, None, own_state(&repository, state).await?),
         };
         served_state.mark_served();
-        let recorded = RecordedTimes::load(&repository).await;
         let tree = served_state
             .tree(repository.clone())
             .await
@@ -1496,7 +1500,8 @@ impl FuseFilesystem {
         self.context.clone()
     }
 
-    /// Runs `work` under the captured execution context unless one is already current.
+    /// Runs `work` under the captured execution context unless one is current at the call
+    /// ([`scoped_in`]).
     pub(crate) fn scoped<F: Future>(&self, work: F) -> impl Future<Output = F::Output> {
         scoped_in(self.context.as_ref(), work)
     }
@@ -3887,16 +3892,20 @@ fn identity_refresh(
     }
 }
 
-/// Runs `work` under `context` unless one is already current.
-pub(crate) async fn scoped_in<T>(
+/// Runs `work` under `context` unless one is current at the call.
+///
+/// Not an `async fn`, which would hold `work` beside the scope that takes it: the future is the
+/// scope or `work` itself.
+#[lore_macro::test_pub]
+pub(crate) fn scoped_in<F: Future>(
     context: Option<&Arc<dyn Any + Send + Sync>>,
-    work: impl Future<Output = T>,
-) -> T {
+    work: F,
+) -> impl Future<Output = F::Output> {
     match context {
         Some(context) if LORE_CONTEXT.try_with(|_| ()).is_err() => {
-            LORE_CONTEXT.scope(context.clone(), work).await
+            Either::Left(LORE_CONTEXT.scope(context.clone(), work))
         }
-        _ => work.await,
+        _ => Either::Right(work),
     }
 }
 

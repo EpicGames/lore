@@ -24,9 +24,11 @@ use lore_revision::node::NodeBlock;
 use lore_revision::node::NodeExtFlags;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
+use lore_revision::repository::RepositoryContext;
 use lore_revision::util::path::RelativePath;
 use lore_storage::hash::hash_string;
 
+use crate::harness::fixtures;
 use crate::harness::fixtures::Tree;
 use crate::harness::invariants;
 use crate::harness::invariants::Rules;
@@ -56,6 +58,18 @@ struct Mounted {
     renamed: AtomicUsize,
 }
 
+/// A repository context over in-memory stores with its working tree at `path`, whose Lore
+/// directory a provider over it reads.
+async fn repository_at(path: &std::path::Path) -> Arc<RepositoryContext> {
+    use crate::helper::RepositoryContextCreationArgsExt as _;
+
+    let immutable = fixtures::immutable().await;
+    let mutable = fixtures::mutable_over(immutable.clone()).await;
+    Arc::new(RepositoryContext::new(
+        crate::helper::default_repository_creation_args(immutable, mutable).with_path(path),
+    ))
+}
+
 impl Mounted {
     /// The provider over `mounted`, saved, with the directories `local` made under `write/`, and
     /// `committed` as the revision the commit stored.
@@ -66,7 +80,10 @@ impl Mounted {
         for dir in local {
             std::fs::create_dir_all(write.join(dir)).expect("a local directory is made");
         }
-        let tree = Tree::new(mounted).await.reloaded().await;
+        let tree = Tree::new_in(repository_at(external.path()).await, mounted)
+            .await
+            .reloaded()
+            .await;
         let fs = FuseFilesystem::new_writable(
             tree.repository.clone(),
             tree.state.clone(),

@@ -147,27 +147,44 @@ impl Instance {
             .expect("the staged State loads")
     }
 
+    /// The creation arguments of the instance's context over `immutable`, its immutable store or
+    /// one standing in for it.
+    fn args_over(
+        &self,
+        immutable: Arc<dyn lore_storage::ImmutableStore>,
+    ) -> lore_revision::repository::RepositoryContextCreationArgs {
+        use fuse_fixture::RepositoryContextCreationArgsExt as _;
+
+        let fixture = &self.fixture;
+        fuse_fixture::default_repository_creation_args(immutable, fixture.mutable.clone())
+            .with_path(&fixture.path)
+            .with_id(fixture.repository.id)
+            .with_instance_id(fixture.repository.instance_id)
+    }
+
     /// The instance's context holding `token`, with no filesystem of its own: for a store write
     /// another command makes while one holds the token.
     fn writing(
         &self,
         token: &lore_revision::repository::RepositoryWriteToken,
     ) -> Arc<lore_revision::repository::RepositoryContext> {
-        use fuse_fixture::RepositoryContextCreationArgsExt as _;
-
-        let fixture = &self.fixture;
         Arc::new(
             lore_revision::repository::RepositoryContext::new(
-                fuse_fixture::default_repository_creation_args(
-                    fixture.immutable.clone(),
-                    fixture.mutable.clone(),
-                )
-                .with_path(&fixture.path)
-                .with_id(fixture.repository.id)
-                .with_instance_id(fixture.repository.instance_id),
+                self.args_over(self.fixture.immutable.clone()),
             )
             .with_write_token(token.share()),
         )
+    }
+
+    /// The instance's context over `immutable` in place of its immutable store, with no
+    /// filesystem of its own.
+    fn context_over(
+        &self,
+        immutable: Arc<dyn lore_storage::ImmutableStore>,
+    ) -> Arc<lore_revision::repository::RepositoryContext> {
+        Arc::new(lore_revision::repository::RepositoryContext::new(
+            self.args_over(immutable),
+        ))
     }
 
     /// The instance's context with `fs` as its filesystem, as a command relayed to the service
@@ -213,16 +230,9 @@ impl Instance {
     ) -> lore_revision::repository::RepositoryContext {
         use fuse_fixture::RepositoryContextCreationArgsExt as _;
 
-        let fixture = &self.fixture;
         lore_revision::repository::RepositoryContext::new(
-            fuse_fixture::default_repository_creation_args(
-                fixture.immutable.clone(),
-                fixture.mutable.clone(),
-            )
-            .with_path(&fixture.path)
-            .with_id(fixture.repository.id)
-            .with_instance_id(fixture.repository.instance_id)
-            .with_filesystem_provider(Arc::new(FuseProvider(fs.clone()))),
+            self.args_over(self.fixture.immutable.clone())
+                .with_filesystem_provider(Arc::new(FuseProvider(fs.clone()))),
         )
     }
 
@@ -7993,13 +8003,7 @@ async fn a_create_on_a_zero_revision_mount_attaches_on_the_worker_in_a_fresh_blo
     LORE_CONTEXT
         .scope(fuse_fixture::setup_test_execution(), async {
             let store = holding_store::HoldingStore::new(instance.fixture.immutable.clone());
-            let repository = Arc::new(
-                lore_revision::repository::RepositoryContext::new_server_context(
-                    store.clone(),
-                    instance.fixture.mutable.clone(),
-                    instance.fixture.repository.id,
-                ),
-            );
+            let repository = instance.context_over(store.clone());
             let fs = FuseFilesystem::new_writable(
                 repository,
                 lore_revision::state::State::new(),
@@ -8556,13 +8560,7 @@ async fn holding_provider(
         "the tree records file metadata"
     );
     let store = holding_store::HoldingStore::new(instance.fixture.immutable.clone());
-    let repository = Arc::new(
-        lore_revision::repository::RepositoryContext::new_server_context(
-            store.clone(),
-            instance.fixture.mutable.clone(),
-            instance.fixture.repository.id,
-        ),
-    );
+    let repository = instance.context_over(store.clone());
     let fs = FuseFilesystem::new_writable(
         repository,
         instance.fixture.state.clone(),

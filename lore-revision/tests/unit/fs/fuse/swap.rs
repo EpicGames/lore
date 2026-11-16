@@ -44,6 +44,7 @@ use lore_revision::fs::hold::SwapPhase;
 use lore_revision::lore::RepositoryId;
 use lore_revision::node::NodeFileMode;
 use lore_revision::node::NodeFlags;
+use lore_revision::records::InstanceRecords;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
 use lore_revision::state::Content;
@@ -51,12 +52,10 @@ use lore_revision::state::Ext;
 use lore_revision::state::Mark;
 use lore_revision::state::Rewrite;
 use lore_revision::state::State;
+use lore_revision::test_util::ArmedPause;
 use lore_revision::util::path::RelativePath;
 use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
-use lore_storage::KeyType;
-use lore_storage::KeyValueStream;
-use lore_storage::MutableStore;
 use lore_storage::StoreError;
 use lore_storage::StoreGetData;
 use lore_storage::StoreMatchResult;
@@ -203,6 +202,18 @@ impl Swapping {
             .without_command_locks()
             .with_write_token(self.instance.write_token.share()),
         )
+    }
+
+    /// Another provider over the instance at `state`, and the records it shares with the
+    /// instance's other holders, whose lookups a race test pauses.
+    async fn provider_at(&self, state: &Arc<State>) -> (Arc<FuseFilesystem>, Arc<InstanceRecords>) {
+        let repository = self.repository();
+        let fs = FuseFilesystem::new(repository.clone(), state.clone(), attr_context())
+            .await
+            .expect("provider");
+        let records =
+            InstanceRecords::open(repository.dot_dir_path().expect("a Lore directory")).await;
+        (fs, records)
     }
 
     async fn getattr(&self, ino: u64) -> lore_fuse::abi::Attr {
@@ -896,8 +907,8 @@ async fn a_remounted_provider_reports_the_times_an_earlier_swap_recorded() {
                 .await
                 .expect("lookup file");
             assert_eq!(file.attr.mtime, changed.mtime() / 1000);
-            // The fixture's commits stored their times in the mutable store, which a mount over a
-            // Lore directory does not read.
+            // The fixture's commits stored their times in the mutable store, which a mount does
+            // not read.
             let kept = operation
                 .file_info(&path("dir/keep.txt"))
                 .await
@@ -948,12 +959,20 @@ async fn only_a_swap_that_changes_something_records_a_time() {
         s.swap_to(&s.first.clone(), Arc::new(RecordingSink::default()))
             .await;
         assert!(s.fs.recorded_times().none());
-        assert!(RecordedTimes::load(&s.repository()).await.none());
+        assert!(
+            RecordedTimes::load(s.repository().dot_dir_path().expect("a Lore directory"))
+                .await
+                .none()
+        );
 
         let second = s.commit(&[("a.txt", Some(b"two"))]).await;
         s.swap_to(&second, Arc::new(RecordingSink::default())).await;
         assert!(!s.fs.recorded_times().none());
-        assert!(!RecordedTimes::load(&s.repository()).await.none());
+        assert!(
+            !RecordedTimes::load(s.repository().dot_dir_path().expect("a Lore directory"))
+                .await
+                .none()
+        );
     })
     .await;
 }
@@ -994,7 +1013,11 @@ async fn first_publish_onto_an_empty_mount_records_nothing_and_invalidates_the_r
 
             assert_eq!(empty.served().revision(), s.first.revision());
             assert!(empty.recorded_times().none(), "no time is recorded");
-            assert!(RecordedTimes::load(&s.repository()).await.none());
+            assert!(
+                RecordedTimes::load(s.repository().dot_dir_path().expect("a Lore directory"))
+                    .await
+                    .none()
+            );
             assert!(sink.has(&Call::Inode(ROOT_INO)), "{:?}", sink.calls());
             assert!(
                 sink.has(&Call::Entry(ROOT_INO, b"a.txt".to_vec())),
@@ -1504,95 +1527,8 @@ async fn removing_a_large_clean_tree_reads_nothing_below_its_top() {
     .await;
 }
 
-/// A mutable store whose next load, once armed, waits to be released.
-struct GatedStore {
-    inner: Arc<dyn MutableStore>,
-    armed: AtomicBool,
-    reached: tokio::sync::Notify,
-    release: tokio::sync::Notify,
-}
-
-#[async_trait]
-impl MutableStore for GatedStore {
-    /// Joins the claim of the store this one wraps.
-    async fn hold_for_command(
-        self: Arc<Self>,
-    ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, StoreError> {
-        self.inner.clone().hold_for_command().await
-    }
-
-    async fn load(
-        self: Arc<Self>,
-        partition: Partition,
-        key: Hash,
-        key_type: KeyType,
-    ) -> Result<Hash, StoreError> {
-        if self.armed.swap(false, Ordering::SeqCst) {
-            self.reached.notify_one();
-            self.release.notified().await;
-        }
-        self.inner.clone().load(partition, key, key_type).await
-    }
-
-    async fn store(
-        self: Arc<Self>,
-        partition: Partition,
-        key: Hash,
-        value: Hash,
-        key_type: KeyType,
-    ) -> Result<(), StoreError> {
-        self.inner
-            .clone()
-            .store(partition, key, value, key_type)
-            .await
-    }
-
-    async fn compare_and_swap(
-        self: Arc<Self>,
-        partition: Partition,
-        key: Hash,
-        expected: Hash,
-        value: Hash,
-        key_type: KeyType,
-    ) -> Result<Hash, StoreError> {
-        self.inner
-            .clone()
-            .compare_and_swap(partition, key, expected, value, key_type)
-            .await
-    }
-
-    async fn list(
-        self: Arc<Self>,
-        partition: Partition,
-        key_type: KeyType,
-    ) -> Result<KeyValueStream, StoreError> {
-        self.inner.clone().list(partition, key_type).await
-    }
-
-    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
-        self.inner.clone().flush(options).await
-    }
-}
-
-/// Stores the marker a swap stores in the mutable store over a context without a Lore directory
-/// for the instance `repository` serves, so a provider over such a context reads the store for
-/// every new inode's time.
-async fn mark_times_stored(repository: &RepositoryContext) {
-    repository
-        .try_write_mutable_store()
-        .expect("write token")
-        .store(
-            repository.root_id(),
-            lore_revision::fs::fuse::attr::marker_key(repository),
-            lore_base::types::Hash::from_u64(1),
-            lore_base::types::KeyType::Untyped,
-        )
-        .await
-        .expect("store the marker");
-}
-
 /// A swap that runs between two entries of one READDIRPLUS page, while the page waits on the
-/// store for a new inode's time: neither entry puts the content from before the swap in an
+/// records for a new inode's time: neither entry puts the content from before the swap in an
 /// inode, and the page goes plain from the entry refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_swap_between_two_entries_of_a_readdirplus_page_leaves_no_old_content() {
@@ -1601,25 +1537,8 @@ async fn a_swap_between_two_entries_of_a_readdirplus_page_leaves_no_old_content(
         async |s: Swapping| {
             let second = s.commit(&[("c.txt", Some(b"sea"))]).await;
             s.swap_to(&second, Arc::new(RecordingSink::default())).await;
-            let repository = s.repository();
-            mark_times_stored(&repository).await;
-            let gate = Arc::new(GatedStore {
-                inner: repository.try_mutable_store_arc().expect("write token"),
-                armed: AtomicBool::new(false),
-                reached: tokio::sync::Notify::new(),
-                release: tokio::sync::Notify::new(),
-            });
-            let gated = Arc::new(RepositoryContext::new(
-                fuse_fixture::default_repository_creation_args(
-                    repository.immutable_store(),
-                    gate.clone(),
-                )
-                .with_id(repository.id)
-                .with_instance_id(repository.instance_id),
-            ));
-            let fs = FuseFilesystem::new(gated, second.clone(), attr_context())
-                .await
-                .expect("provider");
+            let (fs, records) = s.provider_at(&second).await;
+            let pause = records.lookup_pause();
             let operation = InstanceOperationImpl::new(
                 StaticDispatchInstanceOperation::Fuse(FuseOperation::new(fs.clone())),
                 true,
@@ -1645,7 +1564,7 @@ async fn a_swap_between_two_entries_of_a_readdirplus_page_leaves_no_old_content(
                 .expect("lookup")
                 .ino;
 
-            gate.armed.store(true, Ordering::SeqCst);
+            pause.arm();
             let fh = fs.opendir(&req(), ROOT_INO).expect("opendir").fh;
             let page = {
                 let fs = fs.clone();
@@ -1664,7 +1583,7 @@ async fn a_swap_between_two_entries_of_a_readdirplus_page_leaves_no_old_content(
                     (emitted, nodeids)
                 })
             };
-            gate.reached.notified().await;
+            pause.reached().await;
             let third = s
                 .commit(&[
                     (first.as_str(), Some(&b"first, rewritten"[..])),
@@ -1680,13 +1599,13 @@ async fn a_swap_between_two_entries_of_a_readdirplus_page_leaves_no_old_content(
             )
             .await
             .expect("swap");
-            gate.release.notify_one();
+            pause.resume();
             let (emitted, nodeids) = page.await.expect("the page completes");
             fs.releasedir(ROOT_INO, fh);
             assert_eq!(nodeids.len(), 3, "the page lists every entry: {nodeids:?}");
             assert_eq!(
                 nodeids[0], 0,
-                "the entry waiting on the store is refused: {nodeids:?}"
+                "the entry waiting on the records is refused: {nodeids:?}"
             );
             assert!(
                 nodeids.iter().all(|&nodeid| nodeid == 0),
@@ -1707,14 +1626,14 @@ async fn a_swap_between_two_entries_of_a_readdirplus_page_leaves_no_old_content(
             assert_eq!(
                 fs.getattr(&req(), first_ino).await.expect("attr").attr.size,
                 16,
-                "the entry waiting on the store takes no old content"
+                "the entry waiting on the records takes no old content"
             );
         },
     )
     .await;
 }
 
-/// A READDIRPLUS interrupted while a row waits on the store for its new inode's time gives back
+/// A READDIRPLUS interrupted while a row waits on the records for its new inode's time gives back
 /// the lookups it counted for the rows before it: each inode's count is back to its value before
 /// the request.
 #[tokio::test(flavor = "multi_thread")]
@@ -1726,25 +1645,8 @@ async fn an_interrupted_readdirplus_gives_back_the_rows_it_counted() {
         async |s: Swapping| {
             let second = s.commit(&[("c.txt", Some(b"sea"))]).await;
             s.swap_to(&second, Arc::new(RecordingSink::default())).await;
-            let repository = s.repository();
-            mark_times_stored(&repository).await;
-            let gate = Arc::new(GatedStore {
-                inner: repository.try_mutable_store_arc().expect("write token"),
-                armed: AtomicBool::new(false),
-                reached: tokio::sync::Notify::new(),
-                release: tokio::sync::Notify::new(),
-            });
-            let gated = Arc::new(RepositoryContext::new(
-                fuse_fixture::default_repository_creation_args(
-                    repository.immutable_store(),
-                    gate.clone(),
-                )
-                .with_id(repository.id)
-                .with_instance_id(repository.instance_id),
-            ));
-            let fs = FuseFilesystem::new(gated, second.clone(), attr_context())
-                .await
-                .expect("provider");
+            let (fs, records) = s.provider_at(&second).await;
+            let pause = records.lookup_pause();
             // A plain READDIR caches the root's listing, so the READDIRPLUS answers on a worker.
             let order: Vec<String> = {
                 let mut buffer = vec![0u8; 64 * 1024];
@@ -1768,7 +1670,7 @@ async fn an_interrupted_readdirplus_gives_back_the_rows_it_counted() {
 
             let (session, transport) = fuse_test_util::mock_session(&fs, 2).await;
             let fh = fs.opendir(&req(), ROOT_INO).expect("opendir").fh;
-            gate.armed.store(true, Ordering::SeqCst);
+            pause.arm();
             let page = lore_fuse::abi::ReadIn {
                 fh,
                 size: 64 * 1024,
@@ -1780,11 +1682,11 @@ async fn an_interrupted_readdirplus_gives_back_the_rows_it_counted() {
                 ROOT_INO,
                 page.as_bytes(),
             ));
-            gate.reached.notified().await;
+            pause.reached().await;
             assert_eq!(
                 lookups(counted),
                 before + 1,
-                "the first row is counted before the page waits on the store"
+                "the first row is counted before the page waits on the records"
             );
             transport.push_request(fuse_test_util::raw_request(
                 lore_fuse::abi::Opcode::Interrupt,
@@ -1793,7 +1695,7 @@ async fn an_interrupted_readdirplus_gives_back_the_rows_it_counted() {
                 lore_fuse::abi::InterruptIn { unique: 2 }.as_bytes(),
             ));
             fuse_test_util::await_reply(&transport, 2).await;
-            gate.release.notify_one();
+            pause.resume();
             assert_eq!(session.deferred_requests(), 0, "answered on a worker");
             session.shutdown().await;
             fs.releasedir(ROOT_INO, fh);
@@ -1914,7 +1816,7 @@ async fn a_readdirplus_row_whose_lookup_fails_goes_plain_and_the_page_answers() 
     .await;
 }
 
-/// A swap that lands mid-page, while a row waits on the store for its new inode's time, makes
+/// A swap that lands mid-page, while a row waits on the records for its new inode's time, makes
 /// every row after it plain, whatever the swap did to it: a row whose node it detached, one it
 /// left alone and one it rewrote, each with an inode the kernel holds. None of them is counted,
 /// and the rewritten one keeps the swap's content.
@@ -1930,25 +1832,8 @@ async fn a_swap_landing_mid_page_makes_every_row_after_it_plain() {
         async |s: Swapping| {
             let second = s.commit(&[("g.txt", Some(b"gee"))]).await;
             s.swap_to(&second, Arc::new(RecordingSink::default())).await;
-            let repository = s.repository();
-            mark_times_stored(&repository).await;
-            let gate = Arc::new(GatedStore {
-                inner: repository.try_mutable_store_arc().expect("write token"),
-                armed: AtomicBool::new(false),
-                reached: tokio::sync::Notify::new(),
-                release: tokio::sync::Notify::new(),
-            });
-            let gated = Arc::new(RepositoryContext::new(
-                fuse_fixture::default_repository_creation_args(
-                    repository.immutable_store(),
-                    gate.clone(),
-                )
-                .with_id(repository.id)
-                .with_instance_id(repository.instance_id),
-            ));
-            let fs = FuseFilesystem::new(gated, second.clone(), attr_context())
-                .await
-                .expect("provider");
+            let (fs, records) = s.provider_at(&second).await;
+            let pause = records.lookup_pause();
             let operation = InstanceOperationImpl::new(
                 StaticDispatchInstanceOperation::Fuse(FuseOperation::new(fs.clone())),
                 true,
@@ -1966,7 +1851,7 @@ async fn a_swap_landing_mid_page_makes_every_row_after_it_plain() {
                     .collect()
             };
             assert_eq!(order.len(), 5);
-            // Every row after the first has an inode, so only the first waits on the store.
+            // Every row after the first has an inode, so only the first waits on the records.
             let mut held = Vec::new();
             for name in &order[1..] {
                 let ino = fs
@@ -1979,13 +1864,13 @@ async fn a_swap_landing_mid_page_makes_every_row_after_it_plain() {
             let lookups = |ino: u64| fs.inodes().get(ino).map_or(0, |entry| entry.nlookup);
             let before: Vec<u64> = held.iter().map(|&ino| lookups(ino)).collect();
 
-            gate.armed.store(true, Ordering::SeqCst);
+            pause.arm();
             let fh = fs.opendir(&req(), ROOT_INO).expect("opendir").fh;
             let page = {
                 let fs = fs.clone();
                 lore_base::lore_spawn!(async move { plus_rows(&fs, ROOT_INO, fh, 0).await })
             };
-            gate.reached.notified().await;
+            pause.reached().await;
             let (detached, kept, rewritten) = (&order[1], &order[2], &order[3]);
             let third = s
                 .commit(&[
@@ -2002,7 +1887,7 @@ async fn a_swap_landing_mid_page_makes_every_row_after_it_plain() {
             )
             .await
             .expect("swap");
-            gate.release.notify_one();
+            pause.resume();
             let (emitted, rows) = page
                 .await
                 .expect("the page completes")
@@ -4060,37 +3945,15 @@ async fn a_file_a_failed_apply_rewrote_is_invalidated_whatever_its_inode_holds()
     .await;
 }
 
-/// A lookup that read a file, then waited on the store while a swap replaced its content, does
-/// not revive the orphan holding what it read. The provider is served over a context without a
-/// Lore directory, which keeps its swap times in the gated store, so the lookup waits there for the
-/// time a swap recorded.
+/// A lookup that read a file, then waited on the records for its time while a swap replaced its
+/// content, does not revive the orphan holding what it read.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_orphan_is_not_revived_across_a_swap_that_replaced_its_content() {
     swapping(
         &[("a.txt", b"one"), ("keep.txt", b"k")],
         async |s: Swapping| {
-            let repository = s.repository();
-            let gate = Arc::new(GatedStore {
-                inner: repository.try_mutable_store_arc().expect("write token"),
-                armed: AtomicBool::new(false),
-                reached: tokio::sync::Notify::new(),
-                release: tokio::sync::Notify::new(),
-            });
-            let gated = Arc::new(
-                RepositoryContext::new(
-                    fuse_fixture::default_repository_creation_args(
-                        repository.immutable_store(),
-                        gate.clone(),
-                    )
-                    .with_id(repository.id)
-                    .with_instance_id(repository.instance_id),
-                )
-                .without_command_locks()
-                .with_write_token(s.instance.write_token.share()),
-            );
-            let fs = FuseFilesystem::new(gated.clone(), s.first.clone(), attr_context())
-                .await
-                .expect("provider");
+            let (fs, records) = s.provider_at(&s.first).await;
+            let pause = records.lookup_pause();
             fs.set_swap_hook(failing_once(SwapPhase::Placed));
             let operation = InstanceOperationImpl::new(
                 StaticDispatchInstanceOperation::Fuse(FuseOperation::new(fs.clone())),
@@ -4101,7 +3964,7 @@ async fn an_orphan_is_not_revived_across_a_swap_that_replaced_its_content() {
             let failed = swap(
                 &fs,
                 &operation,
-                gated.clone(),
+                s.repository(),
                 rewritten.clone(),
                 Arc::new(RecordingSink::default()),
             )
@@ -4110,7 +3973,7 @@ async fn an_orphan_is_not_revived_across_a_swap_that_replaced_its_content() {
             swap(
                 &fs,
                 &operation,
-                gated.clone(),
+                s.repository(),
                 s.first.clone(),
                 Arc::new(RecordingSink::default()),
             )
@@ -4120,7 +3983,7 @@ async fn an_orphan_is_not_revived_across_a_swap_that_replaced_its_content() {
                 .await
                 .expect("keep.txt");
 
-            gate.armed.store(true, Ordering::SeqCst);
+            pause.arm();
             let lookup = {
                 let fs = fs.clone();
                 lore_base::lore_spawn!(async move {
@@ -4130,18 +3993,18 @@ async fn an_orphan_is_not_revived_across_a_swap_that_replaced_its_content() {
                         .ino
                 })
             };
-            gate.reached.notified().await;
+            pause.reached().await;
             let changed = s.commit(&[("a.txt", Some(b"changed"))]).await;
             swap(
                 &fs,
                 &operation,
-                gated.clone(),
+                s.repository(),
                 changed.clone(),
                 Arc::new(RecordingSink::default()),
             )
             .await
             .expect("change");
-            gate.release.notify_one();
+            pause.resume();
             let ino = lookup.await.expect("the lookup completes");
             assert_eq!(read_at(&fs, ino, 0, 1 << 16).await, b"changed");
         },
@@ -4194,13 +4057,11 @@ async fn adding_a_deep_tree_reads_in_proportion_to_it() {
     );
 }
 
-/// An immutable store whose reads, once `stall` is armed, wait for `release` the first time, and
+/// An immutable store whose next read, once `stall` is armed, waits to be resumed, and whose reads
 /// fail while `failing` is set.
 struct GatedImmutable {
     inner: Arc<dyn ImmutableStore>,
-    stall: AtomicBool,
-    reached: tokio::sync::Notify,
-    release: tokio::sync::Notify,
+    stall: ArmedPause,
     failing: AtomicBool,
 }
 
@@ -4208,9 +4069,7 @@ impl GatedImmutable {
     fn new(inner: Arc<dyn ImmutableStore>) -> Arc<Self> {
         Arc::new(Self {
             inner,
-            stall: AtomicBool::new(false),
-            reached: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
+            stall: ArmedPause::default(),
             failing: AtomicBool::new(false),
         })
     }
@@ -4219,10 +4078,7 @@ impl GatedImmutable {
         if self.failing.load(Ordering::SeqCst) {
             return Err(lore_base::error::Disconnected.into());
         }
-        if self.stall.swap(false, Ordering::SeqCst) {
-            self.reached.notify_one();
-            self.release.notified().await;
-        }
+        self.stall.pass().await;
         Ok(())
     }
 }
@@ -4424,12 +4280,12 @@ async fn a_listing_built_across_a_whole_swap_is_cached() {
                 .node(gated.clone(), lore_revision::node::ROOT_NODE)
                 .await
                 .expect("root");
-            store.stall.store(true, Ordering::SeqCst);
+            store.stall.arm();
             let page = {
                 let fs = fs.clone();
                 lore_base::lore_spawn!(async move { root_page(&fs).await })
             };
-            store.reached.notified().await;
+            store.stall.reached().await;
             let second = s.commit(&[("a.txt", Some(b"two!"))]).await;
             swap(
                 &fs,
@@ -4440,7 +4296,7 @@ async fn a_listing_built_across_a_whole_swap_is_cached() {
             )
             .await
             .expect("swap");
-            store.release.notify_one();
+            store.stall.resume();
             page.await.expect("the page completes");
 
             assert!(

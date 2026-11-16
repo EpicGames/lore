@@ -934,20 +934,21 @@ State is rebuilt at every mount.
   provider adds the owner write bit. Owner is the mounting user; `st_blksize` is `MAX_READ`
   (1 MiB) (`attr_for`, `fs/fuse/attr.rs`). Local entries report their host file (see Writes).
 - A file served from the store reports the time the instance's modified-time records hold for its
-  path, `.lore/records/`, else the instance's base time (`RecordedTimes`, `attr.rs`). The mount and
-  the commands the service runs on the instance share one set of records (`InstanceRecords::open`,
-  `lore-revision/src/records.rs`). A swap records its time for each path it changes and writes the
-  records back before it publishes, synced under `--sync-data`. A commit records the modification
-  time it read for each file it stores, however recent, so a committed file keeps the time it
-  showed, and writes the records back after its store flush and before it serves the files from the
-  store, synced under `--sync-data`; a commit whose records cannot be written back serves none of
-  them from the store (`hand_over_committed`, `lore-revision/src/commit.rs`). A write that serves a
-  file from the store again, as a reset of an edited file to the content the mount serves does, sets
-  one time, read before the first such file, for each of them in the records before it serves the
-  file, where a lookup sees it at once, and writes them back as its operation ends, synced under
-  `--sync-data` (`restore_revision_content`, `FuseOperation::finalize`, `fs/fuse/operation.rs`). A
-  `lore reset --force` writes each file it names, a clean one included, so each takes a new time, as
-  in an instance on disk. An inode the kernel holds across a swap or such a write takes the time
+  path, `.lore/records/`, else the instance's base time (`RecordedTimes`, `attr.rs`), so a provider
+  refuses a context without a Lore directory. The mount and the commands the service runs on the
+  instance share one set of records (`InstanceRecords::open`, `lore-revision/src/records.rs`). A
+  swap records its time for each path it changes and writes the records back before it publishes,
+  synced under `--sync-data`. A commit records the modification time it read for each file it
+  stores, however recent, so a committed file keeps the time it showed, and writes the records back
+  after its store flush and before it serves the files from the store, synced under `--sync-data`;
+  a commit whose records cannot be written back serves none of them from the store
+  (`hand_over_committed`, `lore-revision/src/commit.rs`). A write that serves a file from the store
+  again, as a reset of an edited file to the content the mount serves does, sets one time, read
+  before the first such file, for each of them in the records before it serves the file, where a
+  lookup sees it at once, and writes them back as its operation ends, synced under `--sync-data`
+  (`restore_revision_content`, `FuseOperation::finalize`, `fs/fuse/operation.rs`). A
+  `lore reset --force` writes each file it names, a clean one included, so each takes a new time,
+  as in an instance on disk. An inode the kernel holds across a swap or such a write takes the time
   recorded for its path. Until the records hold a shard file or a time is set, no inode creation
   looks a time up. An instance clone carries the records.
 - A virtual clone tells a changed file by address and content, never by a recorded time: its
@@ -957,8 +958,7 @@ State is rebuilt at every mount.
 - v0.14.0 also stored swap times in the mutable store (`fuse-recorded-time`, with a
   `fuse-recorded-times` marker). Its swaps recorded the same times in the records, which this client
   reads alone. After a downgrade, v0.14.0 reports older times for the files this client's swaps
-  changed: run a clean build in each virtual clone after a downgrade. A mount over a context without
-  a Lore directory, as a test's, keeps its times under those mutable-store keys.
+  changed: run a clean build in each virtual clone after a downgrade.
 - Times are stored before a swap applies anything (`swap_through`, `swap.rs`).
 
 ### The READ path

@@ -8,7 +8,6 @@ use lore_base::types::Address;
 use lore_revision::fs::fuse::attr::AttrContext;
 use lore_revision::fs::fuse::attr::RecordedTimes;
 use lore_revision::fs::fuse::attr::attr_for;
-use lore_revision::fs::fuse::attr::marker_key;
 use lore_revision::fs::fuse::attr::statfs;
 use lore_revision::fs::fuse::inode::InodeEntry;
 use lore_revision::fs::fuse::inode::InodeKind;
@@ -127,46 +126,12 @@ fn uid_gid_are_mounting_user() {
     assert_eq!((mounting.blksize, mounting.base_time), (4096, 5));
 }
 
-#[tokio::test]
-async fn mtime_uses_base_time_when_no_recorded_time() {
+#[test]
+fn mtime_uses_base_time_when_no_recorded_time() {
     let ctx = ctx();
     let attr = attr_for(&entry(file(1, false), 0, false), &ctx);
     assert_eq!(attr.mtime, ctx.base_time / 1000);
     assert_eq!(attr.mtimensec, 123_000_000);
-
-    let immutable_store = lore_storage::local::immutable_store::create(
-        None::<&str>,
-        lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
-        false,
-        lore_storage::ImmutableStoreSettings::default(),
-    )
-    .await
-    .expect("in-memory immutable store");
-    let mutable_store = lore_storage::local::mutable_store::create(
-        None::<&str>,
-        lore_storage::MutableStoreSettings::default(),
-        immutable_store.clone(),
-    )
-    .await
-    .expect("in-memory mutable store");
-    let repository = RepositoryContext::new_null_context(immutable_store, mutable_store);
-    let path = RelativePath::new_from_initial_path("never/recorded.txt").expect("path");
-    let times = RecordedTimes::load(&repository).await;
-    assert!(times.none());
-    assert_eq!(times.mtime_for(&repository, &path, 777).await, 777);
-
-    times
-        .store(&repository, std::iter::once(&path), 999)
-        .await
-        .expect("store the swap's time");
-    assert!(!times.none());
-    assert_eq!(times.mtime_for(&repository, &path, 777).await, 999);
-    let other = RelativePath::new_from_initial_path("never/other.txt").expect("path");
-    assert_eq!(times.mtime_for(&repository, &other, 777).await, 777);
-    assert!(
-        !RecordedTimes::load(&repository).await.none(),
-        "a later mount finds the marker"
-    );
 }
 
 /// Two instances on one store, each with a Lore directory and a write token, run under the
@@ -205,27 +170,23 @@ fn records_of(repository: &RepositoryContext) -> std::path::PathBuf {
         .join(RECORDS_DIR)
 }
 
-/// A swap's times land in the instance's records, with nothing in the mutable store, and a copy
-/// of the records gives another instance the same times.
+/// A swap's times land in the instance's records, and a copy of the records gives another
+/// instance the same times.
 #[tokio::test]
 async fn swap_times_are_kept_in_the_instance_records_and_a_copy_carries_them() {
     two_instances(async |source, clone| {
         let repository = &source.repository;
         let path = RelativePath::new_from_initial_path("dir/swapped.txt").expect("path");
-        let times = RecordedTimes::load(repository).await;
+        let times = RecordedTimes::load(repository.dot_dir_path().expect("a Lore directory")).await;
         assert!(times.none());
         times
             .store(repository, std::iter::once(&path), 999)
             .await
             .expect("store the swap's time");
         assert_eq!(times.mtime_for(repository, &path, 777).await, 999);
-        assert_eq!(
-            lore_revision::state::stored_modified_time(repository, marker_key(repository)).await,
-            0,
-            "the mutable store holds no marker"
-        );
         drop(times);
-        let reloaded = RecordedTimes::load(repository).await;
+        let reloaded =
+            RecordedTimes::load(repository.dot_dir_path().expect("a Lore directory")).await;
         assert!(!reloaded.none(), "a later mount finds the shard");
         assert_eq!(reloaded.mtime_for(repository, &path, 777).await, 999);
 
@@ -237,7 +198,8 @@ async fn swap_times_are_kept_in_the_instance_records_and_a_copy_carries_them() {
                 std::fs::copy(entry.path(), copied.join(entry.file_name())).expect("copy");
             }
         }
-        let carried = RecordedTimes::load(&clone.repository).await;
+        let carried =
+            RecordedTimes::load(clone.repository.dot_dir_path().expect("a Lore directory")).await;
         assert!(!carried.none());
         assert_eq!(
             carried.mtime_for(&clone.repository, &path, 777).await,
@@ -281,7 +243,8 @@ async fn the_mount_shares_the_records_of_the_instances_commands() {
                 .await
                 .expect("record as a commit does");
 
-            let times = RecordedTimes::load(&repository).await;
+            let times =
+                RecordedTimes::load(repository.dot_dir_path().expect("a Lore directory")).await;
             assert!(!times.none(), "the command's record opens the gate");
             assert_eq!(times.mtime_for(&repository, &committed, 7).await, 500);
             times

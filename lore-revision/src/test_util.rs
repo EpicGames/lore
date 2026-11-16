@@ -337,6 +337,40 @@ pub(crate) async fn branch_step(step: BranchStep) {
     }
 }
 
+/// A pause a test arms: once armed, the next [`pass`](Self::pass) stops, whichever task makes it,
+/// until it is resumed.
+#[derive(Default)]
+pub struct ArmedPause {
+    armed: AtomicBool,
+    reached: Notify,
+    resume: Notify,
+}
+
+impl ArmedPause {
+    /// Stops the next pass.
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Waits until the armed pass stops.
+    pub async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Lets the stopped pass go on.
+    pub fn resume(&self) {
+        self.resume.notify_one();
+    }
+
+    /// Stops here where the pause is armed.
+    pub async fn pass(&self) {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.reached.notify_one();
+            self.resume.notified().await;
+        }
+    }
+}
+
 /// Where a task run under [`hold_unmount_drains`] reports that a FUSE unmount's drain found the
 /// inode table counting no lookups, and what it waits for to go on.
 #[cfg(target_os = "linux")]

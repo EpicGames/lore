@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lore_base::test_util::TempDir;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Fragment;
@@ -694,6 +695,26 @@ fn marked_address(marker: u64) -> Address {
     }
 }
 
+/// A provider over a context without a Lore directory is refused before it takes the State, so
+/// the caller's own State, which it would serve for the zero revision, stays unserved.
+#[tokio::test]
+async fn a_provider_over_a_context_without_a_lore_directory_is_refused_and_serves_nothing() {
+    let (immutable_store, mutable_store, execution) =
+        fuse_fixture::test_store_create().await.expect("stores");
+    lore_base::runtime::LORE_CONTEXT
+        .scope(execution, async {
+            let repository = Arc::new(RepositoryContext::new_null_context(
+                immutable_store,
+                mutable_store,
+            ));
+            let state = lore_revision::state::State::new();
+            let built = FuseFilesystem::new(repository, state.clone(), attr_context()).await;
+            assert!(matches!(built, Err(error) if error.is_internal()));
+            assert!(!state.is_served(), "the State is left unserved");
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn same_content_directories_under_a_path_specific_view_keep_their_own_masks() {
     let (immutable_store, mutable_store, execution) =
@@ -703,9 +724,11 @@ async fn same_content_directories_under_a_path_specific_view_keep_their_own_mask
         .view
         .add_exclusion("a/x/secret.txt")
         .expect("exclusion");
+    let instance = TempDir::new("fuse-provider-view-masks-");
     let repository = Arc::new(
         RepositoryContext::new(
             fuse_fixture::default_repository_creation_args(immutable_store, mutable_store)
+                .with_path(instance.path())
                 .with_filter(Arc::new(filter)),
         )
         .with_write_token(RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER)),
@@ -1789,5 +1812,25 @@ async fn a_pinned_block_gives_back_exactly_its_charge_after_attaches() {
         served.listings.pinned_bytes(),
         0,
         "exactly the charge comes back"
+    );
+}
+
+/// A future run under an execution context holds its work once: the scope takes the work rather
+/// than standing beside it.
+#[test]
+fn a_scoped_future_holds_its_work_once() {
+    let context: Arc<dyn std::any::Any + Send + Sync> = Arc::new(());
+    let work = || async {
+        let held = [0_u8; 1024];
+        tokio::task::yield_now().await;
+        held.len()
+    };
+    let scoped = lore_revision::fs::fuse::filesystem::scoped_in(Some(&context), work());
+
+    assert!(
+        size_of_val(&scoped) < 2 * size_of_val(&work()),
+        "the scoped future holds {} bytes for work of {}",
+        size_of_val(&scoped),
+        size_of_val(&work())
     );
 }

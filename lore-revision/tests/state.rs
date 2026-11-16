@@ -984,7 +984,8 @@ mod tests {
 
     /// Run `body` against a fresh in-memory state, inside the execution scope the
     /// state edits read their globals from. Nothing here serializes, so the
-    /// repository needs no path and no write token.
+    /// repository needs no write token; its path is a scratch directory, as a
+    /// provider over it reads its Lore directory.
     async fn with_state<F, Fut>(body: F)
     where
         F: FnOnce(Arc<RepositoryContext>, Arc<State>) -> Fut + Send + 'static,
@@ -1002,8 +1003,10 @@ mod tests {
                 )
                 .await
                 .expect("Failed to create store");
+                let tempdir = generate_tempdir();
                 let repository = Arc::new(RepositoryContext::new(
-                    default_repository_creation_args(immutable_store, mutable_store),
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_path(tempdir.path()),
                 ));
                 body(repository, State::new()).await;
             }))

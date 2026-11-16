@@ -10688,7 +10688,7 @@ async fn store_modified_time(repository: &RepositoryContext, path: &impl WalkPat
 
 /// The modification time stored under `key` in `repository`'s mutable store, 0 for none.
 #[lore_macro::test_pub]
-pub(crate) async fn stored_modified_time(repository: &RepositoryContext, key: Hash) -> u64 {
+async fn stored_modified_time(repository: &RepositoryContext, key: Hash) -> u64 {
     match repository
         .read_mutable_store()
         .load(repository.root_id(), key, KeyType::Untyped)
