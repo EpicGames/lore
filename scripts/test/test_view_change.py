@@ -21,7 +21,7 @@ from lore_parsers import (
     parse_layer_list_json,
     parse_status_json,
 )
-from test_utils import to_posix, view_file
+from test_utils import staged_revision, status_revisions, to_posix, view_file
 
 from lore import Lore
 
@@ -172,23 +172,9 @@ def assert_status_clean(instance: Lore, message: str) -> None:
     assert {to_posix(entry.get("path", "")) for entry in entries} == set(), message
 
 
-def status_revisions(instance: Lore) -> dict:
-    """What the instance reports of the revisions it stands on."""
-    entries = parse_jsonl(
-        instance.status(json=True, offline=True, revision_only=True),
-        "repositoryStatusRevision",
-    )
-    return entries[-1]
-
-
 def current_revision(instance: Lore) -> str:
     """The revision the instance's working tree stands on."""
     return status_revisions(instance)["revision"]
-
-
-def staged_revision(instance: Lore) -> str:
-    """The staged state the instance holds, which is zero while it holds none."""
-    return status_revisions(instance)["revisionStaged"]
 
 
 @pytest.mark.smoke

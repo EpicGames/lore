@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: MIT
 """Shared test utility functions."""
 
-import json
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -82,18 +81,23 @@ def status_by_path(repo: "Lore", **kwargs) -> dict[str, dict]:
     }
 
 
+def status_revisions(repo: "Lore") -> dict:
+    """What `repo` reports of the revisions it stands on."""
+    entries = parse_jsonl(
+        repo.status(json=True, offline=True, revision_only=True),
+        "repositoryStatusRevision",
+    )
+    return entries[-1]
+
+
+def staged_revision(repo: "Lore") -> str:
+    """The staged state `repo` holds, which is zero while it holds none."""
+    return status_revisions(repo)["revisionStaged"]
+
+
 def has_staged_anchor(repo: "Lore") -> bool:
     """Whether `status` reports a staged revision, the state every staged or dirty mark lives in."""
-    zero_hash = "0" * 64
-    for line in repo.status(json=True, offline=True).splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        revision_staged = event.get("data", {}).get("revisionStaged", "")
-        if revision_staged and revision_staged != zero_hash:
-            return True
-    return False
+    return staged_revision(repo) != "0" * 64
 
 
 def get_unstage_counts(output: str) -> dict:

@@ -1413,13 +1413,17 @@ async fn enumerate_eligible_links(
 }
 
 /// Pre-populate `MergedLink`s for entries already in the staged
-/// `LinkMergeState` (from a prior resume pass) so the conflict / main-merge
+/// `LinkMergeState` (from an earlier pass) so the conflict / main-merge
 /// tail re-applies their pins instead of regressing them to `state_current`'s
 /// pre-merge values.
+///
+/// Drops from `link_merge_entries` each entry whose link the staged state still pins at its
+/// pre-merge revision. A pass that failed after checkpointing a link and before staging its pin
+/// leaves such an entry, and the caller merges that link again.
 async fn seed_resumed_merged_links(
     repository: &Arc<RepositoryContext>,
     state_staged_opt: &Option<Arc<State>>,
-    link_merge_entries: &[LinkMergeEntry],
+    link_merge_entries: &mut Vec<LinkMergeEntry>,
 ) -> Result<Vec<MergedLink>, MergeError> {
     let mut merged_links: Vec<MergedLink> = Vec::new();
     let Some(state_staged) = state_staged_opt else {
@@ -1432,12 +1436,17 @@ async fn seed_resumed_merged_links(
         .link_list(repository.clone())
         .await
         .forward::<MergeError>("listing staged links")?;
-    for entry in link_merge_entries {
-        let staged_ref = staged_link_list
+    let staged_row = |entry: &LinkMergeEntry| {
+        staged_link_list
             .iter()
             .find(|l| l.local_node == entry.local_node)
-            .copied();
-        let Some(staged_ref) = staged_ref else {
+            .copied()
+    };
+    link_merge_entries.retain(|entry| {
+        staged_row(entry).is_none_or(|staged_ref| staged_ref.signature != entry.base.signature)
+    });
+    for entry in link_merge_entries.iter() {
+        let Some(staged_ref) = staged_row(entry) else {
             continue;
         };
         let link_path = state_staged
@@ -1509,12 +1518,12 @@ async fn report_unresolved_link_conflicts(merged_links: &[MergedLink]) -> Result
 ///
 /// Reads top-down: enumerate eligible links, load existing
 /// `LinkMergeState` for resume detection, seed `merged_links` for any
-/// already-merged entries, check the main repository's merge against the
-/// working tree, skip the links its diff removes, plan the merge of the
-/// following links it brings in, check the merge of each remaining eligible
-/// link, write each link's merge in turn, and finalize either as a
-/// merge-in-conflict (if any link conflicted) or by writing the main
-/// repository's merge. A resumed merge whose main repository is merged
+/// already-merged entries and merge again those whose pin was never staged,
+/// check the main repository's merge against the working tree, skip the links
+/// its diff removes, plan the merge of the following links it brings in, check
+/// the merge of each remaining eligible link, write each link's merge in turn,
+/// and finalize either as a merge-in-conflict (if any link conflicted) or by
+/// writing the main repository's merge. A resumed merge whose main repository is merged
 /// already is refused.
 async fn merge_start_all(
     repository: Arc<RepositoryContext>,
@@ -1540,7 +1549,7 @@ async fn merge_start_all(
     };
 
     let mut merged_links =
-        seed_resumed_merged_links(&repository, &state_staged_opt, &link_merge_entries).await?;
+        seed_resumed_merged_links(&repository, &state_staged_opt, &mut link_merge_entries).await?;
     if let Some(state_staged) = &state_staged_opt {
         if report_unresolved_link_conflicts(&merged_links).await? {
             return Ok(state_staged.revision());
@@ -1779,11 +1788,17 @@ async fn merge_start_all(
             //
             // Deserialize fresh (rather than reuse `state_current`'s Arc)
             // so checkpoint mutations don't bleed into the parent merge's
-            // input state. The next phase overwrites this checkpoint.
-            let checkpoint =
-                state::State::deserialize(repository.clone(), state_current.revision())
-                    .await
-                    .forward::<MergeError>("deserializing checkpoint state")?;
+            // input state. The next phase overwrites this checkpoint. A
+            // resumed merge builds on its staged state, which keeps the pins
+            // an earlier pass realized.
+            let checkpoint = state::State::deserialize(
+                repository.clone(),
+                state_staged_opt
+                    .as_ref()
+                    .map_or(state_current.revision(), |staged| staged.revision()),
+            )
+            .await
+            .forward::<MergeError>("deserializing checkpoint state")?;
             checkpoint.set_parent_self(state_current.revision());
             checkpoint
                 .serialize_link_merge_state(repository.clone(), &link_merge_entries)
