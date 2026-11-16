@@ -1907,13 +1907,15 @@ single conditional put on the mutable store.
   working tree, fetching fragments on demand, materializing a view.
 - *Fully atomic.* The operation either completes in full or leaves the repository in its
   prior state, with no observable intermediate. Examples: advancing a branch's latest
-  pointer, obliterating a fragment, the local mutable-store update at the end of
-  committing.
+  pointer, obliterating a fragment.
 
 A push uploads many fragments (resumable partial), then issues a single conditional put on
 the latest pointer (atomic). Committing creates many fragments locally (resumable partial),
 then writes the new revision state and advances the local latest pointer (atomic). The
-shape recurs.
+shape recurs. A flush of the local mutable store is not atomic across keys, so a commit
+orders its local writes across several flushes and records the revision it publishes as a
+commit intent, which lets the next commit finish one killed part way
+([ADR-00038](../developing/decisions/00038-commit-intent-orders-anchor-writes.md)).
 
 #### 16.2 Why immutability makes this tractable
 
@@ -2818,6 +2820,8 @@ Per-instance state lives in the local mutable store under instance-keyed entries
 - The instance's *current branch* - which branch this working directory is operating on.
 - The instance's *staged anchor* - a pointer to the state tree recording the instance's dirty
   and staged divergence from the committed revision.
+- The instance's *commit intent* - the revision a commit is publishing, set until the
+  commit's anchors are on disk.
 - The instance's *metadata blob* - the path on disk, creation time, and other information for
   diagnostics and stale-instance detection.
 

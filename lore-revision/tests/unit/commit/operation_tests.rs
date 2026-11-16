@@ -20,9 +20,14 @@ use lore_revision::filter::Filter;
 use lore_revision::fs::filesystem_provider::CaseLookup;
 use lore_revision::fs::filesystem_provider::FilesystemProvider;
 use lore_revision::fs::filesystem_provider::FsError;
+use lore_revision::fs::filesystem_provider::HoldOptions;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
 use lore_revision::fs::hold;
 use lore_revision::fs::os::OsFilesystem;
+use lore_revision::instance::ANCHOR_COMMITTING;
+use lore_revision::instance::ANCHOR_CURRENT;
+use lore_revision::instance::ANCHOR_STAGED;
+use lore_revision::instance::anchor_key;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::interface::LoreString;
@@ -1608,6 +1613,91 @@ async fn a_commit_carrying_a_staged_layer_is_refused_on_a_provider_holding_its_s
         *filesystem.committed_calls.lock(),
         [(signature, signature, true)],
         "The refused commit handed a revision over"
+    );
+}
+
+/// A commit cut short before its anchors reached disk, on a provider holding its state, has its
+/// revision held by the operation that completes it, the local changes kept, as a sync holds the
+/// revision it moves to: the operation read and stored none of the commit's files, so it has
+/// nothing to hand over as committed.
+#[tokio::test]
+async fn a_commit_cut_short_is_held_by_a_provider_holding_its_state_once_completed() {
+    let dir = lore_base::test_util::TempDir::new("lore-commit-test-");
+    let filesystem = Arc::new(TestFilesystemProvider::holding_state_reading(dir.path()));
+    std::fs::write(dir.path().join("one.txt"), b"one").expect("write file");
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Making test stores");
+    let root = dir.to_path_buf();
+    let committed = filesystem.clone();
+
+    let (first, second, third) = runtime()
+        .spawn(LORE_CONTEXT.scope(execution, async move {
+            let (fixture, committing) = committing_repository(
+                &root,
+                immutable_store,
+                mutable_store,
+                committed,
+                Arc::default(),
+            )
+            .await;
+            stage_working_tree(&fixture, &root).await;
+            let first = commit_staged(&committing, &fixture.token, test_commit())
+                .await
+                .expect("Committing");
+            std::fs::write(root.join("one.txt"), b"two").expect("rewrite file");
+            stage_working_tree(&fixture, &root).await;
+            let second = commit_staged(&committing, &fixture.token, test_commit())
+                .await
+                .expect("Committing");
+            for (function, revision) in [
+                (ANCHOR_COMMITTING, second),
+                (ANCHOR_CURRENT, first),
+                (ANCHOR_STAGED, Hash::default()),
+            ] {
+                let (key, key_type) =
+                    anchor_key(committing.salt(), function, committing.instance_id);
+                committing
+                    .try_write_mutable_store()
+                    .expect("A write handle")
+                    .store(committing.id, key, revision, key_type)
+                    .await
+                    .expect("Storing the anchor");
+            }
+
+            let completed = commit_staged(&committing, &fixture.token, test_commit()).await;
+            assert!(
+                matches!(completed, Err(CommitError::NothingStaged(_))),
+                "{completed:?}"
+            );
+            std::fs::write(root.join("two.txt"), b"two").expect("write file");
+            stage_working_tree(&fixture, &root).await;
+            let third = commit_staged(&committing, &fixture.token, test_commit())
+                .await
+                .expect("Committing over the completed commit");
+            (first, second, third)
+        }))
+        .await
+        .expect("Test task failed");
+
+    assert_eq!(
+        *filesystem.hold_calls.lock(),
+        [(
+            second,
+            HoldOptions {
+                keep_local: true,
+                ..HoldOptions::default()
+            }
+        )],
+        "The completed commit's revision was not held, or not with the local changes kept"
+    );
+    assert_eq!(
+        *filesystem.committed_calls.lock(),
+        [
+            (first, first, true),
+            (second, second, true),
+            (third, third, true)
+        ],
+        "The completed commit was handed over as one the operation read"
     );
 }
 

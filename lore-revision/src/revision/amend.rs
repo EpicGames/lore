@@ -6,6 +6,8 @@ use lore_error_set::prelude::*;
 
 use crate::branch;
 use crate::commit::LoreRevisionCommitRevisionEventData;
+use crate::commit::clear_commit_intent;
+use crate::commit::complete_interrupted_commit;
 use crate::commit::store_branch_latest_and_make_current;
 use crate::errors::*;
 use crate::event;
@@ -83,11 +85,20 @@ pub struct AmendRevisionOptions {
     pub message: Option<String>,
 }
 
+/// Amends the current revision with `options`, publishing the amended revision as the branch
+/// latest and making it current.
+///
+/// A commit of this instance cut short before its anchors reached disk is finished first
+/// ([`complete_interrupted_commit`]), so that the revision amended is the one it committed.
 pub(crate) async fn amend_revision(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: AmendRevisionOptions,
 ) -> Result<Hash, AmendRevisionError> {
+    complete_interrupted_commit(&repository)
+        .await
+        .forward::<AmendRevisionError>("completing an interrupted commit")?;
+
     let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
         .await
         .forward::<AmendRevisionError>("Failed to deserialize current revision anchor")?;
@@ -154,9 +165,13 @@ pub(crate) async fn amend_revision(
         branch_previous,
         signature,
         current_branch,
+        None,
     )
     .await
     .forward::<AmendRevisionError>("Failed to store branch latest")?;
+    clear_commit_intent(&repository)
+        .await
+        .forward::<AmendRevisionError>("clearing the commit intent")?;
 
     event::LoreEvent::RevisionCommitRevision(LoreRevisionCommitRevisionEventData {
         repository: repository.id,

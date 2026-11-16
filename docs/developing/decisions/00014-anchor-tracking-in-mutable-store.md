@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by [ADR-00038](00038-commit-intent-orders-anchor-writes.md)
 date: 2026-03-21
 deciders: Mattias Jansson
 consulted: Raghav Narula, Matt Hoffman

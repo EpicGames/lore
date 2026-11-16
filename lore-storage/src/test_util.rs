@@ -858,15 +858,19 @@ pub type Answered = Box<
         + Sync,
 >;
 
+/// Run after a [`HookedStore`] forwards a flush that the store answers without an error.
+type Flushed = Box<dyn Fn() + Send + Sync>;
+
 /// A mutable store that forwards every call to `inner`, after its hook sees each load, store,
 /// compare-and-swap and list, and before its `answered` hook, if any, sees each load, store and
-/// compare-and-swap the store answers without an error. One that keeps zero keys answers a load
-/// of a key `inner` holds no value for with zero, where `inner` answers `AddressNotFound`, as a
-/// store that keeps a key set to zero answers.
+/// compare-and-swap the store answers without an error, and its `flushed` hook, if any, each
+/// flush. One that keeps zero keys answers a load of a key `inner` holds no value for with zero,
+/// where `inner` answers `AddressNotFound`, as a store that keeps a key set to zero answers.
 pub struct HookedStore {
     inner: Arc<dyn MutableStore>,
     hook: Hook,
     answered: Option<Answered>,
+    flushed: Option<Flushed>,
     keeps_zero_keys: bool,
 }
 
@@ -879,10 +883,31 @@ impl HookedStore {
         hook: impl Fn(StoreCall, Hash, KeyType) -> Result<(), StoreError> + Send + Sync + 'static,
         answered: Option<Answered>,
     ) -> Arc<Self> {
+        Self::hooked(inner, Box::new(hook), answered, None)
+    }
+
+    /// [`wrap`](Self::wrap), with `flushed` also run after each flush the store answers without an
+    /// error.
+    pub fn wrap_flushing(
+        inner: Arc<dyn MutableStore>,
+        hook: impl Fn(StoreCall, Hash, KeyType) -> Result<(), StoreError> + Send + Sync + 'static,
+        answered: Option<Answered>,
+        flushed: impl Fn() + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Self::hooked(inner, Box::new(hook), answered, Some(Box::new(flushed)))
+    }
+
+    fn hooked(
+        inner: Arc<dyn MutableStore>,
+        hook: Hook,
+        answered: Option<Answered>,
+        flushed: Option<Flushed>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner,
-            hook: Box::new(hook),
+            hook,
             answered,
+            flushed,
             keeps_zero_keys: false,
         })
     }
@@ -893,6 +918,7 @@ impl HookedStore {
             inner,
             hook: Box::new(|_, _, _| Ok(())),
             answered: None,
+            flushed: None,
             keeps_zero_keys: true,
         })
     }
@@ -1005,7 +1031,11 @@ impl MutableStore for HookedStore {
     }
 
     async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
-        self.inner.clone().flush(options).await
+        self.inner.clone().flush(options).await?;
+        if let Some(flushed) = &self.flushed {
+            flushed();
+        }
+        Ok(())
     }
 }
 

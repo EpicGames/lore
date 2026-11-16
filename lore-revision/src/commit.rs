@@ -34,6 +34,7 @@ use crate::file::dirty::MovedNode;
 use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::CaseLookup;
 use crate::fs::filesystem_provider::FileInfo;
+use crate::fs::filesystem_provider::HoldOptions;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
@@ -588,6 +589,10 @@ pub fn commit_boxed(
 /// A provider that holds its state is handed each revision the instance's repository commits
 /// ([`InstanceOperation::committed`]), and is refused a commit of a link alone or of a layer,
 /// which would make a revision current that it is not handed.
+///
+/// A commit of this instance cut short before its anchors reached disk is finished first, through
+/// an operation of its own, or the call fails where something was staged after it
+/// ([`complete_interrupted_commit`]).
 #[lore_macro::test_pub]
 pub(crate) async fn commit_with_metadata(
     repository: Arc<RepositoryContext>,
@@ -597,6 +602,7 @@ pub(crate) async fn commit_with_metadata(
     values: LoreArray<LoreString>,
     formats: LoreArray<LoreMetadataType>,
 ) -> Result<Hash, CommitError> {
+    complete_interrupted_commit(&repository).await?;
     with_operation(repository.file_system(), async |operation| {
         Box::pin(commit_with_metadata_in_operation(
             &operation, repository, token, options, keys, values, formats,
@@ -1601,10 +1607,14 @@ async fn build_commit_metadata(
 /// `reconciling` is the operation the commit read its files through, with the times it collected,
 /// `None` for a link's own commit, which makes no revision of the instance current. Outside a dry
 /// run, where its provider holds its state, it owes the provider's settle from before the revision
-/// may become current ([`InstanceOperationImpl::owe_settle`]), released at once where the
-/// branch's latest was not stored, and, once the revision is current and the times are stored in
-/// the instance's records, is handed `state_staged` as stored ([`hand_over_committed`]), before it
-/// is reused as the staged anchor.
+/// may become current ([`store_branch_latest_and_make_current`]), and, once the revision is current
+/// and the times are stored in the instance's records, is handed `state_staged` as stored
+/// ([`hand_over_committed`]), before it is reused as the staged anchor.
+///
+/// The instance's own commit publishes its branch latest under a commit intent, cleared once the
+/// anchors are on disk ([`clear_commit_intent`]). A link's commit writes its branch latest and
+/// current anchor with no intent: the commit that follows reads a link's revision from its branch
+/// latest or its pin, not from its anchor.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_commit(
     repository: Arc<RepositoryContext>,
@@ -1620,27 +1630,28 @@ async fn finalize_commit(
 
     if !dry_run {
         if let Some((operation, _)) = reconciling {
-            operation.owe_settle().await;
-        }
-        // The halves of `store_branch_latest_and_make_current`, apart: only a failure of the
-        // first leaves nothing current, so no settle owed.
-        if let Err(error) = branch::store_latest(
-            repository.clone(),
-            branch,
-            branch_previous,
-            signature,
-            BranchLatestStatus::Divergent,
-        )
-        .await
-        {
-            if let Some((operation, _)) = reconciling {
-                operation.release_settle_owed();
-            }
-            return Err(error).forward::<CommitError>("Failed to store current branch latest");
-        }
-        crate::instance::store_current_anchor(&repository, signature)
+            store_branch_latest_and_make_current(
+                repository.clone(),
+                branch_previous,
+                signature,
+                branch,
+                Some(operation),
+            )
+            .await?;
+        } else {
+            branch::store_latest(
+                repository.clone(),
+                branch,
+                branch_previous,
+                signature,
+                BranchLatestStatus::Divergent,
+            )
             .await
-            .forward::<CommitError>("Failed to serialize current revision anchor")?;
+            .forward::<CommitError>("Failed to store current branch latest")?;
+            crate::instance::store_current_anchor(&repository, signature)
+                .await
+                .forward::<CommitError>("Failed to serialize current revision anchor")?;
+        }
         if let Some((operation, modified_times)) = reconciling
             && operation.holds_state()
         {
@@ -1680,6 +1691,10 @@ async fn finalize_commit(
                 .forward::<CommitError>("Failed to serialize staged anchor")?;
         } else {
             let _ = crate::instance::delete_staged_anchor(&repository).await;
+        }
+
+        if reconciling.is_some() {
+            clear_commit_intent(&repository).await?;
         }
     }
 
@@ -1954,12 +1969,59 @@ async fn commit_staged_revision(
 /// pointer write compares against it, so a branch that advanced in the meantime
 /// fails with `BranchAdvanced` instead of orphaning the other committer's
 /// revision.
-pub async fn store_branch_latest_and_make_current(
+///
+/// The commit intent naming `signature` is stored and flushed before the branch latest is stored,
+/// and the branch latest is flushed before the current anchor is written. A process killed on the
+/// way leaves the anchors behind the branch latest, never ahead of it, and the intent on disk
+/// wherever the branch latest names `signature`, which is what the next commit needs to finish the
+/// work ([`complete_interrupted_commit`]). The caller clears the intent once the anchors it writes
+/// are on disk ([`clear_commit_intent`]).
+///
+/// `reconciling`, where given, is the operation the commit read its files through. It owes the
+/// provider's settle from before the revision may become current
+/// ([`InstanceOperationImpl::owe_settle`]), released where the branch latest was not stored.
+pub(crate) async fn store_branch_latest_and_make_current(
     repository: Arc<RepositoryContext>,
     previous: Hash,
     signature: Hash,
     branch: BranchId,
+    reconciling: Option<&InstanceOperationImpl>,
 ) -> Result<(), CommitError> {
+    if let Some(operation) = reconciling {
+        operation.owe_settle().await;
+    }
+    if let Err(error) = publish_branch_latest(&repository, previous, signature, branch).await {
+        if let Some(operation) = reconciling {
+            operation.release_settle_owed();
+        }
+        return Err(error);
+    }
+    repository
+        .flush(execution_context().globals().flush_options())
+        .await
+        .forward_any::<CommitError>("flushing the branch latest")?;
+
+    crate::instance::store_committed_current_anchor(&repository, signature)
+        .await
+        .forward::<CommitError>("Failed to serialize current revision anchor")
+}
+
+/// Stores the commit intent naming `signature` and flushes it, then stores `signature` as
+/// `branch`'s latest over `previous` (no flush).
+async fn publish_branch_latest(
+    repository: &Arc<RepositoryContext>,
+    previous: Hash,
+    signature: Hash,
+    branch: BranchId,
+) -> Result<(), CommitError> {
+    crate::instance::store_commit_intent(repository, signature)
+        .await
+        .forward::<CommitError>("storing the commit intent")?;
+    repository
+        .flush(execution_context().globals().flush_options())
+        .await
+        .forward_any::<CommitError>("flushing the commit intent")?;
+
     branch::store_latest(
         repository.clone(),
         branch,
@@ -1968,13 +2030,397 @@ pub async fn store_branch_latest_and_make_current(
         BranchLatestStatus::Divergent,
     )
     .await
-    .forward::<CommitError>("Failed to store current branch latest")?;
+    .forward::<CommitError>("Failed to store current branch latest")
+}
 
-    crate::instance::store_current_anchor(&repository, signature)
+/// Clears the commit intent ([`crate::instance::store_commit_intent`]) once the anchors a commit
+/// wrote are on disk: flushes the stores, then stores zero, which the command's closing flush
+/// writes. A cleared intent on disk ahead of the anchors would leave them behind a branch latest
+/// that no commit completes.
+pub(crate) async fn clear_commit_intent(
+    repository: &Arc<RepositoryContext>,
+) -> Result<(), CommitError> {
+    repository
+        .flush(execution_context().globals().flush_options())
         .await
-        .forward::<CommitError>("Failed to serialize current revision anchor")?;
+        .forward_any::<CommitError>("flushing the anchors of the commit")?;
+    crate::instance::store_commit_intent(repository, Hash::default())
+        .await
+        .forward::<CommitError>("clearing the commit intent")
+}
 
-    Ok(())
+/// Finishes a commit of this instance that was cut short after it published its revision as the
+/// branch latest, before the current and staged anchors it writes reached disk, and clears a
+/// commit intent that names no such commit.
+///
+/// Fails with `BranchAdvanced`, keeping the intent and the anchors as they are, where something
+/// was staged after the commit was cut short ([`staged_by_the_commit`]): the branch latest holds
+/// the commit, and what was staged since is the user's to unstage, or to stage again after a
+/// sync takes the revision. A warning says so. A forced command clears the intent and runs over
+/// the anchors as they are, as it did before commits recorded an intent.
+///
+/// A dry run changes nothing. Over a commit cut short it warns that the commit will be finished,
+/// or that it can't be, and fails with `BranchAdvanced`, since the anchors stay behind the branch
+/// latest; a forced dry run, and one over an intent that names no commit cut short, go on.
+///
+/// Reads one key where the commit intent is zero, which it is after every commit that ran to its
+/// end. The rest is a cold path, boxed: it runs only after a commit was cut short
+/// ([`complete_commit_cut_short`]).
+pub(crate) async fn complete_interrupted_commit(
+    repository: &Arc<RepositoryContext>,
+) -> Result<(), CommitError> {
+    let intent = crate::instance::load_commit_intent(repository)
+        .await
+        .forward::<CommitError>("loading the commit intent")?;
+    if intent.is_zero() {
+        return Ok(());
+    }
+    Box::pin(complete_commit_cut_short(repository, intent)).await
+}
+
+/// What a non-zero commit intent names.
+enum CutShort {
+    /// No commit of this instance cut short: the intent is left over and is cleared.
+    None,
+    /// A commit cut short, with something staged after it: it is left as it is.
+    StagedSince {
+        /// Whether the current anchor reached disk on the interrupted commit's revision
+        current_on_intent: bool,
+    },
+    /// A commit cut short and nothing staged after it: it is finished.
+    Completes {
+        /// The State of the interrupted commit's revision
+        committed: Arc<State>,
+        /// The staged anchor as recovery read it, rebased onto `committed` once it is current
+        staged: Option<Hash>,
+        /// The branch and the revision a merge of divergent history the commit made leaves as
+        /// where the last sync points, which the commit stores once its anchors are written
+        last_sync: Option<(BranchId, Hash)>,
+    },
+}
+
+/// [`complete_interrupted_commit`] for `intent`, a non-zero commit intent.
+///
+/// A commit cut short leaves its intent equal to the branch latest with the anchors behind it
+/// ([`anchors_behind_commit`]): the current anchor still on the revision the commit was made
+/// over, which reads as a branch advanced by another instance, or the staged anchor still on a
+/// state staged over that revision, which reads as a staged state with a stale parent. A provider
+/// that holds its state is handed the intent's revision to hold, keeping the local changes it
+/// serves, as a sync hands it the revision it moves to. The revision is made current and the
+/// staged anchor, as [`cut_short`] read it, rebased onto it, its dirty paths carried over, which
+/// leaves both as a commit that runs to its end leaves them. The intent is cleared once they are
+/// on disk ([`clear_commit_intent`]).
+async fn complete_commit_cut_short(
+    repository: &Arc<RepositoryContext>,
+    intent: Hash,
+) -> Result<(), CommitError> {
+    let dry_run = execution_context().globals().dry_run();
+    let force = execution_context().globals().force();
+    let (committed, staged, last_sync) = match cut_short(repository, intent).await? {
+        CutShort::Completes {
+            committed,
+            staged,
+            last_sync,
+        } => (committed, staged, last_sync),
+        CutShort::StagedSince { current_on_intent } if !force => {
+            if current_on_intent {
+                lore_warn!(
+                    "Revision {intent}, which a commit of this instance published before it was \
+                     interrupted, is current, and changes were staged after it over the revision \
+                     before it. Unstage them, then stage them again."
+                );
+            } else {
+                lore_warn!(
+                    "The branch latest holds revision {intent}, which a commit of this instance \
+                     published before it was interrupted, and changes were staged after it. \
+                     Unstage them, or run `lore sync` to take the revision, then stage them again."
+                );
+            }
+            return Err(BranchAdvanced.into());
+        }
+        cut => {
+            if matches!(cut, CutShort::StagedSince { .. }) {
+                // A forced command runs over the anchors as they are, as it did before the intent
+                // was recorded.
+                lore_warn!(
+                    "Revision {intent}, which a commit of this instance published before it was \
+                     interrupted, is left as it is; the forced command replaces it as the branch \
+                     latest."
+                );
+            }
+            if dry_run {
+                return Ok(());
+            }
+            return crate::instance::store_commit_intent(repository, Hash::default())
+                .await
+                .forward::<CommitError>("clearing the commit intent");
+        }
+    };
+    if dry_run {
+        // The anchors stay behind the branch latest. A dry run fails as the command run over them
+        // fails, rather than reporting an amend of the revision before the intent's.
+        lore_warn!(
+            "The commit of revision {intent} was interrupted; the command will finish it first. A \
+             dry run leaves it as it is."
+        );
+        return Err(BranchAdvanced.into());
+    }
+
+    lore_info!("Completing the interrupted commit of revision {intent}");
+    with_operation(repository.file_system(), async |operation| {
+        if operation.holds_state() {
+            operation
+                .hold_state(
+                    repository.clone(),
+                    committed.clone(),
+                    HoldOptions {
+                        keep_local: true,
+                        ..HoldOptions::default()
+                    },
+                )
+                .await
+                .forward_any::<CommitError>("holding the revision of the interrupted commit")?;
+        }
+        crate::instance::store_committed_current_anchor(repository, intent)
+            .await
+            .forward::<CommitError>("Failed to serialize current revision anchor")?;
+        let Some(staged) = staged else {
+            return Ok(());
+        };
+        let rebased = state::rebase_staged_state_in(
+            &operation,
+            repository.clone(),
+            staged,
+            intent,
+            false,
+            true,
+            None,
+        )
+        .await
+        .forward::<CommitError>("rebasing the staged anchor")?;
+        crate::instance::store_staged_anchor(repository, rebased.unwrap_or_default())
+            .await
+            .forward::<CommitError>("Failed to serialize staged anchor")
+    })
+    .await?;
+    if let Some((branch, revision)) = last_sync {
+        branch::store_last_sync(repository.clone(), branch, revision).await;
+    }
+
+    clear_commit_intent(repository).await
+}
+
+/// What `intent`, a non-zero commit intent, names ([`CutShort`]): a commit of this instance cut
+/// short before its anchors reached disk where `intent` is the branch latest and the anchors are
+/// behind it ([`anchors_behind_commit`]), and whether anything was staged after it
+/// ([`staged_by_the_commit`]).
+async fn cut_short(
+    repository: &Arc<RepositoryContext>,
+    intent: Hash,
+) -> Result<CutShort, CommitError> {
+    let (current_revision, current_branch) = crate::instance::load_own_current_anchor(repository)
+        .await
+        .forward::<CommitError>("loading the current anchor")?;
+    let branch_latest = branch::load_latest(repository.clone(), current_branch)
+        .await
+        .forward::<CommitError>("loading the branch latest")?;
+    if branch_latest != intent {
+        return Ok(CutShort::None);
+    }
+    let staged = match crate::instance::load_own_staged_revision(repository)
+        .await
+        .forward::<CommitError>("loading the staged anchor")?
+    {
+        Some(staged_revision) => Some(
+            State::deserialize(repository.clone(), staged_revision)
+                .await
+                .forward_with::<CommitError, _>(|| {
+                    format!("Failed to deserialize revision state {staged_revision}")
+                })?,
+        ),
+        None => None,
+    };
+    let committed = State::deserialize(repository.clone(), intent)
+        .await
+        .forward_with::<CommitError, _>(|| {
+            format!("Failed to deserialize revision state {intent}")
+        })?;
+    if !anchors_behind_commit(repository, current_revision, &committed, staged.as_ref()).await? {
+        return Ok(CutShort::None);
+    }
+    if !staged_by_the_commit(repository, &committed, current_revision, staged.as_ref()).await? {
+        return Ok(CutShort::StagedSince {
+            current_on_intent: current_revision == intent,
+        });
+    }
+    // A merge of divergent history leaves the last sync on the revision it merged in, as
+    // `finalize_commit` does once its anchors are written: one whose second parent is the current
+    // anchor, or, where the current anchor reached disk on the intent, one made over its second
+    // parent ([`made_over`]).
+    let other = committed.parent_other();
+    let merged_divergent = !other.is_zero()
+        && (other == current_revision
+            || (current_revision == intent && made_over(repository, other, &committed).await?));
+    let last_sync = merged_divergent.then(|| (current_branch, committed.parent_self()));
+    Ok(CutShort::Completes {
+        committed,
+        staged: staged.map(|staged| staged.revision()),
+        last_sync,
+    })
+}
+
+/// Whether `staged`, the instance's staged state, is the one the commit of `committed` left,
+/// with nothing staged after it: there is none; it is the state of dirty nodes the commit stages
+/// over `committed`, with no other parent and nothing staged on it; or it was staged over the
+/// parents `committed` has and stages nothing `committed` doesn't hold.
+///
+/// An amend cut short leaves `current_revision`, the current anchor, on the revision it replaces,
+/// and the staged state of dirty nodes over that revision. That state, with no other parent and
+/// nothing staged on it, is the amend's own as well.
+///
+/// A staged node `committed` holds at a path the commit changed over its first parent is one the
+/// commit committed, whatever its content: staging pins a path, and the commit read the content.
+/// So is a link there that `committed` holds with the same pin, and a staged delete of a path
+/// `committed` no longer holds. Anything else staged, a node at a path the commit did not change,
+/// an add, a delete of a node `committed` holds, a move, a change in a linked repository or of a
+/// link's pin, or other parents, which a merge, cherry-pick or revert stages, was staged after
+/// the commit.
+#[lore_macro::test_pub]
+async fn staged_by_the_commit(
+    repository: &Arc<RepositoryContext>,
+    committed: &Arc<State>,
+    current_revision: Hash,
+    staged: Option<&Arc<State>>,
+) -> Result<bool, CommitError> {
+    let Some(staged) = staged else {
+        return Ok(true);
+    };
+    let over_committed = staged.parent_self() == committed.revision()
+        || (staged.parent_self() == current_revision
+            && current_revision != committed.parent_self());
+    if over_committed {
+        if !staged.parent_other().is_zero() {
+            return Ok(false);
+        }
+    } else if (staged.parent_self(), staged.parent_other())
+        != (committed.parent_self(), committed.parent_other())
+    {
+        return Ok(false);
+    }
+    let changes = state::diff_collect(
+        repository.clone(),
+        committed.clone(),
+        repository.clone(),
+        staged.clone(),
+        None,
+        FilterMode::TRACKED,
+    )
+    .await
+    .forward_any::<CommitError>("comparing the staged state with the interrupted commit")?;
+    if over_committed {
+        return Ok(!changes.iter().any(|change| change.flags.is_stage()));
+    }
+    // The paths the commit changed over its first parent: a path staged anywhere else was
+    // staged after it, whatever `committed` holds there.
+    let parent = State::deserialize(repository.clone(), committed.parent_self())
+        .await
+        .forward_with::<CommitError, _>(|| {
+            format!(
+                "Failed to deserialize revision state {}",
+                committed.parent_self()
+            )
+        })?;
+    let committed_changes = state::diff_collect(
+        repository.clone(),
+        parent,
+        repository.clone(),
+        committed.clone(),
+        None,
+        FilterMode::TRACKED,
+    )
+    .await
+    .forward_any::<CommitError>("comparing the interrupted commit with its parent")?;
+    let changed: HashSet<&str> = committed_changes
+        .iter()
+        .map(|change| change.path().as_str())
+        .collect();
+    Ok(changes
+        .iter()
+        .filter(|change| change.flags.is_stage())
+        .all(|change| {
+            if change.resolved_side().mapping.repository.id != repository.id
+                || !changed.contains(change.path().as_str())
+            {
+                return false;
+            }
+            match change.action {
+                FileAction::Keep => {
+                    !change.to.flags.contains(NodeFlags::Link)
+                        || change.from.address == change.to.address
+                }
+                FileAction::Delete => !change.from.mapping.node.is_valid_node_id(),
+                _ => false,
+            }
+        }))
+}
+
+/// Whether the anchors of this instance are behind `committed`, a revision it committed: the
+/// current anchor is on a revision `committed` was made over ([`made_over`]), or the current
+/// anchor is on `committed` and `staged`, the staged state, is still staged over its first
+/// parent.
+///
+/// The current anchor is held to the revisions a commit is made over, so that an intent left
+/// behind by a commit, which a writer that does not know the intent never clears, does not take a
+/// current anchor that writer moved elsewhere for a commit cut short.
+async fn anchors_behind_commit(
+    repository: &Arc<RepositoryContext>,
+    current_revision: Hash,
+    committed: &Arc<State>,
+    staged: Option<&Arc<State>>,
+) -> Result<bool, CommitError> {
+    if current_revision != committed.revision() {
+        return made_over(repository, current_revision, committed).await;
+    }
+    Ok(staged.is_some_and(|staged| staged.parent_self() == committed.parent_self()))
+}
+
+/// Whether `revision` is one a commit of `committed` was made over: its first parent; its second
+/// parent where the commit merged the branch latest into it, which leaves both parents on one
+/// branch, as a sync of divergent history does; or a revision with the same parents, which an
+/// amend replaces. A merge of another branch is made over its first parent, and so is a merge
+/// whose second parent records no branch.
+async fn made_over(
+    repository: &Arc<RepositoryContext>,
+    revision: Hash,
+    committed: &Arc<State>,
+) -> Result<bool, CommitError> {
+    let parents = (committed.parent_self(), committed.parent_other());
+    if revision == parents.0 {
+        return Ok(true);
+    }
+    if revision.is_zero() {
+        return Ok(false);
+    }
+    let state = State::deserialize(repository.clone(), revision)
+        .await
+        .forward_with::<CommitError, _>(|| {
+            format!("Failed to deserialize revision state {revision}")
+        })?;
+    if revision == parents.1 {
+        if state.metadata_hash().is_zero() || committed.metadata_hash().is_zero() {
+            return Ok(false);
+        }
+        let branch = state
+            .recorded_branch(repository.clone())
+            .await
+            .forward_any::<CommitError>("reading the branch of the second parent")?;
+        let committed_branch = committed
+            .recorded_branch(repository.clone())
+            .await
+            .forward_any::<CommitError>("reading the branch of the interrupted commit")?;
+        return Ok(branch == committed_branch);
+    }
+    Ok((state.parent_self(), state.parent_other()) == parents)
 }
 
 /// Fragments every file the state holds and rehashes the directories the changes reach.

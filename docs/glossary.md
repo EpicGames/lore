@@ -157,6 +157,12 @@ To record the staged changes as a new revision (`lore commit`). The new revision
 
 Compare to: revision.
 
+### Commit intent
+
+The revision a commit of a repository instance publishes as its branch's latest, recorded in the mutable store before the commit publishes it and cleared once the anchors the commit writes are on disk. The next commit or amend uses it to finish a commit killed in between.
+
+Also see: commit, latest.
+
 ### Compaction
 
 The background process that keeps the local store under its maximum size by removing the least recently used content and rewriting its packfiles. Like eviction, it removes only content the remote also holds.

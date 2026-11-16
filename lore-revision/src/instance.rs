@@ -66,6 +66,9 @@ pub const INSTANCE_METADATA: &str = "instance-metadata";
 pub const ANCHOR_CURRENT: &str = "anchor-current";
 pub const ANCHOR_CURRENT_BRANCH: &str = "anchor-current-branch";
 pub const ANCHOR_STAGED: &str = "anchor-staged";
+/// Names the commit intent among an instance's anchor keys ([`anchor_key`]): the revision a commit
+/// of the instance publishes ([`store_commit_intent`]).
+pub const ANCHOR_COMMITTING: &str = "anchor-committing";
 
 /// A unique identity for a repository instance (a local checkout).
 ///
@@ -312,7 +315,12 @@ async fn remove_instance_keys(
     let _ = handle
         .store(repository.id, key, Hash::default(), key_type)
         .await;
-    for function in [ANCHOR_CURRENT, ANCHOR_CURRENT_BRANCH, ANCHOR_STAGED] {
+    for function in [
+        ANCHOR_CURRENT,
+        ANCHOR_CURRENT_BRANCH,
+        ANCHOR_STAGED,
+        ANCHOR_COMMITTING,
+    ] {
         let (key, key_type) = anchor_key(repository.salt(), function, instance_id);
         let _ = handle
             .store(repository.id, key, Hash::default(), key_type)
@@ -868,8 +876,37 @@ pub async fn load_staged_revision(
     Ok(None)
 }
 
-/// Write the current anchor to the mutable store.
+/// Write the current anchor to the mutable store, clearing the commit intent
+/// ([`store_commit_intent`]) first where one is left: the anchor moves away from the revision it
+/// names.
+///
+/// A non-zero intent is one a commit left when it was cut short. The cleared intent is flushed
+/// before the anchor is written, so that a flush cut short cannot land the anchor without it.
+/// That clear is a cold path, boxed.
 pub async fn store_current_anchor(
+    repository: &Arc<RepositoryContext>,
+    revision: Hash,
+) -> Result<(), AnchorError> {
+    if !load_commit_intent(repository).await?.is_zero() {
+        Box::pin(clear_commit_intent_on_disk(repository)).await?;
+    }
+    store_committed_current_anchor(repository, revision).await
+}
+
+/// Clears the commit intent and flushes the stores, for [`store_current_anchor`].
+async fn clear_commit_intent_on_disk(
+    repository: &Arc<RepositoryContext>,
+) -> Result<(), AnchorError> {
+    store_commit_intent(repository, Hash::default()).await?;
+    repository
+        .flush(crate::lore::execution_context().globals().flush_options())
+        .await
+        .forward_any::<AnchorError>("flushing the cleared commit intent")
+}
+
+/// Write the current anchor to the mutable store, keeping the commit intent
+/// ([`store_commit_intent`]) for a commit that makes `revision` current.
+pub(crate) async fn store_committed_current_anchor(
     repository: &Arc<RepositoryContext>,
     revision: Hash,
 ) -> Result<(), AnchorError> {
@@ -880,6 +917,71 @@ pub async fn store_current_anchor(
         .await
         .forward_any::<AnchorError>("failed to store current anchor")?;
     Ok(())
+}
+
+/// Write the commit intent to the mutable store (no flush): `revision`, which a commit of this
+/// instance publishes as its branch's latest and makes current, or zero once the commit's anchors
+/// are on disk.
+///
+/// The intent, on disk before the branch latest is stored, tells the next commit that a branch
+/// latest the anchors are behind is this instance's own commit rather than one of another
+/// instance, see [`crate::commit::store_branch_latest_and_make_current`] for the order of the
+/// writes. [`store_current_anchor`] clears it.
+pub(crate) async fn store_commit_intent(
+    repository: &Arc<RepositoryContext>,
+    revision: Hash,
+) -> Result<(), AnchorError> {
+    let (key, key_type) = anchor_key(repository.salt(), ANCHOR_COMMITTING, repository.instance_id);
+    let handle = repository.try_write_mutable_store().ok_or(WriteRequired)?;
+    handle
+        .store(repository.id, key, revision, key_type)
+        .await
+        .forward_any::<AnchorError>("storing the commit intent")?;
+    Ok(())
+}
+
+/// Load the commit intent ([`store_commit_intent`]) of this instance, zero when there is none.
+#[lore_macro::test_pub]
+pub(crate) async fn load_commit_intent(
+    repository: &Arc<RepositoryContext>,
+) -> Result<Hash, AnchorError> {
+    load_own_anchor(repository, ANCHOR_COMMITTING).await
+}
+
+/// Load this instance's current anchor from the mutable store: its revision, zero when there is
+/// none, and its branch. Unlike [`load_current_anchor`], a store that fails a read fails the call,
+/// and so does a missing branch, rather than falling back to the legacy anchor file.
+pub(crate) async fn load_own_current_anchor(
+    repository: &Arc<RepositoryContext>,
+) -> Result<(Hash, BranchId), AnchorError> {
+    let revision = load_own_anchor(repository, ANCHOR_CURRENT).await?;
+    let branch = load_own_anchor(repository, ANCHOR_CURRENT_BRANCH).await?;
+    if branch.is_zero() {
+        return Err(AnchorError::internal("anchor branch is missing"));
+    }
+    Ok((revision, branch.to_context()))
+}
+
+/// Load the revision of this instance's staged anchor from the mutable store, `None` where the
+/// store holds none or holds zero. Unlike [`load_staged_revision`], a store that fails the read
+/// fails the call.
+pub(crate) async fn load_own_staged_revision(
+    repository: &Arc<RepositoryContext>,
+) -> Result<Option<Hash>, AnchorError> {
+    load_anchor(repository, ANCHOR_STAGED, repository.instance_id)
+        .await
+        .forward_any::<AnchorError>("loading the staged anchor")
+}
+
+/// Load the anchor `function` names of this instance, zero where the store holds none.
+async fn load_own_anchor(
+    repository: &Arc<RepositoryContext>,
+    function: &str,
+) -> Result<Hash, AnchorError> {
+    load_anchor(repository, function, repository.instance_id)
+        .await
+        .map(Option::unwrap_or_default)
+        .forward_any::<AnchorError>("loading an anchor")
 }
 
 /// Write the current branch to the mutable store (no flush).
