@@ -681,7 +681,7 @@ impl<C: Send + Sync + 'static> Scenario<C> {
                     }
                 }
                 if depth == path.len() {
-                    let sleep = path.last().map(child_sleep).unwrap_or_default();
+                    let sleep = path.last().map_or_default(child_sleep);
                     let cancelled = path.last().map_or_else(Vec::new, |parent| {
                         let mut cancelled = parent.cancelled.clone();
                         if let Some(Choice::Cancel(task)) = parent.chosen {
@@ -818,8 +818,8 @@ impl<C: Send + Sync + 'static> Scenario<C> {
         if let Some(what) = no_task {
             panic!("scenario '{}': {what}, after:\n{trace}", self.name);
         }
-        let records = log.as_ref().map(|log| log.drain()).unwrap_or_default();
-        let calls = log.as_ref().map(|log| log.take_calls()).unwrap_or_default();
+        let records = log.as_ref().map_or_default(|log| log.drain());
+        let calls = log.as_ref().map_or_default(|log| log.take_calls());
         if let Some(what) = log.as_ref().and_then(|log| log.no_task()) {
             panic!("scenario '{}': {what}, after:\n{trace}", self.name);
         }

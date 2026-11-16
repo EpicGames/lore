@@ -616,13 +616,11 @@ pub struct LocalImmutableStoreFailureGenerator {
 impl LocalImmutableStoreFailureGenerator {
     /// The hashes the environment variable `name` lists, separated by commas.
     fn hashes_from_env(name: &str) -> HashSet<Hash> {
-        std::env::var(name)
-            .map(|val| {
-                val.split(",")
-                    .filter_map(|hash| Hash::from_str(hash.trim()).ok())
-                    .collect()
-            })
-            .unwrap_or_default()
+        std::env::var(name).map_or_default(|val| {
+            val.split(",")
+                .filter_map(|hash| Hash::from_str(hash.trim()).ok())
+                .collect()
+        })
     }
 }
 

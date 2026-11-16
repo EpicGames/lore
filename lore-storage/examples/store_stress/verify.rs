@@ -1304,20 +1304,18 @@ pub fn info(args: &Args) -> u8 {
     let mut groups: Vec<_> = groups.flatten().map(|group| group.path()).collect();
     groups.sort();
     for group in groups {
-        let mut names: Vec<String> = std::fs::read_dir(&group)
-            .map(|files| {
-                files
-                    .flatten()
-                    .map(|file| {
-                        let len = file.metadata().map_or(0, |metadata| metadata.len());
-                        format!("{}({len})", file.file_name().to_string_lossy())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut names: Vec<String> = std::fs::read_dir(&group).map_or_default(|files| {
+            files
+                .flatten()
+                .map(|file| {
+                    let len = file.metadata().map_or(0, |metadata| metadata.len());
+                    format!("{}({len})", file.file_name().to_string_lossy())
+                })
+                .collect()
+        });
         names.sort();
-        let mut packs: Vec<String> = std::fs::read_dir(group.join("pack"))
-            .map(|files| {
+        let mut packs: Vec<String> =
+            std::fs::read_dir(group.join("pack")).map_or_default(|files| {
                 files
                     .flatten()
                     .map(|file| {
@@ -1325,8 +1323,7 @@ pub fn info(args: &Args) -> u8 {
                         format!("{}:{len}", file.file_name().to_string_lossy())
                     })
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         packs.sort();
         println!(
             "{}: files [{}] packs [{}]",

@@ -1848,8 +1848,7 @@ async fn seed_local_store(settings: &LocalImmutableStoreSettings) -> Result<(), 
                 .expect("Could not downcast store");
 
             let margin = std::env::var("LORE_SEEDING_MARGIN")
-                .map(|v| v.parse::<usize>().unwrap_or_default())
-                .unwrap_or_default();
+                .map_or_default(|v| v.parse::<usize>().unwrap_or_default());
 
             let buffer = std::env::var("LORE_SEEDING_BUFFER").map_or(DEFAULT_BUFFER_SIZE, |v| {
                 v.parse::<usize>().unwrap_or(DEFAULT_BUFFER_SIZE)

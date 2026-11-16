@@ -1722,14 +1722,12 @@ async fn put_refuses_invalid_fragments(dir: PathBuf) -> Outcome {
                 sanitized.push(name);
                 continue;
             }
-            let stored = found
-                .map(|found| {
-                    format!(
-                        "flags {:#x} sizes {}/{}",
-                        found.data.flags, found.data.size_payload, found.data.size_content
-                    )
-                })
-                .unwrap_or_default();
+            let stored = found.map_or_default(|found| {
+                format!(
+                    "flags {:#x} sizes {}/{}",
+                    found.data.flags, found.data.size_payload, found.data.size_content
+                )
+            });
             accepted.push(format!("{name} (stored {stored})"));
         }
     }

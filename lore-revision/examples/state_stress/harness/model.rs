@@ -777,8 +777,7 @@ impl StateModel {
     pub fn chain(&self, directory: NodeID) -> Vec<NodeID> {
         self.chains
             .get(&directory)
-            .map(|chain| chain.iter().copied().collect())
-            .unwrap_or_default()
+            .map_or_default(|chain| chain.iter().copied().collect())
     }
 
     /// What `node` hangs from, up its chains.
