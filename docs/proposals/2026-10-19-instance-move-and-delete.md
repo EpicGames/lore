@@ -6,7 +6,7 @@ authors:
   - Zack Neyland
 status: Accepted
 created: 2026-10-19
-updated: 2026-11-07
+updated: 2026-11-16
 discussion: https://web.lore.internal.epicgames.net/epic/Lore/change-request/1113
 ---
 
@@ -31,11 +31,7 @@ new location. A user who removes a checkout by hand leaves its registration behi
 `lore repository instance prune` retires it. Both manual procedures depend on the user knowing the procedure and on the
 directory being an ordinary one.
 
-Neither procedure is available for an SWFS instance. An SWFS instance keeps its `.lore` in an external directory under
-the global data directory (see [`external_dir.rs`](../../lore-revision/src/global/external_dir.rs)), and its checkout
-path is a virtual mount owned by the Lore service (see [
-`mount_manager.rs`](../../lore-revision/src/fs/mount_manager.rs)). There is no directory for the user to move or
-delete, and moving the registered path alone leaves SWFS mounted at the old path.
+Neither procedure is available for an SWFS instance. An SWFS instance keeps its `.lore` in an external directory in the external root, which is `external/` in the global data directory unless the user names another root ([Configurable external directory root](2026-11-11-configurable-external-directory-root.md), [`external_dir.rs`](../../lore-revision/src/global/external_dir.rs)), and its checkout path is a virtual mount owned by the Lore service (see [`mount_manager.rs`](../../lore-revision/src/fs/mount_manager.rs)). There is no directory for the user to move or delete, and moving the registered path alone leaves SWFS mounted at the old path.
 
 A command that does the work must also leave a usable state when it fails part-way. A failed move must not leave
 `instance list` naming a path that holds nothing. A delete must work on Windows, where a process cannot delete a
@@ -176,24 +172,7 @@ removes the directories step 3 created.
    instance's own local store, so the command skips this step for such instances. The command closes the instance before
    it deletes anything, so no lock or store file is open.
 3. **Unmount** an SWFS instance, closing its interface.
-4. **Delete the files**: the external directory for an SWFS instance, the instance directory otherwise, retrying while
-   they are in use. The command first renames that directory aside, to a sibling `<name>.deleting-<instance ID>` in
-   the same parent directory, where `<instance ID>` is the hex form of the identifier in `.lore/instance`, and then
-   deletes the sibling. A regular instance's path holds nothing as soon as the rename lands. An SWFS instance's sibling
-   sits beside its external directory, in the global data directory. The rename is retried while the files are in use,
-   like any rename here, and a rename still refused after the retries fails the delete before anything is removed.
-   Where the rename is refused because the directory is a mount point (`EXDEV` or `EBUSY` on Unix,
-   `ERROR_NOT_SAME_DEVICE` on Windows), the command deletes the directory in place, and keeps the mount point's own
-   empty directory where the system refuses to remove it. On Unix, a directory whose rename is refused with `EBUSY` is
-   therefore deleted in place rather than retried. Windows doesn't refuse to rename a volume mounted in a folder, or a
-   junction: both are reparse points with the mount-point tag, and the rename moves the reparse point without the files
-   it leads to. The command doesn't rename a directory with that tag; it deletes the files through it and keeps the
-   reparse point. Where the directory is a volume mounted in a folder, which `GetVolumeNameForVolumeMountPointW` names,
-   the command also keeps the entries at the volume's root that are both hidden and system, such as
-   `System Volume Information` and `$RECYCLE.BIN`, which the system keeps and denies access to. Validation checks the sibling name in every case, so an instance that is a mount point and whose
-   sibling name is taken is refused. The rename, the deletion and the fallback run as one I/O driver job on a thread of
-   its own, outside the syscall pool and its cap, so a removal that takes minutes holds no pool thread. Where the system
-   refuses a thread, the job runs on a pool thread. The command runs the job again while the files are in use.
+4. **Delete the files**: the external directory for an SWFS instance, the instance directory otherwise, retrying while they are in use. The command first renames that directory aside, to a sibling `<name>.deleting-<instance ID>` in the same parent directory, where `<instance ID>` is the hex form of the identifier in `.lore/instance`, and then deletes the sibling. A regular instance's path holds nothing as soon as the rename lands. An SWFS instance's sibling sits beside its external directory, in the external root. The rename is retried while the files are in use, like any rename here, and a rename still refused after the retries fails the delete before anything is removed. Where the rename is refused because the directory is a mount point (`EXDEV` or `EBUSY` on Unix, `ERROR_NOT_SAME_DEVICE` on Windows), the command deletes the directory in place, and keeps the mount point's own empty directory where the system refuses to remove it. On Unix, a directory whose rename is refused with `EBUSY` is therefore deleted in place rather than retried. Windows doesn't refuse to rename a volume mounted in a folder, or a junction: both are reparse points with the mount-point tag, and the rename moves the reparse point without the files it leads to. The command doesn't rename a directory with that tag; it deletes the files through it and keeps the reparse point. Where the directory is a volume mounted in a folder, which `GetVolumeNameForVolumeMountPointW` names, the command also keeps the entries at the volume's root that are both hidden and system, such as `System Volume Information` and `$RECYCLE.BIN`, which the system keeps and denies access to. Validation checks the sibling name in every case, so an instance that is a mount point and whose sibling name is taken is refused. The rename, the deletion and the fallback run as one I/O driver job on a thread of its own, outside the syscall pool and its cap, so a removal that takes minutes holds no pool thread. Where the system refuses a thread, the job runs on a pool thread. The command runs the job again while the files are in use.
 5. **Delete at background disk priority.** The thread that removes the files lowers its own disk priority for the
    removal and restores it afterwards: `setiopolicy_np` with `IOPOL_THROTTLE` on macOS, `ioprio_set` at the lowest
    best-effort level on Linux, and `THREAD_MODE_BACKGROUND_BEGIN` on Windows, which also lowers the thread's CPU and
@@ -349,16 +328,7 @@ did not rename there. A delete in place, of a mount point, a volume mounted in a
 directory holds when it runs, and through a junction that is the content of the directory the junction leads to, which
 can be on another volume.
 
-Both commands read one value from the repository directory itself: the instance identifier in `.lore/instance`. An
-instance counts as SWFS when an external directory exists for that identifier, but a directory can name any identifier.
-A checkout that named an existing SWFS instance's identifier could otherwise make a delete, run by a user inside the
-service, remove that instance's external directory while the instance stayed mounted. The same holds for an SWFS
-checkout whose instance file is changed to name another SWFS instance: its path is still a mount, but of the instance it
-belongs to, so a delete would deregister and remove the named instance's external directory while unmounting its own,
-and a move would remount its own instance while registering the named one. Both commands therefore treat an instance as
-SWFS only when the service holds the directory's own path as a mount of that same instance, which ties the path to the
-identifier, and fail otherwise. A checkout that is not SWFS but whose path the service holds as a mount fails too,
-rather than having its files moved or deleted through the mount.
+Both commands read one value from the repository directory itself: the instance identifier in `.lore/instance`. An instance counts as SWFS when an external directory exists for that identifier, but a directory can name any identifier. A checkout that named an existing SWFS instance's identifier could otherwise make a delete, run by a user inside the service, remove that instance's external directory while the instance stayed mounted. The same holds for an SWFS checkout whose instance file is changed to name another SWFS instance: its path is still a mount, but of the instance it belongs to, so a delete would deregister and remove the named instance's external directory while unmounting its own, and a move would remount its own instance while registering the named one. Both commands therefore treat an instance as SWFS only when the service holds the directory's own path as a mount of that same instance, which ties the path to the identifier, and fail otherwise. A checkout that is not SWFS but whose path the service holds as a mount fails too, rather than having its files moved or deleted through the mount. While the lookup of that external directory is unknown, such as while the external root isn't available or while a move of the root is recorded, both commands refuse an instance whose path the service holds as a mount, naming the root's state ([Configurable external directory root](2026-11-11-configurable-external-directory-root.md#reading-an-external-directory)).
 
 ## Privacy Considerations
 
