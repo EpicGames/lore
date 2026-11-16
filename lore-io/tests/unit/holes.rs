@@ -91,6 +91,24 @@ async fn next_data_reports_written_ranges_and_skips_holes() {
     );
 }
 
+/// A walk reads the file system's block on its first lookup and keeps it for the rest of the walk.
+#[tokio::test]
+async fn a_walk_keeps_the_file_systems_block_from_its_first_lookup() {
+    let dir = TempDir::new("lore-io-holes-block-");
+    let file = sparse_file(&dir, MIB, std::slice::from_ref(&(0..4096))).await;
+    let cursor = DataCursor::default();
+    assert_eq!(cursor.block(), None, "before the first lookup");
+
+    let (found, cursor) = file.next_data(0, cursor).await;
+    found.expect("find data");
+
+    let block = cursor.block().expect("the block, after the first lookup");
+    assert!(
+        block >= 512 && block.is_power_of_two(),
+        "a block of {block} bytes"
+    );
+}
+
 /// One walk reports every range of a file holding more extents than one map of the file takes,
 /// across the batches it maps them in, as walks of their own do one range at a time.
 #[tokio::test]

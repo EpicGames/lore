@@ -19,10 +19,16 @@
 //! Unlike `get`, no `GET_HEADER` or `GET_DATA` events are emitted; only the terminal
 //! `GET_ITEM_COMPLETE`.
 //!
-//! Multi-fragment writes go through a temp file at `<path>.loretmp` (or `<path>.<ext>.loretmp`
-//! if `path` already has an extension); the rename to the final target is atomic. A failure
-//! mid-write removes the temp file, so the target is either the finished range or untouched. The
-//! temp file is emptied before it is written, and a hole of the content is left unwritten in it.
+//! Multi-fragment writes go through a temporary file at `<path>.loretmp`, the name of `path` with
+//! `.loretmp` appended; the rename to the final target is atomic, so the target is either the
+//! finished range or untouched. The temporary file is emptied before it is written, and a hole of
+//! the content is left unwritten in it. A write of a range of at least 32 MiB that fails or stops
+//! keeps the temporary file, with its resume record beside it, as the `lore_storage_get_file`
+//! contract describes. A later write of the same content and range to the same path resumes from
+//! it, emptying it only where a hole of the content holds data there or its holes cannot be
+//! checked: a fragment the temporary file holds, checked against its address, is not fetched
+//! again, and a hole is not written. A write of other content or another range of at least 32 MiB
+//! empties it.
 //!
 //! A path takes one get at a time. Items that name the same path, in one call or in concurrent
 //! calls of this function or `lore_storage_get_file_resolved`, are not supported.
@@ -66,7 +72,7 @@ pub struct LoreStorageGetFileItem {
     /// Content address to read; `hash == Hash::default()` truncates `path` to zero bytes
     pub address: Address,
     /// Destination path, which takes one get at a time; empty rejects with `INVALID_ARGUMENTS`.
-    /// Multi-fragment writes stage via `<path>.loretmp` then atomically rename
+    /// Multi-fragment writes go through `<path>.loretmp`, renamed into place atomically
     pub path: LoreString,
     /// First content byte to write, counted from the start of the decompressed content.
     /// Past the end of the content rejects with `INVALID_ARGUMENTS`
@@ -190,7 +196,9 @@ async fn resolve_get_file_item(
         return Ok(());
     }
 
-    let mut read_options = effective.read_options(remote_session.is_some());
+    let mut read_options = effective
+        .read_options(remote_session.is_some())
+        .resuming_write();
     if item.local_cache != 0 {
         read_options = read_options.with_cache();
     }

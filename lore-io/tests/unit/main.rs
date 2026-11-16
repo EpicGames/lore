@@ -8,6 +8,7 @@
 
 mod clone;
 mod driver;
+mod file;
 #[cfg(target_family = "windows")]
 mod find;
 #[cfg(target_os = "linux")]

@@ -4,14 +4,18 @@
 //! `test-util`, so a test can count the decodes, hashes and fetches a read costs, answer a remote
 //! fetch without a remote, order what concurrent reads, stores and compactions do, fail packfile
 //! opens, writes, syncs and metadata reads and store directory stats or keep writes in flight,
-//! interrupt a payload gate hold, hold a read's memory past the read, and count the tasks the store
-//! runs of its own accord. A mutable store wrapper shows a test each call it forwards, so the test
-//! can fail, record or follow up the call, and can answer zero for the keys its store doesn't hold.
+//! interrupt a payload gate hold, hold a read's memory past the read, refuse the lock a file read
+//! takes on its temporary file, see it wait for that lock or find the file moved, hold the rename
+//! that finishes the file, and count the tasks the store runs of its own accord. A mutable store wrapper shows a test each call it
+//! forwards, so the test can fail, record or follow up the call, and can answer zero for the keys
+//! its store doesn't hold.
 //! An immutable store wrapper shows a test each content call it forwards, so the test can fail or
 //! record the call.
 
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicUsize;
@@ -70,6 +74,9 @@ thread_local! {
 
 tokio::task_local! {
     static UNVALIDATED_PUTS: ();
+    static LOCKS_REFUSED: ();
+    static LOCK_WAITS: Arc<Notify>;
+    static TEMPORARY_FILES_MOVED: ();
 }
 
 /// A point where [`pause_at`] holds a store, a read, a list, a flush or a compaction.
@@ -413,6 +420,69 @@ pub async fn accepting_unvalidated_puts<F: Future>(puts: F) -> F::Output {
 /// Whether the running task is inside [`accepting_unvalidated_puts`].
 pub(crate) fn unvalidated_puts_accepted() -> bool {
     UNVALIDATED_PUTS.try_with(|()| ()).is_ok()
+}
+
+/// Runs `read`, each attempt it makes to lock its temporary file failing as on a file system that
+/// refuses advisory locks. The refusal is the future's, whichever thread polls it.
+pub async fn refusing_locks<F: Future>(read: F) -> F::Output {
+    LOCKS_REFUSED.scope((), read).await
+}
+
+/// Whether the running task is inside [`refusing_locks`].
+pub(crate) fn locks_refused() -> bool {
+    LOCKS_REFUSED.try_with(|()| ()).is_ok()
+}
+
+/// Runs `read`, notifying `waiting` each time it finds the lock of its temporary file held by
+/// another read and waits to try again.
+pub async fn noting_lock_waits<F: Future>(waiting: Arc<Notify>, read: F) -> F::Output {
+    LOCK_WAITS.scope(waiting, read).await
+}
+
+/// Notifies the waiter [`noting_lock_waits`] runs the task with, if any, that it waits for a lock.
+pub(crate) fn note_lock_wait() {
+    let _ = LOCK_WAITS.try_with(|waiting| waiting.notify_one());
+}
+
+/// Runs `read`, each temporary file it locks found moved from its path once locked, as where other
+/// reads keep renaming the files they wrote into place.
+pub async fn moving_temporary_files<F: Future>(read: F) -> F::Output {
+    TEMPORARY_FILES_MOVED.scope((), read).await
+}
+
+/// Whether the running task is inside [`moving_temporary_files`].
+pub(crate) fn temporary_files_moved() -> bool {
+    TEMPORARY_FILES_MOVED.try_with(|()| ()).is_ok()
+}
+
+/// The renames [`hold_rename_of`] holds, by the temporary file each moves. The process's rather
+/// than a thread's or a task's, since the task that renames runs apart from the read.
+static RENAME_HOLDS: parking_lot::Mutex<Vec<(PathBuf, Arc<Pause>)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Holds the next resuming read to finish the temporary file `temporary` before it renames the
+/// file into place, until the returned pause is resumed. `reached` is notified once the task
+/// finishing the file has removed its resume record, still holding the file's lock. The hold is the
+/// process's, so `temporary` must be a path of the test's own.
+pub fn hold_rename_of(temporary: PathBuf) -> Arc<Pause> {
+    let pause = Arc::new(Pause::default());
+    RENAME_HOLDS.lock().push((temporary, pause.clone()));
+    pause
+}
+
+/// Holds the task finishing `temporary` before its rename if [`hold_rename_of`] armed it.
+pub(crate) async fn rename_point(temporary: &Path) {
+    let pause = {
+        let mut holds = RENAME_HOLDS.lock();
+        holds
+            .iter()
+            .position(|(armed, _)| armed == temporary)
+            .map(|position| holds.remove(position).1)
+    };
+    if let Some(pause) = pause {
+        pause.reached.notify_one();
+        pause.resume.notified().await;
+    }
 }
 
 /// Runs `hook` once, in the next payload gate hold taken on this thread, after the hold reads the

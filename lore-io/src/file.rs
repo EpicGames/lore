@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::fs::File;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -155,6 +156,120 @@ impl std::fmt::Debug for IoFile {
     }
 }
 
+/// What an attempt at the exclusive lock of a file came to ([`IoFile::try_lock`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockAttempt {
+    /// The handle holds the lock.
+    Acquired,
+    /// Another handle holds the lock.
+    Busy,
+    /// The file system refuses advisory locks.
+    Unsupported,
+}
+
+/// Whether an attempt at a lock failed because the file system refuses advisory locks, as one
+/// without lock support or a network mount without a lock service answers: `ENOLCK`, `ENOTSUP`,
+/// `EOPNOTSUPP` or `ENOSYS` on Unix, `ERROR_NOT_SUPPORTED` or `ERROR_INVALID_FUNCTION` on Windows,
+/// or [`std::io::ErrorKind::Unsupported`]. Another holder having the lock is not one.
+pub fn lock_refused(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(target_family = "windows")]
+    let refusals = [
+        windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED as i32,
+        windows_sys::Win32::Foundation::ERROR_INVALID_FUNCTION as i32,
+    ];
+    #[cfg(not(target_family = "windows"))]
+    let refusals = [libc::ENOLCK, libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOSYS];
+    err.raw_os_error()
+        .is_some_and(|code| refusals.contains(&code))
+}
+
+/// One attempt at the exclusive lock of `file`: `true` where it took the lock, `false` where
+/// another handle holds it.
+#[cfg(not(target_family = "windows"))]
+fn try_lock_file(file: &File) -> std::io::Result<bool> {
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(err)) => Err(err),
+    }
+}
+
+/// One attempt at the exclusive lock of `file`, an overlapped handle: `true` where it took the
+/// lock, `false` where another handle holds it. See [`IoFile::try_lock`].
+#[cfg(target_family = "windows")]
+fn try_lock_file(file: &File) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::ERROR_IO_PENDING;
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::LOCKFILE_EXCLUSIVE_LOCK;
+    use windows_sys::Win32::Storage::FileSystem::LOCKFILE_FAIL_IMMEDIATELY;
+    use windows_sys::Win32::Storage::FileSystem::LockFileEx;
+    use windows_sys::Win32::System::IO::GetOverlappedResult;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    use windows_sys::Win32::System::Threading::CreateEventW;
+
+    /// The event an attempt waits on, closed once the attempt is done with it.
+    struct Event(HANDLE);
+
+    impl Drop for Event {
+        fn drop(&mut self) {
+            // SAFETY: the handle is the event this attempt created, and nothing uses it after.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    let refused = |err: std::io::Error| {
+        if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+            Ok(false)
+        } else {
+            Err(err)
+        }
+    };
+
+    // SAFETY: creates an unnamed, manual-reset event, not signalled, with default security.
+    let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    if event.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let event = Event(event);
+    let handle = file.as_raw_handle();
+    // SAFETY: an all-zero `OVERLAPPED` is valid, and its zero offset starts the lock at the file's
+    // first byte.
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    overlapped.hEvent = event.0.map_addr(|address| address | 1);
+    // SAFETY: the handle is open, and `overlapped` and the event outlive the call, which the wait
+    // below ends before either goes for a call left pending.
+    let locked = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if locked != 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
+        return refused(err);
+    }
+    let mut transferred = 0u32;
+    // SAFETY: waits for the call pending on `overlapped`, which lives until it returns.
+    if unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, 1) } != 0 {
+        return Ok(true);
+    }
+    refused(std::io::Error::last_os_error())
+}
+
 impl IoFile {
     pub(crate) fn new(driver: IoDriver, file: Arc<File>) -> IoFile {
         IoFile { driver, file }
@@ -293,6 +408,36 @@ impl IoFile {
 
     pub async fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
         self.driver.file_metadata_raw(Arc::clone(&self.file)).await
+    }
+
+    /// Whether `path` names the file this handle has open, as
+    /// [`IoDriver::names_one_entry`](crate::IoDriver::names_one_entry) tells one entry: `false`
+    /// where it names another file, the file having been renamed or replaced, or nothing.
+    pub async fn is_at(&self, path: impl Into<PathBuf>) -> std::io::Result<bool> {
+        self.driver
+            .is_at_raw(Arc::clone(&self.file), path.into())
+            .await
+    }
+
+    /// Takes the exclusive lock of the file this handle has open where no other handle holds it,
+    /// without waiting: [`LockAttempt::Busy`] while another handle does, and
+    /// [`LockAttempt::Unsupported`] where the file system refuses advisory locks ([`lock_refused`]).
+    /// The lock is held until the last clone of this handle is dropped and every operation issued
+    /// through one has ended. It is advisory on Unix, and on Windows covers the whole file, so
+    /// other handles can neither read nor write it. The attempt runs on the calling thread, so on a
+    /// network file system it may block that thread for as long as the server takes to answer.
+    ///
+    /// On Windows the attempt is a `LockFileEx` of its own rather than `std`'s, which hands an
+    /// overlapped handle a stack `OVERLAPPED` it may return before the kernel is done with: it
+    /// waits on an event of its own whose low-order bit is set, so that no completion of it reaches
+    /// an `iocp` port, and waits for an attempt left pending.
+    pub fn try_lock(&self) -> std::io::Result<LockAttempt> {
+        match try_lock_file(&self.file) {
+            Ok(true) => Ok(LockAttempt::Acquired),
+            Ok(false) => Ok(LockAttempt::Busy),
+            Err(err) if lock_refused(&err) => Ok(LockAttempt::Unsupported),
+            Err(err) => Err(err),
+        }
     }
 
     /// Sets the file length, extending it with a hole that reads as zeros or truncating it.

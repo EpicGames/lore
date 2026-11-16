@@ -11,6 +11,7 @@ use lore_storage::StorageError;
 mod call;
 mod close;
 mod get;
+mod get_file;
 mod get_resolved;
 mod handle;
 mod held;

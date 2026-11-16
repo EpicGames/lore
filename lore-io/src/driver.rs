@@ -18,8 +18,8 @@
 //!
 //! The operations every backend runs the same way go to the psync backend directly, outside the
 //! backend surface, and a backend cannot override them: `write_file_segments_atomic`,
-//! `write_file_segments`, `set_len`, `remove_dir_all_keeping` and `names_one_entry` run on the
-//! syscall pool, and `remove_dir_all_in_background` on a thread of its own.
+//! `write_file_segments`, `set_len`, `is_at_raw`, `remove_dir_all_keeping` and `names_one_entry`
+//! run on the syscall pool, and `remove_dir_all_in_background` on a thread of its own.
 //!
 //! There is no trait, and none is needed to make that complete: adding a variant to
 //! [`DriverInner`] makes every match here non-exhaustive, and filling those arms in requires
@@ -699,6 +699,12 @@ impl IoDriver {
             #[cfg(target_family = "windows")]
             DriverInner::Iocp(driver) => driver.file_metadata(file).await,
         }
+    }
+
+    /// Every backend runs this on the syscall pool, so it goes there directly, as
+    /// [`Self::names_one_entry`] does.
+    pub(crate) async fn is_at_raw(&self, file: Arc<File>, path: PathBuf) -> std::io::Result<bool> {
+        PsyncDriver.is_at(file, path).await
     }
 
     /// Every backend runs this on the syscall pool, so it goes there directly, as

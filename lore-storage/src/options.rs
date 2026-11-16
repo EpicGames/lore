@@ -171,6 +171,13 @@ impl FlushOptions {
     };
 }
 
+/// The shortest range a file read with [`ReadOptions::resume_write`] resumes. A read of a shorter
+/// range writes as one without it. Every resuming read that completes creates and removes the
+/// resume record of its temporary file, which costs a read of two small leaves about a third of its
+/// time, and one of this length 1.5% when reads run one at a time and 5% when they run at once,
+/// both within the noise of the measurement.
+pub const RESUME_WRITE_MIN_LEN: usize = 32 << 20;
+
 /// Options controlling how a fragment is read from storage.
 ///
 /// A payload the local store holds is read as stored. One fetched from a remote is checked against
@@ -205,6 +212,23 @@ pub struct ReadOptions {
     pub strict_local: bool,
     /// Write to file directly
     pub direct_write: bool,
+    /// Resume a file read from what its file already holds. A read through a temporary file of a
+    /// range of at least [`RESUME_WRITE_MIN_LEN`] keeps it when the read fails or stops, and resumes
+    /// from a temporary file that a read of the same content and range left at the same path; any
+    /// other temporary file is emptied. A read of a shorter range, or of a single fragment, writes
+    /// as one without this, and so does one whose file system refuses the temporary file's lock.
+    /// With `direct_write` a read writes no temporary file. A defragment into a file
+    /// ([`DefragmentSink::File`]) with this aborts its fetch pool and write sink when it is
+    /// dropped, so that nothing is written to the file past it.
+    ///
+    /// [`DefragmentSink::File`]: crate::defragment::DefragmentSink::File
+    pub resume_write: bool,
+    /// With `resume_write`, the file a defragment writes ([`DefragmentSink::File`]) already holds
+    /// part of the content: a whole leaf it holds, checked against its hash, is taken rather than
+    /// fetched. A file read sets it where its temporary file holds part of the content.
+    ///
+    /// [`DefragmentSink::File`]: crate::defragment::DefragmentSink::File
+    pub resume_held: bool,
     /// Force sync data to storage media after write
     pub sync_data: bool,
     /// Create the directory a file read lands in, with its missing ancestors, where the write
@@ -235,6 +259,8 @@ impl Default for ReadOptions {
             no_local_write: false,
             strict_local: false,
             direct_write: false,
+            resume_write: false,
+            resume_held: false,
             sync_data: false,
             create_parent: false,
             priority: false,
@@ -290,6 +316,12 @@ impl ReadOptions {
     /// See [`ReadOptions::strict_local`].
     pub fn with_strict_local(mut self) -> Self {
         self.strict_local = true;
+        self
+    }
+
+    /// See [`ReadOptions::resume_write`].
+    pub fn resuming_write(mut self) -> Self {
+        self.resume_write = true;
         self
     }
 

@@ -30,6 +30,7 @@ use crate::immutable_store::StoreError;
 use crate::immutable_store::claim_for_task;
 use crate::mutable_store::MutableStore;
 use crate::options::ReadOptions;
+use crate::resume::Opened;
 use crate::store_types::PayloadRead;
 use crate::store_types::StoreMatch;
 use crate::types::Address;
@@ -1646,7 +1647,11 @@ pub fn stream_root(
 ///
 /// Armed before the open, because a failure part-way through it can leave the file created.
 /// Disarmed after the rename because the path is derived from the destination: a guard outliving
-/// its own rename would delete the next reader's file.
+/// its own rename would delete the next reader's file. Never armed for a read that resumes
+/// ([`ReadOptions::resume_write`]): its temporary file is kept for the next read to resume from,
+/// and until the read holds the file's lock, the file is another read's. A read that falls back
+/// from resuming, its file system refusing the lock, arms it then. It removes the resume record as
+/// well, which a read that resumed may have left.
 struct TemporaryFile {
     path: Option<PathBuf>,
 }
@@ -1656,22 +1661,19 @@ impl TemporaryFile {
         Self { path: Some(path) }
     }
 
-    fn renamed(&mut self) {
+    fn disarm(&mut self) {
         self.path = None;
     }
 }
 
 impl Drop for TemporaryFile {
     fn drop(&mut self) {
-        if let Some(path) = self.path.take()
-            && let Err(err) = std::fs::remove_file(&path)
-            && !matches!(
-                err.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            )
-        {
-            lore_base::lore_warn!("failed to remove temporary file {}: {err}", path.display());
-        }
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        let record = crate::resume::record_path(&path);
+        crate::resume::report_removal(&path, std::fs::remove_file(&path));
+        crate::resume::report_removal(&record, std::fs::remove_file(&record));
     }
 }
 
@@ -1740,8 +1742,13 @@ pub fn read_into_file(
 /// defragment pipeline into a file emptied and sized to the range up front, so each leaf lands at
 /// its own offset and peak memory follows the leaf rather than the content — and no metadata comes
 /// back, because the handle moves into the pipeline. A hole is left unwritten, and every leaf is
-/// written, one of zeros included. That path stages through `<path><temp_file_extension>` and
-/// renames, unless `options.direct_write` asks for the target to be written in place.
+/// written, one of zeros included. That path writes through `<path><temp_file_extension>` and
+/// renames, unless `options.direct_write` asks for the target to be written in place. With
+/// `options.resume_write`, for a range of at least
+/// [`RESUME_WRITE_MIN_LEN`](crate::options::RESUME_WRITE_MIN_LEN), the temporary file is kept when
+/// the write fails or stops, and a later write of the same content and range resumes from it, as
+/// [`crate::resume`] describes: the file it resumes is sized, and is emptied and written again as a
+/// fresh one where a hole of the content holds data there or its holes cannot be checked.
 ///
 /// Where `options.create_parent` asks for it, a write that finds the directory `path` goes in
 /// missing creates that directory, with its missing ancestors, and opens again at once. A
@@ -1782,31 +1789,43 @@ fn write_root_to_file(
         if fragment.flags & FragmentFlags::PayloadFragmented == FragmentFlags::PayloadFragmented {
             let mut retry = crate::retry(10, 10_000, 10);
 
-            let file_path = if options.direct_write {
+            let mut file_path = if options.direct_write {
                 path.to_path_buf()
             } else {
-                let mut temporary_ext = path.extension().unwrap_or_default().to_os_string();
-                temporary_ext.push(temp_file_extension);
-
-                let mut temporary_path = path.to_path_buf();
-                temporary_path.set_extension(temporary_ext);
-
-                temporary_path
+                let mut temporary_path = path.as_os_str().to_os_string();
+                temporary_path.push(temp_file_extension);
+                PathBuf::from(temporary_path)
             };
 
-            let mut temporary =
-                (!options.direct_write).then(|| TemporaryFile::guard(file_path.clone()));
+            let mut resuming = options.resume_write
+                && !options.direct_write
+                && range.len() >= crate::options::RESUME_WRITE_MIN_LEN;
+            let mut temporary = (!options.direct_write && !resuming)
+                .then(|| TemporaryFile::guard(file_path.clone()));
 
             let mut create_parent = options.create_parent;
-            let file = loop {
+            let (file, held) = loop {
                 let directory_missing = {
-                    let err =
-                        match crate::defragment::open_file_write(file_path.as_path(), range.len())
-                            .await
-                        {
-                            Ok(file) => break file,
-                            Err(err) => err,
+                    // `opened` ends with this block, so that it is not held across the wait below.
+                    let err = {
+                        let opened = if resuming {
+                            crate::resume::open(file_path.as_path(), &address.hash, &range).await
+                        } else {
+                            crate::defragment::open_file_write(file_path.as_path(), range.len())
+                                .await
+                                .map(|file| Opened::File(file, false))
                         };
+                        match opened {
+                            Ok(Opened::File(file, held)) => break (file, held),
+                            Ok(Opened::Refused) => {
+                                resuming = false;
+                                temporary = Some(TemporaryFile::guard(file_path.clone()));
+                                continue;
+                            }
+                            Ok(Opened::Moving) => return Err(StorageError::from(SlowDown)),
+                            Err(err) => err,
+                        }
+                    };
                     if create_parent && names_a_missing_directory(&err) {
                         true
                     } else if retry.wait().await {
@@ -1823,33 +1842,69 @@ fn write_root_to_file(
                     create_parent_directory(path).await?;
                 }
             };
-            let defrag_target = DefragmentSink::File {
-                file: file.clone(),
-                size: range.len(),
-            };
-
+            if held {
+                lore_base::lore_debug!("Resuming {} from its temporary file", path.display());
+            }
             lore_base::lore_trace!(
                 "Opened file for immutable data write: {} size {}",
                 path.display(),
                 range.len()
             );
 
-            let claim = claim_for_task(&store, store.try_join_claim())
+            if held {
+                Box::pin(pipe_resumed(
+                    store,
+                    partition,
+                    address,
+                    fragment,
+                    buffer,
+                    range.start as u64..range.end as u64,
+                    &file,
+                    options,
+                    remote_session,
+                    &file_path,
+                ))
+                .await?;
+            } else {
+                let claim = claim_for_task(&store, store.try_join_claim())
+                    .await
+                    .map(Arc::new);
+                defragment_pipeline(
+                    store,
+                    partition,
+                    address,
+                    fragment,
+                    buffer,
+                    range.start as u64..range.end as u64,
+                    DefragmentSink::File {
+                        file: file.clone(),
+                        size: range.len(),
+                    },
+                    ReadOptions {
+                        resume_write: resuming,
+                        resume_held: false,
+                        ..options
+                    },
+                    remote_session,
+                    claim,
+                )
+                .await?;
+            }
+
+            // A task of its own finishes a resuming read's file, holding its lock until the rename
+            // ends even where the read is dropped. `file_path` is taken rather than moved, which
+            // would add a drop flag to this future.
+            if resuming {
+                return crate::resume::finish(
+                    file,
+                    std::mem::take(&mut file_path),
+                    path,
+                    options.sync_data,
+                )
                 .await
-                .map(Arc::new);
-            defragment_pipeline(
-                store,
-                partition,
-                address,
-                fragment,
-                buffer,
-                range.start as u64..range.end as u64,
-                defrag_target,
-                options,
-                remote_session,
-                claim,
-            )
-            .await?;
+                .map_err(|e| StorageError::internal_with_context(e, "task failure"))?
+                .map(|()| None);
+            }
 
             if options.sync_data {
                 file.sync_data()
@@ -1860,15 +1915,18 @@ fn write_root_to_file(
             drop(file);
 
             if !options.direct_write {
-                let rename_err_msg =
-                    format!("rename {} -> {}", file_path.display(), path.display());
                 lore_io::IoDriver::global()
                     .rename(file_path.as_path(), path)
                     .await
-                    .map_err(|e| StorageError::internal_with_context(e, &rename_err_msg))?;
+                    .map_err(|e| {
+                        StorageError::internal_with_context(
+                            e,
+                            &format!("rename {} -> {}", file_path.display(), path.display()),
+                        )
+                    })?;
 
                 if let Some(temporary) = temporary.as_mut() {
-                    temporary.renamed();
+                    temporary.disarm();
                 }
             }
 
@@ -1901,6 +1959,70 @@ fn write_root_to_file(
                 }
             };
             Ok(Some(metadata))
+        }
+    }
+}
+
+/// The defragment pipeline of a read resuming from `file`, a temporary file that holds part of the
+/// content: written again as a fresh one, emptied and sized, where a hole of the content holds data
+/// there or its holes cannot be checked ([`crate::defragment::Unresumable`]). It takes the store's
+/// claim once, for every pass. Boxed by its caller, being a cold path, so that the restart it may
+/// take stays out of every other read's future.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+fn pipe_resumed<'a>(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    fragment: Fragment,
+    buffer: Bytes,
+    range: Range<u64>,
+    file: &'a lore_io::IoFile,
+    options: ReadOptions,
+    remote_session: Option<Arc<StorageSession>>,
+    temporary: &'a Path,
+) -> impl Future<Output = Result<(), StorageError>> + 'a {
+    async move {
+        let claim = claim_for_task(&store, store.try_join_claim())
+            .await
+            .map(Arc::new);
+        let size = (range.end - range.start) as usize;
+        let mut held = true;
+        loop {
+            let pipelined = defragment_pipeline(
+                store.clone(),
+                partition,
+                address,
+                fragment,
+                buffer.clone(),
+                range.clone(),
+                DefragmentSink::File {
+                    file: file.clone(),
+                    size,
+                },
+                ReadOptions {
+                    resume_write: true,
+                    resume_held: held,
+                    ..options
+                },
+                remote_session.clone(),
+                claim.clone(),
+            )
+            .await;
+            match pipelined {
+                Err(err) if held && crate::defragment::cannot_resume(&err) => {
+                    lore_base::lore_warn!(
+                        "{} cannot be resumed, writing it again: {err}",
+                        temporary.display()
+                    );
+                    held = false;
+                    let emptied = |e| StorageError::internal_with_context(e, "empty a file");
+                    file.set_len(0, ()).await.map_err(emptied)?;
+                    file.set_len(size as u64, ()).await.map_err(emptied)?;
+                }
+                pipelined => return pipelined,
+            }
         }
     }
 }

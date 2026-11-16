@@ -20,10 +20,10 @@
 use std::fs::File;
 use std::ops::Range;
 
-/// What one walk of a file's ranges of data keeps across [`next_data`] calls. On Linux that is the
-/// file system's block, read once, and the last batch of extents `FIEMAP` mapped, so the walk maps
-/// the file, and syncs it, once for each batch. A walk starts with a new cursor and keeps it to one
-/// file.
+/// What one walk of a file's ranges of data keeps across [`next_data`] calls: the file system's
+/// block, read once ([`DataCursor::block`]), and on Linux the last batch of extents `FIEMAP`
+/// mapped, so the walk maps the file, and syncs it, once for each batch. A walk starts with a new
+/// cursor and keeps it to one file.
 #[derive(Default)]
 pub struct DataCursor {
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -31,6 +31,27 @@ pub struct DataCursor {
     /// Set once the walk has advised random reads of the file, on its first `SEEK_DATA` lookup.
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     advised: bool,
+    /// The file system's block, read on the walk's first lookup. On Linux the `FIEMAP` part keeps
+    /// it, so that the cursor stays one pointer.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    block: Option<u64>,
+}
+
+impl DataCursor {
+    /// The file system's block, `fstatfs`'s `f_bsize`, which the walk read on its first lookup and
+    /// widens each range from `FIEMAP` to. `None` before the first lookup, and where the platform
+    /// reports no holes.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn block(&self) -> Option<u64> {
+        self.map.as_ref().and_then(|map| map.block)
+    }
+
+    /// The file system's block, `fstatfs`'s `f_bsize`, which the walk read on its first lookup.
+    /// `None` before the first lookup, and where the platform reports no holes.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub fn block(&self) -> Option<u64> {
+        self.block
+    }
 }
 
 /// The first range of `file` at or after `offset` the file system holds data for, ending where the
@@ -63,8 +84,36 @@ pub(crate) fn next_data(
     if !cursor.advised {
         cursor.advised = true;
         let _ = advise_random(file);
+        #[cfg(any(target_os = "freebsd", target_vendor = "apple"))]
+        {
+            cursor.block = Some(block_size(file)?);
+        }
     }
     seek_next_data(file, offset)
+}
+
+/// The file system's block, `fstatfs`'s `f_bsize`, which every extent but an inline or tail one is
+/// aligned to.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_vendor = "apple"
+))]
+fn block_size(file: &File) -> std::io::Result<u64> {
+    use std::os::fd::AsRawFd;
+
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: Calling OS functions. `fstatfs` fills `stats`, which outlives the call.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fstatfs` succeeded, so it filled `stats`.
+    let stats = unsafe { stats.assume_init() };
+    // `f_bsize` is signed on some platforms and unsigned on others.
+    #[allow(clippy::unnecessary_fallible_conversions, clippy::useless_conversion)]
+    let block = u64::try_from(stats.f_bsize).unwrap_or(0);
+    Ok(block.max(1))
 }
 
 /// [`next_data`] from `SEEK_DATA` and `SEEK_HOLE`, where the platform has them.
@@ -170,8 +219,8 @@ mod fiemap {
     /// The part of a [`super::DataCursor`] `FIEMAP` keeps: the block, the last batch of extents,
     /// and the range of the file that batch maps.
     pub(super) struct Cursor {
-        /// The file system's block, once read.
-        block: Option<u64>,
+        /// The file system's block, once read ([`super::DataCursor::block`]).
+        pub(super) block: Option<u64>,
         /// Set once the file system refused to map the file.
         pub(super) unsupported: bool,
         /// The last batch, as the kernel wrote it.
@@ -268,7 +317,7 @@ mod fiemap {
     ) -> std::io::Result<Option<Range<u64>>> {
         let block = match cursor.block {
             Some(block) => block,
-            None => *cursor.block.insert(block_size(file)?),
+            None => *cursor.block.insert(super::block_size(file)?),
         };
         if !cursor.mapped.contains(&offset) {
             cursor.map_from(file, offset)?;
@@ -308,18 +357,6 @@ mod fiemap {
             cursor.map_from(file, next)?;
             first = 0;
         }
-    }
-
-    /// The file system's block, which every extent but an inline or tail one is aligned to.
-    fn block_size(file: &File) -> std::io::Result<u64> {
-        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
-        // SAFETY: Calling OS functions. `fstatfs` fills `stats`, which outlives the call.
-        if unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: `fstatfs` succeeded, so it filled `stats`.
-        let block = unsafe { stats.assume_init() }.f_bsize;
-        Ok(u64::try_from(block).unwrap_or(0).max(1))
     }
 }
 

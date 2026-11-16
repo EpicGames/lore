@@ -110,36 +110,15 @@ impl FSLock {
         Ok(FSLock { file })
     }
 
-    /// Opens the lock file and takes the OS lock, retrying while another holder has it.
-    ///
-    /// The wait is non-blocking attempts with backoff rather than a blocking lock, so no runtime
-    /// thread is parked on a lock another process holds. Two properties change with that, and
-    /// both are deliberate. Kernel queueing is gone: a blocking lock queues its waiters, while
-    /// pollers race for whichever attempt lands after a release, so a waiter can be starved under
-    /// sustained contention. And the wait stays unbounded, matching the blocking lock callers had
-    /// before, which means a peer that never releases would otherwise look exactly like a hang —
-    /// hence the warning once the wait passes [`LOCK_WAIT_WARN`].
+    /// Opens the lock file and takes the OS lock, retrying as [`LockWait`] paces it while another
+    /// holder has it.
     pub async fn acquire_exact_path(path: &Path) -> std::io::Result<FSLock> {
         let file = Self::open_with_retry(path).await?;
-
-        let started = std::time::Instant::now();
-        let mut delay = LOCK_RETRY_START;
-        let mut warned = false;
+        let mut wait = LockWait::new();
         loop {
             match Self::try_lock(&file) {
                 Ok(()) => return Ok(FSLock { file }),
-                Err(err) if is_lock_contended(&err) => {
-                    if !warned && started.elapsed() >= LOCK_WAIT_WARN {
-                        crate::lore_warn!(
-                            "Still waiting for lock \"{}\" held by another process after {} seconds",
-                            path.display(),
-                            started.elapsed().as_secs()
-                        );
-                        warned = true;
-                    }
-                    tokio::time::sleep(delay).await;
-                    delay = std::cmp::min(delay * 2, LOCK_RETRY_MAX);
-                }
+                Err(err) if is_lock_contended(&err) => wait.next(path).await,
                 Err(err) => return Err(err),
             }
         }
@@ -266,6 +245,60 @@ impl FSLock {
         } else {
             Ok(())
         }
+    }
+}
+
+/// The pace of a wait for a lock another holder has: the caller makes a non-blocking attempt, and
+/// where it finds the lock held, awaits [`Self::next`] before the next.
+///
+/// The wait is non-blocking attempts with backoff rather than a blocking lock, so no runtime
+/// thread is parked on a lock another holder has. Two properties change with that, and both are
+/// deliberate. Kernel queueing is gone: a blocking lock queues its waiters, while pollers race for
+/// whichever attempt lands after a release, so a waiter can be starved under sustained contention.
+/// And the wait stays unbounded, matching a blocking lock, which means a holder that never
+/// releases would otherwise look exactly like a hang — hence the warning once the wait passes
+/// [`LOCK_WAIT_WARN`].
+///
+/// Not an async function taking the attempt, which would grow every future waiting through it by
+/// the attempt and a second copy of its arguments. The delay is in microseconds, to keep the pace
+/// small in a future.
+pub struct LockWait {
+    started: std::time::Instant,
+    delay_micros: u32,
+    warned: bool,
+}
+
+impl LockWait {
+    /// A wait that has made its first attempt.
+    pub fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            delay_micros: LOCK_RETRY_START.as_micros() as u32,
+            warned: false,
+        }
+    }
+
+    /// The sleep before the next attempt at the lock of `path`, which the warning names once the
+    /// wait passes [`LOCK_WAIT_WARN`]. Each delay doubles the one before, up to
+    /// [`LOCK_RETRY_MAX`].
+    pub fn next(&mut self, path: &Path) -> tokio::time::Sleep {
+        if !self.warned && self.started.elapsed() >= LOCK_WAIT_WARN {
+            crate::lore_warn!(
+                "Still waiting for lock \"{}\" after {} seconds",
+                path.display(),
+                self.started.elapsed().as_secs()
+            );
+            self.warned = true;
+        }
+        let sleep = tokio::time::sleep(Duration::from_micros(u64::from(self.delay_micros)));
+        self.delay_micros = (self.delay_micros * 2).min(LOCK_RETRY_MAX.as_micros() as u32);
+        sleep
+    }
+}
+
+impl Default for LockWait {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

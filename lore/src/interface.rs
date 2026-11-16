@@ -7334,18 +7334,48 @@ pub type LoreStorageGetFileArgs = crate::storage::get_file::LoreStorageGetFileAr
 /// Write content-addressed payloads to filesystem paths.
 ///
 /// Each item emits `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE`. No HEADER or DATA events are produced —
-/// the payload is written straight to disk. Multi-fragment writes stage through `<path>.loretmp`
-/// and rename atomically, and a failure mid-write removes the temp file, so the target is either
-/// the finished range or untouched. An `offset` past the end of the content is rejected with
-/// `INVALID_ARGUMENTS` without opening the target, so a destination that was already there
-/// survives. The temp file is emptied before anything is written to it, so nothing a
-/// `<path>.loretmp` left by an earlier get held stays in it. A hole the content was stored with
-/// (`skip_holes` on `lore_storage_put_file`), a range holding no data, is left unwritten, so it is
-/// a hole of the written file where its file system supports holes. Every range of data is written,
-/// zeros included: written zeros are data.
+/// the payload is written straight to disk. A multi-fragment write goes through `<path>.loretmp`,
+/// the name of `path` with `.loretmp` appended, and renames it into place atomically, so the target
+/// is either the finished range or untouched. The temporary file is emptied before anything is
+/// written to it, so nothing a `<path>.loretmp` left by an earlier get held stays in it, except
+/// where the write resumes from it, below. A hole the content was stored with (`skip_holes` on
+/// `lore_storage_put_file`), a range holding no data, is left unwritten, so it is a hole of the
+/// written file where its file system supports holes. Every range of data is written, zeros
+/// included: written zeros are data.
+///
+/// A multi-fragment write of a range of at least 32 MiB that fails, or that a process stops, keeps
+/// `<path>.loretmp`, which takes disk space up to the size of the range, and beside it its *resume
+/// record*, the file `<path>.loretmp.rec`, which names the content hash and the range the temporary
+/// file holds. The rename into place comes after the resume record is removed, so a rename that
+/// fails keeps the temporary file alone. A later call writing the same content, `offset` and
+/// `length` to the same path resumes from them. It takes the temporary file's map of data ranges
+/// once, reads back each fragment whose whole range is data there, and checks it against its
+/// address, and fetches every other fragment: those that fail, and those of zeros. A hole is not
+/// written, and of it the call reads back only the parts of the file-system blocks it shares with
+/// the fragments beside it that hold data. Where a whole block of a hole holds data in the
+/// temporary file, as every hole holding a whole block does on a file system that reports no holes,
+/// where a part read back holds bytes other than zeros, where the temporary file cannot be mapped,
+/// or where a part of a hole cannot be read back, the call empties the file and writes the range
+/// again. The read covers every fragment of the range, so on a slow disk a resume of a mostly
+/// written range can take longer than fetching it again over a fast link.
+/// Where the file system refuses advisory locks, as some network file systems do, a write of any
+/// length writes as a shorter one does.
+///
+/// What each write does with the two files at its path:
+/// - a multi-fragment write of at least 32 MiB of other content or another range empties the
+///   temporary file before it writes its own, and any one removes both files once it completes;
+/// - a shorter multi-fragment write keeps nothing when it fails, and otherwise writes the temporary
+///   file and renames it into place, leaving the resume record;
+/// - a single-fragment write, and an item of the zero hash, write `path` directly and leave both.
 ///
 /// A `path` takes one get at a time. Items that name the same path, in one call or in concurrent
-/// calls of this function or `lore_storage_get_file_resolved`, are not supported.
+/// calls of this function or `lore_storage_get_file_resolved`, are not supported. Even so,
+/// multi-fragment writes of at least 32 MiB to one path exclude each other: such a write waits for
+/// another one writing the same temporary file, while a shorter write neither waits nor is waited
+/// for. Delete both files to reclaim the space of a write that will not be retried.
+///
+/// An `offset` past the end of the content is rejected with `INVALID_ARGUMENTS` without opening the
+/// target, so a destination that was already there survives.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_storage_get_file(
     globals: &LoreGlobalArgs,
@@ -7437,12 +7467,15 @@ pub type LoreStorageGetFileResolvedArgs =
 /// no zero-hash truncation as in `lore_storage_get_file`, because a resolve that finds nothing is a
 /// miss rather than an address for empty content.
 ///
-/// `offset` and `length` select part of the content, multi-fragment writes stage through
-/// `<path>.loretmp` before an atomic rename, and holes are left unwritten, all as in
+/// `offset` and `length` select part of the content, multi-fragment writes go through
+/// `<path>.loretmp` and an atomic rename, and holes are left unwritten, all as in
 /// `lore_storage_get_file`: the file holds exactly the requested range from its own first byte, and
-/// the target is either the finished range or untouched. A start past the end is rejected with
-/// `INVALID_ARGUMENTS` without opening the target, so a destination that was already there
-/// survives.
+/// the target is either the finished range or untouched. A write of a range of at least 32 MiB that
+/// fails or stops keeps `<path>.loretmp` and its resume record, and is resumed from them, as in
+/// `lore_storage_get_file`, by a call whose key resolves to the same content and that asks for the
+/// same range. The files are kept, emptied and removed, and writes of at least 32 MiB to one path
+/// exclude each other, as there. A start past the end is rejected with `INVALID_ARGUMENTS` without
+/// opening the target, so a destination that was already there survives.
 ///
 /// A `path` takes one get at a time. Items that name the same path, in one call or in concurrent
 /// calls of this function or `lore_storage_get_file`, are not supported.

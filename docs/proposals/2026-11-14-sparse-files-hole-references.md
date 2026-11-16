@@ -315,7 +315,8 @@ work extends it:
 
 The resumable get, a separate change that keeps the `<path>.loretmp` of a get across a failed get
 and hashes each leaf already in it on the retry, builds on this one. It must not empty a temporary
-file it resumes, and it counts a hole's range as held, as a hole has no leaf to hash.
+file it resumes, unless a hole of the content holds data there or its holes cannot be checked; then
+it writes the file afresh. It counts a hole's range as held, as a hole has no leaf to hash.
 
 ## Unresolved Questions
 

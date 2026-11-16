@@ -17,9 +17,10 @@
 //! - `offset` past the end of the content → `INVALID_ARGUMENTS`, with `path` left untouched.
 //! - a file write failure reports its own error, `INTERNAL` where the filesystem gave no code.
 //!
-//! Ranges and temp-file staging behave as in `lore_storage_get_file`, and a path takes one get at a
-//! time, as there. Only the terminal `GET_ITEM_COMPLETE` is emitted, and its `address` is the
-//! *resolved* address, so a caller still learns the key-to-hash mapping.
+//! Ranges, temporary files and the resume from one behave as in `lore_storage_get_file`, matched
+//! on the resolved address, and a path takes one get at a time, as there. Only the terminal
+//! `GET_ITEM_COMPLETE` is emitted, and its `address` is the *resolved* address, so a caller still
+//! learns the key-to-hash mapping.
 //!
 //! Backend selection matches `lore_storage_get_resolved`: local first, remote on a miss, narrowed
 //! by the handle's bound and the per-call `offline`/`local`/`remote` flags.
@@ -68,7 +69,7 @@ pub struct LoreStorageGetFileResolvedItem {
     /// a hash
     pub context: Context,
     /// Destination path, which takes one get at a time; empty rejects with `INVALID_ARGUMENTS`.
-    /// Multi-fragment writes stage via `<path>.loretmp` then atomically rename
+    /// Multi-fragment writes go through `<path>.loretmp`, renamed into place atomically
     pub path: LoreString,
     /// First content byte to write, counted from the start of the decompressed content. Past the
     /// end of the content rejects with `INVALID_ARGUMENTS`
@@ -197,7 +198,9 @@ async fn resolve_get_file_resolved_item(
         );
     }
 
-    let mut read_options = effective.read_options(remote_session.is_some());
+    let mut read_options = effective
+        .read_options(remote_session.is_some())
+        .resuming_write();
     if item.local_cache != 0 {
         read_options = read_options.with_cache();
     }

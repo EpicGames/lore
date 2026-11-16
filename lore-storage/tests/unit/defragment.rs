@@ -274,6 +274,72 @@ mod write_to_file {
             .expect("send");
     }
 
+    /// Send one range the file already holds, as the fetch pool does for a leaf it checked there.
+    async fn send_held(tx: &DataSender, offset: usize, len: usize) {
+        tx.send(DataMessage::Held(offset, len as u64))
+            .await
+            .expect("send");
+    }
+
+    /// A held range counts toward the file as written, and its bytes are left as they are.
+    #[tokio::test]
+    async fn counts_a_held_range_as_written_and_leaves_its_bytes() {
+        let dir = TempDir::new("lore-storage-sink-test-");
+        let file = target(&dir, "held").await;
+        file.write_all_at(Bytes::from(vec![0x5A; 20]), 10)
+            .await
+            .expect("write the held range");
+        let (tx, rx) = channel::<DataMessage>(4);
+        send_one(&tx, 0, Bytes::from(vec![0xCD; 10])).await;
+        send_held(&tx, 10, 20).await;
+        send_one(&tx, 30, Bytes::from(vec![0xEF; SIZE - 30])).await;
+        drop(tx);
+
+        lore_storage::defragment::write_to_file(file.clone(), SIZE, rx)
+            .await
+            .expect("a file covered by written and held ranges");
+
+        let contents = file.read_exact_at(SIZE, 0).await.expect("read back");
+        assert_eq!(&contents[10..30], &[0x5A; 20]);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_held_range_past_end() {
+        let dir = TempDir::new("lore-storage-sink-test-");
+        let file = target(&dir, "held-past-end").await;
+        let (tx, rx) = channel::<DataMessage>(4);
+        send_held(&tx, 95, 10).await;
+        drop(tx);
+
+        let err = lore_storage::defragment::write_to_file(file, SIZE, rx)
+            .await
+            .expect_err("a held range past the end should be rejected");
+        assert!(
+            err.to_string().contains("out of bounds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Held and written ranges that do not add up to the file leave a hole, as written ranges
+    /// alone do.
+    #[tokio::test]
+    async fn rejects_held_and_written_ranges_that_do_not_cover_the_file() {
+        let dir = TempDir::new("lore-storage-sink-test-");
+        let file = target(&dir, "held-hole").await;
+        let (tx, rx) = channel::<DataMessage>(4);
+        send_one(&tx, 0, Bytes::from(vec![0xAB; 20])).await;
+        send_held(&tx, 40, SIZE - 40).await;
+        drop(tx);
+
+        let err = lore_storage::defragment::write_to_file(file, SIZE, rx)
+            .await
+            .expect_err("a hole should be rejected");
+        assert!(
+            err.to_string().contains("covers 80 of 100 bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// A hole counts toward the file, and reads as zeros where the target held content
     /// before: a file written in place, or one an earlier write left behind.
     #[tokio::test]

@@ -613,8 +613,9 @@ revision involved. An application opens a storage handle and operates on content
 - *File ingest and extract.* The same handle reads a file directly into content-addressed
   fragments - chunking and hashing it through the storage subsystem's own machinery (§8) - and
   writes a stored payload straight back to a filesystem path, without the caller assembling bytes
-  in memory or implementing chunking itself. This is the bridge that lets storage back an asset
-  or build pipeline directly.
+  in memory or implementing chunking itself. A large write of content, or of a range of it, to a
+  path that is interrupted resumes on a retry of the same content and range (§14.4). This is the
+  bridge that lets storage back an asset or build pipeline directly.
 - *Metadata probe.* An application can fetch a fragment's metadata - its size, flags, and
   compression - without paying for the payload bytes, to decide whether content is present or
   worth fetching before committing to the transfer.
@@ -653,9 +654,7 @@ in the handle's local mutable store, where the revision graph API reads it. The 
 loads a revision the revision graph API resolves, by its hash. The handle counts the storage and
 revision graph calls in flight, and closing it waits for them before it flushes the stores. A
 revision tree holds the handle's stores past a close, until the tree itself is closed. A revision
-tree does not support content stored with its holes skipped (§8.5), and nothing refuses it when a
-file is added or modified: FUSE reads of such a file fail, and status reports it modified whenever a
-scan hashes it.
+tree does not support content stored with its holes skipped (§8.5).
 
 #### 6.4 Specifications behind the API
 
@@ -936,20 +935,16 @@ typically a small fraction of the file - and those fragments can be fetched in p
 processed out of order, since each is independent of the others. Sparse reads scale with the
 requested range, not with the file size.
 
-A reference with the zero hash is a *hole*: it names no fragment, and stands for a range holding
-no data, from its offset to the next reference, which reads as zeros. A file the file system
-holds mostly as holes, such as a disk image, can be stored with its holes skipped: only the
-ranges the file system holds data for are read, chunked and stored, and each hole between them
-costs one reference, however large it is. A hole is a range never written, or allocated and
-never written, as the file system's extent map tells. Zeros written to the file are data, stored
-as any other content, so a file with a hole and the same file with zeros written over it are
-different content with different addresses. Fixed-size chunks keep their offsets on such a file,
-cut short where data starts or ends, so a chunk inside the data has the address it has without
-the holes skipped. Writing the content to a file empties the file first and leaves each hole
-unwritten, so the hole is a hole of the file again wherever the file system supports holes, and
-writes every range of data, zeros included. Every other reader sees zeros for a hole, but
-fragment delivery, which sends a fragment with no payload for it, and FUSE, which refuses it.
-Only a list of leaves holds holes, and two holes never follow each other.
+A reference can be a *hole*: it names no fragment, and stands for a range holding no data, which
+reads as zeros. A file the file system holds mostly as holes, such as a disk image, can be stored
+with its holes skipped: only the ranges the file system holds data for are read, chunked and stored,
+and each hole between them costs one reference, however large it is. Zeros written to the file are
+data, stored as any other content, so a file with a hole and the same file with zeros written over
+it are different content with different addresses. A fixed-size chunk wholly inside the data has the
+address it has without the holes skipped, so that data deduplicates against the same file stored
+whole. Writing the content to a file leaves its holes as holes wherever the file system supports
+them, a resumed write included (§14.4), and writes every range of data, zeros included. Readers of
+the storage API see zeros for a hole, but fragment delivery passes it on as a hole.
 
 #### 8.6 Compression as an orthogonal concern
 
@@ -1634,6 +1629,19 @@ The same property applies to fetches. A sync that pulls a large revision from th
 fetches fragment by fragment; an interruption leaves the already-fetched fragments in the
 local fragment cache, and the resume picks up where it stopped. The fragment cache and the
 upload protocol are mirror images in this respect.
+
+A storage API read of content into a file resumes without the fragment cache. A large read that
+is interrupted keeps what it wrote, and a retry of the same content and range to the same path
+checks each fragment it finds there against its address and fetches only the fragments it cannot
+verify, every fragment of zeros among them, since a range no read wrote reads as zeros too. The
+check reads back what was written rather than trusting a record of it, since a crash can lose or
+tear writes to a file outside the store: on a slow disk a resume of a mostly written range can take
+longer than fetching it again over a fast link. Holes stay holes on a resume, as in a fresh read,
+and a retry that cannot trust the file, as where it finds data in a hole of the content, writes it
+afresh. Only a large read resumes: keeping a read resumable costs it a small, fixed amount of
+file-system work, a large share of a small read's time spent to save at most a fetch of that small
+range. Resuming reads to one path exclude each other, so that none writes into a file another is
+writing or moving into place; other reads neither exclude nor wait.
 
 #### 14.5 Conflict handling and merging
 

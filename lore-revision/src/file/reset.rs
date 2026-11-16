@@ -3397,8 +3397,9 @@ impl HeldChildren {
 
     /// Whether the purge leaves the entry `name` of `directory`, folding to `folded`: one a child
     /// [`holds`](Self::holds), or the temporary file a write in progress puts such a child in
-    /// place through. The storage layer names that from the child's extension: `a.txt.~loretemp`
-    /// for `a.txt`, and `a..~loretemp` for `a`, which has none.
+    /// place through. The storage layer appends its extension to the child's name:
+    /// `a.txt.~loretemp` for `a.txt` and `a.~loretemp` for `a`, which has none; files earlier
+    /// releases left are named `a..~loretemp`.
     async fn leaves(
         &self,
         operation: &InstanceOperationImpl,

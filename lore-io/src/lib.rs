@@ -84,7 +84,9 @@ pub use driver::BackendKind;
 pub use driver::IoDriver;
 pub use driver::WHOLE_FILE_LIMIT;
 pub use file::IoFile;
+pub use file::LockAttempt;
 pub use file::OpenOptions;
+pub use file::lock_refused;
 pub use holes::DataCursor;
 #[cfg(target_family = "windows")]
 pub use iocp::IocpStats;

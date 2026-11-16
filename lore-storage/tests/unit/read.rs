@@ -34,6 +34,8 @@ use lore_storage::write::try_acquire_in_flight;
 use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
 
+mod resume;
+
 async fn make_test_store() -> (TempDir, Arc<dyn ImmutableStore>) {
     let dir = TempDir::new("lore-storage-read-test-");
     let store = LocalImmutableStore::new(

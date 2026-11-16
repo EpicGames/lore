@@ -593,8 +593,8 @@ mod tests {
     }
 
     /// A purge keeps the temporary file a write in progress holds beside a file the revision
-    /// holds, named from the file's extension or for a file without one, and deletes one beside
-    /// nothing the revision holds.
+    /// holds, named by appending to the file's name, and for a file without an extension also the
+    /// one earlier releases named, and deletes one beside nothing the revision holds.
     #[tokio::test]
     async fn a_purge_keeps_only_the_temporary_files_of_files_the_revision_holds() {
         with_fixture(async |fixture| {
@@ -602,7 +602,12 @@ mod tests {
             test_file_write(&path("a.bin"), b"committed");
             test_file_write(&path("plain"), b"committed");
             test_commit_tree(&fixture, "Initial").await;
-            for relative in ["a.bin.~loretemp", "plain..~loretemp", "gone.bin.~loretemp"] {
+            for relative in [
+                "a.bin.~loretemp",
+                "plain.~loretemp",
+                "plain..~loretemp",
+                "gone.bin.~loretemp",
+            ] {
                 test_file_write(&path(relative), b"partial");
             }
 
@@ -612,6 +617,7 @@ mod tests {
                 &fixture,
                 &[
                     ("a.bin.~loretemp", Some(b"partial")),
+                    ("plain.~loretemp", Some(b"partial")),
                     ("plain..~loretemp", Some(b"partial")),
                     ("gone.bin.~loretemp", None),
                 ],

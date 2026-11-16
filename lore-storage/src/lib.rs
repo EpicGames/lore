@@ -32,6 +32,7 @@ pub mod read;
 mod read_flight;
 #[cfg(feature = "test-util")]
 pub mod read_flight;
+pub(crate) mod resume;
 pub mod store_types;
 #[cfg(feature = "test-util")]
 pub mod test_util;

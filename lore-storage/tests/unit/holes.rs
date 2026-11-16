@@ -56,7 +56,7 @@ fn sparse_file(path: &Path, size: usize, extents: &[(usize, usize)]) -> Vec<u8> 
 }
 
 /// The data ranges the file system reports for `path`.
-async fn data_ranges(path: &Path) -> Vec<std::ops::Range<u64>> {
+pub(crate) async fn data_ranges(path: &Path) -> Vec<std::ops::Range<u64>> {
     let (handle, size) = ContentSource::file(path).open().await.expect("open file");
     let mut ranges = Vec::new();
     let mut offset = 0;
@@ -76,7 +76,7 @@ async fn data_ranges(path: &Path) -> Vec<std::ops::Range<u64>> {
 /// Whether the file system the tests run on reports holes, probed once with a file holding a hole
 /// between two ranges of data. A test that needs holes reported returns early where they are not,
 /// saying why.
-async fn holes_reported() -> bool {
+pub(crate) async fn holes_reported() -> bool {
     static REPORTED: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
     let reported = *REPORTED
         .get_or_init(|| async {
