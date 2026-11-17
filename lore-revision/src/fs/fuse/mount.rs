@@ -41,6 +41,7 @@ use crate::fs::fuse::inode::Name;
 use crate::fs::fuse::inode::ROOT_INO;
 use crate::fs::fuse::notifications::Invalidations;
 use crate::fs::fuse::operation::FuseOperation;
+use crate::fs::mount_manager::MountRecord;
 use crate::instance::InstanceId;
 use crate::lore_debug;
 use crate::lore_warn;
@@ -79,8 +80,9 @@ pub struct FuseMount {
     _mount: Arc<Mount>,
     /// Inodes still holding lookups after the last plain unmount; with debug assertions only.
     leaked: Mutex<Option<Vec<u64>>>,
-    /// The instance's external directory; `None` for a read-only mount.
-    external_dir: Option<PathBuf>,
+    /// The instance's external directory, with the global data directory it was resolved for;
+    /// `None` for a read-only mount.
+    external: Option<Arc<MountRecord>>,
 }
 
 impl FuseMount {
@@ -96,8 +98,8 @@ impl FuseMount {
         Self::mount_with(repository, state, path, instance_id, base_time, None).await
     }
 
-    /// [`Self::mount`] read-write, over the local changes held in `external_dir`, the
-    /// instance's `external_dir_for_instance` ([`FuseFilesystem::new_writable`]), reaching the
+    /// [`Self::mount`] read-write, over the local changes held in the instance's external
+    /// directory, which `external` records ([`FuseFilesystem::new_writable`]), reaching the
     /// remote through `remote`, the instance's [`RepositoryContext::serving_remote`]. Make
     /// `remote` under the execution context of the call the mount serves, so its connect finds
     /// that caller's credentials, not the service's.
@@ -107,7 +109,7 @@ impl FuseMount {
         path: &Path,
         instance_id: InstanceId,
         base_time: u64,
-        external_dir: PathBuf,
+        external: Arc<MountRecord>,
     ) -> Result<Arc<Self>, FuseMountError> {
         Self::mount_with(
             repository,
@@ -115,7 +117,7 @@ impl FuseMount {
             path,
             instance_id,
             base_time,
-            Some((external_dir, remote)),
+            Some((external, remote)),
         )
         .await
     }
@@ -126,13 +128,19 @@ impl FuseMount {
         path: &Path,
         instance_id: InstanceId,
         base_time: u64,
-        writable: Option<(PathBuf, SharedRemote)>,
+        writable: Option<(Arc<MountRecord>, SharedRemote)>,
     ) -> Result<Arc<Self>, FuseMountError> {
         let attr = AttrContext::for_mounting_user(MAX_READ, base_time);
-        let (filesystem, external_dir) = match writable {
-            Some((dir, remote)) => (
-                FuseFilesystem::new_writable_over((repository, remote), state, attr, &dir).await,
-                Some(dir),
+        let (filesystem, external) = match writable {
+            Some((record, remote)) => (
+                FuseFilesystem::new_writable_over(
+                    (repository, remote),
+                    state,
+                    attr,
+                    &record.external_dir,
+                )
+                .await,
+                Some(record),
             ),
             None => (FuseFilesystem::new(repository, state, attr).await, None),
         };
@@ -141,7 +149,7 @@ impl FuseMount {
             filesystem.start_access_recording(recorder);
         }
 
-        let (access, init) = match external_dir {
+        let (access, init) = match external {
             Some(_) => (MountAccess::ReadWrite, InitConfig::read_write()),
             None => (MountAccess::ReadOnly, InitConfig::default()),
         };
@@ -202,7 +210,7 @@ impl FuseMount {
             session,
             _mount: mount,
             leaked: Mutex::new(None),
-            external_dir,
+            external,
         }))
     }
 
@@ -392,10 +400,16 @@ impl FuseMount {
     /// The external directory of a read-write mount, with the remote it reaches, which mounting
     /// the instance again keeps: made for the call that first mounted it, it holds that caller's
     /// credentials. `None` for a read-only mount.
-    fn writable(&self) -> Option<(PathBuf, SharedRemote)> {
-        self.external_dir
+    fn writable(&self) -> Option<(Arc<MountRecord>, SharedRemote)> {
+        self.external
             .clone()
-            .map(|dir| (dir, self.filesystem.remote()))
+            .map(|record| (record, self.filesystem.remote()))
+    }
+
+    /// The external directory of a read-write mount, with the global data directory it was
+    /// resolved for. `None` for a read-only mount.
+    pub fn record(&self) -> Option<&Arc<MountRecord>> {
+        self.external.as_ref()
     }
 
     /// Mounts this instance again, after it was unmounted, at the revision it last served and
@@ -475,8 +489,8 @@ impl FilesystemProvider for FuseFilesystemProvider {
         _dot_path: &Path,
         _destination: &Path,
     ) -> Result<CloneAnswer, InstanceCloneError> {
-        match &self.mount.external_dir {
-            Some(external) => crate::fs::fuse::clone::answer(external).await,
+        match &self.mount.external {
+            Some(external) => crate::fs::fuse::clone::answer(&external.external_dir).await,
             None => Ok(CloneAnswer::Unsupported {
                 reason: "a read-only mount cannot be cloned".to_string(),
             }),
@@ -494,7 +508,12 @@ impl FilesystemProvider for FuseFilesystemProvider {
         copy_unclonable: bool,
         run: &CloneRun,
     ) -> Result<CloneStats, InstanceCloneError> {
-        let Some(external) = &self.mount.external_dir else {
+        let Some(external) = self
+            .mount
+            .external
+            .as_ref()
+            .map(|record| &record.external_dir)
+        else {
             return Err(NotSupported {
                 operation: "cloning a read-only mount".to_string(),
             }

@@ -22,16 +22,20 @@ use crate::fs::fuse::mount::FuseFilesystemProvider;
 use crate::fs::fuse::mount_manager::FuseMountManager;
 #[cfg(target_os = "linux")]
 use crate::fs::fuse::mount_manager::remove_deleted_instance;
-use crate::fs::swfs::api_interface::SwfsInterface;
 use crate::fs::swfs::filesystem::SwfsFilesystem;
+use crate::fs::swfs::mount_manager::SwfsMount;
 use crate::fs::swfs::mount_manager::SwfsMountManager;
 use crate::fs::swfs::paths::MountPath;
-use crate::global::external_dir::check_for_external_lore_dir;
+use crate::global::external_dir::canonical_global;
+use crate::global::external_dir::resolve::Lookup;
+use crate::global::external_dir::resolve::RootState;
+use crate::global::external_dir::resolve::resolve;
 use crate::instance::InstanceId;
 #[cfg(target_os = "linux")]
 use crate::instance::InstanceMetadata;
 use crate::instance::list_instances;
 use crate::lore_warn;
+use crate::repository::DOT_LORE;
 #[cfg(target_os = "linux")]
 use crate::repository::RepositoryConfig;
 #[cfg(target_os = "linux")]
@@ -48,6 +52,15 @@ pub enum MountManagerError {
     MountsBusy,
 }
 
+/// What a read-write mount records of where its instance lives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountRecord {
+    /// The instance's external directory.
+    pub external_dir: PathBuf,
+    /// The canonical path of the global data directory the external directory was resolved for.
+    pub global: Arc<Path>,
+}
+
 /// A FUSE instance found at startup, mounted once the manager exists.
 #[lore_macro::test_pub]
 #[cfg(target_os = "linux")]
@@ -56,6 +69,8 @@ pub(crate) struct PendingFuseMount {
     pub(crate) instance: InstanceMetadata,
     pub(crate) dot_lore: PathBuf,
     pub(crate) config: RepositoryConfig,
+    /// The canonical path of the global data directory the start resolved `dot_lore` for.
+    pub(crate) global: Arc<Path>,
 }
 
 #[lore_macro::test_pub]
@@ -63,7 +78,7 @@ pub(crate) struct PendingFuseMount {
 struct PendingFuseMount;
 
 /// The mounts a start made of its registered SWFS instances, not yet ready, by path.
-type FoundSwfsMounts = Vec<(MountPath, InstanceId, Arc<SwfsInterface>)>;
+type FoundSwfsMounts = Vec<(MountPath, SwfsMount)>;
 
 /// The instances registered in the shared stores a start found, `None` where a store could not be
 /// opened or listed, so some are unknown.
@@ -77,18 +92,22 @@ pub struct MountManager {
 
 impl MountManager {
     /// Mounts the SWFS instances of every store in `entries` and finds its FUSE instances, which
-    /// are mounted once the manager exists, and the instances registered in them. A store that
-    /// cannot be opened or listed, and an instance whose external directory or config cannot be
-    /// read, are logged and skipped rather than stopping the rest.
+    /// are mounted once the manager exists, and the instances registered in them, in the external
+    /// root `state` a start resolved once for them all. A store that cannot be opened or listed, and an
+    /// instance whose external directory is unknown or whose config cannot be read, are logged
+    /// and skipped rather than stopping the rest, and no external directory is removed for them.
     #[lore_macro::test_pub]
     async fn mounts_of_entries(
         entries: &[SharedStoreRegistryEntry],
+        state: &RootState,
     ) -> Result<(FoundSwfsMounts, Vec<PendingFuseMount>, RegisteredInstances), MountManagerError>
     {
         let mut swfs = Vec::new();
         #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut pending_fuse = Vec::new();
         let mut registered = Some(BTreeSet::new());
+        let global = canonical_global(&state.global)
+            .forward::<MountManagerError>("resolving the external root")?;
         for entry in entries {
             let entry_repository = match entry.create_null_repository_context().await {
                 Ok(repository) => repository,
@@ -113,12 +132,12 @@ impl MountManager {
                 registered.extend(instances.iter().map(|instance| instance.instance_id));
             }
             for instance in &instances {
-                let dot_lore = match check_for_external_lore_dir(instance.instance_id) {
-                    Ok(Some(dot_lore)) => dot_lore,
-                    Ok(None) => continue,
-                    Err(error) => {
+                let dot_lore = match state.lookup(instance.instance_id) {
+                    Lookup::Present(dot_lore) => dot_lore,
+                    Lookup::Absent => continue,
+                    Lookup::Unknown(unknown) => {
                         lore_warn!(
-                            "Unable to find the external .lore directory of instance at {}: {error}",
+                            "Not mounting the virtual instance at {}: {unknown}",
                             instance.path
                         );
                         continue;
@@ -137,7 +156,7 @@ impl MountManager {
                 match config.vfs_type() {
                     #[cfg(target_os = "linux")]
                     VfsType::Fuse => {
-                        if remove_deleted_instance(instance).await {
+                        if remove_deleted_instance(state, instance, &dot_lore).await {
                             continue;
                         }
                         pending_fuse.push(PendingFuseMount {
@@ -149,18 +168,31 @@ impl MountManager {
                             },
                             dot_lore,
                             config,
+                            global: global.clone(),
                         });
                     }
                     VfsType::Swfs => {
                         let mount_path =
                             MountPath::new(Path::new(&instance.path))
                                 .forward::<MountManagerError>("Failed to make mount path")?;
-                        let mount = SwfsMountManager::mount_registered(
+                        let record = Arc::new(MountRecord {
+                            external_dir: external_dir_of(&dot_lore)?,
+                            global: global.clone(),
+                        });
+                        let interface = SwfsMountManager::mount_registered(
                             instance.instance_id,
                             mount_path.clone(),
+                            &record.external_dir,
                         )
                         .await?;
-                        swfs.push((mount_path, instance.instance_id, mount));
+                        swfs.push((
+                            mount_path,
+                            SwfsMount {
+                                instance_id: instance.instance_id,
+                                interface,
+                                record,
+                            },
+                        ));
                     }
                     VfsType::None => {}
                     // Only Linux serves FUSE instances.
@@ -176,9 +208,12 @@ impl MountManager {
         let registry = SharedStoreRegistry::load()
             .await
             .forward::<MountManagerError>("Unable to load shared store registry")?;
-        let (swfs, pending_fuse, registered) = Self::mounts_of_entries(registry.entries()).await?;
+        let state = resolve().forward::<MountManagerError>("resolving the external root")?;
+        let (swfs, pending_fuse, registered) =
+            Self::mounts_of_entries(registry.entries(), &state).await?;
         #[cfg(target_os = "linux")]
         Box::pin(crate::fs::fuse::mount_manager::remove_interrupted_clones(
+            &state,
             registered.as_ref(),
         ))
         .await;
@@ -207,17 +242,32 @@ impl MountManager {
         &self.fuse
     }
 
+    /// The external `.lore` directory of the instance mounted at `repository_path`, from the
+    /// external directory its mount recorded, which resolves nothing: the root was available at
+    /// mount, and stays in place while the service runs. `None` where nothing read-write is
+    /// mounted there.
     pub fn check_for_external_lore_dir(
         &self,
         repository_path: &Path,
     ) -> Result<Option<PathBuf>, MountManagerError> {
-        match self.mounted(repository_path)? {
-            Some((instance_id, _)) => check_for_external_lore_dir(instance_id)
-                .forward::<MountManagerError>(
-                    "Unable to find external lore directory for expected instance ID",
-                ),
-            None => Ok(None),
+        Ok(self
+            .record_at(repository_path)?
+            .map(|record| record.external_dir.join(DOT_LORE)))
+    }
+
+    /// What the read-write mount at `repository_path` recorded of where its instance lives, if
+    /// one is mounted there.
+    pub fn record_at(
+        &self,
+        repository_path: &Path,
+    ) -> Result<Option<Arc<MountRecord>>, MountManagerError> {
+        let mount_path = MountPath::new(repository_path)
+            .forward::<MountManagerError>("Failed to make mount path")?;
+        #[cfg(target_os = "linux")]
+        if let Some(mount) = self.fuse.mounted_at(&mount_path) {
+            return Ok(mount.record().cloned());
         }
+        Ok(self.swfs.record_at(&mount_path))
     }
 
     pub fn filesystem_provider(
@@ -285,4 +335,11 @@ impl MountManager {
             fuse: FuseMountManager::new(None),
         })
     }
+}
+
+/// The external directory that holds the Lore directory `dot_lore`.
+pub(crate) fn external_dir_of(dot_lore: &Path) -> Result<PathBuf, MountManagerError> {
+    dot_lore.parent().map(Path::to_path_buf).ok_or_else(|| {
+        MountManagerError::internal(format!("{} has no external directory", dot_lore.display()))
+    })
 }

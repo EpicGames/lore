@@ -30,6 +30,8 @@
 //! The [`clone`] module is the exception: blocking calls that clone or copy a
 //! directory tree, which a caller on an async runtime runs on a blocking thread.
 
+#[cfg(target_os = "macos")]
+pub mod acl;
 mod buffer;
 pub mod clone;
 mod dir;
@@ -93,7 +95,10 @@ pub use iocp::IocpStats;
 pub use pool::PoolStats;
 pub use pool::requested_max_threads;
 pub use pool::set_max_threads;
+pub use psync::create_dir_all_private;
+pub use psync::create_dir_in_existing_parent;
 pub use psync::stat_blocking;
+pub use psync::sync_dir;
 pub use stat::Stat;
 pub use stat::StatKind;
 #[cfg(target_os = "linux")]

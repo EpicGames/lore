@@ -200,6 +200,20 @@ def _link_message_args(link_messages: dict[str, str] | None) -> list[str]:
     ]
 
 
+def external_root(global_dir: str | os.PathLike[str]) -> str:
+    """The external root of the global data directory below `global_dir`, the
+    `LORE_GLOBAL_PATH` of a test: the path `external-root` names, or the default
+    location, `external/` in the global data directory, where it names none or is
+    absent."""
+    data = os.path.join(global_dir, "data")
+    try:
+        with open(os.path.join(data, "external-root"), "rb") as setting:
+            path = tomllib.load(setting).get("path", "")
+    except FileNotFoundError:
+        path = ""
+    return path or os.path.join(data, "external")
+
+
 def strip_protocol(url: str) -> str:
     """Strip protocol scheme (e.g. 'lore://') and trailing slash from a URL."""
     url = url.removesuffix("/")
@@ -281,13 +295,12 @@ class Lore:
     def dot_path(self) -> str:
         """Return the full path to the repository metadata directory.
 
-        A virtual clone keeps it outside its mount, in the external directory the
-        global data directory holds for its instance, which is where Lore finds it
-        through the mount table."""
+        A virtual instance keeps it outside its mount, in its external directory in the
+        external root, which is where Lore finds it through the mount table."""
         instance = lore_mount_instance(self.path)
         if instance is not None:
             global_dir = self.sandboxed_env()["LORE_GLOBAL_PATH"]
-            return os.path.join(global_dir, "data", "external", instance, ".lore")
+            return os.path.join(external_root(global_dir), instance, ".lore")
         return os.path.join(self.path, self.dot_dir())
 
     def ignore_file(self) -> str:

@@ -735,9 +735,13 @@ mod fuse_remote_tests {
         drop(token);
         unmount_through(&manager, &root).await.expect("unmounts");
 
-        let dot_lore = external_dir_for_instance(repository.instance_id)
+        let state = lore_revision::global::external_dir::resolve::resolve()
+            .expect("resolve the external root");
+        let dot_lore = external_dir_for_instance(&state, repository.instance_id)
             .expect("external dir resolves")
             .join(DOT_LORE);
+        let global = lore_revision::global::external_dir::canonical_global(&state.global)
+            .expect("the global data directory canonicalizes");
         let config = load_repository_config_from_dot_dir(&dot_lore).expect("config loads");
         let instance = InstanceMetadata {
             instance_id: repository.instance_id,
@@ -746,7 +750,7 @@ mod fuse_remote_tests {
         };
         manager
             .fuse()
-            .remount_instance(repository, &instance, &dot_lore, &config)
+            .remount_instance(repository, &instance, (&dot_lore, global), &config)
             .await
             .expect("the service remounts the instance at the served revision");
         let mount = manager
@@ -2858,9 +2862,13 @@ mod fuse_remote_tests {
         .await
         .expect("create_local mounts the FUSE instance");
         if let Some(view) = view {
-            let dot_lore = external_dir_for_instance(created.instance_id)
-                .expect("external dir resolves")
-                .join(DOT_LORE);
+            let dot_lore = external_dir_for_instance(
+                &lore_revision::global::external_dir::resolve::resolve()
+                    .expect("resolve the external root"),
+                created.instance_id,
+            )
+            .expect("external dir resolves")
+            .join(DOT_LORE);
             // Fixture write of the instance's view, as clone copies it.
             #[allow(clippy::disallowed_methods)]
             std::fs::write(dot_lore.join(VIEW_FILTER), view).expect("view file");

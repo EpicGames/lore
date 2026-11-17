@@ -11,35 +11,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use lore_base::env::CallEnvironment;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::test_util::TempDir;
 use lore_revision::instance::InstanceError;
 use lore_revision::instance::InstanceId;
 use lore_revision::instance::instance_move_with;
-use lore_revision::interface::ExecutionContext;
-use lore_revision::relay::EventDispatcher;
 use lore_revision::repository::DOT_LORE;
 use lore_revision::repository::RepositoryConfig;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryPaths;
 
 use crate::helper::default_repository_creation_args;
-
-/// A call whose global data directory is `global`, so no test touches the real one.
-fn execution_in(global: &Path) -> Arc<ExecutionContext> {
-    let environment = CallEnvironment {
-        values: [Some(global.display().to_string()), None, None],
-    };
-    Arc::new(
-        ExecutionContext::new_client_with_user_id(
-            Default::default(),
-            EventDispatcher::no_dispatch(),
-            "test-user".to_string(),
-        )
-        .with_environment(environment),
-    )
-}
+use crate::helper::execution_in;
 
 /// A regular instance at `source`, and a `target` beside it that does not exist.
 struct Instance {
@@ -498,5 +481,63 @@ async fn a_move_into_another_repository_is_refused() {
         refused_move(&instance, &target).await;
 
         assert!(!target.exists(), "{dot}: nothing is created at the target");
+    }
+}
+
+/// A move, a dry run included, is refused with `InvalidArguments` before anything moves where a
+/// virtual instance whose external directory is present is registered at the target, though
+/// nothing is at the target path.
+#[tokio::test]
+async fn a_move_onto_a_registered_virtual_instance_is_refused_before_it_moves() {
+    for dry_run in [false, true] {
+        let mut instance = Instance::new().await;
+        let repository = Arc::try_unwrap(instance.repository).unwrap_or_else(|_| panic!("shared"));
+        instance.repository =
+            Arc::new(repository.with_write_token(crate::helper::in_memory::token()));
+        let globals = lore_revision::interface::LoreGlobalArgs {
+            dry_run: u8::from(dry_run),
+            ..Default::default()
+        };
+        let result = LORE_CONTEXT
+            .scope(
+                crate::helper::execution_in_with(instance.global(), globals),
+                async {
+                    let virtual_id = InstanceId::generate();
+                    lore_revision::instance::store_instance_registration(
+                        &instance.repository,
+                        virtual_id,
+                        &instance.target_str(),
+                    )
+                    .await
+                    .expect("register the virtual instance");
+                    let state = lore_revision::global::external_dir::resolve::resolve()
+                        .expect("resolve the external root");
+                    let dot_lore = lore_revision::global::external_dir::external_dir_for_instance(
+                        &state, virtual_id,
+                    )
+                    .expect("the external directory")
+                    .join(lore_revision::repository::DOT_LORE);
+                    std::fs::create_dir_all(&dot_lore).expect("make the external directory");
+                    std::fs::write(
+                        dot_lore.join("config.toml"),
+                        b"[vfs]\nvfs_type = \"Fuse\"\n",
+                    )
+                    .expect("write the config");
+                    instance_move_with(
+                        instance.repository.clone(),
+                        &instance.target_str(),
+                        async |_: &Path| -> Result<(), InstanceError> {
+                            panic!("nothing is registered")
+                        },
+                    )
+                    .await
+                },
+            )
+            .await;
+
+        let error = result.expect_err("the move is refused");
+        assert!(error.is_invalid_arguments(), "dry run {dry_run}: {error}");
+        assert!(instance.source.join(DOT_LORE).exists(), "nothing moves");
+        assert!(!instance.target.exists());
     }
 }

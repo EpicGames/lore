@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+pub(crate) mod external_dir;
+
 use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;

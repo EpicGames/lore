@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: MIT
 //! TOML configuration files that survive an interrupted write.
 //!
-//! Lore keeps four of these: the global config, the repository config, the layer set, and the
-//! shared-store config. None of them is stored in a revision, pushed, or cloned, so each is the
-//! only record of what it holds and a lost one cannot be recovered by syncing. They share one
-//! implementation rather than one per owner so that the two rules that keep them recoverable —
-//! a write that cannot truncate the target, and absent being the only thing that means defaults
-//! — are decided here once instead of drifting apart per call site.
+//! Lore keeps these: the global config, the repository config, the layer set, the shared-store
+//! config, and the four files of the external root, which it saves strictly. None of them is
+//! stored in a revision, pushed, or cloned, so each is the only record of what it holds and a lost
+//! one cannot be recovered by syncing. They share one implementation rather than one per owner so
+//! that the two rules that keep them recoverable — a write that cannot truncate the target, and
+//! absent being the only thing that means defaults — are decided here once instead of drifting
+//! apart per call site.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -151,24 +152,13 @@ pub async fn save<ConfigType: Serialize>(
     path: impl AsRef<Path>,
 ) -> Result<(), SaveError> {
     let path = path.as_ref();
-    let config_string = toml::to_string_pretty(&config).map_err(|err| {
-        SaveError::internal(format!(
-            "failed to format config {} as TOML: {err}",
-            path.display()
-        ))
-    })?;
+    let body = toml_body(config, path)?;
     let temp_path = temp_path(path);
 
     lore_io::IoDriver::global()
-        .write_file_bytes(&temp_path, bytes::Bytes::from(config_string), true)
+        .write_file_bytes(&temp_path, body, true)
         .await
-        .map_err(|err| {
-            SaveError::internal(format!(
-                "failed to write config {}: {err}, {} is unchanged",
-                temp_path.display(),
-                path.display()
-            ))
-        })?;
+        .map_err(|err| write_error(&temp_path, path, &err))?;
 
     lore_io::IoDriver::global()
         .rename(&temp_path, path)
@@ -182,6 +172,61 @@ pub async fn save<ConfigType: Serialize>(
         })?;
 
     Ok(())
+}
+
+/// [`save`] for a config that must survive a power loss once the save returns: the flushed
+/// temporary file is renamed over the target with [`lore_io::rename::rename_durable`], whose
+/// failure to flush the directory fails the save. On macOS that flush is `F_FULLFSYNC`, which
+/// empties the drive's cache, so the temporary file's flushed data is on disk with the rename.
+pub async fn save_strict<ConfigType: Serialize>(
+    config: &ConfigType,
+    path: impl AsRef<Path>,
+) -> Result<(), SaveError> {
+    let path = path.as_ref();
+    let body = toml_body(config, path)?;
+    let temp_path = temp_path(path);
+
+    lore_io::IoDriver::global()
+        .write_file_bytes(&temp_path, body, true)
+        .await
+        .map_err(|err| write_error(&temp_path, path, &err))?;
+
+    let (from, to) = (temp_path.clone(), path.to_path_buf());
+    lore_base::lore_spawn_blocking!(move || lore_io::rename::rename_durable(&from, &to))
+        .await
+        .unwrap_or_else(|err| Err(std::io::Error::other(err)))
+        .map_err(|err| {
+            SaveError::internal(format!(
+                "failed to rename {} onto {} and flush their directory: {err}, the new \
+                 configuration is in one of the two",
+                temp_path.display(),
+                path.display()
+            ))
+        })
+}
+
+/// `config` as the TOML body of the config file `path`.
+fn toml_body<ConfigType: Serialize>(
+    config: &ConfigType,
+    path: &Path,
+) -> Result<bytes::Bytes, SaveError> {
+    toml::to_string_pretty(config)
+        .map(bytes::Bytes::from)
+        .map_err(|err| {
+            SaveError::internal(format!(
+                "failed to format config {} as TOML: {err}",
+                path.display()
+            ))
+        })
+}
+
+/// The error of a failed write of `temp_path`, the temporary file of the config file `path`.
+fn write_error(temp_path: &Path, path: &Path, err: &std::io::Error) -> SaveError {
+    SaveError::internal(format!(
+        "failed to write config {}: {err}, {} is unchanged",
+        temp_path.display(),
+        path.display()
+    ))
 }
 
 #[allow(async_fn_in_trait)]

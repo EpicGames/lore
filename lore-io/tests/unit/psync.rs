@@ -381,3 +381,99 @@ fn a_junction_to_a_directory_removes_its_hidden_system_entries() {
         .collect();
     assert!(left.is_empty(), "the files are removed: {left:?}");
 }
+
+/// A creation in an existing parent makes the directory, takes an existing one as success, and
+/// fails with `NotFound` under a missing parent, which it doesn't make.
+#[test]
+fn a_creation_in_an_existing_parent_makes_no_parent() {
+    let root = TempDir::new("lore-io-dir-in-parent-");
+    let dir = root.join("dir");
+    let missing = root.join("missing");
+
+    lore_io::create_dir_in_existing_parent(&dir).expect("create the directory");
+    lore_io::create_dir_in_existing_parent(&dir).expect("an existing directory is success");
+    let under_missing = lore_io::create_dir_in_existing_parent(&missing.join("dir"));
+
+    assert!(dir.is_dir());
+    assert_eq!(
+        under_missing.map_err(|err| err.kind()),
+        Err(io::ErrorKind::NotFound)
+    );
+    assert!(!missing.exists(), "the missing parent isn't made");
+}
+
+/// The directories a private creation makes, the leaf and every missing parent, have mode
+/// `0o700`, and an existing directory at the path is success.
+#[cfg(target_family = "unix")]
+#[test]
+fn a_private_creation_makes_each_missing_directory_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TempDir::new("lore-io-private-dirs-");
+    let leaf = root.join("a").join("b").join("c");
+
+    lore_io::create_dir_all_private(&leaf).expect("create the directories");
+    lore_io::create_dir_all_private(&leaf).expect("an existing directory is success");
+
+    for dir in [root.join("a"), root.join("a").join("b"), leaf] {
+        let mode = std::fs::metadata(&dir).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "{}", dir.display());
+    }
+}
+
+/// A private creation refuses a file at its path.
+#[test]
+fn a_private_creation_refuses_a_file_at_its_path() {
+    let root = TempDir::new("lore-io-private-dirs-file-");
+    let file = root.join("file");
+    std::fs::write(&file, b"file").expect("write a file");
+
+    lore_io::create_dir_all_private(&file).expect_err("a file is not a directory");
+    lore_io::create_dir_all_private(&file.join("below")).expect_err("a file has no children");
+}
+
+/// A private creation in a directory its caller can write but not read creates the directory,
+/// then fails to open its parent to flush it, and reports that failure, as does a plain flush of
+/// that parent.
+#[cfg(target_family = "unix")]
+#[test]
+fn a_private_creation_reports_a_failed_flush() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let root = TempDir::new("lore-io-private-dirs-unflushable-");
+    let parent = root.join("parent");
+    std::fs::create_dir(&parent).expect("create the parent");
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o300))
+        .expect("make the parent unreadable");
+
+    let created = lore_io::create_dir_all_private(&parent.join("child"));
+    let flushed = lore_io::sync_dir(&parent);
+
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+        .expect("make the parent readable again");
+    assert_eq!(
+        created.map_err(|err| err.kind()),
+        Err(io::ErrorKind::PermissionDenied)
+    );
+    assert_eq!(
+        flushed.map_err(|err| err.kind()),
+        Err(io::ErrorKind::PermissionDenied)
+    );
+    assert!(parent.join("child").is_dir());
+}
+
+/// On macOS, a private creation flushes each directory it creates into through `F_FULLFSYNC`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_private_creation_flushes_with_a_full_sync_on_macos() {
+    let root = TempDir::new("lore-io-private-dirs-full-sync-");
+
+    let before = test_util::full_syncs_on_this_thread();
+    lore_io::create_dir_all_private(&root.join("a").join("b")).expect("create the directories");
+
+    assert!(test_util::full_syncs_on_this_thread() >= before + 2);
+}

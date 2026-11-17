@@ -28,8 +28,6 @@ use crate::fs::swfs::paths::MountPath;
 use crate::fs::swfs::paths::SwfsPath;
 use crate::fs::swfs::served_tree::Served;
 use crate::fs::swfs::served_tree::ServedTree;
-use crate::global::external_dir::check_for_external_lore_dir;
-use crate::global::external_dir::external_dir_for_instance;
 use crate::immutable;
 use crate::instance::InstanceId;
 use crate::instance::load_current_anchor;
@@ -155,19 +153,14 @@ pub struct MountResources {
 }
 
 impl MountResources {
+    /// The resources of a mount of the registered instance `instance_id`, whose external
+    /// directory is `instance_directory`, at `mount_path`.
     pub async fn premount_instance(
         instance_id: InstanceId,
         mount_path: MountPath,
+        instance_directory: &Path,
     ) -> Result<MountResources, SwfsMountError> {
-        let dot_directory = check_for_external_lore_dir(instance_id)
-            .forward::<SwfsMountError>("Finding instance directory")?
-            .ok_or_else(|| {
-                SwfsMountError::internal(format!(
-                    "Missing instance directory at {}",
-                    mount_path.as_ref().display()
-                ))
-            })?;
-
+        let dot_directory = instance_directory.join(DOT_LORE);
         let repository_config = load_repository_config_from_dot_dir(&dot_directory)
             .internal("Loading repository config")?;
         let repository_id =
@@ -178,6 +171,7 @@ impl MountResources {
             instance_id,
             mount_path,
             &repository_config,
+            instance_directory,
         )
         .await
     }
@@ -192,19 +186,29 @@ impl MountResources {
         instance_id: InstanceId,
         mount_path: MountPath,
         config: &RepositoryConfig,
+        instance_directory: &Path,
     ) -> Result<MountResources, SwfsMountError> {
-        let resources =
-            Self::premount_instance_with_config(repository_id, instance_id, mount_path, config)
-                .await?;
+        let resources = Self::premount_instance_with_config(
+            repository_id,
+            instance_id,
+            mount_path,
+            config,
+            instance_directory,
+        )
+        .await?;
         resources.modified.set_trusted(true);
         Ok(resources)
     }
 
+    /// The resources of a mount at `mount_path` of the instance `instance_id` of the repository
+    /// `repository_id`, with the config `config`, whose external directory is
+    /// `instance_directory`.
     pub async fn premount_instance_with_config(
         repository_id: RepositoryId,
         instance_id: InstanceId,
         mount_path: MountPath,
         config: &RepositoryConfig,
+        instance_directory: &Path,
     ) -> Result<MountResources, SwfsMountError> {
         if config.vfs_type() != VfsType::Swfs {
             return Err(SwfsMountError::internal(
@@ -214,10 +218,8 @@ impl MountResources {
 
         let execution = execution_context();
 
-        let instance_directory = external_dir_for_instance(instance_id)
-            .forward::<SwfsMountError>("Finding instance directory")?;
         let write_directory = instance_directory.join(WRITE_DIRECTORY);
-        std::fs::create_dir_all(&write_directory)
+        lore_io::create_dir_in_existing_parent(&write_directory)
             .internal("Creating write directory for SWFS mount")?;
         let dot_directory = instance_directory.join(DOT_LORE);
 

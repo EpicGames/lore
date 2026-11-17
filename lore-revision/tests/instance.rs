@@ -683,21 +683,45 @@ mod tests {
 
                 let root_path = root.display().to_string();
                 assert_eq!(
-                    instance_staleness(&root_path, current).await,
+                    instance_staleness(
+                        &lore_revision::global::external_dir::resolve::resolve()
+                            .expect("resolve the external root"),
+                        &root_path,
+                        current
+                    )
+                    .await,
                     InstanceStaleness::Active,
                     "the instance the directory names is active"
                 );
                 assert_eq!(
-                    instance_staleness(&root_path, other).await,
+                    instance_staleness(
+                        &lore_revision::global::external_dir::resolve::resolve()
+                            .expect("resolve the external root"),
+                        &root_path,
+                        other
+                    )
+                    .await,
                     InstanceStaleness::Superseded,
                     "an instance the directory no longer names is superseded"
                 );
                 assert_eq!(
-                    instance_staleness(&root.join("gone").display().to_string(), other).await,
+                    instance_staleness(
+                        &lore_revision::global::external_dir::resolve::resolve()
+                            .expect("resolve the external root"),
+                        &root.join("gone").display().to_string(),
+                        other
+                    )
+                    .await,
                     InstanceStaleness::PathMissing
                 );
                 assert_eq!(
-                    instance_staleness(&bare.display().to_string(), other).await,
+                    instance_staleness(
+                        &lore_revision::global::external_dir::resolve::resolve()
+                            .expect("resolve the external root"),
+                        &bare.display().to_string(),
+                        other
+                    )
+                    .await,
                     InstanceStaleness::CheckoutMissing,
                     "a directory holding no instance file holds no checkout"
                 );
@@ -705,12 +729,24 @@ mod tests {
                 std::fs::create_dir_all(truncated.join(DOT_LORE)).expect("create .lore directory");
                 test_file_write(&truncated.join(DOT_LORE).join(INSTANCE), &[0u8; 4]);
                 assert_eq!(
-                    instance_staleness(&truncated.display().to_string(), other).await,
+                    instance_staleness(
+                        &lore_revision::global::external_dir::resolve::resolve()
+                            .expect("resolve the external root"),
+                        &truncated.display().to_string(),
+                        other
+                    )
+                    .await,
                     InstanceStaleness::CheckoutMissing,
                     "an instance file too short to name an instance holds no checkout"
                 );
                 assert_eq!(
-                    instance_staleness(&format!("{}\0", root.display()), other).await,
+                    instance_staleness(
+                        &lore_revision::global::external_dir::resolve::resolve()
+                            .expect("resolve the external root"),
+                        &format!("{}\0", root.display()),
+                        other
+                    )
+                    .await,
                     InstanceStaleness::Active,
                     "a path that cannot be examined is not evidence of a removed checkout"
                 );
@@ -718,18 +754,36 @@ mod tests {
                 std::fs::create_dir_all(unreadable.join(DOT_LORE).join(INSTANCE))
                     .expect("create instance directory");
                 assert_eq!(
-                    instance_staleness(&unreadable.display().to_string(), other).await,
+                    instance_staleness(
+                        &lore_revision::global::external_dir::resolve::resolve()
+                            .expect("resolve the external root"),
+                        &unreadable.display().to_string(),
+                        other
+                    )
+                    .await,
                     InstanceStaleness::Active,
                     "an instance file that exists but cannot be read is not evidence of a \
                      removed checkout"
                 );
                 assert_eq!(
-                    instance_staleness("", other).await,
+                    instance_staleness(
+                        &lore_revision::global::external_dir::resolve::resolve()
+                            .expect("resolve the external root"),
+                        "",
+                        other
+                    )
+                    .await,
                     InstanceStaleness::Active,
                     "an empty path is corrupt metadata, not a removed directory"
                 );
                 assert_eq!(
-                    instance_staleness(&root_path, InstanceId::default()).await,
+                    instance_staleness(
+                        &lore_revision::global::external_dir::resolve::resolve()
+                            .expect("resolve the external root"),
+                        &root_path,
+                        InstanceId::default()
+                    )
+                    .await,
                     InstanceStaleness::Active,
                     "a zero instance ID cannot be compared with the file"
                 );
@@ -1151,7 +1205,13 @@ mod tests {
                     .await
                     .expect("register current instance failed");
                 assert_eq!(
-                    instance_staleness(&own_path, current).await,
+                    instance_staleness(
+                        &lore_revision::global::external_dir::resolve::resolve()
+                            .expect("resolve the external root"),
+                        &own_path,
+                        current
+                    )
+                    .await,
                     InstanceStaleness::PathMissing
                 );
 
@@ -2156,20 +2216,6 @@ mod tests {
             .expect("Test failed");
     }
 
-    /// A call whose global data directory is `global`.
-    fn execution_in(global: &Path) -> Arc<lore_revision::interface::ExecutionContext> {
-        Arc::new(
-            lore_revision::interface::ExecutionContext::new_client_with_user_id(
-                Default::default(),
-                lore_revision::relay::EventDispatcher::no_dispatch(),
-                "test-user".to_string(),
-            )
-            .with_environment(lore_base::env::CallEnvironment {
-                values: [Some(global.display().to_string()), None, None],
-            }),
-        )
-    }
-
     /// A destination that a live instance is registered at, as an SWFS instance outside its
     /// service is at a path that does not exist, is refused, and that instance stays registered.
     #[tokio::test]
@@ -2194,8 +2240,13 @@ mod tests {
                         .into_owned(),
                 );
                 let other = InstanceId::generate();
-                let external =
-                    lore_revision::global::external_dir::external_lore_dir(other).expect("dir");
+                let external = lore_revision::global::external_dir::external_dir_for_instance(
+                    &lore_revision::global::external_dir::resolve::resolve()
+                        .expect("resolve the external root"),
+                    other,
+                )
+                .expect("dir")
+                .join(lore_revision::repository::DOT_LORE);
                 std::fs::create_dir_all(&external).expect("make the external directory");
                 std::fs::write(external.join(CONFIG), b"[vfs]\nvfs_type = \"Swfs\"\n")
                     .expect("write the external config");
@@ -2203,7 +2254,13 @@ mod tests {
                     .await
                     .expect("register the other instance");
                 assert_eq!(
-                    instance_staleness(&target, other).await,
+                    instance_staleness(
+                        &lore_revision::global::external_dir::resolve::resolve()
+                            .expect("resolve the external root"),
+                        &target,
+                        other
+                    )
+                    .await,
                     InstanceStaleness::Active
                 );
 

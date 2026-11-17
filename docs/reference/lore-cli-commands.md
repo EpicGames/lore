@@ -592,20 +592,20 @@ Instance management
 
 * `list` — List all registered instances for this repository
 * `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no revision, and paths that now
-  hold a different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when
-  it is not mounted
+  hold a different instance. An SWFS instance is kept while its `.lore` remains in the external root, even when it's not
+  mounted, and so is an instance whose external directory can't be checked, as while the external root is unavailable
 * `delete` — Delete the current instance: unmount (if a virtual instance), deregister from mutable store, and delete
   associated directories
 * `move` — Move the current instance to a new path
 * `clone` — Clone the current instance to a new path as an instance of its own, on the same revision, branch and staged
   state. The new instance shares the instance's data blocks, and cloning is refused where the destination's filesystem
   or volume cannot share them unless --allow-copy is given. A FUSE instance on Linux is cloned into a FUSE instance the
-  service mounts at the path, copying only its Lore directory and local changes, which the volume of the global data
-  directory holds. The instance must use a shared store, and the path must not be inside another instance. While cloning
-  runs, commands on the instance, and commands from other processes on every instance over the store, wait for it where
-  they open the store. An instance delete waits too, since it opens the store to deregister the instance before it
-  removes any file. An instance move renames an on-disk instance before it opens the store, so a move makes cloning
-  fail, or on Windows is refused while cloning lists one of its directories
+  service mounts at the path, copying only its Lore directory and local changes, which the volume of the external root
+  holds. The instance must use a shared store, and the path must not be inside another instance. While cloning runs,
+  commands on the instance, and commands from other processes on every instance over the store, wait for it where they
+  open the store. An instance delete waits too, since it opens the store to deregister the instance before it removes
+  any file. An instance move renames an on-disk instance before it opens the store, so a move makes cloning fail, or on
+  Windows is refused while cloning lists one of its directories
 
 ## `lore repository instance list`
 
@@ -616,8 +616,8 @@ List all registered instances for this repository
 ## `lore repository instance prune`
 
 Remove stale instance entries: paths that no longer exist, paths that hold no revision, and paths that now hold a
-different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when it is not
-mounted
+different instance. An SWFS instance is kept while its `.lore` remains in the external root, even when it's not mounted,
+and so is an instance whose external directory can't be checked, as while the external root is unavailable
 
 **Usage:** `lore repository instance prune`
 
@@ -643,12 +643,12 @@ Move the current instance to a new path
 Clone the current instance to a new path as an instance of its own, on the same revision, branch and staged state. The
 new instance shares the instance's data blocks, and cloning is refused where the destination's filesystem or volume
 cannot share them unless --allow-copy is given. A FUSE instance on Linux is cloned into a FUSE instance the service
-mounts at the path, copying only its Lore directory and local changes, which the volume of the global data directory
-holds. The instance must use a shared store, and the path must not be inside another instance. While cloning runs,
-commands on the instance, and commands from other processes on every instance over the store, wait for it where they
-open the store. An instance delete waits too, since it opens the store to deregister the instance before it removes any
-file. An instance move renames an on-disk instance before it opens the store, so a move makes cloning fail, or on
-Windows is refused while cloning lists one of its directories
+mounts at the path, copying only its Lore directory and local changes, which the volume of the external root holds. The
+instance must use a shared store, and the path must not be inside another instance. While cloning runs, commands on the
+instance, and commands from other processes on every instance over the store, wait for it where they open the store. An
+instance delete waits too, since it opens the store to deregister the instance before it removes any file. An instance
+move renames an on-disk instance before it opens the store, so a move makes cloning fail, or on Windows is refused while
+cloning lists one of its directories
 
 **Usage:** `lore repository instance clone [OPTIONS] <target-path>`
 

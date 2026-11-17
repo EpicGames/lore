@@ -670,6 +670,33 @@ pub async fn test_anchor_states(
     (current, staged)
 }
 
+/// A call whose global data directory is `global`, so no test touches the real one.
+#[allow(dead_code)]
+pub fn execution_in(
+    global: &std::path::Path,
+) -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
+    execution_in_with(global, lore_revision::interface::LoreGlobalArgs::default())
+}
+
+/// A call as [`execution_in`] makes it, with `globals`.
+#[allow(dead_code)]
+pub fn execution_in_with(
+    global: &std::path::Path,
+    globals: lore_revision::interface::LoreGlobalArgs,
+) -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
+    let environment = lore_base::env::CallEnvironment {
+        values: [Some(global.display().to_string()), None, None],
+    };
+    std::sync::Arc::new(
+        lore_revision::interface::ExecutionContext::new_client_with_user_id(
+            globals,
+            lore_revision::relay::EventDispatcher::no_dispatch(),
+            "test-user".to_string(),
+        )
+        .with_environment(environment),
+    )
+}
+
 pub fn setup_test_execution() -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
     test_execution_with(lore_revision::interface::LoreGlobalArgs::default())
 }

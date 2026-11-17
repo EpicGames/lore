@@ -12,7 +12,7 @@ use lore_base::env::CallEnvironment;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::test_util::TempDir;
 use lore_revision::fs::mount_manager_state::MountManagerState;
-use lore_revision::global::external_dir::external_lore_dir;
+use lore_revision::global::external_dir::external_dir_for_instance;
 use lore_revision::instance::InstanceId;
 use lore_revision::instance::instance_delete;
 use lore_revision::interface::ExecutionContext;
@@ -48,7 +48,13 @@ async fn delete_refuses_a_checkout_that_names_an_swfs_instance_it_is_not_mounted
         .scope(execution_in(global.path()), async {
             // An SWFS instance exists: its external `.lore` is in the global data directory.
             let swfs_instance = InstanceId::generate();
-            let external = external_lore_dir(swfs_instance).expect("global data directory");
+            let external = external_dir_for_instance(
+                &lore_revision::global::external_dir::resolve::resolve()
+                    .expect("resolve the external root"),
+                swfs_instance,
+            )
+            .expect("global data directory")
+            .join(lore_revision::repository::DOT_LORE);
             std::fs::create_dir_all(&external).expect("create the external directory");
 
             // The service runs but holds no mounts, so the checkout's path is not one.

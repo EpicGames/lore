@@ -121,7 +121,11 @@ impl Mounted {
             .remount_instance(
                 self.repository.clone(),
                 &instance_metadata(&self.repository, &self.path),
-                &dot_lore,
+                (
+                    &dot_lore,
+                    lore_revision::global::external_dir::canonical_global_data_dir()
+                        .expect("the global data directory"),
+                ),
                 &config,
             )
             .await

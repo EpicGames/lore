@@ -698,11 +698,12 @@ async fn fresh_state(
 }
 
 /// What a writable provider reads from its external directory at mount: the deletion list,
-/// kept open, the paths it holds, and what `write/` holds. Blocking.
+/// kept open, the paths it holds, and what `write/` holds. A missing external directory is made,
+/// but never the root that holds it. Blocking.
 fn read_local_changes(
     external_dir: &Path,
 ) -> Result<(DeletionList, Vec<RelativePath>, LocalTree), FuseProviderError> {
-    std::fs::create_dir_all(external_dir)
+    lore_io::create_dir_in_existing_parent(external_dir)
         .map_err(|error| mount_failed("creating", external_dir, &error))?;
     let list = external_dir.join(DELETION_LIST);
     let deletions =

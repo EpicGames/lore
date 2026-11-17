@@ -55,10 +55,12 @@ use crate::filter::Filter;
 use crate::find;
 use crate::fs::filesystem_provider::FilesystemProvider;
 use crate::fs::filesystem_provider::with_operation;
+use crate::fs::mount_manager::MountRecord;
 use crate::fs::mount_manager_state::MountManagerState;
 use crate::fs::os::OsFilesystem;
 use crate::global::GlobalConfig;
-use crate::global::external_dir::external_dir_for_instance;
+use crate::global::external_dir::create_external_dir;
+use crate::global::external_dir::resolve::resolve;
 use crate::hash;
 use crate::instance::InstanceId;
 use crate::interface::LoreBranchLocation;
@@ -1968,24 +1970,57 @@ pub(crate) fn refuse_instance_nested_at(
     Ok(())
 }
 
-pub fn get_dot_lore_path(path: &std::path::Path) -> Result<PathBuf, InvalidPath> {
+/// What finding a Lore directory can fail with: an invalid path, or an internal error naming why
+/// the external directory of the virtual instance at the path is unknown.
+#[error_set]
+pub enum DotLorePathError {
+    InvalidPath,
+}
+
+/// The Lore directory of the instance at `path`: the external `.lore` of a virtual instance
+/// mounted there, or the `.lore` (or legacy `.urc`) in `path`. In the service, a mounted path
+/// answers from what its mount recorded. Elsewhere, inside a FUSE mount, the external root is
+/// resolved only once the mount matches, so a path outside a virtual instance pays nothing for
+/// it.
+pub fn get_dot_lore_path(path: &std::path::Path) -> Result<PathBuf, DotLorePathError> {
+    dot_lore_path(path, None)
+}
+
+/// [`get_dot_lore_path`] in the external root `state` its caller resolved, for a caller that judges
+/// several instances.
+pub fn get_dot_lore_path_in(
+    path: &std::path::Path,
+    state: &crate::global::external_dir::resolve::RootState,
+) -> Result<PathBuf, DotLorePathError> {
+    dot_lore_path(path, Some(state))
+}
+
+/// [`get_dot_lore_path`] in the external root `state`, or one it resolves where that is `None`.
+fn dot_lore_path(
+    path: &std::path::Path,
+    state: Option<&crate::global::external_dir::resolve::RootState>,
+) -> Result<PathBuf, DotLorePathError> {
     if let Some(mount_manager) = MountManagerState::mount_manager() {
         match mount_manager.check_for_external_lore_dir(path) {
-            Ok(Some(path)) => {
-                return Ok(path);
-            }
+            Ok(Some(path)) => return Ok(path),
             Ok(None) => {}
             Err(_) => {
                 return Err(InvalidPath {
                     path: format!("{}", path.display()),
-                });
+                }
+                .into());
             }
         }
     };
     #[cfg(target_os = "linux")]
-    if let Ok(Some(dot_lore)) = crate::fs::fuse::discover::discover_external_dot_lore(path) {
+    if let Some(dot_lore) =
+        crate::fs::fuse::discover::discover_external_dot_lore(path, state)
+            .forward::<DotLorePathError>("finding the Lore directory of a FUSE instance")?
+    {
         return Ok(dot_lore);
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = state;
     let legacy = path.join(DOT_URC);
     Ok(if legacy.is_dir() {
         legacy
@@ -2064,7 +2099,10 @@ pub fn load_repository_config_from_dot_dir(
 }
 
 pub fn load_repository_config(path: impl AsRef<Path>) -> Result<RepositoryConfig, RepositoryError> {
-    load_repository_config_from_dot_dir(&get_dot_lore_path(path.as_ref())?)
+    load_repository_config_from_dot_dir(
+        &get_dot_lore_path(path.as_ref())
+            .forward::<RepositoryError>("finding the Lore directory")?,
+    )
 }
 
 /// Whether the repository at `path`, whose Lore directory [`get_dot_lore_path`] finds at
@@ -2330,6 +2368,50 @@ pub fn exclusive_callers_waiting(dot_path: &Path) -> usize {
     repository_lock_gate(&key)
         .exclusive_waiting
         .load(Ordering::Acquire)
+}
+
+/// The count of the stores opened past the store cache, per canonical store directory.
+#[cfg(feature = "test-util")]
+pub mod store_opens {
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::sync::LazyLock;
+
+    use parking_lot::Mutex;
+
+    /// A store a repository opens.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) enum Store {
+        Immutable,
+        Mutable,
+    }
+
+    /// The opens of each store of one directory so far.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Opens {
+        /// Opens of the immutable store.
+        pub immutable: usize,
+        /// Opens of the mutable store.
+        pub mutable: usize,
+    }
+
+    static OPENS: LazyLock<Mutex<HashMap<PathBuf, Opens>>> = LazyLock::new(Default::default);
+
+    pub(super) fn count(key: &Path, store: Store) {
+        let mut opens = OPENS.lock();
+        let opens = opens.entry(key.to_path_buf()).or_default();
+        match store {
+            Store::Immutable => opens.immutable += 1,
+            Store::Mutable => opens.mutable += 1,
+        }
+    }
+
+    /// The opens of the stores in the directory `path` names.
+    pub fn opens_in(path: &Path) -> Opens {
+        let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        OPENS.lock().get(&key).copied().unwrap_or_default()
+    }
 }
 
 /// The gate of the directory `key` names.
@@ -2821,6 +2903,8 @@ pub async fn create_immutable_store_at_path(
     )
     .await
     .forward::<RepositoryError>("Failed to create local store")?;
+    #[cfg(feature = "test-util")]
+    store_opens::count(&key, store_opens::Store::Immutable);
 
     // Let storage-layer load-triggered GC passes obtain a sink bound to the calling
     // command's context (idempotent; first registration wins).
@@ -2859,21 +2943,24 @@ pub async fn create_client_mutable_store(
             .await
             .forward::<RepositoryError>("Failed to access shared store")?
     {
-        // Reject repositories that have a local mutable store alongside a
-        // shared store configuration. Automatic migration is not supported.
-        let local_mutable = dotpath.join("mutable");
-        if local_mutable.exists() {
-            return Err(RepositoryError::internal(
-                "This repository has a local mutable store but is configured to use a shared store. Reclone the repository with `lore clone --use-shared-store` to use the shared mutable store.",
-            ));
-        }
-
+        refuse_local_mutable_store(&dotpath)?;
         global_path
     } else {
         dotpath
     };
 
     create_mutable_store_at_path(path, immutable_store).await
+}
+
+/// Refuses the Lore directory `dotpath` of a repository configured to use a shared store while it
+/// holds a mutable store of its own, which nothing migrates.
+fn refuse_local_mutable_store(dotpath: &Path) -> Result<(), RepositoryError> {
+    if dotpath.join("mutable").exists() {
+        return Err(RepositoryError::internal(
+            "This repository has a local mutable store but is configured to use a shared store. Reclone the repository with `lore clone --use-shared-store` to use the shared mutable store.",
+        ));
+    }
+    Ok(())
 }
 
 /// The client mutable store at `path`, from the store cache or opened here, with the claim it
@@ -2932,6 +3019,8 @@ pub async fn create_mutable_store_at_path(
     )
     .await
     .forward::<RepositoryError>("Failed to create local store")?;
+    #[cfg(feature = "test-util")]
+    store_opens::count(&key, store_opens::Store::Mutable);
 
     if key != path {
         cache_mutable_store(key, store.clone());
@@ -3074,7 +3163,9 @@ pub fn load_and_connect_with_token(
 ///
 /// [`RepositoryError`] where the instance cannot be opened.
 pub async fn recover_missing_instance_file(path: &Path) -> Result<(), RepositoryError> {
-    let instance_file = get_dot_lore_path(path)?.join(INSTANCE);
+    let instance_file = get_dot_lore_path(path)
+        .forward::<RepositoryError>("finding the Lore directory")?
+        .join(INSTANCE);
     if execution_context().globals().dry_run() {
         return Ok(());
     }
@@ -3150,7 +3241,8 @@ async fn open_repository(
         },
     );
 
-    let dot_path = get_dot_lore_path(path)?;
+    let dot_path =
+        get_dot_lore_path(path).forward::<RepositoryError>("finding the Lore directory")?;
 
     let id_path = dot_path.join(ID);
     let config_path = dot_path.join(CONFIG);
@@ -3679,6 +3771,62 @@ fn cache_disabled(global: &LoreGlobalArgs, config: &RepositoryConfig) -> bool {
     !(global.cache() || config.vfs_type().is_virtual() || cache_payloads)
 }
 
+/// The stores of the shared store `config` names, opened and claimed for the creation of the
+/// instance `instance_id` of `repository` at `path`. Refuses the creation with `InvalidArguments`
+/// while a virtual instance is registered at `path`, as registering it would, before anything is
+/// written there. `None` where `config` names no shared store, or one that can't be found yet,
+/// which holds no other registration.
+async fn open_shared_stores_for_creation(
+    config: &RepositoryConfig,
+    repository: RepositoryId,
+    instance_id: InstanceId,
+    path: &Path,
+) -> Result<Option<ClaimedStores>, RepositoryError> {
+    let Ok(Some(store)) = crate::shared_store::get_shared_store_path_for_repo(config).await else {
+        return Ok(None);
+    };
+    let (immutable_store, opening) =
+        create_immutable_store_at_path(store.clone(), ImmutableStoreCreateOptions::none(), true)
+            .await?;
+    let (immutable_store, mutable_store, stores) =
+        claim_opened_stores(immutable_store, opening, |immutable_store| {
+            create_mutable_store_at_path(store, immutable_store)
+        })
+        .await?;
+    let registry = Arc::new(RepositoryContext::new_server_context(
+        immutable_store.clone(),
+        mutable_store.clone(),
+        repository,
+    ));
+    let state = resolve().forward::<RepositoryError>("resolving the external root")?;
+    crate::instance::refuse_registered_virtual_instance_at(
+        &registry,
+        &state,
+        instance_id,
+        &path.display().to_string(),
+    )
+    .await
+    .forward::<RepositoryError>("checking the instances registered at the path")?;
+    Ok(Some((immutable_store, mutable_store, stores)))
+}
+
+/// Creates the external directory of the new virtual instance `instance_id` in the external root a
+/// resolution finds, as [`create_external_dir`] does, and answers it as its mount records it.
+/// Blocking.
+fn create_external_record(
+    instance_id: InstanceId,
+) -> Result<Arc<MountRecord>, crate::global::external_dir::ExternalDirError> {
+    let state = resolve()?;
+    Ok(Arc::new(MountRecord {
+        external_dir: create_external_dir(&state, instance_id)?,
+        global: crate::global::external_dir::canonical_global(&state.global)?,
+    }))
+}
+
+/// Creates a new instance of the repository `repository` at `path`, with `default_branch` as its
+/// default branch, writing through `token`. The mount of a new SWFS instance, a cold path, is
+/// boxed, so its future doesn't set the size of every creation, and so of every command's
+/// dispatch.
 pub async fn create_local(
     path: &Path,
     token: &RepositoryWriteToken,
@@ -3714,33 +3862,60 @@ pub async fn create_local(
         None
     };
 
+    let swfs_mount_manager = if fuse_mount_manager.is_none() && config.vfs_type().is_virtual() {
+        Some(
+            MountManagerState::mount_manager().ok_or(RepositoryError::internal(
+                "Attempting to create a virtual-filesystem instance outside the service",
+            ))?,
+        )
+    } else {
+        None
+    };
+    let in_memory = no_tracking || execution_context().globals().in_memory();
+    let shared_stores = if in_memory {
+        None
+    } else {
+        open_shared_stores_for_creation(&config, repository, instance_id, path).await?
+    };
+    let external = if config.vfs_type().is_virtual() {
+        Some(
+            lore_base::lore_spawn_blocking!(move || create_external_record(instance_id))
+                .await
+                .internal("creating the external directory")?
+                .forward::<RepositoryError>("Unable to create external directory")?,
+        )
+    } else {
+        None
+    };
     let dotpath;
     let filesystem_provider: Option<Arc<dyn FilesystemProvider + 'static>>;
-    if fuse_mount_manager.is_some() {
-        dotpath = external_dir_for_instance(instance_id)
-            .forward::<RepositoryError>("Unable to get external directory")?
-            .join(DOT_LORE);
-        filesystem_provider = None;
-    } else if config.vfs_type().is_virtual() {
-        let mount_manager = MountManagerState::mount_manager().ok_or(RepositoryError::internal(
-            "Attempting to create a virtual-filesystem instance outside the service",
-        ))?;
-        dotpath = mount_manager
-            .swfs()
-            .create_mount(path, &config, repository, instance_id)
+    match (&external, &swfs_mount_manager) {
+        (Some(external), Some(mount_manager)) => {
+            dotpath = Box::pin(mount_manager.swfs().create_mount(
+                path,
+                &config,
+                repository,
+                (instance_id, external.clone()),
+            ))
             .await
             .forward_any::<RepositoryError>("Failed to create mount for instance")?;
-        filesystem_provider = Some(
-            mount_manager
-                .filesystem_provider(path)
-                .forward_any::<RepositoryError>(
-                    "Failed to get filesystem provider for fresh mount",
-                )?,
-        );
-    } else {
-        dotpath = path.join(DOT_LORE);
-        filesystem_provider = None;
-    };
+            filesystem_provider = Some(
+                mount_manager
+                    .filesystem_provider(path)
+                    .forward_any::<RepositoryError>(
+                        "Failed to get filesystem provider for fresh mount",
+                    )?,
+            );
+        }
+        (Some(external), None) => {
+            dotpath = external.external_dir.join(DOT_LORE);
+            filesystem_provider = None;
+        }
+        (None, _) => {
+            dotpath = path.join(DOT_LORE);
+            filesystem_provider = None;
+        }
+    }
     let idpath = dotpath.join(ID);
 
     /*if dotpath.exists() {
@@ -3783,7 +3958,6 @@ pub async fn create_local(
     // write mutex held for the duration of setup. The stores are claimed for
     // the same duration: creation takes no repository lock, and the writes
     // below run inside this claim rather than each taking one of its own.
-    let in_memory = no_tracking || execution_context().globals().in_memory();
     if keeps_records_on_disk(&config, in_memory) {
         crate::records::mark_new_instance(&dotpath, token)
             .await
@@ -3796,6 +3970,13 @@ pub async fn create_local(
         }
         let stores = claim_stores(&imm, &mut_).await?;
         (imm, mut_, stores)
+    } else if let Some((immutable_store, mutable_store, stores)) = shared_stores {
+        refuse_local_mutable_store(&dotpath)?;
+        (
+            immutable_store,
+            mutable_store as Arc<dyn MutableStore>,
+            stores,
+        )
     } else {
         crate::shared_store::ensure_shared_store_for_repo(&config)
             .await
@@ -3886,7 +4067,17 @@ pub async fn create_local(
         repository.set_disable_cache(cache_disabled(execution_context().globals(), &config));
         if let Err(error) = mount_manager
             .fuse()
-            .create_mount(repository.clone(), path, &config, instance_id)
+            .create_mount(
+                repository.clone(),
+                path,
+                &config,
+                (
+                    instance_id,
+                    external.clone().ok_or_else(|| {
+                        RepositoryError::internal("a FUSE instance has no external directory")
+                    })?,
+                ),
+            )
             .await
         {
             // The caller gets no instance id to undo, so the instance is undone here.
@@ -3940,7 +4131,8 @@ pub fn load_filter(root_path: &Path) -> Result<Arc<filter::Filter>, RepositoryEr
         }
     }
 
-    let dot_path = get_dot_lore_path(root_path)?;
+    let dot_path =
+        get_dot_lore_path(root_path).forward::<RepositoryError>("finding the Lore directory")?;
     let filter = filter::load_with_instance_ignore(
         &ignore_path,
         dot_path.join(INSTANCE_IGNORE),
@@ -4975,7 +5167,8 @@ pub fn repository_id(repository_path: impl AsRef<str>) -> Result<RepositoryId, R
         return Err(RepositoryError::internal("Invalid repository path"));
     };
 
-    let dot_path = get_dot_lore_path(&path)?;
+    let dot_path =
+        get_dot_lore_path(&path).forward::<RepositoryError>("finding the Lore directory")?;
     let id_path = dot_path.join(ID);
 
     Ok(read_id_from_file(id_path).internal("Repository not found")?)
@@ -4986,7 +5179,8 @@ pub fn repository_remote(repository_path: impl AsRef<str>) -> Result<String, Rep
         return Err(RepositoryError::internal("Invalid repository path"));
     };
 
-    let dot_path = get_dot_lore_path(&path)?;
+    let dot_path =
+        get_dot_lore_path(&path).forward::<RepositoryError>("finding the Lore directory")?;
     let config_path = dot_path.join(CONFIG);
 
     let Ok(config) = load_config(config_path) else {

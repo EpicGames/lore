@@ -27,7 +27,7 @@ from service_util import (
     SERVICE_UNAVAILABLE,
 )
 
-from lore import Lore
+from lore import Lore, external_root
 
 # A marker rather than a skip at import: a module skipped while it is collected
 # is reported as skipped even in a run whose marker expression selects none of
@@ -428,8 +428,8 @@ def test_failed_virtual_clone_leaves_nothing_and_the_path_clones_again(
     only_revision = repo.revision_history()[0].signature
     unreachable_revision = f"{only_revision}~1"
 
-    external_root = Path(global_dir_name) / "data" / "external"
-    before = set(external_root.iterdir()) if external_root.exists() else set()
+    root = Path(external_root(global_dir_name))
+    before = set(root.iterdir()) if root.exists() else set()
 
     clone_path = str(
         Path(repo.path).parent / Lore.generate_random_name("failed-fuse-clone")
@@ -449,7 +449,7 @@ def test_failed_virtual_clone_leaves_nothing_and_the_path_clones_again(
         "the clone fails after `create_local` made the instance"
     )
     assert not is_mounted(clone_path), "a failed clone leaves no mount behind"
-    after = set(external_root.iterdir()) if external_root.exists() else set()
+    after = set(root.iterdir()) if root.exists() else set()
     assert after == before, "a failed clone leaves no external directory behind"
     assert Path(clone_path).is_dir(), (
         "a failed clone keeps the mount point that existed before it"
@@ -648,7 +648,7 @@ def test_a_write_through_a_virtual_clone_survives_a_service_restart(
     Path(fuse.path, "local.txt").write_bytes(content)
 
     [written] = glob.glob(
-        os.path.join(global_dir_name, "data", "external", "*", "write", "local.txt")
+        os.path.join(external_root(global_dir_name), "*", "write", "local.txt")
     )
     assert Path(written).read_bytes() == content, "the write lands under write/"
 
@@ -983,7 +983,7 @@ def fuse_clone_of(
     fuse_mounts.append(clone.path)
     assert is_mounted(clone.path), "the FUSE clone is mounted"
     [config] = glob.glob(
-        os.path.join(global_dir_name, "data", "external", "*", ".lore", "config.toml")
+        os.path.join(external_root(global_dir_name), "*", ".lore", "config.toml")
     )
     text = Path(config).read_text()
     if not any(line.strip().startswith("identity") for line in text.splitlines()):
@@ -993,7 +993,7 @@ def fuse_clone_of(
 
 def external_dirs(global_dir_name: str) -> list[str]:
     """The external directories the service holds for FUSE instances."""
-    return glob.glob(os.path.join(global_dir_name, "data", "external", "*"))
+    return glob.glob(os.path.join(external_root(global_dir_name), "*"))
 
 
 @pytest.mark.smoke

@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import shutil
+import uuid
 
 import pytest
 from assertion_helpers import AlwaysEqual
@@ -13,6 +14,7 @@ from error_types import (
     BranchAdvanced,
     ExistingSharedStore,
     LocalMutableStoreWithSharedStore,
+    LoreException,
     MissingSharedStore,
     WrongSharedStoreRemote,
 )
@@ -25,7 +27,7 @@ from lore_parsers import (
 from test_repository_info import get_instance_id
 from test_utils import to_posix
 
-from lore import Lore, per_url_store_path, strip_protocol
+from lore import Lore, external_root, per_url_store_path, strip_protocol
 
 logger = logging.getLogger(__name__)
 
@@ -1233,18 +1235,29 @@ SWFS_CONFIG = '[vfs]\nvfs_type = "Swfs"\n'
 NON_SWFS_CONFIG = '[vfs]\nvfs_type = "None"\n'
 
 
-def plant_external_instance(global_dir_name: str, repo: Lore, config: str):
+def plant_external_instance(
+    global_dir_name: str, repo: Lore, config: str, missing_root: str | None = None
+):
     """Write the external `.lore` directory the Lore service keeps for an SWFS
     instance, so `repo` stands in for an SWFS instance that isn't mounted. SWFS
-    is not available to smoke tests, so they cannot create a real one."""
+    is not available to smoke tests, so they cannot create a real one. With
+    `missing_root`, `external-root` then names that missing directory, so the
+    instance's external directory reads as unknown, as while a root's volume
+    isn't mounted."""
     instance_id = get_instance_id(repo.repository_info())
     assert instance_id is not None
     external_dot_lore = os.path.join(
-        global_dir_name, "data", "external", instance_id, ".lore"
+        external_root(global_dir_name), instance_id, ".lore"
     )
     os.makedirs(external_dot_lore)
     with open(os.path.join(external_dot_lore, "config.toml"), "w") as f:
         f.write(config)
+    if missing_root is not None:
+        assert not os.path.exists(missing_root)
+        with open(os.path.join(global_dir_name, "data", "external-root"), "w") as f:
+            f.write(
+                f"path = '{missing_root}'\nid = \"{uuid.uuid4().hex}\"\ngeneration = 1\n"
+            )
 
 
 @pytest.mark.own_vfs("plants an SWFS instance's external directory and deletes its path, which a virtual clone's own external directory and mount hold")
@@ -1275,6 +1288,45 @@ def test_instance_prune_keeps_unmounted_swfs_instance(
     assert swfs_instance["stale"] == 0
     assert swfs_instance["branchName"] == "main"
     assert swfs_instance["revision"] != "0" * 64
+
+
+@pytest.mark.own_vfs("plants a virtual instance's external directory and empties its path, which a virtual clone's own external directory and mount hold")
+@pytest.mark.smoke
+def test_an_instance_whose_external_root_is_missing_is_kept_and_its_path_refused(
+    new_lore_repo, global_dir_name, scratch_dir
+):
+    """While `external-root` names a missing directory, a virtual instance whose
+    mount point is empty reads as unknown: prune keeps it, listing reports it
+    active, switching to its branch warns about it, and a clone at its path is
+    refused with exit code 3 and writes nothing there."""
+    repo_a, repo_b = create_shared_instances(new_lore_repo)
+    repo_a.run(["branch", "create", "feature-branch"])
+    plant_external_instance(
+        global_dir_name,
+        repo_b,
+        SWFS_CONFIG,
+        missing_root=str(scratch_dir("missing-root")),
+    )
+    shutil.rmtree(repo_b.path)
+    os.makedirs(repo_b.path)
+
+    output = repo_a.run(["repository", "instance", "prune"], json=True)
+    assert parse_jsonl(output, "repositoryInstance") == []
+
+    output = repo_a.run(["repository", "instance", "list"], json=True)
+    by_path = {
+        to_posix(i["path"]): i for i in parse_jsonl(output, "repositoryInstance")
+    }
+    assert by_path[to_posix(repo_b.path)]["stale"] == 0
+
+    output = repo_a.run(["branch", "switch", "main"], json=True)
+    [warning] = parse_jsonl(output, "branchMultipleInstance")
+    assert any(to_posix(repo_b.path) in path for path in warning["instancePaths"])
+
+    with pytest.raises(LoreException) as refused:
+        repo_a.clone(path=repo_b.path, use_shared_store=True)
+    assert refused.value.returncode == 3
+    assert os.listdir(repo_b.path) == []
 
 
 @pytest.mark.own_vfs("deletes an instance's directory to leave it stale, which a virtual clone's mount holds")

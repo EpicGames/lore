@@ -42,7 +42,7 @@ lore clone <url> ~/work/tree --vfs fuse \
     --view <view filter file> --prefetch <recording>
 
 ls -l ~/work/tree; cat ~/work/tree/README.md    # read through the mount
-echo hi > ~/work/tree/new.txt                  # lands in <global data>/external/<instance id>/write
+echo hi > ~/work/tree/new.txt                  # lands in <external root>/<instance id>/write
 
 cd ~/work/tree
 lore status                                    # sees the write at once, no --scan
@@ -87,7 +87,8 @@ lore service start                             # remounts every FUSE instance
   `lore-revision/src/repository.rs`): the service remounts only instances it finds through the
   shared store registry (`mounts_of_entries`, `fs/mount_manager.rs`).
 - The instance's `.lore` directory lives outside the mount, at
-  `<global data>/external/<instance id>/.lore` (`external_dir_for_instance`,
+  `<external root>/<instance id>/.lore`, where the external root is `external/` in the global
+  data directory unless the `external-root` file there names another (`external_dir_for_instance`,
   `lore-revision/src/global/external_dir.rs`). Commands inside the mount find it through
   `/proc/self/mountinfo`, never by statting the mount (`fs/fuse/discover.rs`).
 
@@ -137,7 +138,7 @@ lore service start                 # removes the deleted instance's external dir
 lore repository instance prune     # optional, from another instance of the same repository
 ```
 
-- Service start removes `<global data>/external/<instance id>/`, holding `.lore` and `write/`, of
+- Service start removes `<external root>/<instance id>/`, holding `.lore` and `write/`, of
   every registered FUSE instance whose mount point no longer exists, and does not mount it
   (`remove_deleted_instance`, `mount_manager.rs`). A path that cannot be reached is left
   alone. A running service removes nothing.
@@ -491,7 +492,7 @@ directory (`external_dir_for_instance`, `lore-revision/src/global/external_dir.r
 `write/`, the staging directory and the deletion list. Nothing else is persisted: the
 State is rebuilt at every mount.
 
-| Path below `<global data>/external/<instance id>/` | Holds |
+| Path below `<external root>/<instance id>/` | Holds |
 |---|---|
 | `write/` | Created and copied-up files, directories and symlinks at their repository-relative paths, spelled as the State spells them. The host file system owns their bytes, sizes, modes and times. |
 | `write-staging/` | Copy-ups and stored content in progress; emptied at mount. |

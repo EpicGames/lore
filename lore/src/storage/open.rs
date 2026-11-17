@@ -229,7 +229,13 @@ fn open_local(
                 // path on failure so the dotpath check below surfaces the real error. The store
                 // caches resolve whichever spelling arrives to the directory it names.
                 let absolute = make_absolute(path).unwrap_or_else(|_| PathBuf::from(path));
-                let dotpath = get_dot_lore_path(&absolute).map_err(|_err| {
+                let dotpath = get_dot_lore_path(&absolute).map_err(|err| {
+                    if !err.is_invalid_path() {
+                        return StorageError::internal_with_context(
+                            err,
+                            "finding the Lore directory of the repository",
+                        );
+                    }
                     StorageError::from(InvalidArguments {
                         reason: format!(
                             "unable to find .lore directory for repository at {}",

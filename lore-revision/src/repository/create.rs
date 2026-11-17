@@ -221,7 +221,8 @@ pub(crate) async fn create_with_metadata(
     } else {
         repository::refuse_nesting_in_swfs_mount(path)?;
     }
-    let existing_dot_dir = get_dot_lore_path(path)?;
+    let existing_dot_dir =
+        get_dot_lore_path(path).forward::<CreateError>("finding the Lore directory")?;
     if existing_dot_dir.exists() {
         if call.force() && repository::force_may_replace(path, &existing_dot_dir) {
             if call.dry_run() {

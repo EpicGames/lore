@@ -13,7 +13,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use lore_base::env::CallEnvironment;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::test_util::TempDir;
 use lore_revision::instance::InstanceError;
@@ -23,7 +22,6 @@ use lore_revision::instance::instance_delete;
 use lore_revision::instance::instance_delete_with;
 use lore_revision::interface::ExecutionContext;
 use lore_revision::interface::LoreGlobalArgs;
-use lore_revision::relay::EventDispatcher;
 use lore_revision::repository::DOT_LORE;
 use lore_revision::repository::RepositoryConfig;
 use lore_revision::repository::RepositoryContext;
@@ -35,26 +33,8 @@ use lore_revision::shared_store::SharedStoreConfig;
 use lore_revision::shared_store::shared_store_subdir_for_remote;
 
 use crate::helper::default_repository_creation_args;
-
-/// A call whose global data directory is `global`, so no test touches the real one.
-fn execution_in(global: &Path) -> Arc<ExecutionContext> {
-    execution_with(global, LoreGlobalArgs::default())
-}
-
-/// A call as [`execution_in`] makes it, with `globals`.
-fn execution_with(global: &Path, globals: LoreGlobalArgs) -> Arc<ExecutionContext> {
-    let environment = CallEnvironment {
-        values: [Some(global.display().to_string()), None, None],
-    };
-    Arc::new(
-        ExecutionContext::new_client_with_user_id(
-            globals,
-            EventDispatcher::no_dispatch(),
-            "test-user".to_string(),
-        )
-        .with_environment(environment),
-    )
-}
+use crate::helper::execution_in;
+use crate::helper::execution_in_with;
 
 /// A regular instance at `path`, with a file in a nested directory of its working tree.
 struct Instance {
@@ -165,8 +145,11 @@ impl Instance {
             dry_run: 1,
             ..Default::default()
         };
-        self.delete_in(execution_with(self._global.path(), globals), deregistered)
-            .await
+        self.delete_in(
+            execution_in_with(self._global.path(), globals),
+            deregistered,
+        )
+        .await
     }
 
     async fn delete_in(

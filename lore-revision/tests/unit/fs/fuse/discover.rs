@@ -47,3 +47,53 @@ fn returns_none_when_no_lore_mount() {
     let found = lore_mount_for_path(mountinfo, Path::new("/home/user/project"));
     assert_eq!(found, None);
 }
+
+/// A table planted for a mount point is what a lookup of a path below it reads, on any thread,
+/// and matches as the file would; a path elsewhere reads the real table.
+#[test]
+fn a_planted_table_matches_as_the_file_would() {
+    use lore_revision::fs::fuse::discover::lore_mount_containing;
+    use lore_revision::fs::fuse::discover::test_util::fuse_lore_entry;
+    use lore_revision::fs::fuse::discover::test_util::plant_table;
+
+    let root = lore_base::test_util::TempDir::new("lore-discover-planted-");
+    let mount_point = root.path().join("my instance");
+    let instance_id = InstanceId::generate();
+    let _planted = plant_table(&mount_point, fuse_lore_entry(&mount_point, instance_id));
+
+    let below = mount_point.join("sub").join("file");
+    let found = std::thread::spawn(move || lore_mount_containing(&below))
+        .join()
+        .expect("look up on another thread");
+
+    assert_eq!(found, Some((mount_point.clone(), instance_id)));
+    assert_eq!(lore_mount_containing(&root.path().join("elsewhere")), None);
+}
+
+/// A table planted to fail to read reads as no mount, as an unreadable `/proc/self/mountinfo`
+/// does, and its guard's drop ends it.
+#[test]
+fn an_unreadable_planted_table_reads_as_no_mount() {
+    use lore_revision::fs::fuse::discover::lore_mount_containing;
+    use lore_revision::fs::fuse::discover::test_util::fuse_lore_entry;
+    use lore_revision::fs::fuse::discover::test_util::plant_table;
+    use lore_revision::fs::fuse::discover::test_util::plant_unreadable_table;
+
+    let root = lore_base::test_util::TempDir::new("lore-discover-unreadable-");
+    let mount_point = root.path().join("instance");
+    let instance_id = InstanceId::generate();
+    let outer = plant_table(&mount_point, fuse_lore_entry(&mount_point, instance_id));
+    let inner = plant_unreadable_table(&mount_point.join("sub"));
+
+    assert_eq!(
+        lore_mount_containing(&mount_point.join("sub").join("file")),
+        None
+    );
+    drop(inner);
+    assert_eq!(
+        lore_mount_containing(&mount_point.join("sub").join("file")),
+        Some((mount_point.clone(), instance_id))
+    );
+    drop(outer);
+    assert_eq!(lore_mount_containing(&mount_point.join("sub")), None);
+}

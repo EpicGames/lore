@@ -125,12 +125,17 @@ async fn ensure_parent_dir_rejects_parent_that_is_a_file() {
     assert!(stats.created_parents.is_empty());
 }
 
-/// A parent that genuinely cannot be created still has to abort the clone.
+/// A parent that genuinely cannot be created still has to abort the clone. Root can write the
+/// read-only directory that stands in for one, so the test returns early as root.
 #[cfg(unix)]
 #[tokio::test]
 async fn ensure_parent_dir_rejects_uncreatable_parent() {
     use std::os::unix::fs::PermissionsExt;
 
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
     let (temp, operation) = create_operation().await;
     let locked = relative_path("locked");
     tokio::fs::create_dir(on_disk(&temp, &locked))
@@ -880,6 +885,272 @@ async fn a_clone_leaves_a_name_another_branch_holds() {
                     .ok(),
                 Some(holder)
             );
+        })
+        .await;
+}
+
+/// Copies the directory `from` to `to`, files and directories alike.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("make the copy");
+    for entry in std::fs::read_dir(from).expect("list the directory") {
+        let entry = entry.expect("read an entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("stat an entry").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy a file");
+        }
+    }
+}
+
+/// A clone or create at the path of a registered virtual instance, here one whose checkout is gone
+/// and whose external directory names FUSE, is refused with `InvalidArguments` before anything is
+/// written at the path. A write-mode open of an unregistered instance there registers nothing,
+/// and the virtual instance stays registered.
+#[tokio::test]
+async fn creating_at_a_registered_virtual_instance_path_is_refused_and_writes_nothing() {
+    use lore_revision::global::external_dir::external_dir_for_instance;
+    use lore_revision::global::external_dir::resolve::resolve;
+    use lore_revision::instance::InstanceId;
+    use lore_revision::instance::instance_key;
+    use lore_revision::lore::RepositoryId;
+    use lore_revision::repository::DOT_LORE;
+    use lore_revision::repository::INSTANCE;
+    use lore_revision::repository::RepositoryAccess;
+    use lore_revision::repository::RepositoryConfig;
+    use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::repository::SharedStoreToUseConfig;
+    use lore_revision::repository::create_local;
+    use lore_revision::repository::load_and_connect_with_token;
+
+    let global = TempDir::new("lore-clone-virtual-path-global-");
+    let shared = TempDir::new("lore-clone-virtual-path-store-");
+    let parent = TempDir::new("lore-clone-virtual-path-");
+    let held = TempDir::new("lore-clone-virtual-path-held-");
+    LORE_CONTEXT
+        .scope(crate::helper::execution_in(global.path()), async {
+            let path = parent.path().join("instance");
+            std::fs::create_dir(&path).expect("make the instance path");
+            let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+            let config = RepositoryConfig {
+                remote_url: Some("lore://127.0.0.1:1/virtual-path".to_owned()),
+                shared_store_to_use: Some(SharedStoreToUseConfig {
+                    use_shared_store: Some(true),
+                    shared_store_path: Some(shared.path().display().to_string()),
+                }),
+                ..Default::default()
+            };
+            let create = |config: RepositoryConfig| {
+                let path = path.clone();
+                async move {
+                    let token = RepositoryWriteToken::acquire(&path).await;
+                    create_local(
+                        &path,
+                        &token,
+                        repository_id,
+                        BranchId::from(uuid::Uuid::now_v7()),
+                        branch::DEFAULT_DEFAULT_NAME.to_string(),
+                        config,
+                        false,
+                    )
+                    .await
+                }
+            };
+            let virtual_instance = create(config.clone()).await.expect("create the instance");
+            let virtual_id = virtual_instance.instance_id;
+            drop(virtual_instance);
+            copy_tree(&path.join(DOT_LORE), held.path());
+            std::fs::remove_dir_all(path.join(DOT_LORE)).expect("leave an empty mount point");
+            let state = resolve().expect("resolve the external root");
+            let dot_lore = external_dir_for_instance(&state, virtual_id)
+                .expect("the external directory")
+                .join(lore_revision::repository::DOT_LORE);
+            std::fs::create_dir_all(&dot_lore).expect("make the external directory");
+            std::fs::write(
+                dot_lore.join("config.toml"),
+                b"[vfs]\nvfs_type = \"Fuse\"\n",
+            )
+            .expect("write the config");
+
+            let refused = create(config).await;
+
+            match refused {
+                Err(error) => assert!(error.is_invalid_arguments(), "{error}"),
+                Ok(_) => panic!("creating at a virtual instance's path is refused"),
+            }
+            assert_eq!(
+                std::fs::read_dir(&path).expect("list the path").count(),
+                0,
+                "nothing is written at the path"
+            );
+
+            copy_tree(held.path(), &path.join(DOT_LORE));
+            let unregistered = InstanceId::generate();
+            std::fs::write(path.join(DOT_LORE).join(INSTANCE), unregistered.data())
+                .expect("give the checkout an unregistered instance");
+            let token = RepositoryWriteToken::acquire(&path).await;
+            let opened =
+                load_and_connect_with_token(&path, RepositoryAccess::ReadWrite, Some(token))
+                    .await
+                    .expect("the open goes ahead");
+            let registered = |instance_id| {
+                let opened = opened.clone();
+                async move {
+                    let (key, key_type) = instance_key(opened.salt(), instance_id);
+                    opened
+                        .read_mutable_store()
+                        .load(opened.id, key, key_type)
+                        .await
+                        .is_ok_and(|registration| !registration.is_zero())
+                }
+            };
+            assert!(
+                !registered(unregistered).await,
+                "the open registers nothing"
+            );
+            assert!(
+                registered(virtual_id).await,
+                "the virtual instance stays registered"
+            );
+        })
+        .await;
+}
+
+/// A creation over a shared store that already exists opens each of its stores once, registers the
+/// new instance in it, and leaves the instances registered before it.
+#[tokio::test]
+async fn creating_over_an_existing_shared_store_opens_it_once_and_registers_the_instance() {
+    use lore_revision::instance::instance_key;
+    use lore_revision::lore::RepositoryId;
+    use lore_revision::repository::RepositoryConfig;
+    use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::repository::SharedStoreToUseConfig;
+    use lore_revision::repository::create_local;
+    use lore_revision::repository::store_opens::opens_in;
+    use lore_revision::shared_store::get_shared_store_path_for_repo;
+
+    let global = TempDir::new("lore-create-shared-global-");
+    let shared = TempDir::new("lore-create-shared-store-");
+    let parent = TempDir::new("lore-create-shared-");
+    LORE_CONTEXT
+        .scope(crate::helper::execution_in(global.path()), async {
+            let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+            let config = RepositoryConfig {
+                remote_url: Some("lore://127.0.0.1:1/create-shared".to_owned()),
+                shared_store_to_use: Some(SharedStoreToUseConfig {
+                    use_shared_store: Some(true),
+                    shared_store_path: Some(shared.path().display().to_string()),
+                }),
+                ..Default::default()
+            };
+            let create = |name: &str| {
+                let path = parent.path().join(name);
+                let config = config.clone();
+                async move {
+                    let token = RepositoryWriteToken::acquire(&path).await;
+                    create_local(
+                        &path,
+                        &token,
+                        repository_id,
+                        BranchId::from(uuid::Uuid::now_v7()),
+                        branch::DEFAULT_DEFAULT_NAME.to_string(),
+                        config,
+                        false,
+                    )
+                    .await
+                    .expect("create the instance")
+                }
+            };
+            let first = create("first").await;
+            let first_id = first.instance_id;
+            drop(first);
+            let store = get_shared_store_path_for_repo(&config)
+                .await
+                .expect("find the shared store")
+                .expect("the shared store exists");
+            let before = opens_in(&store);
+
+            let second = create("second").await;
+
+            let after = opens_in(&store);
+            assert_eq!(
+                (
+                    after.immutable - before.immutable,
+                    after.mutable - before.mutable
+                ),
+                (1, 1),
+                "the creation opens each store once"
+            );
+
+            for instance_id in [first_id, second.instance_id] {
+                let (key, key_type) = instance_key(second.salt(), instance_id);
+                let registration = second
+                    .read_mutable_store()
+                    .load(second.id, key, key_type)
+                    .await
+                    .expect("the instance is registered");
+                assert!(!registration.is_zero());
+            }
+        })
+        .await;
+}
+
+/// A creation over a shared store that already exists refuses a path whose Lore directory holds a
+/// mutable store of its own.
+#[tokio::test]
+async fn creating_over_an_existing_shared_store_refuses_a_local_mutable_store() {
+    use lore_revision::lore::RepositoryId;
+    use lore_revision::repository::DOT_LORE;
+    use lore_revision::repository::RepositoryConfig;
+    use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::repository::SharedStoreToUseConfig;
+    use lore_revision::repository::create_local;
+
+    let global = TempDir::new("lore-create-local-mutable-global-");
+    let shared = TempDir::new("lore-create-local-mutable-store-");
+    let parent = TempDir::new("lore-create-local-mutable-");
+    LORE_CONTEXT
+        .scope(crate::helper::execution_in(global.path()), async {
+            let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+            let config = RepositoryConfig {
+                remote_url: Some("lore://127.0.0.1:1/create-local-mutable".to_owned()),
+                shared_store_to_use: Some(SharedStoreToUseConfig {
+                    use_shared_store: Some(true),
+                    shared_store_path: Some(shared.path().display().to_string()),
+                }),
+                ..Default::default()
+            };
+            let create = |path: std::path::PathBuf| {
+                let config = config.clone();
+                async move {
+                    let token = RepositoryWriteToken::acquire(&path).await;
+                    create_local(
+                        &path,
+                        &token,
+                        repository_id,
+                        BranchId::from(uuid::Uuid::now_v7()),
+                        branch::DEFAULT_DEFAULT_NAME.to_string(),
+                        config,
+                        false,
+                    )
+                    .await
+                }
+            };
+            drop(
+                create(parent.path().join("first"))
+                    .await
+                    .expect("create the shared store's first instance"),
+            );
+            let second = parent.path().join("second");
+            std::fs::create_dir_all(second.join(DOT_LORE).join("mutable"))
+                .expect("make a local mutable store");
+
+            let refused = create(second).await;
+
+            match refused {
+                Err(error) => assert!(error.to_string().contains("local mutable store"), "{error}"),
+                Ok(_) => panic!("a local mutable store is refused"),
+            }
         })
         .await;
 }

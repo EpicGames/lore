@@ -1024,7 +1024,8 @@ pub async fn clone(
     // Read before anything below can create the path, so cleanup only removes what this call created.
     let mount_point_preexisted = path.exists();
 
-    let existing_dot_dir = get_dot_lore_path(path)?;
+    let existing_dot_dir =
+        get_dot_lore_path(path).forward::<CloneError>("finding the Lore directory")?;
     if existing_dot_dir.exists() {
         if call.force() && repository::force_may_replace(path, &existing_dot_dir) {
             // A dry run could not set up the clone without replacing the repository it would

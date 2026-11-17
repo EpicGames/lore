@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 //! FUSE instances mounted through the service's `MountManager` and its FUSE manager:
-//! create, sync, the refusal outside the service, remount after a restart, and unmount on stop.
+//! create, sync, the refusal outside the service, remount after a restart, unmount on stop, and
+//! the allocations of the service's lookup of a mounted path.
 //!
 //! Every test takes `SERIAL`: they share the process-wide `MountManagerState` and the
 //! `LORE_GLOBAL_PATH` override, and `unmount_all` acts on every mount the manager holds.
@@ -11,6 +12,7 @@
 //! while the process runs. `integration` drives a mounted instance through the same manager.
 #![cfg(target_os = "linux")]
 
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -24,6 +26,9 @@ use lore_revision::fs::fuse::mount_manager::StopStep;
 use lore_revision::fs::mount_manager::MountManager;
 use lore_revision::fs::mount_manager_state::MountManagerState;
 use lore_revision::global::external_dir::external_dir_for_instance;
+use lore_revision::global::external_dir::resolve::test_util::reads_in;
+use lore_revision::global::external_dir::setting::RootId;
+use lore_revision::global::external_dir::setting::Setting;
 use lore_revision::instance::InstanceId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::DOT_LORE;
@@ -36,6 +41,7 @@ use lore_revision::repository::RepositoryError;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::repository::VfsType;
 use lore_revision::repository::create_local;
+use lore_revision::repository::get_dot_lore_path;
 use lore_revision::repository::load_and_connect;
 use lore_revision::repository::load_repository_config_from_dot_dir;
 use lore_revision::revision::sync::SyncOptions;
@@ -118,8 +124,15 @@ async fn create_local_with_fuse_mounts_and_lists_empty_root() {
             manager
                 .check_for_external_lore_dir(&path)
                 .expect("the lookup succeeds"),
-            lore_revision::global::external_dir::check_for_external_lore_dir(instance_id)
-                .expect("the global lookup succeeds"),
+            match lore_revision::global::external_dir::resolve::resolve()
+                .expect("the external root resolves")
+                .lookup(instance_id)
+            {
+                lore_revision::global::external_dir::resolve::Lookup::Present(dot_lore) => {
+                    Some(dot_lore)
+                }
+                lookup => panic!("the instance's external directory is {lookup:?}"),
+            },
             "the mount leads to the instance's external .lore directory"
         );
         assert_eq!(
@@ -134,9 +147,13 @@ async fn create_local_with_fuse_mounts_and_lists_empty_root() {
             "a fresh FUSE mount caches fetched content, as a loaded FUSE instance does"
         );
 
-        let dot_lore = external_dir_for_instance(instance_id)
-            .expect("external dir resolves")
-            .join(DOT_LORE);
+        let dot_lore = external_dir_for_instance(
+            &lore_revision::global::external_dir::resolve::resolve()
+                .expect("resolve the external root"),
+            instance_id,
+        )
+        .expect("external dir resolves")
+        .join(DOT_LORE);
         let config = load_repository_config_from_dot_dir(&dot_lore).expect("config loads");
         let base_time = config
             .vfs
@@ -286,9 +303,13 @@ async fn a_service_mount_keeps_writes_under_the_instance_write_directory_across_
         })
         .await
         .expect("write task completes");
-        let write = external_dir_for_instance(repository.instance_id)
-            .expect("external dir resolves")
-            .join("write");
+        let write = external_dir_for_instance(
+            &lore_revision::global::external_dir::resolve::resolve()
+                .expect("resolve the external root"),
+            repository.instance_id,
+        )
+        .expect("external dir resolves")
+        .join("write");
         assert_eq!(
             std::fs::read(write.join("Intermediate/obj.o")).expect("the host file"),
             b"object"
@@ -307,7 +328,11 @@ async fn a_service_mount_keeps_writes_under_the_instance_write_directory_across_
             .remount_instance(
                 repository.clone(),
                 &instance_metadata(&repository, &path),
-                &dot_lore_of(&repository),
+                (
+                    &dot_lore_of(&repository),
+                    lore_revision::global::external_dir::canonical_global_data_dir()
+                        .expect("the global data directory"),
+                ),
                 &config,
             )
             .await
@@ -607,7 +632,11 @@ async fn stale_endpoint_is_lazily_unmounted_before_remount() {
             .remount_instance(
                 repository.clone(),
                 &instance_metadata(&repository, &path),
-                &dot_lore_of(&repository),
+                (
+                    &dot_lore_of(&repository),
+                    lore_revision::global::external_dir::canonical_global_data_dir()
+                        .expect("the global data directory"),
+                ),
                 &config,
             )
             .await
@@ -705,7 +734,11 @@ async fn remount_after_restart_keeps_inode_numbers() {
             .remount_instance(
                 repository.clone(),
                 &instance_metadata(&repository, &path),
-                &dot_lore_of(&repository),
+                (
+                    &dot_lore_of(&repository),
+                    lore_revision::global::external_dir::canonical_global_data_dir()
+                        .expect("the global data directory"),
+                ),
                 &config,
             )
             .await
@@ -940,11 +973,15 @@ async fn a_fuse_clone_refused_by_a_stop_leaves_no_external_directory() {
             .await
             .expect("with nothing mounted, the stop goes ahead");
 
-        let external_root = external_dir_for_instance(InstanceId::generate())
-            .expect("external dir")
-            .parent()
-            .expect("external root")
-            .to_path_buf();
+        let external_root = external_dir_for_instance(
+            &lore_revision::global::external_dir::resolve::resolve()
+                .expect("resolve the external root"),
+            InstanceId::generate(),
+        )
+        .expect("external dir")
+        .parent()
+        .expect("external root")
+        .to_path_buf();
         let before = names_in(&external_root);
         assert_refused_by_the_stop(clone_fails(&store, &late_path).await);
         assert_eq!(
@@ -988,6 +1025,202 @@ async fn a_fuse_clone_refused_by_a_stop_removes_only_the_mount_point_it_made() {
     .await;
 }
 
+/// Creating a FUSE instance while `external-root` names a missing root fails, and makes neither
+/// the root, nor its parent, nor anything at the default location.
+#[tokio::test(flavor = "multi_thread")]
+async fn creating_a_fuse_instance_makes_no_missing_configured_root() {
+    skip_without_fuse!();
+    let _serial = SERIAL.lock().await;
+    service_execution().await;
+    let global = TempDir::new("lore-fuse-mount-missing-root-");
+    let data = global.path().join("data");
+    std::fs::create_dir(&data).expect("the global data directory is made");
+    let volume = global.path().join("volume");
+    Setting {
+        path: volume.join("root").display().to_string(),
+        id: RootId::generate(),
+        generation: NonZeroU64::MIN,
+    }
+    .save(&data)
+    .await
+    .expect("the setting is written");
+    Box::pin(LORE_CONTEXT.scope(execution_in(global.path()), async move {
+        let (_store_dir, store) = canonical_dir("lore-fuse-mount-store-");
+        let (_dir, path) = canonical_dir("lore-fuse-mount-missing-root-");
+        let _guard = MountGuard(path.clone());
+
+        let error = clone_fails(&store, &path)
+            .await
+            .expect("creating with a missing root fails");
+
+        assert!(error.is_internal(), "{error}");
+        assert!(!is_mounted(&path), "nothing is mounted");
+        assert!(!volume.exists(), "the root and its parent aren't made");
+        assert!(
+            !data.join("external").exists(),
+            "nothing is made at the default location"
+        );
+    }))
+    .await;
+}
+
+/// With an available root other than the default location, a FUSE instance is created in that
+/// root, mounted from it, moved with its external directory left there, and mounted from it again,
+/// and nothing of it is made at the default location.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fuse_instance_lives_in_a_configured_root() {
+    skip_without_fuse!();
+    let _serial = SERIAL.lock().await;
+    service_execution().await;
+    let global = TempDir::new("lore-fuse-mount-configured-root-");
+    let data = global.path().join("data");
+    std::fs::create_dir(&data).expect("the global data directory is made");
+    let root = global.path().join("root");
+    lore_io::create_dir_all_private(&root).expect("the root is made");
+    let id = RootId::generate();
+    lore_revision::global::external_dir::marker::Marker {
+        id,
+        generation: NonZeroU64::MIN,
+    }
+    .save(&root)
+    .await
+    .expect("the marker is written");
+    Setting {
+        path: root.display().to_string(),
+        id,
+        generation: NonZeroU64::MIN,
+    }
+    .save(&data)
+    .await
+    .expect("the setting is written");
+    Box::pin(LORE_CONTEXT.scope(execution_in(global.path()), async move {
+        let (_store_dir, store) = canonical_dir("lore-fuse-mount-store-");
+        let (_dir, path) = canonical_dir("lore-fuse-mount-configured-root-");
+        let (_target_dir, target_parent) = canonical_dir("lore-fuse-mount-configured-target-");
+        let target = target_parent.join("moved");
+        let _guard = MountGuard(path.clone());
+        let _target_guard = MountGuard(target.clone());
+
+        let (repository, _token) = create_instance(
+            &path,
+            RepositoryId::from(uuid::Uuid::now_v7()),
+            shared_store_config(&store, VfsType::Fuse),
+        )
+        .await;
+        let instance_id = repository.instance_id;
+        let external = root.join(instance_id.text_encoding().as_str());
+        assert!(external.join(DOT_LORE).is_dir(), "created in the root");
+        assert!(
+            !data.join("external").exists(),
+            "nothing is made at the default location"
+        );
+        let manager = MountManagerState::mount_manager().expect("manager is initialised");
+        let recorded = |at: &Path| {
+            manager
+                .record_at(at)
+                .expect("the path makes a mount path")
+                .map(|record| record.external_dir.clone())
+        };
+        assert_eq!(
+            recorded(&path),
+            Some(external.clone()),
+            "mounted from the root"
+        );
+        write_through(path.join("local.txt"), b"written in the root").await;
+        assert!(
+            external.join("write").join("local.txt").is_file(),
+            "the write lands in the root"
+        );
+
+        manager
+            .fuse()
+            .move_mount(instance_id, &path, &target)
+            .await
+            .expect("the mount moves");
+        assert_eq!(
+            recorded(&target),
+            Some(external.clone()),
+            "moved over the root"
+        );
+        assert_eq!(
+            read_file(target.join("local.txt")).await,
+            b"written in the root"
+        );
+
+        manager
+            .fuse()
+            .unmount(&target, false)
+            .await
+            .expect("unmounts");
+        let state = lore_revision::global::external_dir::resolve::resolve()
+            .expect("resolve the external root");
+        let lookup = state.lookup(instance_id);
+        let lore_revision::global::external_dir::resolve::Lookup::Present(dot_lore) = lookup else {
+            panic!("the instance's external directory is {lookup:?}");
+        };
+        let config = load_repository_config_from_dot_dir(&dot_lore).expect("config loads");
+        manager
+            .fuse()
+            .remount_instance(
+                repository.clone(),
+                &instance_metadata(&repository, &target),
+                (
+                    &dot_lore,
+                    lore_revision::global::external_dir::canonical_global(&state.global)
+                        .expect("the global data directory"),
+                ),
+                &config,
+            )
+            .await
+            .expect("mounts again from the root");
+        assert_eq!(recorded(&target), Some(external.clone()));
+        assert_eq!(
+            read_file(target.join("local.txt")).await,
+            b"written in the root"
+        );
+        manager
+            .fuse()
+            .unmount(&target, false)
+            .await
+            .expect("unmounts");
+    }))
+    .await;
+}
+
+/// With no root ID stored, creating the first FUSE instance makes the default root, `external/` in
+/// the global data directory, with the instance's external directory in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_fuse_instance_with_no_root_id_makes_the_default_root() {
+    skip_without_fuse!();
+    let _serial = SERIAL.lock().await;
+    service_execution().await;
+    let global = TempDir::new("lore-fuse-mount-default-root-");
+    Box::pin(LORE_CONTEXT.scope(execution_in(global.path()), async move {
+        let (_store_dir, store) = canonical_dir("lore-fuse-mount-store-");
+        let (_dir, path) = canonical_dir("lore-fuse-mount-default-root-");
+        let _guard = MountGuard(path.clone());
+        let default_root = global.path().join("data").join("external");
+        assert!(!default_root.exists(), "no default root before the first");
+
+        let (repository, _token) = create_instance(
+            &path,
+            RepositoryId::from(uuid::Uuid::now_v7()),
+            shared_store_config(&store, VfsType::Fuse),
+        )
+        .await;
+
+        assert!(is_mounted(&path), "the instance is mounted");
+        assert!(
+            default_root
+                .join(repository.instance_id.text_encoding().as_str())
+                .join(DOT_LORE)
+                .is_dir(),
+            "the instance's external directory is in the default root"
+        );
+    }))
+    .await;
+}
+
 /// A stop that has taken its snapshot of the mounts may have missed a mount made since, so that
 /// mount is refused while the stop runs: unmounted, and forgotten. Through a remount, which has
 /// nothing of its own to undo, so the refusal is what leaves neither behind.
@@ -1024,7 +1257,11 @@ async fn a_mount_made_while_a_stop_runs_is_refused_unmounted_and_forgotten() {
             .remount_instance(
                 repository.clone(),
                 &instance_metadata(&repository, &path),
-                &dot_lore_of(&repository),
+                (
+                    &dot_lore_of(&repository),
+                    lore_revision::global::external_dir::canonical_global_data_dir()
+                        .expect("the global data directory"),
+                ),
                 &config,
             )
             .await
@@ -1891,7 +2128,12 @@ async fn a_move_overtaken_by_a_stop_leaves_the_instance_for_the_next_start() {
         let _guard = MountGuard(path.clone());
         let _target_guard = MountGuard(target.clone());
         let instance = fresh_fuse_instance(&store, &path).await;
-        let external = external_dir_for_instance(instance.instance_id).expect("external dir");
+        let external = external_dir_for_instance(
+            &lore_revision::global::external_dir::resolve::resolve()
+                .expect("resolve the external root"),
+            instance.instance_id,
+        )
+        .expect("external dir");
 
         let manager = MountManagerState::mount_manager().expect("manager is initialised");
         let _resume = ResumeMounting(manager.clone());
@@ -2057,7 +2299,12 @@ async fn deleting_an_instance_unmounts_it_and_removes_its_directories() {
         let _guard = MountGuard(path.clone());
         let instance = fresh_fuse_instance(&store, &path).await;
         write_through(path.join("local.txt"), b"deleted with it").await;
-        let external = external_dir_for_instance(instance.instance_id).expect("external dir");
+        let external = external_dir_for_instance(
+            &lore_revision::global::external_dir::resolve::resolve()
+                .expect("resolve the external root"),
+            instance.instance_id,
+        )
+        .expect("external dir");
         assert!(external.exists());
         let command = opened_as_a_command(instance, &path).await;
 
@@ -2088,7 +2335,12 @@ async fn deleting_or_moving_a_busy_instance_is_refused_as_busy() {
         let _guard = MountGuard(path.clone());
         let _target_guard = MountGuard(target.clone());
         let instance = fresh_fuse_instance(&store, &path).await;
-        let external = external_dir_for_instance(instance.instance_id).expect("external dir");
+        let external = external_dir_for_instance(
+            &lore_revision::global::external_dir::resolve::resolve()
+                .expect("resolve the external root"),
+            instance.instance_id,
+        )
+        .expect("external dir");
         let holder = Holder::open(&path).await;
         let command = opened_as_a_command(instance, &path).await;
 
@@ -2137,7 +2389,11 @@ async fn a_stop_passes_over_a_snapshot_mount_unmounted_meanwhile() {
             .remount_instance(
                 repository.clone(),
                 &instance_metadata(&repository, &elsewhere),
-                &dot_lore_of(&repository),
+                (
+                    &dot_lore_of(&repository),
+                    lore_revision::global::external_dir::canonical_global_data_dir()
+                        .expect("the global data directory"),
+                ),
                 &config,
             )
             .await
@@ -2232,6 +2488,8 @@ async fn initialize_child() {
             .expect("the idle instance unmounts");
         assert!(!is_mounted(&path));
 
+        let data = lore_revision::global::get_global_data_dir().expect("the global data directory");
+        let before = reads_in(&data);
         let restarted = lore_revision::fs::mount_manager::MountManager::initialize()
             .await
             .expect("a restarted service initialises");
@@ -2240,6 +2498,31 @@ async fn initialize_child() {
                 .mounts()
                 .contains(&(path.clone(), instance_id, VfsType::Fuse)),
             "the registry scan remounts the FUSE instance"
+        );
+        assert_eq!(
+            reads_in(&data).setting,
+            before.setting + 1,
+            "the start resolves the external root once"
+        );
+        assert_eq!(
+            restarted
+                .record_at(&path)
+                .expect("the path makes a mount path")
+                .map(|record| record.global.clone()),
+            Some(std::sync::Arc::from(
+                std::fs::canonicalize(&data).expect("canonicalize the global data directory")
+            )),
+            "the mount records the global data directory it was resolved for"
+        );
+        let before = reads_in(&data);
+        restarted
+            .check_for_external_lore_dir(&path)
+            .expect("the lookup succeeds")
+            .expect("the mount leads to the external directory");
+        assert_eq!(
+            reads_in(&data),
+            before,
+            "a mounted path's lookup reads no root file"
         );
         assert_eq!(
             entry_source(&path),
@@ -2257,7 +2540,12 @@ async fn initialize_child() {
         // A fixture edit, outside any repository write.
         #[allow(clippy::disallowed_methods)]
         std::fs::remove_dir(&path).expect("mount point removes");
-        let external = external_dir_for_instance(instance_id).expect("external dir");
+        let external = external_dir_for_instance(
+            &lore_revision::global::external_dir::resolve::resolve()
+                .expect("resolve the external root"),
+            instance_id,
+        )
+        .expect("external dir");
         assert!(external.exists());
         let cleaned = lore_revision::fs::mount_manager::MountManager::initialize()
             .await
@@ -2421,7 +2709,12 @@ type InstanceError = lore_revision::instance::InstanceError;
 /// Whether the volume of the external directories clones files, so cloning a virtual clone
 /// shares blocks rather than copying them.
 fn external_dirs_clone_files() -> bool {
-    let root = lore_revision::global::external_dir::external_dirs_root().expect("external root");
+    let root = lore_revision::global::external_dir::external_dirs_root(
+        &lore_revision::global::external_dir::resolve::resolve()
+            .expect("resolve the external root"),
+    )
+    .map(std::path::Path::to_path_buf)
+    .expect("external root");
     std::fs::create_dir_all(&root).expect("external root");
     lore_io::clone::detect(&root, &root)
         .expect("probe the external directories' volume")
@@ -2459,9 +2752,13 @@ async fn an_instance_clone_of_a_fuse_instance_mounts_its_revision_and_local_chan
         write_through(path.join("local.txt"), b"written before cloning").await;
         remove_through(path.join("gone.txt")).await;
         let base_time = load_repository_config_from_dot_dir(
-            &external_dir_for_instance(source_id)
-                .expect("external dir")
-                .join(DOT_LORE),
+            &external_dir_for_instance(
+                &lore_revision::global::external_dir::resolve::resolve()
+                    .expect("resolve the external root"),
+                source_id,
+            )
+            .expect("external dir")
+            .join(DOT_LORE),
         )
         .expect("the source's config")
         .vfs_base_time();
@@ -2503,7 +2800,12 @@ async fn an_instance_clone_of_a_fuse_instance_mounts_its_revision_and_local_chan
             swapped,
             "the new instance reports the time the source's sync recorded"
         );
-        let clone_external = external_dir_for_instance(clone_id).expect("external dir");
+        let clone_external = external_dir_for_instance(
+            &lore_revision::global::external_dir::resolve::resolve()
+                .expect("resolve the external root"),
+            clone_id,
+        )
+        .expect("external dir");
         assert!(
             clone_external.join(DOT_LORE).is_dir(),
             "the new instance keeps its external directory"
@@ -2571,7 +2873,12 @@ async fn an_instance_clone_of_a_fuse_instance_that_fails_to_register_leaves_noth
         write_through(path.join("local.txt"), b"local").await;
         let registered = instances_registered_beside(&path).await;
         let before = names_in(
-            &lore_revision::global::external_dir::external_dirs_root().expect("external root"),
+            &lore_revision::global::external_dir::external_dirs_root(
+                &lore_revision::global::external_dir::resolve::resolve()
+                    .expect("resolve the external root"),
+            )
+            .map(std::path::Path::to_path_buf)
+            .expect("external root"),
         );
 
         let failed = clone_instance_at(
@@ -2602,7 +2909,12 @@ async fn an_instance_clone_of_a_fuse_instance_that_fails_to_register_leaves_noth
         assert!(!destination.exists(), "no mount point is made");
         assert_eq!(
             names_in(
-                &lore_revision::global::external_dir::external_dirs_root().expect("external root")
+                &lore_revision::global::external_dir::external_dirs_root(
+                    &lore_revision::global::external_dir::resolve::resolve()
+                        .expect("resolve the external root")
+                )
+                .map(std::path::Path::to_path_buf)
+                .expect("external root")
             ),
             before,
             "the new instance's external directory is removed"
@@ -2641,7 +2953,12 @@ async fn an_instance_clone_whose_destination_is_taken_is_refused_before_it_regis
         synced_fuse_instance(&store, &path, &[("readme.txt", b"tracked")]).await;
         let registered = instances_registered_beside(&path).await;
         let before = names_in(
-            &lore_revision::global::external_dir::external_dirs_root().expect("external root"),
+            &lore_revision::global::external_dir::external_dirs_root(
+                &lore_revision::global::external_dir::resolve::resolve()
+                    .expect("resolve the external root"),
+            )
+            .map(std::path::Path::to_path_buf)
+            .expect("external root"),
         );
 
         let taken = destination.clone();
@@ -2680,7 +2997,12 @@ async fn an_instance_clone_whose_destination_is_taken_is_refused_before_it_regis
         assert_eq!(instances_registered_beside(&path).await, registered);
         assert_eq!(
             names_in(
-                &lore_revision::global::external_dir::external_dirs_root().expect("external root")
+                &lore_revision::global::external_dir::external_dirs_root(
+                    &lore_revision::global::external_dir::resolve::resolve()
+                        .expect("resolve the external root")
+                )
+                .map(std::path::Path::to_path_buf)
+                .expect("external root")
             ),
             before,
             "the new instance's external directory is removed"
@@ -2713,7 +3035,12 @@ async fn an_instance_clone_of_a_fuse_instance_whose_mount_is_refused_leaves_noth
         let manager = MountManagerState::mount_manager().expect("manager is initialised");
         let _resume = ResumeMounting(manager.clone());
         let before = names_in(
-            &lore_revision::global::external_dir::external_dirs_root().expect("external root"),
+            &lore_revision::global::external_dir::external_dirs_root(
+                &lore_revision::global::external_dir::resolve::resolve()
+                    .expect("resolve the external root"),
+            )
+            .map(std::path::Path::to_path_buf)
+            .expect("external root"),
         );
 
         let stopping = manager.clone();
@@ -2737,15 +3064,24 @@ async fn an_instance_clone_of_a_fuse_instance_whose_mount_is_refused_leaves_noth
         assert!(!destination.exists(), "the mount point it made is removed");
         assert_eq!(
             names_in(
-                &lore_revision::global::external_dir::external_dirs_root().expect("external root")
+                &lore_revision::global::external_dir::external_dirs_root(
+                    &lore_revision::global::external_dir::resolve::resolve()
+                        .expect("resolve the external root")
+                )
+                .map(std::path::Path::to_path_buf)
+                .expect("external root")
             ),
             before,
             "the new instance's external directory is removed"
         );
         assert!(
-            external_dir_for_instance(source_id)
-                .expect("external dir")
-                .is_dir(),
+            external_dir_for_instance(
+                &lore_revision::global::external_dir::resolve::resolve()
+                    .expect("resolve the external root"),
+                source_id
+            )
+            .expect("external dir")
+            .is_dir(),
             "the source keeps its external directory"
         );
     }))
@@ -2770,7 +3106,12 @@ async fn an_instance_clone_of_a_fuse_instance_that_would_copy_needs_a_copy_allow
         let _guard = MountGuard(path.clone());
         synced_fuse_instance(&store, &path, &[("readme.txt", b"tracked")]).await;
         let before = names_in(
-            &lore_revision::global::external_dir::external_dirs_root().expect("external root"),
+            &lore_revision::global::external_dir::external_dirs_root(
+                &lore_revision::global::external_dir::resolve::resolve()
+                    .expect("resolve the external root"),
+            )
+            .map(std::path::Path::to_path_buf)
+            .expect("external root"),
         );
 
         let refused = clone_instance_at(
@@ -2788,7 +3129,12 @@ async fn an_instance_clone_of_a_fuse_instance_that_would_copy_needs_a_copy_allow
         assert!(!destination.exists());
         assert_eq!(
             names_in(
-                &lore_revision::global::external_dir::external_dirs_root().expect("external root")
+                &lore_revision::global::external_dir::external_dirs_root(
+                    &lore_revision::global::external_dir::resolve::resolve()
+                        .expect("resolve the external root")
+                )
+                .map(std::path::Path::to_path_buf)
+                .expect("external root")
             ),
             before,
             "no external directory is written"
@@ -2819,7 +3165,12 @@ async fn a_start_removes_what_interrupted_clones_left_and_keeps_registered_clone
         use lore_revision::fs::fuse::mount_manager::remove_interrupted_clones;
         use lore_revision::instance::CLONE_IN_PROGRESS_MARK;
 
-        let root = lore_revision::global::external_dir::external_dirs_root().expect("root");
+        let root = lore_revision::global::external_dir::external_dirs_root(
+            &lore_revision::global::external_dir::resolve::resolve()
+                .expect("resolve the external root"),
+        )
+        .map(std::path::Path::to_path_buf)
+        .expect("root");
         let (_target_dir, target_parent) = canonical_dir("lore-fuse-mount-sweep-target-");
         let marked = |id: InstanceId, names: &Path| {
             let dot = root.join(id.text_encoding()).join(DOT_LORE);
@@ -2860,7 +3211,12 @@ async fn a_start_removes_what_interrupted_clones_left_and_keeps_registered_clone
         let other = root.join("not-an-instance.removing");
         std::fs::create_dir_all(&other).expect("another entry");
 
-        remove_interrupted_clones(None).await;
+        remove_interrupted_clones(
+            &lore_revision::global::external_dir::resolve::resolve()
+                .expect("resolve the external root"),
+            None,
+        )
+        .await;
         assert!(
             root.join(unregistered.text_encoding()).exists(),
             "with instances unknown, no marked directory is removed"
@@ -2872,7 +3228,12 @@ async fn a_start_removes_what_interrupted_clones_left_and_keeps_registered_clone
             "a lock file no clone holds is removed"
         );
 
-        remove_interrupted_clones(Some(&std::collections::BTreeSet::from([registered]))).await;
+        remove_interrupted_clones(
+            &lore_revision::global::external_dir::resolve::resolve()
+                .expect("resolve the external root"),
+            Some(&std::collections::BTreeSet::from([registered])),
+        )
+        .await;
         assert!(!root.join(unregistered.text_encoding()).exists());
         assert!(
             !mount_point.exists(),
@@ -2904,6 +3265,61 @@ async fn a_start_removes_what_interrupted_clones_left_and_keeps_registered_clone
             std::fs::remove_dir_all(left).expect("clean up");
         }
         let _ = std::fs::remove_file(root.join(format!("{}.lock", held.text_encoding())));
+    }))
+    .await;
+}
+
+/// Allocations the service's lookup of a mounted FUSE instance's path may make, measured on a
+/// mount. `main`'s lookup makes 13, read from its code with `LORE_GLOBAL_PATH` naming the global
+/// data directory, as here: the mount path 3, its canonical parent and the join of its name; the
+/// global data directory 3, the variable and the join of `data`; the joins of `external`, the
+/// instance ID and `.lore` 2 each, a copy and the growth of its push; and the ID's text 1.
+const LOOKUP_ALLOCATION_BUDGET: u64 = 6;
+
+struct DisableCountingOnDrop;
+
+impl Drop for DisableCountingOnDrop {
+    fn drop(&mut self) {
+        lore_base::allocator::set_allocation_counting(false);
+    }
+}
+
+/// After a warm-up, the service's lookup of a mounted FUSE instance's path answers its external
+/// `.lore` directory within [`LOOKUP_ALLOCATION_BUDGET`].
+#[tokio::test(flavor = "multi_thread")]
+async fn the_lookup_of_a_mounted_path_stays_within_its_budget() {
+    skip_without_fuse!();
+    let _serial = SERIAL.lock().await;
+    let execution = service_execution().await;
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let (_store_dir, store) = canonical_dir("lore-fuse-lookup-allocations-store-");
+        let (_dir, path) = canonical_dir("lore-fuse-lookup-allocations-");
+        let _guard = MountGuard(path.clone());
+        let repository = fresh_fuse_instance(&store, &path).await;
+        let state = lore_revision::global::external_dir::resolve::resolve()
+            .expect("resolve the external root");
+        let expected = external_dir_for_instance(&state, repository.instance_id)
+            .expect("the external directory")
+            .join(DOT_LORE);
+        assert_eq!(
+            get_dot_lore_path(&path).expect("the warm-up lookup"),
+            expected
+        );
+
+        lore_base::allocator::set_allocation_counting(true);
+        let restore = DisableCountingOnDrop;
+        let before = lore_base::allocator::thread_allocation_count();
+        let found = get_dot_lore_path(&path);
+        let allocations = lore_base::allocator::thread_allocation_count() - before;
+        drop(restore);
+
+        assert_eq!(found.expect("the lookup"), expected);
+        assert!(
+            allocations <= LOOKUP_ALLOCATION_BUDGET,
+            "the lookup made {allocations} allocations, over its budget of \
+             {LOOKUP_ALLOCATION_BUDGET}"
+        );
+        drop(repository);
     }))
     .await;
 }

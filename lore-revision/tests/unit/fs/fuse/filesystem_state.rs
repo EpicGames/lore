@@ -717,6 +717,33 @@ async fn an_external_directory_the_provider_cannot_read_fails_the_mount() {
     }
 }
 
+/// A mount over an external directory whose root is missing fails, and makes neither the root nor
+/// the external directory.
+#[tokio::test]
+async fn a_mount_in_a_missing_root_makes_no_root() {
+    let fixture = fuse_fixture::committed(&[("keep.txt", b"k")]).await;
+    let host = TempDir::new("lore-fuse-filesystem-state-missing-root-");
+    let root = host.path().join("root");
+
+    let result = LORE_CONTEXT
+        .scope(
+            fuse_fixture::setup_test_execution(),
+            FuseFilesystem::new_writable(
+                fixture.repository.clone(),
+                fixture.state.clone(),
+                attr_context(),
+                &root.join("instance"),
+            ),
+        )
+        .await;
+
+    match result {
+        Ok(_) => panic!("the mount succeeded"),
+        Err(error) => assert!(error.is_internal(), "{error}"),
+    }
+    assert!(!root.exists(), "the root isn't made");
+}
+
 #[tokio::test]
 async fn a_write_directory_over_a_tracked_file_replaces_it() {
     let fixture = fuse_fixture::committed(&[("x", b"file")]).await;

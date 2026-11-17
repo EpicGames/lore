@@ -422,7 +422,8 @@ pub enum RepositoryInstanceCommands {
     List,
     /// Remove stale instance entries: paths that no longer exist, paths that hold no revision, and
     /// paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains
-    /// in the global data directory, even when it is not mounted.
+    /// in the external root, even when it's not mounted, and so is an instance whose external
+    /// directory can't be checked, as while the external root is unavailable.
     Prune,
     /// Delete the current instance: unmount (if a virtual instance), deregister from mutable store, and delete associated directories
     Delete,
@@ -432,8 +433,8 @@ pub enum RepositoryInstanceCommands {
     /// branch and staged state. The new instance shares the instance's data blocks, and cloning is
     /// refused where the destination's filesystem or volume cannot share them unless --allow-copy
     /// is given. A FUSE instance on Linux is cloned into a FUSE instance the service mounts at the
-    /// path, copying only its Lore directory and local changes, which the volume of the global data
-    /// directory holds. The instance must use a shared store, and the path must not be inside
+    /// path, copying only its Lore directory and local changes, which the volume of the external
+    /// root holds. The instance must use a shared store, and the path must not be inside
     /// another instance. While cloning runs, commands on the instance, and commands from other
     /// processes on every instance over the store, wait for it where they open the store. An
     /// instance delete waits too, since it opens the store to deregister the instance before it

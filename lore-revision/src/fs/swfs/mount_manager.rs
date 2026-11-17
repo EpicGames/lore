@@ -11,22 +11,25 @@ use lore_base::error::NotSupported;
 use lore_error_set::ForwardStrict;
 
 use crate::fs::mount_manager::MountManagerError;
+use crate::fs::mount_manager::MountRecord;
 use crate::fs::swfs::api_interface::SwfsInterface;
 use crate::fs::swfs::api_interface::WrappedHandle;
 use crate::fs::swfs::api_interface::swfs_api::SWFSHandle;
 use crate::fs::swfs::mount_resources::MountResources;
 use crate::fs::swfs::paths::MountPath;
-use crate::global::external_dir::external_dir_for_instance;
 use crate::instance::InstanceId;
 use crate::lore::RepositoryId;
 use crate::repository::DOT_LORE;
 use crate::repository::RepositoryConfig;
 use crate::repository::VfsType;
 
-/// An SWFS mount: the instance it serves and the interface SWFS calls back through.
-struct SwfsMount {
-    instance_id: InstanceId,
-    interface: Arc<SwfsInterface>,
+/// An SWFS mount: the instance it serves, the interface SWFS calls back through, and where the
+/// instance lives.
+#[lore_macro::test_pub]
+pub(crate) struct SwfsMount {
+    pub(crate) instance_id: InstanceId,
+    pub(crate) interface: Arc<SwfsInterface>,
+    pub(crate) record: Arc<MountRecord>,
 }
 
 /// The service's SWFS mounts.
@@ -60,42 +63,37 @@ impl SwfsMountManager {
     /// recorded once SWFS is ready. A later registration at a path displaces an earlier one, whose
     /// mount is dropped unused.
     pub(crate) async fn with_mounts(
-        found: Vec<(MountPath, InstanceId, Arc<SwfsInterface>)>,
+        found: Vec<(MountPath, SwfsMount)>,
     ) -> Result<Self, MountManagerError> {
-        let mut unique: Vec<(MountPath, InstanceId, Arc<SwfsInterface>)> =
-            Vec::with_capacity(found.len());
+        let mut unique: Vec<(MountPath, SwfsMount)> = Vec::with_capacity(found.len());
         for mount in found {
-            unique.retain(|(mount_path, _, _)| *mount_path != mount.0);
+            unique.retain(|(mount_path, _)| *mount_path != mount.0);
             unique.push(mount);
         }
         let manager = Self::new();
-        for (mount_path, instance_id, interface) in unique {
-            interface
+        for (mount_path, mount) in unique {
+            mount
+                .interface
                 .wait_for_ready()
                 .await
                 .forward::<MountManagerError>("Failed waiting for mount to be ready")?;
             manager
                 .handles
-                .insert(interface.lookup_key(), interface.clone());
-            manager.mounts.insert(
-                mount_path,
-                SwfsMount {
-                    instance_id,
-                    interface,
-                },
-            );
+                .insert(mount.interface.lookup_key(), mount.interface.clone());
+            manager.mounts.insert(mount_path, mount);
         }
         Ok(manager)
     }
 
-    /// Mounts the registered instance `instance_id` at `mount_path` through SWFS, without waiting
-    /// for SWFS to be ready or recording the mount.
+    /// Mounts the registered instance `instance_id`, whose external directory is `external_dir`,
+    /// at `mount_path` through SWFS, without waiting for SWFS to be ready or recording the mount.
     pub(crate) async fn mount_registered(
         instance_id: InstanceId,
         mount_path: MountPath,
+        external_dir: &Path,
     ) -> Result<Arc<SwfsInterface>, MountManagerError> {
         SwfsInterface::mount(
-            MountResources::premount_instance(instance_id, mount_path)
+            MountResources::premount_instance(instance_id, mount_path, external_dir)
                 .await
                 .forward::<MountManagerError>("Failed gathering premount resources")?,
         )
@@ -116,12 +114,15 @@ impl SwfsMountManager {
         })
     }
 
+    /// Mounts a fresh SWFS instance `instance_id` of the repository `repository_id` at
+    /// `repository_path`, over the external directory `record` records, and answers its Lore
+    /// directory there.
     pub async fn create_mount(
         &self,
         repository_path: &Path,
         repository_config: &RepositoryConfig,
         repository_id: RepositoryId,
-        instance_id: InstanceId,
+        (instance_id, record): (InstanceId, Arc<MountRecord>),
     ) -> Result<PathBuf, MountManagerError> {
         let mount_path = MountPath::new(repository_path)
             .forward::<MountManagerError>("Failed to make mount path")?;
@@ -142,21 +143,28 @@ impl SwfsMountManager {
         // catches one that raced another to the last place.
         self.refuse_past_mount_limit()
             .map_err(|refused| MountManagerError::internal(refused.to_string()))?;
-        let dot_lore = external_dir_for_instance(instance_id)
-            .forward::<MountManagerError>("Unable to get external directory")?
-            .join(DOT_LORE);
-        let mount = SwfsInterface::mount(
+        let dot_lore = record.external_dir.join(DOT_LORE);
+        let interface = SwfsInterface::mount(
             MountResources::premount_instance_with_config(
                 repository_id,
                 instance_id,
                 mount_path.clone(),
                 repository_config,
+                &record.external_dir,
             )
             .await
             .forward::<MountManagerError>("Failed gathering premount resources")?,
         )
         .forward::<MountManagerError>("Failed to mount")?;
-        self.attach(mount_path, instance_id, mount).await?;
+        self.attach(
+            mount_path,
+            SwfsMount {
+                instance_id,
+                interface,
+                record,
+            },
+        )
+        .await?;
         Ok(dot_lore)
     }
 
@@ -198,6 +206,13 @@ impl SwfsMountManager {
         self.mounts.get(mount_path).map(|mount| mount.instance_id)
     }
 
+    /// What the mount at `mount_path` recorded of where its instance lives, if any.
+    pub(crate) fn record_at(&self, mount_path: &MountPath) -> Option<Arc<MountRecord>> {
+        self.mounts
+            .get(mount_path)
+            .map(|mount| mount.record.clone())
+    }
+
     /// The interface of the mount at `mount_path`, if any.
     pub(crate) fn interface_at(&self, mount_path: &MountPath) -> Option<Arc<SwfsInterface>> {
         self.mounts
@@ -215,56 +230,88 @@ impl SwfsMountManager {
 
     /// Remove a mount, closing it. Returns the `instance_id` if a mount existed at the path.
     pub fn remove_mount(&self, path: &Path) -> Result<Option<InstanceId>, MountManagerError> {
-        let mount_path =
-            MountPath::new(path).forward::<MountManagerError>("Failed to make mount path")?;
-        if let Some((_, mount)) = self.mounts.remove(&mount_path) {
-            self.handles.remove(&mount.interface.lookup_key());
-            // Closed explicitly: other holders of the interface would keep the path mounted.
-            mount.interface.close();
-            Ok(Some(mount.instance_id))
-        } else {
-            Ok(None)
-        }
+        Ok(self.take_mount(path)?.map(|(instance_id, _)| instance_id))
     }
 
-    /// Mount `instance_id` at `mount_path`, record it, and wait for SWFS to be ready.
+    /// Removes the mount at `path`, closing it, and answers the instance it served and its record.
+    fn take_mount(
+        &self,
+        path: &Path,
+    ) -> Result<Option<(InstanceId, Arc<MountRecord>)>, MountManagerError> {
+        let mount_path =
+            MountPath::new(path).forward::<MountManagerError>("Failed to make mount path")?;
+        let Some((_, mount)) = self.mounts.remove(&mount_path) else {
+            return Ok(None);
+        };
+        self.handles.remove(&mount.interface.lookup_key());
+        // Closed explicitly: other holders of the interface would keep the path mounted.
+        mount.interface.close();
+        Ok(Some((mount.instance_id, mount.record)))
+    }
+
+    /// Mount `instance_id`, which lives where `record` says, at `mount_path`, record it, and wait
+    /// for SWFS to be ready.
     async fn mount_instance(
         &self,
         instance_id: InstanceId,
         mount_path: MountPath,
+        record: Arc<MountRecord>,
     ) -> Result<(), MountManagerError> {
-        let mount = Self::mount_registered(instance_id, mount_path.clone()).await?;
-        self.attach(mount_path, instance_id, mount).await
+        let interface =
+            Self::mount_registered(instance_id, mount_path.clone(), &record.external_dir).await?;
+        self.attach(
+            mount_path,
+            SwfsMount {
+                instance_id,
+                interface,
+                record,
+            },
+        )
+        .await
     }
 
-    /// Record a fresh `mount` of `instance_id` at `mount_path` and wait for SWFS to be ready. If
-    /// SWFS does not become ready the mount is closed and no longer recorded.
+    /// Record a fresh `mount` at `mount_path` and wait for SWFS to be ready. If SWFS does not
+    /// become ready the mount is closed and no longer recorded.
     async fn attach(
         &self,
         mount_path: MountPath,
-        instance_id: InstanceId,
-        mount: Arc<SwfsInterface>,
+        mount: SwfsMount,
     ) -> Result<(), MountManagerError> {
-        let handle = mount.lookup_key();
-        // Recorded before SWFS is ready, as it can call back as soon as it is mounted.
-        self.handles.insert(handle.clone(), mount.clone());
-        let displaced = self.mounts.insert(
-            mount_path.clone(),
-            SwfsMount {
-                instance_id,
-                interface: mount.clone(),
-            },
-        );
-        if displaced.is_some() {
+        let interface = self.record(&mount_path, mount)?;
+        self.wait_until_ready(&mount_path, interface).await
+    }
+
+    /// Records a fresh `mount` at `mount_path` before SWFS is ready, as it can call back as soon
+    /// as it is mounted, and answers its interface. A plain `fn`, so that the future waiting for
+    /// SWFS doesn't hold the mount.
+    fn record(
+        &self,
+        mount_path: &MountPath,
+        mount: SwfsMount,
+    ) -> Result<Arc<SwfsInterface>, MountManagerError> {
+        let interface = mount.interface.clone();
+        self.handles
+            .insert(interface.lookup_key(), interface.clone());
+        if self.mounts.insert(mount_path.clone(), mount).is_some() {
             return Err(MountManagerError::internal(format!(
                 "Mount double created for path {}",
                 mount_path.as_ref().display()
             )));
         }
-        if let Err(error) = mount.wait_for_ready().await {
-            self.mounts.remove(&mount_path);
-            self.handles.remove(&handle);
-            mount.close();
+        Ok(interface)
+    }
+
+    /// Waits for SWFS to be ready to serve `interface`, recorded at `mount_path`, and closes and
+    /// forgets the mount where it doesn't become ready.
+    async fn wait_until_ready(
+        &self,
+        mount_path: &MountPath,
+        interface: Arc<SwfsInterface>,
+    ) -> Result<(), MountManagerError> {
+        if let Err(error) = interface.wait_for_ready().await {
+            self.mounts.remove(mount_path);
+            self.handles.remove(&interface.lookup_key());
+            interface.close();
             return Err(MountManagerError::internal(format!(
                 "Failed waiting for mount to be ready: {error}"
             )));
@@ -285,17 +332,20 @@ impl SwfsMountManager {
 
         // The mount is closed, not just dropped: callers still hold references to the interface,
         // and the source path stays mounted until it is closed.
-        let Some(instance_id) = self.remove_mount(from_path)? else {
+        let Some((instance_id, record)) = self.take_mount(from_path)? else {
             return Err(MountManagerError::internal(format!(
                 "Mount not found at path {}",
                 from_path.display()
             )));
         };
 
-        let Err(error) = self.mount_instance(instance_id, to_mount_path).await else {
+        let Err(error) = self
+            .mount_instance(instance_id, to_mount_path, record.clone())
+            .await
+        else {
             return Ok(());
         };
-        self.mount_instance(instance_id, from_mount_path)
+        self.mount_instance(instance_id, from_mount_path, record)
             .await
             .map_err(|restore_error| {
                 MountManagerError::internal(format!(

@@ -362,34 +362,30 @@ async fn prepare_repository_call(
 
     let execution = setup_execution(globals, callback);
 
-    // Inside the call's scope, so the metadata of an instance kept in the global directory, as an
-    // SWFS instance's is, is looked for in the directory the call carries: a service relaying
-    // calls for another global directory would otherwise look in its own.
-    let dotpath = LORE_CONTEXT
+    // Inside the call's scope, so the external root of a virtual instance is the one of the global
+    // data directory the call carries: a service relaying calls for another global data directory
+    // would otherwise look in its own.
+    let found = LORE_CONTEXT
         .scope(execution.clone(), async {
             get_dot_lore_path(&repository_path)
         })
-        .await
-        .map_err(|err| err.ffi_code())?;
-    if !dotpath.is_dir() {
-        let err = RepositoryError::from(RepositoryNotFound {
+        .await;
+    let failure = match found {
+        Ok(dotpath) if dotpath.is_dir() => return Ok((repository_path, execution)),
+        Ok(_) => LoreErrorDetail::from_error(&RepositoryError::from(RepositoryNotFound {
             repository: repository_path.display().to_string(),
-        });
-        // A pre-command failure reports the same status, return value, and
-        // detail as a command failure. Complete inside the execution scope so
-        // the failure log routes to the dispatcher.
-        let status = LORE_CONTEXT
-            .scope(execution, async move {
-                execution_context()
-                    .dispatcher
-                    .complete(LoreErrorDetail::from_error(&err))
-                    .await
-            })
-            .await;
-        return Err(status);
-    }
-
-    Ok((repository_path, execution))
+        })),
+        Err(err) => LoreErrorDetail::from_error(&err),
+    };
+    // A pre-command failure reports the same status, return value, and
+    // detail as a command failure. Complete inside the execution scope so
+    // the failure log routes to the dispatcher.
+    let status = LORE_CONTEXT
+        .scope(execution, async move {
+            execution_context().dispatcher.complete(failure).await
+        })
+        .await;
+    Err(status)
 }
 
 fn post_command_cleanup(repository: Arc<RepositoryContext>) -> std::sync::Weak<RepositoryContext> {

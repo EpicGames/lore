@@ -154,3 +154,84 @@ async fn a_failed_save_names_the_target_and_the_temporary() {
         "the error must name the config it was saving: {message}"
     );
 }
+
+/// A strict save replaces the config and leaves no temporary file.
+#[tokio::test]
+async fn a_strict_save_replaces_the_config() {
+    let dir = lore_base::test_util::TempDir::new("lore-config-strict-");
+    let path = dir.path().join("settings.toml");
+    std::fs::write(&path, b"name = \"original\"\n").expect("write config");
+
+    save_strict(
+        &Settings {
+            name: "replacement".to_owned(),
+        },
+        &path,
+    )
+    .await
+    .expect("a strict save replaces the config");
+
+    let config: Settings = load(&path).await.expect("the saved config loads");
+    assert_eq!(config.name, "replacement");
+    assert!(!temp_path(&path).exists());
+}
+
+/// A strict save in a directory its caller can write but not read renames the config into place,
+/// then fails to open the directory to flush it, and fails.
+#[cfg(target_family = "unix")]
+#[tokio::test]
+async fn a_strict_save_reports_a_failed_flush() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = lore_base::test_util::TempDir::new("lore-config-strict-unflushable-");
+    let parent = dir.path().join("parent");
+    std::fs::create_dir(&parent).expect("create the parent");
+    let path = parent.join("settings.toml");
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o300))
+        .expect("make the parent unreadable");
+
+    let saved = save_strict(
+        &Settings {
+            name: "strict".to_owned(),
+        },
+        &path,
+    )
+    .await;
+
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+        .expect("make the parent readable again");
+    assert!(saved.is_err());
+    let config: Settings = load(&path).await.expect("the renamed config loads");
+    assert_eq!(config.name, "strict");
+}
+
+/// An ordinary save succeeds in a directory it cannot read, since it flushes no directory.
+#[cfg(target_family = "unix")]
+#[tokio::test]
+async fn an_ordinary_save_flushes_no_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = lore_base::test_util::TempDir::new("lore-config-ordinary-");
+    let parent = dir.path().join("parent");
+    std::fs::create_dir(&parent).expect("create the parent");
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o300))
+        .expect("make the parent unreadable");
+    let saved = save(
+        &Settings {
+            name: "ordinary".to_owned(),
+        },
+        parent.join("settings.toml"),
+    )
+    .await;
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+        .expect("make the parent readable again");
+    saved.expect("an ordinary save flushes no directory");
+}

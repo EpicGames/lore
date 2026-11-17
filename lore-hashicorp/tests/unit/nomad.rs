@@ -30,8 +30,8 @@ fn test_nomad_resource_detector_with_env_vars() {
 
 #[test]
 fn test_nomad_resource_detector_with_missing_env_vars() {
-    // make sure no env var is accidentally set
-    temp_env::with_vars_unset(["NOMAD_ALLOC_ID"], || {
+    // Unsets every variable the detector reads, which a run inside a Nomad job has set.
+    temp_env::with_vars_unset(["NOMAD_ALLOC_ID", "NOMAD_JOB_ID"], || {
         let resource = NomadResourceDetector.detect();
 
         assert_eq!(resource.len(), 0);

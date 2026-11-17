@@ -13,7 +13,7 @@ from error_types import (
 from service_util import LORE_SERVICE_ENVIRONMENT
 from test_repository_info import get_instance_id
 
-from lore import Lore, per_url_store_path
+from lore import Lore, external_root, per_url_store_path
 
 pytestmark = pytest.mark.own_vfs("makes its SWFS clones from ordinary repositories")
 
@@ -55,7 +55,7 @@ def test_swfs_creates_external_dot_lore(
     instance_id = get_instance_id(repo.repository_info())
     assert instance_id is not None
     external_dot_lore = os.path.join(
-        global_dir_name, "data", "external", instance_id, ".lore"
+        external_root(global_dir_name), instance_id, ".lore"
     )
 
     # Expect the external .lore directory to have been created rather than a local one.
@@ -515,7 +515,7 @@ def test_swfs_refuses_an_instance_past_the_mount_limit(
     instances = [
         source.clone(vfs="swfs", use_shared_store=True) for _ in range(SWFS_MOUNT_LIMIT)
     ]
-    external = os.path.join(global_dir_name, "data", "external")
+    external = external_root(global_dir_name)
     assert len(os.listdir(external)) == SWFS_MOUNT_LIMIT
 
     with pytest.raises(NotSupportedError):

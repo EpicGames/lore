@@ -191,9 +191,13 @@ pub fn instance_metadata(repository: &RepositoryContext, path: &Path) -> Instanc
 }
 
 pub fn dot_lore_of(repository: &RepositoryContext) -> PathBuf {
-    external_dir_for_instance(repository.instance_id)
-        .expect("external dir resolves")
-        .join(DOT_LORE)
+    external_dir_for_instance(
+        &lore_revision::global::external_dir::resolve::resolve()
+            .expect("resolve the external root"),
+        repository.instance_id,
+    )
+    .expect("external dir resolves")
+    .join(DOT_LORE)
 }
 
 pub fn lore_mounts_at(path: &Path) -> usize {

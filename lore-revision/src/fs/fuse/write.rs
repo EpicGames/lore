@@ -630,19 +630,19 @@ impl Drop for TakenAside<'_> {
 
 impl LocalFiles {
     /// Opens `write`, creating it on first use, and empties the staging directory beside it.
-    /// Blocking.
+    /// Neither is made where the external directory that holds them is missing. Blocking.
     #[lore_macro::test_pub]
     pub(crate) fn open(write: &Path) -> Result<Self, FuseProviderError> {
         let root_path = write.to_path_buf();
         let staging = write.with_file_name(STAGING_DIRECTORY);
-        std::fs::create_dir_all(&root_path)
+        lore_io::create_dir_in_existing_parent(&root_path)
             .map_err(|error| open_failed("creating", &root_path, &error))?;
         if let Err(error) = std::fs::remove_dir_all(&staging)
             && error.kind() != std::io::ErrorKind::NotFound
         {
             return Err(open_failed("emptying", &staging, &error));
         }
-        std::fs::create_dir_all(&staging)
+        lore_io::create_dir_in_existing_parent(&staging)
             .map_err(|error| open_failed("creating", &staging, &error))?;
         let root = File::open(&root_path)
             .map_err(|error| open_failed("opening", &root_path, &error))?

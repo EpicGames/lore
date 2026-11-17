@@ -97,6 +97,22 @@ fn a_wait_ends_on_its_claims_release_though_the_name_retakes_the_slot() {
     drop(again);
 }
 
+/// Opening the local files of a missing external directory fails, and makes neither it nor
+/// `write/`.
+#[test]
+fn opening_the_local_files_of_a_missing_external_directory_makes_nothing() {
+    let dir = TempDir::new("lore-fuse-open-missing-");
+    let external = dir.path().join("external");
+
+    let opened = LocalFiles::open(&external.join("write"));
+
+    match opened {
+        Ok(_) => panic!("the open succeeded"),
+        Err(error) => assert!(error.is_internal(), "{error}"),
+    }
+    assert!(!external.exists(), "the external directory isn't made");
+}
+
 /// A host file taken aside and dropped before it is settled, as by a panic, goes back.
 #[test]
 fn a_host_file_taken_aside_and_dropped_unsettled_goes_back() {
