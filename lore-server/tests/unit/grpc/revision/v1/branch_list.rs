@@ -229,6 +229,7 @@ mod direct_handling {
                 .find_map(|item| item.as_ref().err())
                 .expect("stream must carry the backpressure signal");
             assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+            assert_eq!(status.message(), OVERLOADED);
         }))
         .await;
     }

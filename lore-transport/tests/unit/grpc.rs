@@ -269,6 +269,19 @@ fn a_refusal_keeps_the_remotes_reason_on_its_trace() {
     }
 }
 
+/// A slow down keeps the remote's reason on its trace, as a refusal does.
+#[test]
+fn a_slow_down_keeps_the_remotes_reason_on_its_trace() {
+    let error = ProtocolError::from(Status::resource_exhausted("use branch info"));
+    assert!(error.is_slow_down(), "{error:?}");
+    assert!(
+        error.trace().locations().iter().any(|location| location
+            .context()
+            .is_some_and(|context| context.contains("use branch info"))),
+        "{error:?}"
+    );
+}
+
 /// A refusal the remote gives no reason for adds no context to the trace.
 #[test]
 fn a_refusal_without_a_reason_adds_no_context() {

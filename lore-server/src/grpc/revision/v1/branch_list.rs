@@ -152,6 +152,11 @@ pub async fn branch_list_implementation(
     Ok(Response::new(Box::pin(ReceiverStream::from(rx))))
 }
 
+/// The message of the `RESOURCE_EXHAUSTED` status that ends a throttled `BranchList` call. It tells
+/// the caller what to do in place of another call.
+#[lore_macro::test_pub]
+const OVERLOADED: &str = "Store overloaded. Do not list branches in a loop. For one branch, use `lore branch info --remote <branch>`.";
+
 async fn stream_branches(
     repository: Arc<RepositoryContext>,
     creator_filter: Option<String>,
@@ -168,6 +173,12 @@ async fn stream_branches(
     )
     .await
     {
+        // The only source of this code in `produce_branches` is a store that asks for a slow down.
+        let status = if status.code() == tonic::Code::ResourceExhausted {
+            Status::resource_exhausted(OVERLOADED)
+        } else {
+            status
+        };
         log_server_error(&status);
         let _ = tx.send(Err(status)).await;
     }

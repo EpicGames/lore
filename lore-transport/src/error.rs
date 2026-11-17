@@ -26,14 +26,20 @@ impl From<tonic::Status> for ProtocolError {
     fn from(value: tonic::Status) -> Self {
         match value.code() {
             tonic::Code::Unavailable | tonic::Code::Unknown => ProtocolError::from(Disconnected),
-            tonic::Code::Unauthenticated => refusal(ProtocolError::from(NotAuthenticated), &value),
-            tonic::Code::PermissionDenied => refusal(ProtocolError::from(NotAuthorized), &value),
+            tonic::Code::Unauthenticated => {
+                with_remote_reason(ProtocolError::from(NotAuthenticated), &value)
+            }
+            tonic::Code::PermissionDenied => {
+                with_remote_reason(ProtocolError::from(NotAuthorized), &value)
+            }
             tonic::Code::NotFound => ProtocolError::from(NotFound),
             tonic::Code::FailedPrecondition => match address_not_found_details(&value) {
                 Some(error) => ProtocolError::from(error),
                 None => ProtocolError::internal_with_context(value, "remote rejected the request"),
             },
-            tonic::Code::ResourceExhausted => ProtocolError::from(SlowDown),
+            tonic::Code::ResourceExhausted => {
+                with_remote_reason(ProtocolError::from(SlowDown), &value)
+            }
             tonic::Code::OutOfRange => ProtocolError::from(Oversized {
                 context: value.message().to_string(),
             }),
@@ -45,9 +51,9 @@ impl From<tonic::Status> for ProtocolError {
     }
 }
 
-/// `error` with the message of `status`, the remote's reason for the refusal, on its trace when
-/// the remote gave one.
-fn refusal(mut error: ProtocolError, status: &tonic::Status) -> ProtocolError {
+/// `error` with the message of `status`, the remote's reason for the refusal or the slow down, on
+/// its trace when the remote gave one.
+fn with_remote_reason(mut error: ProtocolError, status: &tonic::Status) -> ProtocolError {
     if !status.message().is_empty() {
         error.push_trace(lore_error_set::Location::with_context(
             file!(),

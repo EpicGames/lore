@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use lore_base::lore_debug;
+use lore_base::lore_warn;
 use lore_base::types::BranchId;
 use lore_base::types::BranchPoint;
 use lore_base::types::Hash;
@@ -156,17 +157,18 @@ impl RevisionService {
 
             let mut client = self.client.clone();
 
-            match client.branch_list(request).await {
+            let status = match client.branch_list(request).await {
                 Ok(response) => match collect_branch_list(response.into_inner(), limit).await {
                     Ok(response) => break response,
-                    Err(status) => {
-                        handle_error(&mut retry, status).await?;
-                    }
+                    Err(status) => status,
                 },
-                Err(status) => {
-                    handle_error(&mut retry, status).await?;
-                }
+                Err(status) => status,
+            };
+            // Not in `handle_error`: a command that sends many calls at once would warn for each.
+            if let Some(reason) = first_throttle_reason(&retry, &status) {
+                lore_warn!("Remote is throttling the branch listing: {reason}");
             }
+            handle_error(&mut retry, status).await?;
         };
 
         Ok(list)
@@ -404,6 +406,19 @@ fn branch_record_from_v1(branch: model_v1::Branch) -> BranchRecord {
         deleted: branch.deleted,
         stack: branch.stack.into_iter().map(BranchPoint::from).collect(),
     }
+}
+
+/// The remote's reason for the first `RESOURCE_EXHAUSTED` answer of a call. `None` for a later
+/// answer of the same call, which would repeat the reason, and where the remote gave none.
+#[lore_macro::test_pub]
+fn first_throttle_reason<'a>(
+    retry: &crate::util::Retry,
+    status: &'a tonic::Status,
+) -> Option<&'a str> {
+    (status.code() == tonic::Code::ResourceExhausted
+        && retry.counter() == 0
+        && !status.message().is_empty())
+    .then(|| status.message())
 }
 
 #[lore_macro::test_pub]
