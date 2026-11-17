@@ -817,6 +817,11 @@ pub trait ImmutableStore: Any + Send + Sync {
         let _ = terminate;
     }
 
+    /// The GC limits and load totals of a store with background GC, `None` for one without.
+    fn gc_counters(&self) -> Option<Arc<crate::maintenance::GcCounters>> {
+        None
+    }
+
     /// Get maximum supported query batch size, if any
     fn max_query_batch(&self) -> Option<usize>;
 

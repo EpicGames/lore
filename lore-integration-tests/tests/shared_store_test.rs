@@ -78,6 +78,7 @@ mod shared_store_tests {
                 remote_url: REMOTE_URL.into(),
                 path: LoreString::from(path.display().to_string().as_str()),
                 make_default: 0,
+                ..Default::default()
             },
             None,
         )

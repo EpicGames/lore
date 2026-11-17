@@ -249,7 +249,7 @@ Store at path: /home/you/.local/share/lore/shared_store/127.0.0.1_41337
 
 ## Free disk space
 
-The store keeps itself within the limits in the `[store]` table of the instance's `.lore/config.toml`, 10 GiB by default. Past a limit, Lore evicts content the Lore Server also holds and fetches it again when it's next read. It never evicts revisions you haven't pushed. See the [`[store]` table](../reference/lore-cli-config.md#store-table) for the limits and how to change them.
+The store keeps itself within the limits in the `[store_config]` table of its `shared_store.toml`, 10 GiB by default, which `lore shared-store create --max-size` sets. Past a limit, Lore evicts content the Lore Server also holds and fetches it again when it's next read. It never evicts revisions you haven't pushed. See the [`[store]` table](../reference/lore-cli-config.md#store-table) for the limits and how to change them.
 
 To delete a store and everything in it:
 

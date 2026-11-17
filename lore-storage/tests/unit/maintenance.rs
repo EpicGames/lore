@@ -36,6 +36,12 @@ async fn create_test_store(path: Option<PathBuf>) -> Arc<dyn ImmutableStore> {
     .unwrap()
 }
 
+fn limits(max_size: usize, max_capacity: usize) -> Arc<GcCounters> {
+    let limits = Arc::new(GcCounters::new());
+    limits.set_caps(max_size, max_capacity, false);
+    limits
+}
+
 #[tokio::test]
 async fn gc_compaction_reduces_fragment_count() {
     let dir = generate_tempdir();
@@ -250,7 +256,13 @@ async fn evictor_exits_when_store_dropped() {
     let weak = Arc::downgrade(&store);
     drop(store);
 
-    evictor(weak, 1024 * 1024, Some(Duration::from_millis(10)), false).await;
+    evictor(
+        weak,
+        limits(0, 1024 * 1024),
+        Some(Duration::from_millis(10)),
+        false,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -259,7 +271,13 @@ async fn compactor_exits_when_store_dropped() {
     let weak = Arc::downgrade(&store);
     drop(store);
 
-    compactor(weak, 1024, Some(Duration::from_millis(10)), false).await;
+    compactor(
+        weak,
+        limits(1024, 0),
+        Some(Duration::from_millis(10)),
+        false,
+    )
+    .await;
 }
 
 /// A store whose first compaction step fails, counting the steps it is asked for.
@@ -422,7 +440,12 @@ async fn compactor_goes_on_after_a_failed_step() {
     let dyn_store: Arc<dyn ImmutableStore> = store.clone();
     let weak = Arc::downgrade(&dyn_store);
     #[allow(clippy::disallowed_methods)] // Test-local task, joined below.
-    let compactor = tokio::spawn(compactor(weak, 1024, Some(Duration::from_millis(1)), false));
+    let compactor = tokio::spawn(compactor(
+        weak,
+        limits(1024, 0),
+        Some(Duration::from_millis(1)),
+        false,
+    ));
 
     for _ in 0..1000 {
         if store.steps.load(std::sync::atomic::Ordering::Relaxed) >= 2 {

@@ -59,7 +59,9 @@ The `[store]` table tunes the repository's local stores — the on-disk immutabl
 | `verify_write` | Boolean | unset (behaves as `false`) | Verify each write by reading the data back and rehashing it. |
 | `cache_payloads` | Boolean | unset (behaves as `false`) | Keep the content of files commands fetch from the remote, and of those they write, in the store. Instances that share a store want this, so a second instance at the same revision reads the content locally instead of fetching it again. |
 
-A command that finds the store over a limit as it loads it starts a pass at once rather than after the interval.
+A command that finds the store over a limit as it loads it starts a pass at once rather than after the interval. A store already open in a process, such as the Lore service, takes the limits of the latest command that opens it to collect. It keeps the delays it was opened with until no command or mount holds it open.
+
+An instance over a shared store collects to the shared store's limits, not these: the `max_capacity`, `eviction_delay`, `max_size` and `compaction_delay` of the `[store_config]` table in the store's `shared_store.toml`. `lore shared-store create` writes them, from its `--max-size` and `--max-capacity` options or the defaults above. A field left out of the table takes its default. Every instance over the store, and `lore repository gc`, takes a changed limit at its next command.
 
 Eviction removes only content the remote also holds, which Lore fetches again when it's next read. Content held only locally, such as commits not yet pushed, counts toward both limits but is never evicted. Once it fills about 70% of a limit, eviction removes the remote content cached beside it. The store keeps its packfiles in 256 groups, and compaction rewrites a group's packfiles only once at least 10% of their bytes are no longer referenced.
 

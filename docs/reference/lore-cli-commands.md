@@ -2746,6 +2746,9 @@ Create a shared store backed by a remote
 
   Possible values: `true`, `false`
 
+* `--max-size <bytes>` — Bytes the store holds before compaction reclaims space, defaults to 10 GiB. Change it later as `max_size` in the store's `shared_store.toml`
+* `--max-capacity <fragments>` — Fragments the store holds before eviction removes some, defaults to 2000000. The periodic eviction pass treats a value below 1048576 as 1048576. Change it later as `max_capacity` in the store's `shared_store.toml`
+
 ## `lore shared-store info`
 
 Show the shared store this repository uses

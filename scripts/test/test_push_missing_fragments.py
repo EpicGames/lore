@@ -4,7 +4,6 @@ import hashlib
 import logging
 import os
 import uuid
-from pathlib import Path
 
 import grpc
 import pytest
@@ -208,18 +207,6 @@ def _server_holds(grpc_target: str, repo_id: str, hash_hex: str) -> bool:
     return state in HELD_STATUSES
 
 
-def _set_store_caps(repo: Lore, max_size: str, max_capacity: str) -> None:
-    """Rewrite the repository's [store] GC caps in config.toml."""
-    config_path = Path(os.path.join(repo.dot_path(), "config.toml"))
-    lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True)
-    for index, line in enumerate(lines):
-        if line.strip().startswith("max_size"):
-            lines[index] = f"max_size = {max_size}\n"
-        elif line.strip().startswith("max_capacity"):
-            lines[index] = f"max_capacity = {max_capacity}\n"
-    config_path.write_text("".join(lines), encoding="utf-8")
-
-
 @pytest.mark.smoke
 @pytest.mark.requires_instrumented_lore
 def test_push_after_a_failed_push_uploads_what_an_evicted_list_names(
@@ -248,7 +235,7 @@ def test_push_after_a_failed_push_uploads_what_an_evicted_list_names(
 
     local_store = os.path.join(repo.dot_path(), "immutable")
     assert bytes.fromhex(LIST_HASH) in index_hashes(local_store)
-    _set_store_caps(repo, max_size="1", max_capacity="1")
+    repo.set_store_caps(max_size="1", max_capacity="1")
     repo.repository_gc()
     assert bytes.fromhex(LIST_HASH) not in index_hashes(local_store), (
         "gc evicted the list"

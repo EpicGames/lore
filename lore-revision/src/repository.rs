@@ -80,6 +80,7 @@ use crate::protocol::RemoteFuture;
 use crate::revision;
 use crate::revision::sync;
 use crate::revision::sync::SyncOptions;
+use crate::shared_store::get_shared_store_for_repo;
 use crate::shared_store::get_shared_store_path_for_repo;
 use crate::state;
 use crate::state::CanReadRepository;
@@ -247,8 +248,8 @@ pub struct StoreConfig {
 }
 
 impl StoreConfig {
-    #[lore_macro::test_pub]
-    fn client_default() -> Self {
+    /// The limits and delays a new instance's config and a new shared store's config hold.
+    pub fn client_default() -> Self {
         StoreConfig {
             max_capacity: Some(2_000_000),
             eviction_delay: Some(30),
@@ -259,14 +260,15 @@ impl StoreConfig {
         }
     }
 
-    pub fn global_default() -> Self {
+    /// This config, with the limits and delays it leaves out taken from [`Self::client_default`].
+    pub fn with_default_limits(&self) -> Self {
+        let default = Self::client_default();
         StoreConfig {
-            max_capacity: Some(2_000_000),
-            eviction_delay: Some(30),
-            max_size: Some(10 * 1024 * 1024 * 1024),
-            compaction_delay: Some(50),
-            verify_write: None,
-            cache_payloads: None,
+            max_capacity: self.max_capacity.or(default.max_capacity),
+            eviction_delay: self.eviction_delay.or(default.eviction_delay),
+            max_size: self.max_size.or(default.max_size),
+            compaction_delay: self.compaction_delay.or(default.compaction_delay),
+            ..self.clone()
         }
     }
 
@@ -2735,19 +2737,35 @@ pub async fn create_client_immutable_store(
     create_options: ImmutableStoreCreateOptions,
     verify_write: bool,
 ) -> Result<(Arc<dyn ImmutableStore>, Option<StoreGuard>), RepositoryError> {
-    create_immutable_store_at_path(
-        get_shared_store_path_for_repo(config)
+    let (path, create_options) =
+        immutable_store_path_and_options(config, dotpath.as_ref(), create_options).await?;
+    create_immutable_store_at_path(path, create_options, verify_write).await
+}
+
+/// The path of the repository's immutable store, in the shared store its config names or
+/// under `dotpath`, and the GC options `create_options` become for it: a shared store collects
+/// to its own limits, as [`crate::shared_store::SharedStoreConfig::gc_options`] gives them.
+async fn immutable_store_path_and_options(
+    config: &RepositoryConfig,
+    dotpath: &Path,
+    create_options: ImmutableStoreCreateOptions,
+) -> Result<(PathBuf, ImmutableStoreCreateOptions), RepositoryError> {
+    Ok(
+        match get_shared_store_for_repo(config)
             .await
             .forward::<RepositoryError>("Failed to access shared store")?
-            .unwrap_or_else(|| dotpath.as_ref().to_owned()),
-        create_options,
-        verify_write,
+        {
+            Some((path, shared_store_config)) => {
+                (path, shared_store_config.gc_options(create_options))
+            }
+            None => (dotpath.to_owned(), create_options),
+        },
     )
-    .await
 }
 
 /// The client immutable store at `path`, from the store cache or opened here, with the claim
-/// it was opened under when this call opened it, `None` when it came from the cache.
+/// it was opened under when this call opened it, `None` when it came from the cache. Options that
+/// set GC limits apply to a cached store too.
 ///
 /// A caller keeps that claim until its own claim on the store has joined it, so the store is
 /// current at that claim rather than reloading what its opening read: see
@@ -2759,17 +2777,15 @@ pub async fn create_immutable_store_at_path(
 ) -> Result<(Arc<dyn ImmutableStore>, Option<StoreGuard>), RepositoryError> {
     // Fast path: upgrade an existing weak reference.
     if let Some(store) = get_cached_immutable_store(&path) {
-        lore_debug!("Reusing cached immutable store");
-        return Ok((store, None));
+        return Ok(reuse_cached_immutable_store(store, &create_options));
     }
 
     // Filed under the directory the path names, so another spelling of it reaches the same
     // store rather than building a second one over the same files.
     let key = canonical_store_key(&path);
     if let Some(store) = get_cached_immutable_store(&key) {
-        lore_debug!("Reusing cached immutable store");
         cache_immutable_store(path, store.clone());
-        return Ok((store, None));
+        return Ok(reuse_cached_immutable_store(store, &create_options));
     }
 
     // Slow path: serialize concurrent first-time initializers per directory so only
@@ -2793,9 +2809,8 @@ pub async fn create_immutable_store_at_path(
 
     // Re-check the cache — another task may have finished while we waited.
     if let Some(store) = get_cached_immutable_store(&key) {
-        lore_debug!("Reusing cached immutable store");
         cache_immutable_store(path, store.clone());
-        return Ok((store, None));
+        return Ok(reuse_cached_immutable_store(store, &create_options));
     }
 
     let (store, opening) = crate::store::immutable::create_claimed(
@@ -2818,6 +2833,16 @@ pub async fn create_immutable_store_at_path(
     cache_immutable_store(path, store.clone());
 
     Ok((store, opening))
+}
+
+/// `store` from the store cache, with the GC limits `create_options` sets applied to it.
+fn reuse_cached_immutable_store(
+    store: Arc<dyn ImmutableStore>,
+    create_options: &ImmutableStoreCreateOptions,
+) -> (Arc<dyn ImmutableStore>, Option<StoreGuard>) {
+    lore_debug!("Reusing cached immutable store");
+    lore_storage::maintenance::spawn_gc(&store, create_options);
+    (store, None)
 }
 
 /// The repository's mutable store, in the shared store its config names or under `dotpath`,
@@ -4971,25 +4996,29 @@ pub fn repository_remote(repository_path: impl AsRef<str>) -> Result<String, Rep
     Ok(config.remote_url.unwrap_or_default())
 }
 
-/// Run a full eviction and compaction pass over the repository's store with the caps in its
-/// configuration, with the whole index loaded for eviction.
+/// Run a full eviction and compaction pass over the repository's store with the caps it
+/// collects to, with the whole index loaded for eviction.
 pub async fn gc(repository: Arc<RepositoryContext>) -> Result<(), RepositoryError> {
     let dot_path = repository.dot_dir_path()?;
     let config_path = dot_path.join(CONFIG);
 
     let config = load_config(config_path.as_path())?;
-    let config_store = config.store.as_ref();
 
     // Collecting evicts and compacts the store's files, which no dry run may change.
     if crate::runtime::try_execution_context().is_some_and(|context| context.globals().dry_run()) {
         return Ok(());
     }
 
+    let (_, options) = immutable_store_path_and_options(
+        &config,
+        dot_path,
+        config.store.clone().unwrap_or_default().to_options(),
+    )
+    .await?;
     let sync_data = crate::runtime::try_execution_context()
         .is_some_and(|context| context.globals().sync_data());
-    let max_size = config_store.map_or_default(|config| config.max_size.unwrap_or_default());
-    let max_capacity =
-        config_store.map_or_default(|config| config.max_capacity.unwrap_or_default());
+    let max_size = options.max_size.unwrap_or_default();
+    let max_capacity = options.max_capacity.unwrap_or_default();
     if max_capacity > 0
         && let Err(err) = repository.immutable_store().load_index().await
     {

@@ -14,6 +14,7 @@ import string
 import subprocess
 import sys
 import tempfile
+import tomllib
 import uuid
 from collections.abc import Iterable
 from pathlib import Path
@@ -197,6 +198,24 @@ def _link_message_args(link_messages: dict[str, str] | None) -> list[str]:
         for path, message in (link_messages or {}).items()
         for arg in ("--link-message", path, message)
     ]
+
+
+def strip_protocol(url: str) -> str:
+    """Strip protocol scheme (e.g. 'lore://') and trailing slash from a URL."""
+    url = url.removesuffix("/")
+    if "://" in url:
+        url = url.split("://", 1)[1]
+    return url
+
+
+def per_url_store_path(base: str, remote: str) -> str:
+    """Path to the shared store for `remote` under base path `base`, mirroring the
+    Rust layout <base>/<escaped-url>/shared_store. Each remote URL gets its own
+    subdirectory so one base path can back multiple endpoints."""
+    escaped = "".join(
+        "_" if c in '/\\:*?"<>|' or ord(c) < 32 else c for c in strip_protocol(remote)
+    )
+    return os.path.join(base, escaped, "shared_store")
 
 
 class Lore:
@@ -469,6 +488,31 @@ class Lore:
 
     def repository_list(self, url: str | None = None, **kwargs: Unpack[GlobalOptions]):
         return self.run(["repository", "list"] + ([url] if url else []), **kwargs)
+
+    def store_caps_path(self) -> Path:
+        """The file holding the GC caps the repository's store collects to: its shared
+        store's `shared_store.toml`, or its own `config.toml`."""
+        config_path = Path(self.dot_path()) / "config.toml"
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        shared = config.get("shared_store_to_use", {})
+        if not shared.get("use_shared_store"):
+            return config_path
+        if base := shared.get("shared_store_path"):
+            store = per_url_store_path(base, self.remote)
+        else:
+            store = self.shared_store_info().stores[strip_protocol(self.remote)].path
+        return Path(store) / "shared_store.toml"
+
+    def set_store_caps(self, max_size: str, max_capacity: str) -> None:
+        """Rewrite the GC caps the repository's store collects to."""
+        path = self.store_caps_path()
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            if line.strip().startswith("max_size"):
+                lines[index] = f"max_size = {max_size}\n"
+            elif line.strip().startswith("max_capacity"):
+                lines[index] = f"max_capacity = {max_capacity}\n"
+        path.write_text("".join(lines), encoding="utf-8")
 
     def _own_shared_store(
         self, asked_vfs: str | None, vfs: str | None, repo_path: str
@@ -2671,12 +2715,16 @@ class Lore:
         remote_url: str,
         path: str | None = None,
         make_default: bool = True,
+        max_size: int | None = None,
+        max_capacity: int | None = None,
         **kwargs: Unpack[GlobalOptions],
     ) -> str:
         return self.run(
             ["shared-store", "create", remote_url]
             + (["--path", path] if path else [])
-            + ([] if make_default else ["--make-default", "false"]),
+            + ([] if make_default else ["--make-default", "false"])
+            + (["--max-size", str(max_size)] if max_size else [])
+            + (["--max-capacity", str(max_capacity)] if max_capacity else []),
             **kwargs,
         )
 

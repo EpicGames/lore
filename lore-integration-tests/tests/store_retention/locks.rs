@@ -100,6 +100,7 @@ async fn create_shared_store(path: &Path) {
             remote_url: super::REMOTE_URL.into(),
             path: LoreString::from(path.to_str().expect("a UTF-8 path")),
             make_default: 0,
+            ..Default::default()
         },
         None,
     )

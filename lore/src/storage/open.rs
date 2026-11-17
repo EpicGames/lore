@@ -77,11 +77,12 @@ pub struct LoreStorageOpenArgs {
     /// never hashed. Payloads the local store holds are never hashed either way.
     pub skip_verify: u8,
     /// Soft cap on total immutable-store bytes (compactor target). A non-zero cache target enables
-    /// incremental background GC for the handle; `0` then selects the default. Shared disk backends
-    /// inherit the first opener's value
+    /// incremental background GC for the handle; `0` then selects the default. A store this
+    /// process already has open takes these targets; a shared store keeps its own instead
     pub cache_target_bytes: u64,
     /// Soft cap on immutable-store fragment count (evictor target). A non-zero cache target enables
-    /// incremental background GC for the handle; `0` then selects the default
+    /// incremental background GC for the handle; `0` then selects the default. A store this
+    /// process already has open takes these targets; a shared store keeps its own instead
     pub cache_target_fragments: u64,
 }
 

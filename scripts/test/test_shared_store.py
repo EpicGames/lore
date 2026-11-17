@@ -25,7 +25,7 @@ from lore_parsers import (
 from test_repository_info import get_instance_id
 from test_utils import to_posix
 
-from lore import Lore
+from lore import Lore, per_url_store_path, strip_protocol
 
 logger = logging.getLogger(__name__)
 
@@ -73,27 +73,9 @@ def same_path(path1, path2):
     return os.path.abspath(path1) == os.path.abspath(path2)
 
 
-def _strip_protocol(url: str) -> str:
-    """Strip protocol scheme (e.g. 'lore://') and trailing slash from a URL."""
-    url = url.removesuffix("/")
-    if "://" in url:
-        url = url.split("://", 1)[1]
-    return url
-
-
-def per_url_store_path(base: str, remote: str) -> str:
-    """Path to the shared store for `remote` under base path `base`, mirroring the
-    Rust layout <base>/<escaped-url>/shared_store. Each remote URL gets its own
-    subdirectory so one base path can back multiple endpoints."""
-    escaped = "".join(
-        "_" if c in '/\\:*?"<>|' or ord(c) < 32 else c for c in _strip_protocol(remote)
-    )
-    return os.path.join(base, escaped, "shared_store")
-
-
 def get_shared_store_info(repo: Lore) -> SpecificSharedStoreInfo:
     logger.info(f"Getting shared store info for {repo.shared_store_info()}")
-    return repo.shared_store_info().stores[_strip_protocol(repo.remote)]
+    return repo.shared_store_info().stores[strip_protocol(repo.remote)]
 
 
 def _get_shared_store_list(repo: Lore, path: str) -> SharedStoreListEntry:
@@ -198,7 +180,7 @@ def test_create(new_lore_repo, scratch_dir):
 
     assert (
         shared_store_info.stores[other_remote_name].path
-        != shared_store_info.stores[_strip_protocol(repo.remote)].path
+        != shared_store_info.stores[strip_protocol(repo.remote)].path
     )
 
 
@@ -439,7 +421,7 @@ def test_shared_store_remote_mismatch_rejected(new_lore_repo, scratch_dir):
 
     config_path = os.path.join(per_url_store_path(base, repo.remote), CONFIG_TOML)
     with open(config_path, "r+") as f:
-        contents = f.read().replace(_strip_protocol(repo.remote), "some.other.host")
+        contents = f.read().replace(strip_protocol(repo.remote), "some.other.host")
         f.seek(0)
         f.write(contents)
         f.truncate()
@@ -452,7 +434,7 @@ def test_shared_store_remote_mismatch_rejected(new_lore_repo, scratch_dir):
 def test_create_repo_remote_different_but_correct(new_lore_repo, create_repo):
     # Create the shared store with a protocol-less url
     repo: Lore = new_lore_repo(create_repo=False)
-    no_protocol_remote = _strip_protocol(repo.remote)
+    no_protocol_remote = strip_protocol(repo.remote)
     assert no_protocol_remote != repo.remote
     repo.shared_store_create(no_protocol_remote, offline=True)
     shared_store_path = get_shared_store_info(repo).path
@@ -602,7 +584,7 @@ def test_create_repo_creates_store_for_new_endpoint(new_lore_repo, create_repo):
     repo = create_repo(use_shared_store=True)
 
     info = repo.shared_store_info()
-    real_endpoint = _strip_protocol(repo.remote)
+    real_endpoint = strip_protocol(repo.remote)
     assert info.stores[real_endpoint].exists, (
         "The new endpoint's shared store should have been auto-created"
     )
@@ -1668,3 +1650,35 @@ def test_set_use_automatically_dry_run_changes_nothing(new_lore_repo):
     assert repo.shared_store_info().is_automatic is False, (
         "a dry run turned on automatic shared store use"
     )
+
+
+@pytest.mark.smoke
+def test_shared_store_limits_apply_to_its_instances(new_lore_repo, scratch_dir):
+    """An instance over a shared store collects to the limits the store was created with, over
+    the defaults in its own config, and to limits changed in the store's config from the next
+    command."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("First", {"a.txt": b"a\n"})
+    base = str(scratch_dir("limited_store"))
+    repo.shared_store_create(
+        repo.remote, base, make_default=False, max_size=100, max_capacity=1
+    )
+    clone = repo.clone(use_shared_store=True, shared_store_path=base)
+    clone.write_files({"local.bin": os.urandom(8192)})
+    clone.stage("local.bin")
+    clone.commit("Unpushed, so never evicted")
+
+    out = clone.repository_gc(json=True)
+
+    assert parse_jsonl(out, "compactionBegin")[0]["targetBytes"] == 100, out
+    assert parse_jsonl(out, "evictionBegin"), out
+
+    config_path = os.path.join(per_url_store_path(base, repo.remote), CONFIG_TOML)
+    with open(config_path, encoding="utf-8") as f:
+        config = f.read()
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write(config.replace("max_size = 100\n", "max_size = 200\n"))
+
+    out = clone.repository_gc(json=True)
+
+    assert parse_jsonl(out, "compactionBegin")[0]["targetBytes"] == 200, out

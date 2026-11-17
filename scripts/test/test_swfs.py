@@ -12,9 +12,8 @@ from error_types import (
 )
 from service_util import LORE_SERVICE_ENVIRONMENT
 from test_repository_info import get_instance_id
-from test_shared_store import per_url_store_path
 
-from lore import Lore
+from lore import Lore, per_url_store_path
 
 pytestmark = pytest.mark.own_vfs("makes its SWFS clones from ordinary repositories")
 

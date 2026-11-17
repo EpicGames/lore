@@ -5300,6 +5300,10 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         true
     }
 
+    fn gc_counters(&self) -> Option<Arc<crate::maintenance::GcCounters>> {
+        Some(self.gc_counters.clone())
+    }
+
     fn isolates_partitions(&self) -> bool {
         self.settings.isolate_partitions
     }
@@ -6802,6 +6806,11 @@ impl ImmutableStoreCreateOptions {
             max_size: None,
             compaction_delay: None,
         }
+    }
+
+    /// Whether the options set GC limits, rather than leave a store's as they are.
+    pub fn collects(&self) -> bool {
+        self.max_capacity.is_some() || self.max_size.is_some()
     }
 }
 

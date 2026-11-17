@@ -13,28 +13,46 @@ use crate::gc_event::GcEventSinkRef;
 use crate::immutable_store::ImmutableStore;
 use crate::local::immutable_store::ImmutableStoreCreateOptions;
 
-/// Spawn the background incremental evictor and compactor for `store`, configured
-/// by `options`. The tasks hold only a weak reference and self-cancel when the last
-/// strong reference to `store` drops at command completion. These periodic background
-/// passes run silently; only load-triggered passes report to a command's event sink.
+/// Apply the limits of `options` to `store` and run its background incremental evictor and
+/// compactor, once per store. Options without limits leave the store as it is. The tasks read the
+/// limits at each pass, so a store already collecting enforces the latest limits applied, at the
+/// delays it was first given. They hold only a weak reference and end when the last strong
+/// reference to `store` drops. These periodic passes run silently; only load-triggered passes
+/// report to a command's event sink.
 pub fn spawn_gc(store: &Arc<dyn ImmutableStore>, options: &ImmutableStoreCreateOptions) {
-    if let Some(max_capacity) = options.max_capacity
-        && max_capacity > 0
-    {
-        let weak = Arc::downgrade(store);
-        let eviction_delay = options.eviction_delay;
-        drop(lore_base::lore_spawn!(async move {
-            evictor(weak, max_capacity, eviction_delay, false).await;
-        }));
+    let Some(counters) = store.gc_counters() else {
+        return;
+    };
+    if !options.collects() {
+        return;
     }
-    if let Some(max_size) = options.max_size
-        && max_size > 0
-    {
-        let weak = Arc::downgrade(store);
-        let compaction_delay = options.compaction_delay;
-        drop(lore_base::lore_spawn!(async move {
-            compactor(weak, max_size, compaction_delay, false).await;
-        }));
+    let max_capacity = options.max_capacity.unwrap_or(0);
+    let max_size = options.max_size.unwrap_or(0);
+    counters.set_caps(max_size, max_capacity, false);
+    if max_capacity > 0 {
+        lore_base::lore_debug!(
+            "Store evictor enforcing max capacity of {}",
+            evictor_capacity(max_capacity)
+        );
+        if !counters.evictor_spawned.swap(true, Ordering::AcqRel) {
+            drop(lore_base::lore_spawn!(evictor(
+                Arc::downgrade(store),
+                counters.clone(),
+                options.eviction_delay,
+                false,
+            )));
+        }
+    }
+    if max_size > 0 {
+        lore_base::lore_debug!("Store compactor enforcing max size of {max_size}");
+        if !counters.compactor_spawned.swap(true, Ordering::AcqRel) {
+            drop(lore_base::lore_spawn!(compactor(
+                Arc::downgrade(store),
+                counters,
+                options.compaction_delay,
+                false,
+            )));
+        }
     }
 }
 
@@ -42,22 +60,24 @@ pub fn spawn_gc(store: &Arc<dyn ImmutableStore>, options: &ImmutableStoreCreateO
 /// to it, so that its passes leave small stores alone.
 const EVICTOR_FLOOR: usize = 1024 * 1024;
 
-/// Evictor task: enforces max capacity at regular intervals.
-pub async fn evictor(
-    store: Weak<dyn ImmutableStore>,
-    max_capacity: usize,
-    eviction_delay: Option<Duration>,
-    sync_data: bool,
-) {
-    use std::cmp::max;
-
+/// The capacity the periodic evictor enforces for `max_capacity`.
+fn evictor_capacity(max_capacity: usize) -> usize {
     #[cfg(feature = "test-util")]
     let floor = crate::test_util::evictor_floor(EVICTOR_FLOOR);
     #[cfg(not(feature = "test-util"))]
     let floor = EVICTOR_FLOOR;
-    let max_capacity = max(max_capacity, floor);
+    max_capacity.max(floor)
+}
+
+/// Evictor task: enforces the max capacity `limits` holds at regular intervals, skipping the
+/// passes where it is 0.
+pub async fn evictor(
+    store: Weak<dyn ImmutableStore>,
+    limits: Arc<GcCounters>,
+    eviction_delay: Option<Duration>,
+    sync_data: bool,
+) {
     let eviction_delay = eviction_delay.unwrap_or(Duration::from_secs(10));
-    lore_base::lore_debug!("Store evictor enforcing max capacity of {max_capacity}");
     // No startup pass: sleep first so short-lived processes exit before the first scan.
     // Their over-capacity is caught by the load-driven trigger in `GcCounters`.
     loop {
@@ -66,10 +86,17 @@ pub async fn evictor(
             let Some(real_store) = store.upgrade() else {
                 break;
             };
+            let max_capacity = limits.max_capacity.load(Ordering::Relaxed);
+            if max_capacity == 0 {
+                continue;
+            }
             #[cfg(feature = "test-util")]
             let _task = crate::test_util::store_task(crate::test_util::StoreTask::Evictor);
             // Background maintenance is silent — not tied to any command's event stream.
-            if let Err(err) = real_store.evict(max_capacity, sync_data, None).await {
+            if let Err(err) = real_store
+                .evict(evictor_capacity(max_capacity), sync_data, None)
+                .await
+            {
                 lore_base::lore_warn!("Store evictor failed: {err}");
             }
         }
@@ -77,16 +104,16 @@ pub async fn evictor(
     lore_base::lore_debug!("Store evictor exiting");
 }
 
-/// Compactor task: enforces max size at regular intervals. A step that fails is reported and
-/// ends the pass, and the next interval resumes past the groups it covered.
+/// Compactor task: enforces the max size `limits` holds at regular intervals, skipping the steps
+/// where it is 0. A step that fails is reported and ends the pass, and the next interval resumes
+/// past the groups it covered.
 pub async fn compactor(
     store: Weak<dyn ImmutableStore>,
-    max_size: usize,
+    limits: Arc<GcCounters>,
     compaction_delay: Option<Duration>,
     sync_data: bool,
 ) {
     let compaction_delay = compaction_delay.unwrap_or(Duration::from_secs(60 * 60 * 24));
-    lore_base::lore_debug!("Store compactor enforcing max size of {max_size}");
     let mut at = if let Some(store) = store.upgrade() {
         store.compact_resume_at().await
     } else {
@@ -103,6 +130,11 @@ pub async fn compactor(
             let Some(real_store) = store.upgrade() else {
                 break;
             };
+            let max_size = limits.max_size.load(Ordering::Relaxed) as usize;
+            if max_size == 0 {
+                at = None;
+                continue;
+            }
             #[cfg(feature = "test-util")]
             let _task = crate::test_util::store_task(crate::test_util::StoreTask::Compactor);
             // A pass that was stopped rather than finished leaves its resume point behind,
@@ -196,17 +228,19 @@ pub async fn gc(
 ///
 /// One instance per [`crate::local::immutable_store::LocalImmutableStore`] (never a
 /// process-global), so parallel commands on different repositories keep independent
-/// counters.
+/// counters. Its caps are also the limits the store's periodic evictor and compactor enforce.
 pub struct GcCounters {
     total_size: AtomicU64,
     fragment_count: AtomicUsize,
-    /// Compaction cap in bytes; 0 disables the compaction trigger (read-only / `--no-gc`).
+    /// Compaction cap in bytes; 0 disables compaction.
     max_size: AtomicU64,
-    /// Eviction cap in fragments; 0 disables the eviction trigger.
+    /// Eviction cap in fragments; 0 disables eviction.
     max_capacity: AtomicUsize,
     sync_data: AtomicBool,
     compaction_fired: AtomicBool,
     eviction_fired: AtomicBool,
+    evictor_spawned: AtomicBool,
+    compactor_spawned: AtomicBool,
     /// Back-reference to the owning store, needed to fire a pass. Set once after the
     /// store's `Arc` exists (the store can't exist when its groups are constructed).
     store: OnceLock<Weak<dyn ImmutableStore>>,
@@ -222,6 +256,8 @@ impl Default for GcCounters {
             sync_data: AtomicBool::new(false),
             compaction_fired: AtomicBool::new(false),
             eviction_fired: AtomicBool::new(false),
+            evictor_spawned: AtomicBool::new(false),
+            compactor_spawned: AtomicBool::new(false),
             store: OnceLock::new(),
         }
     }
@@ -232,8 +268,8 @@ impl GcCounters {
         Self::default()
     }
 
-    /// Set the caps + sync flag from the store's create options. Caps of 0 leave the
-    /// corresponding trigger disabled (read-only / `--no-gc` opens pass 0 here).
+    /// Set the caps + sync flag from the store's create options. A cap of 0 disables its
+    /// collection.
     pub fn set_caps(&self, max_size: usize, max_capacity: usize, sync_data: bool) {
         self.max_size.store(max_size as u64, Ordering::Relaxed);
         self.max_capacity.store(max_capacity, Ordering::Relaxed);
@@ -301,6 +337,15 @@ impl GcCounters {
         ) {
             total = current;
         }
+    }
+
+    /// The compaction and eviction caps, as `(max_size, max_capacity)`. Test builds only.
+    #[cfg(feature = "test-util")]
+    pub fn caps(&self) -> (usize, usize) {
+        (
+            self.max_size.load(Ordering::Relaxed) as usize,
+            self.max_capacity.load(Ordering::Relaxed),
+        )
     }
 
     /// The bytes of packstore data counted as loaded. Test builds only.

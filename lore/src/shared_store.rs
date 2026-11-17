@@ -7,6 +7,7 @@ use lore_macro::LoreArgs;
 use lore_revision::global::GlobalConfig;
 use lore_revision::instance::list_instances;
 use lore_revision::repository::RepositoryError;
+use lore_revision::repository::StoreConfig;
 use lore_revision::shared_store::LoreSharedStoreInfoEventData;
 use lore_revision::shared_store::LoreSharedStoreListEventData;
 use lore_revision::shared_store::LoreSharedStoreListItem;
@@ -36,7 +37,18 @@ pub struct LoreSharedStoreCreateArgs {
 
     /// Set this as the default shared store in the global config
     pub make_default: u8,
+
+    /// Bytes the store holds before compaction reclaims space; 0 uses the default of 10 GiB
+    pub max_size: u64,
+
+    /// Fragments the store holds before eviction removes some; 0 uses the default of 2000000. The
+    /// periodic eviction pass treats a value below 1048576 as 1048576
+    pub max_capacity: u64,
 }
+
+// Locks the C ABI layout, as `LoreStorageOpenArgs` does: remote_url and path (16 bytes each),
+// make_default with 7 bytes of padding, max_size and max_capacity.
+const _: () = assert!(std::mem::size_of::<LoreSharedStoreCreateArgs>() == 56);
 
 /// Creates a new shared store at the specified path
 ///
@@ -84,8 +96,21 @@ fn create_local(
             .unwrap_or(raw_remote_url)
             .to_owned();
 
-        lore_revision::shared_store::create_shared_store(path, remote_url, args.make_default != 0)
-            .await
+        let mut store_config = StoreConfig::client_default();
+        if args.max_size != 0 {
+            store_config.max_size = Some(args.max_size as usize);
+        }
+        if args.max_capacity != 0 {
+            store_config.max_capacity = Some(args.max_capacity as usize);
+        }
+
+        lore_revision::shared_store::create_shared_store(
+            path,
+            remote_url,
+            args.make_default != 0,
+            store_config,
+        )
+        .await
     })
 }
 

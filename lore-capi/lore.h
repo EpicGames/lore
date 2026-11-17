@@ -5607,6 +5607,11 @@ typedef struct lore_shared_store_create_args_t {
   struct lore_string_t path;
   // Set this as the default shared store in the global config
   uint8_t make_default;
+  // Bytes the store holds before compaction reclaims space; 0 uses the default of 10 GiB
+  uint64_t max_size;
+  // Fragments the store holds before eviction removes some; 0 uses the default of 2000000. The
+  // periodic eviction pass treats a value below 1048576 as 1048576
+  uint64_t max_capacity;
 } lore_shared_store_create_args_t;
 
 // Arguments for querying the configured default shared store (no parameters).
@@ -5647,11 +5652,12 @@ typedef struct lore_storage_open_args_t {
   // never hashed. Payloads the local store holds are never hashed either way.
   uint8_t skip_verify;
   // Soft cap on total immutable-store bytes (compactor target). A non-zero cache target enables
-  // incremental background GC for the handle; `0` then selects the default. Shared disk backends
-  // inherit the first opener's value
+  // incremental background GC for the handle; `0` then selects the default. A store this
+  // process already has open takes these targets; a shared store keeps its own instead
   uint64_t cache_target_bytes;
   // Soft cap on immutable-store fragment count (evictor target). A non-zero cache target enables
-  // incremental background GC for the handle; `0` then selects the default
+  // incremental background GC for the handle; `0` then selects the default. A store this
+  // process already has open takes these targets; a shared store keeps its own instead
   uint64_t cache_target_fragments;
 } lore_storage_open_args_t;
 
