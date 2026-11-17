@@ -55,7 +55,9 @@ use lore_revision::interface::LoreMetadata;
 use lore_revision::metadata::Metadata;
 use lore_revision::protocol::RemoteConnections;
 use lore_revision::protocol::RemoteEndpoint;
+use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::repository::RepositoryMetadata;
 use lore_revision::test_util::write_state_revision;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
@@ -278,6 +280,28 @@ pub(crate) async fn store_latest(
     ))
     .await
     .expect("stores the latest revision");
+}
+
+/// Writes repository metadata naming `default_branch` the default branch through `write`, and
+/// points the repository's metadata key at it.
+pub(crate) async fn store_repository_metadata(
+    write: &Arc<RepositoryContext>,
+    default_branch: BranchId,
+) {
+    let hash = repository::metadata_store(
+        write.clone(),
+        RepositoryMetadata {
+            name: "graph".to_owned(),
+            default_branch,
+            default_branch_name: "main".to_owned(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("writes the repository metadata");
+    repository::metadata_store_hash(write.clone(), hash)
+        .await
+        .expect("stores the repository metadata key");
 }
 
 /// Metadata holding `id`, where given, and the string `entries`.

@@ -5826,3 +5826,131 @@ fn repin_levels_order_each_repository_after_those_it_links() {
     let levels = repin_levels(&[vec![1, 2], vec![], vec![1], vec![4], vec![3]]);
     assert_eq!(levels, [vec![1, 4], vec![2, 3], vec![0]]);
 }
+
+/// `archive_local` archives a live branch and answers `Now`; an archive of the branch after
+/// answers `Already` and writes nothing: the metadata key stays as the first archive left it.
+#[tokio::test]
+async fn archive_local_answers_already_for_an_archived_branch() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        create_on(
+            &repository,
+            branch_id(2),
+            "feature",
+            vec![branch_point(9, 9)],
+        )
+        .await
+        .expect("the branch is created");
+
+        let first = archive_local(repository.clone(), branch_id(2)).await;
+        let archived_key = mutable_value(repository.clone(), METADATA, branch_id(2)).await;
+        let second = archive_local(repository.clone(), branch_id(2)).await;
+
+        assert_eq!(first.ok(), Some(Archived::Now));
+        assert_eq!(second.ok(), Some(Archived::Already));
+        assert_eq!(
+            mutable_value(repository.clone(), METADATA, branch_id(2))
+                .await
+                .ok(),
+            archived_key.ok()
+        );
+        assert_eq!(mapped(&repository, "feature").await, None);
+    }))
+    .await;
+}
+
+/// `archive_local` archives the branch an instance's current anchor names, which `delete` refuses
+/// with `DeleteCurrent`.
+#[tokio::test]
+async fn archive_local_skips_the_current_anchor_check() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        create_on(
+            &repository,
+            branch_id(2),
+            "feature",
+            vec![branch_point(9, 9)],
+        )
+        .await
+        .expect("the branch is created");
+        lore_revision::instance::store_current_anchor_branch(&repository, branch_id(2))
+            .await
+            .expect("the current branch is stored");
+
+        let deleted = delete(repository.clone(), branch_id(2)).await;
+        let archived = archive_local(repository.clone(), branch_id(2)).await;
+
+        assert!(
+            deleted.as_ref().is_err_and(|err| err.is_delete_current()),
+            "got {deleted:?}"
+        );
+        assert_eq!(archived.ok(), Some(Archived::Now));
+        assert_eq!(mapped(&repository, "feature").await, None);
+    }))
+    .await;
+}
+
+/// `archives_locally` answers whether the branch's name names it in the local store, by its
+/// mapping or by the id derived from it with no mapping, and writes nothing: false for a branch
+/// the store lacks and for one archived already.
+#[tokio::test]
+async fn archives_locally_follows_the_name_its_mapping_or_derived_id_gives() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let derived = fallback_id("legacy");
+        create_on(
+            &repository,
+            branch_id(2),
+            "feature",
+            vec![branch_point(9, 9)],
+        )
+        .await
+        .expect("the branch is created");
+        create_on(&repository, derived, "legacy", vec![branch_point(9, 9)])
+            .await
+            .expect("the derived branch is created");
+        release_name(repository.clone(), "legacy", derived)
+            .await
+            .expect("the derived branch's mapping is released");
+
+        let live = archives_locally(repository.clone(), branch_id(2)).await;
+        let unmapped_derived = archives_locally(repository.clone(), derived).await;
+        let absent = archives_locally(repository.clone(), branch_id(3)).await;
+        archive_local(repository.clone(), branch_id(2))
+            .await
+            .expect("the branch is archived");
+        let archived = archives_locally(repository.clone(), branch_id(2)).await;
+
+        assert_eq!(
+            [live, unmapped_derived, absent, archived].map(Result::ok),
+            [Some(true), Some(true), Some(false), Some(false)]
+        );
+        assert_eq!(
+            mapped(&repository, "legacy").await,
+            None,
+            "no mapping is written"
+        );
+    }))
+    .await;
+}
+
+/// `archives_locally` answers false for a branch whose id derives from its name once it is
+/// archived: the derived id no longer names the branch, whose metadata says it left the name.
+#[tokio::test]
+async fn archives_locally_answers_false_for_an_archived_derived_branch() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let derived = fallback_id("legacy");
+        create_on(&repository, derived, "legacy", vec![branch_point(9, 9)])
+            .await
+            .expect("the derived branch is created");
+        archive_local(repository.clone(), derived)
+            .await
+            .expect("the derived branch is archived");
+
+        let gated = archives_locally(repository.clone(), derived).await;
+
+        assert_eq!(gated.ok(), Some(false));
+    }))
+    .await;
+}

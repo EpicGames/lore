@@ -11,7 +11,6 @@ use lore::revision_graph::RevisionGraphError;
 use lore::revision_graph::branch_create::Checked;
 use lore::revision_graph::branch_create::LoreRevisionGraphBranchCreateArgs;
 use lore::revision_graph::branch_create::ParentAt;
-use lore::revision_graph::branch_create::PreCheck;
 use lore::revision_graph::branch_create::branch_create;
 use lore::revision_graph::branch_create::classify_create_refusal;
 use lore::revision_graph::branch_create::name_free_at;
@@ -19,6 +18,7 @@ use lore::revision_graph::branch_create::parent_at;
 use lore::revision_graph::branch_create::settle;
 use lore::revision_graph::branch_list::LoreRevisionGraphBranchListArgs;
 use lore::revision_graph::branch_list::branch_list;
+use lore::revision_graph::locations::PreCheck;
 use lore::revision_graph::locations::local_read_context;
 use lore::revision_graph::locations::local_write_context;
 use lore::revision_graph::locations::remote_revision_service;
@@ -56,9 +56,7 @@ use lore_revision::event::revision_graph::LoreRevisionGraphBranchEventData;
 use lore_revision::interface::LoreBranchLocation;
 use lore_revision::interface::LoreBranchPoint;
 use lore_revision::interface::LoreString;
-use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
-use lore_revision::repository::RepositoryMetadata;
 use lore_revision::test_util::BranchStep;
 use lore_revision::test_util::step_branch_writes;
 use lore_revision::test_util::write_state_revision;
@@ -93,6 +91,7 @@ use crate::revision_graph::support::new_repository;
 use crate::revision_graph::support::open_in_memory_handle;
 use crate::revision_graph::support::store_latest;
 use crate::revision_graph::support::store_metadata;
+use crate::revision_graph::support::store_repository_metadata;
 use crate::revision_graph::support::store_with_remote;
 use crate::revision_graph::support::store_with_remote_as;
 use crate::revision_graph::support::write_line;
@@ -176,25 +175,6 @@ async fn create_in_category(
     )
     .await
     .expect("creates the branch");
-}
-
-/// Writes repository metadata naming `default_branch` the default branch through `write`, and
-/// points the repository's metadata key at it.
-async fn store_repository_metadata(write: &Arc<RepositoryContext>, default_branch: BranchId) {
-    let hash = repository::metadata_store(
-        write.clone(),
-        RepositoryMetadata {
-            name: "graph".to_owned(),
-            default_branch,
-            default_branch_name: "main".to_owned(),
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("writes the repository metadata");
-    repository::metadata_store_hash(write.clone(), hash)
-        .await
-        .expect("stores the repository metadata key");
 }
 
 /// A branch's latest revision is the branch point, and its stack follows it.

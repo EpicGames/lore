@@ -801,6 +801,27 @@ fn revision_graph_branch_create_survives_the_wire() {
     }
 }
 
+/// A branch archive relayed to the service carries its branch id.
+#[test]
+fn revision_graph_branch_archive_survives_the_wire() {
+    use lore::revision_graph::branch_archive::LoreRevisionGraphBranchArchiveArgs;
+    use lore::storage::handle::LoreStore;
+
+    let args = LoreRevisionGraphBranchArchiveArgs {
+        id: 17,
+        store: LoreStore { handle_id: 4 },
+        repository: Partition::from([0x21u8; 16]),
+        branch: Context::from([0x42u8; 16]),
+    };
+
+    match relayed(LoreCommand::RevisionGraphBranchArchive(args.clone())) {
+        LoreCommand::RevisionGraphBranchArchive(read_back) => {
+            assert_eq!(read_back, args, "must carry every field unchanged");
+        }
+        other => panic!("Unexpected command: {other:?}"),
+    }
+}
+
 /// The revision graph commands follow the commands that preceded them. Bitcode names a variant by
 /// its position, in the first byte of the encoding, so a command added ahead of another shifts the
 /// variant the other decodes as: the last of the earlier commands keeps the bytes it encodes as
@@ -849,6 +870,10 @@ fn revision_graph_commands_follow_the_last_existing_command() {
         (
             6,
             LoreCommand::RevisionGraphBranchCreate(Default::default()),
+        ),
+        (
+            7,
+            LoreCommand::RevisionGraphBranchArchive(Default::default()),
         ),
     ] {
         assert_eq!(

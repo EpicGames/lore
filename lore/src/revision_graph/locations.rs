@@ -20,6 +20,9 @@
 //!
 //! A call that resolves one object takes its outcome from what each location answers
 //! ([`LocationAnswer`]) through [`CallOutcome`].
+//!
+//! A write verb's pre-checks answer a [`PreCheck`] at each location, and [`ended_at`] ends a
+//! location's work where it failed.
 
 #[cfg(feature = "test-util")]
 use std::future;
@@ -31,15 +34,19 @@ use futures::future::Either;
 use lore_base::error::BranchNotFound;
 use lore_base::error::NoRemote;
 use lore_base::error::RevisionNotFound;
+use lore_base::types::BranchId;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
+use lore_revision::interface::LoreBranchLocation;
 use lore_revision::protocol::RemoteEndpoint;
+use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_transport::ProtocolError;
 use lore_transport::Revision;
 
 use crate::revision_graph::RevisionForm;
 use crate::revision_graph::RevisionGraphError;
+use crate::revision_graph::record::emit_location_complete;
 use crate::storage::store::PerCallFlags;
 use crate::storage::store::StoreInternal;
 
@@ -172,6 +179,63 @@ impl CallOutcome {
             None if self.revision_missing => Err(missing(LocationMiss::RevisionNotFound)),
             None => Err(missing(LocationMiss::BranchNotFound)),
         }
+    }
+}
+
+/// What a pre-check reads at one location: the `T` it found or the refusal that stops the call,
+/// or the failure that ends the location's work.
+#[lore_macro::test_pub]
+pub(crate) type PreCheck<T> = Result<Result<T, RevisionGraphError>, RevisionGraphError>;
+
+/// `outcome`, the outcome of work at `location` of call `id`, which ends the location's work where
+/// it failed: the failure is reported in the location's complete event, with no records, and fails
+/// the call.
+pub(crate) fn ended_at<T>(
+    id: u64,
+    location: LoreBranchLocation,
+    outcome: Result<T, RevisionGraphError>,
+) -> Result<T, RevisionGraphError> {
+    if outcome.is_err() {
+        emit_location_complete(id, location, 0, &outcome);
+    }
+    outcome
+}
+
+/// The default branch the repository metadata names at one location, read through `ctx`: at the
+/// remote where `at_remote`, the metadata the remote's repository service names, and otherwise the
+/// local store's, which [`repository::metadata_hash`] reads from the local store alone since `ctx`
+/// has no remote. `None` where the local store holds no repository metadata.
+pub(crate) async fn default_branch_at(
+    ctx: &Arc<RepositoryContext>,
+    at_remote: bool,
+) -> Result<Option<BranchId>, RevisionGraphError> {
+    let metadata_hash = if at_remote {
+        ctx.remote()
+            .await
+            .forward_any::<RevisionGraphError>("reaching the remote")?
+            .repository()
+            .await
+            .forward_any::<RevisionGraphError>("reaching the remote's repository service")?
+            .query(Some(ctx.id), None)
+            .await
+            .forward_any::<RevisionGraphError>("querying the remote for the repository")?
+            .metadata
+    } else {
+        match repository::metadata_hash(ctx.clone()).await {
+            Ok(hash) => hash,
+            Err(err) if err.is_address_not_found() || err.is_payload_not_found() => {
+                return Ok(None);
+            }
+            Err(err) => {
+                return Err(err)
+                    .forward_any::<RevisionGraphError>("loading the repository metadata key");
+            }
+        }
+    };
+    match repository::metadata(ctx.clone(), metadata_hash).await {
+        Ok(metadata) => Ok(Some(metadata.default_branch)),
+        Err(err) if !at_remote && err.is_address_not_found() => Ok(None),
+        Err(err) => Err(err).forward_any::<RevisionGraphError>("reading the repository metadata"),
     }
 }
 

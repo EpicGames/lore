@@ -189,4 +189,7 @@ pub enum LoreCommand {
     RevisionGraphBranchCreate(
         crate::revision_graph::branch_create::LoreRevisionGraphBranchCreateArgs,
     ),
+    RevisionGraphBranchArchive(
+        crate::revision_graph::branch_archive::LoreRevisionGraphBranchArchiveArgs,
+    ),
 }

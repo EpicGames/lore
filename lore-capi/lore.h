@@ -6916,6 +6916,19 @@ typedef struct lore_revision_graph_branch_create_args_t {
   struct lore_revision_identifier_t from;
 } lore_revision_graph_branch_create_args_t;
 
+// Arguments for `lore_revision_graph_branch_archive`.
+typedef struct lore_revision_graph_branch_archive_args_t {
+  // Caller-chosen id echoed back in every event this surface defines for the call. Separate
+  // from `globals.correlation_id`.
+  uint64_t id;
+  // Open storage handle the call reaches the repository through
+  struct lore_store_t store;
+  // Repository the branch is archived in
+  struct lore_partition_t repository;
+  // Branch to archive. Not zero.
+  lore_branch_id_t branch;
+} lore_revision_graph_branch_archive_args_t;
+
 // Return the tag identifying the type of an event.
 uint32_t lore_event_type(const struct lore_event_t *event);
 
@@ -14358,6 +14371,82 @@ int32_t lore_revision_graph_branch_create(const struct lore_global_args_t *globa
 void lore_revision_graph_branch_create_async(const struct lore_global_args_t *globals,
                                              const struct lore_revision_graph_branch_create_args_t *args,
                                              struct lore_event_callback_config_t callback);
+
+// Archive `args->branch` at each location the call consults.
+//
+// With no location flag, the call archives the branch at the remote, if `args->store` has one,
+// and in the local store; `local` or `offline` archives it in the local store alone, and `remote`
+// at the remote alone. An archive releases the branch's name and keeps its metadata and latest, so
+// `lore_revision_graph_revision_resolve` still resolves the branch by its id, and
+// `lore_revision_graph_branch_list` lists it with `include_archived`. The call ignores
+// `globals.force` and `globals.dry_run`, and `lore_storage_close` waits for it.
+//
+// Where the call will archive the branch in the local store, it first reads which repository
+// instances registered in the local store have the branch as their current branch. A live one, an
+// instance record with `stale` 0, refuses the call before either location changes: the call sends
+// a `LORE_EVENT_REVISION_GRAPH_INSTANCE` for each live one and fails, with no location complete
+// event. At the remote, the call refuses a protected branch, the repository's default branch and a
+// branch without a branch point before it archives anything, also with no location complete event,
+// and then archives the branch at the remote. In the local store, it settles a restore that
+// stopped part way, then archives the branch, refusing a protected branch, the default branch and
+// a branch without a branch point there too. A location where the branch is archived already,
+// once such a restore is settled, reports it archived and writes nothing more.
+//
+// Each location that holds the branch sends a `LORE_EVENT_REVISION_GRAPH_BRANCH` with the branch's
+// record and `archived` set, then its `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE`, which carries
+// no error and no records where the location doesn't hold the branch. A failure at the remote
+// fails the call before it reaches the local store, so no complete event for the local store
+// follows. Where the archive succeeds at the remote and fails in the local store, a refusal there
+// included, the local store's complete event carries the error, and a call with `local` set
+// retries it.
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_REVISION_GRAPH_BRANCH` | `lore_revision_graph_branch_event_data_t` | The archived branch, as one location holds it |
+// | `LORE_EVENT_REVISION_GRAPH_INSTANCE` | `lore_revision_graph_instance_event_data_t` | A live instance on the branch, which refuses the call |
+// | `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE` | `lore_revision_graph_location_complete_event_data_t` | One location's outcome, after its record |
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | A log line |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` on success or the error code, with its detail in `error` |
+//
+// Fails with:
+// - error code 3 (invalid arguments) for a zero `args->branch`, an unknown or closed
+//   `args->store`, and location flags that contradict each other or those `args->store` was
+//   opened with;
+// - error code 111 (no remote) where `remote` is set in `globals` and `args->store` has no remote;
+// - error code 48 (delete current) where a live repository instance over the local store has the
+//   branch as its current branch;
+// - error code 47 (delete protected) for a protected branch;
+// - error code 49 (delete default) for the repository's default branch and a branch without a
+//   branch point;
+// - error code 87 (branch not found) where no location consulted holds the branch;
+// - error code 80 (address not found) where the remote lacks a blob it names, such as the branch's
+//   metadata;
+// - error code 118 (oversized) where a location holds a metadata blob larger than 1 MiB;
+// - error code 16 (not authenticated) where the call has no login or tokens the remote accepts.
+//   The call starts no login: the caller logs in, with `lore_auth_login_interactive` or
+//   `lore_auth_login_with_token`, and calls again, and a storage handle's open connection picks
+//   up the new login within a minute. A caller that passes its own tokens in `globals` opens a
+//   new storage handle with fresh ones, since an open connection keeps the tokens it connected
+//   with;
+// - error codes 17 (not authorized), 28 (disconnected), 29 (not connected), 30 (maintenance) and
+//   31 (slow down) where the remote refuses the call or can't be reached;
+// - error code -1 (internal) for any other failure, such as a corrupt block, or a refusal of the
+//   archive at the remote that the call can't attribute, whose message the detail carries.
+//
+// An event's strings, arrays and error detail are valid only during the callback invocation that
+// delivers it. This call and `lore_revision_graph_branch_archive_async` copy `args` before they
+// return, so an `_async` caller can free `args` once the call returns. A caller that passes the
+// same `globals.correlation_id` on every call over one storage handle reuses one storage session
+// per connection, as with the `lore_storage_*` calls. `args->id`, which every
+// `LORE_EVENT_REVISION_GRAPH_*` event echoes, is separate from it.
+int32_t lore_revision_graph_branch_archive(const struct lore_global_args_t *globals,
+                                           const struct lore_revision_graph_branch_archive_args_t *args,
+                                           struct lore_event_callback_config_t callback);
+
+// Archive a branch at each location the call consults (async variant).
+void lore_revision_graph_branch_archive_async(const struct lore_global_args_t *globals,
+                                              const struct lore_revision_graph_branch_archive_args_t *args,
+                                              struct lore_event_callback_config_t callback);
 
 // Select how payloads are compressed before they are stored, over
 // `lore_storage::COMPRESSION_MODE`.

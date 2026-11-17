@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use lore_base::error::BranchNotFound;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::BranchPoint;
@@ -55,8 +56,9 @@ enum Op {
     /// A create of branch `id` named `name`, as a file-system create does, which restores a branch
     /// that has metadata.
     Create { id: u8, name: &'static str },
-    /// An archive of branch `id`.
-    Archive { id: u8 },
+    /// An archive of branch `id`, with `branch::archive_local` where `local`, which reads an
+    /// archived branch as not found, as `branch::delete` answers it, and `branch::delete` otherwise.
+    Archive { id: u8, local: bool },
     /// A protect of branch `id`, in a repository without a remote.
     Protect { id: u8 },
 }
@@ -69,7 +71,15 @@ impl Op {
                     .await
                     .map(|_| ())
             }
-            Op::Archive { id } => branch::delete(repository, branch_id(id)).await,
+            Op::Archive { id, local: false } => branch::delete(repository, branch_id(id)).await,
+            Op::Archive { id, local: true } => {
+                match branch::archive_local(repository, branch_id(id)).await? {
+                    branch::Archived::Now => Ok(()),
+                    branch::Archived::Already => Err(BranchError::from(BranchNotFound {
+                        branch: branch_id(id).to_string(),
+                    })),
+                }
+            }
             Op::Protect { id } => branch::protect(repository, branch_id(id)).await,
         }
     }
@@ -80,7 +90,11 @@ fn create(id: u8, name: &'static str) -> Op {
 }
 
 fn archive(id: u8) -> Op {
-    Op::Archive { id }
+    Op::Archive { id, local: false }
+}
+
+fn archive_local(id: u8) -> Op {
+    Op::Archive { id, local: true }
 }
 
 /// What the raced branch is when a race starts.
@@ -316,7 +330,7 @@ impl Model {
                 self.names.insert(name, id);
                 true
             }
-            Op::Archive { id } => {
+            Op::Archive { id, .. } => {
                 let released = if self.pending.is_some_and(|(held, _)| held == id) {
                     self.settle(id)
                 } else {
@@ -571,7 +585,7 @@ async fn run_order(
         match racer.advance(&repository).await {
             Advanced::Stopped(step) => {
                 racer.settled |= step == BranchStep::PendingRestoreSettled;
-                if let (BranchStep::ArchiveReleasing, Op::Archive { id }) = (step, racer.op) {
+                if let (BranchStep::ArchiveReleasing, Op::Archive { id, .. }) = (step, racer.op) {
                     racer.released = metadata_name(&repository, id).await;
                 }
                 trace.push((next, Some(step)));
@@ -710,7 +724,7 @@ fn explained(initial: &Model, finished: &[Finished], end: &Model) -> bool {
         .collect();
     let preempted: Vec<usize> = (0..finished.len())
         .filter(|&i| {
-            matches!(finished[i].op, Op::Archive { id } if failed_create(finished, id, finished[i].released))
+            matches!(finished[i].op, Op::Archive { id, .. } if failed_create(finished, id, finished[i].released))
                 && finished[i].released.is_some()
                 && finished[i]
                     .outcome
@@ -742,7 +756,7 @@ fn explained(initial: &Model, finished: &[Finished], end: &Model) -> bool {
     }
     if let Some((id, _)) = initial.released && finished.iter().any(|other| {
         other.outcome.is_err()
-            && matches!(other.op, Op::Create { id: of, .. } | Op::Archive { id: of } if of == id)
+            && matches!(other.op, Op::Create { id: of, .. } | Op::Archive { id: of, .. } if of == id)
     }) {
         let mut released = initial.clone();
         released.release_marked(id, None);
@@ -775,7 +789,7 @@ fn succeeds(model: &mut Model, finished: &Finished, all: &[Finished]) -> bool {
         Op::Create { id, name } => {
             model.names.get(name) == Some(&id) && model.metadata.get(&id) == Some(&name)
         }
-        Op::Archive { id } => {
+        Op::Archive { id, .. } => {
             (finished.settled && failed_create(all, id, None))
                 || finished
                     .released
@@ -969,6 +983,22 @@ async fn racing_archive_and_rename_of_a_live_branch_end_as_if_one_at_a_time() {
     race(
         Start::Live,
         &[archive(RACED), create(RACED, BEE)],
+        EVERY_ORDER,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn archive_local_racing_a_restore_ends_as_if_one_at_a_time() {
+    race(
+        Start::Archived,
+        &[archive_local(RACED), create(RACED, BEE)],
+        EVERY_ORDER,
+    )
+    .await;
+    race(
+        Start::Stopped,
+        &[archive_local(RACED), create(RACED, SEA)],
         EVERY_ORDER,
     )
     .await;

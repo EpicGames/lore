@@ -7,6 +7,7 @@
 //! [`RevisionGraphError`] is the surface's error set, and [`LoreRevisionIdentifier`] is how a
 //! caller names a revision.
 
+pub mod branch_archive;
 pub mod branch_create;
 pub mod branch_list;
 pub mod branch_metadata_get;
@@ -25,6 +26,8 @@ pub(crate) mod record;
 #[cfg(feature = "test-util")]
 pub mod record;
 pub mod revision_resolve;
+
+use std::convert::Infallible;
 
 use lore_base::error::AddressNotFound;
 use lore_base::error::BranchAdvanced;
@@ -47,6 +50,7 @@ use lore_base::error::SlowDown;
 use lore_base::types::BranchId;
 use lore_base::types::Hash;
 use lore_error_set::prelude::*;
+use lore_transport::ProtocolError;
 
 /// The failures a revision graph verb reports.
 #[error_set]
@@ -78,6 +82,23 @@ impl RevisionGraphError {
         Self::from(InvalidArguments {
             reason: reason.into(),
         })
+    }
+
+    /// The failure that reports `err`, a refusal of a write at the remote no confirming read
+    /// attributed: a refusal of the caller, an overloaded remote, a lost connection and a remote in
+    /// maintenance keep their codes, and any other refusal is `Internal` with the remote's message,
+    /// under `context`.
+    pub(crate) fn remote_refusal(err: ProtocolError, context: &'static str) -> Self {
+        if !(err.is_not_authorized()
+            || err.is_not_authenticated()
+            || err.is_slow_down()
+            || err.is_disconnected()
+            || err.is_maintenance())
+        {
+            return Self::internal_with_context(err, context);
+        }
+        let Err(forwarded) = Err::<Infallible, _>(err).forward_any::<Self>(context);
+        forwarded
     }
 }
 

@@ -45,6 +45,9 @@ use crate::revision_graph::RevisionForm;
 use crate::revision_graph::RevisionGraphError;
 use crate::revision_graph::call::revision_graph_call;
 use crate::revision_graph::locations::LocationMiss;
+use crate::revision_graph::locations::PreCheck;
+use crate::revision_graph::locations::default_branch_at;
+use crate::revision_graph::locations::ended_at;
 use crate::revision_graph::locations::local_write_context;
 use crate::revision_graph::locations::locations;
 use crate::revision_graph::locations::remote_revision_service;
@@ -80,11 +83,6 @@ pub struct LoreRevisionGraphBranchCreateArgs {
     /// and a branch makes that branch the parent, at its latest or at the revision number given.
     pub from: LoreRevisionIdentifier,
 }
-
-/// What a pre-check reads at one location: the `T` it found or the refusal that stops the call,
-/// or the failure that ends the location's work.
-#[lore_macro::test_pub]
-pub(crate) type PreCheck<T> = Result<Result<T, RevisionGraphError>, RevisionGraphError>;
 
 /// Where a new branch starts at one location, as [`parent_at`] reads it.
 #[lore_macro::test_pub]
@@ -297,44 +295,6 @@ async fn parent_metadata(
         .await
         .forward_any::<RevisionGraphError>("reading the parent's metadata")?
         .map(|(_, metadata)| metadata))
-}
-
-/// The default branch the repository metadata names at one location, read through `ctx`: at the
-/// remote where `at_remote`, the metadata the remote's repository service names, and otherwise the
-/// local store's, which [`repository::metadata_hash`] reads from the local store alone since `ctx`
-/// has no remote. `None` where the local store holds no repository metadata.
-async fn default_branch_at(
-    ctx: &Arc<RepositoryContext>,
-    at_remote: bool,
-) -> Result<Option<BranchId>, RevisionGraphError> {
-    let metadata_hash = if at_remote {
-        ctx.remote()
-            .await
-            .forward_any::<RevisionGraphError>("reaching the remote")?
-            .repository()
-            .await
-            .forward_any::<RevisionGraphError>("reaching the remote's repository service")?
-            .query(Some(ctx.id), None)
-            .await
-            .forward_any::<RevisionGraphError>("querying the remote for the repository")?
-            .metadata
-    } else {
-        match repository::metadata_hash(ctx.clone()).await {
-            Ok(hash) => hash,
-            Err(err) if err.is_address_not_found() || err.is_payload_not_found() => {
-                return Ok(None);
-            }
-            Err(err) => {
-                return Err(err)
-                    .forward_any::<RevisionGraphError>("loading the repository metadata key");
-            }
-        }
-    };
-    match repository::metadata(ctx.clone(), metadata_hash).await {
-        Ok(metadata) => Ok(Some(metadata.default_branch)),
-        Err(err) if !at_remote && err.is_address_not_found() => Ok(None),
-        Err(err) => Err(err).forward_any::<RevisionGraphError>("reading the repository metadata"),
-    }
 }
 
 /// The value the mapping of `name` holds at one location, which a create claims the name from:
@@ -684,20 +644,6 @@ async fn connection_identity(ctx: &RepositoryContext) -> String {
         .map_or_default(|connection| connection.identity().to_owned())
 }
 
-/// `outcome`, the outcome of work at `location` of call `id`, which ends the location's work where
-/// it failed: the failure is reported in the location's complete event, with no records, and fails
-/// the call.
-fn ended_at<T>(
-    id: u64,
-    location: LoreBranchLocation,
-    outcome: Result<T, RevisionGraphError>,
-) -> Result<T, RevisionGraphError> {
-    if outcome.is_err() {
-        emit_location_complete(id, location, 0, &outcome);
-    }
-    outcome
-}
-
 /// The pre-checks of a create from the revision `form` names of a branch named `name` at one
 /// location, through `ctx`, and at the remote given its revision service `service`, read together.
 ///
@@ -770,15 +716,7 @@ pub(crate) fn classify_create_refusal(
         }
         _ => {}
     }
-    if err.is_not_authorized()
-        || err.is_not_authenticated()
-        || err.is_slow_down()
-        || err.is_disconnected()
-        || err.is_maintenance()
-    {
-        return Err(err).forward_any::<RevisionGraphError>("creating the branch at the remote");
-    }
-    Err(RevisionGraphError::internal_with_context(
+    Err(RevisionGraphError::remote_refusal(
         err,
         "the remote refused the branch create",
     ))

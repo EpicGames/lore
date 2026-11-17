@@ -22,6 +22,8 @@ use std::sync::atomic::Ordering;
 use async_trait::async_trait;
 use lore::revision_graph::LoreRevisionIdentifier;
 use lore::revision_graph::RevisionGraphError;
+use lore::revision_graph::branch_archive::LoreRevisionGraphBranchArchiveArgs;
+use lore::revision_graph::branch_archive::branch_archive;
 use lore::revision_graph::branch_create::LoreRevisionGraphBranchCreateArgs;
 use lore::revision_graph::branch_create::branch_create;
 use lore::revision_graph::branch_list::LoreRevisionGraphBranchListArgs;
@@ -595,6 +597,23 @@ pub(crate) async fn list_branches(
         )
     })
     .await
+}
+
+/// The status and events of a `branch_archive` call of `branch` in `f`'s repository, on `store`
+/// under `globals`, as [`status_and_events_of`] reports them.
+pub(crate) async fn archive_branch(
+    f: &Fixture,
+    store: LoreStore,
+    globals: LoreGlobalArgs,
+    branch: BranchId,
+) -> (i32, Vec<LoreEvent>) {
+    let args = LoreRevisionGraphBranchArchiveArgs {
+        id: 1,
+        store,
+        repository: f.repository,
+        branch,
+    };
+    status_and_events_of(|callback| branch_archive(globals, args, callback)).await
 }
 
 /// The status and events of a `branch_create` call in `f`'s repository, on `store` under `globals`,

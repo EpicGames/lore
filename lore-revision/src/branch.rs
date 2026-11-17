@@ -3936,17 +3936,116 @@ async fn release_archived_name(
     release_name(repository, name, branch).await
 }
 
-/// Archives `branch` with [`archive_record`], and sends a `BranchArchive` event where `repository`
-/// is neither a layer nor a link. Refuses the current branch, a protected branch, the default
-/// branch and a branch without a branch point. The name in the branch's metadata must map to the
-/// branch, as [`load_name_to_id`] looks it up, and otherwise the archive fails with
-/// [`BranchNotFound`]. A remote that refuses the lookup, or a failed read of the derived id's latest
-/// or metadata, fails the archive with that error. A branch archived already fails with
-/// [`BranchNotFound`], unless the local store maps its name to nothing and the remote's mapping, or
-/// the id derived from the name, names the branch: the lookup caches that mapping and the remote's
-/// metadata, and the branch is archived again. Metadata that says the
-/// branch is archived while its name maps to it, as an older version's restore or an archive that
-/// stopped between its swap and its release leaves it, is archived the same way.
+/// Archives `branch` as [`archive_local`] does, and sends a `BranchArchive` event where
+/// `repository` is neither a layer nor a link. Refuses the current branch too, and fails with
+/// [`BranchNotFound`] where [`archive_local`] answers [`Archived::Already`].
+///
+/// A client's dry run makes the checks and sends the event, but archives nothing. That relies on
+/// `repository` being built by `RepositoryContext::new_with_state`, or derived from a context it
+/// built, as every context of the CLI's archive is: its store then discards the mapping the lookup
+/// caches for a name only the remote or the derived id maps, so a release would find no mapping
+/// and fail.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn delete(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+) -> impl Future<Output = Result<(), BranchError>> {
+    async move {
+        // Do not allow deleting the current branch
+        if let Ok((_revision, current_branch)) =
+            crate::instance::load_current_anchor(&repository).await
+            && current_branch == branch
+        {
+            return Err(BranchError::from(DeleteCurrent {
+                branch: branch.to_string(),
+            }));
+        }
+
+        let (archived, branch_name) = archive_loop(
+            repository.clone(),
+            branch,
+            repository::discards_mutable_writes(),
+        )
+        .await?;
+        if archived == Archived::Already {
+            return Err(BranchError::from(BranchNotFound {
+                branch: branch_name,
+            }));
+        }
+
+        // A layer or link archive is a consequence of the outer one, not its own
+        // user-facing event, so reporting each one would read as repeated archives.
+        if !repository.is_layer() && !repository.is_link() {
+            event::LoreEvent::BranchArchive(LoreBranchArchiveEventData {
+                name: branch_name.into(),
+            })
+            .send();
+        }
+
+        Ok(())
+    }
+}
+
+/// What [`archive_local`] found a branch to be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Archived {
+    /// The call archived the branch.
+    Now,
+    /// The branch was archived already: once a stopped restore is settled and a [`RELEASED`] name
+    /// released, its name doesn't map to it.
+    Already,
+}
+
+/// Whether `metadata` records a restore in progress or one that stopped ([`RESTORING`]), or a name a
+/// settled restore had claimed ([`RELEASED`]), which an archive of its branch settles or releases.
+pub fn holds_pending_name(metadata: &Metadata) -> bool {
+    restoring(metadata).is_some() || released(metadata).is_some()
+}
+
+/// Whether [`archive_local`] would change the names of `branch` in the local store of
+/// `repository`: the store holds its metadata, and the name the metadata records, or the name its
+/// [`RESTORING`] or [`RELEASED`] entry records, names the branch there, by the name's mapping or
+/// the id derived from it ([`lookup_name_local_unwritten`]). Writes nothing.
+///
+/// # Errors
+///
+/// A failed or corrupt read.
+pub async fn archives_locally(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+) -> Result<bool, BranchError> {
+    let Some((_, metadata)) = local_metadata(repository.clone(), branch).await? else {
+        return Ok(false);
+    };
+    for held in [
+        name(&metadata).ok(),
+        restoring(&metadata),
+        released(&metadata),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if lookup_name_local_unwritten(repository.clone(), held)
+            .await?
+            .is_some_and(|named| named.branch() == branch)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Archives `branch` with [`archive_record`]. Refuses a protected branch, the default branch and a
+/// branch without a branch point. Checks no current anchor and sends no event. The name in the
+/// branch's metadata must map to the branch, as [`load_name_to_id`] looks it up, and otherwise the
+/// branch is archived already. A remote that refuses the lookup, or a failed read of the derived
+/// id's latest or metadata, fails the archive with that error. A branch whose local store maps its
+/// name to nothing, and whose name the remote's mapping or the id derived from the name maps to it,
+/// is archived again: the lookup caches that mapping and the remote's metadata. Metadata that says
+/// the branch is archived while its name maps to it, as an older version's restore or an archive
+/// that stopped between its swap and its release leaves it, is archived the same way.
 ///
 /// Metadata that records a restore in progress, or one that stopped ([`RESTORING`]), is settled
 /// ([`settle_pending_restore`]): the archive swaps the record out and releases the name it names,
@@ -3954,122 +4053,115 @@ async fn release_archived_name(
 /// the record stayed, is archived as above. A metadata key that changed since the archive read it,
 /// as a restore, a protect or a metadata edit leaves it, sends the archive back to its read. A
 /// [`RELEASED`] name other than the branch's own, which a settled restore had claimed, is released
-/// before the lookup ([`unmarked`]), and the entry stays for the next restore to release
-/// again and remove. A branch whose name doesn't map to it then fails the archive with
-/// [`BranchNotFound`], as the branch is archived, unless this archive's settle released a name
-/// that mapped to the branch, the claim of the restore it settled: the branch read as live under
-/// that name, and the archive succeeds. So of two archives that settle one restore, one succeeds,
-/// and an archive that settles a restore stopped before its claim fails, as does one that
-/// releases only a [`RELEASED`] name, the claim of a restore settled before.
+/// before the lookup ([`unmarked`]), and the entry stays for the next restore to release again and
+/// remove. A branch whose name doesn't map to it then answers [`Archived::Already`], unless this
+/// archive's settle released a name that mapped to the branch, the claim of the restore it settled:
+/// the branch read as live under that name, and answers [`Archived::Now`]. So of two archives that
+/// settle one restore, one archives the branch, and an archive that settles a restore stopped
+/// before its claim answers [`Archived::Already`], as does one that releases only a [`RELEASED`]
+/// name, the claim of a restore settled before.
 ///
-/// A client's dry run makes the checks and sends the event, but archives nothing. That relies on
-/// `repository` being built by `RepositoryContext::new_with_state`, or derived from a context it
-/// built, as every context of the CLI's archive is: its store then discards the mapping the lookup
-/// caches for a name only the remote or the derived id maps, so a release would find no mapping
-/// and fail.
-pub async fn delete(
+/// Returns the archive's future with its answer, without a future of its own.
+pub fn archive_local(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
-) -> Result<(), BranchError> {
-    // Do not allow deleting the current branch
-    if let Ok((_revision, current_branch)) = crate::instance::load_current_anchor(&repository).await
-        && current_branch == branch
-    {
-        return Err(BranchError::from(DeleteCurrent {
-            branch: branch.to_string(),
-        }));
-    }
+) -> impl Future<Output = Result<Archived, BranchError>> {
+    futures::FutureExt::map(archive_loop(repository, branch, false), |archived| {
+        archived.map(|(archived, _)| archived)
+    })
+}
 
-    let discards = repository::discards_mutable_writes();
-    let mut settled = false;
-    let mut released_name = false;
-    let branch_name = loop {
-        let (read, read_locally, branch_metadata) =
-            archivable_metadata(&repository, branch).await?;
-        let branch_name = name(&branch_metadata).unwrap_or_default().to_string();
-        #[cfg(feature = "test-util")]
-        crate::test_util::branch_step(crate::test_util::BranchStep::ArchiveMetadataRead).await;
-        if let Some(pending) = restoring(&branch_metadata) {
-            if discards {
-                break branch_name;
+/// [`archive_local`] with the branch's name, which stops before each write where `discards`, as a
+/// client's dry run does, answering [`Archived::Now`].
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn archive_loop(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    discards: bool,
+) -> impl Future<Output = Result<(Archived, String), BranchError>> {
+    async move {
+        let mut settled = false;
+        let mut released_name = false;
+        let archived = loop {
+            let (read, read_locally, branch_metadata) =
+                archivable_metadata(&repository, branch).await?;
+            let branch_name = name(&branch_metadata).unwrap_or_default().to_string();
+            #[cfg(feature = "test-util")]
+            crate::test_util::branch_step(crate::test_util::BranchStep::ArchiveMetadataRead).await;
+            if let Some(pending) = restoring(&branch_metadata) {
+                if discards {
+                    break (Archived::Now, branch_name);
+                }
+                let pending = pending.to_string();
+                if let Some((_settled, released)) = settle_pending_restore(
+                    repository.clone(),
+                    branch,
+                    read,
+                    read_locally,
+                    branch_metadata,
+                    &pending,
+                )
+                .await?
+                {
+                    settled = true;
+                    released_name |= released;
+                }
+                continue;
             }
-            let pending = pending.to_string();
-            if let Some((_settled, released)) = settle_pending_restore(
+            if !settled
+                && !discards
+                && let Some(marked) = released(&branch_metadata)
+                && !fold_eq(marked, &branch_name)
+            {
+                release_unless(repository.clone(), branch, marked, unmarked).await?;
+            }
+
+            let mapped = match load_name_to_id(repository.clone(), &branch_name).await {
+                Ok(held) => held == branch,
+                Err(err) if err.is_branch_not_found() => false,
+                Err(err) => return Err(err),
+            };
+            if !mapped {
+                if released_name {
+                    break (Archived::Now, branch_name);
+                }
+                break (Archived::Already, branch_name);
+            }
+            #[cfg(feature = "test-util")]
+            crate::test_util::branch_step(crate::test_util::BranchStep::ArchiveLookedUp).await;
+            if discards {
+                break (Archived::Now, branch_name);
+            }
+            let expected =
+                local_metadata_expected(repository.clone(), branch, read, read_locally).await;
+            match archive_record(
                 repository.clone(),
                 branch,
-                read,
-                read_locally,
+                &branch_name,
+                expected,
                 branch_metadata,
-                &pending,
             )
-            .await?
+            .await
             {
-                settled = true;
-                released_name |= released;
+                Ok(()) => break (Archived::Now, branch_name),
+                Err(err) if err.is_branch_already_exists() => {
+                    lore_debug!(
+                        "Branch {branch} changed since the archive read it as {branch_name}"
+                    );
+                }
+                Err(err) => return Err(err),
             }
-            continue;
-        }
-        if !settled
-            && !discards
-            && let Some(marked) = released(&branch_metadata)
-            && !fold_eq(marked, &branch_name)
-        {
-            release_unless(repository.clone(), branch, marked, unmarked).await?;
-        }
-
-        let mapped = match load_name_to_id(repository.clone(), &branch_name).await {
-            Ok(held) => held == branch,
-            Err(err) if err.is_branch_not_found() => false,
-            Err(err) => return Err(err),
         };
-        if !mapped {
-            if released_name {
-                break branch_name;
-            }
-            return Err(BranchError::from(BranchNotFound {
-                branch: branch_name,
-            }));
-        }
-        #[cfg(feature = "test-util")]
-        crate::test_util::branch_step(crate::test_util::BranchStep::ArchiveLookedUp).await;
-        if discards {
-            break branch_name;
-        }
-        let expected =
-            local_metadata_expected(repository.clone(), branch, read, read_locally).await;
-        match archive_record(
-            repository.clone(),
-            branch,
-            &branch_name,
-            expected,
-            branch_metadata,
-        )
-        .await
-        {
-            Ok(()) => break branch_name,
-            Err(err) if err.is_branch_already_exists() => {
-                lore_debug!("Branch {branch} changed since the archive read it as {branch_name}");
-            }
-            Err(err) => return Err(err),
-        }
-    };
-
-    // A layer or link archive is a consequence of the outer one, not its own
-    // user-facing event, so reporting each one would read as repeated archives.
-    if !repository.is_layer() && !repository.is_link() {
-        event::LoreEvent::BranchArchive(LoreBranchArchiveEventData {
-            name: branch_name.into(),
-        })
-        .send();
+        Ok(archived)
     }
-
-    Ok(())
 }
 
 /// The metadata of `branch`, as [`load_local_or_remote`] reads it, with its hash and whether the
-/// read was local, where [`delete`] may archive the branch. A protected branch, the default branch
-/// and one without a branch point are refused. A refusal of the read passes on; metadata that can't
-/// be read otherwise, or holds no name, fails with [`BranchNotFound`] naming the branch.
+/// read was local, where [`archive_local`] may archive the branch. A protected branch, the default
+/// branch and one without a branch point are refused. A refusal of the read passes on; metadata
+/// that can't be read otherwise, or holds no name, fails with [`BranchNotFound`] naming the branch.
 async fn archivable_metadata(
     repository: &Arc<RepositoryContext>,
     branch: BranchId,

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 //! Integration tests for the revision graph API, run against an in-process Lore Server.
 
+mod archive;
 mod concurrency;
 mod counting;
 mod create;
