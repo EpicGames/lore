@@ -2184,7 +2184,7 @@ async fn unmount_fuse_instance(path: &str) -> Result<(), InstanceError> {
 #[allow(clippy::unused_async)]
 async fn unmount_fuse_instance(path: &str) -> Result<(), InstanceError> {
     Err(InstanceError::internal(format!(
-        "The instance at {path} is a virtual clone, which only Linux serves"
+        "The instance at {path} is a FUSE instance, which only Linux serves"
     )))
 }
 
@@ -2268,7 +2268,7 @@ async fn move_fuse_mount(
     _to: &str,
 ) -> Result<(), InstanceError> {
     Err(InstanceError::internal(format!(
-        "The instance at {from} is a virtual clone, which only Linux serves"
+        "The instance at {from} is a FUSE instance, which only Linux serves"
     )))
 }
 
@@ -2592,7 +2592,7 @@ fn resolve_clone_destination(
     let longest = name.len() + IN_PROGRESS_INFIX.len() + 32 + REMOVING_SUFFIX.len();
     if writes_beside && longest > MAX_NAME_LENGTH {
         return Err(refused(&format!(
-            "its name is too long for the directory the clone writes beside it, whose name \
+            "its name is too long for the directory that cloning writes beside it, whose name \
              adds {} characters",
             longest - name.len()
         )));
@@ -2623,7 +2623,7 @@ async fn clone_anchors(
     }
     if anchors[1].is_zero() {
         return Err(InstanceError::internal(format!(
-            "Instance {instance} has no branch to give its clone"
+            "Instance {instance} has no branch to give the new instance"
         )));
     }
     Ok(anchors)
@@ -2641,7 +2641,7 @@ async fn store_anchors(
         handle
             .store(repository.id, key, value, key_type)
             .await
-            .forward::<InstanceError>("storing the clone's anchors")?;
+            .forward::<InstanceError>("storing the new instance's anchors")?;
     }
     lore_debug!("Instance {clone} took its source's anchors");
     Ok(())
@@ -2764,8 +2764,8 @@ fn refuse_clone(
 
     let (remedy, written_to) = if vfs == VfsType::Fuse {
         (
-            "Put Lore's global data directory, which holds the local changes of every virtual \
-             clone, on a filesystem that clones files (Btrfs, XFS or bcachefs)",
+            "Put Lore's global data directory, which holds the local changes of every FUSE \
+             instance, on a filesystem that clones files (Btrfs, XFS or bcachefs)",
             "the global data directory's volume",
         )
     } else {
@@ -2862,14 +2862,14 @@ async fn remove_leftover_clones(destination: &Path, own: &Path) {
         Ok(Ok(leftovers)) => leftovers,
         Ok(Err(err)) => {
             lore_warn!(
-                "Failed to list the directory holding {} for clones an interruption left: {err}",
+                "Failed to list the directory holding {} for directories that interrupted cloning left: {err}",
                 destination.display()
             );
             return;
         }
         Err(err) => {
             lore_warn!(
-                "Failed to list the directory holding {} for clones an interruption left: {err}",
+                "Failed to list the directory holding {} for directories that interrupted cloning left: {err}",
                 destination.display()
             );
             return;
@@ -2921,7 +2921,7 @@ async fn remove_clone_left(path: &Path, aside: Option<&Path>) -> bool {
         &display_path(path),
         CloneStats::default(),
     );
-    remove_clone_directory(path, aside, "an interrupted clone").await
+    remove_clone_directory(path, aside, "interrupted cloning").await
 }
 
 /// Removes `path`, a directory `left_by` left, renamed aside to `aside` first where given, and
@@ -2983,10 +2983,11 @@ async fn instance_clone_plan_with(
     )?;
     if !uses_shared_store(&repository).await? {
         return Err(NotSupported {
-            operation: "cloning an instance with a local store, since the clone's anchors and \
-                        registration would be written to the source's own store; only an \
-                        instance on a shared store can be cloned"
-                .to_string(),
+            operation:
+                "cloning an instance with a local store, since the new instance's anchors and \
+                 registration would be written to the source's own store; only an instance \
+                 on a shared store can be cloned"
+                    .to_string(),
         }
         .into());
     }
@@ -2996,7 +2997,7 @@ async fn instance_clone_plan_with(
     let destination =
         lore_base::lore_spawn_blocking!(move || resolve_clone_destination(&target, writes_beside))
             .await
-            .internal("resolving the clone's destination")??;
+            .internal("resolving the new instance's destination")??;
     let target_path = display_path(&destination);
     let source_path = display_path(&source);
     let answer = provider
@@ -3073,17 +3074,18 @@ async fn instance_clone_plan_with(
     // The lock file's name holds the new instance ID, so no other clone holds it; the lock is
     // taken off the runtime, as resolving its path stats the directory it lies in.
     let locking = in_progress.clone();
-    let in_progress_lock =
-        lore_base::lore_spawn_blocking!(move || FSLock::try_acquire_file_lock(&locking))
-            .await
-            .internal("locking the clone's in-progress directory")?
-            .internal("locking the clone's in-progress directory")?
-            .ok_or_else(|| {
-                InstanceError::internal(format!(
-                    "{}: another clone holds the lock of this clone's in-progress directory",
-                    display_path(&in_progress)
-                ))
-            })?;
+    let in_progress_lock = lore_base::lore_spawn_blocking!(move || FSLock::try_acquire_file_lock(
+        &locking
+    ))
+    .await
+    .internal("locking the new instance's in-progress directory")?
+    .internal("locking the new instance's in-progress directory")?
+    .ok_or_else(|| {
+        InstanceError::internal(format!(
+            "{}: another process holds the lock of the new instance's in-progress directory",
+            display_path(&in_progress)
+        ))
+    })?;
     remove_leftover_clones(&destination, &in_progress).await;
     Ok(Some(InstanceClonePlan {
         provider,
@@ -3243,7 +3245,7 @@ async fn place_clone(
         repository
             .flush(FlushOptions::SYNC_DATA)
             .await
-            .forward_any::<InstanceError>("flushing the clone's anchors")?;
+            .forward_any::<InstanceError>("flushing the new instance's anchors")?;
         match move_into_place(&plan.in_progress, &plan.destination).await {
             Err(err)
                 if matches!(
@@ -3257,15 +3259,17 @@ async fn place_clone(
                 )))
             }
             moved => moved
-                .map_err(|err| clone_io_failure(err, "moving the clone to its destination"))
-                .forward::<InstanceError>("moving the clone to its destination"),
+                .map_err(|err| clone_io_failure(err, "moving the new instance to its destination"))
+                .forward::<InstanceError>("moving the new instance to its destination"),
         }
     }
     .await;
     if let Err(err) = placed {
         remove_instance_keys(repository, plan.clone_id).await;
         if let Err(flush_err) = repository.flush(flush_options).await {
-            lore_warn!("Failed to flush the removal of a failed clone's registration: {flush_err}");
+            lore_warn!(
+                "Failed to flush the removal of the new instance's registration after cloning failed: {flush_err}"
+            );
         }
         return Err(err).forward_with::<InstanceError, _>(context);
     }
@@ -3292,8 +3296,8 @@ async fn place_clone(
         .await
         .forward_with::<InstanceError, _>(|| {
             format!(
-                "registering the clone at {}, which registers itself when a write command next \
-                 opens it",
+                "registering the new instance at {}, which registers itself when a write command \
+                 next opens it",
                 plan.target_path
             )
         })
@@ -3322,7 +3326,7 @@ async fn place_virtual_clone(
         repository
             .flush(FlushOptions::SYNC_DATA)
             .await
-            .forward_any::<InstanceError>("flushing the clone's anchors")
+            .forward_any::<InstanceError>("flushing the new instance's anchors")
     }
     .await;
     let placed = match anchored {
@@ -3333,7 +3337,9 @@ async fn place_virtual_clone(
         remove_instance_keys(repository, plan.clone_id).await;
         let flush_options = crate::lore::execution_context().globals().flush_options();
         if let Err(flush_err) = repository.flush(flush_options).await {
-            lore_warn!("Failed to flush the removal of a failed clone's registration: {flush_err}");
+            lore_warn!(
+                "Failed to flush the removal of the new instance's registration after cloning failed: {flush_err}"
+            );
         }
         return Err(err);
     }
@@ -3376,7 +3382,7 @@ async fn place_mount(
     }
     let mounted = match register(repository, plan.clone_id, &plan.target_path).await {
         Ok(()) => mount_fuse_clone(repository, plan).await,
-        Err(err) => Err(err).forward::<InstanceError>("registering the clone"),
+        Err(err) => Err(err).forward::<InstanceError>("registering the new instance"),
     };
     if mounted.is_err()
         && let Err(err) = lore_io::IoDriver::global()
@@ -3399,7 +3405,7 @@ async fn mount_fuse_clone(
 ) -> Result<(), InstanceError> {
     let Some(mm) = MountManagerState::mount_manager() else {
         return Err(InstanceError::internal(format!(
-            "{}: a virtual clone is cloned only in the service, which mounts it",
+            "{}: a FUSE instance is cloned only in the service, which mounts it",
             plan.target_path
         )));
     };
@@ -3426,7 +3432,7 @@ async fn mount_fuse_clone(
     plan: &InstanceClonePlan,
 ) -> Result<(), InstanceError> {
     Err(InstanceError::internal(format!(
-        "The instance at {} is a virtual clone, which only Linux serves",
+        "The instance at {} is a FUSE instance, which only Linux serves",
         plan.source.display()
     )))
 }
@@ -3438,7 +3444,7 @@ async fn remove_clone_mark(dot: &Path, target_path: &str) {
         .remove_file(dot.join(CLONE_IN_PROGRESS_MARK))
         .await
     {
-        lore_warn!("Failed to remove the mark of a clone in progress from {target_path}: {err}");
+        lore_warn!("Failed to remove the mark of cloning in progress from {target_path}: {err}");
     }
 }
 
@@ -3531,12 +3537,12 @@ async fn register_clone(
 ) -> Result<(), InstanceError> {
     register_instance(repository, clone, target_path)
         .await
-        .forward::<InstanceError>("registering the clone")?;
+        .forward::<InstanceError>("registering the new instance")?;
     let flush_options = crate::lore::execution_context().globals().flush_options();
     repository
         .flush(flush_options)
         .await
-        .forward_any::<InstanceError>("flushing the clone's registration")
+        .forward_any::<InstanceError>("flushing the new instance's registration")
 }
 
 /// Finishes a clone after [`instance_clone`], whatever it returned: removes the in-progress
@@ -3557,7 +3563,7 @@ pub async fn instance_clone_finish(plan: InstanceClonePlan) {
         && !remove_clone_directory(
             &plan.in_progress,
             Some(&removing_path(&plan.in_progress)),
-            "a failed clone",
+            "failed cloning",
         )
         .await
     {
@@ -3610,7 +3616,7 @@ async fn copy_instance_directory(
     let io = lore_io::IoDriver::global();
     io.create_dir_all(&dot)
         .await
-        .map_err(|err| clone_io_failure(err, "creating the clone's Lore directory"))?;
+        .map_err(|err| clone_io_failure(err, "creating the new instance's Lore directory"))?;
     let mark = if plan.vfs == VfsType::Fuse {
         bytes::Bytes::copy_from_slice(plan.destination.as_os_str().as_encoded_bytes())
     } else {
@@ -3618,14 +3624,16 @@ async fn copy_instance_directory(
     };
     io.write_file_bytes(dot.join(CLONE_IN_PROGRESS_MARK), mark, false)
         .await
-        .map_err(|err| clone_io_failure(err, "marking the clone as in progress"))?;
+        .map_err(|err| clone_io_failure(err, "marking the new instance as in progress"))?;
     plan.clone_id
         .write_to_file(dot.join(crate::repository::INSTANCE))
         .await
-        .map_err(|err| clone_io_failure(err, "writing the clone's instance ID"))?;
+        .map_err(|err| clone_io_failure(err, "writing the new instance's ID"))?;
     crate::records::mark_holding_no_store_records(&dot)
         .await
-        .map_err(|err| clone_io_failure(err, "marking the clone as holding no store records"))?;
+        .map_err(|err| {
+            clone_io_failure(err, "marking the new instance as holding no store records")
+        })?;
 
     let started = std::time::Instant::now();
     // The copy keeps the in-progress directory's lock and the instance's locks, through the

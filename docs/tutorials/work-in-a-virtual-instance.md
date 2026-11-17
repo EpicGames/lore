@@ -1,8 +1,8 @@
-# Work in a virtual clone on Linux
+# Work in a virtual instance on Linux
 
-In this tutorial you'll clone a repository as a virtual clone, a mount that the Lore service serves straight from the shared store, and run the everyday edit loop in it: edit files, check status, commit, push, sync, switch branches, reset an edit and merge a branch. When you're finished, your virtual clone will hold the same files as an ordinary working tree of the same repository, and you'll know how to get it back after the service stops or a clone fails.
+In this tutorial you'll clone a repository as a virtual instance, a mount that the Lore service serves straight from the shared store, and run the everyday edit loop in it: edit files, check status, commit, push, sync, switch branches, reset an edit and merge a branch. When you're finished, your virtual instance will hold the same files as an ordinary working tree of the same repository, and you'll know how to get it back after the service stops or cloning fails.
 
-A virtual clone writes no files when you clone it. Every read of tracked content is answered from the store, which fetches what it doesn't hold on first read, and only the files you create or change are written to disk, outside the mount. Every command you run in a virtual clone is carried out by the Lore service that serves its mount, and a clone that finds no service running starts it.
+A virtual instance writes no files when you clone it. Every read of tracked content is answered from the store, which fetches what it doesn't hold on first read, and only the files you create or change are written to disk, outside the mount. Every command you run in a virtual instance is carried out by the Lore service that serves its mount, and cloning starts the service when it finds none running.
 
 ## Prerequisites
 
@@ -14,7 +14,7 @@ A virtual clone writes no files when you clone it. Every read of tracked content
 
 1. **Start the Lore service.**
 
-   Name the build that serves your commands, then start it. The [background service tutorial](run-commands-through-the-service.md) explains both commands. This step is optional: the clone in the next step starts the service when none is running, from the `lore` you run.
+   Name the build that serves your commands, then start it. The [background service tutorial](run-commands-through-the-service.md) explains both commands. This step is optional: cloning in the next step starts the service when none is running, from the `lore` you run.
 
    ```bash
    lore service set-executable "$(command -v lore)"
@@ -28,9 +28,9 @@ A virtual clone writes no files when you clone it. Every read of tracked content
 
    (Your path will differ.)
 
-2. **Clone the repository as a virtual clone.**
+2. **Clone the repository as a virtual instance.**
 
-   `--vfs fuse` makes the clone a virtual one, over the shared store from the quickstart. It always goes to the service, whether or not you've turned on running commands through the service.
+   `--vfs fuse` makes the new instance a virtual one, over the shared store from the quickstart. It always goes to the service, whether or not you've turned on running commands through the service.
 
    ```bash
    cd ~
@@ -41,7 +41,7 @@ A virtual clone writes no files when you clone it. Every read of tracked content
    Cloning repository 3f2a1b4c5d6e7f8a... branch main into /home/you/my-project-fuse
    Cloned 0/0 files (0 bytes/0 bytes)
    Branch main revision c7d1e8b3...
-   Clone complete in 0.02s
+   Cloned in 0.02s
    ```
 
    `Cloned 0/0 files` is the point: nothing was written. The files are there all the same:
@@ -63,11 +63,11 @@ A virtual clone writes no files when you clone it. Every read of tracked content
 
 3. **Edit, create and delete files.**
 
-   Work in the clone with any tool, as in an ordinary working tree.
+   Work in the virtual instance with any tool, as in an ordinary working tree.
 
    ```bash
    cd ~/my-project-fuse
-   echo 'Hello from a virtual clone' > hello.txt
+   echo 'Hello from a virtual instance' > hello.txt
    echo 'Written through the mount.' > todo.txt
    rm sample.bin
    ```
@@ -127,7 +127,7 @@ A virtual clone writes no files when you clone it. Every read of tracked content
    lore push
    ```
 
-   Then sync the virtual clone:
+   Then sync the virtual instance:
 
    ```bash
    cd ~/my-project-fuse
@@ -189,7 +189,7 @@ A virtual clone writes no files when you clone it. Every read of tracked content
    M hello.txt
    Resetting file system changes
    Reset 1 (0 directories, 1 files), deleted 0 (0 directories, 0 files)
-   Hello from a virtual clone
+   Hello from a virtual instance
    ```
 
 9. **Merge the branch and push the result.**
@@ -218,7 +218,7 @@ A virtual clone writes no files when you clone it. Every read of tracked content
 
 10. **Stop and start the service.**
 
-    Leave the clone first: the service can't take down the mount of a clone that a shell has as its working directory.
+    Leave the virtual instance first: the service can't take down the mount of a virtual instance that a shell has as its working directory.
 
     ```bash
     cd ~
@@ -236,7 +236,7 @@ A virtual clone writes no files when you clone it. Every read of tracked content
     todo.txt
     ```
 
-    Stopping the service takes down the mount of every virtual clone it serves, and starting it mounts every one it can reach again, at the revision it stood on and with your uncommitted changes in place.
+    Stopping the service takes down the mount of every virtual instance it serves, and starting it mounts every one it can reach again, at the revision it stood on and with your uncommitted changes in place.
 
 ## Verify
 
@@ -254,7 +254,7 @@ diff -r --exclude=.lore my-project my-project-fuse && echo 'The working trees ma
 The working trees match
 ```
 
-Then check that the virtual clone is in sync with the server:
+Then check that the virtual instance is in sync with the server:
 
 ```bash
 cd ~/my-project-fuse
@@ -268,29 +268,29 @@ Remote revision 7 -> d91a958f...
 Local branch in sync with remote
 ```
 
-Both trees holding the same files, with the virtual clone at revision 7 in sync with the server, means the edit loop worked. Your hashes will differ.
+Both trees holding the same files, with the virtual instance at revision 7 in sync with the server, means the edit loop worked. Your hashes will differ.
 
 ## Troubleshooting
 
 ### `Lore service unavailable`, exit code 32, when you clone
 
 ```text
-[Error] Lore service unavailable: A FUSE clone is mounted by the Lore service, and no service could be reached or started: starting /opt/lore/bin/lore failed: No such file or directory (os error 2)
+[Error] Lore service unavailable: A FUSE instance is mounted by the Lore service, and no service could be reached or started: starting /opt/lore/bin/lore failed: No such file or directory (os error 2)
 ```
 
-No service was running, and none could be started from the executable named for it, with `lore service set-executable` or in `LORE_SERVICE_EXECUTABLE`, so nothing was created. Name one that exists, or clear the setting with `lore service set-executable ""` and unset `LORE_SERVICE_EXECUTABLE` to have the clone start the service from the `lore` you run, then clone again.
+No service was running, and none could be started from the executable named for it, with `lore service set-executable` or in `LORE_SERVICE_EXECUTABLE`, so nothing was created. Name one that exists, or clear the setting with `lore service set-executable ""` and unset `LORE_SERVICE_EXECUTABLE` to have cloning start the service from the `lore` you run, then clone again.
 
-### `Repository not found`, exit code 89, in a virtual clone
+### `Repository not found`, exit code 89, in a virtual instance
 
 ```text
 [Error] Repository not found: /home/you/my-project-fuse
 ```
 
-No service is running, so the clone isn't mounted and its directory is empty, for example after `lore service stop` or a restart. Run `lore service start`: it mounts every virtual clone it finds again, with your uncommitted changes in place.
+No service is running, so the virtual instance isn't mounted and its directory is empty, for example after `lore service stop` or a restart. Run `lore service start`: it mounts every virtual instance it finds again, with your uncommitted changes in place.
 
-### A clone fails partway
+### Cloning fails partway
 
-A virtual clone that fails, for example on a revision that doesn't exist, leaves no mount, no directory and no instance behind. Fix the cause and run the same `lore clone` again, to the same path.
+When cloning with `--vfs fuse` fails, for example on a revision that doesn't exist, it leaves no mount, no directory and no instance behind. Fix the cause and run the same `lore clone` again, to the same path.
 
 ### `Local modifications prevent synchronization`, exit code 44
 
@@ -307,14 +307,14 @@ A virtual clone that fails, for example on a revision that doesn't exist, leaves
 [Error] Mounts are busy: /home/you/my-project-fuse
 ```
 
-A shell or a program has its working directory or an open file inside a virtual clone. Leave the clone and close the program, then stop again. `lore service stop --force` detaches every mount at once instead, and the programs inside a detached clone lose access to it.
+A shell or a program has its working directory or an open file inside a virtual instance. Leave the virtual instance and close the program, then stop again. `lore service stop --force` detaches every mount at once instead, and the programs inside a detached virtual instance lose access to it.
 
 ### `Transport endpoint is not connected`
 
-The service that served the clone stopped without taking its mount down, for example after a crash. Run `lore service start`: it detaches the dead mount and mounts every virtual clone it can reach again. Deletions are recorded without syncing to disk, so a crash can bring back a file you deleted just before it.
+The service that served the virtual instance stopped without taking its mount down, for example after a crash. Run `lore service start`: it detaches the dead mount and mounts every virtual instance it can reach again. Deletions are recorded without syncing to disk, so a crash can bring back a file you deleted just before it.
 
 ## Next steps
 
-- [Run Lore commands through the background service](run-commands-through-the-service.md) — the service that carries out every command in a virtual clone.
-- [`lore clone` in the CLI command reference](../reference/lore-cli-commands.md#lore-clone) — `--vfs` and the other clone flags.
+- [Run Lore commands through the background service](run-commands-through-the-service.md) — the service that carries out every command in a virtual instance.
+- [`lore clone` in the CLI command reference](../reference/lore-cli-commands.md#lore-clone) — `--vfs` and the other flags of `lore clone`.
 - [`lore service` in the CLI command reference](../reference/lore-cli-commands.md#lore-service) — every service command and its flags.

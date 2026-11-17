@@ -123,7 +123,7 @@ pub enum VfsType {
     /// content in the shared store made for its remote, so it needs a reachable remote: it cannot
     /// be created offline, or for a repository with no remote.
     Swfs,
-    /// A writable virtual clone: a Linux FUSE mount served by the Lore service.
+    /// A writable virtual instance: a Linux FUSE mount served by the Lore service.
     Fuse,
 }
 
@@ -210,7 +210,7 @@ pub struct RepositoryCloneArgs {
     #[clap(long, value_name = "key")]
     layer_metadata: Option<String>,
 
-    /// Access recording whose paths a virtual clone warms in the background (one path per line, directories ending with `/`)
+    /// Access recording whose paths a FUSE instance warms in the background (one path per line, directories ending with `/`)
     #[clap(long, value_name = "file")]
     prefetch: Option<String>,
 
@@ -226,15 +226,15 @@ pub struct RepositoryCloneArgs {
     #[clap(long, action)]
     no_tracking: bool,
 
-    /// Root files for dependency-based selective clone (only clone these files and their dependencies). A root file inside a link is skipped. Don't commit after merging, reverting or cherry-picking in such an instance: the commit can delete a directory the instance never had on disk, with everything in it
+    /// Root files for dependency-based selective cloning (only clone these files and their dependencies). A root file inside a link is skipped. Don't commit after merging, reverting or cherry-picking in such an instance: the commit can delete a directory the instance never had on disk, with everything in it
     #[clap(long = "root-file", value_name = "path")]
     root_files: Vec<String>,
 
-    /// Tags to filter dependencies by during dependency-based clone
+    /// Tags to filter dependencies by during dependency-based cloning
     #[clap(long = "dependency-tag", value_name = "tag")]
     dependency_tags: Vec<String>,
 
-    /// Follow transitive dependencies recursively during dependency-based clone
+    /// Follow transitive dependencies recursively during dependency-based cloning
     #[clap(long, action)]
     dependency_recursive: bool,
 
@@ -372,11 +372,12 @@ pub enum RepositoryCommands {
 
     /// Clone a remote repository into the given path
     ///
-    /// A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the
-    /// clone for working offline instead. With it, as with `--cache`, a clone that writes its files
-    /// caches every file metadata block of the cloned revision, which staging and committing write
-    /// to, so both work without the remote, and fails if it cannot. A bare or virtual clone writes no
-    /// files and reads them from the remote when a command needs them.
+    /// Cloning needs the remote, so `--offline` does not keep it from connecting: it prepares the
+    /// new instance for working offline instead. With it, as with `--cache`, cloning into an
+    /// instance that writes its files caches every file metadata block of the cloned revision, which
+    /// staging and committing write to, so both work without the remote, and fails if it cannot. A
+    /// bare or virtual instance writes no files and reads them from the remote when a command needs
+    /// them.
     Clone(RepositoryCloneArgs),
 
     /// Delete a repository
@@ -423,21 +424,21 @@ pub enum RepositoryInstanceCommands {
     /// paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains
     /// in the global data directory, even when it is not mounted.
     Prune,
-    /// Delete the current instance: unmount (if SWFS or a virtual clone), deregister from mutable store, and delete associated directories
+    /// Delete the current instance: unmount (if a virtual instance), deregister from mutable store, and delete associated directories
     Delete,
     /// Move the current instance to a new path
     Move(RepositoryInstanceMoveArgs),
     /// Clone the current instance to a new path as an instance of its own, on the same revision,
-    /// branch and staged state. The clone shares the instance's data blocks, and is refused where
-    /// the destination's filesystem or volume cannot share them unless --allow-copy is given. A
-    /// virtual clone on Linux is cloned into a virtual clone the service mounts at the path,
-    /// copying only its Lore directory and local changes, which the volume of the global data
+    /// branch and staged state. The new instance shares the instance's data blocks, and cloning is
+    /// refused where the destination's filesystem or volume cannot share them unless --allow-copy
+    /// is given. A FUSE instance on Linux is cloned into a FUSE instance the service mounts at the
+    /// path, copying only its Lore directory and local changes, which the volume of the global data
     /// directory holds. The instance must use a shared store, and the path must not be inside
-    /// another instance. While the clone runs, commands on the instance, and commands from other
+    /// another instance. While cloning runs, commands on the instance, and commands from other
     /// processes on every instance over the store, wait for it where they open the store. An
     /// instance delete waits too, since it opens the store to deregister the instance before it
     /// removes any file. An instance move renames an on-disk instance before it opens the store, so
-    /// a move makes the clone fail, or on Windows is refused while the clone lists one of its
+    /// a move makes cloning fail, or on Windows is refused while cloning lists one of its
     /// directories.
     Clone(RepositoryInstanceCloneArgs),
 }
@@ -451,13 +452,13 @@ pub struct RepositoryInstanceMoveArgs {
 
 #[derive(Args)]
 pub struct RepositoryInstanceCloneArgs {
-    /// Path to create the clone at; it must not exist, and must be on the instance's volume for
-    /// the clone to share its data blocks
+    /// Path to create the new instance at; it must not exist, and must be on the instance's volume
+    /// for the new instance to share its data blocks
     #[arg(value_name = "target-path")]
     pub target_path: String,
-    /// Copy the instance's files where the clone cannot share their data blocks, rather than
-    /// refusing. A copy takes as long as writing every file, and commands wait for it as they
-    /// wait for every clone
+    /// Copy the instance's files where the new instance cannot share their data blocks, rather
+    /// than refusing. A copy takes as long as writing every file, and commands wait for it as they
+    /// wait while any instance is cloned
     #[arg(long)]
     pub allow_copy: bool,
 }
@@ -1176,7 +1177,7 @@ pub fn handle_repository_clone(globals: LoreGlobalArgs, args: &RepositoryCloneAr
                     anstyle::Reset,
                     data.revision
                 );
-                println!("Clone complete in {:.2}s", start.elapsed().as_secs_f32());
+                println!("Cloned in {:.2}s", start.elapsed().as_secs_f32());
             }
             LoreEvent::RevisionResolve(data) => util::handle_revision_resolve_event(data),
             LoreEvent::Complete(_) => {}
@@ -2073,10 +2074,10 @@ fn handle_repository_instance_clone(
                     }
                 }
                 LoreRepositoryInstanceClonePhase::Registering => {
-                    println!("  Registering the clone");
+                    println!("  Registering the new instance");
                 }
                 LoreRepositoryInstanceClonePhase::RemovingLeftover => {
-                    println!("  Removing {}, left by an interrupted clone", data.path);
+                    println!("  Removing {}, left by interrupted cloning", data.path);
                 }
             },
             LoreEvent::RepositoryInstanceCloneComplete(data) => {

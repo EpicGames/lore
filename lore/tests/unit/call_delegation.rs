@@ -722,7 +722,7 @@ async fn fuse_clone_and_create_arguments_without_a_running_service_report_their_
     let cases = [
         (
             dispatched_without_a_service(clone).await,
-            "A FUSE clone is mounted by the Lore service",
+            "A FUSE instance is mounted by the Lore service",
         ),
         (
             dispatched_without_a_service(create_args(lore::repository::LoreVfsType::Fuse)).await,
@@ -760,7 +760,7 @@ async fn a_fuse_clone_command_without_a_running_service_reports_the_clone_reason
     assert_eq!(status, service_unavailable(), "{message}");
     assert_eq!(reported, Some(status));
     assert!(
-        message.contains("A FUSE clone is mounted by the Lore service"),
+        message.contains("A FUSE instance is mounted by the Lore service"),
         "got: {message}"
     );
 }

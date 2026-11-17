@@ -1,6 +1,6 @@
 # Install the Lore CLI
 
-`lore` is the CLI for the Lore version control system. It handles the full workflow — from branching, merging, and shipping your work to more advanced tasks like sparse clones and offline commits — all from a single binary.
+`lore` is the CLI for the Lore version control system. It handles the full workflow — from branching, merging, and shipping your work to more advanced tasks like sparse cloning and offline commits — all from a single binary.
 
 In this guide, you'll install `lore`, add it to your PATH, and set up shell completions so that you can effectively drive Lore, at full speed, directly from your terminal.
 

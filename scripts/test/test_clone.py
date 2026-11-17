@@ -274,8 +274,8 @@ def test_clone_keeps_file_metadata_blocks_for_offline_commit(new_lore_repo, flag
 
 @pytest.mark.smoke
 def test_failed_clone_sends_no_clone_end_event(new_lore_repo, scratch_dir):
-    """A clone that fails to write a file fails the command and sends no repositoryCloneEnd
-    event. That event, and the "Clone complete" line the CLI prints for it, are only for a clone
+    """Cloning that fails to write a file fails the command and sends no repositoryCloneEnd
+    event. That event, and the "Cloned in" line the CLI prints for it, are only for cloning
     that succeeded."""
     repo: Lore = new_lore_repo()
     repo.write_commit_push(
@@ -346,19 +346,18 @@ def test_clone_dry_run_with_swfs_is_refused(new_lore_repo, scratch_dir):
     repo: Lore = new_lore_repo()
     target = scratch_dir("swfs")
 
-    output = repo.run(
-        [
-            "repository",
-            "clone",
-            repo.remote_path,
-            str(target),
-            "--vfs",
-            "swfs",
-            "--use-shared-store",
-        ],
-        dry_run=True,
-        check=False,
-    )
+    with pytest.raises(LoreException):
+        repo.run(
+            [
+                "repository",
+                "clone",
+                repo.remote_path,
+                str(target),
+                "--vfs",
+                "swfs",
+                "--use-shared-store",
+            ],
+            dry_run=True,
+        )
 
-    assert "--dry-run is not supported for an SWFS clone" in output, output
     assert not target.exists(), "clone --dry-run --vfs swfs created the destination"

@@ -368,6 +368,8 @@ Create a repository in the given directory
       Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its content in the shared
       store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with
       no remote
+    - `fuse`:
+      A writable virtual instance: a Linux FUSE mount served by the Lore service
 
 * `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
@@ -376,10 +378,10 @@ Create a repository in the given directory
 
 Clone a remote repository into the given path
 
-A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline
-instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned
-revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare or
-virtual clone writes no files and reads them from the remote when a command needs them.
+Cloning needs the remote, so `--offline` does not keep it from connecting: it prepares the new instance for working
+offline instead. With it, as with `--cache`, cloning into an instance that writes its files caches every file metadata
+block of the cloned revision, which staging and committing write to, so both work without the remote, and fails if it
+cannot. A bare or virtual instance writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore repository clone [OPTIONS] <url> [path]`
 
@@ -411,18 +413,20 @@ virtual clone writes no files and reads them from the remote when a command need
       Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its content in the shared
       store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with
       no remote
+    - `fuse`:
+      A writable virtual instance: a Linux FUSE mount served by the Lore service
 
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
-* `--prefetch <file>` — Access recording whose paths a virtual clone warms in the background (one path per line, directories ending with `/`)
+* `--prefetch <file>` — Access recording whose paths a FUSE instance warms in the background (one path per line, directories ending with `/`)
 * `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 * `--no-tracking` — Clone without local repository tracking (memory-only stores)
-* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their
+* `--root-file <path>` — Root files for dependency-based selective cloning (only clone these files and their
   dependencies). A root file inside a link is skipped. Don't commit after merging, reverting or cherry-picking in such
   an instance: the commit can delete a directory the instance never had on disk, with everything in it
-* `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based clone
-* `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based clone
+* `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based cloning
+* `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based cloning
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
 
   Default value: `0`
@@ -590,18 +594,18 @@ Instance management
 * `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no revision, and paths that now
   hold a different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when
   it is not mounted
-* `delete` — Delete the current instance: unmount (if SWFS or a virtual clone), deregister from mutable store, and
-  delete associated directories
+* `delete` — Delete the current instance: unmount (if a virtual instance), deregister from mutable store, and delete
+  associated directories
 * `move` — Move the current instance to a new path
 * `clone` — Clone the current instance to a new path as an instance of its own, on the same revision, branch and staged
-  state. The clone shares the instance's data blocks, and is refused where the destination's filesystem or volume cannot
-  share them unless --allow-copy is given. A virtual clone on Linux is cloned into a virtual clone the service mounts at
-  the path, copying only its Lore directory and local changes, which the volume of the global data directory holds. The
-  instance must use a shared store, and the path must not be inside another instance. While the clone runs, commands on
-  the instance, and commands from other processes on every instance over the store, wait for it where they open the
-  store. An instance delete waits too, since it opens the store to deregister the instance before it removes any file.
-  An instance move renames an on-disk instance before it opens the store, so a move makes the clone fail, or on Windows
-  is refused while the clone lists one of its directories
+  state. The new instance shares the instance's data blocks, and cloning is refused where the destination's filesystem
+  or volume cannot share them unless --allow-copy is given. A FUSE instance on Linux is cloned into a FUSE instance the
+  service mounts at the path, copying only its Lore directory and local changes, which the volume of the global data
+  directory holds. The instance must use a shared store, and the path must not be inside another instance. While cloning
+  runs, commands on the instance, and commands from other processes on every instance over the store, wait for it where
+  they open the store. An instance delete waits too, since it opens the store to deregister the instance before it
+  removes any file. An instance move renames an on-disk instance before it opens the store, so a move makes cloning
+  fail, or on Windows is refused while cloning lists one of its directories
 
 ## `lore repository instance list`
 
@@ -619,7 +623,7 @@ mounted
 
 ## `lore repository instance delete`
 
-Delete the current instance: unmount (if SWFS or a virtual clone), deregister from mutable store, and delete associated
+Delete the current instance: unmount (if a virtual instance), deregister from mutable store, and delete associated
 directories
 
 **Usage:** `lore repository instance delete`
@@ -637,26 +641,27 @@ Move the current instance to a new path
 ## `lore repository instance clone`
 
 Clone the current instance to a new path as an instance of its own, on the same revision, branch and staged state. The
-clone shares the instance's data blocks, and is refused where the destination's filesystem or volume cannot share them
-unless --allow-copy is given. A virtual clone on Linux is cloned into a virtual clone the service mounts at the path,
-copying only its Lore directory and local changes, which the volume of the global data directory holds. The instance
-must use a shared store, and the path must not be inside another instance. While the clone runs, commands on the
-instance, and commands from other processes on every instance over the store, wait for it where they open the store. An
-instance delete waits too, since it opens the store to deregister the instance before it removes any file. An instance
-move renames an on-disk instance before it opens the store, so a move makes the clone fail, or on Windows is refused
-while the clone lists one of its directories
+new instance shares the instance's data blocks, and cloning is refused where the destination's filesystem or volume
+cannot share them unless --allow-copy is given. A FUSE instance on Linux is cloned into a FUSE instance the service
+mounts at the path, copying only its Lore directory and local changes, which the volume of the global data directory
+holds. The instance must use a shared store, and the path must not be inside another instance. While cloning runs,
+commands on the instance, and commands from other processes on every instance over the store, wait for it where they
+open the store. An instance delete waits too, since it opens the store to deregister the instance before it removes any
+file. An instance move renames an on-disk instance before it opens the store, so a move makes cloning fail, or on
+Windows is refused while cloning lists one of its directories
 
 **Usage:** `lore repository instance clone [OPTIONS] <target-path>`
 
 ###### **Arguments:**
 
-* `<target-path>` — Path to create the clone at; it must not exist, and must be on the instance's volume for the clone
-  to share its data blocks
+* `<target-path>` — Path to create the new instance at; it must not exist, and must be on the instance's volume for the
+  new instance to share its data blocks
 
 ###### **Options:**
 
-* `--allow-copy` — Copy the instance's files where the clone cannot share their data blocks, rather than refusing. A
-  copy takes as long as writing every file, and commands wait for it as they wait for every clone
+* `--allow-copy` — Copy the instance's files where the new instance cannot share their data blocks, rather than
+  refusing. A copy takes as long as writing every file, and commands wait for it as they wait while any instance is
+  cloned
 
 ## `lore repository config`
 
@@ -2232,10 +2237,10 @@ are persisted so subsequent `lore stage` / `lore status` calls see an accurate p
 
 Clone a remote repository into the given path
 
-A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline
-instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned
-revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare or
-virtual clone writes no files and reads them from the remote when a command needs them.
+Cloning needs the remote, so `--offline` does not keep it from connecting: it prepares the new instance for working
+offline instead. With it, as with `--cache`, cloning into an instance that writes its files caches every file metadata
+block of the cloned revision, which staging and committing write to, so both work without the remote, and fails if it
+cannot. A bare or virtual instance writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore clone [OPTIONS] <url> [path]`
 
@@ -2267,18 +2272,20 @@ virtual clone writes no files and reads them from the remote when a command need
       Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its content in the shared
       store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with
       no remote
+    - `fuse`:
+      A writable virtual instance: a Linux FUSE mount served by the Lore service
 
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
-* `--prefetch <file>` — Access recording whose paths a virtual clone warms in the background (one path per line, directories ending with `/`)
+* `--prefetch <file>` — Access recording whose paths a FUSE instance warms in the background (one path per line, directories ending with `/`)
 * `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 * `--no-tracking` — Clone without local repository tracking (memory-only stores)
-* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their
+* `--root-file <path>` — Root files for dependency-based selective cloning (only clone these files and their
   dependencies). A root file inside a link is skipped. Don't commit after merging, reverting or cherry-picking in such
   an instance: the commit can delete a directory the instance never had on disk, with everything in it
-* `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based clone
-* `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based clone
+* `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based cloning
+* `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based cloning
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
 
   Default value: `0`
@@ -2720,7 +2727,7 @@ Manage the shared store
 * `create` — Create a shared store backed by a remote
 * `info` — Show the shared store this repository uses
 * `list` — Show information about the registry of shared stores
-* `set-use-automatically` — Set whether new clones use a shared store without being asked to
+* `set-use-automatically` — Set whether new instances use a shared store without being asked to
 
 ## `lore shared-store create`
 
@@ -2759,7 +2766,7 @@ Show information about the registry of shared stores
 
 ## `lore shared-store set-use-automatically`
 
-Set whether new clones use a shared store without being asked to
+Set whether new instances use a shared store without being asked to
 
 **Usage:** `lore shared-store set-use-automatically <enabled>`
 

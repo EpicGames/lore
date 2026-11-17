@@ -675,7 +675,7 @@ async fn process_block_item(
     if let Some(dep_ctx) = item.dep_context.clone() {
         let Walk::Clone(clone) = &dispatcher.walk else {
             return Err(CloneError::internal(
-                "Dependency discovery runs only for a clone",
+                "Dependency discovery runs only while cloning",
             ));
         };
         return process_block_item_dependency(dispatcher, clone, block, item, dep_ctx).await;
@@ -1011,7 +1011,7 @@ pub async fn clone(
     if call.dry_run() && vfs.is_virtual() {
         let kind = if swfs { "an SWFS" } else { "a FUSE" };
         return Err(CloneError::from(InvalidArguments {
-            reason: format!("--dry-run is not supported for {kind} clone"),
+            reason: format!("--dry-run is not supported when cloning {kind} instance"),
         }));
     }
     if swfs {
@@ -1250,7 +1250,7 @@ async fn abandon_failed_fuse_clone(
                 .await
         {
             lore_warn!(
-                "Failed to undo FUSE clone mount at {}: {error}",
+                "Failed to undo the FUSE instance mount at {}: {error}",
                 path.display()
             );
         }
@@ -1464,7 +1464,7 @@ async fn clone_into(
         .file_system()
         .begin_operation()
         .await
-        .forward::<CloneError>("Starting clone file operation")?;
+        .forward::<CloneError>("Starting the file operation of cloning")?;
 
     let materialize_result = clone_materialize(
         CloneContext {
@@ -1547,14 +1547,14 @@ fn store_cloned_branch(
             .forward::<CloneError>("Failed to create local branch")?;
             if !held.is_zero() {
                 lore_warn!(
-                    "Another writer stored the metadata of the cloned branch {branch_id} first, so the clone leaves it"
+                    "Another writer stored the metadata of the cloned branch {branch_id} first, so cloning leaves it"
                 );
             } else if !branch::claim_name_unless_held(repository.clone(), &branch_name, branch_id)
                 .await
                 .forward::<CloneError>("Failed to create local branch")?
             {
                 lore_warn!(
-                    "The name {branch_name} names another branch or changed during the clone, so it doesn't name the cloned branch {branch_id}"
+                    "The name {branch_name} names another branch or changed while cloning, so it doesn't name the cloned branch {branch_id}"
                 );
             }
         }
@@ -1598,7 +1598,7 @@ fn refuse_on_held_state(
     {
         return Ok(());
     }
-    Err(hold::refused("restrict a clone to a dependency set").into())
+    Err(hold::refused("restrict cloning to a dependency set").into())
 }
 
 /// Hands a provider that holds its state in a `State` ([`InstanceOperationImpl::holds_state`])
@@ -2036,7 +2036,7 @@ pub async fn clone_execute(
                 Ok(None) => {}
                 Err(err) => {
                     lore_warn!(
-                        "Clone could not materialize content: {err}\n{}",
+                        "Cloning could not materialize content: {err}\n{}",
                         err.trace()
                     );
                     failure = failure.or(Some(err));
@@ -2054,7 +2054,7 @@ pub async fn clone_execute(
             Ok(None) => {}
             Err(err) => {
                 lore_warn!(
-                    "Clone could not materialize content: {err}\n{}",
+                    "Cloning could not materialize content: {err}\n{}",
                     err.trace()
                 );
                 failure = failure.or(Some(err));
@@ -2129,7 +2129,7 @@ pub(crate) async fn clone_node(
                 failure = failure.or(result
                     .inspect_err(|err| {
                         lore_warn!(
-                            "Clone could not materialize content: {err}\n{}",
+                            "Cloning could not materialize content: {err}\n{}",
                             err.trace()
                         );
                     })
@@ -2143,7 +2143,7 @@ pub(crate) async fn clone_node(
                 .and_then(|r| r)
                 .inspect_err(|err| {
                     lore_warn!(
-                        "Clone could not materialize content: {err}\n{}",
+                        "Cloning could not materialize content: {err}\n{}",
                         err.trace()
                     );
                 })
@@ -2157,7 +2157,7 @@ pub(crate) async fn clone_node(
             .and_then(|r| r)
             .inspect_err(|err| {
                 lore_warn!(
-                    "Clone could not materialize content: {err}\n{}",
+                    "Cloning could not materialize content: {err}\n{}",
                     err.trace()
                 );
             })

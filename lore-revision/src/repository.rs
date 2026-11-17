@@ -3942,7 +3942,7 @@ async fn load_held_filter(
                 .read_held_file(&RelativePath::new_from_clean_parts(name, ""))
                 .await
                 .forward_any_with::<RepositoryError, _>(|| {
-                    format!("Failed to read the virtual clone's {name}")
+                    format!("Failed to read the FUSE instance's {name}")
                 })?
             {
                 ignore = Some((bytes, name));

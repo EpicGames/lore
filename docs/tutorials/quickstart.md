@@ -213,7 +213,7 @@ Pushed revision 1 -> a3f8c2d1... to branch main
 
 Now that the repository has a revision on the server, clone it into a sibling directory to get a second, independent working tree, and keep that tree's content in a *shared store*. With a shared store, you can keep multiple working trees on your machine without each one costing its own disk space: instead of copying content into every tree's `.lore/`, all the trees that point at the store draw from one on-disk copy. Any tree cloned from the same server can use it, and because Lore stores content as deduplicated *fragments*, even similar files share the parts they have in common — not just byte-for-byte duplicates.
 
-Clone into the sibling directory, adding `--use-shared-store` so the new tree keeps its content in the shared store instead of its own `.lore/`. There's no store for this server yet, so the clone creates one first:
+Clone into the sibling directory, adding `--use-shared-store` so the new tree keeps its content in the shared store instead of its own `.lore/`. There's no store for this server yet, so cloning creates one first:
 
 ```bash
 cd ~
@@ -228,12 +228,12 @@ Cloning repository 3f2a1b4c5d6e7f8a... branch main into /home/you/my-project-b
 Pull state a3f8c2d1...
 Cloned 2/2 files (269.00 bytes/269.00 bytes)
 Branch main revision a3f8c2d1...
-Clone complete in 0.12s
+Cloned in 0.12s
 ```
 
 (Your repository ID, hashes, timing, and store path will differ. The store lives in Lore's data directory, shown here for Linux.)
 
-The clone already contains the committed files — confirm it:
+The new working tree already contains the committed files — confirm it:
 
 <!-- tabs:start -->
 
@@ -396,7 +396,7 @@ Pushed revision 3 -> c7d1e8b3... to branch main
 
 ## Step 9 — Sync the second working tree
 
-Switch to the clone you made in Step 6 and pull the merged revision from the server:
+Switch to the working tree you cloned in Step 6 and pull the merged revision from the server:
 
 ```bash
 cd ~/my-project-b

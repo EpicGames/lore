@@ -3,7 +3,7 @@
 ## Synopsis
 
 ```text
-<repo>/.lore/config.toml   # per-repository client settings (created on init/clone)
+<repo>/.lore/config.toml   # per-repository client settings (written when the repository is created or cloned)
 ~/.config/lore/cli.toml    # user-level CLI settings (OS user config dir; Linux shown)
 ```
 
@@ -22,11 +22,11 @@ All keys are snake_case. The config structs are plain serde with no case renamin
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `remote_url` | string | none | URL of the remote repository this working tree pushes to and clones from. |
-| `identity` | string | none (resolved at create/clone) | The identity recorded on commits you make from this repository. |
+| `identity` | string | none (resolved when the repository is created or cloned) | The identity recorded on commits you make from this repository. |
 
 #### `remote_url`
 
-Set at create or clone time from the URL you pass (for example `lore://127.0.0.1:41337/my-project`). It may be empty: a repository created with `--offline` (or `--local`) has no remote, and the argument you pass names the repository rather than locating it — `lore --offline repository create my-project`, or no argument at all to name it after the current directory.
+Set from the URL you pass when the repository is created or cloned (for example `lore://127.0.0.1:41337/my-project`). It may be empty: a repository created with `--offline` (or `--local`) has no remote, and the argument you pass names the repository rather than locating it — `lore --offline repository create my-project`, or no argument at all to name it after the current directory.
 
 The scheme decides whether the client authenticates the server. `lores://` validates the server certificate, and is the scheme used when the URL has none. `lore://` doesn't: the client accepts any certificate on QUIC connections, and sends gRPC requests to the server, access tokens included, without TLS. Use `lore://` only for a server on the same machine, as in the examples on this page. With a `lores://` remote, the client refuses to connect if the server advertises a storage, revision, lock, repository, or notification endpoint whose scheme doesn't authenticate the server.
 
@@ -41,7 +41,7 @@ Treat the field as fixed once the repository exists. Pointing an established rep
 `identity` is resolved once, when the repository is created or cloned, and written into `config.toml` — it isn't refreshed on later commands. The resolution order is:
 
 - If you pass `--identity` to `lore repository create` or `lore clone`, that value is written.
-- Otherwise Lore uses the identity resolved from the server connection during create or clone.
+- Otherwise Lore uses the identity resolved from the server connection when the repository is created or cloned.
 - If neither resolves to a non-empty value (for example, an offline create with no `--identity`), the field is left unset.
 
 When `identity` is unset and you try to commit, Lore fails with: `No commit identity configured; pass --identity or set identity in .lore/config.toml`. Set the field by hand, or pass `--identity` on the command, to resolve it.
@@ -168,7 +168,7 @@ Lore resolves the executable to start in this order, and the order is stable —
 2. `[service] executable` in this file.
 3. The running program, when it is the `lore` client itself.
 
-Step 3 applies in two cases. One is `lore service start`, which asks for a service outright and so needs no name. The other is a command that makes a [virtual clone](../how-to/use-virtual-clones-on-linux.md), or works in one whose service ended without taking its mount down, which only the service can carry out. A command that `use_automatically` sends to the service doesn't start one through step 3: that needs step 1 or 2. Step 3 applies to the `lore` client alone, so a program that links the library starts a service only from step 1 or 2.
+Step 3 applies in two cases. One is `lore service start`, which asks for a service outright and so needs no name. The other is a command that makes a [virtual instance](../how-to/use-virtual-instances-on-linux.md), or works in one whose service ended without taking its mount down, which only the service can carry out. A command that `use_automatically` sends to the service doesn't start one through step 3: that needs step 1 or 2. Step 3 applies to the `lore` client alone, so a program that links the library starts a service only from step 1 or 2.
 
 If none of those resolve, starting a service fails and names both places one can be set. Running `lore service run` by hand always serves from the build you ran, whatever this setting says; the service reports on startup when that isn't the configured one.
 

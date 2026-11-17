@@ -140,7 +140,7 @@ Submitted work and the slot its result is published into share one allocation: `
 
 ## Replacing `std::fs` and `tokio::fs`
 
-A file operation in Lore is currently either a `tokio::fs` call or a `lore_spawn_blocking!` closure. Both execute the syscall on the tokio blocking pool, sized `min(2 × (cores + 1), 128)`, which costs two cross-thread handoffs per operation and sets a parallelism ceiling from a thread-count formula — 10 threads on a four-core machine, where a clone materializing tens of thousands of fragments needs far more requests in flight to keep the device busy.
+A file operation in Lore is currently either a `tokio::fs` call or a `lore_spawn_blocking!` closure. Both execute the syscall on the tokio blocking pool, sized `min(2 × (cores + 1), 128)`, which costs two cross-thread handoffs per operation and sets a parallelism ceiling from a thread-count formula — 10 threads on a four-core machine, where cloning that materializes tens of thousands of fragments needs far more requests in flight to keep the device busy.
 
 The proposal's survey found 34 distinct file I/O sites across `lore-storage`, `lore-revision`, and `lore-base`, none of which leak file types across a public API boundary. The migration is therefore entirely internal, and lands per subsystem — pack store, local stores, defragment, fragment engine, revision file operations — each slice green against the full test suite before the next.
 

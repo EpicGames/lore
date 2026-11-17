@@ -277,13 +277,13 @@ async fn remove_empty_mount_point(path: &Path) {
     }
 }
 
-/// Removes `path`, which cloning a virtual clone left, warning where it cannot, and says
+/// Removes `path`, which cloning a FUSE instance left, warning where it cannot, and says
 /// whether it is gone.
 async fn remove_left_by_a_clone(path: &Path) -> bool {
     match lore_io::IoDriver::global().remove_dir_all(path).await {
         Ok(()) => {
             lore_info!(
-                "Removed {}, which cloning a virtual clone left",
+                "Removed {}, which cloning a FUSE instance left",
                 path.display()
             );
             true
@@ -291,7 +291,7 @@ async fn remove_left_by_a_clone(path: &Path) -> bool {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(error) => {
             lore_warn!(
-                "Unable to remove {}, which cloning a virtual clone left: {error}",
+                "Unable to remove {}, which cloning a FUSE instance left: {error}",
                 path.display()
             );
             false
@@ -698,18 +698,19 @@ impl FuseMountManager {
             && let Err(error) = self.unmount_tracked(&mount_path, &mount, true).await
         {
             lore_warn!(
-                "Lazy unmount failed while abandoning FUSE clone at {}: {error}",
+                "Lazy unmount failed while abandoning the FUSE instance at {}: {error}",
                 repository_path.display()
             );
             // Forgets only the clone's own mount, not one made at the path since.
             self.mounts
                 .remove_if(&mount_path, |_, entry| Arc::ptr_eq(entry, &mount));
         }
-        let external = external_dir_for_instance(instance_id)
-            .forward::<MountManagerError>("Locating the abandoned clone's external directory")?;
+        let external = external_dir_for_instance(instance_id).forward::<MountManagerError>(
+            "Locating the abandoned FUSE instance's external directory",
+        )?;
         if let Err(error) = lore_io::IoDriver::global().remove_dir_all(&external).await {
             lore_warn!(
-                "Failed to remove external directory {} left after an abandoned FUSE clone: {error}",
+                "Failed to remove external directory {} left after an abandoned FUSE instance: {error}",
                 external.display()
             );
         }
@@ -720,7 +721,7 @@ impl FuseMountManager {
             && error.kind() != std::io::ErrorKind::DirectoryNotEmpty
         {
             lore_warn!(
-                "Unable to remove mount point {} left after an abandoned FUSE clone: {error}",
+                "Unable to remove mount point {} left after an abandoned FUSE instance: {error}",
                 repository_path.display()
             );
         }

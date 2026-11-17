@@ -1,15 +1,15 @@
 # Run parallel instances over a shared store
 
-A [shared store](../glossary.md#shared-store) keeps a repository's content once on your machine for any number of working trees. Each working tree over the store is an [instance](../glossary.md#repository-instance): a clone with its own working tree, view, current branch, and staged state. A fragment fetched for one instance is there for every other, and it takes disk space once.
+A [shared store](../glossary.md#shared-store) keeps a repository's content once on your machine for any number of working trees. Each working tree over the store is an [instance](../glossary.md#repository-instance), with its own working tree, view, current branch, and staged state. A fragment fetched for one instance is there for every other, and it takes disk space once.
 
 In this guide, you'll set up a shared store, add an instance for each branch, build, or automated tool you run in parallel, and keep the instances in order as you move and remove them.
 
 If you've used Git worktrees, instances cover the same ground without a main repository:
 
 - **No instance owns the store.** Delete any instance, the first one you cloned included, and the others keep working.
-- **Every instance is a clone.** You create each one with `lore clone`, or copy one you have with `lore repository instance clone`. No instance has to exist before the others.
+- **Every instance is cloned.** You create each one with `lore clone`, or copy one you have with `lore repository instance clone`. No instance has to exist before the others.
 - **Branches and revisions live in the store.** A revision committed in one instance is in every other instance at once, before you push it, and it stays after you delete the instance that committed it.
-- **The store outlives its instances.** Deleting the last instance leaves the store in place, and the next clone uses it again.
+- **The store outlives its instances.** Deleting the last instance leaves the store in place, and the next instance you clone uses it again.
 
 ## Prerequisites
 
@@ -24,7 +24,7 @@ If you've used Git worktrees, instances cover the same ground without a main rep
     lore shared-store set-use-automatically true
     ```
 
-    Every `lore clone` and `lore repository create` on this machine then uses a shared store. To opt in one clone at a time instead, leave the setting off and pass `--use-shared-store` to each clone.
+    Every `lore clone` and `lore repository create` on this machine then uses a shared store. To opt in one instance at a time instead, leave the setting off and pass `--use-shared-store` each time you clone.
 
 2. **Clone the first instance.**
 
@@ -33,13 +33,13 @@ If you've used Git worktrees, instances cover the same ground without a main rep
     lore clone lore://127.0.0.1:41337/my-project my-project-a
     ```
 
-    The first clone from a server finds no store for it and creates one:
+    Cloning the first instance from a server finds no store for it and creates one:
 
     ```text
     [Warn] Creating new shared store for remote lore://127.0.0.1:41337 in shared store at /home/you/.local/share/lore/shared_store/127.0.0.1_41337/shared_store
     Cloning repository 3f2a1b4c5d6e7f8a... branch main into /home/you/my-project-a
     ...
-    Clone complete in 0.12s
+    Cloned in 0.12s
     ```
 
     The instance's `.lore/` holds only its config and identity. Its content lives in the store.
@@ -59,20 +59,20 @@ If you've used Git worktrees, instances cover the same ground without a main rep
 
     Linux is shown. The store lives in Lore's data directory, which is `~/Library/Application Support/com.epicgames.lore` on macOS and `%LOCALAPPDATA%\Epic Games\lore\data` on Windows.
 
-One store serves every repository on a Lore Server, so a clone of another repository from `lore://127.0.0.1:41337` uses the same store.
+One store serves every repository on a Lore Server, so an instance of another repository cloned from `lore://127.0.0.1:41337` uses the same store.
 
 > [!NOTE]
 > A working tree that keeps its own store in `.lore/`, such as `~/my-project` from the Quickstart, stays on it. To bring a repository onto the shared store, clone a new instance of it.
 
 ### Keep the store on another drive
 
-To keep the store somewhere other than Lore's data directory, create it there before the first clone. Pass the server's address, with no repository path:
+To keep the store somewhere other than Lore's data directory, create it there before you clone the first instance. Pass the server's address, with no repository path:
 
 ```bash
 lore shared-store create lore://127.0.0.1:41337 --path /mnt/data/lore
 ```
 
-Lore creates the store in a subdirectory named after the server, `/mnt/data/lore/127.0.0.1_41337/shared_store`, and makes it the default store for that server, so later clones use it.
+Lore creates the store in a subdirectory named after the server, `/mnt/data/lore/127.0.0.1_41337/shared_store`, and makes it the default store for that server, so instances cloned later use it.
 
 > [!CAUTION]
 > Create the store before you clone any instance from the server. A store created later becomes the new default, and every instance that follows the default then opens the new, empty store and fails with `anchor branch is missing`.
@@ -85,7 +85,7 @@ Clone the repository again for each branch, build, or automated tool you want to
 lore clone lore://127.0.0.1:41337/my-project my-project-b
 ```
 
-The clone fetches only what the store doesn't already hold. Every `lore clone` option works the same over a shared store: `--branch` starts the instance on another branch, and `--view` gives it a sparse view of its own.
+Cloning fetches only what the store doesn't already hold. Every `lore clone` option works the same over a shared store: `--branch` starts the instance on another branch, and `--view` gives it a sparse view of its own.
 
 ### Clone an instance you already have
 
@@ -95,15 +95,15 @@ Each instance writes every file its view selects, so a full working tree costs i
 lore repository instance clone ~/my-project-c
 ```
 
-The clone is an instance of its own, on the source's branch, revision, and staged state, with the source's uncommitted changes. On the source's volume, on a filesystem that clones files (APFS on macOS, Btrfs, XFS with reflink or bcachefs on Linux, Dev Drive or ReFS on Windows), it shares the source's data blocks and takes little space. Its first `lore status --scan` hashes only the files a scan of the source would: those with no [modified-time record](../glossary.md#modified-time-record), and those changed since theirs.
+The new instance is separate from the source, on the source's branch, revision, and staged state, with the source's uncommitted changes. On the source's volume, on a filesystem that clones files (APFS on macOS, Btrfs, XFS with reflink or bcachefs on Linux, Dev Drive or ReFS on Windows), it shares the source's data blocks and takes little space. Its first `lore status --scan` hashes only the files a scan of the source would: those with no [modified-time record](../glossary.md#modified-time-record), and those changed since theirs.
 
-The clone first waits for Lore commands already running on the source instance in its process to finish. While it runs, Lore commands on the source instance wait for it, and so do Lore commands from other processes on every instance over the store. `lore repository instance delete` waits too, since it opens the store to deregister the source before it removes any file. `lore repository instance move` of an on-disk instance doesn't wait: it renames the source before it opens the store, so moving the source while the clone copies it makes the clone fail. A move of a virtual clone waits until cloning ends. On Windows the move is refused while the clone lists a directory of the source. Commands that don't open the store, such as `lore repository config get`, don't wait either. Where the Lore service runs your commands, it runs them in its own process with the clone, so commands it runs on other instances over the store don't wait.
+Cloning first waits for Lore commands already running on the source instance in its process to finish. While it runs, Lore commands on the source instance wait for it, and so do Lore commands from other processes on every instance over the store. `lore repository instance delete` waits too, since it opens the store to deregister the source before it removes any file. `lore repository instance move` of an on-disk instance doesn't wait: it renames the source before it opens the store, so moving the source while cloning copies it makes cloning fail. A move of a virtual instance waits until cloning ends. On Windows the move is refused while cloning lists a directory of the source. Commands that don't open the store, such as `lore repository config get`, don't wait either. Where the Lore service runs your commands, it runs them in its own process, which also runs the cloning, so commands it runs on other instances over the store don't wait.
 
-A repository nested inside the instance is an instance of its own, and the clone leaves it out. An instance that keeps its own store in `.lore/` can't be cloned this way, and the destination can't be inside an instance, the source included.
+A repository nested inside the instance is an instance of its own, and cloning leaves it out. An instance that keeps its own store in `.lore/` can't be cloned this way, and the destination can't be inside an instance, the source included.
 
-A virtual clone on Linux (`--vfs fuse`) clones into another virtual clone, which the Lore service mounts at the destination. Only its uncommitted changes and its Lore directory are copied, since its tracked files come from the store, so cloning takes as long and as much space as those changes. The new instance reports the modification times its source reports, which its Lore directory holds. Whether it shares blocks depends on the volume holding Lore's global data directory, where every virtual clone keeps its changes, rather than on the destination's. A write in either instance afterward leaves the other alone. A virtual clone on Windows (`--vfs swfs`) can't be cloned.
+A FUSE instance on Linux (`--vfs fuse`) clones into another FUSE instance, which the Lore service mounts at the destination. Only its uncommitted changes and its Lore directory are copied, since its tracked files come from the store, so cloning takes as long and as much space as those changes. The new instance reports the modification times its source reports, which its Lore directory holds. Whether it shares blocks depends on the volume holding Lore's global data directory, where every virtual instance keeps its changes, rather than on the destination's. A write in either instance afterward leaves the other alone. An SWFS instance on Windows (`--vfs swfs`) can't be cloned.
 
-Elsewhere, such as on NTFS, on ext4, or on another volume, the clone is refused, and the message says what a full copy would cost. Pass `--allow-copy` to make the copy anyway. A copy writes every file and takes as long as that does. Run with `--dry-run` first to see whether a clone shares blocks. Where it can't, the dry run says what a copy would cost and is refused as the clone would be; add `--allow-copy` to see the copy it would make.
+Elsewhere, such as on NTFS, on ext4, or on another volume, cloning is refused, and the message says what a full copy would cost. Pass `--allow-copy` to make the copy anyway. A copy writes every file and takes as long as that does. Run with `--dry-run` first to see whether the new instance shares blocks. Where it can't, the dry run says what a copy would cost and is refused as cloning would be; add `--allow-copy` to see the copy it would make.
 
 ## Work across instances
 
@@ -211,7 +211,7 @@ Store at path: /home/you/.local/share/lore/shared_store/127.0.0.1_41337
     Pruned 1 stale instance(s)
     ```
 
-    Every clone over the store also prunes the stale instances of its repository, so the list catches up at the next clone if you skip this step.
+    Cloning over the store also prunes the stale instances of its repository, so the list catches up the next time you clone if you skip this step.
 
 ## Move an instance
 
@@ -245,7 +245,7 @@ Store at path: /home/you/.local/share/lore/shared_store/127.0.0.1_41337
     ```
 
 > [!WARNING]
-> Run `lore repository update-path` before any other instance prunes or clones. Until you do, the instance list records the old path, which no longer exists. A prune, including the one every clone over the store runs, takes the moved instance for a deleted one and discards its branch, revision, and staged state. The instance then fails with `anchor branch is missing`, and you have to delete it and clone it again. The revisions it committed stay in the store.
+> Run `lore repository update-path` before any other instance prunes or clones. Until you do, the instance list records the old path, which no longer exists. A prune, including the one cloning over the store runs, takes the moved instance for a deleted one and discards its branch, revision, and staged state. The instance then fails with `anchor branch is missing`, and you have to delete it and clone it again. The revisions it committed stay in the store.
 
 ## Free disk space
 
@@ -259,7 +259,7 @@ To delete a store and everything in it:
 
 2. **Delete the store directory.**
 
-    Delete the path `lore shared-store info` reports for the server. The next clone from that server creates a new, empty store in the same place.
+    Delete the path `lore shared-store info` reports for the server. The next instance cloned from that server creates a new, empty store in the same place.
 
 > [!WARNING]
 > Deleting a store deletes every revision committed in its instances and not pushed, on every branch of every repository over it.
@@ -270,7 +270,7 @@ To delete a store and everything in it:
 lore shared-store set-use-automatically false
 ```
 
-New clones then keep their own store in `.lore/`. Instances already over the shared store keep using it. While automatic use is on, you can only clone a repository without the shared store by turning the setting off first.
+New instances then keep their own store in `.lore/`. Instances already over the shared store keep using it. While automatic use is on, you can only clone a repository without the shared store by turning the setting off first.
 
 ## See also
 

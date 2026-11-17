@@ -375,7 +375,7 @@ async fn unanswered_forced_service_call(
         }
     }
     let needs = match &command {
-        LoreCommand::RepositoryClone(_) => "A FUSE clone is mounted by the Lore service",
+        LoreCommand::RepositoryClone(_) => "A FUSE instance is mounted by the Lore service",
         LoreCommand::RepositoryCreate(_) => {
             "A FUSE instance is created and mounted by the Lore service"
         }

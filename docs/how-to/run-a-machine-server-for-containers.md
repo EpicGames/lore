@@ -163,7 +163,7 @@ The examples use Linux paths and Docker. The machine server and its clients work
 
 ## Result
 
-The clone completes in the container, and the content it read is in the machine server's local tier, where the next container's clone of it reads it from the machine's disk.
+Cloning completes in the container, and the content it read is in the machine server's local tier, where the next container that clones the repository reads it from the machine's disk.
 
 ## Add or remove a container
 
@@ -173,7 +173,7 @@ The server reads `sockets` when it starts. Add or remove the container's path, t
 
 - **`a lore-unix remote is reached through the machine server's socket, which LORE_UDS_SOCKET must name`.** The process that ran the command lacks the variable. A Lore service started without it keeps running without it: stop it with `lore service stop`, and start it again with the variable set.
 - **`PERMISSION_DENIED`: `<host> is not forwarded`.** The upstream advertises a host that `[server.uds.forward]` doesn't name. Add the host and restart the server.
-- **Clones or pushes fail with a store failure, and the server logs a refusal from the upstream.** The machine identity lacks a grant for the repository, or its login lapsed. Grant it the repository, or log it in again as in step 1. The server takes the change without a restart.
+- **Cloning or pushing fails with a store failure, and the server logs a refusal from the upstream.** The machine identity lacks a grant for the repository, or its login lapsed. Grant it the repository, or log it in again as in step 1. The server takes the change without a restart.
 - **The server doesn't start.** Its log names the cause: a socket another server holds, a missing `[server.auth]` or per-partition authorizer, an empty `sockets` list, a `forward` key with a scheme or port, or `LORE_UDS_SOCKET` set in its environment.
 
 ## See also

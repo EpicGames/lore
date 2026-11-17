@@ -155,7 +155,7 @@ fn handle_link_add(globals: LoreGlobalArgs, args: &LinkAddArgs) -> u8 {
                     crate::util::format_bytes_to_string(data.count.bytes_transferred),
                     crate::util::format_bytes_to_string(data.count.bytes_total),
                 );
-                println!("Clone complete in {:.2}s", start.elapsed().as_secs_f32());
+                println!("Cloned in {:.2}s", start.elapsed().as_secs_f32());
             }
             LoreEvent::LinkChange(data) => {
                 println!(

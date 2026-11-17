@@ -432,7 +432,7 @@ Cloning repository <id> branch main into /tmp/primary-clone
 Pull state <hash>
 Cloned 2/2 files (10.00 MiB/10.00 MiB)
 Branch main revision <hash>
-Clone complete in X.XXs
+Cloned in X.XXs
 <md5hash>  /tmp/e2e-test/asset.bin
 <md5hash>  /tmp/primary-clone/asset.bin
 ```

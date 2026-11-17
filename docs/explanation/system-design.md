@@ -1750,7 +1750,7 @@ path, and an instance an older client created still reads a time from there when
 own records hold none. This is what keeps a full scan linear in file count rather than
 in total bytes: most files are dismissed on metadata alone.
 
-A FUSE virtual clone compares no file by time. It holds the working tree as a state tree, so
+A FUSE instance compares no file by time. It holds the working tree as a state tree, so
 a scan diffs addresses and descends only where either side is dirty, and a single file is
 compared by address, or by content where it was written. Its records instead hold the time the
 mount reports for each file it serves from the store: a sync or switch records its time for

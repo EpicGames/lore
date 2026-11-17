@@ -291,11 +291,12 @@ pub enum LoreCommands {
 
     /// Clone a remote repository into the given path
     ///
-    /// A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the
-    /// clone for working offline instead. With it, as with `--cache`, a clone that writes its files
-    /// caches every file metadata block of the cloned revision, which staging and committing write
-    /// to, so both work without the remote, and fails if it cannot. A bare or virtual clone writes no
-    /// files and reads them from the remote when a command needs them.
+    /// Cloning needs the remote, so `--offline` does not keep it from connecting: it prepares the
+    /// new instance for working offline instead. With it, as with `--cache`, cloning into an
+    /// instance that writes its files caches every file metadata block of the cloned revision, which
+    /// staging and committing write to, so both work without the remote, and fails if it cannot. A
+    /// bare or virtual instance writes no files and reads them from the remote when a command needs
+    /// them.
     Clone(repository::RepositoryCloneArgs),
 
     /// Stage changes for commit.

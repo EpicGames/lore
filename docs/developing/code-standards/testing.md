@@ -340,7 +340,7 @@ Fixed sleeps are acceptable only for time-based behavior such as TTL expiry, or 
 
 - `new_lore_repo` — Creates a new test repository.
 - `scratch_dir` — Hands out a path beside the repositories for the test to create
-  something at: a shared store, a clone target, a moved instance.
+  something at: a shared store, a path to clone into, a moved instance.
 - `lore_executable_path` — Path to the Lore client binary.
 - `auto_lore_local_server` — Auto starts the server for the session.
 
@@ -485,8 +485,8 @@ that service, except in the tests that manage a service of their own through
 `runs_in_process(reason)`, whose commands stay in their own process. The
 executable the relayed commands name for starting a service doesn't exist, so a
 service that stops partway fails the tests that follow instead of being replaced,
-the commands of a virtual clone included. Naming none would not do that: a
-virtual clone's commands start a service from the `lore` that ran them.
+the commands of a virtual instance included. Naming none would not do that: a
+virtual instance's commands start a service from the `lore` that ran them.
 
 ```bash
 LORE_TEST_SHARED_SERVICE=1 uv run pytest scripts/test/ -m smoke -n 4
@@ -523,33 +523,33 @@ process. Outside a call the service reads its own paths, so start it as the
 harness starts its shared service: with a directory of its own for both paths
 and `LORE_AUTH_STORE=fallback`.
 
-### Running every test over virtual clones
+### Running every test over virtual instances
 
 `LORE_TEST_VFS` names a VFS that every repository a test creates or clones
 through the harness takes where the test names none, so the suite runs over
-virtual clones. The service mounts a virtual clone, so the run needs one:
+virtual instances. The service mounts a virtual instance, so the run needs one:
 
 ```bash
 LORE_TEST_SHARED_SERVICE=1 LORE_TEST_VFS=fuse uv run pytest scripts/test/ -m smoke -n 4
 ```
 
-A bare, untracked or dry-run clone stays as the test asks, since a virtual
-clone has no such form. A virtual clone stays mounted past the test that made
-it, so the harness detaches every Lore mount below a test's directories before
-removing them.
+A test that clones bare, untracked or as a dry run keeps that form, since a
+virtual instance has no such form. A virtual instance stays mounted past the test
+that made it, so the harness detaches every Lore mount below a test's directories
+before removing them.
 
-A virtual clone always uses a shared store. A repository the run makes virtual,
+A virtual instance always uses a shared store. A repository the run makes virtual,
 where the test asks for no shared store, gets a store of its own beside it
 (`--shared-store-path <path>.store`). That keeps it apart from the test's other
 repositories, as the store in its own `.lore` did: a branch it commits to
 doesn't advance in theirs.
 
-A test that cannot run over a virtual clone keeps the VFS it names, or none,
+A test that cannot run over a virtual instance keeps the VFS it names, or none,
 with `@pytest.mark.own_vfs("<why>")`. The reason names what the test does that a
-virtual clone does not: it links or layers a repository, deletes or moves an
+virtual instance does not: it links or layers a repository, deletes or moves an
 instance's directory, reads the store in a repository's own `.lore`, or asserts
 what a plain status reports of an ordinary working tree, where a status on a
-virtual clone always scans.
+virtual instance always scans.
 
 ### Per-test timeout
 
@@ -581,7 +581,7 @@ is legitimately slower.
 
 ## 5. Load tests
 
-Lore has a load-testing suite that exercises concurrent clone, commit, sync, lock, and compaction workloads. It runs on internal infrastructure and isn't part of the open-source repository, so its harness and scenarios aren't documented here.
+Lore has a load-testing suite that exercises concurrent cloning, commit, sync, lock, and compaction workloads. It runs on internal infrastructure and isn't part of the open-source repository, so its harness and scenarios aren't documented here.
 
 ---
 

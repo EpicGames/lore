@@ -9,7 +9,7 @@ changes in place. Tracked content is read lazily from the store; local content l
   and no third-party FUSE crate (`src/lib.rs`).
 - The provider, which answers requests from a revision, lives in
   `lore-revision/src/fs/fuse/`. The service holds a mount manager per VFS
-  (`lore-revision/src/fs/mount_manager.rs`); virtual clones are the FUSE manager's, in
+  (`lore-revision/src/fs/mount_manager.rs`); FUSE instances are the FUSE manager's, in
   `lore-revision/src/fs/fuse/mount_manager.rs`.
 
 Paths: `src/…` and `tests/…` are this crate; `fs/…` is `lore-revision/src/fs/…`; `repository/…`,
@@ -36,7 +36,7 @@ export PATH=$PWD/target/release:$PATH
 export LORE_SERVICE_EXECUTABLE=$PWD/target/release/lore   # this build serves, over [service] executable
 export LORE_SERVICE_SOCKET=lore-fuse-try       # a service of its own, apart from any other
 
-# Clone into a FUSE mount. The clone runs in the service, and with none running on this socket
+# Clone into a FUSE mount. Cloning runs in the service, and with none running on this socket
 # starts one. --view and --prefetch are optional.
 lore clone <url> ~/work/tree --vfs fuse \
     --view <view filter file> --prefetch <recording>
@@ -57,7 +57,8 @@ lore service start                             # remounts every FUSE instance
 
 - `--vfs fuse` selects `VfsType::Fuse`. `--vfs default` also means FUSE on Linux
   (`LoreVfsType::to_config`, `lore/src/repository.rs`); the flag's default is `none`.
-- A FUSE clone, and every command run against an existing FUSE instance, goes to the service
+- Cloning into a FUSE instance (`lore clone --vfs fuse`), and every command run against an
+  existing one, goes to the service
   whatever `LORE_USE_SERVICE` says (`command_requires_service`, `lore/src/call_delegation.rs`).
   With no service running it starts one: from the named service executable, or with none named,
   from the `lore` client that ran it, which calls `lore::serve_from_this_executable()`
@@ -67,9 +68,9 @@ lore service start                             # remounts every FUSE instance
   same way. A command in an instance whose mount answers while nothing listens on its socket
   starts none: the service serving the mount is still starting, or listens on another socket. The
   error names both causes and the socket it looked on.
-- An instance is found as FUSE through its mount (`discover_external_dot_lore`), so a command at
-  the path of a clone no service has mounted, after `lore service stop` or a reboot, does not see
-  the instance and starts no service. `lore service start` mounts it again.
+- An instance is found as FUSE through its mount (`discover_external_dot_lore`), so a command at the
+  path of a FUSE instance no service has mounted, after `lore service stop` or a reboot, does not
+  see the instance and starts no service. `lore service start` mounts it again.
 - `LORE_USE_SERVICE` relays any other command; `0`, `false`, `no` and `off` read as off
   (`reads_as_off`, `lore/src/remote/service_process.rs`).
   `lore service set-use-automatically true` makes relaying the default.
@@ -81,8 +82,8 @@ lore service start                             # remounts every FUSE instance
   (`LORE_SERVICE_SOCKET_VAR`, `lore/src/remote.rs`). `.cargo/config.toml` sets `LORE_USE_SERVICE=0`
   and `LORE_SERVICE_SOCKET=lore_service-cargo` for anything `cargo` runs. Override both when trying
   the mount through `cargo run`.
-- A FUSE clone always uses the shared store for its remote, as if `--use-shared-store` were given,
-  and refuses `LORE_SHARED_STORE_MODE_DISABLED` (`LoreSharedStoreMode::for_vfs`,
+- A FUSE instance always uses the shared store for its remote, as if `--use-shared-store` were
+  given, and refuses `LORE_SHARED_STORE_MODE_DISABLED` (`LoreSharedStoreMode::for_vfs`,
   `lore-revision/src/repository.rs`): the service remounts only instances it finds through the
   shared store registry (`mounts_of_entries`, `fs/mount_manager.rs`).
 - The instance's `.lore` directory lives outside the mount, at
@@ -92,8 +93,8 @@ lore service start                             # remounts every FUSE instance
 
 **Prefetch settings and recording.** The service reads `LORE_TREE_PREFETCH_DEPTH` and
 `LORE_FUSE_RECORD_DIR` from its own environment, so set them when starting it:
-`LORE_TREE_PREFETCH_DEPTH=2 lore service start` warms two levels of each clone's tree instead
-of every block (see "Prefetch"). To record a prefetch file:
+`LORE_TREE_PREFETCH_DEPTH=2 lore service start` warms two levels of each FUSE instance's tree
+instead of every block (see "Prefetch"). To record a prefetch file:
 
 ```sh
 lore service stop
@@ -104,8 +105,8 @@ lore service stop                                       # the recording is ~/rec
 lore service start                                      # without the variable: recording off
 ```
 
-**Removing or moving a virtual clone.** `lore repository instance delete` and
-`lore repository instance move <path>`, run from outside the clone, do it in the service:
+**Removing or moving a FUSE instance.** `lore repository instance delete` and
+`lore repository instance move <path>`, run from outside the instance, do it in the service:
 
 ```sh
 cd ~ && lore repository instance delete --repository ~/work/tree
@@ -115,16 +116,15 @@ cd ~ && lore repository instance move ~/work/elsewhere --repository ~/work/tree
 - Both refuse with `MountsBusy` (exit code 51), changing nothing, while anything holds the mount,
   such as a shell whose working directory is inside it. Moving is also refused while the service
   stops.
-- Deleting a clone unmounts it first, then deregisters it and removes its external directory and
-  the empty mount point (`instance_delete`, `lore-revision/src/instance.rs`).
-- Moving a clone unmounts it and mounts it on a new mount point at the target, at the revision it
-  served, with its uncommitted changes. The old mount point stays, empty, until the registration
-  names the target, so a service that starts in between mounts the clone where it is still
-  registered (`move_mount`, `mount_manager.rs`; `remove_left_mount_point`,
-  `instance.rs`). If the clone cannot be mounted at the target, it is mounted at the source
-  again.
-- A mount point holding no checkout is an unmounted clone, not a removed one: pruning keeps its
-  registration while its external directory names a virtual clone (`instance_staleness`,
+- Deleting a FUSE instance unmounts it first, then deregisters it and removes its external directory
+  and the empty mount point (`instance_delete`, `lore-revision/src/instance.rs`).
+- Moving a FUSE instance unmounts it and mounts it on a new mount point at the target, at the
+  revision it served, with its uncommitted changes. The old mount point stays, empty, until the
+  registration names the target, so a service that starts in between mounts the instance where it is
+  still registered (`move_mount`, `mount_manager.rs`; `remove_left_mount_point`, `instance.rs`). If
+  the instance cannot be mounted at the target, it is mounted at the source again.
+- A mount point holding no checkout is an unmounted instance, not a removed one: pruning keeps its
+  registration while its external directory names a FUSE instance (`instance_staleness`,
   `instance.rs`).
 
 By hand, unmount first: deleting a mounted tree deletes through the mount, building every
@@ -143,17 +143,17 @@ lore repository instance prune     # optional, from another instance of the same
   alone. A running service removes nothing.
 - The instance stays registered in the shared store until `lore repository instance prune` runs
   in another instance of that repository (`instance_prune`, `lore-revision/src/instance.rs`).
-  The content the clone fetched stays in the shared store for other instances;
+  The content the instance fetched stays in the shared store for other instances;
   `lore shared-store list` names the registered stores.
-- A virtual clone that fails inside the service undoes its mount: the service detaches it
-  lazily, removes its external directory and, where the clone created the mount point, removes
-  it once empty (`abandon_clone`, `mount_manager.rs`, called from `clone`
-  through `abandon_failed_fuse_clone`, `repository/clone.rs`, and from `create_local`,
-  `lore-revision/src/repository.rs`). The registration goes at the next prune, and the path
-  clones again.
+- When making a FUSE instance fails inside the service (`lore clone` or `lore repository create`
+  with `--vfs fuse`), the service undoes its mount: it detaches it lazily, removes its external
+  directory and, where it created the mount point, removes it once empty (`abandon_clone`,
+  `mount_manager.rs`, called from `clone` through `abandon_failed_fuse_clone`,
+  `repository/clone.rs`, and from `create_local`, `lore-revision/src/repository.rs`). The
+  registration goes at the next prune, and the path clones again.
 
-**Cloning a virtual clone.** `lore repository instance clone <path>`, run in a virtual clone,
-makes another virtual clone at `<path>` in the service, on the same revision, branch and staged
+**Cloning a FUSE instance.** `lore repository instance clone <path>`, run in a FUSE instance,
+makes another FUSE instance at `<path>` in the service, on the same revision, branch and staged
 state, over the same shared store:
 
 ```sh
@@ -318,13 +318,13 @@ first, lose the socket and leave dead endpoints.
 
 | Event | Behaviour | Code |
 |---|---|---|
-| Clone | Mounts an empty `State`, then the clone's swap publishes the revision. Records `vfs.base_time` in the instance config. The hold fetches nothing beyond the revision's state and tree headers, and starts a background prefetch that warms the store (see "Prefetch"); the provider loads the rest on demand (`clone_materialize_hold`, `repository/clone.rs`). While the state's records cache, the clone reads the root's ignore file into the store, so a command run offline finds it, and returns once both are done (`clone_onto_held_state`, `repository/clone.rs`). | `create_mount`, `mount_manager.rs`; `create_local`, `lore-revision/src/repository.rs` |
-| Failed clone | Detached lazily, its external directory removed, and the mount point removed where the clone created it and it is empty; the registration goes at the next prune. | `abandon_clone`, `mount_manager.rs`; `clone`, `abandon_failed_fuse_clone`, `repository/clone.rs` |
-| Instance clone | `lore repository instance clone`: locks and marks the new instance's external directory, the mark naming the destination; copies the source's external directory under the new instance's ID, holding the source's repository lock alone; gives the new instance the source's anchors; makes the mount point at the destination; registers the new instance there and mounts it at the revision its anchors name. A failure removes the mount point, the registration and the external directory. | `place_virtual_clone`, `instance.rs`; `mount_clone`, `mount_manager.rs`; `fs/fuse/clone.rs` |
-| Service start | Mounts each registered virtual clone at its current revision. A store it cannot open or list, and an instance whose `.lore` or config it cannot read, is logged and skipped, and the rest are mounted. An instance whose mount point was deleted has its external directory removed and is not mounted; a path that cannot be reached is left alone, and the next prune of the store retires the registration. An external directory that cloning left marked as in progress, whose lock no other cloning holds, is removed with the empty mount point its mark names where no store registers its instance, and loses only the mark where one does; one a removal renamed aside, and a lock file no cloning holds, is removed. | `mounts_of_entries`, `fs/mount_manager.rs`; `remove_deleted_instance`, `remove_interrupted_clones`, `remount_instances`, `mount_manager.rs` |
+| Cloning | Mounts an empty `State`, then the swap of cloning publishes the revision. Records `vfs.base_time` in the instance config. The hold fetches nothing beyond the revision's state and tree headers, and starts a background prefetch that warms the store (see "Prefetch"); the provider loads the rest on demand (`clone_materialize_hold`, `repository/clone.rs`). While the state's records cache, cloning reads the root's ignore file into the store, so a command run offline finds it, and returns once both are done (`clone_onto_held_state`, `repository/clone.rs`). | `create_mount`, `mount_manager.rs`; `create_local`, `lore-revision/src/repository.rs` |
+| Failed cloning | Detached lazily, its external directory removed, and the mount point removed where cloning created it and it is empty; the registration goes at the next prune. | `abandon_clone`, `mount_manager.rs`; `clone`, `abandon_failed_fuse_clone`, `repository/clone.rs` |
+| Instance cloning | `lore repository instance clone`: locks and marks the new instance's external directory, the mark naming the destination; copies the source's external directory under the new instance's ID, holding the source's repository lock alone; gives the new instance the source's anchors; makes the mount point at the destination; registers the new instance there and mounts it at the revision its anchors name. A failure removes the mount point, the registration and the external directory. | `place_virtual_clone`, `instance.rs`; `mount_clone`, `mount_manager.rs`; `fs/fuse/clone.rs` |
+| Service start | Mounts each registered FUSE instance at its current revision. A store it cannot open or list, and an instance whose `.lore` or config it cannot read, is logged and skipped, and the rest are mounted. An instance whose mount point was deleted has its external directory removed and is not mounted; a path that cannot be reached is left alone, and the next prune of the store retires the registration. An external directory that cloning left marked as in progress, whose lock no other cloning holds, is removed with the empty mount point its mark names where no store registers its instance, and loses only the mark where one does; one a removal renamed aside, and a lock file no cloning holds, is removed. | `mounts_of_entries`, `fs/mount_manager.rs`; `remove_deleted_instance`, `remove_interrupted_clones`, `remount_instances`, `mount_manager.rs` |
 | Stale endpoint | Detected by `statfs` → `ENOTCONN`, lazily unmounted before remount. | `remount_instance`, `mount_manager.rs` |
-| Delete | `lore repository instance delete`: unmounts the clone, which a busy mount refuses with `MountsBusy`, then removes its registration, its external directory and the empty mount point. | `instance_delete`, `lore-revision/src/instance.rs` |
-| Move | `lore repository instance move`: refused while the service stops; unmounts the clone, which a busy mount refuses with `MountsBusy`; mounts it on a mount point made at the target at the revision it served; registers it there; removes the old mount point. When mounting or registering at the target fails, it mounts the clone at its source again. A crash after the mount at the target and before the registration leaves a stale endpoint there, which `fusermount3 -uz <target>` detaches; the next start mounts the clone at its source. | `move_mount`, `mount_manager.rs`; `instance_move_with`, `instance.rs` |
+| Delete | `lore repository instance delete`: unmounts the instance, which a busy mount refuses with `MountsBusy`, then removes its registration, its external directory and the empty mount point. | `instance_delete`, `lore-revision/src/instance.rs` |
+| Move | `lore repository instance move`: refused while the service stops; unmounts the instance, which a busy mount refuses with `MountsBusy`; mounts it on a mount point made at the target at the revision it served; registers it there; removes the old mount point. When mounting or registering at the target fails, it mounts the instance at its source again. A crash after the mount at the target and before the registration leaves a stale endpoint there, which `fusermount3 -uz <target>` detaches; the next start mounts the instance at its source. | `move_mount`, `mount_manager.rs`; `instance_move_with`, `instance.rs` |
 | Stop | Plain unmount of every FUSE mount. If any is busy, the ones already unmounted are remounted at the revision they served, and the stop fails with `MountsBusy` (exit code 51) naming the paths. A mount someone else already detached counts as unmounted. From its snapshot of the mounts until it is refused, a stop makes a mount another command creates detach and fail. | `unmount_all`, `refuse_while_stopping`, `mount_manager.rs` |
 | Stop with the global `--force` | Every mount is detached lazily (`fusermount3 -u -z`, or `umount2(MNT_DETACH)` as root) and forgotten; nothing is remounted, and a path that stays attached is named in a warning while the stop goes ahead. Mounts a refused stop remounted are back in the table, so a later forced stop detaches them too. | `unmount_all`, `mount_manager.rs`; `unmount_path`, `src/mount.rs` |
 
@@ -345,7 +345,7 @@ first, lose the socket and leave dead endpoints.
 - A provider reaches the remote through a connection of its own, which every context it serves
   through shares: connected from the instance's configuration whatever the command that built
   it was told about going offline, since content it serves later may be stored on the remote
-  alone (`RepositoryContext::serving_remote`). A clone or create makes it in the caller's
+  alone (`RepositoryContext::serving_remote`). Cloning or creating makes it in the caller's
   execution context, so it authenticates with the caller's credentials, as the external
   directory is resolved with the caller's global path; a remount after a move keeps it, and a
   service start makes it in the service's context (`create_mount`,
@@ -368,7 +368,7 @@ first, lose the socket and leave dead endpoints.
   the view filter) and the listing cache (`fs/fuse/served.rs`). It sits in an
   `ArcSwap<Served>`: a load takes no lock, increments the refcount and writes only slots its own
   thread owns, and a publish returns once no load can still be taking what it replaced.
-- Clone, sync and branch switch hand the provider the target revision alone
+- Cloning, sync and branch switch hand the provider the target revision alone
   (`InstanceOperationImpl::hold_state`, `fs/filesystem_provider.rs`; `realize_state`,
   `fs/realize.rs`), with `HoldOptions`: `--force` overwrites local changes, forwarding local
   changes keeps them, `--reset` gives every tracked path holding a local change the target's
@@ -380,7 +380,7 @@ first, lose the socket and leave dead endpoints.
   (`hold::add_reset_paths`). It gives a file or directory renamed in case the revision's
   spelling, a directory through an instance rename before the apply, which a dry run leaves,
   and replaces a directory made where a tracked file stood, with the files added in it, as an
-  ordinary clone's reset does. The provider takes it in
+  ordinary instance's reset does. The provider takes it in
   `swap::hold_mounted`, through the provider-agnostic `fs/hold.rs`: it diffs the served revision,
   read clean, against the target (`hold::changes`), checks the local changes the served State
   carries against that diff (`hold::check`), applies it (`hold::apply`), and reports it as a sync does: the totals once
@@ -390,7 +390,7 @@ first, lose the socket and leave dead endpoints.
   used.
   After the hold, a sync or switch reads the target's ignore file into the store
   (`InstanceOperationImpl::warm_held_ignore_file`, `fs/filesystem_provider.rs`, called from
-  `realize_state`, `fs/realize.rs`); the Clone row above gives a clone's order.
+  `realize_state`, `fs/realize.rs`); the Cloning row above gives the order of cloning.
 - A view change also checks and reports what enters and leaves the view: the diff of the served
   revision under the served view against the target under the target's view
   (`hold::shown_changes`), so a narrowing past a local change refuses unless forced or
@@ -409,7 +409,7 @@ first, lose the socket and leave dead endpoints.
   added locally in a directory the target removes refuses nothing. Where a local replacement
   stands beside the node it displaced under one folded name, the local one is checked. A file
   added locally, and a link, count as changed whatever they hold. It logs
-  `Verifying N changes with the held state`, as an ordinary clone logs the changes it verifies
+  `Verifying N changes with the held state`, as an ordinary instance logs the changes it verifies
   against its files, and names each path it refuses. A dry run stops after the check and reports
   what the sync would change. An edit landing between the
   check and the apply is kept, as the apply overwrites no local file unless forced or matching,
@@ -420,7 +420,7 @@ first, lose the socket and leave dead endpoints.
   above it that were deleted too. Host paths follow the State's spelling of a name. Swaps are
   serialized, with each other and with a commit's reconciliation (`swap_plan`).
   The first publish onto the empty revision a mount starts on only publishes and invalidates the
-  root and the names the kernel looked up; it diffs and records nothing, so a clone costs the
+  root and the names the kernel looked up; it diffs and records nothing, so cloning costs the
   same for any tree size (`fs/fuse/swap.rs`, `is_unpublished_empty`). Any other swap:
   1. takes what the State applies: the unfiltered diff from the served revision, plus a
      re-placement of each path an earlier failed or cancelled apply changed, from what the served
@@ -600,7 +600,7 @@ State is rebuilt at every mount.
   holds discarded: held on the scans' queue where one is handed in, and discarded once every scan
   has drained (`status::scan_paths`, `repository/status.rs`). The provider reports
   `holds_state` (`fs/fuse/mount.rs`), so `lore status` scans without `--scan`. Unasked, the
-  scan reports what a plain status reports on an ordinary clone: a deleted directory as one
+  scan reports what a plain status reports on an ordinary instance: a deleted directory as one
   entry, without the entries below it, and no summary line; `--scan` adds both
   (`TreeDiffPlan::for_status`, `ScanReport`, `repository/status.rs`). Entries stream in the
   order the scan finds them: the text output sorts them, and `--json` keeps that order. `lore stage`
@@ -608,7 +608,7 @@ State is rebuilt at every mount.
   `lore stage .` right after a write stages it (`mark_through_provider_diff`,
   `file/stage.rs`). Neither needs `--scan` or `lore file dirty`. `lore diff` reads the tree directly. The diff skips a symlink in the
   filesystem State, below a directory added as a whole too, and so does the operation's directory
-  listing (`FuseDirectoryListing`), as an ordinary clone's walk does, so a symlink is never a
+  listing (`FuseDirectoryListing`), as an ordinary instance's walk does, so a symlink is never a
   change (`versioned_on_a_working_tree`). A path naming one holds nothing for the operation's
   reads (`FuseOperation::located`); sync and merge verification and stage ask whether one stands
   there (`InstanceOperationImpl::unversioned_symlink_at_or_above` and `unversioned_symlink_at`,
@@ -748,7 +748,7 @@ State is rebuilt at every mount.
   never written through (`emptied_file`; only a reset reaches one, lore-as0); SETATTR for
   `make_executable`; UNLINK and RMDIR, recording deletions, for `remove` and
   `remove_recursive`, where a missing path is no error,
-  as on an ordinary clone; RENAME for `rename`, child by child onto an existing directory and
+  as on an ordinary instance; RENAME for `rename`, child by child onto an existing directory and
   for a tracked directory, which RENAME refuses with `EXDEV`, except a change of case alone,
   which respells the directory in place and its host directory with it, made where none was
   so the next mount takes the spelling. `copy_file` keeps the source's executable bit. Stored
@@ -765,13 +765,12 @@ State is rebuilt at every mount.
   deletion. The operation reads the deletion list once, and again only once an append or rewrite
   has moved its change count (`DeletionList::changes`, `deletion_listed`). A provider without
   `write/` answers `NotSupported` (`FuseOperation::writable`, `operation.rs`).
-- **Desktop trash.** GNOME's `gvfsd-trash` treats every lore mount as a volume of its own and
-  looks up `.Trash` and `.Trash-<uid>` in its root
-  (`loading_a_fuse_instance_never_enters_the_mount`, `lore-revision/tests/fuse_mount.rs`), and
-  any file created there, which a debug build's unmount invalidates again. A
-  file-manager delete in a virtual clone may therefore create `.Trash-<uid>` at the repository
-  root, where status shows it; an ordinary clone uses `~/.local/share/Trash`. The `x-gvfs-notrash`
-  mount option would opt out, but `fusermount3` fails to set it (lore-9fr).
+- **Desktop trash.** GNOME's `gvfsd-trash` treats every lore mount as a volume of its own and looks
+  up `.Trash` and `.Trash-<uid>` in its root (`loading_a_fuse_instance_never_enters_the_mount`,
+  `lore-revision/tests/fuse_mount.rs`), and any file created there, which a debug build's unmount
+  invalidates again. A file-manager delete in a FUSE instance may therefore create `.Trash-<uid>` at
+  the repository root, where status shows it; an ordinary instance uses `~/.local/share/Trash`. The
+  `x-gvfs-notrash` mount option would opt out, but `fusermount3` fails to set it (lore-9fr).
 - **STATFS** adds the size of the file system holding `write/` and reports its free blocks and
   inodes (`statfs_with_local`, `write.rs`).
 
@@ -826,7 +825,7 @@ State is rebuilt at every mount.
   name of up to 64 bytes; past that `hash_string` lowercases the name into a `String`, and
   `fold_eq` does so for a pair holding a non-ASCII name.
 - The State holds one spelling per folded name, and LOOKUP answers a name only in that spelling;
-  any other answers absent, as on an ordinary Linux clone (`LookupCase::Exact`,
+  any other answers absent, as on an ordinary Linux instance (`LookupCase::Exact`,
   `fs/fuse/filesystem.rs`). Were two spellings to answer with one inode, the kernel would take a
   rename between them for a rename onto itself and send nothing (`vfs_rename`), so `mv Foo foo`
   would leave `Foo`. A CREATE, MKDIR or MKNOD of a name that folds to a held one answers `EEXIST`.
@@ -847,7 +846,7 @@ State is rebuilt at every mount.
   stays listed, as an ordinary working tree keeps a local file its view leaves out
   (`holds_local`). Each entry, and each directory's inode, keeps the line that decided its view
   verdict beside the packed bits, so a listing below an excluded directory resumes from that
-  line: a re-inclusion written before it re-includes nothing below, as in an ordinary clone
+  line: a re-inclusion written before it re-includes nothing below, as in an ordinary instance
   (`view::view_line`). A view change recomputes every directory inode's verdict under the new
   view (`plan_view_change`). Local entries are listed from the
   State with the `LOCAL` flag; there is no second listing to merge.
@@ -914,7 +913,7 @@ State is rebuilt at every mount.
   `lore-revision/src/state.rs`). A directory spanning K uncached blocks costs K + 1 round
   trips.
 - Loading a node block starts no other work: a command that reads a block's file metadata fetches it
-  then (`State::block_file_metadata`, `state.rs`), and a clone's tree prefetch warms
+  then (`State::block_file_metadata`, `state.rs`), and the tree prefetch of cloning warms
   file-metadata blocks on its own awaited path. A task left running past a command would hold the
   command's repository, which the service's end-of-command check forbids.
 - **File metadata and new nodes.** The filesystem State takes new nodes from fresh blocks past the
@@ -950,15 +949,15 @@ State is rebuilt at every mount.
   `lore reset --force` writes each file it names, a clean one included, so each takes a new time,
   as in an instance on disk. An inode the kernel holds across a swap or such a write takes the time
   recorded for its path. Until the records hold a shard file or a time is set, no inode creation
-  looks a time up. An instance clone carries the records.
-- A virtual clone tells a changed file by address and content, never by a recorded time: its
+  looks a time up. Cloning an instance carries the records.
+- A FUSE instance tells a changed file by address and content, never by a recorded time: its
   scan is the diff of the filesystem State (see "Status and diff"), a single file is compared
   through `file_holds_content`, and no comparison records a time (`file_modification` and
   `file_modified_against_node`, `lore-revision/src/state.rs`).
 - v0.14.0 also stored swap times in the mutable store (`fuse-recorded-time`, with a
   `fuse-recorded-times` marker). Its swaps recorded the same times in the records, which this client
   reads alone. After a downgrade, v0.14.0 reports older times for the files this client's swaps
-  changed: run a clean build in each virtual clone after a downgrade.
+  changed: run a clean build in each FUSE instance after a downgrade.
 - Times are stored before a swap applies anything (`swap_through`, `swap.rs`).
 
 ### The READ path
@@ -1106,7 +1105,7 @@ fetches made meanwhile; the recorded blocks report the content of the node block
 payload of the name tables and file-metadata blocks they fetched, and their failed fetches. A block
 warm-up also logs one debug line of its own; the cache runs inside the warm-ups log none.
 
-- **Recording.** The clone reads the file when it publishes, so a file that cannot be read is a
+- **Recording.** Cloning reads the file when it publishes, so a file that cannot be read is a
   warning to the command (`plan`, `repository/prefetch.rs`). Paths are spelled as the line holds
   them and kept in first-access order, each once as parsed; `/` is the root, a trailing `/` marks a
   directory, and a line that is not UTF-8 or holds no relative path is skipped. Block indices
@@ -1136,7 +1135,7 @@ warm-up also logs one debug line of its own; the cache runs inside the warm-ups 
     it, and otherwise under a cache get permit, fetched and stored; its name table address is read
     from its content, so it is expanded once. A fetch that fails is counted, and a failed node
     block's name table is not fetched.
-  - `<n>`: the clone's discovery walk with the view filter (`BlockDiscoverDispatcher`,
+  - `<n>`: the discovery walk of cloning with the view filter (`BlockDiscoverDispatcher`,
     `repository/clone.rs`), entering directories down to `n` levels below the root, so that
     every directory above that depth lists locally. The walk follows every node's sibling link, so
     every block holding an entry of a directory it enters loads, and reads and filters the names
@@ -1160,9 +1159,9 @@ Measured on 2026-09-25 against `lore.internal.epicgames.net/Fortnite`, revision 
 Linux view, a cold isolated store each run, one storage connection (before r1346) and the prefetch
 before r1351 (block batches with barriers, 256 paths resolving, contents in batches of 256). The
 SD-WAN link (`sdwan0`) carried about 1.6 MiB/s of other traffic before the runs and about 3 MiB/s
-in all during them (a real clone and other services).
+in all during them (cloning into an ordinary instance, and other services).
 
-| Setting | Clone returns | Prefetch | Fetched | What |
+| Setting | Cloning returns | Prefetch | Fetched | What |
 |---|---|---|---|---|
 | tree `2` | 1.90 s | 19.7 s | 22.0 MiB | 47 directories, 21 files, 85 blocks |
 | tree `blocks` | 1.73 to 2.01 s | 303 to 349 s (3 runs) | 1070 to 1076 MiB | 44,196 node blocks (895 MiB), 33,713 name tables (113 MiB), 44,196 file-metadata blocks (66 MiB) |
@@ -1228,21 +1227,21 @@ in the code.
 | `UNMOUNT_BUSY_RETRIES`, `UNMOUNT_BUSY_BACKOFF` | constants (`src/mount.rs`) | 5, 20 ms | Busy-unmount retries. |
 | `DRAIN_WAIT` | constant (`fs/fuse/mount.rs`) | 2 s | Debug-build FORGET drain on plain unmount. |
 | `DRAIN_RESEND`, `DRAIN_SETTLE` | constants (`fs/fuse/mount.rs`) | 50 ms, 100 ms | The drain's interval between invalidations, and how long the table must count no lookups before it ends. |
-| `vfs.base_time` | instance config (`VfsConfig::base_time`, `lore-revision/src/repository.rs`) | clone time | Time a file served from the store reports until a time is recorded for its path. |
+| `vfs.base_time` | instance config (`VfsConfig::base_time`, `lore-revision/src/repository.rs`) | time of cloning | Time a file served from the store reports until a time is recorded for its path. |
 | `LORE_IMMUTABLE_STORE_VERIFY_WRITE` | env (`LocalImmutableStore::new_claimed`, `lore-storage/src/local/immutable_store.rs`) | off | `1` or `true` verifies each local store write by read-back and rehash. |
 | `LORE_MAX_CONNECTIONS` | env of the service process, or `--max-connections` (`lore_globals_from_args`, `lore-client/src/cli/cli.rs`) | 1, at most 10 (`storage_connection_count`, `connect_impl`, `lore-transport/src/connection.rs`) | Storage connections the process opens; remote fetches spread over them. The first connection a process makes to a remote fixes the count for its lifetime. Throughput from a distant remote scales with the count ("Remote fetch throughput"). |
 | `LORE_FUSE_RECORD_DIR` | env, read at mount time (`RECORD_DIR_ENV`, `access_recorder.rs`; `mount_with`, `fs/fuse/mount.rs`) | unset | Each mount records first-access paths to `<dir>/<instance id>-<unix seconds>.txt`. See "Access recording" above. |
-| `LORE_TREE_PREFETCH_DEPTH` | env, read by each virtual clone in the service (`tree_prefetch_from_env`, `repository/prefetch.rs`) | `blocks` | `0` off, `<n>` levels, `all` the whole view, `blocks` every block. An unreadable value warns and takes the default. See "Prefetch". |
-| `--prefetch <file>` | CLI, `CloneOptions::prefetch` (`repository/clone.rs`; `clone_impl`, `lore/src/repository.rs`) | none | Access recording a virtual clone warms. Resolved against the caller's working directory. |
+| `LORE_TREE_PREFETCH_DEPTH` | env, read by each FUSE instance in the service (`tree_prefetch_from_env`, `repository/prefetch.rs`) | `blocks` | `0` off, `<n>` levels, `all` the whole view, `blocks` every block. An unreadable value warns and takes the default. See "Prefetch". |
+| `--prefetch <file>` | CLI, `CloneOptions::prefetch` (`repository/clone.rs`; `clone_impl`, `lore/src/repository.rs`) | none | Access recording a FUSE instance warms. Resolved against the caller's working directory. |
 | `CloneOptions::tree_prefetch` | API (`repository/clone.rs`) | `None`, the variable | Overrides `LORE_TREE_PREFETCH_DEPTH`. |
 | `WARM_BLOCK_LOADS` | constant (`repository/clone.rs`) | 64 | Block loads a tree walk keeps in flight. |
 | `BLOCKS_IN_FLIGHT` | constant (`repository/prefetch.rs`) | 512 | Node blocks `blocks` and a recording's block indices keep in flight, each with its file-metadata block and name table. |
 | `RECORDING_RESOLVING` | constant (`prefetch.rs`) | 2048 | Recorded paths resolving at once. |
 | `RECORDING_CONTENT_FETCHES` | constant (`prefetch.rs`) | 512 | Resolved files whose contents are fetching at once. |
-| `CACHE_GETS` | constant (`lore-revision/src/immutable.rs`) | 512 | Gets `immutable::cache` has in flight on one connection to a remote: the recording prefetch, readahead and the `blocks` tree prefetch's block warm-up, and the cache calls commands await, which can queue behind a mount's backlog on the same remote: state caching in sync, clone, `info` and dump (`State::cache_fragments`), and the history lookup (`batch_load_history`, `find.rs`). The `Levels` and `all` tree prefetch read blocks at priority and do not take it, nor do demand reads; a `blocks` warm-up's node block takes it only where the local store lacks the block. A get goes to the remote at once, so with no cap a prefetch puts thousands ahead of a demand READ's priority get; on a slow link 100,000 or more queued. 512 is the smallest cap with no measured cost on a fast link (table below). Each connection holds its own permits (`Connection::cache_get_permits`, `lore-transport/src/connection.rs`), so a stalled remote holds back only the cache gets over its connections. A cache get that joins a read or fetch of the same content in flight gives its permit back. A get has no client deadline (`get`, `lore-transport/src/quic/storage_service/client.rs`): a remote that stops answering stops its own cache fetches until its held gets return, or the server's handler ceiling (1 h by default) ends them. A get that waited for its permit skips a fragment that turned local meanwhile. |
+| `CACHE_GETS` | constant (`lore-revision/src/immutable.rs`) | 512 | Gets `immutable::cache` has in flight on one connection to a remote: the recording prefetch, readahead and the `blocks` tree prefetch's block warm-up, and the cache calls commands await, which can queue behind a mount's backlog on the same remote: state caching in sync, cloning, `info` and dump (`State::cache_fragments`), and the history lookup (`batch_load_history`, `find.rs`). The `Levels` and `all` tree prefetch read blocks at priority and do not take it, nor do demand reads; a `blocks` warm-up's node block takes it only where the local store lacks the block. A get goes to the remote at once, so with no cap a prefetch puts thousands ahead of a demand READ's priority get; on a slow link 100,000 or more queued. 512 is the smallest cap with no measured cost on a fast link (table below). Each connection holds its own permits (`Connection::cache_get_permits`, `lore-transport/src/connection.rs`), so a stalled remote holds back only the cache gets over its connections. A cache get that joins a read or fetch of the same content in flight gives its permit back. A get has no client deadline (`get`, `lore-transport/src/quic/storage_service/client.rs`): a remote that stops answering stops its own cache fetches until its held gets return, or the server's handler ceiling (1 h by default) ends them. A get that waited for its permit skips a fragment that turned local meanwhile. |
 | `LORE_CACHE_GETS` | env of the service process, read and logged once (`cache_gets`, `immutable.rs`) | `CACHE_GETS` | Overrides the cap on each connection; `0` means no cap. A cap above what a tokio semaphore holds takes that maximum; a value that is not a count warns and takes the default. For measuring the cap on a given link. |
 
-**`CACHE_GETS` on the fast link**, 2026-10-03: median of 3 cold builds per cap. Each build is the cold ShaderCompileWorker clone and build of the r1550 release binary through the quiet runner, on `sdwan0` (p95 40-51 MiB/s with no cap). Caps rotated per round, each set against its own no-cap runs.
+**`CACHE_GETS` on the fast link**, 2026-10-03: median of 3 cold builds per cap. Each build clones and builds ShaderCompileWorker cold with the r1550 release binary through the quiet runner, on `sdwan0` (p95 40-51 MiB/s with no cap). Caps rotated per round, each set against its own no-cap runs.
 
 | Cap | Median (s) | vs no cap |
 |---|---|---|
@@ -1303,8 +1302,8 @@ Machine prerequisites for `bench_read_targets`:
 
 ### Build benchmarks
 
-`lore-fuse/bench/m2/` times a cold Unreal build on a virtual clone against the same build on an
-ordinary clone of the same view and revision. Every script sources `common.sh`, which reads
+`lore-fuse/bench/m2/` times a cold Unreal build on a FUSE instance against the same build on an
+ordinary instance of the same view and revision. Every script sources `common.sh`, which reads
 `M2_ENV` (default `/tmp/lore-fuse-m2/env.sh`) for `LORE`, `LORE_GLOBAL_PATH`,
 `LORE_SERVICE_SOCKET`, `LORE_SERVICE_EXECUTABLE`, `LINUX_MULTIARCH_ROOT` and `BENCH_REV`.
 `M2_OUT` (default `/tmp/lore-fuse-m2/runs`) holds the output, `M2_CORES` (default `0-11`) names
@@ -1314,26 +1313,26 @@ the CPUs the build is pinned to, and `M2_ACTIONS` (default 12) is UBT's `-MaxPar
 |---|---|
 | `build.sh <tree> <target> <label>` | Waits for a quiet machine (no `cargo`, `rustc`, `clippy-driver`, `pytest` or server process, and under 5% CPU busy three checks running), then times `Engine/Build/BatchFiles/RunUBT.sh <target> Linux Development` pinned to `M2_CORES`, with UBA's store in the run directory so that no build warms the next. A foreign process seen during the run marks it `DISCARD`. |
 | `cold-vfs.sh <view> <mount> [recording]` | Stops the benchmark service, told apart from other services of the same executable by its socket; deletes its shared store, external directories and store registry; drops the page cache; starts the service and clones `BENCH_REV` with `--vfs fuse --use-shared-store --view`, and `--prefetch` given a recording. `M2_KEEP_STORE=1` keeps the store. |
-| `reset-real.sh <tree> [time]` | Returns the ordinary clone to its revision. Build outputs are mostly paths `.p4ignore.txt` ignores, which no scan reports, so it deletes everything changed since the marker the last reset left (since `time` the first time), runs `lore reset --purge`, and requires a clean `lore status --scan`. |
+| `reset-real.sh <tree> [time]` | Returns the ordinary instance to its revision. Build outputs are mostly paths `.p4ignore.txt` ignores, which no scan reports, so it deletes everything changed since the marker the last reset left (since `time` the first time), runs `lore reset --purge`, and requires a clean `lore status --scan`. |
 | `matrix.sh <real tree> <view> <target> <reps> [recording]` | `reps` ordinary builds, each after a reset and a cache drop, then `reps` cold virtual builds per mode (`vfs-tree`, and `vfs-recording` given a recording); one line per run in `M2_OUT/matrix.log`. |
 
-A recording for `--prefetch` comes from one build on a virtual clone with `LORE_FUSE_RECORD_DIR`
+A recording for `--prefetch` comes from one build on a FUSE instance with `LORE_FUSE_RECORD_DIR`
 in the service's environment ("Access recording").
 
 `lore-fuse/bench/m3/` runs the milestone 3 measurements on top of `bench/m2/`. Its `common.sh`
 sources the m2 one with `M2_OUT` defaulting to `/tmp/lore-fuse-m3/runs`. `BENCH_BIN` names the
 lore binary under test, in place of `LORE` and `LORE_SERVICE_EXECUTABLE` from `M2_ENV`, and
-`M3_MOUNT` (default `/tmp/lore-fuse-m3/mnt/fn`) is the cold clone's mount.
+`M3_MOUNT` (default `/tmp/lore-fuse-m3/mnt/fn`) is the mount of the cold FUSE instance.
 
 | Script | What it does |
 |---|---|
 | `quiet-run.sh <label> <command>...` | Waits until other processes have used under `QUIET_IDLE_TICKS` (50, half a core) in each of `QUIET_SECS` (30) seconds with no build or test process (`QUIET_FOREIGN`) running, then runs the command. The run is every process carrying its `QUIET_RUN_ID`, and their descendants. Another build or test process, others over `QUIET_BUSY_TICKS` (200) in one second, or over `QUIET_IDLE_TICKS` for 3 seconds kill the run, run `QUIET_CLEANUP` and start the wait again. Logs to `QUIET_DIR/<label>.log`, keeps the output as `<label>-run-<n>.out`, and gives up after `QUIET_DEADLINE_SECS` (36000) with exit 75. |
-| `cold-build.sh <label>` | One cold virtual build for `quiet-run.sh`: `cold-vfs.sh` clones with the `M3_RECORDING` prefetch (none when set and empty), then `build.sh` builds `M3_TARGET` (`ShaderCompileWorker`) in it. Prints clone, build and total seconds; samples `M3_NET` (`sdwan0`) received bytes each second and records the service's `LORE_CACHE_GETS`. |
+| `cold-build.sh <label>` | One cold virtual build for `quiet-run.sh`: `cold-vfs.sh` clones with the `M3_RECORDING` prefetch (none when set and empty), then `build.sh` builds `M3_TARGET` (`ShaderCompileWorker`) in it. Prints cloning, build and total seconds; samples `M3_NET` (`sdwan0`) received bytes each second and records the service's `LORE_CACHE_GETS`. |
 | `compare.sh <base> <new> [pairs] [tag]` | Cold builds of two binaries, alternated so both see the same link, each through `quiet-run.sh`; stops at the first failed build. |
 | `caps.sh <binary> [rounds] [tag]` | Cold builds at each cache-get cap in `CAPS` (default `64 128 0`), rotated each round. |
 | `verify.sh <tag>` | The milestone 3 verification set: clippy and rustfmt on the FUSE crates, the FUSE, State and command suites, the lore-fuse, lore-io and remote FUSE tests, a debug build, and the FUSE and service pytest suites. One `<step> exit=<status>` line per step. |
 | `final-measure.sh <tag> <base>` | `verify.sh`, then the release binary, `bench/m2/latency.sh` three times and `compare.sh` against `base`, each step gating the next. |
-| `fortnite-experiments.md` | How to time a Fortnite build from scratch on another machine: p4 sync, ordinary Lore clone, FUSE clone recording its accesses, FUSE clone prefetching from the recording. |
+| `fortnite-experiments.md` | How to time a Fortnite build from scratch on another machine: p4 sync, ordinary Lore instance, FUSE instance recording its accesses, FUSE instance prefetching from the recording. |
 | `repeat-test.sh`, `contention.sh` | One test run over and over: alone, or in `LOOPS` (6) concurrent loops per test binary, every binary at once, to compare a fix against its base under the same load. |
 
 ## Measured performance
@@ -1369,7 +1368,7 @@ no row with that much reclaim kept its page cache. W4 warm (±233% to ±810%), `
 
 **Cold LOOKUP against the remote** (`lore.internal.epicgames.net/Fortnite` at `fe9b2325…`, Linux
 view, fresh store and service per run, QUIC RTT 135-141 ms, runs alternated back to back on
-2026-09-24; a 147 GiB clone from the same remote ran throughout). Each step builds one cold
+2026-09-24; cloning 147 GiB from the same remote ran throughout). Each step builds one cold
 listing, the parent directory of the path stat'ed; wall seconds, two runs each:
 
 | Step (listing built: blocks spanned / uncached) | Before (r1340) | After (r1343) |
@@ -1408,20 +1407,20 @@ MiB/s in every run). Files/s over the whole run:
 
 **Cold build against the remote** (`lore.internal.epicgames.net/Fortnite` at `fe9b2325…`, the
 Linux view of the standard view filter, `ShaderCompileWorker` Linux Development, 12 actions on the
-P-cores, a UBA store per run; 2026-09-25, 16 storage connections, r1352). The ordinary clone was
+P-cores, a UBA store per run; 2026-09-25, 16 storage connections, r1352). The ordinary instance was
 cloned once and reset between builds; each virtual build starts from an empty store, and its
-figures include the clone (1.9-2.1 s). Seconds:
+figures include cloning (1.9-2.1 s). Seconds:
 
 | Build | Runs | Median | Outside UBA's compile | UnrealBuildTool compile |
 |---|---|---|---|---|
-| Ordinary clone | 156.3, 143.8, 149.9 | 149.9 | 21.0-21.8 | 12.6-13.2 |
-| Virtual clone, `--prefetch` recording with block indices | 164.9, 169.1, 167.4 | 167.4 (1.12×) | 32.7-35.5 | 14.3-16.7 |
-| Virtual clone over a store already holding everything | 153.3 | - | 26.4 | 14.7 |
+| Ordinary instance | 156.3, 143.8, 149.9 | 149.9 | 21.0-21.8 | 12.6-13.2 |
+| FUSE instance, `--prefetch` recording with block indices | 164.9, 169.1, 167.4 | 167.4 (1.12×) | 32.7-35.5 | 14.3-16.7 |
+| FUSE instance over a store already holding everything | 153.3 | - | 26.4 | 14.7 |
 
 - UBA's compile took 122.8-136.0 s across all runs, ordinary and virtual alike, most of the
-  spread; the time outside it is what the clone changes.
+  spread; the time outside it is what the FUSE instance changes.
 - The recording's prefetch (5,497 blocks, 50,425 paths, 312 MiB of content, about 530 MiB in
-  all) ended 19-21 s after the clone, its blocks alone after 9-11 s; the `blocks` tree prefetch
+  all) ended 19-21 s after cloning, its blocks alone after 9-11 s; the `blocks` tree prefetch
   then took 27-34 s for 893 MiB.
 - Earlier steps, one run each: batched warm-up 191.1 s; contents fetched as files resolve 185.1
   s; 2,048 paths resolving 174.5 s; block indices 163.3 s, with READs at normal priority.
@@ -1460,14 +1459,14 @@ The budget is p50 < 20 µs and p99 < 100 µs. The tests:
 - A READ served from a local-store fragment allocates 3 (budget 8).
 
 **Cold build against the remote.**
-- **The setup is the milestone 2 one above**: the clone and build steps of `bench/m2/cold-vfs.sh`, run through `bench/m3/quiet-run.sh` (`bench/m3/compare.sh`).
+- **The setup is the milestone 2 one above**: the cloning and build steps of `bench/m2/cold-vfs.sh`, run through `bench/m3/quiet-run.sh` (`bench/m3/compare.sh`).
 - **Two versions, alternated on one link:** milestone 3 at r1536 and milestone 2 complete (r1429). The runs were on 2026-10-02.
 - **The link:** `sdwan0` carried 12.5-12.6 MiB/s on average over each build's first 120 s, with 5 s peaks of 48-59 MiB/s.
-- **Clone time is included.**
+- **Cloning time is included.**
 
 Seconds:
 
-| Build | Runs | Median | Outside UBA's compile | UnrealBuildTool compile | Median against the ordinary clone's 149.9 s |
+| Build | Runs | Median | Outside UBA's compile | UnrealBuildTool compile | Median against the ordinary instance's 149.9 s |
 |---|---|---|---|---|---|
 | Milestone 2 complete (r1429) | 159.5, 163.6, 165.1 | 163.6 | 30.5-32.9 | 14.1-14.6 | 1.09× |
 | Milestone 3 (r1536) | 162.2, 165.1, 164.5 | 164.5 | 31.4-32.5 | 14.1-14.6 | 1.10× |
@@ -1508,16 +1507,16 @@ On a slow link every version misses the budget. On 2026-10-01 and 2026-10-02, at
 - **Cold build,** against milestone 3, alternated: milestone 3 160.5, 164.5, 166.3 s (median 164.5); follow-ups 163.6, 163.7, 166.5 s (median 163.7, on par).
 - **Chain logs:** 16.0 MB at each unmount.
 
-**End to end on a repository**, at r1677 on 2026-10-12: a 440-file repository (6.98 MiB of sources and docs) on a local server, one virtual clone beside two ordinary ones. The steps:
-- clone, and edits `status` sees unscanned;
+**End to end on a repository**, at r1677 on 2026-10-12: a 440-file repository (6.98 MiB of sources and docs) on a local server, one FUSE instance beside two ordinary ones. The steps:
+- cloning, and edits `status` sees unscanned;
 - a sync bringing a remote change in and keeping the local edits;
-- a sync refused on an edit the remote changes (exit 44, as on an ordinary clone), its dry run refused the same way, a forced dry run changing nothing, and a forced sync overwriting the edit and keeping the others;
+- a sync refused on an edit the remote changes (exit 44, as on an ordinary instance), its dry run refused the same way, a forced dry run changing nothing, and a forced sync overwriting the edit and keeping the others;
 - branch create, stage, commit and push from the mount, and switches both ways: one refused on an edit the switch changes, one carrying an edit it leaves;
 - `reset` of a file, a merge of the branch into main pushed from the mount, and a sync restoring a file deleted locally that the remote changed.
 
-After each step the virtual clone matched an ordinary one byte for byte, and each sync and switch verified as many changes.
+After each step the FUSE instance matched an ordinary one byte for byte, and each sync and switch verified as many changes.
 
-**Commits and conflicts end to end**, at r1690 on 2026-10-12: the `lore-revision` sources, `lore-fuse` and the docs on a local server, one virtual clone beside an ordinary one, 46 of 46 checks. Beyond the steps above:
+**Commits and conflicts end to end**, at r1690 on 2026-10-12: the `lore-revision` sources, `lore-fuse` and the docs on a local server, one FUSE instance beside an ordinary one, 46 of 46 checks. Beyond the steps above:
 - a commit from the mount leaves status clean and its files gone from `write/`, still served;
 - a commit of a link alone and of a layer refused, the revision and the staged edit left in place;
 - a conflicting merge leaving markers, its resolve refused while they stay, then resolved, committed and pushed;
@@ -1548,7 +1547,7 @@ After each step the virtual clone matched an ordinary one byte for byte, and eac
 - **Under concurrent writes, the tail is still rebuilds, plus a second cause.** A save logs four patches, so a 64-slot log overflows every 16 saves and the next LOOKUP rebuilds (about 1.25 ms). LOOKUPs that met no rebuild still have a p99 of 180-217 µs.
 - **Among creates, the tail without rebuilds is 0.39-0.48 ms.** At r1580 each CREATE's duplicate-name check walked the directory's whole chain (lore-030), about 2,000 steps in a 2,000-entry directory.
 
-**Cold build against the remote**, at r1580 against milestone 3 (r1536), alternated on one link (`sdwan0`, p95 37-52 MiB/s), three runs each through the quiet runner, clone included, on 2026-10-03: milestone 3 160.6, 164.9, 164.3 s (median 164.3); follow-ups 165.8, 165.1, 165.4 s (median 165.4, +0.7%, inside milestone 3's spread). The cache-get cap is at its default, 512.
+**Cold build against the remote**, at r1580 against milestone 3 (r1536), alternated on one link (`sdwan0`, p95 37-52 MiB/s), three runs each through the quiet runner, cloning included, on 2026-10-03: milestone 3 160.6, 164.9, 164.3 s (median 164.3); follow-ups 165.8, 165.1, 165.4 s (median 165.4, +0.7%, inside milestone 3's spread). The cache-get cap is at its default, 512.
 
 ### State node operations: measurements
 
@@ -1589,14 +1588,14 @@ profile on a second machine, pinned to one thread per core, on 2026-10-31:
 
 Open follow-ups from milestone 3:
 
-- **Ignore rules on a virtual clone: dirty adds.** A command reads a virtual clone's ignore
-  file from the provider, from `write/` or the store, never through the service's own mount
+- **Ignore rules on a FUSE instance: dirty adds.** A command reads a FUSE instance's ignore file
+  from the provider, from `write/` or the store, never through the service's own mount
   (`load_held_filter`, `lore-revision/src/repository.rs`; `read_held_file`, `filesystem.rs`), and
   the provider diff answers whether lore's tree tracks a path from that tree, its from side, never
   from the served State, whose node IDs part from its base's after a swap
   (`DiffFlags::FilesystemTo`, `state/diff.rs`). Left: an add only marked dirty that a rule excludes
-  is left out of the report but stays marked in lore's tree, where an ordinary clone's scan drops it
-  (`state/os_diff.rs`, with `stage::drops_cleanly`); queue it for discard in the diff's settle.
+  is left out of the report but stays marked in lore's tree, where an ordinary instance's scan drops
+  it (`state/os_diff.rs`, with `stage::drops_cleanly`); queue it for discard in the diff's settle.
 - **A narrowing over a local copy of revision content.** A view change checks what each view
   shows, but applies only the revision's own changes, so a local copy still holding what the
   revision holds, at a path the new view drops, passes the check and stays listed as local
@@ -1605,10 +1604,10 @@ Open follow-ups from milestone 3:
   the same way (`listing::holds_local`).
 - **Directories a re-inclusion may reach.** A view whose re-inclusion opens with a wildcard,
   such as `/*` with `!*/Saved/Config/`, leaves every excluded directory one the rule may reach
-  below, so the mount lists it, empty where it holds nothing in view, where an ordinary clone
+  below, so the mount lists it, empty where it holds nothing in view, where an ordinary instance
   creates no directory it finds nothing in (`child_filter`, `view.rs`). Left: hide such a
   directory until something below it is in view, which takes a walk below it per listing.
-- **Links.** Adding a link to a virtual clone is refused (`lore-revision/src/link/add.rs`): the
+- **Links.** Adding a link to a FUSE instance is refused (`lore-revision/src/link/add.rs`): the
   provider serves no link, and a link node in the State failed the node block's child assertion,
   which aborts the service.
 - **A link a swap adds.** A swap copies a node the target revision adds without its `Link`
@@ -1634,18 +1633,18 @@ Open follow-ups from milestone 3:
   file at the path a change replaces or removes, or below a directory the change removes: a
   file added locally where the target adds one, or a link, is refused whatever it holds, and so
   is a directory the target replaces with a file holding a local edit of the content it
-  replaces, where an ordinary clone compares each file (`hold::check`). A refused path is named without the sizes an ordinary clone gives. A sync
+  replaces, where an ordinary instance compares each file (`hold::check`). A refused path is named without the sizes an ordinary instance gives. A sync
   forwarding local changes reports every change the view shows, those it leaves local included,
-  where an ordinary clone reports only what it writes (`hold::report`). A sync carrying layers
-  or restricted to a dependency set is refused on a virtual clone
+  where an ordinary instance reports only what it writes (`hold::report`). A sync carrying layers
+  or restricted to a dependency set is refused on a FUSE instance
   (`lore-revision/src/revision/sync.rs`).
 - **What a reset leaves and reports.** A sync or branch switch resetting local changes leaves a
   symbolic link standing at a tracked file's path, and writes nothing through it, as a forced
-  sync does; an ordinary clone's reset writes the file through the link (lore-f16d). It still
+  sync does; an ordinary instance's reset writes the file through the link (lore-f16d). It still
   reports the file added (lore-iul6). A symbolic link standing at a tracked directory's path
-  goes, and the directory comes back, where an ordinary clone's reset writes its files through
+  goes, and the directory comes back, where an ordinary instance's reset writes its files through
   the link. It re-places and reports each path holding a local
-  change, one already holding the target's content included, where an ordinary clone reports
+  change, one already holding the target's content included, where an ordinary instance reports
   what it writes (`hold::add_reset_paths`).
 - **A hold decodes the changed blocks twice.** A sync or branch switch diffs a clean State of the
   served revision against the target (`hold::changes`): the served State carries the local
@@ -1657,8 +1656,8 @@ Open follow-ups from milestone 3:
   block budget; charge them if they come to matter.
 - **READDIRPLUS across a swap** (lore-czh). A stream read across any swap lists plain, even where the swap
   left its directory alone (the swap count in `stream_current` and `push_dirents_plus`).
-- **A merge failing part-way** (lore-pq2). An error part-way through a merge's apply on a virtual
-  clone can leave changes applied with nothing staged. A symlink at a written path no longer
+- **A merge failing part-way** (lore-pq2). An error part-way through a merge's apply on a FUSE
+  instance can leave changes applied with nothing staged. A symlink at a written path no longer
   triggers it (lore-ubp refuses up front); the general case is open.
 - **Instance writes carry no address** (lore-ew0). Plan decision 9 has `write_node` and
   `set_file_to_immutable_store_contents` give the node the content's address, `LocalContent` and
@@ -1674,12 +1673,12 @@ Open follow-ups from milestone 3:
   answer `ENOENT`; the State is unchanged. Other host operations by path below such a
   directory behave the same way. A third rename of one directory landing between another's
   respell and its gather can leave an entry under the old host path (`gather_host_dir`).
-- **A file arriving with the recorded time and size** (lore-2yv; all clones). Status and stage
+- **A file arriving with the recorded time and size** (lore-2yv; all instances). Status and stage
   trust a recorded modification time when the size matches, in milliseconds. A different file
   renamed over the path with the same size and millisecond, or one written by `cp -p`, `tar x`
-  or `rsync -t`, is never read. On a virtual clone the provider handles the rename case in RENAME;
-  ordinary clones still miss it.
-- **A stage that only discards in nested repositories** (lore-q53; all clones). `stage()` saves
+  or `rsync -t`, is never read. On a FUSE instance the provider handles the rename case in RENAME;
+  ordinary instances still miss it.
+- **A stage that only discards in nested repositories** (lore-q53; all instances). `stage()` saves
   the staged State only where the main repository changed, so a stage whose only effect is
   discarding entries queued for nested repositories loses those discards.
 - **Residue that equals the revision** (lore-5xd). A local file whose content equals the current
@@ -1762,14 +1761,14 @@ Writes and commits:
 - **Transient omission after a no-inode flip** (lore-6uh). Between a batch flip and the put-back of a file
   something reached meanwhile, the node stands clean, and a status running then misses the file
   until the next status.
-- **Symlinks are not versioned** (lore-ubp). As on an ordinary clone, whose walk skips them
+- **Symlinks are not versioned** (lore-ubp). As on an ordinary instance, whose walk skips them
   (`file_list_item`, `fs/os/mod.rs`), status, stage and commit take a symlink as nothing there: one
   made through the mount, alone or in a directory made with it, stays local under `write/` and
   never shows as a change, and a tracked file a symlink replaced reads as deleted
   (`versioned_on_a_working_tree`, `state/diff.rs`). `lore stage` naming one skips it, reporting
   the path ignored (`PathIgnore`) as status does for a path holding nothing, and stages the other
   paths named with it; a path below one fails as a path below nothing does
-  (`stage_filesystem_path`). An ordinary clone's stage follows the link and stages the target's
+  (`stage_filesystem_path`). An ordinary instance's stage follows the link and stages the target's
   bytes. A tracked file a symlink replaced, named in `lore stage`, stages its deletion. A file
   staged and then replaced by a symlink fails the commit with `FileNotFound`, as one deleted after
   staging does.
@@ -1787,7 +1786,7 @@ Writes and commits:
   replaces a symlink with the file (lore-as0).
 - **Forced sync over local directories** (lore-5i2). Below a directory the target removes, `--force`
   removes the files the served revision holds and keeps files added locally, with their host
-  files and the directories above them, as an ordinary clone does. A directory the target turns
+  files and the directories above them, as an ordinary instance does. A directory the target turns
   into a file keeps the files added below it, and the target's file is not placed there.
 - **Deletions lost to a crash** (lore-qgr). The deletion list is appended without `fsync` (plan decision 2),
   so a crash may lose the last deletions, and those paths reappear at the next mount.
@@ -1841,10 +1840,10 @@ Reads, listings and prefetch:
   the payloads of the 512 blocks in flight.
 - **File-metadata blocks** (lore-duo). `blocks` fetches all of them (66 of 1076 MiB in the prefetch table),
   by milestone 2 plan decision 2, though the provider reads none: new nodes take fresh blocks.
-- **Prefetch contention** (lore-bd9). While the recording's prefetch fills the link (30-54 MiB/s), the
-  build's own misses share it: UnrealBuildTool compiled in 14.3 s with READs fetching at
-  priority (18.2 s at normal priority), against 12.6-13.2 s on a real clone. Listing builds for
-  kernel requests and for the prefetch's paths share the priority streams.
+- **Prefetch contention** (lore-bd9). While the recording's prefetch fills the link (30-54 MiB/s),
+  the build's own misses share it: UnrealBuildTool compiled in 14.3 s with READs fetching at
+  priority (18.2 s at normal priority), against 12.6-13.2 s on an ordinary instance. Listing builds
+  for kernel requests and for the prefetch's paths share the priority streams.
 - **Repository links** (lore-6ib). A listing that holds a Lore link node (a linked repository)
   fails with `NotSupported` (`Listing::build_with`, `listing.rs`). READLINK answers local symlinks
   only.

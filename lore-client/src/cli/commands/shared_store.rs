@@ -36,7 +36,7 @@ pub enum SharedStoreCommands {
     /// Show information about the registry of shared stores
     List(SharedStoreListArgs),
 
-    /// Set whether new clones use a shared store without being asked to
+    /// Set whether new instances use a shared store without being asked to
     SetUseAutomatically(SharedStoreSetUseAutomaticallyArgs),
 }
 

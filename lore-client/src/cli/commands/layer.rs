@@ -123,10 +123,7 @@ pub fn handle_layer_add(globals: LoreGlobalArgs, args: &LayerAddArgs) -> u8 {
                     crate::util::format_bytes_to_string(data.count.bytes_transferred),
                     crate::util::format_bytes_to_string(data.count.bytes_total),
                 );
-                println!(
-                    "Layer clone complete in {:.2}s",
-                    start.elapsed().as_secs_f32()
-                );
+                println!("Layer cloned in {:.2}s", start.elapsed().as_secs_f32());
             }
             LoreEvent::Complete(data) => {
                 if data.status == 0 {
