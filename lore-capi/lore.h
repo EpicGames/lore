@@ -6897,6 +6897,25 @@ typedef struct lore_revision_graph_branch_metadata_set_args_t {
   struct lore_string_array_t remove;
 } lore_revision_graph_branch_metadata_set_args_t;
 
+// Arguments for `lore_revision_graph_branch_create`.
+typedef struct lore_revision_graph_branch_create_args_t {
+  // Caller-chosen id echoed back in every event this surface defines for the call. Separate
+  // from `globals.correlation_id`.
+  uint64_t id;
+  // Open storage handle the call reaches the repository through
+  struct lore_store_t store;
+  // Repository the branch is created in
+  struct lore_partition_t repository;
+  // Name of the new branch: not empty, at most 1000 bytes, and not a branch id. No live branch
+  // may hold it, compared regardless of case.
+  struct lore_string_t name;
+  // Category of the new branch, at most 1000 bytes. Empty means the default category.
+  struct lore_string_t category;
+  // The revision the new branch starts at. A hash makes the revision's own branch the parent,
+  // and a branch makes that branch the parent, at its latest or at the revision number given.
+  struct lore_revision_identifier_t from;
+} lore_revision_graph_branch_create_args_t;
+
 // Return the tag identifying the type of an event.
 uint32_t lore_event_type(const struct lore_event_t *event);
 
@@ -14254,6 +14273,91 @@ int32_t lore_revision_graph_branch_metadata_set(const struct lore_global_args_t 
 void lore_revision_graph_branch_metadata_set_async(const struct lore_global_args_t *globals,
                                                    const struct lore_revision_graph_branch_metadata_set_args_t *args,
                                                    struct lore_event_callback_config_t callback);
+
+// Create a branch named `args->name` in `args->category`, starting at the revision `args->from`
+// names, at each location the call consults.
+//
+// With no location flag, the call creates the branch at the remote, if `args->store` has one, and
+// in the local store; `local` or `offline` creates it in the local store alone, and `remote` at
+// the remote alone. The call checks the name, the category and the creator before it reads either
+// location. Before it creates anything, it reads at each location it creates on where the branch
+// starts, and whether a live branch holds the name there, compared regardless of case. A hash in
+// `args->from` makes the revision's own branch the parent, as any location consulted records it,
+// and a branch makes that branch the parent, at its latest or at the revision number given. The
+// branch point must be the same revision at every location the call creates on. The new branch's
+// stack is that branch point, then the parent's stack, from the local store's metadata of the
+// parent or, where the local store lacks it, from the remote's.
+//
+// The call creates the branch with a new id at the remote first, then in the local store under the
+// same id, name, category, creator and stack. Each location records its own `created` time. The
+// creator is the call's user id, else `globals.identity`, else the identity `args->store` was
+// opened with, else the identity the remote connection authenticated as; the local store records
+// the creator the remote returns. A branch created at both locations starts with its local latest
+// in sync with the remote, and one created in the local store alone starts divergent. A name an
+// archived branch held gets a new branch with a new id; the archived branch keeps its own. The
+// call ignores `globals.force` and `globals.dry_run`, and `lore_storage_close` waits for it.
+//
+// Each location the call creates the branch on sends a `LORE_EVENT_REVISION_GRAPH_BRANCH` with
+// the branch's record, then its `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE`. A refusal found
+// before the call creates anything, such as a name a live branch holds, fails the call with no
+// location complete event. A failed read at a location, a refused connection included, ends that
+// location with its complete event, which carries the error, and fails the call. A failure at the
+// remote fails the call before it reaches the local store, so no complete event for the local
+// store follows. To commit on the new branch, load a tree at its latest with
+// `lore_revision_tree_load`, set the `branch` metadata key to the record's `branch` as a
+// `LORE_METADATA_TYPE_CONTEXT` value, and commit.
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_REVISION_GRAPH_BRANCH` | `lore_revision_graph_branch_event_data_t` | The new branch, as one location records it |
+// | `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE` | `lore_revision_graph_location_complete_event_data_t` | One location's outcome, after its record |
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | A log line |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` on success or the error code, with its detail in `error` |
+//
+// Fails with:
+// - error code 3 (invalid arguments) for a name that is empty, longer than 1000 bytes, not UTF-8
+//   or reads as a branch id; a category or a creator longer than 1000 bytes; a malformed
+//   `args->from`; a parent in the personal category; a parent without a latest revision that
+//   isn't the repository's default branch, or, with the local store alone, whose store holds no
+//   repository metadata to tell; an unknown or closed `args->store`; and location flags that
+//   contradict each other or those `args->store` was opened with;
+// - error code 111 (no remote) where `remote` is set in `globals` and `args->store` has no remote;
+// - error code 87 (branch not found) where no location consulted holds the parent, records the
+//   own branch of the revision `args->from` names, or holds the parent's metadata;
+// - error code 88 (revision not found) where a location the call creates on lacks the revision
+//   `args->from` names, its revision number, or the parent another location holds;
+// - error code 42 (divergent) where `args->from` resolves to different revisions at the locations
+//   the call creates on;
+// - error code 57 (branch already exists) where a live branch holds the name at a location the
+//   call creates on, as for the loser of two concurrent creates;
+// - error code 80 (address not found) where the remote lacks a blob it names, such as the
+//   repository's metadata;
+// - error code 118 (oversized) where a location holds a metadata blob larger than 1 MiB;
+// - error code 16 (not authenticated) where the call has no login or tokens the remote accepts.
+//   The call starts no login: the caller logs in, with `lore_auth_login_interactive` or
+//   `lore_auth_login_with_token`, and calls again, and a storage handle's open connection picks
+//   up the new login within a minute. A caller that passes its own tokens in `globals` opens a
+//   new storage handle with fresh ones, since an open connection keeps the tokens it connected
+//   with;
+// - error codes 17 (not authorized), 28 (disconnected), 29 (not connected), 30 (maintenance) and
+//   31 (slow down) where the remote refuses the call or can't be reached;
+// - error code -1 (internal) for any other failure, such as a corrupt block, or a refusal of the
+//   create at the remote that the call can't attribute, whose message the detail carries.
+//
+// An event's strings, arrays and error detail are valid only during the callback invocation that
+// delivers it. This call and `lore_revision_graph_branch_create_async` copy `args` before they
+// return, so an `_async` caller can free `args` and its strings once the call returns. A caller
+// that passes the same `globals.correlation_id` on every call over one storage handle reuses one
+// storage session per connection, as with the `lore_storage_*` calls. `args->id`, which every
+// `LORE_EVENT_REVISION_GRAPH_*` event echoes, is separate from it.
+int32_t lore_revision_graph_branch_create(const struct lore_global_args_t *globals,
+                                          const struct lore_revision_graph_branch_create_args_t *args,
+                                          struct lore_event_callback_config_t callback);
+
+// Create a branch at each location the call consults (async variant).
+void lore_revision_graph_branch_create_async(const struct lore_global_args_t *globals,
+                                             const struct lore_revision_graph_branch_create_args_t *args,
+                                             struct lore_event_callback_config_t callback);
 
 // Select how payloads are compressed before they are stored, over
 // `lore_storage::COMPRESSION_MODE`.

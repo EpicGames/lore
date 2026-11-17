@@ -7,6 +7,7 @@
 //! [`RevisionGraphError`] is the surface's error set, and [`LoreRevisionIdentifier`] is how a
 //! caller names a revision.
 
+pub mod branch_create;
 pub mod branch_list;
 pub mod branch_metadata_get;
 pub mod branch_metadata_set;

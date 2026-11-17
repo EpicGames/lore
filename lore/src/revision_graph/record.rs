@@ -163,9 +163,8 @@ pub(crate) fn branch_record_from_metadata(
     }
 }
 
-/// The record of the branch the remote's `record` describes: its fields as the remote sent them,
-/// `protect` from the metadata blob it names, read through `ctx`, `archived` from `deleted`, and
-/// `divergent` false.
+/// The record of the branch the remote's `record` describes: [`remote_record_out`], with `protect`
+/// from the metadata blob `record` names, read through `ctx`.
 ///
 /// Returns the blob read's future with `protect` mapped onto the record, which is built before
 /// the read, so that the future holds the record in its event's form rather than `record`.
@@ -178,7 +177,19 @@ pub fn remote_branch_record(
     ctx: Arc<RepositoryContext>,
     record: BranchRecord,
 ) -> impl Future<Output = Result<BranchRecordOut, RevisionGraphError>> {
-    let mut out = BranchRecordOut {
+    let metadata = record.metadata;
+    let mut out = remote_record_out(record);
+    Metadata::deserialize(ctx, metadata).map(move |read| {
+        let metadata = read.forward_any::<RevisionGraphError>("reading the branch metadata")?;
+        out.protect = branch::protected(&metadata);
+        Ok(out)
+    })
+}
+
+/// The record of the branch the remote's `record` describes, as the remote sent its fields, with
+/// `archived` from `deleted`, and `protect` and `divergent` false.
+pub(crate) fn remote_record_out(record: BranchRecord) -> BranchRecordOut {
+    BranchRecordOut {
         branch: record.id,
         name: LoreString::from(record.name.as_str()),
         category: LoreString::from(record.category.as_str()),
@@ -189,19 +200,14 @@ pub fn remote_branch_record(
         protect: false,
         archived: record.deleted,
         divergent: false,
-    };
-    Metadata::deserialize(ctx, record.metadata).map(move |read| {
-        let metadata = read.forward_any::<RevisionGraphError>("reading the branch metadata")?;
-        out.protect = branch::protected(&metadata);
-        Ok(out)
-    })
+    }
 }
 
 /// `stack` as the branch record event carries it. Collected from the vector itself, the conversion
 /// keeps the vector's allocation: the standard library collects in place into an element type of
 /// the same size and alignment. The assertion checks both, since `BranchPoint` has no `repr(C)` to
 /// fix them.
-fn event_stack(stack: Vec<BranchPoint>) -> LoreArray<LoreBranchPoint> {
+pub(crate) fn event_stack(stack: Vec<BranchPoint>) -> LoreArray<LoreBranchPoint> {
     const {
         assert!(
             size_of::<BranchPoint>() == size_of::<LoreBranchPoint>()

@@ -8,121 +8,22 @@
 
 use std::sync::Mutex;
 
-use lore::storage::handle::LoreStore;
 use lore_base::error::BranchNotFound;
 use lore_base::test_util::TempDir;
 use lore_base::types::BranchId;
 use lore_base::types::Context;
-use lore_base::types::KeyType;
 use lore_revision::branch;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreBranchLocation;
 use lore_revision::interface::LoreMetadata;
-use lore_storage::test_util::ImmutableCall;
-use lore_storage::test_util::StoreCall;
 
-use super::counting::CountingImmutable;
-use super::counting::CountingMutable;
+use super::counting::ByKeyType;
+use super::counting::LocalCalls;
+use super::counting::counted;
 use super::counting::open_counted_handle;
 use super::support::*;
 use crate::common::net_common::close_handle;
 use crate::common::net_common::put_content;
-
-/// Mutable store calls of one kind, by the key type they name.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct ByKeyType {
-    /// On name mappings.
-    branch_id: usize,
-    /// On branch metadata keys.
-    branch_metadata: usize,
-    /// On the latest keys of branches.
-    branch_latest_pointer: usize,
-    /// On untyped keys: a branch's latest status and an instance's anchors.
-    untyped: usize,
-    /// On instance registrations.
-    instance: usize,
-}
-
-impl ByKeyType {
-    /// The calls of kind `call` that `mutable` counted.
-    fn of(mutable: &CountingMutable, call: StoreCall) -> Self {
-        let count = |key_type| mutable.count_for(call, key_type);
-        Self {
-            branch_id: count(KeyType::BranchId),
-            branch_metadata: count(KeyType::BranchMetadata),
-            branch_latest_pointer: count(KeyType::BranchLatestPointer),
-            untyped: count(KeyType::Untyped),
-            instance: count(KeyType::Instance),
-        }
-    }
-
-    /// The calls of every key type.
-    fn total(&self) -> usize {
-        self.branch_id
-            + self.branch_metadata
-            + self.branch_latest_pointer
-            + self.untyped
-            + self.instance
-    }
-}
-
-/// The calls one verb call made on the local stores.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct LocalCalls {
-    /// Its loads.
-    loads: ByKeyType,
-    /// Its lists.
-    lists: ByKeyType,
-    /// Its compare-and-swaps.
-    swaps: ByKeyType,
-    /// Its payload reads.
-    gets: usize,
-    /// The addresses its content queries named, one query of several addresses counting each.
-    queries: usize,
-    /// Its content puts.
-    puts: usize,
-    /// Its other calls on either store: stores, loads, lists and compare-and-swaps of other key
-    /// types, and content calls other than payload reads, queries and puts.
-    others: usize,
-}
-
-impl LocalCalls {
-    /// The calls `mutable` and `immutable` counted.
-    fn of(mutable: &CountingMutable, immutable: &CountingImmutable) -> Self {
-        let loads = ByKeyType::of(mutable, StoreCall::Load);
-        let lists = ByKeyType::of(mutable, StoreCall::List);
-        let swaps = ByKeyType::of(mutable, StoreCall::CompareAndSwap);
-        let [gets, queries, puts] = [ImmutableCall::Get, ImmutableCall::Query, ImmutableCall::Put]
-            .map(|call| immutable.count(call));
-        let others = mutable.total() - loads.total() - lists.total() - swaps.total()
-            + immutable.total()
-            - gets
-            - queries
-            - puts;
-        Self {
-            loads,
-            lists,
-            swaps,
-            gets,
-            queries,
-            puts,
-            others,
-        }
-    }
-}
-
-/// The status and events of the call `call` makes on a counted handle over the local stores of
-/// `f`'s handle, with the fixture's remote, and the calls it made on those stores.
-async fn counted<F: Future<Output = (i32, Vec<LoreEvent>)>>(
-    f: &Fixture,
-    call: impl FnOnce(LoreStore) -> F,
-) -> (i32, Vec<LoreEvent>, LocalCalls) {
-    let (store, mutable, immutable) = open_counted_handle(f, None, None);
-    let (status, events) = call(store).await;
-    let calls = LocalCalls::of(&mutable, &immutable);
-    close_handle(store).await;
-    (status, events, calls)
-}
 
 /// Creates a branch named `name` in the local store of `f`'s handle from the default branch, as
 /// [`create_local_branch`] does, under the id derived from the name, then releases the name, so

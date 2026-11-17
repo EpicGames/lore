@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 //! Shared fixtures for the revision graph verbs' tests: an in-memory storage handle opened as a
-//! caller opens one, an execution context for the setup a test writes through the stores, branches
-//! and metadata blobs written through a context, a branch created and archived in a handle's local
-//! store, a handle's state over other stores, a handle whose mutable store fails chosen calls, an
-//! immutable store that counts its reads, a remote revision service whose answers a test chooses,
-//! a metadata blob held by a remote storage peer alone, a registered instance that reads as live,
-//! and the record and location complete events a call sends.
+//! caller opens one, an execution context for the setup a test writes through the stores,
+//! branches, metadata blobs, lines of revisions and latest revisions written through a context, a
+//! branch created and archived in a handle's local store, a handle's state over other stores, a
+//! handle whose mutable store fails chosen calls, an immutable store that counts its reads, a
+//! remote revision service whose answers a test chooses, a metadata blob held by a remote storage
+//! peer alone, a registered instance that reads as live, and the record and location complete
+//! events a call sends.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -55,6 +56,7 @@ use lore_revision::metadata::Metadata;
 use lore_revision::protocol::RemoteConnections;
 use lore_revision::protocol::RemoteEndpoint;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::test_util::write_state_revision;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_storage::StoreError;
@@ -229,6 +231,53 @@ pub(crate) async fn archive(
             .unwrap_or_else(|err| panic!("archiving {name}: {err}"));
     })
     .await;
+}
+
+/// Writes through `write` a revision metadata blob that names `branch`, and returns its hash.
+pub(crate) async fn metadata_naming(write: &Arc<RepositoryContext>, branch: BranchId) -> Hash {
+    let mut metadata = Metadata::new();
+    metadata.set_branch(branch).expect("sets the branch");
+    metadata
+        .serialize(write.clone())
+        .await
+        .expect("writes the metadata")
+}
+
+/// Writes through `write` a line of `count` revisions numbered from 1, each with metadata naming
+/// `branch`, and returns them oldest first.
+pub(crate) async fn write_line(
+    write: &Arc<RepositoryContext>,
+    branch: BranchId,
+    count: u64,
+) -> Vec<Hash> {
+    let metadata = metadata_naming(write, branch).await;
+    let mut line = Vec::new();
+    let mut parent = Hash::default();
+    for number in 1..=count {
+        parent = write_state_revision(write, parent, number, metadata).await;
+        line.push(parent);
+    }
+    line
+}
+
+/// Stores `latest` as the latest revision of `branch` in the local store of `store`, with no
+/// metadata or name.
+pub(crate) async fn store_latest(
+    store: &StoreInternal,
+    repository: Partition,
+    branch: BranchId,
+    latest: Hash,
+) {
+    let write = local_write_context(store, repository);
+    in_setup_context(branch::mutable_try_store(
+        write,
+        branch::LATEST,
+        branch,
+        Hash::default(),
+        latest,
+    ))
+    .await
+    .expect("stores the latest revision");
 }
 
 /// Metadata holding `id`, where given, and the string `entries`.
@@ -664,6 +713,34 @@ pub(crate) async fn store_with_remote(
     service: Arc<NamingRevision>,
 ) -> StoreInternal {
     store_with_remote_storage(repository, service, Vec::new()).await
+}
+
+/// A new in-memory store whose remote reaches `service` as its revision service for `repository`,
+/// over a connection with no storage that authenticated as `identity`, and that holds no identity of
+/// its own.
+pub(crate) async fn store_with_remote_as(
+    repository: Partition,
+    service: Arc<dyn Revision>,
+    identity: &str,
+) -> StoreInternal {
+    let connection = Connection::detached_revision_as(
+        identity.to_owned(),
+        Vec::new(),
+        Ok(()),
+        repository,
+        service,
+    );
+    let endpoint = RemoteEndpoint::over(RemoteConnections::with_connection(repository, connection));
+    let store = in_memory_store(Some(Arc::new(endpoint)), BoundFlags::default()).await;
+    StoreInternal::new(
+        String::new(),
+        store.immutable.clone(),
+        store.mutable.clone(),
+        store.remote.clone(),
+        store.bound_flags,
+        store.trust_remote,
+        StoreHold::default(),
+    )
 }
 
 /// A new in-memory store whose remote reaches `service` as its revision service for `repository`,

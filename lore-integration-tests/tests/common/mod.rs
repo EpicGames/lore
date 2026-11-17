@@ -30,6 +30,7 @@ pub(crate) mod net_common {
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
     use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
     use lore_server::authnz::repository_catalog::BaselineRepositoryCatalog;
     use lore_server::grpc::server::FeatureSettings;
     use lore_server::grpc::server::GrpcServerBuilder;
@@ -106,10 +107,23 @@ pub(crate) mod net_common {
         backend_immutable: Arc<dyn lore_storage::ImmutableStore>,
         backend_mutable: Arc<dyn lore_storage::MutableStore>,
     ) -> (String, TestServerStop) {
+        start_grpc_server_with(
+            backend_immutable,
+            backend_mutable,
+            Arc::new(AllowAllRepositoryAuthorizer),
+        )
+    }
+
+    /// [`start_grpc_server`] with `authorizer` deciding each request's access.
+    pub(crate) fn start_grpc_server_with(
+        backend_immutable: Arc<dyn lore_storage::ImmutableStore>,
+        backend_mutable: Arc<dyn lore_storage::MutableStore>,
+        authorizer: Arc<dyn RepositoryAuthorizer>,
+    ) -> (String, TestServerStop) {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("binds a port to serve on");
         let addr = listener.local_addr().expect("the listener has an address");
-        let stop = spawn_grpc_server(listener, backend_immutable, backend_mutable);
+        let stop = spawn_grpc_server_with(listener, backend_immutable, backend_mutable, authorizer);
         (format!("grpc://{addr}"), stop)
     }
 
@@ -118,6 +132,21 @@ pub(crate) mod net_common {
         listener: std::net::TcpListener,
         backend_immutable: Arc<dyn lore_storage::ImmutableStore>,
         backend_mutable: Arc<dyn lore_storage::MutableStore>,
+    ) -> TestServerStop {
+        spawn_grpc_server_with(
+            listener,
+            backend_immutable,
+            backend_mutable,
+            Arc::new(AllowAllRepositoryAuthorizer),
+        )
+    }
+
+    /// [`spawn_grpc_server`] with `authorizer` deciding each request's access.
+    pub(crate) fn spawn_grpc_server_with(
+        listener: std::net::TcpListener,
+        backend_immutable: Arc<dyn lore_storage::ImmutableStore>,
+        backend_mutable: Arc<dyn lore_storage::MutableStore>,
+        authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> TestServerStop {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
@@ -159,7 +188,7 @@ pub(crate) mod net_common {
                 )
                 .with_token_verification(
                     lore_server::auth::jwt::TokenVerification::Ignore,
-                    Arc::new(AllowAllRepositoryAuthorizer),
+                    authorizer,
                     repository_catalog,
                 )
                 .unwrap()

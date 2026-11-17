@@ -79,7 +79,7 @@ libc = { workspace = true }
 lore-fuse = { path = "../lore-fuse", features = ["test-util"] }
 
 [features]
-integration_tests = ["lore-server/integration_tests"]
+integration_tests = ["lore-server/integration_tests", "dep:tonic"]
 grpc_integration_tests = ["dep:tokio-stream", "dep:tonic"]
 
 [lints]

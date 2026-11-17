@@ -15,11 +15,15 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use async_trait::async_trait;
 use lore::revision_graph::LoreRevisionIdentifier;
 use lore::revision_graph::RevisionGraphError;
+use lore::revision_graph::branch_create::LoreRevisionGraphBranchCreateArgs;
+use lore::revision_graph::branch_create::branch_create;
 use lore::revision_graph::branch_list::LoreRevisionGraphBranchListArgs;
 use lore::revision_graph::branch_list::branch_list;
 use lore::revision_graph::branch_metadata_get::LoreRevisionGraphBranchMetadataGetArgs;
@@ -66,6 +70,7 @@ use lore_base::types::BranchPoint;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
+use lore_base::types::RepositoryId;
 use lore_revision::branch;
 use lore_revision::branch::BranchLatestStatus;
 use lore_revision::event::LoreEvent;
@@ -94,6 +99,10 @@ use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
 use lore_revision::repository::SALT_LORE;
 use lore_revision::test_util::register_live_instance;
+use lore_server::authnz::repository_authorizer::Action;
+use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
+use lore_server::authnz::repository_authorizer::VerifiedToken;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_storage::StoreMatch;
@@ -104,6 +113,7 @@ use lore_storage::test_util::HookedStore;
 use lore_storage::test_util::StoreCall;
 use lore_storage::test_util::answered;
 use lore_transport::Connection;
+use tonic::Status;
 
 use crate::common::net_common::CountingStore;
 use crate::common::net_common::Partitions;
@@ -112,7 +122,7 @@ use crate::common::net_common::close_handle;
 use crate::common::net_common::make_backends;
 use crate::common::net_common::open_handle;
 use crate::common::net_common::put_content;
-use crate::common::net_common::start_grpc_server;
+use crate::common::net_common::start_grpc_server_with;
 
 /// The name of the fixture repository's default branch.
 pub(crate) const DEFAULT_BRANCH_NAME: &str = "main";
@@ -178,18 +188,44 @@ impl Drop for Fixture {
     }
 }
 
+/// A repository authorizer that refuses every action but [`Action::Read`] with `PermissionDenied`
+/// while its flag is set, so a test can seed the repository before it arms it.
+pub(crate) struct ReadOnly(pub Arc<AtomicBool>);
+
+#[async_trait]
+impl RepositoryAuthorizer for ReadOnly {
+    async fn check_repository_access(
+        &self,
+        _token: Option<&VerifiedToken<'_>>,
+        _repository_id: RepositoryId,
+        action: Action,
+    ) -> Result<(), Status> {
+        if action != Action::Read && self.0.load(Ordering::SeqCst) {
+            return Err(Status::permission_denied(
+                "the test's repository is read-only",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A fresh [`Fixture`].
 pub(crate) async fn fixture() -> Fixture {
-    set_up(true).await
+    set_up(true, Arc::new(AllowAllRepositoryAuthorizer)).await
+}
+
+/// A [`Fixture`] whose server decides each request's access with `authorizer`.
+pub(crate) async fn fixture_with_authorizer(authorizer: Arc<dyn RepositoryAuthorizer>) -> Fixture {
+    set_up(true, authorizer).await
 }
 
 /// A [`Fixture`] whose storage handle has no remote. The server and its repository are set up as
 /// [`fixture`] sets them up, and nothing the handle does reaches the server.
 pub(crate) async fn fixture_without_remote() -> Fixture {
-    set_up(false).await
+    set_up(false, Arc::new(AllowAllRepositoryAuthorizer)).await
 }
 
-async fn set_up(with_remote: bool) -> Fixture {
+async fn set_up(with_remote: bool, authorizer: Arc<dyn RepositoryAuthorizer>) -> Fixture {
     let (uncounted_immutable, backend_mutable) = make_backends(Partitions::Isolated).await;
     let counting = CountingStore::new(uncounted_immutable.clone());
     let server_gets = counting.gets();
@@ -201,7 +237,8 @@ async fn set_up(with_remote: bool) -> Fixture {
         overtaking_load(server_overtake.clone()),
     );
 
-    let (url, stop) = start_grpc_server(server_immutable.clone(), server_mutable.clone());
+    let (url, stop) =
+        start_grpc_server_with(server_immutable.clone(), server_mutable.clone(), authorizer);
     let store = open_handle(with_remote.then_some(url.as_str())).await;
 
     let default_branch = BranchId::from(uuid::Uuid::now_v7());
@@ -558,6 +595,27 @@ pub(crate) async fn list_branches(
         )
     })
     .await
+}
+
+/// The status and events of a `branch_create` call in `f`'s repository, on `store` under `globals`,
+/// of a branch named `name` in the default category from the revision `from` names, as
+/// [`status_and_events_of`] reports them.
+pub(crate) async fn create_branch(
+    f: &Fixture,
+    store: LoreStore,
+    globals: LoreGlobalArgs,
+    name: &str,
+    from: LoreRevisionIdentifier,
+) -> (i32, Vec<LoreEvent>) {
+    let args = LoreRevisionGraphBranchCreateArgs {
+        id: 1,
+        store,
+        repository: f.repository,
+        name: LoreString::from(name),
+        category: LoreString::default(),
+        from,
+    };
+    status_and_events_of(|callback| branch_create(globals, args, callback)).await
 }
 
 /// The status and events of a `branch_metadata_get` call of the metadata of `branch` in `f`'s

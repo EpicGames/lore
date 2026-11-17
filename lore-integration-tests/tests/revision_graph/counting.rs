@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 //! A storage handle over the fixture handle's local stores that counts the calls a call makes on
 //! them, so a test can tell what a verb reads and writes in the local store, and can fail the
-//! local store's payload reads.
+//! local store's payload reads, and the calls of one verb call grouped by kind and key type.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -17,6 +17,7 @@ use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_base::types::KeyType;
+use lore_revision::event::LoreEvent;
 use lore_revision::protocol::RemoteEndpoint;
 use lore_storage::StoreError;
 use lore_storage::fragment_flags::FragmentFlags;
@@ -154,6 +155,102 @@ pub(crate) fn open_counted_handle(
         remote.or_else(|| state.remote.clone()),
     );
     (handle, mutable, immutable)
+}
+
+/// Mutable store calls of one kind, by the key type they name.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ByKeyType {
+    /// On name mappings.
+    pub(crate) branch_id: usize,
+    /// On branch metadata keys.
+    pub(crate) branch_metadata: usize,
+    /// On the latest keys of branches.
+    pub(crate) branch_latest_pointer: usize,
+    /// On untyped keys: a branch's latest status and an instance's anchors.
+    pub(crate) untyped: usize,
+    /// On instance registrations.
+    pub(crate) instance: usize,
+}
+
+impl ByKeyType {
+    /// The calls of kind `call` that `mutable` counted.
+    pub(crate) fn of(mutable: &CountingMutable, call: StoreCall) -> Self {
+        let count = |key_type| mutable.count_for(call, key_type);
+        Self {
+            branch_id: count(KeyType::BranchId),
+            branch_metadata: count(KeyType::BranchMetadata),
+            branch_latest_pointer: count(KeyType::BranchLatestPointer),
+            untyped: count(KeyType::Untyped),
+            instance: count(KeyType::Instance),
+        }
+    }
+
+    /// The calls of every key type.
+    pub(crate) fn total(&self) -> usize {
+        self.branch_id
+            + self.branch_metadata
+            + self.branch_latest_pointer
+            + self.untyped
+            + self.instance
+    }
+}
+
+/// The calls one verb call made on the local stores.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct LocalCalls {
+    /// Its loads.
+    pub(crate) loads: ByKeyType,
+    /// Its lists.
+    pub(crate) lists: ByKeyType,
+    /// Its compare-and-swaps.
+    pub(crate) swaps: ByKeyType,
+    /// Its payload reads.
+    pub(crate) gets: usize,
+    /// The addresses its content queries named, one query of several addresses counting each.
+    pub(crate) queries: usize,
+    /// Its content puts.
+    pub(crate) puts: usize,
+    /// Its other calls on either store: stores, loads, lists and compare-and-swaps of other key
+    /// types, and content calls other than payload reads, queries and puts.
+    pub(crate) others: usize,
+}
+
+impl LocalCalls {
+    /// The calls `mutable` and `immutable` counted.
+    pub(crate) fn of(mutable: &CountingMutable, immutable: &CountingImmutable) -> Self {
+        let loads = ByKeyType::of(mutable, StoreCall::Load);
+        let lists = ByKeyType::of(mutable, StoreCall::List);
+        let swaps = ByKeyType::of(mutable, StoreCall::CompareAndSwap);
+        let [gets, queries, puts] = [ImmutableCall::Get, ImmutableCall::Query, ImmutableCall::Put]
+            .map(|call| immutable.count(call));
+        let others = mutable.total() - loads.total() - lists.total() - swaps.total()
+            + immutable.total()
+            - gets
+            - queries
+            - puts;
+        Self {
+            loads,
+            lists,
+            swaps,
+            gets,
+            queries,
+            puts,
+            others,
+        }
+    }
+}
+
+/// The status and events of the call `call` makes on a counted handle over the local stores of
+/// `f`'s handle, with the fixture's remote, and the calls it made on those stores.
+pub(crate) async fn counted<F: Future<Output = (i32, Vec<LoreEvent>)>>(
+    f: &Fixture,
+    call: impl FnOnce(LoreStore) -> F,
+) -> (i32, Vec<LoreEvent>, LocalCalls) {
+    let (store, mutable, immutable) = open_counted_handle(f, None, None);
+    let (status, events) = call(store).await;
+    let calls = LocalCalls::of(&mutable, &immutable);
+    close_handle(store).await;
+    (status, events, calls)
 }
 
 /// A counted handle counts each call on its stores by its kind and key type, and keeps the key and

@@ -53,7 +53,6 @@ use lore_revision::interface::LoreMetadata;
 use lore_revision::interface::LoreNodeType;
 use lore_revision::interface::LoreString;
 use lore_revision::metadata::BRANCH;
-use lore_revision::metadata::Metadata;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::StateData;
@@ -74,6 +73,7 @@ use crate::revision_graph::support::handle_failing;
 use crate::revision_graph::support::hash;
 use crate::revision_graph::support::in_setup_context;
 use crate::revision_graph::support::location_outcomes;
+use crate::revision_graph::support::metadata_naming;
 use crate::revision_graph::support::new_branch;
 use crate::revision_graph::support::new_repository;
 use crate::revision_graph::support::open_in_memory_handle;
@@ -83,6 +83,7 @@ use crate::revision_graph::support::revision_records;
 use crate::revision_graph::support::store_corrupt_metadata;
 use crate::revision_graph::support::store_with_remote;
 use crate::revision_graph::support::store_with_remote_storage;
+use crate::revision_graph::support::write_line;
 use crate::revision_tree::support::load_tree;
 
 /// The `id` every call in this file passes.
@@ -170,29 +171,6 @@ fn local_outcome(events: &[LoreEvent]) -> (u64, i32) {
         panic!("expected one location complete event, the local store's");
     };
     (records, code)
-}
-
-/// Writes through `write` a revision metadata blob that names `branch`, and returns its hash.
-async fn metadata_naming(write: &Arc<RepositoryContext>, branch: BranchId) -> Hash {
-    let mut metadata = Metadata::new();
-    metadata.set_branch(branch).expect("sets the branch");
-    metadata
-        .serialize(write.clone())
-        .await
-        .expect("writes the metadata")
-}
-
-/// Writes through `write` a line of `count` revisions numbered from 1, each with metadata naming
-/// `branch`, and returns them oldest first.
-async fn write_line(write: &Arc<RepositoryContext>, branch: BranchId, count: u64) -> Vec<Hash> {
-    let metadata = metadata_naming(write, branch).await;
-    let mut line = Vec::new();
-    let mut parent = Hash::default();
-    for number in 1..=count {
-        parent = write_state_revision(write, parent, number, metadata).await;
-        line.push(parent);
-    }
-    line
 }
 
 /// Writes through `write` a blob one byte larger than a revision state, which a read of a state

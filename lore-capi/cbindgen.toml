@@ -121,6 +121,7 @@ include = [
     "LoreRevisionGraphBranchListArgs",
     "LoreRevisionGraphBranchMetadataGetArgs",
     "LoreRevisionGraphBranchMetadataSetArgs",
+    "LoreRevisionGraphBranchCreateArgs",
 ]
 
 [export.rename]
@@ -630,6 +631,7 @@ include = [
 "LoreRevisionGraphBranchMetadataEntry" = "lore_revision_graph_branch_metadata_entry_t"
 "LoreArray_lore_revision_graph_branch_metadata_entry" = "lore_revision_graph_branch_metadata_entry_array_t"
 "LoreRevisionGraphBranchMetadataSetArgs" = "lore_revision_graph_branch_metadata_set_args_t"
+"LoreRevisionGraphBranchCreateArgs" = "lore_revision_graph_branch_create_args_t"
 "LoreString" = "lore_string_t"
 "LoreArray_instance_id" = "lore_instance_id_array_t"
 "LoreStringArray" = "lore_string_array_t"

@@ -53,6 +53,7 @@ use crate::revision_graph::support::new_repository;
 use crate::revision_graph::support::open_in_memory_handle;
 use crate::revision_graph::support::register_live_instance;
 use crate::revision_graph::support::store_corrupt_metadata;
+use crate::revision_graph::support::store_latest;
 use crate::revision_graph::support::store_with_remote;
 use crate::storage::in_memory_store;
 
@@ -96,26 +97,6 @@ fn resolved(events: &[LoreEvent]) -> Vec<(LoreBranchLocation, BranchId)> {
             (record.location, record.branch)
         })
         .collect()
-}
-
-/// Stores `latest` as the latest revision of `branch` in the local store of `store`, with no
-/// metadata or name.
-async fn store_latest(
-    store: &StoreInternal,
-    repository: Partition,
-    branch: BranchId,
-    latest: Hash,
-) {
-    let write = local_write_context(store, repository);
-    in_setup_context(branch::mutable_try_store(
-        write,
-        branch::LATEST,
-        branch,
-        Hash::default(),
-        latest,
-    ))
-    .await
-    .expect("stores the latest revision");
 }
 
 /// A name that is empty, longer than the limit, or reads as a branch id fails the call with

@@ -337,7 +337,7 @@ pub(crate) fn latest_at<'a>(
 /// A failed or corrupt read, a failed request, a list item labelled the number without a state of
 /// its own with that number, and a walked parent that is not a revision state.
 #[allow(clippy::manual_async_fn)]
-fn numbered_at<'a>(
+pub(crate) fn numbered_at<'a>(
     ctx: &'a Arc<RepositoryContext>,
     service: Option<&'a Arc<dyn Revision>>,
     branch: BranchId,

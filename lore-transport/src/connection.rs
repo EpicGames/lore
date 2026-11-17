@@ -1250,7 +1250,17 @@ impl Connection {
         storage: Vec<Arc<dyn Storage>>,
         ready: Result<(), ProtocolError>,
     ) -> Arc<Self> {
-        let connection = Self::detached_over(Arc::new(LoreProtocol::default()));
+        Self::detached_ready_as(String::new(), storage, ready)
+    }
+
+    /// A [`detached_ready`](Self::detached_ready) connection authenticated as `identity`.
+    #[cfg(feature = "test-util")]
+    fn detached_ready_as(
+        identity: String,
+        storage: Vec<Arc<dyn Storage>>,
+        ready: Result<(), ProtocolError>,
+    ) -> Arc<Self> {
+        let connection = Self::detached_over(Arc::new(LoreProtocol::default()), identity);
         if !storage.is_empty() {
             *connection.storage.write() = Some(Arc::new(StorageConnector::new(storage)));
         }
@@ -1262,20 +1272,21 @@ impl Connection {
     /// admin and lock services through `protocol`.
     #[cfg(feature = "test-util")]
     pub fn detached_protocol(protocol: Arc<dyn Protocol>) -> Arc<Self> {
-        let connection = Self::detached_over(protocol);
+        let connection = Self::detached_over(protocol, String::new());
         connection.storage_ready.complete(Ok(()));
         connection.revision_ready.complete(Ok(()));
         connection.lock_ready.complete(Ok(()));
         connection
     }
 
-    /// A connection to no remote over `protocol`, with every service pending.
+    /// A connection to no remote over `protocol`, authenticated as `identity`, with every service
+    /// pending.
     #[cfg(feature = "test-util")]
-    fn detached_over(protocol: Arc<dyn Protocol>) -> Arc<Self> {
+    fn detached_over(protocol: Arc<dyn Protocol>, identity: String) -> Arc<Self> {
         Arc::new(Connection::unconnected(
             Url::parse("lore://detached.invalid").expect("valid URL"),
             AuthEndpoint::none(),
-            String::new(),
+            identity,
             Arc::default(),
             AuthMode::Auto,
             CongestionAlgorithm::default(),
@@ -1293,7 +1304,19 @@ impl Connection {
         repository: RepositoryId,
         revision: Arc<dyn Revision>,
     ) -> Arc<Self> {
-        let connection = Self::detached_ready(storage, ready);
+        Self::detached_revision_as(String::new(), storage, ready, repository, revision)
+    }
+
+    /// A [`detached_revision`](Self::detached_revision) connection authenticated as `identity`.
+    #[cfg(feature = "test-util")]
+    pub fn detached_revision_as(
+        identity: String,
+        storage: Vec<Arc<dyn Storage>>,
+        ready: Result<(), ProtocolError>,
+        repository: RepositoryId,
+        revision: Arc<dyn Revision>,
+    ) -> Arc<Self> {
+        let connection = Self::detached_ready_as(identity, storage, ready);
         connection.revision.insert(repository, revision);
         connection.revision_ready.complete(Ok(()));
         connection

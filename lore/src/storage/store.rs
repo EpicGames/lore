@@ -144,8 +144,7 @@ impl EffectiveFlags {
 /// Runtime state for one open storage handle.
 #[lore_macro::test_pub]
 pub(crate) struct StoreInternal {
-    // Auth identity for remote-path ops; unused by the local-only path.
-    #[allow(dead_code)]
+    /// The identity the handle was opened with, `globals.identity` at open.
     pub identity: String,
     pub immutable: Arc<dyn ImmutableStore>,
     pub mutable: Arc<dyn MutableStore>,
