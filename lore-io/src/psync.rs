@@ -394,6 +394,23 @@ impl PsyncDriver {
         })
     }
 
+    /// Runs [`crate::holes::punch_holes`] on the syscall pool, as [`Self::next_data`] runs its
+    /// lookup.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn punch_holes(
+        file: Arc<File>,
+        holes: Vec<std::ops::Range<u64>>,
+    ) -> SyscallTask<std::io::Result<()>> {
+        SyscallPool::global().submit(move || crate::holes::punch_holes(&file, &holes))
+    }
+
+    /// Runs [`crate::holes::holds_holes`] on the syscall pool, as [`Self::next_data`] runs its
+    /// lookup.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn holds_holes(file: Arc<File>) -> SyscallTask<bool> {
+        SyscallPool::global().submit(move || crate::holes::holds_holes(&file))
+    }
+
     pub(crate) async fn rename(&self, from: PathBuf, to: PathBuf) -> std::io::Result<()> {
         SyscallPool::global()
             .submit(move || std::fs::rename(from, to))

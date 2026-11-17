@@ -818,8 +818,9 @@ async fn a_resumed_read_leaves_holes_unwritten_and_writes_zeros() {
 
 /// A resumed read whose temporary file holds data in a hole of the content, written there after
 /// the failed read, empties the file and writes it as a fresh one: the target is the content, and
-/// each hole is a hole again.
-#[cfg(unix)]
+/// each hole is a hole again. On Apple platforms the write sink frees the hole instead, as
+/// [`a_resumed_read_on_apfs_loads_only_the_leaves_it_lacks_and_keeps_every_hole`] tests.
+#[cfg(all(unix, not(target_vendor = "apple")))]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hole_of_the_temporary_file_holding_data_empties_it() {
     const HOLE: usize = 1;
@@ -852,6 +853,70 @@ async fn a_hole_of_the_temporary_file_holding_data_empties_it() {
 
     assert_eq!(std::fs::read(&target).expect("read the target"), content);
     assert_eq!(crate::holes::data_ranges(&target).await, holed_data());
+}
+
+/// On APFS, which fills a hole of under 16 MiB beside data it writes out, a resumed read of content
+/// with such holes resumes whatever the whole blocks of its holes hold in the temporary file, zeros
+/// the file system filled in or other bytes written there after the failed read: it loads only the
+/// leaves of data the temporary file lacks, and the target is the content with every hole a hole
+/// and every leaf of zeros written.
+#[cfg(target_vendor = "apple")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_read_on_apfs_loads_only_the_leaves_it_lacks_and_keeps_every_hole() {
+    const HOLE: usize = 1;
+
+    let (_store_dir, store) = make_test_store().await;
+    let target_dir = TempDir::new("lore-storage-resume-apfs-");
+    if !crate::holes::holes_reported().await {
+        return;
+    }
+    let target = target_dir.path().join("content.bin");
+    let (root, leaves, content) = put_holed(&store).await;
+    read_failing_at(
+        &store,
+        root,
+        leaves[ZEROS].expect("a leaf of zeros"),
+        &target,
+        None,
+    )
+    .await;
+    let temporary = temporary_file(&target);
+    let held = std::fs::read(&temporary).expect("read the temporary file");
+    let holds = |index: usize| {
+        held[index * LEAF..(index + 1) * LEAF] == content[index * LEAF..(index + 1) * LEAF]
+    };
+    let lacking: Vec<usize> = (0..LEAVES)
+        .filter(|index| index % 4 != 1 && index % 4 != 3)
+        .filter(|index| !holds(*index))
+        .collect();
+    let filled = crate::holes::data_ranges(&temporary).await;
+    assert!(
+        (HOLE..LEAVES - 1).step_by(4).any(|hole| {
+            let range = (hole * LEAF) as u64..((hole + 1) * LEAF) as u64;
+            filled
+                .iter()
+                .any(|data| data.start <= range.start && range.end <= data.end)
+        }),
+        "the file system filled a hole of the temporary file: {filled:?}"
+    );
+    write_at(&temporary, (HOLE * LEAF + LEAF / 4) as u64, &[0xFF; 4096]);
+
+    let (resumed, loads) = hooked(&store, None);
+    read_resuming(resumed, root, &target, None)
+        .await
+        .expect("the resumed read completes");
+
+    assert_eq!(
+        data_leaves_loaded(&loads, &leaves),
+        lacking,
+        "only the leaves the temporary file lacks are loaded"
+    );
+    assert_eq!(std::fs::read(&target).expect("read the target"), content);
+    assert_eq!(
+        crate::holes::data_ranges(&target).await,
+        holed_data(),
+        "each hole is unallocated, and each leaf of zeros written"
+    );
 }
 
 /// A resumed read of content with holes writes the content's bytes on every file system, whether it
@@ -989,8 +1054,9 @@ fn ending_entry(index: usize) -> Option<Vec<u8>> {
 
 /// A resumed read of content ending in a hole writes the file again as a fresh one where zeros were
 /// written, after the failed read, into the last block of the file, part of the hole: no leaf
-/// shares that block, so data there is data in the hole, even zeros. The target holds the content's
-/// bytes, with its data where a read that does not resume puts it, so that block is a hole again.
+/// shares that block, so data there is data in the hole, even zeros. On Apple platforms the read
+/// resumes instead, and the write sink frees the block. The target holds the content's bytes, with
+/// its data where a read that does not resume puts it, so that block is a hole again.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_resumed_read_finds_bytes_written_into_a_hole_ending_the_content() {
@@ -1011,13 +1077,20 @@ async fn a_resumed_read_finds_bytes_written_into_a_hole_ending_the_content() {
         content.len() as u64 - 64,
         &[0; 16],
     );
-    read_resuming(store.clone(), root, &target, None)
+    let (resumed, loads) = hooked(&store, None);
+    read_resuming(resumed, root, &target, None)
         .await
         .expect("the resumed read completes");
     read_resuming(store, root, &fresh, None)
         .await
         .expect("the fresh read completes");
 
+    let loaded = data_leaves_loaded(&loads, &leaves);
+    assert_eq!(
+        loaded.iter().all(|index| *index >= FAILING),
+        cfg!(target_vendor = "apple"),
+        "the read resumes exactly where the write sink frees the block: {loaded:?}"
+    );
     assert_eq!(std::fs::read(&target).expect("read the target"), content);
     assert_eq!(
         crate::holes::data_ranges(&target).await,

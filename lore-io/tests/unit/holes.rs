@@ -12,7 +12,8 @@ use lore_io::OpenOptions;
 const MIB: u64 = 1 << 20;
 
 /// A file of `size` bytes with `0xAB` at `extents` and a hole everywhere else, open to read and
-/// write.
+/// write. On Apple platforms the holes are punched once the data is synced, as APFS fills a hole
+/// of under 16 MiB beside data it flushes.
 async fn sparse_file(dir: &TempDir, size: u64, extents: &[Range<u64>]) -> IoFile {
     let path = dir.path().join("sparse");
     let file = std::fs::File::create(&path).expect("create");
@@ -22,10 +23,32 @@ async fn sparse_file(dir: &TempDir, size: u64, extents: &[Range<u64>]) -> IoFile
         file.write_all_at(&data, extent.start).expect("write");
     }
     file.sync_all().expect("sync");
-    IoDriver::global()
+    let file = IoDriver::global()
         .open(&path, &OpenOptions::new().read(true).write(true))
         .await
-        .expect("open")
+        .expect("open");
+    #[cfg(target_vendor = "apple")]
+    file.punch_holes(gaps(size, extents))
+        .await
+        .expect("punch the holes");
+    file
+}
+
+/// The ranges of a file of `size` bytes outside `extents`, which are sorted and apart.
+#[cfg(target_vendor = "apple")]
+fn gaps(size: u64, extents: &[Range<u64>]) -> Vec<Range<u64>> {
+    let mut gaps = Vec::new();
+    let mut at = 0;
+    for extent in extents {
+        if extent.start > at {
+            gaps.push(at..extent.start);
+        }
+        at = extent.end;
+    }
+    if at < size {
+        gaps.push(at..size);
+    }
+    gaps
 }
 
 /// Every range of data the file reports from the start, in one walk with one cursor.
@@ -144,6 +167,7 @@ async fn one_walk_reports_more_extents_than_one_map_takes() {
 /// Reserves `range` of the file at `path` as an extent allocated and never written, an unwritten
 /// extent, or `false` where its file system reserves none or has no extent map to report one by,
 /// as tmpfs.
+#[cfg(target_os = "linux")]
 fn reserve(path: &std::path::Path, range: Range<u64>) -> bool {
     use std::os::fd::AsRawFd;
 
@@ -180,6 +204,7 @@ fn reserve(path: &std::path::Path, range: Range<u64>) -> bool {
 
 /// An extent allocated and never written is a hole, also once the page cache holds its pages,
 /// where `SEEK_DATA` takes it for data.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn next_data_takes_an_unwritten_extent_as_a_hole_whatever_the_cache_holds() {
     if !holes_reported().await {
@@ -199,6 +224,7 @@ async fn next_data_takes_an_unwritten_extent_as_a_hole_whatever_the_cache_holds(
 }
 
 /// Whether the file at `path` lives on tmpfs, which has no extent map to give.
+#[cfg(target_os = "linux")]
 fn on_tmpfs(path: &std::path::Path) -> bool {
     use std::os::fd::AsRawFd;
 
@@ -216,6 +242,7 @@ fn on_tmpfs(path: &std::path::Path) -> bool {
 
 /// On a file system with no extent map, a walk is refused `FIEMAP` once, takes `SEEK_DATA` and
 /// `SEEK_HOLE` from then on, and reports the written ranges with one cursor.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_walk_without_an_extent_map_reports_the_written_ranges() {
     let shm = std::path::Path::new("/dev/shm");
@@ -231,4 +258,67 @@ async fn a_walk_without_an_extent_map_reports_the_written_ranges() {
         return;
     }
     assert_eq!(data(&file).await, extents);
+}
+
+/// On a file system that holds holes, punching holes deallocates the whole blocks of each hole and
+/// nothing else: the data around them, written zeros included, and the parts of a hole in the
+/// blocks it shares with data stay allocated, and the file reads as before.
+#[cfg(target_vendor = "apple")]
+#[tokio::test]
+async fn punching_holes_deallocates_their_whole_blocks_alone() {
+    let dir = TempDir::new("lore-io-punch-");
+    let path = dir.path().join("file");
+    let hole = 2 * MIB + 100..3 * MIB - 100;
+    let mut content = vec![0xABu8; 4 * MIB as usize];
+    content[MIB as usize..2 * MIB as usize].fill(0);
+    content[hole.start as usize..hole.end as usize].fill(0);
+    std::fs::write(&path, &content).expect("write the file");
+    let file = IoDriver::global()
+        .open(&path, &OpenOptions::new().read(true).write(true))
+        .await
+        .expect("open");
+    let (found, cursor) = file.next_data(0, DataCursor::default()).await;
+    found.expect("find data");
+    let block = cursor.block().expect("the block");
+    assert!(file.holds_holes().await, "APFS holds holes");
+
+    file.punch_holes(vec![hole.clone()])
+        .await
+        .expect("punch the hole");
+
+    let start = hole.start.div_ceil(block) * block;
+    let end = hole.end / block * block;
+    assert_eq!(data(&file).await, [0..start, end..4 * MIB]);
+    assert_eq!(std::fs::read(&path).expect("read the file"), content);
+}
+
+/// A punched hole that ends the file takes the file's last block whole, also where the file ends
+/// inside it, and a hole inside one block deallocates nothing.
+#[cfg(target_vendor = "apple")]
+#[tokio::test]
+async fn punching_a_hole_that_ends_the_file_takes_its_last_block_and_one_inside_a_block_none() {
+    let dir = TempDir::new("lore-io-punch-end-");
+    let path = dir.path().join("file");
+    let len = 4 * MIB + 1000;
+    let inside = MIB + 100..MIB + 200;
+    let ending = 3 * MIB + 100..len;
+    let mut content = vec![0xABu8; len as usize];
+    content[inside.start as usize..inside.end as usize].fill(0);
+    content[ending.start as usize..].fill(0);
+    std::fs::write(&path, &content).expect("write the file");
+    let file = IoDriver::global()
+        .open(&path, &OpenOptions::new().read(true).write(true))
+        .await
+        .expect("open");
+    let (found, cursor) = file.next_data(0, DataCursor::default()).await;
+    found.expect("find data");
+    let block = cursor.block().expect("the block");
+
+    file.punch_holes(vec![inside, ending.clone()])
+        .await
+        .expect("punch the holes");
+
+    let start = ending.start.div_ceil(block) * block;
+    assert_eq!(data(&file).await, std::slice::from_ref(&(0..start)));
+    assert_eq!(std::fs::read(&path).expect("read the file"), content);
 }

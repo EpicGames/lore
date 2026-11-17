@@ -845,12 +845,13 @@ async fn fetch_unordered(
 /// sink as held where the file holds it ([`place_leaf`]), and fetched otherwise. A hole, a
 /// reference of the zero hash, is handed to the sink as one, unwritten: the file was emptied before
 /// any write of its content, and no write fills a hole. Where a whole block of the hole is data in
-/// the map, zeros or not ([`DataMap::data_in_hole`]), or where the file cannot be mapped, the pool
-/// fails with [`Unresumable`] at once. The parts of the hole that are data in the blocks it shares
-/// with the leaves beside it are read back by a task of the pool's ([`check_hole_edges`]), under
-/// the budget a leaf's read-back takes, which fails the pool the same way where they are not all
-/// zeros or cannot be read. Where the pool fails so, the read writes the file again as a fresh one,
-/// whatever else its tasks failed with ([`and_joined`]).
+/// the map, zeros or not, and the sink's punch does not free it ([`DataMap::data_in_hole`]), or
+/// where the file cannot be mapped, the pool fails with [`Unresumable`] at once. The parts of the
+/// hole that are data in the blocks it shares with the leaves beside it are read back by a task of
+/// the pool's ([`check_hole_edges`]), under the budget a leaf's read-back takes, which fails the
+/// pool the same way where they are not all zeros or cannot be read. Where the pool fails so, the
+/// read writes the file again as a fresh one, whatever else its tasks failed with
+/// ([`and_joined`]).
 ///
 /// Holds `claim` for as long as it fetches, for the reason [`walk_fragment_tree`] gives, and so
 /// does each of its fetches. The pipeline aborts it when it is dropped; its fetches are then
@@ -1013,12 +1014,15 @@ pub(crate) fn cannot_resume(err: &StorageError) -> bool {
 /// bytes per range of data, with a cursor the pool moves forward as it walks the leaves in content
 /// order. It keeps the file's length, and the file system's block its walk took
 /// ([`lore_io::DataCursor::block`]), which a leaf allocates whole wherever it writes to it. Where
-/// the file system reports no holes, the whole file is one range of data.
+/// the file system reports no holes, the whole file is one range of data. On Apple platforms it
+/// keeps whether the sink's punch frees the whole blocks of every hole ([`IoFile::holds_holes`]).
 struct DataMap {
     ranges: Vec<Range<u64>>,
     next: usize,
     block: u64,
     len: u64,
+    #[cfg(target_vendor = "apple")]
+    punches: bool,
 }
 
 impl DataMap {
@@ -1049,6 +1053,8 @@ impl DataMap {
             next: 0,
             block: cursor.block().unwrap_or(1),
             len,
+            #[cfg(target_vendor = "apple")]
+            punches: file.holds_holes().await,
         })
     }
 
@@ -1088,7 +1094,9 @@ impl DataMap {
     /// What of the hole `range`, at or after the last range asked about, is data: `None` where any
     /// whole block of it is, and otherwise the parts of the blocks it shares with the leaves beside
     /// it that are, under one block each and empty where none is. A hole that ends the file shares
-    /// its last block with no leaf, so that block counts as whole.
+    /// its last block with no leaf, so that block counts as whole. Where the sink's punch frees the
+    /// whole blocks of every hole before the rename, on Apple platforms, data in them is no data
+    /// of the target, and only the parts are returned.
     fn data_in_hole(&mut self, range: Range<u64>) -> Option<[Range<u64>; 2]> {
         let whole_start = range.start.div_ceil(self.block) * self.block;
         let whole_end = if range.end == self.len {
@@ -1098,7 +1106,11 @@ impl DataMap {
         };
         let first_end = whole_start.min(range.end);
         let first = self.data_in(range.start..first_end);
-        if whole_start < whole_end {
+        #[cfg(target_vendor = "apple")]
+        let punches = self.punches;
+        #[cfg(not(target_vendor = "apple"))]
+        let punches = false;
+        if whole_start < whole_end && !punches {
             self.skip_to(whole_start);
             if self
                 .ranges
@@ -1118,9 +1130,9 @@ impl DataMap {
 /// it, each in one read of exactly its size, and fails with [`Unresumable`] where they are not all
 /// zeros or cannot be read. A leaf's write allocates those blocks whole, and a fresh write leaves
 /// the hole's bytes in them as zeros. A whole block of the hole that is data never comes here: it
-/// fails the read, zeros or not, since zero is not the same as no data. Nowhere else do zeros stand
-/// for a hole: a leaf of zeros is never held ([`holds_leaf`]). Holds `permit`, of the fetch pool's
-/// budget, until it ends.
+/// fails the read, zeros or not, since zero is not the same as no data, or the sink's punch frees
+/// it ([`DataMap::data_in_hole`]). Nowhere else do zeros stand for a hole: a leaf of zeros is never
+/// held ([`holds_leaf`]). Holds `permit`, of the fetch pool's budget, until it ends.
 ///
 /// The hole goes to the sink before this ends. That is safe: a check that fails makes the read
 /// write the file afresh, emptying it first, and no leaf's write touches the hole's bytes, so the
@@ -1657,7 +1669,11 @@ fn joined(stage: Result<Result<(), StorageError>, JoinError>) -> Result<(), Stor
 /// A hole is counted and not written: the file comes from [`open_file_write`], or is a resumed
 /// file emptied before any write of its content, so the range is unallocated and reads as zeros.
 /// A held range is counted and not written either: the file holds the leaf there already. Every
-/// payload is written, one of zeros included: zeros are data.
+/// payload is written, one of zeros included: zeros are data. On Apple platforms, every hole is
+/// deallocated once every payload is written ([`IoFile::punch_holes`]), as APFS allocates the small
+/// holes beside data it writes out, and a resumed file may hold such zeros, or other data, in the
+/// whole blocks of a hole; a range of data is never deallocated. The ranges of the holes are kept
+/// for that, 16 bytes each, until the get ends.
 #[lore_macro::test_pub]
 async fn write_to_file(
     file: IoFile,
@@ -1667,6 +1683,8 @@ async fn write_to_file(
     let mut tasks: JoinSet<Result<(), StorageError>> = JoinSet::new();
     let mut result = Ok(());
     let mut written = 0usize;
+    #[cfg(target_vendor = "apple")]
+    let mut holes: Vec<std::ops::Range<u64>> = Vec::new();
 
     while let Some(message) = data_rx.recv().await {
         let (offset, length) = match &message {
@@ -1689,6 +1707,10 @@ async fn write_to_file(
         }
 
         written += length;
+        #[cfg(target_vendor = "apple")]
+        if let DataMessage::Hole(..) = message {
+            holes.push(offset as u64..end as u64);
+        }
 
         let DataMessage::Payload(offset, payload, permit) = message else {
             continue;
@@ -1726,6 +1748,13 @@ async fn write_to_file(
         result = Err(StorageError::internal(format!(
             "defragmented content covers {written} of {size} bytes"
         )));
+    }
+    #[cfg(target_vendor = "apple")]
+    if result.is_ok() && !holes.is_empty() {
+        result = file
+            .punch_holes(holes)
+            .await
+            .map_err(|e| StorageError::internal_with_context(e, "punch the holes of the file"));
     }
 
     result

@@ -731,6 +731,21 @@ impl IoDriver {
         PsyncDriver::next_data(file, offset, cursor)
     }
 
+    /// Every backend runs this on the syscall pool, as [`Self::next_data_raw`].
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn punch_holes_raw(
+        file: Arc<File>,
+        holes: Vec<std::ops::Range<u64>>,
+    ) -> SyscallTask<std::io::Result<()>> {
+        PsyncDriver::punch_holes(file, holes)
+    }
+
+    /// Every backend runs this on the syscall pool, as [`Self::next_data_raw`].
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn holds_holes_raw(file: Arc<File>) -> SyscallTask<bool> {
+        PsyncDriver::holds_holes(file)
+    }
+
     /// Reads an entire file into pooled memory as a single backend
     /// dispatch — open, stat, read to the stat length, close — and
     /// returns it as [`Bytes`] without copying.

@@ -403,6 +403,7 @@ mod skipping_holes {
             content[offset..offset + length].copy_from_slice(&data);
         }
         file.sync_all().expect("sync test file");
+        crate::holes::punch_gaps(&file, size, extents);
         content
     }
 

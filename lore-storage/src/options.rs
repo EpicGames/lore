@@ -52,10 +52,12 @@ pub struct WriteOptions {
     ///
     /// A hole is a range never written, or allocated and never written (an unwritten extent), as
     /// [`lore_io::IoFile::next_data`] finds it: from the extent map on Linux, so what the page
-    /// cache holds does not change it. Zeros written to the file are data, stored as any other
-    /// content: a hole is not zeros, even though it reads as zeros. The address therefore depends
-    /// on how the file is allocated as well as on what it reads as. A file with a hole and the same
-    /// file with zeros written over the hole have different addresses.
+    /// cache holds does not change it, and from `SEEK_DATA` on macOS, with the file's data written
+    /// out first, as APFS allocates the small holes beside data it writes out. Zeros written
+    /// to the file are data, stored as any other content: a hole is not zeros, even though it reads
+    /// as zeros. The address therefore depends on how the file is allocated as well as on what it
+    /// reads as. A file with a hole and the same file with zeros written over the hole have
+    /// different addresses.
     pub skip_holes: bool,
 }
 

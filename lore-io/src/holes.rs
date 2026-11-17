@@ -13,7 +13,11 @@
 //! the other platforms that have them, also take an unwritten extent as a hole, but take it as
 //! data wherever the page cache holds pages for it, which any read of the extent, or reading
 //! ahead into it, leaves behind. A walk that takes `SEEK_DATA` advises random reads of the file on
-//! its first lookup ([`advise_random`]), so the reads through its handle read nothing ahead.
+//! its first lookup ([`advise_random`]), so the reads through its handle read nothing ahead. On
+//! Apple platforms, where the file system holds holes, that first lookup also writes the file's
+//! data out, as `FIEMAP` does on Linux: APFS allocates a hole of under 16 MiB beside data as zeros
+//! when it writes that data out, so otherwise what is a hole would depend on whether APFS had
+//! written the data out yet.
 //!
 //! All are blocking calls, which the syscall pool runs.
 
@@ -28,7 +32,8 @@ use std::ops::Range;
 pub struct DataCursor {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     map: Option<Box<fiemap::Cursor>>,
-    /// Set once the walk has advised random reads of the file, on its first `SEEK_DATA` lookup.
+    /// Set once the walk has advised random reads of the file, on its first `SEEK_DATA` lookup, and
+    /// on Apple platforms written its data out where the file system holds holes.
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     advised: bool,
     /// The file system's block, read on the walk's first lookup. On Linux the `FIEMAP` part keeps
@@ -59,7 +64,9 @@ impl DataCursor {
 /// An unwritten extent is a hole. A range from `FIEMAP` is widened to whole blocks of the
 /// file system, and may end past the end of the file. A file system that refuses `FIEMAP` once is
 /// walked with `SEEK_DATA` from then on, and the first `SEEK_DATA` lookup of a walk advises random
-/// reads of `file` ([`advise_random`]). The advice changes no answer, so its failure is ignored.
+/// reads of `file` ([`advise_random`]); on Apple platforms, where the file system holds holes, it
+/// then writes the file's data out before it looks. The advice changes no answer, so its failure is
+/// ignored.
 ///
 /// Where the platform reports no holes, everything from `offset` to the end is one range of data.
 pub(crate) fn next_data(
@@ -88,6 +95,10 @@ pub(crate) fn next_data(
         {
             cursor.block = Some(block_size(file)?);
         }
+        #[cfg(target_vendor = "apple")]
+        if holds_holes(file) {
+            fsync(file)?;
+        }
     }
     seek_next_data(file, offset)
 }
@@ -114,6 +125,81 @@ fn block_size(file: &File) -> std::io::Result<u64> {
     #[allow(clippy::unnecessary_fallible_conversions, clippy::useless_conversion)]
     let block = u64::try_from(stats.f_bsize).unwrap_or(0);
     Ok(block.max(1))
+}
+
+/// Deallocates the whole blocks of the file system in each of `holes`, ranges of `file` that hold
+/// no data of its content, so that each holds no storage and reads as zeros, once the file's data
+/// is written out (see the module doc). A part of a hole in a block it shares with data stays as it
+/// is, and a hole that ends the file takes its last block whole, as `F_PUNCHHOLE` takes only whole
+/// blocks and takes them past the end. Does nothing where the file system holds no holes
+/// ([`holds_holes`]). Where it holds them, it fails if one cannot be deallocated, so on success the
+/// whole blocks of every hole are unallocated.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn punch_holes(file: &File, holes: &[Range<u64>]) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    if !holds_holes(file) {
+        return Ok(());
+    }
+    fsync(file)?;
+    let fd = file.as_raw_fd();
+    let block = block_size(file)?;
+    let len = file.metadata()?.len();
+    for hole in holes {
+        let start = hole.start.div_ceil(block) * block;
+        let end = if hole.end >= len {
+            hole.end.div_ceil(block) * block
+        } else {
+            hole.end / block * block
+        };
+        if start >= end {
+            continue;
+        }
+        let (Ok(offset), Ok(length)) = (
+            libc::off_t::try_from(start),
+            libc::off_t::try_from(end - start),
+        ) else {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        };
+        let punch = libc::fpunchhole_t {
+            fp_flags: 0,
+            reserved: 0,
+            fp_offset: offset,
+            fp_length: length,
+        };
+        // SAFETY: Calling OS functions. `punch` outlives the call, which only reads it.
+        if unsafe { libc::fcntl(fd, libc::F_PUNCHHOLE, &punch) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Writes out the data of `file` with `fsync`, rather than `F_FULLFSYNC`, which also flushes the
+/// drive's cache.
+#[cfg(target_vendor = "apple")]
+fn fsync(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    crate::pool::retry_on_interrupt(|| {
+        // SAFETY: Calling OS functions. `fsync` reads no memory of the caller's.
+        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })
+}
+
+/// Whether the file system of `file` holds holes: its smallest hole, `_PC_MIN_HOLE_SIZE`, is above
+/// zero, as APFS reports its block. A file system that reports none, or that `fpathconf` gives no
+/// answer for, holds none.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn holds_holes(file: &File) -> bool {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: Calling OS functions. `fpathconf` reads no memory of the caller's.
+    unsafe { libc::fpathconf(file.as_raw_fd(), libc::_PC_MIN_HOLE_SIZE) > 0 }
 }
 
 /// [`next_data`] from `SEEK_DATA` and `SEEK_HOLE`, where the platform has them.

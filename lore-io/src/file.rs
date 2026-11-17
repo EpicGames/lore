@@ -457,7 +457,9 @@ impl IoFile {
     /// On Linux the map comes from `FIEMAP`, with the file synced first, and a range is widened to
     /// whole blocks of the file system, so it may end past the end of the file. Elsewhere, and on a
     /// file system without `FIEMAP`, it comes from `SEEK_DATA`, which takes an unwritten extent the
-    /// page cache holds pages for as data. Where the platform reports no holes, everything from
+    /// page cache holds pages for as data. On Apple platforms, where the file system holds holes,
+    /// the walk writes the file's data out before its first lookup, as APFS allocates the small
+    /// holes beside data it writes out. Where the platform reports no holes, everything from
     /// `offset` to the end is one range of data.
     ///
     /// `cursor` is what one walk of the file keeps between calls ([`crate::DataCursor`]): a new one
@@ -476,5 +478,30 @@ impl IoFile {
         ),
     > + use<> {
         IoDriver::next_data_raw(Arc::clone(&self.file), offset, cursor)
+    }
+
+    /// Writes the file's data out, then deallocates the whole blocks of the file system in each of
+    /// `holes`, so that each holds no storage and reads as zeros; APFS keeps a small hole beside
+    /// data only where it is deallocated after the data is written out. A part of a hole in a block
+    /// it shares with data stays as it is, and a hole that ends the file takes its last block
+    /// whole. Does nothing where the file system holds no holes ([`Self::holds_holes`]), and fails
+    /// where it holds them and refuses to deallocate one.
+    ///
+    /// The call starts when this is called, as [`Self::next_data`] does.
+    #[cfg(target_vendor = "apple")]
+    pub fn punch_holes(
+        &self,
+        holes: Vec<std::ops::Range<u64>>,
+    ) -> impl Future<Output = std::io::Result<()>> + use<> {
+        IoDriver::punch_holes_raw(Arc::clone(&self.file), holes)
+    }
+
+    /// Whether the file system of this file holds holes: its smallest hole, `_PC_MIN_HOLE_SIZE`, is
+    /// above zero. [`Self::punch_holes`] deallocates nothing where it is not.
+    ///
+    /// The call starts when this is called, as [`Self::next_data`] does.
+    #[cfg(target_vendor = "apple")]
+    pub fn holds_holes(&self) -> impl Future<Output = bool> + use<> {
+        IoDriver::holds_holes_raw(Arc::clone(&self.file))
     }
 }

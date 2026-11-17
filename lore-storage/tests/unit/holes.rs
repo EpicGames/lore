@@ -52,7 +52,62 @@ fn sparse_file(path: &Path, size: usize, extents: &[(usize, usize)]) -> Vec<u8> 
         content[offset..offset + length].copy_from_slice(&data);
     }
     file.sync_all().expect("sync test file");
+    punch_gaps(&file, size, extents);
     content
+}
+
+/// Punches the whole blocks of the ranges of `file`, `size` bytes, outside `extents`, which are
+/// `(offset, length)` each, sorted and apart, once its data is synced. Only on Apple platforms,
+/// where APFS fills a hole of under 16 MiB beside data it flushes; elsewhere a range left unwritten
+/// stays a hole.
+pub(crate) fn punch_gaps(file: &std::fs::File, size: usize, extents: &[(usize, usize)]) {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+
+        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: `fstatfs` fills `stats`, which outlives the call.
+        assert_eq!(
+            unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) },
+            0,
+            "statfs"
+        );
+        // SAFETY: `fstatfs` succeeded, so it filled `stats`.
+        let block = unsafe { stats.assume_init() }.f_bsize as usize;
+        let mut at = 0;
+        for gap in extents
+            .iter()
+            .map(|&(offset, length)| {
+                let gap = at..offset;
+                at = offset + length;
+                gap
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .chain(std::iter::once(at..size))
+        {
+            let start = gap.start.div_ceil(block) * block;
+            let end = gap.end / block * block;
+            if start >= end {
+                continue;
+            }
+            let punch = libc::fpunchhole_t {
+                fp_flags: 0,
+                reserved: 0,
+                fp_offset: start as libc::off_t,
+                fp_length: (end - start) as libc::off_t,
+            };
+            // SAFETY: `punch` outlives the call, which only reads it.
+            assert_eq!(
+                unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &punch) },
+                0,
+                "punch {start}..{end}: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = (file, size, extents);
 }
 
 /// The data ranges the file system reports for `path`.
@@ -310,6 +365,30 @@ async fn a_file_without_holes_is_addressed_as_without_skipping_holes() {
         let without = put(&store, &source, plain).await;
         assert_eq!(with, without, "chunking every {step} bytes");
     }
+}
+
+/// A file put before its data is written out gets the address it gets once it is: the put syncs
+/// the file before it looks for holes, so a hole the file system fills with zeros when it writes
+/// the data beside it out, as APFS does with one of under 16 MiB, is the same range either way. The
+/// source is opened read-only.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_put_before_its_data_is_written_out_gets_the_address_it_gets_after() {
+    let dir = TempDir::new("lore-storage-holes-unsynced-");
+    let source = dir.path().join("fresh");
+    let file = std::fs::File::create(&source).expect("create test file");
+    file.set_len(8 * MIB as u64).expect("size test file");
+    for offset in [0, 2 * MIB, 6 * MIB] {
+        file.write_all_at(&random_buffer(MIB), offset as u64)
+            .expect("write extent");
+    }
+    let (_store_dir, store) = make_store().await;
+    let options = holes_options(256 << 10);
+
+    let before = put(&store, &source, options).await;
+    file.sync_all().expect("sync test file");
+    let after = put(&store, &source, options).await;
+
+    assert_eq!(before, after);
 }
 
 /// Holes in a list long enough to be split into sublists: every sublist holding a hole is a list
@@ -577,6 +656,15 @@ fn image_with_zeros(path: &Path) -> Vec<u8> {
     file.write_all_at(&vec![0u8; IMAGE_ZEROS.len()], IMAGE_ZEROS.start as u64)
         .expect("write zeros");
     file.sync_all().expect("sync the zeros");
+    punch_gaps(
+        &file,
+        IMAGE_SIZE,
+        &[
+            IMAGE_DATA[0],
+            (IMAGE_ZEROS.start, IMAGE_ZEROS.len()),
+            IMAGE_DATA[1],
+        ],
+    );
     content
 }
 
@@ -609,8 +697,8 @@ async fn get(store: &Arc<dyn ImmutableStore>, address: Address, out: &Path, opti
 }
 
 /// Written zeros are data, whatever the size of the get: a file of 40 MiB stored skipping its holes
-/// reads back with its holes as holes and its written zeros written, and one stored without
-/// reads back written whole, as its holes were stored as data.
+/// reads back with its holes as holes and its written zeros written and allocated, and one stored
+/// without reads back written whole, as its holes were stored as data.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_large_get_writes_its_written_zeros_as_data() {
     if !holes_reported().await {
@@ -638,6 +726,11 @@ async fn a_large_get_writes_its_written_zeros_as_data() {
             std::fs::read(&out).expect("read the output"),
             content,
             "{name}"
+        );
+        let allocated: u64 = written.iter().map(|range| range.end - range.start).sum();
+        assert!(
+            std::fs::metadata(&out).expect("stat").blocks() * 512 >= allocated,
+            "{name}: every range written, zeros included, holds storage, by the file's block count"
         );
         assert_eq!(data_ranges(&out).await, written, "{name}");
     }

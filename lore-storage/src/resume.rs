@@ -20,7 +20,10 @@
 //! it that hold data. Where a whole block of a hole holds data, a part read back holds bytes other
 //! than zeros, the file cannot be mapped, or a part of a hole cannot be read back, the read empties
 //! the file and writes it as a fresh one. Where the file system reports no holes, the whole file is
-//! data, so content with a hole holding a whole block is written as fresh.
+//! data, so content with a hole holding a whole block is written as fresh. On Apple platforms,
+//! where the file system holds holes, a whole block of a hole holding data does not empty the file:
+//! APFS allocates the small holes beside data it writes out, and the write sink deallocates the
+//! whole blocks of every hole of the range before the rename.
 //!
 //! A resuming read holds the exclusive lock of its temporary file for as long as any handle to it
 //! lives, from before it reads or empties anything there until every task writing to it has ended,

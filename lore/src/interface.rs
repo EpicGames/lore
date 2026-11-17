@@ -7341,7 +7341,10 @@ pub type LoreStorageGetFileArgs = crate::storage::get_file::LoreStorageGetFileAr
 /// where the write resumes from it, below. A hole the content was stored with (`skip_holes` on
 /// `lore_storage_put_file`), a range holding no data, is left unwritten, so it is a hole of the
 /// written file where its file system supports holes. Every range of data is written, zeros
-/// included: written zeros are data.
+/// included: written zeros are data. On macOS, APFS allocates a hole of under 16 MiB beside data
+/// as zeros when it writes that data out, so where the file system holds holes, once every range
+/// of data is written the call writes the data out and deallocates the whole blocks of each hole
+/// (`F_PUNCHHOLE`), and never a range of data. Where one cannot be deallocated, the call fails.
 ///
 /// A multi-fragment write of a range of at least 32 MiB that fails, or that a process stops, keeps
 /// `<path>.loretmp`, which takes disk space up to the size of the range, and beside it its *resume
@@ -7356,8 +7359,10 @@ pub type LoreStorageGetFileArgs = crate::storage::get_file::LoreStorageGetFileAr
 /// temporary file, as every hole holding a whole block does on a file system that reports no holes,
 /// where a part read back holds bytes other than zeros, where the temporary file cannot be mapped,
 /// or where a part of a hole cannot be read back, the call empties the file and writes the range
-/// again. The read covers every fragment of the range, so on a slow disk a resume of a mostly
-/// written range can take longer than fetching it again over a fast link.
+/// again. On macOS, where the file system holds holes, as APFS does, a whole block of a hole
+/// holding data does not empty the file, since the call deallocates the whole blocks of every hole
+/// of the range before the rename. The read covers every fragment of the range, so on a slow disk
+/// a resume of a mostly written range can take longer than fetching it again over a fast link.
 /// Where the file system refuses advisory locks, as some network file systems do, a write of any
 /// length writes as a shorter one does.
 ///

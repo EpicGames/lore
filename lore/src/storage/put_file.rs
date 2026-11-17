@@ -66,14 +66,16 @@ pub struct LoreStoragePutFileItem {
     /// header turns the query on
     pub remote_query: u8,
     /// Read only the ranges of the file the file system holds data for, and store each hole between
-    /// them as a hole in the fragment list: never read, hashed or stored. A hole is a range
-    /// holding no data, never written, or allocated and never written (an unwritten extent), as the
-    /// file system's extent map tells on Linux. Zeros written to the file are data and stored as
-    /// such: a file with a hole and the same file with zeros written over it get different
-    /// addresses. A file larger than one fragment that has holes gets a different address than it
-    /// gets without this; one without holes gets the same. `lore_storage_get_file` leaves each
-    /// hole unwritten, a hole of the file it writes. The field sits in what was padding, after
-    /// `remote_query`, so zero the whole item before setting its fields, as for `remote_query`
+    /// them as a hole in the fragment list: never read, hashed or stored. A hole is a range holding
+    /// no data, never written, or allocated and never written (an unwritten extent), as the file
+    /// system's extent map tells on Linux and `SEEK_DATA` on macOS, each with the file synced
+    /// first. APFS allocates a hole of under 16 MiB beside data as zeros when it writes that data
+    /// out, so such a range is data there. Zeros written to the file are data and stored as such: a
+    /// file with a hole and the same file with zeros written over it get different addresses. A
+    /// file larger than one fragment that has holes gets a different address than it gets without
+    /// this; one without holes gets the same. `lore_storage_get_file` leaves each hole unwritten, a
+    /// hole of the file it writes. The field sits in what was padding, after `remote_query`, so
+    /// zero the whole item before setting its fields, as for `remote_query`
     pub skip_holes: u8,
     /// Leaf fragment size cap for large files; `0` lets `write_content` choose
     pub fixed_size_chunk: u64,

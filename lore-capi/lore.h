@@ -6135,14 +6135,16 @@ typedef struct lore_storage_put_file_item_t {
   // header turns the query on
   uint8_t remote_query;
   // Read only the ranges of the file the file system holds data for, and store each hole between
-  // them as a hole in the fragment list: never read, hashed or stored. A hole is a range
-  // holding no data, never written, or allocated and never written (an unwritten extent), as the
-  // file system's extent map tells on Linux. Zeros written to the file are data and stored as
-  // such: a file with a hole and the same file with zeros written over it get different
-  // addresses. A file larger than one fragment that has holes gets a different address than it
-  // gets without this; one without holes gets the same. `lore_storage_get_file` leaves each
-  // hole unwritten, a hole of the file it writes. The field sits in what was padding, after
-  // `remote_query`, so zero the whole item before setting its fields, as for `remote_query`
+  // them as a hole in the fragment list: never read, hashed or stored. A hole is a range holding
+  // no data, never written, or allocated and never written (an unwritten extent), as the file
+  // system's extent map tells on Linux and `SEEK_DATA` on macOS, each with the file synced
+  // first. APFS allocates a hole of under 16 MiB beside data as zeros when it writes that data
+  // out, so such a range is data there. Zeros written to the file are data and stored as such: a
+  // file with a hole and the same file with zeros written over it get different addresses. A
+  // file larger than one fragment that has holes gets a different address than it gets without
+  // this; one without holes gets the same. `lore_storage_get_file` leaves each hole unwritten, a
+  // hole of the file it writes. The field sits in what was padding, after `remote_query`, so
+  // zero the whole item before setting its fields, as for `remote_query`
   uint8_t skip_holes;
   // Leaf fragment size cap for large files; `0` lets `write_content` choose
   uint64_t fixed_size_chunk;
@@ -12696,7 +12698,10 @@ void lore_storage_put_file_async(const struct lore_global_args_t *globals,
 // where the write resumes from it, below. A hole the content was stored with (`skip_holes` on
 // `lore_storage_put_file`), a range holding no data, is left unwritten, so it is a hole of the
 // written file where its file system supports holes. Every range of data is written, zeros
-// included: written zeros are data.
+// included: written zeros are data. On macOS, APFS allocates a hole of under 16 MiB beside data
+// as zeros when it writes that data out, so where the file system holds holes, once every range
+// of data is written the call writes the data out and deallocates the whole blocks of each hole
+// (`F_PUNCHHOLE`), and never a range of data. Where one cannot be deallocated, the call fails.
 //
 // A multi-fragment write of a range of at least 32 MiB that fails, or that a process stops, keeps
 // `<path>.loretmp`, which takes disk space up to the size of the range, and beside it its *resume
@@ -12711,8 +12716,10 @@ void lore_storage_put_file_async(const struct lore_global_args_t *globals,
 // temporary file, as every hole holding a whole block does on a file system that reports no holes,
 // where a part read back holds bytes other than zeros, where the temporary file cannot be mapped,
 // or where a part of a hole cannot be read back, the call empties the file and writes the range
-// again. The read covers every fragment of the range, so on a slow disk a resume of a mostly
-// written range can take longer than fetching it again over a fast link.
+// again. On macOS, where the file system holds holes, as APFS does, a whole block of a hole
+// holding data does not empty the file, since the call deallocates the whole blocks of every hole
+// of the range before the rename. The read covers every fragment of the range, so on a slow disk
+// a resume of a mostly written range can take longer than fetching it again over a fast link.
 // Where the file system refuses advisory locks, as some network file systems do, a write of any
 // length writes as a shorter one does.
 //

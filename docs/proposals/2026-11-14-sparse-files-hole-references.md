@@ -5,7 +5,7 @@ authors:
   - Mattias Jansson
 status: Accepted
 created: 2026-11-14
-updated: 2026-11-14
+updated: 2026-11-16
 discussion: https://web.lore.internal.epicgames.net/Epic/Lore/change-request/1300
 ---
 
@@ -21,7 +21,7 @@ fragment list record a hole as a reference with the zero hash, which names no fr
 `skip_holes` field on the `lore_storage_put_file` and `lore_storage_put_file_resolved` items asks a
 put to read only the ranges the file system holds data for. A get into a file leaves each hole
 unwritten, so the file it writes has the same holes. This is the initial implementation, for Linux
-file systems that report holes.
+file systems that report holes, and macOS on APFS is additional work after it.
 
 ## Motivation
 
@@ -93,6 +93,31 @@ same address. Where a file system has no extent map, as tmpfs, the put falls bac
 pages for it. On its first `SEEK_DATA` lookup the put tells the system that it reads the source at
 random, so it reads nothing ahead into a hole and leaves no pages there.
 
+#### macOS (APFS)
+
+macOS on APFS is additional work after the initial Linux implementation. APFS reports the holes of
+a file, but when it writes a file's data out, it allocates as zeros the holes beside that data that
+are smaller than a size of its own. A small hole beside data is therefore a hole only until APFS
+writes that data out, and allocated zeros after.
+
+The put has the file's data written out before it looks for holes, as the put does on Linux with
+an extent map, so what is a hole depends on what the file system allocated alone, and the same
+file gets the same address whether or not APFS had written its data out before the put. A small
+hole APFS has allocated is data to the put.
+
+The get keeps the holes of the content holes: once it has written every range of data, it has that
+data written out, then deallocates each hole, before it completes. It deallocates only the ranges
+of holes, never a range of data, so written zeros stay written. A part of a hole in a block the
+file system shares with data stays allocated as zeros, since the file system allocates whole
+blocks. Linux needs no such step, as a range left unwritten stays a hole there. A get that cannot
+deallocate a hole on a file system that holds holes fails rather than complete with the hole
+allocated; on a file system that holds none, it completes, and its holes read as zeros.
+
+A resumed get on APFS finds the small holes of its temporary file allocated the same way. Where
+the temporary file's file system holds holes, data in the whole blocks of a hole does not make the
+get write the file afresh, since the get deallocates those blocks before it completes. Bytes other
+than zeros in a block a hole shares with data still do, as the get does not deallocate that block.
+
 ### Put
 
 With `skip_holes` set, a put reads each range of data and chunks it as the item asks, and records
@@ -158,13 +183,26 @@ The results below are measured: content put with holes by this change, on Linux,
   `lore_storage_put_file_resolved_item_t`, in what was padding, so the item sizes and every other
   field's offset stay as they are. `lore_storage_get_file` and `lore_storage_get_file_resolved`
   leave holes unwritten, and empty a `<path>.loretmp` an earlier get left before writing it. A hole
-  in fragment delivery is a `GET_FRAGMENT` with no payload. No CLI command changes.
+  in fragment delivery is a `GET_FRAGMENT` with no payload. No CLI command changes. On macOS a put
+  with `skip_holes` has its source's data written out before it looks for holes, and a get of
+  content with holes deallocates them once it has written its data, and resumes from a temporary
+  file whose holes the file system allocated; no signature or layout changes.
 - **File systems** — Measured on Linux on four file systems: ext4, XFS and btrfs, where the put
   finds holes through `FIEMAP`, and tmpfs, which has no extent map, where it finds them through
   `SEEK_DATA` and `SEEK_HOLE`. On each, an image with holes put with `skip_holes` and got back read
   as the image, byte for byte, with only its data allocated; a file with zeros written into a
   range came back with that range allocated, as data; and a range `fallocate` reserved and never
-  wrote was stored as a hole and came back unallocated.
+  wrote was stored as a hole and came back unallocated. Measured on macOS on APFS, with blocks of
+  4 KiB: the file system reports every hole exactly until it writes the data beside it out, then
+  allocates as zeros the holes under 16 MiB beside that data (a gap of 16380 KiB filled, one of
+  16384 KiB stayed a hole), and a hole deallocated after that stayed a hole when the file was
+  written out again. An image with holes put skipping them and got back read as the image, byte for
+  byte, with the whole blocks of every hole of the content unallocated; a file put before APFS
+  wrote its data out got the address it got after; written zeros came back allocated; and a resumed
+  get of content with small holes loaded only the leaves its temporary file lacked and kept every
+  hole. A file put with `skip_holes` on macOS by a build before this amendment, which did not have
+  its data written out first, may have stored small holes as holes, and so have another address
+  than the one it gets now; it reads back the same either way.
 
 ## Non-Functional Considerations
 
@@ -173,12 +211,23 @@ The results below are measured: content put with holes by this change, on Linux,
   hole.
 - **Memory** — Preserved. A hole costs one reference in a list and nothing in memory. A put keeps
   one window of a range in memory, as it keeps one of a file, and a streamed read delivers a hole in
-  pieces no larger than a fragment, from memory shared by every read.
+  pieces no larger than a fragment, from memory shared by every read. On macOS a get of content
+  with holes keeps the range of each hole until it completes, to deallocate them once its data is
+  written out: a fixed cost per hole, so the memory grows with the number of holes, which the
+  fragment list bounds.
 - **Statelessness** — Preserved. The change keeps no state across operations.
 - **Determinism** — The address of a file put with `skip_holes` depends on how the file is
   allocated as well as on what it reads as, by design. On Linux, on a file system with an extent
-  map, the same allocation always gives the same address, whatever the page cache holds. Content
-  put without the field is unchanged.
+  map, the same allocation always gives the same address, whatever the page cache holds. On macOS
+  the same holds, as the put has the file's data written out first. Content put without the field
+  is unchanged.
+- **Latency** — On macOS a put waits for the file's data to be written out before it looks for
+  holes. For a file APFS has already written out this costs nothing measurable; for one just
+  written it costs the time APFS takes to write that data out, which it would spend anyway.
+  Measured on CI's macOS runner, a put of a 256 MiB file holding 64 MiB of data just written took
+  2.3 s, against 0.3 s once APFS had written that data out. A get of content with holes on macOS
+  waits, every time, for the data it wrote to be written out before it deallocates the holes,
+  where a get on Linux does not wait; that cost is not measured.
 - **Throughput** — Measured on XFS, on a shared machine whose disk was busy at times:
   - The generated 8 GiB image, with 2.1 GiB of data in 235 ranges. With `skip_holes` a put reads
     and hashes 2.1 GiB into lists of 364 KB (8,853 leaves and 236 holes); without, 8 GiB into lists
@@ -230,6 +279,9 @@ reach a server, peer or log, and deleting or obliterating content works as befor
   where the lost tail held data the put had already mapped, as the read meets the end of the
   file; a lost tail that held no data, or one walked with `SEEK_DATA`, is stored as a hole to the
   size at open.
+- **Assumption:** on APFS a hole the get deallocated stays a hole until the file is written again
+  — *invalidated if:* APFS allocates such a hole on its own later, so the file a get wrote holds
+  zeros there rather than a hole; it still reads as the content.
 
 **Risks**
 
@@ -246,6 +298,8 @@ reach a server, peer or log, and deleting or obliterating content works as befor
   is stored as two lists. Fixed-size leaves inside its data have the same addresses either way, and
   still deduplicate.
 - Content stored with holes is unreadable by every client built before this change.
+- On macOS, APFS allocates the small holes beside data when it writes that data out, so the put
+  stores them as data, and an image whose holes are small saves little there.
 
 ## Alternatives Considered
 
@@ -298,16 +352,14 @@ content, which needs a server upgrade anyway.
 
 ## Future Work
 
-This is the initial implementation, for Linux file systems that report holes. Planned follow-up
-work extends it:
+This is the initial implementation, for Linux file systems that report holes, and macOS on APFS,
+additional work after it. Planned follow-up work extends it:
 
 - Windows, on NTFS and ReFS: find the ranges of data with
   `FSCTL_QUERY_ALLOCATED_RANGES`, mark the file a get writes sparse (`FSCTL_SET_SPARSE`) before
   sizing it so its holes stay unallocated, and unmap ranges with `FSCTL_SET_ZERO_DATA` where a write
   over an existing file needs it. Until then a put on Windows finds no holes and stores the whole
   file as data, and a get there leaves holes unwritten in a file that is not sparse.
-- macOS, on APFS: holes found and recreated there, where the put finds the ranges of data with
-  `SEEK_DATA` today.
 - Other file systems whose holes the `SEEK_DATA` fallback reports less precisely than an extent
   map.
 - Revision trees holding content stored with holes: FUSE reading a hole as zeros, and status
