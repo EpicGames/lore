@@ -728,7 +728,7 @@ async fn a_branch_metadata_lookup_past_an_unreadable_local_copy_reports_the_refu
 /// the walk of the local store read: the refusal ends the line there.
 #[tokio::test]
 async fn a_batch_over_a_refusing_remote_holds_the_local_revisions() {
-    with_execution(async {
+    Box::pin(with_execution(async {
         for (name, repository) in refusing_contexts().await {
             let line = crate::branch::write_line(&repository, Hash::from([9; 32]), 2, 2).await;
 
@@ -738,7 +738,7 @@ async fn a_batch_over_a_refusing_remote_holds_the_local_revisions() {
 
             assert_eq!(history, vec![(3, line[1]), (2, line[0])], "{name}");
         }
-    })
+    }))
     .await;
 }
 

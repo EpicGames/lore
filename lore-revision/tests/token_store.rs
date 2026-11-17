@@ -837,24 +837,6 @@ mod tests {
             .expect("Task failure");
     }
 
-    /// A call that keeps its key in the file `sec-tokenstore_encryption_key` of a new token store
-    /// directory, with the directory's guard and the key file's path.
-    fn fallback_key_call() -> (Arc<ExecutionContext>, TempDir, std::path::PathBuf) {
-        let store_dir = generate_tempdir();
-        let key_file = store_dir.child("sec-tokenstore_encryption_key");
-        let fallback = Arc::new(
-            ExecutionContext::new_client(Default::default(), EventDispatcher::new(None))
-                .with_environment(CallEnvironment {
-                    values: [
-                        None,
-                        Some(store_dir.display().to_string()),
-                        Some("fallback".to_string()),
-                    ],
-                }),
-        );
-        (fallback, store_dir, key_file)
-    }
-
     /// The mode of `file`'s permission bits.
     #[cfg(unix)]
     #[allow(clippy::disallowed_methods)]
@@ -878,7 +860,7 @@ mod tests {
 
         let _lock = sequential_mutex_lock().await;
         let (_execution, _auth_dir) = setup_test_env().await;
-        let (fallback, _store_dir, key_file) = fallback_key_call();
+        let (fallback, _store_dir, key_file) = store_call(Some("fallback"));
 
         // A file readable by everyone that holds no usable key, so the store writes a new one.
         std::fs::write(&key_file, [7u8; 3]).expect("Failed to write the key file");
@@ -1048,7 +1030,7 @@ mod tests {
 
         let _lock = sequential_mutex_lock().await;
         let (_execution, _auth_dir) = setup_test_env().await;
-        let (fallback, _store_dir, key_file) = fallback_key_call();
+        let (fallback, _store_dir, key_file) = store_call(Some("fallback"));
         std::fs::write(&key_file, [7u8; 32]).expect("Failed to write the key file");
         std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o644))
             .expect("Failed to widen the key file");
@@ -1080,7 +1062,7 @@ mod tests {
 
         let _lock = sequential_mutex_lock().await;
         let (_execution, _auth_dir) = setup_test_env().await;
-        let (fallback, store_dir, key_file) = fallback_key_call();
+        let (fallback, store_dir, key_file) = store_call(Some("fallback"));
         let temporary = store_dir.child("sec-tokenstore_encryption_key.new");
         std::fs::write(&temporary, b"left").expect("Failed to write the temporary file");
         std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o644))
@@ -1107,7 +1089,7 @@ mod tests {
     async fn a_link_in_place_of_the_fallback_key_is_refused() {
         let _lock = sequential_mutex_lock().await;
         let (_execution, _auth_dir) = setup_test_env().await;
-        let (fallback, store_dir, key_file) = fallback_key_call();
+        let (fallback, store_dir, key_file) = store_call(Some("fallback"));
         let target = store_dir.child("elsewhere");
         std::fs::write(&target, b"not a key").expect("Failed to write the link target");
         std::os::unix::fs::symlink(&target, &key_file).expect("Failed to link the key file");
@@ -1134,7 +1116,7 @@ mod tests {
     async fn a_new_token_store_directory_is_its_owners_alone() {
         let _lock = sequential_mutex_lock().await;
         let (_execution, _auth_dir) = setup_test_env().await;
-        let (fallback, store_dir, _key_file) = fallback_key_call();
+        let (fallback, store_dir, _key_file) = store_call(Some("fallback"));
         let nested = store_dir.child("nested");
         let call = Arc::new(
             ExecutionContext::new_client(Default::default(), EventDispatcher::new(None))
@@ -1179,7 +1161,7 @@ mod tests {
         }
         let _lock = sequential_mutex_lock().await;
         let (_execution, _auth_dir) = setup_test_env().await;
-        let (fallback, store_dir, key_file) = fallback_key_call();
+        let (fallback, store_dir, key_file) = store_call(Some("fallback"));
         let token_store_file = store_dir.child("tokenstore.toml");
 
         #[allow(clippy::disallowed_methods)]

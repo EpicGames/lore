@@ -446,7 +446,7 @@ mod swfs_impl {
             let guard = self.handle()?;
             let handle = guard.handle();
             let length = swfs_u16::try_from(path.len())
-                .map_err(|_| SwfsInterfaceError::internal("Frozen file path too long"))?;
+                .internal("converting the frozen file path's length to SWFS's 16-bit length")?;
             // `swfsReadFrozenFile` takes no user data, so its buffer callback finds the buffer
             // through this, and one read runs at a time.
             let _serial = FROZEN_READ_SERIAL.lock();

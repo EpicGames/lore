@@ -218,6 +218,7 @@ async fn verify_action(
 
 /// The changes a sync still has to realize of the one change of the file at `path` from `base` to
 /// `source`, verified as a sync verifies its change set over a working tree on `current`.
+#[cfg(target_family = "unix")]
 async fn verify_as_a_sync(
     repository: &Arc<RepositoryContext>,
     path: &RelativePath,
@@ -225,27 +226,15 @@ async fn verify_as_a_sync(
     source: &Staged,
     current: &Staged,
 ) -> Result<Arc<Vec<NodeChange>>, SyncError> {
-    let operation = repository
-        .file_system()
-        .begin_operation()
-        .await
-        .expect("filesystem operation");
     let change = NodeChange {
         action: FileAction::Keep,
         flags: change::Flags::None,
         from: side(repository, base, path.clone()),
         to: side(repository, source, path.clone()),
     };
-    Box::pin(verify_filesystem_for_changes(Arc::new(SyncVerifyArgs {
-        changes: Arc::new(vec![change]),
-        repository_current: repository.clone(),
-        operation,
-        current: NodeMapping::root(repository.clone(), current.state.clone()),
-        options: Arc::default(),
-        carries_modes: true,
-    })))
-    .await
-    .map(|verified| verified.changes)
+    Box::pin(verify_set(repository, &current.state, vec![change]))
+        .await
+        .map(|verified| verified.changes)
 }
 
 /// Record that the working file holds the current revision's content, which is what a
