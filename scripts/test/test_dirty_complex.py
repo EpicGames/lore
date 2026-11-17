@@ -5360,13 +5360,10 @@ def test_chain_add_scan_switch_reset_keeps_untracked(new_lore_repo):
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(
-    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
-)
 def test_chain_move_scan_switch_status(new_lore_repo):
     """Chain (move -> scan -> switch -> reset): dirty_move old.txt -> new.txt
     -> status (move/fromPath) -> status --scan -> switch(other) -> status ->
-    reset(new.txt) clears the tracking.
+    reset(new.txt) undoes the move.
 
     Invariant: a dirty MOVE keeps action=move with fromPath=source through a
     no-scan status, through a --scan (the rename is still on disk), AND across a
@@ -5436,8 +5433,9 @@ def test_chain_move_scan_switch_status(new_lore_repo):
         msg="dirty move provenance must survive a same-revision switch, not downgrade to add",
     )
 
-    # Reset closes the chain: the destination's tracking is cleared.
+    # Reset closes the chain: the move is undone.
     repo.reset("new.txt", offline=True)
+    assert _chain_read(repo, "old.txt") == "movable content", "move source restored"
     after = get_status_files(repo)
     assert_file_set(after, [], msg="no-scan clean after resetting the move destination")
 
@@ -7766,12 +7764,10 @@ def test_commit_staged_copy(new_lore_repo):
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(
-    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
-)
 def test_reset_dirty_move(new_lore_repo):
-    """Resetting a dirty move (action=move/fromPath=source) restores the source
-    on disk, removes the destination, and leaves a clean status."""
+    """Resetting both ends of a dirty move (action=move/fromPath=source) undoes
+    it: the source holds the committed content again, the destination is gone,
+    and status is clean with and without --scan."""
     repo: Lore = new_lore_repo()
     commit_base(repo, {"old.txt": "movable content\n"})
 
@@ -7783,15 +7779,12 @@ def test_reset_dirty_move(new_lore_repo):
         before, "new.txt", action="move", dirty=True, staged=False, from_path="old.txt"
     )
 
-    repo.reset("new.txt", offline=True)
+    repo.reset(["old.txt", "new.txt"], offline=True)
 
-    assert os.path.exists(repo._fix_path("old.txt")), (
-        "reset must restore the move source"
+    assert _chain_read(repo, "old.txt") == "movable content\n", (
+        "reset must restore the move source with its committed content"
     )
-    with repo.open_file("old.txt", "r") as f:
-        assert f.read() == "movable content\n", (
-            "restored source content must match committed"
-        )
+    assert not _chain_exists(repo, "new.txt"), "reset must remove the move destination"
 
     no_scan = get_status_files(repo)
     assert_file_set(no_scan, [], msg="status clean after resetting the dirty move")

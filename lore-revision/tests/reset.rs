@@ -279,6 +279,36 @@ mod tests {
         .await;
     }
 
+    /// A dry run reset of a dirty move leaves the working tree and the move's mark alone, where the
+    /// reset undoes it.
+    #[tokio::test]
+    async fn a_dry_run_reset_leaves_a_dirty_move_alone() {
+        with_fixture(async |fixture| {
+            let path = fixture.path.clone();
+            test_file_write(&path.join("a.txt"), b"committed");
+            test_commit_tree(&fixture, "Initial").await;
+            std::fs::rename(path.join("a.txt"), path.join("b.txt")).expect("Failed to move");
+            file::dirty::dirty_move(
+                fixture.repository.clone(),
+                path.join("a.txt").to_string_lossy().into_owned(),
+                path.join("b.txt").to_string_lossy().into_owned(),
+            )
+            .await
+            .expect("Dirty move failed");
+
+            assert_dry_run_reset_leaves_the_working_tree(&fixture, &["b.txt"]).await;
+            assert!(
+                next_node(&fixture.repository, "b.txt")
+                    .await
+                    .is_dirty_move(),
+                "a dry run reset undid the move"
+            );
+            let after = assert_dry_run_reset_writes_nothing(&fixture, &["b.txt"]).await;
+            assert_eq!(after.get("a.txt"), Some(&Some(b"committed".to_vec())));
+        })
+        .await;
+    }
+
     /// A dry run reset of files named inside a subdirectory leaves them alone, where the reset
     /// restores them.
     #[tokio::test]
@@ -1106,6 +1136,7 @@ mod tests {
     /// action it reports for it, by path.
     async fn reset_reports(
         fixture: &TestRepository,
+        paths: &[&str],
         globals: LoreGlobalArgs,
     ) -> Vec<(String, LoreFileAction)> {
         let reported = Arc::new(Mutex::new(Vec::new()));
@@ -1124,7 +1155,7 @@ mod tests {
         LORE_CONTEXT
             .scope(
                 execution.clone(),
-                reset_paths(fixture, &[""], ResetOptions::default()),
+                reset_paths(fixture, paths, ResetOptions::default()),
             )
             .await
             .expect("A reset must succeed");
@@ -1158,6 +1189,7 @@ mod tests {
 
             let dry_run = reset_reports(
                 &fixture,
+                &[""],
                 LoreGlobalArgs {
                     dry_run: 1,
                     ..Default::default()
@@ -1165,7 +1197,7 @@ mod tests {
             )
             .await;
             assert_eq!(working_tree(&fixture.path), before);
-            let reset = reset_reports(&fixture, LoreGlobalArgs::default()).await;
+            let reset = reset_reports(&fixture, &[""], LoreGlobalArgs::default()).await;
 
             assert_eq!(
                 reset,
@@ -1179,6 +1211,46 @@ mod tests {
             assert_eq!(dry_run, reset);
         })
         .await;
+    }
+
+    /// A dry run reset of an edited file `lore file dirty move` moved reports what the reset itself
+    /// does: the move back, and the restore of the committed file at its committed path. It leaves
+    /// the working tree as it found it.
+    #[tokio::test]
+    async fn a_dry_run_reset_reports_an_edited_dirty_move_as_the_reset_does() {
+        for named in [&["b.txt"][..], &["a.txt", "b.txt"], &[""]] {
+            with_fixture(async move |fixture| {
+                let path = |relative: &str| fixture.path.join(relative);
+                test_file_write(&path("a.txt"), b"committed");
+                test_commit_tree(&fixture, "Initial").await;
+                std::fs::rename(path("a.txt"), path("b.txt")).expect("Failed to move file");
+                dirty_move(&fixture, "a.txt", "b.txt").await;
+                test_file_write(&path("b.txt"), b"edited");
+                let before = working_tree(&fixture.path);
+                let dry_run = reset_reports(
+                    &fixture,
+                    named,
+                    LoreGlobalArgs {
+                        dry_run: 1,
+                        ..Default::default()
+                    },
+                )
+                .await;
+                assert_eq!(working_tree(&fixture.path), before);
+                let reset = reset_reports(&fixture, named, LoreGlobalArgs::default()).await;
+
+                assert_eq!(
+                    reset,
+                    [
+                        ("a.txt".to_string(), LoreFileAction::Move),
+                        ("a.txt".to_string(), LoreFileAction::Keep),
+                    ],
+                    "a reset of {named:?}"
+                );
+                assert_eq!(dry_run, reset, "a dry run reset of {named:?}");
+            })
+            .await;
+        }
     }
 
     /// A purge leaves a nested repository in place, one an ignore rule matches, whether it reaches
@@ -1985,8 +2057,8 @@ mod tests {
         }
     }
 
-    /// A node the staged tree moved away stands at its new path, so a reset of the path it left,
-    /// to the current or an earlier revision, leaves its move marked. Here `a.txt` was marked
+    /// A reset of the path a node the staged tree moved away left, to the current or an earlier
+    /// revision, leaves its move marked where a new file took that path. Here `a.txt` was marked
     /// moved to `b.txt` and a new `a.txt` staged as added in its place, which a reset of `a.txt`
     /// or of the whole tree refuses. Below the root, with the new `dir/a.txt` neither marked nor
     /// staged, a reset of `dir` writes over it.
@@ -2049,6 +2121,508 @@ mod tests {
                 .await;
             }
         }
+    }
+
+    /// Whether the reset left nothing staged or marked.
+    async fn nothing_left_marked(fixture: &TestRepository) -> bool {
+        state::State::deserialize_current_and_staged(fixture.repository.clone())
+            .await
+            .expect("Failed to deserialize the states")
+            .1
+            .is_none()
+    }
+
+    /// A reset to the current or an earlier revision undoes a dirty move where nothing else stands
+    /// at its source, whether it names the source, the destination, both, a directory above either,
+    /// a path inside a moved directory, or the whole tree, and with `--purge`: the working tree holds
+    /// the committed file there again, the destination is gone and nothing is left marked. Here as
+    /// a rename, a move into a directory, a move of a directory, and a move of an edited file.
+    #[tokio::test]
+    async fn a_reset_undoes_a_dirty_move() {
+        let renamed: &[&[&str]] = &[&["a.txt"], &["b.txt"], &["a.txt", "b.txt"], &[""]];
+        let into_directory: &[&[&str]] = &[&["a.txt"], &["dir/b.txt"], &["dir"], &[""]];
+        let directory: &[&[&str]] = &[&["src"], &["dst"], &["src/inner.txt"], &["dst/inner.txt"]];
+        for (to_first, purge) in [(true, false), (false, false), (false, true)] {
+            for (from, to, edited, named) in [
+                ("a.txt", "b.txt", false, renamed),
+                ("a.txt", "dir/b.txt", false, into_directory),
+                ("src", "dst", false, directory),
+                ("a.txt", "b.txt", true, renamed),
+            ] {
+                for named in named {
+                    with_fixture(async move |fixture| {
+                        let path = |relative: &str| fixture.path.join(relative);
+                        let committed = if from == "src" { "src/inner.txt" } else { from };
+                        test_directory_create(&path("src"));
+                        test_directory_create(&path("dir"));
+                        test_file_write(&path(committed), b"first");
+                        test_file_write(&path("dir/kept.txt"), b"kept");
+                        let first = test_commit_tree(&fixture, "First").await;
+                        test_file_write(&path("other.txt"), b"other");
+                        test_commit_tree(&fixture, "Second").await;
+                        let target = reset_target(&fixture, &first, to_first).await;
+
+                        std::fs::rename(path(from), path(to)).expect("Failed to move");
+                        dirty_move(&fixture, from, to).await;
+                        if edited {
+                            test_file_write(&path(to), b"edited");
+                            file::dirty::dirty(
+                                fixture.repository.clone(),
+                                path_arguments(&fixture.path, &[to]),
+                            )
+                            .await
+                            .expect("Dirty failed");
+                        }
+
+                        if purge {
+                            reset_paths(
+                                &fixture,
+                                named,
+                                ResetOptions {
+                                    purge,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                        } else {
+                            reset_to_revision(&fixture.repository, &fixture.path, named, &target)
+                                .await
+                        }
+                        .expect("A reset must succeed");
+                        assert_working_files(&fixture, &[(committed, Some(b"first")), (to, None)]);
+                        assert!(
+                            nothing_left_marked(&fixture).await,
+                            "a reset of {named:?} to the first revision {to_first}, purge \
+                             {purge}, left {from} moved to {to} marked"
+                        );
+                    })
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// A reset to the last merge from a branch undoes a dirty move as a reset to a named revision
+    /// does, here to the branch point, as no merge from the branch is found, and clears the mark of
+    /// an edited file it restores.
+    #[tokio::test]
+    async fn a_reset_to_the_last_merge_undoes_a_dirty_move() {
+        for named in [&["a.txt", "seed.txt"][..], &["b.txt", "seed.txt"], &[""]] {
+            in_execution(async move {
+                let (repository, tempdir) = committed_repository("", &[]).await;
+                let root = tempdir.to_path_buf();
+                let path = |relative: &str| root.join(relative);
+                test_file_write(&path("a.txt"), b"first");
+                commit_tree(&repository, &root, "First").await;
+                create_branch_on_instance(&repository, "feature", None, "", false)
+                    .await
+                    .expect("Branch create failed");
+                test_file_write(&path("other.txt"), b"other");
+                commit_tree(&repository, &root, "Second").await;
+                std::fs::rename(path("a.txt"), path("b.txt")).expect("Failed to move");
+                file::dirty::dirty_move(
+                    repository.clone(),
+                    path("a.txt").to_string_lossy().into_owned(),
+                    path("b.txt").to_string_lossy().into_owned(),
+                )
+                .await
+                .expect("Dirty move failed");
+                test_file_write(&path("seed.txt"), b"edited");
+                file::dirty::dirty(repository.clone(), path_arguments(&root, &["seed.txt"]))
+                    .await
+                    .expect("Dirty failed");
+
+                reset::reset_to_last_merged(
+                    repository.clone(),
+                    path_arguments(&root, named),
+                    LoreString::from(branch::DEFAULT_DEFAULT_NAME),
+                    ResetMergeSide::Resolved,
+                    ResetOptions::default(),
+                )
+                .await
+                .expect("A reset must succeed");
+                assert_eq!(
+                    std::fs::read(path("a.txt")).ok().as_deref(),
+                    Some(&b"first"[..])
+                );
+                assert!(!path("b.txt").exists(), "a reset of {named:?} left b.txt");
+                for marked in ["a.txt", "seed.txt"] {
+                    assert!(
+                        !next_node(&repository, marked).await.is_dirty_or_staged(),
+                        "a reset of {named:?} to the last merge left {marked} marked"
+                    );
+                }
+            })
+            .await;
+        }
+    }
+
+    /// A reset to the last merge from a branch leaves the same working tree and marks whichever
+    /// order it names a dirty move's ends in, where they resolve to different revisions: `a.txt`,
+    /// which no merge brought in, to the current revision, and `b.txt`, which a merge of `main`
+    /// brought in and a later revision deleted, to that merge, which holds a `b.txt` of its own.
+    #[tokio::test]
+    async fn a_reset_to_the_last_merge_gives_a_dirty_move_one_result_whichever_order_it_names_the_ends_in()
+     {
+        let mut results = Vec::new();
+        for named in [["a.txt", "b.txt"], ["b.txt", "a.txt"]] {
+            let result = Arc::new(Mutex::new(None));
+            let kept = result.clone();
+            in_execution(async move {
+                let (repository, tempdir) = committed_repository("", &[]).await;
+                let root = tempdir.to_path_buf();
+                let path = |relative: &str| root.join(relative);
+                let anchor = async || {
+                    lore_revision::instance::load_current_anchor_boxed(&repository)
+                        .await
+                        .expect("Failed to load current anchor")
+                };
+                let (base, main_branch) = anchor().await;
+                create_branch_on_instance(&repository, "feature", None, "", false)
+                    .await
+                    .expect("Branch create failed");
+                let feature_branch = anchor().await.1;
+                test_file_write(&path("a.txt"), b"a");
+                let feature = commit_tree(&repository, &root, "A").await.revision();
+                move_instance(&repository, main_branch, base).await;
+                std::fs::remove_file(path("a.txt")).expect("Failed to delete file");
+                test_file_write(&path("b.txt"), b"b");
+                commit_tree(&repository, &root, "B").await;
+                move_instance(&repository, feature_branch, feature).await;
+                std::fs::remove_file(path("b.txt")).expect("Failed to delete file");
+                test_file_write(&path("a.txt"), b"a");
+                LORE_CONTEXT
+                    .scope(
+                        test_execution_with(LoreGlobalArgs::default().set_offline()),
+                        Box::pin(branch::merge::merge_start(
+                            repository.clone(),
+                            repository
+                                .try_write_token()
+                                .expect("The repository was opened for writing"),
+                            main_branch,
+                            branch::merge::MergeStartOptions {
+                                message: "Merge main".to_string(),
+                                link_messages: std::collections::HashMap::new(),
+                                no_commit: false,
+                                scope: branch::merge::MergeScope::MainOnly,
+                                inherit_metadata: Default::default(),
+                            },
+                        )),
+                    )
+                    .await
+                    .expect("Merge failed");
+                std::fs::remove_file(path("b.txt")).expect("Failed to delete file");
+                commit_tree(&repository, &root, "Delete b").await;
+                std::fs::rename(path("a.txt"), path("b.txt")).expect("Failed to move");
+                file::dirty::dirty_move(
+                    repository.clone(),
+                    path("a.txt").to_string_lossy().into_owned(),
+                    path("b.txt").to_string_lossy().into_owned(),
+                )
+                .await
+                .expect("Dirty move failed");
+
+                reset::reset_to_last_merged(
+                    repository.clone(),
+                    path_arguments(&root, &named),
+                    LoreString::from(branch::DEFAULT_DEFAULT_NAME),
+                    ResetMergeSide::Resolved,
+                    ResetOptions::default(),
+                )
+                .await
+                .expect("A reset must succeed");
+                let tree = next_tree(&repository).await;
+                let mut marks = Vec::new();
+                for child in tree
+                    .node_children(repository.clone(), ROOT_NODE)
+                    .await
+                    .expect("Failed to list the children")
+                {
+                    marks.push((
+                        tree.node_name_clone(repository.clone(), child)
+                            .await
+                            .expect("Failed to read a name"),
+                        tree.node(repository.clone(), child)
+                            .await
+                            .expect("Failed to read a node")
+                            .flags,
+                    ));
+                }
+                marks.sort();
+                *kept.lock().expect("Failed to keep the result") =
+                    Some((working_tree(&root), marks));
+            })
+            .await;
+            results.push(result.lock().expect("Failed to read the result").take());
+        }
+        assert_eq!(results[0], results[1]);
+    }
+
+    /// A dry run reset, to the current revision or to the last merge from a branch, leaves the
+    /// mark of an edited file it would restore, as it leaves the file.
+    #[tokio::test]
+    async fn a_dry_run_reset_leaves_the_marks_it_would_clear() {
+        in_execution(async {
+            let (repository, tempdir) = committed_repository("", &[]).await;
+            let root = tempdir.to_path_buf();
+            create_branch_on_instance(&repository, "feature", None, "", false)
+                .await
+                .expect("Branch create failed");
+            test_file_write(&root.join("seed.txt"), b"edited");
+            file::dirty::dirty(repository.clone(), path_arguments(&root, &["seed.txt"]))
+                .await
+                .expect("Dirty failed");
+
+            let dry_run = || {
+                test_execution_with(LoreGlobalArgs {
+                    dry_run: 1,
+                    ..LoreGlobalArgs::default().set_offline()
+                })
+            };
+            LORE_CONTEXT
+                .scope(
+                    dry_run(),
+                    reset::reset(
+                        repository.clone(),
+                        repository
+                            .try_write_token()
+                            .expect("The repository was opened for writing"),
+                        path_arguments(&root, &["seed.txt"]),
+                        LoreString::default(),
+                        ResetOptions::default(),
+                    ),
+                )
+                .await
+                .expect("A dry run reset must succeed");
+            LORE_CONTEXT
+                .scope(
+                    dry_run(),
+                    reset::reset_to_last_merged(
+                        repository.clone(),
+                        path_arguments(&root, &["seed.txt"]),
+                        LoreString::from(branch::DEFAULT_DEFAULT_NAME),
+                        ResetMergeSide::Resolved,
+                        ResetOptions::default(),
+                    ),
+                )
+                .await
+                .expect("A dry run reset must succeed");
+            assert_eq!(
+                std::fs::read(root.join("seed.txt")).expect("seed.txt on disk"),
+                b"edited"
+            );
+            assert!(
+                next_node(&repository, "seed.txt").await.is_dirty(),
+                "a dry run reset cleared the mark of seed.txt"
+            );
+        })
+        .await;
+    }
+
+    /// A reset undoes moves that depend on each other: a directory moved out of another that was
+    /// moved into it.
+    #[tokio::test]
+    async fn a_reset_undoes_nested_dirty_moves() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            test_directory_create(&path("a/b"));
+            test_file_write(&path("a/b/f.txt"), b"f");
+            test_file_write(&path("a/g.txt"), b"g");
+            test_commit_tree(&fixture, "First").await;
+            std::fs::rename(path("a/b"), path("b")).expect("Failed to move");
+            dirty_move(&fixture, "a/b", "b").await;
+            std::fs::rename(path("a"), path("b/a")).expect("Failed to move");
+            dirty_move(&fixture, "a", "b/a").await;
+
+            reset_paths(&fixture, &["b"], ResetOptions::default())
+                .await
+                .expect("A reset must succeed");
+            assert_working_files(
+                &fixture,
+                &[
+                    ("a/b/f.txt", Some(b"f")),
+                    ("a/g.txt", Some(b"g")),
+                    ("b", None),
+                ],
+            );
+            assert!(
+                nothing_left_marked(&fixture).await,
+                "the nested moves stay marked"
+            );
+        })
+        .await;
+    }
+
+    /// A reset of either spelling undoes a dirty move that only changed the case of a name.
+    #[tokio::test]
+    async fn a_reset_undoes_a_dirty_move_that_changed_the_case_of_a_name() {
+        for named in ["a.txt", "A.txt"] {
+            with_fixture(async move |fixture| {
+                let path = |relative: &str| fixture.path.join(relative);
+                test_file_write(&path("a.txt"), b"first");
+                test_file_write(&path("other.txt"), b"other");
+                test_commit_tree(&fixture, "First").await;
+                std::fs::rename(path("a.txt"), path("A.txt")).expect("Failed to move");
+                dirty_move(&fixture, "a.txt", "A.txt").await;
+                test_file_write(&path("other.txt"), b"edited");
+                file::dirty::dirty(
+                    fixture.repository.clone(),
+                    path_arguments(&fixture.path, &["other.txt"]),
+                )
+                .await
+                .expect("Dirty failed");
+
+                reset_paths(&fixture, &[named], ResetOptions::default())
+                    .await
+                    .expect("A reset must succeed");
+                let names: Vec<String> = std::fs::read_dir(&fixture.path)
+                    .expect("Failed to list")
+                    .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+                    .filter(|name| name.eq_ignore_ascii_case("a.txt"))
+                    .collect();
+                assert_eq!(names, ["a.txt"], "a reset of {named} spells the file");
+                let tree = next_tree(&fixture.repository).await;
+                let id = node_at(&fixture.repository, &tree, "a.txt").await;
+                let node = tree
+                    .node(fixture.repository.clone(), id)
+                    .await
+                    .expect("Failed to read the node");
+                assert!(
+                    !node.is_dirty_or_staged(),
+                    "a reset of {named} left the move"
+                );
+                assert_eq!(
+                    tree.node_name_clone(fixture.repository.clone(), id)
+                        .await
+                        .expect("Failed to read the name"),
+                    "a.txt",
+                    "a reset of {named} left the moved spelling in the staged tree"
+                );
+            })
+            .await;
+        }
+    }
+
+    /// A reset keeps the file a dirty move that only changed the case of a name moved, where the
+    /// working tree holds a new file at the committed spelling beside it, as a file system that
+    /// does not fold case does: the reset restores the committed file there and leaves the moved one.
+    #[tokio::test]
+    async fn a_reset_keeps_a_case_only_dirty_move_where_a_new_file_took_the_committed_spelling() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            test_file_write(&path("a.txt"), b"first");
+            test_commit_tree(&fixture, "First").await;
+            std::fs::rename(path("a.txt"), path("A.txt")).expect("Failed to move");
+            dirty_move(&fixture, "a.txt", "A.txt").await;
+            test_file_write(&path("A.txt"), b"moved");
+            test_file_write(&path("a.txt"), b"new");
+            if std::fs::read(path("A.txt")).ok().as_deref() != Some(b"moved") {
+                return;
+            }
+
+            reset_paths(&fixture, &["A.txt"], ResetOptions::default())
+                .await
+                .expect("A reset must succeed");
+            assert_working_files(
+                &fixture,
+                &[("a.txt", Some(b"first")), ("A.txt", Some(b"moved"))],
+            );
+        })
+        .await;
+    }
+
+    /// A reset of the whole tree undoes a dirty move onto the name of a committed file marked
+    /// deleted, and restores that file.
+    #[tokio::test]
+    async fn a_reset_of_the_tree_undoes_a_dirty_move_onto_a_deleted_file() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            test_file_write(&path("a.txt"), b"a");
+            test_file_write(&path("b.txt"), b"b");
+            test_commit_tree(&fixture, "First").await;
+            std::fs::remove_file(path("b.txt")).expect("Failed to delete file");
+            file::dirty::dirty(
+                fixture.repository.clone(),
+                path_arguments(&fixture.path, &["b.txt"]),
+            )
+            .await
+            .expect("Dirty failed");
+            std::fs::rename(path("a.txt"), path("b.txt")).expect("Failed to move");
+            dirty_move(&fixture, "a.txt", "b.txt").await;
+
+            reset_paths(&fixture, &[""], ResetOptions::default())
+                .await
+                .expect("A reset must succeed");
+            assert_working_files(&fixture, &[("a.txt", Some(b"a")), ("b.txt", Some(b"b"))]);
+            assert!(nothing_left_marked(&fixture).await, "the move stays marked");
+        })
+        .await;
+    }
+
+    /// A reset refused for a staged path it names leaves a dirty move it also names as it was.
+    #[tokio::test]
+    async fn a_refused_reset_leaves_a_dirty_move() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            test_file_write(&path("a.txt"), b"first");
+            test_file_write(&path("c.txt"), b"first");
+            test_commit_tree(&fixture, "First").await;
+            std::fs::rename(path("a.txt"), path("b.txt")).expect("Failed to move file");
+            dirty_move(&fixture, "a.txt", "b.txt").await;
+            test_file_write(&path("c.txt"), b"staged");
+            stage_paths(&fixture.repository, &fixture.path, &["c.txt"], false, false).await;
+
+            assert!(
+                reset_paths(&fixture, &["b.txt", "c.txt"], ResetOptions::default())
+                    .await
+                    .is_err_and(|err| err.is_invalid_arguments()),
+                "a reset of a staged path is refused"
+            );
+            assert_working_files(
+                &fixture,
+                &[
+                    ("a.txt", None),
+                    ("b.txt", Some(b"first")),
+                    ("c.txt", Some(b"staged")),
+                ],
+            );
+            assert!(
+                next_node(&fixture.repository, "b.txt")
+                    .await
+                    .is_dirty_move(),
+                "the refused reset cleared the move of b.txt"
+            );
+        })
+        .await;
+    }
+
+    /// A reset of the destination of a dirty move leaves the move, and the destination, where a new
+    /// file took the move's source in the working tree.
+    #[tokio::test]
+    async fn a_reset_of_a_move_destination_leaves_the_move_where_a_file_took_its_source() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            test_file_write(&path("a.txt"), b"first");
+            test_commit_tree(&fixture, "First").await;
+            std::fs::rename(path("a.txt"), path("b.txt")).expect("Failed to move file");
+            dirty_move(&fixture, "a.txt", "b.txt").await;
+            test_file_write(&path("a.txt"), b"new");
+
+            reset_paths(&fixture, &["b.txt"], ResetOptions::default())
+                .await
+                .expect("A reset must succeed");
+            assert_working_files(
+                &fixture,
+                &[("a.txt", Some(b"new")), ("b.txt", Some(b"first"))],
+            );
+            assert!(
+                next_node(&fixture.repository, "b.txt")
+                    .await
+                    .is_dirty_move(),
+                "the reset cleared the move of b.txt"
+            );
+        })
+        .await;
     }
 
     /// Marks `name` below the fixture's root deleted, and an added `other` moved onto its name: a

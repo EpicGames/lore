@@ -1044,6 +1044,63 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// A reset naming a dirty move of the instance's own and a path the layer holds staged is
+    /// refused for the layer's path, and leaves the move as it was. No move is marked inside the
+    /// layer, as `lore file dirty move` refuses its paths.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_refused_in_a_layer_leaves_a_dirty_move_of_the_instance() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                let staged = fixture.stage_in_source().await;
+                fixture.write_layer_config(staged).await;
+                fixture.materialize_mount();
+                std::fs::rename(fixture.working(OWN), fixture.working("moved.txt"))
+                    .expect("Failed to move");
+                lore_revision::file::dirty::dirty_move(
+                    fixture.instance.repository.clone(),
+                    fixture.working(OWN).to_string_lossy().into_owned(),
+                    fixture.working("moved.txt").to_string_lossy().into_owned(),
+                )
+                .await
+                .expect("Dirty move failed");
+                lore_revision::file::dirty::dirty_move(
+                    fixture.instance.repository.clone(),
+                    fixture.working(MOUNTED_KEPT).to_string_lossy().into_owned(),
+                    fixture
+                        .working("mount/renamed.txt")
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+                .await
+                .expect_err("A move inside the layer is refused");
+                let anchor = fixture.staged_anchor().await;
+
+                let staged_in_mount = format!("{MOUNT}/{SOURCE_STAGED}");
+                let reset = fixture
+                    .try_reset(&["moved.txt", &staged_in_mount], None, false)
+                    .await;
+                assert!(
+                    reset.as_ref().is_err_and(|err| err.is_invalid_arguments()),
+                    "a reset of a path the layer holds staged is refused, got {reset:?}"
+                );
+                assert_eq!(
+                    (
+                        fixture.working_file(OWN),
+                        fixture.working_file("moved.txt").as_deref(),
+                        fixture.staged_anchor().await,
+                    ),
+                    (None, Some(OWN_CONTENT), anchor),
+                    "the refused reset leaves the move as it was"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     /// The same layer does not block a sync that leaves its mount where it stands. A sync carrying
     /// only the instance's own tree between revisions has no work for a layer at an unmoved revision
     /// under an unmoved view, so the staged content it holds is not at stake.

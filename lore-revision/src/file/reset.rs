@@ -46,10 +46,12 @@ use crate::lore::Hash;
 use crate::lore_debug;
 use crate::lore_limit_drain_tasks;
 use crate::lore_trace;
+use crate::lore_warn;
 use crate::node;
 use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::node::NodeID;
+use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
 use crate::path::resolve_user_paths;
@@ -395,8 +397,9 @@ struct ResetWalk {
     /// The revision the instance is on, which `state_staged` is built on.
     state_current: Arc<State>,
     state_staged: Arc<State>,
-    /// Each path the reset names, with the tree it is reset to.
-    paths: Vec<(RelativePath, Arc<State>)>,
+    /// Each path the reset names, in the working tree and in the trees, with the tree it is reset
+    /// to. The two paths differ only for an entry a dry run reports moving to the second.
+    paths: Vec<(RelativePath, RelativePath, Arc<State>)>,
     layer_walks: Vec<ResetLayerWalk>,
     options: ResetOptions,
     stats: Arc<ResetStats>,
@@ -421,8 +424,9 @@ async fn reset_walk_each_path(walk: ResetWalk) -> Option<ResetError> {
 /// are left alone rather than half-applied. A path that does not name anything inside the
 /// repository is reported ignored and skipped.
 async fn reset_walk_paths(walk: &ResetWalk) -> Option<ResetError> {
-    for (relative_path, state_target) in walk.paths.iter() {
-        let walked = reset_walk_path_to(walk, state_target.clone(), relative_path).await;
+    for (relative_path, state_path, state_target) in walk.paths.iter() {
+        let walked =
+            reset_walk_path_to(walk, state_target.clone(), relative_path, state_path).await;
 
         if let Err(err) = walked {
             return wrap_path_error(&walk.operation, relative_path, err)
@@ -466,11 +470,12 @@ async fn reset_walk_paths(walk: &ResetWalk) -> Option<ResetError> {
     None
 }
 
-/// Walks `relative_path` of `walk` against `state_target`.
+/// Walks `relative_path` of `walk` against `state_target`, which holds it at `state_path`.
 async fn reset_walk_path_to(
     walk: &ResetWalk,
     state_target: Arc<State>,
     relative_path: &RelativePath,
+    state_path: &RelativePath,
 ) -> Result<(), ResetError> {
     let staged_base = StagedBase::of(&state_target, &walk.state_current, &walk.repository).await?;
     reset_walk_path(
@@ -485,8 +490,8 @@ async fn reset_walk_path_to(
             file_tx: walk.file_tx.clone(),
         },
         relative_path.clone(),
-        relative_path.clone(),
-        false,
+        state_path.clone(),
+        relative_path.as_str() != state_path.as_str(),
     )
     .await
 }
@@ -771,6 +776,18 @@ pub async fn reset(
     // One operation covers the whole reset: it resolves the case each path is held in and
     // writes every file, and one opened per file would freeze a filesystem per file.
     let result = with_operation(repository.file_system(), async |operation| {
+        let paths = walk_paths_returning_moves(
+            &operation,
+            &repository,
+            &stats,
+            (&state_current, &state_staged),
+            parent_paths
+                .into_iter()
+                .map(|path| (path, state_target.clone()))
+                .collect(),
+            &producer_layer_walks,
+        )
+        .await?;
         let producer_operation = operation.clone();
         let walked = run_reset_pipeline(operation.clone(), stats.clone(), |file_tx| async move {
             reset_walk_each_path(ResetWalk {
@@ -778,10 +795,7 @@ pub async fn reset(
                 repository: producer_repository,
                 state_current,
                 state_staged,
-                paths: parent_paths
-                    .into_iter()
-                    .map(|path| (path, state_target.clone()))
-                    .collect(),
+                paths,
                 layer_walks: producer_layer_walks,
                 options,
                 stats: producer_stats,
@@ -809,30 +823,7 @@ pub async fn reset(
 
     event::LoreEvent::FileResetEnd(LoreFileResetEndEventData { count: counts }).send();
 
-    // If the staged state was modified (dirty flags cleared), persist it.
-    // If no staged or dirty nodes remain, delete the anchor.
-    if outer_state_staged.is_dirty() {
-        if !outer_state_staged
-            .node_has_staged_or_dirty_children(repository.clone(), ROOT_NODE)
-            .await
-            .forward::<ResetError>("Failed deserializing state node block")?
-        {
-            crate::instance::delete_staged_anchor(&repository)
-                .await
-                .forward::<ResetError>("Failed deserializing state node block")?;
-        } else {
-            let token = repository
-                .try_write_token()
-                .expect("reset requires write access");
-            let signature = outer_state_staged
-                .serialize(repository.clone(), token)
-                .await
-                .forward::<ResetError>("Failed deserializing state node block")?;
-            crate::instance::store_staged_anchor(&repository, signature)
-                .await
-                .forward::<ResetError>("Failed deserializing state node block")?;
-        }
-    }
+    store_staged_tree(&repository, &outer_state_staged).await?;
 
     store_layer_walk_states(repository.clone(), &layer_walks).await?;
 
@@ -845,6 +836,36 @@ pub async fn reset(
     }
 
     result
+}
+
+/// Stores `state_staged` where a reset changed it, as the staged anchor, or deletes the anchor
+/// where nothing staged or dirty is left. A dry run stores nothing, though its walk cleared marks.
+async fn store_staged_tree(
+    repository: &Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+) -> Result<(), ResetError> {
+    if !state_staged.is_dirty() || execution_context().globals().dry_run() {
+        return Ok(());
+    }
+    if !state_staged
+        .node_has_staged_or_dirty_children(repository.clone(), ROOT_NODE)
+        .await
+        .forward::<ResetError>("Failed deserializing state node block")?
+    {
+        return crate::instance::delete_staged_anchor(repository)
+            .await
+            .forward::<ResetError>("Failed deserializing state node block");
+    }
+    let token = repository
+        .try_write_token()
+        .expect("reset requires write access");
+    let signature = state_staged
+        .serialize(repository.clone(), token)
+        .await
+        .forward::<ResetError>("Failed deserializing state node block")?;
+    crate::instance::store_staged_anchor(repository, signature)
+        .await
+        .forward::<ResetError>("Failed deserializing state node block")
 }
 
 /// Resets files to the state they were in at the last merged revision on a branch.
@@ -962,6 +983,7 @@ pub async fn reset_to_last_merged(
     .send();
 
     let outer_stats = stats.clone();
+    let outer_state_staged = state_staged.clone();
     let producer_repository = repository.clone();
     let producer_stats = stats.clone();
     let branch_id = branch.id;
@@ -982,6 +1004,15 @@ pub async fn reset_to_last_merged(
             &stats.layer_mounts,
             options.single_node,
         ))
+        .await?;
+        let paths = walk_paths_returning_moves(
+            &operation,
+            &repository,
+            &stats,
+            (&state_current, &state_staged),
+            paths,
+            &[],
+        )
         .await?;
         let producer_operation = operation.clone();
         let walked = run_reset_pipeline(operation.clone(), stats.clone(), |file_tx| async move {
@@ -1009,6 +1040,7 @@ pub async fn reset_to_last_merged(
         count: count_data(&outer_stats),
     })
     .send();
+    store_staged_tree(&repository, &outer_state_staged).await?;
 
     result
 }
@@ -1086,6 +1118,324 @@ async fn reset_staged_links_under_paths(
     .forward::<ResetError>("Failed to reset staged link nodes")?;
 
     Ok(reset_count)
+}
+
+/// Undoes each move marked by `lore file dirty move` and not staged that the staged tree's diff
+/// below one of `paths` holds, of the node itself or of a directory above it, before the walk: the
+/// node goes back where the current revision holds it, what the working tree holds at its path
+/// moves there with it, and its marks are cleared, a directory's once the walk clears what moved
+/// with it. Answers the paths to walk, each with the tree it is reset to: `paths`, and the path of
+/// each move undone that none of them covers, reset to the tree of the first by name of the paths
+/// it was found below, so the order of `paths` changes nothing,
+/// with the path the working tree holds it at, which differs only in a dry run, which reports each
+/// move and changes nothing.
+///
+/// Where a path, or a path in one of `layer_walks`, holds a staged node the walk refuses, or the
+/// root is named and the staged tree holds staged content, every move stays, so a refused reset
+/// changes nothing. The diff of a path
+/// reports one of two nodes holding its name, so a node moved beside one marked deleted there is
+/// read apart ([`beside_deleted`]). A move waits while the working tree holds something at its
+/// committed path, and goes back once a move undone before it frees the path; where none frees
+/// it, the move stays.
+async fn walk_paths_returning_moves(
+    operation: &InstanceOperationImpl,
+    repository: &Arc<RepositoryContext>,
+    stats: &ResetStats,
+    (state_current, state_staged): (&Arc<State>, &Arc<State>),
+    paths: Vec<(RelativePath, Arc<State>)>,
+    layer_walks: &[ResetLayerWalk],
+) -> Result<Vec<(RelativePath, RelativePath, Arc<State>)>, ResetError> {
+    let mut walked: Vec<_> = paths
+        .iter()
+        .map(|(path, state_target)| (path.clone(), path.clone(), state_target.clone()))
+        .collect();
+    if Arc::ptr_eq(state_staged, state_current) {
+        return Ok(walked);
+    }
+    for layer in layer_walks {
+        for (_, state_path) in layer.paths.iter() {
+            if refuses_staged(
+                &layer.state.state_staged,
+                &layer.state.repository,
+                state_path,
+            )
+            .await?
+            {
+                return Ok(walked);
+            }
+        }
+    }
+    for (path, _) in paths.iter() {
+        if refuses_staged(state_staged, repository, path).await? {
+            return Ok(walked);
+        }
+    }
+    let mut moved = Vec::new();
+    for (at, (path, _)) in paths.iter().enumerate() {
+        let changes = state::diff_collect(
+            repository.clone(),
+            state_current.clone(),
+            repository.clone(),
+            state_staged.clone(),
+            (!path.is_empty()).then(|| path.clone()),
+            FilterMode::CHANGES,
+        )
+        .await
+        .forward::<ResetError>("Listing the changes below a path the reset names")?;
+        for change in changes {
+            if Arc::ptr_eq(&change.to.mapping.state, state_staged) {
+                moved.push((change.to.mapping.node, at));
+            }
+            if Arc::ptr_eq(&change.from.mapping.state, state_current) {
+                moved.push((change.from.mapping.node, at));
+            }
+        }
+        if let Ok(link) = state_staged
+            .find_node_link(repository.clone(), path.as_str())
+            .await
+            && let Ok(Beside::Moved(beside)) = beside_deleted(
+                state_staged,
+                repository,
+                link.node,
+                hash_string(path.name()),
+            )
+            .await
+        {
+            moved.push((beside, at));
+        }
+    }
+
+    let mut name = String::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut found = std::collections::BTreeMap::<NodeID, Vec<usize>>::new();
+    for (mut id, at) in moved {
+        while id.is_valid_node_id() && visited.insert((id, at)) {
+            let node = state_staged
+                .node(repository.clone(), id)
+                .await
+                .forward::<ResetError>("Reading a staged node")?;
+            if node.is_dirty_move()
+                && !node.is_staged()
+                && state_staged
+                    .at_base_place(repository, state_current.revision(), (id, &node), &mut name)
+                    .await
+                    .forward::<ResetError>("Reading where the current revision holds a node")?
+                    == Some(false)
+            {
+                found.entry(id).or_default().push(at);
+            }
+            id = node.parent;
+        }
+    }
+
+    let mut pending: Vec<_> = found.into_iter().collect();
+    loop {
+        let mut progressed = false;
+        let mut waiting = Vec::new();
+        for (id, found_by) in pending {
+            let targets: Vec<&State> = found_by.iter().map(|&at| &*paths[at].1).collect();
+            match Box::pin(return_dirty_move(
+                operation,
+                repository,
+                stats,
+                (state_current, state_staged, &targets),
+                id,
+                &mut name,
+            ))
+            .await?
+            {
+                Returned::Back(held, path) => {
+                    progressed = true;
+                    if !paths
+                        .iter()
+                        .any(|(named, _)| mount_at_or_below(named, &path))
+                        && let Some(&first) =
+                            found_by.iter().min_by_key(|&&at| paths[at].0.as_str())
+                    {
+                        walked.push((held, path, paths[first].1.clone()));
+                    }
+                }
+                Returned::Waits => waiting.push((id, found_by)),
+                Returned::Stays => {}
+            }
+        }
+        if waiting.is_empty() || !progressed {
+            return Ok(walked);
+        }
+        pending = waiting;
+    }
+}
+
+/// Whether the walk of `path` refuses it for a staged node, as [`refuse_staged`] refuses it, or,
+/// for the root, whether `state_staged` holds staged content at all.
+async fn refuses_staged(
+    state_staged: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    path: &RelativePath,
+) -> Result<bool, ResetError> {
+    if path.is_empty() {
+        return state_staged
+            .holds_staged_content(repository.clone(), ROOT_NODE)
+            .await
+            .forward::<ResetError>("Reading the staged tree");
+    }
+    Ok(refuse_staged(state_staged, repository, path).await.is_err())
+}
+
+/// What [`return_dirty_move`] did with a move.
+enum Returned {
+    /// It went back to the second path, from the first where the working tree holds it.
+    Back(RelativePath, RelativePath),
+    /// Its committed path is taken in the working tree, which a move undone after may free.
+    Waits,
+    /// It stays.
+    Stays,
+}
+
+/// Undoes the move of `id` as [`walk_paths_returning_moves`] describes, moving the working tree's entry
+/// first and putting it back where the staged tree's half fails. A move stays where its committed
+/// parent is marked deleted, where the staged tree holds another node at its place, and where one
+/// of `targets`, the trees the paths that found it are reset to, is another revision than
+/// `state_current` and holds its path in the staged tree, which the walk resets. A dry run reports the move and changes nothing, and the walk
+/// reports what it finds at the move's path in the working tree at its committed path
+/// ([`ResetStats::reported`]).
+async fn return_dirty_move(
+    operation: &InstanceOperationImpl,
+    repository: &Arc<RepositoryContext>,
+    stats: &ResetStats,
+    (state_current, state_staged, targets): (&Arc<State>, &Arc<State>, &[&State]),
+    id: NodeID,
+    name: &mut String,
+) -> Result<Returned, ResetError> {
+    let Some(from) = state_staged
+        .node_path_below(repository.clone(), id, ROOT_NODE)
+        .await
+        .forward::<ResetError>("Reading the path of a staged node")?
+    else {
+        return Ok(Returned::Stays);
+    };
+    for state_target in targets {
+        if state_target.revision() != state_current.revision()
+            && state_target
+                .find_node_link(repository.clone(), from.as_str())
+                .await
+                .is_ok()
+        {
+            return Ok(Returned::Stays);
+        }
+    }
+    let committed = state_current
+        .node(repository.clone(), id)
+        .await
+        .forward::<ResetError>("Reading a committed node")?;
+    let committed_name = state_current
+        .node_name_clone(repository.clone(), id)
+        .await
+        .forward::<ResetError>("Reading a committed name")?;
+    let parent_deleted = state_staged
+        .node(repository.clone(), committed.parent)
+        .await
+        .forward::<ResetError>("Reading a staged node")?
+        .is_deleted();
+    let Some(parent) = state_staged
+        .node_path_below(repository.clone(), committed.parent, ROOT_NODE)
+        .await
+        .forward::<ResetError>("Reading the path of a staged node")?
+        .filter(|_| !parent_deleted)
+    else {
+        return Ok(Returned::Stays);
+    };
+    let to = parent.join(&committed_name);
+    if !operation
+        .file_info(&to)
+        .await
+        .is_ok_and(|info| !info.exists())
+        && operation.names_one_entry(&from, &to).await.ok() != Some(Some(true))
+    {
+        return Ok(Returned::Waits);
+    }
+    if execution_context().globals().dry_run() {
+        send_move(&to, &from);
+        stats.dry_run_moves.write().push((from.clone(), to.clone()));
+        return Ok(Returned::Back(from, to));
+    }
+
+    let (left, is_directory) = state_staged
+        .node(repository.clone(), id)
+        .await
+        .forward::<ResetError>("Reading a staged node")
+        .map(|node| (node.parent, node.is_directory()))?;
+    move_entry(operation, &from, &to).await?;
+    let back = state_staged
+        .node_return_unstaged_move(
+            repository,
+            state_current.revision(),
+            id,
+            name,
+            state::ReturnOptions::default(),
+        )
+        .await;
+    if !matches!(back, Ok((state::Return::Back, _))) {
+        move_entry(operation, &to, &from).await?;
+        return Ok(match back.forward::<ResetError>("Moving a node back")?.0 {
+            state::Return::Held => Returned::Waits,
+            _ => Returned::Stays,
+        });
+    }
+    let clear = if is_directory {
+        Clear::Vacated
+    } else {
+        Clear::Dirty
+    };
+    state_staged
+        .node_clear(repository, id, clear)
+        .await
+        .forward::<ResetError>("Failed to clear the dirty flags")?;
+    state_staged
+        .node_clear(repository, left, Clear::Vacated)
+        .await
+        .forward::<ResetError>("Failed to clear the dirty flags")?;
+    send_move(&to, &from);
+    Ok(Returned::Back(to.clone(), to))
+}
+
+/// Moves what the working tree holds at `from` to `to`, creating the directories `to` lands in and
+/// removing them again where the move fails; nothing where it holds nothing at `from`, which
+/// leaves the walk to restore `to`.
+async fn move_entry(
+    operation: &InstanceOperationImpl,
+    from: &RelativePath,
+    to: &RelativePath,
+) -> Result<(), ResetError> {
+    let exists = async |path: &RelativePath| {
+        operation
+            .file_info(path)
+            .await
+            .is_ok_and(|info| info.exists())
+    };
+    if !exists(from).await {
+        return Ok(());
+    }
+    let mut created = Vec::new();
+    let mut parent = to.parent_path();
+    while !parent.is_empty() && !exists(&parent).await {
+        let above = parent.parent_path();
+        created.push(parent);
+        parent = above;
+    }
+    if let Some(deepest) = created.first() {
+        create_empty_directory::<ResetError>(operation, deepest).await?;
+    }
+    let Err(err) = operation.rename(from, to).await else {
+        return Ok(());
+    };
+    for directory in created.iter() {
+        if let Err(left) = operation.remove_empty_directory(directory).await {
+            lore_warn!("Reset leaves {directory}, which it created for a move back: {left}");
+            break;
+        }
+    }
+    Err(err).forward::<ResetError>("Moving a moved node back")
 }
 
 /// Names in `err` whether the working tree holds the path it failed on, which separates a path
@@ -1479,7 +1829,8 @@ fn reset_walk_directory_recurse(
 /// it on disk. The two differ only for a layer mounted somewhere other than the path it
 /// occupies in its own repository. Only the entry lookup needs `state_path`: the walk
 /// proceeds by node id from there and builds every path below it from `relative_path`.
-/// `at_mount` says `relative_path` is the mount of a layer, whose spelling is the mount's.
+/// `at_mount` says `relative_path` keeps its own spelling: the mount of a layer, or an entry a dry
+/// run reports moving to `state_path`.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
@@ -1638,7 +1989,7 @@ fn reset_walk_named_path(
                     }
                     None => Beside::Nothing,
                 };
-                if matches!(beside, Beside::Moved) {
+                if matches!(beside, Beside::Moved(_)) {
                     lore_trace!(
                         "Reset leaves {} deleted, as a move took its place",
                         relative_path.as_str()
@@ -1680,9 +2031,10 @@ fn reset_walk_named_path(
                 // A path absent from the target revision is one of: a file committed
                 // in the current revision but added after the target (delete it so the
                 // working tree matches the target, unless the view excludes it, which
-                // only --purge deletes), a pending dirty-add, or an untracked file (keep
-                // on disk unless --purge, discarding add tracking). A path inside a link is refused,
-                // since its node is numbered in the linked tree, not in `state_staged`.
+                // only --purge deletes), a pending dirty-add, an untracked file (keep
+                // on disk unless --purge, discarding add tracking), or the destination of a
+                // dirty move the reset did not undo (keep as it is). A path inside a link is
+                // refused, since its node is numbered in the linked tree, not in `state_staged`.
                 let mut delete_path = options.purge;
                 if let Ok(staged_link) = state_staged
                     .find_node_link(repository.clone(), state_path.as_str())
@@ -1698,17 +2050,31 @@ fn reset_walk_named_path(
                     .into());
                     }
                     // The flags alone, so the record is not held across the awaits below.
-                    let (dirty_add, link, directory) = state_staged
+                    let (dirty_add, dirty_move, link, directory) = state_staged
                         .node(repository.clone(), staged_link.node)
                         .await
                         .forward::<ResetError>("Failed to find staged node")
-                        .map(|node| (node.is_dirty_add(), node.is_link(), node.is_directory()))?;
+                        .map(|node| {
+                            (
+                                node.is_dirty_add(),
+                                node.is_dirty_move(),
+                                node.is_link(),
+                                node.is_directory(),
+                            )
+                        })?;
 
                     if dry_run_unstaged_link(link) {
                         return Ok(());
                     }
                     refuse_staged_node(&state_staged, &repository, staged_link.node).await?;
 
+                    if dirty_move && !dirty_add {
+                        lore_trace!(
+                            "Reset leaves {}, the destination of a move it does not undo",
+                            relative_path.as_str()
+                        );
+                        return Ok(());
+                    }
                     if dirty_add {
                         lore_trace!(
                             "Reset dirty add {}, discarding staged node and keeping the file",
@@ -1812,9 +2178,9 @@ enum Beside {
     Nothing,
     /// A dirty add or copy, which the reset discards to restore the deleted node.
     Replaced(NodeID),
-    /// A node marked dirty as moved there, which the reset leaves as it leaves every move, the
-    /// deletion beside it marked.
-    Moved,
+    /// A node marked dirty as moved there, which the reset leaves, the deletion beside it marked,
+    /// where it did not undo the move first ([`walk_paths_returning_moves`]).
+    Moved(NodeID),
 }
 
 /// What stands beside `node_id` in `state_staged` under its name, `name_hash`, where `node_id` is
@@ -1851,7 +2217,7 @@ async fn beside_deleted(
         if sibling_node.is_dirty_add() || sibling_node.is_dirty_copy() {
             Beside::Replaced(sibling)
         } else if sibling_node.is_dirty_move() {
-            Beside::Moved
+            Beside::Moved(sibling)
         } else {
             Beside::Nothing
         },
@@ -2149,17 +2515,9 @@ async fn respell(
     {
         return (to_path, false);
     }
-    let moved = |to: &RelativePath, from: &RelativePath| {
-        event::LoreEvent::FileResetFile(LoreFileResetFileEventData {
-            path: to.as_str().into(),
-            action: LoreFileAction::Move,
-            from_path: from.as_str().into(),
-        })
-        .send();
-    };
     if execution_context().globals().dry_run() {
         let reported = stats.reported(&to_path);
-        moved(&reported, &stats.reported(relative_path));
+        send_move(&reported, &stats.reported(relative_path));
         stats
             .dry_run_moves
             .write()
@@ -2169,7 +2527,7 @@ async fn respell(
     match operation.rename(relative_path, &to_path).await {
         Ok(()) => {
             lore_trace!("Renamed {relative_path} to the spelling the revision holds, {to_path}");
-            moved(&to_path, relative_path);
+            send_move(&to_path, relative_path);
             (to_path, true)
         }
         Err(refused)
@@ -2363,6 +2721,16 @@ async fn respell_mount_missed(
         return None;
     }
     respell_missed(operation, stats, repository, missed, relative_path, node).await
+}
+
+/// Sends the Move event of what the reset moves from `from` to `to` in the working tree.
+fn send_move(to: &RelativePath, from: &RelativePath) {
+    event::LoreEvent::FileResetFile(LoreFileResetFileEventData {
+        path: to.as_str().into(),
+        action: LoreFileAction::Move,
+        from_path: from.as_str().into(),
+    })
+    .send();
 }
 
 /// Sends the Delete event of `relative_path`, which the reset removes from the working tree, at

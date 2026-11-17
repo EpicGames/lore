@@ -2773,43 +2773,86 @@ async fn a_reset_discards_a_dirty_add_beside_a_deleted_node_in_either_order() {
 }
 
 /// A reset of a path whose committed node is marked deleted beside a node `lore file dirty move`
-/// took there leaves both, as a reset leaves every move: the move stays, the deletion stays marked,
-/// and the working tree keeps the moved file. Whichever of the two the chain holds first.
+/// took there undoes the move and restores the committed file: the moved file goes back to its
+/// committed path and nothing is left marked. Whichever of the two the chain holds first.
 #[tokio::test]
-async fn a_reset_leaves_a_dirty_move_beside_a_deleted_node_in_either_order() {
+async fn a_reset_undoes_a_dirty_move_beside_a_deleted_node_in_either_order() {
     let orders = Arc::new(Mutex::new(BTreeSet::new()));
-    for (took, content) in [
-        (TookName::MovedIn, &b"b"[..]),
-        (TookName::Renamed { behind: true }, &b"a/g"[..]),
-        (TookName::Renamed { behind: false }, &b"a/g"[..]),
+    for (took, from) in [
+        (TookName::MovedIn, "b"),
+        (TookName::Renamed { behind: true }, "a/g"),
+        (TookName::Renamed { behind: false }, "a/g"),
     ] {
         let orders = orders.clone();
         with_instance(|instance| async move {
             let (held, live, ahead) = beside_deleted_f(&instance, took, false).await;
-            let before = staged_tree(&instance).await.revision();
             reset_to_current(&instance, "a/f").await.expect("the reset");
-            let state = staged_tree(&instance).await;
-            assert_eq!(state.revision(), before, "{took:?}: the staged tree");
-            assert!(
-                node_of(&instance, &state, live).await.is_dirty_move(),
-                "{took:?}: the move stays"
-            );
-            assert!(
-                node_of(&instance, &state, held["a/f"])
-                    .await
-                    .is_dirty_delete(),
-                "{took:?}: the deletion stays marked"
-            );
-            assert_eq!(
-                std::fs::read(instance.path.join("a/f")).expect("a/f on disk"),
-                content,
-                "{took:?}: a/f holds the moved file"
-            );
+            let state = tree_after(&instance).await;
+            for (path, node) in [("a/f", held["a/f"]), (from, live)] {
+                assert_eq!(
+                    node_id_at(&instance, &state, path).await,
+                    node,
+                    "{took:?}: {path} holds its committed node"
+                );
+                let restored = node_of(&instance, &state, node).await;
+                assert!(
+                    !restored.is_dirty() && !restored.is_staged(),
+                    "{took:?}: {path}, flags {:#x}",
+                    restored.flags
+                );
+                assert_eq!(
+                    std::fs::read(instance.path.join(path)).expect("the file on disk"),
+                    path.as_bytes(),
+                    "{took:?}: {path} holds its committed content"
+                );
+            }
             orders.lock().insert(ahead);
         })
         .await;
     }
     assert_eq!(orders.lock().len(), 2, "both chain orders");
+}
+
+/// A reset whose move of the working tree's entry back is refused fails, and leaves the dirty move
+/// as it was in the staged tree and the working tree. Here the file moved out of `d`, which the
+/// working tree no longer holds, so the reset creates `d` for the move and removes it again.
+#[tokio::test]
+async fn a_reset_whose_move_back_fails_leaves_the_dirty_move() {
+    with_instance(|instance| async move {
+        let first = committed(&instance, &["d/a", "other.txt"]).await;
+        let held = tree_paths(&instance, &first).await;
+        dirty_moved(&instance, "d/a", "b").await;
+        std::fs::remove_dir(instance.path.join("d")).expect("the removal of d");
+
+        lore_revision::file::reset::reset(
+            failing_context(&instance, &[]),
+            &instance.write_token,
+            LoreArray::from_vec(vec![LoreString::from(&instance.path.join("b"))]),
+            LoreString::default(),
+            lore_revision::file::reset::ResetOptions::default(),
+        )
+        .await
+        .expect_err("a refused move back fails the reset");
+        let state = staged_tree(&instance).await;
+        assert_eq!(
+            node_id_at(&instance, &state, "b").await,
+            held["d/a"],
+            "b holds the moved node"
+        );
+        assert!(
+            node_of(&instance, &state, held["d/a"])
+                .await
+                .is_dirty_move(),
+            "the move stays marked"
+        );
+        assert_eq!(
+            std::fs::read(instance.path.join("b")).expect("b on disk"),
+            b"d/a",
+            "b holds the moved file"
+        );
+        assert!(!instance.path.join("d").exists(), "the reset left d behind");
+    })
+    .await;
 }
 
 /// A reset of a path whose name a node marked deleted and a node beside it hold, either of them

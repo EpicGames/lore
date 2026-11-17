@@ -1762,7 +1762,7 @@ impl InstanceOperation for InstanceOperationImpl {
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => this.remove_empty_directory(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.remove_empty_directory(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.remove_empty_directory(path).await,
             #[cfg(target_os = "linux")]
@@ -2269,8 +2269,12 @@ pub mod test_util {
             }
         }
 
-        async fn remove_empty_directory(&self, _path: &RelativePath) -> Result<(), FsError> {
-            panic!("Test operation unimplemented except finalize")
+        /// Removes under the directory the provider reads from, and panics where it reads from none.
+        async fn remove_empty_directory(&self, path: &RelativePath) -> Result<(), FsError> {
+            match &self.reads {
+                Some(reads) => reads.remove_empty_directory(path).await,
+                None => panic!("Test operation unimplemented except finalize"),
+            }
         }
 
         /// Records the path, removing nothing.
