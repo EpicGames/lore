@@ -138,9 +138,11 @@ def test_link_add_allows_non_nesting_source_paths(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_link_reset_rejects_restoring_an_overlapping_mount(new_lore_repo):
+@pytest.mark.parametrize("replaced", [False, True])
+def test_link_reset_rejects_restoring_an_overlapping_mount(new_lore_repo, replaced):
     """Staging a removal hides a mount from the registry, so a nesting mount can
-    be added while it is gone. Resetting the removal must not restore the overlap.
+    be added while it is gone. Resetting the removal must not restore the overlap,
+    and leaves a link to another repository added in its place as it was.
     """
     parent, link_repo = _parent_and_link_for_overlap(new_lore_repo)
 
@@ -149,14 +151,22 @@ def test_link_reset_rejects_restoring_an_overlapping_mount(new_lore_repo):
     parent.push()
 
     parent.link_remove("vendor/whole")
+    expected = {"vendor/part": "sub/test"}
+    if replaced:
+        other_repo: Lore = new_lore_repo()
+        other_repo.write_commit_push("Initial other", {"other.txt": "other\n"})
+        parent.link_add("vendor/whole", other_repo.get_id(), "/")
+        expected["vendor/whole"] = "/"
     parent.link_add("vendor/part", link_repo.get_id(), "sub/test")
+    files = parent.read_files()
 
     with pytest.raises(OverlappingLinkError):
         parent.reset("vendor/whole")
 
-    assert _mounted_source_paths(parent) == {"vendor/part": "sub/test"}, (
+    assert _mounted_source_paths(parent) == expected, (
         "A refused reset must leave the staged registry as it was"
     )
+    assert parent.read_files() == files
 
 
 @pytest.mark.smoke

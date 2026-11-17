@@ -939,7 +939,8 @@ enum MountVerdict {
 /// unknown, and so does an entry the removal keeps where `incoming` writes.
 #[allow(clippy::too_many_arguments)]
 async fn verify_mount(
-    change: &NodeChange,
+    mount: &RelativePath,
+    deletes: bool,
     shown: Option<MountedTree>,
     operation: &Arc<InstanceOperationImpl>,
     filter: &Filter,
@@ -948,7 +949,6 @@ async fn verify_mount(
     incoming: &IncomingWrites<'_>,
     forward_changes: bool,
 ) -> Result<MountVerdict, SyncError> {
-    let mount = change.path();
     let work = state::link_mount_work(operation, shown.clone(), mount, forward_changes, |path| {
         held.binary_search(&path.as_lowercase_str()).is_ok()
     })
@@ -966,7 +966,7 @@ async fn verify_mount(
         // A switch or merge reaches this as a sync does, with no --forward-changes to offer.
         lore_error!("Commit or reset them, or use --force to discard them");
         return Err(LocalModifications.into());
-    } else if change.action == change::FileAction::Delete {
+    } else if deletes {
         lore_info!(
             "Keeping local changes in link mount {mount}: {}",
             work.named()
@@ -1040,7 +1040,8 @@ async fn verify_mounts(
         let held = held.get_or_insert_with(|| folded_and_sorted(kept));
         let writes = incoming_writes(change, incoming).await?;
         match verify_mount(
-            change,
+            change.path(),
+            change.action == change::FileAction::Delete,
             shown,
             &args.operation,
             &change.from.mapping.repository.filter,
@@ -1075,7 +1076,8 @@ pub(crate) async fn verify_merge_mounts(
         };
         let writes = incoming_writes(change, incoming).await?;
         verify_mount(
-            change,
+            change.path(),
+            change.action == change::FileAction::Delete,
             shown,
             operation,
             &current.repository.filter,
@@ -1087,6 +1089,31 @@ pub(crate) async fn verify_merge_mounts(
         .await?;
     }
     Ok(())
+}
+
+/// Refuses removing the mount at `mount` of the tree `shown`, which a link `repository` holds
+/// there mounts, for `incoming`, the tree of a link to another repository, where a sync moving the
+/// link to that repository refuses ([`verify_mount`]).
+pub(crate) async fn verify_mount_replacement(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &RepositoryContext,
+    mount: &RelativePath,
+    shown: Option<MountedTree>,
+    incoming: NodeMapping,
+) -> Result<(), SyncError> {
+    verify_mount(
+        mount,
+        false,
+        shown,
+        operation,
+        &repository.filter,
+        repository.path(),
+        &[],
+        &IncomingWrites::Tree(incoming),
+        false,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// `paths` lowercase and sorted, for a binary search by case-folded path.
@@ -3838,7 +3865,7 @@ async fn realize_moved_mount(
     let link_context = repository
         .to_link_context(node.address.context.into())
         .await;
-    realize_link_pin_change_boxed(
+    crate::link::realize_link_pin_change_boxed(
         operation,
         repository,
         link_context,
@@ -3849,27 +3876,10 @@ async fn realize_moved_mount(
             current_node: from_node.child,
             mount_source: crate::link::LinkMountSource::Node(node.child),
         },
+        false,
     )
     .await
     .forward::<SyncError>("Failed realizing the subtree a link exposes")
-}
-
-/// [`realize_link_pin_change_in_operation`](crate::link::realize_link_pin_change_in_operation) for
-/// a moved mount, the cold path. Boxed with an explicit `Send`, since that realize reaches
-/// [`realize_moved_mount`] again.
-fn realize_link_pin_change_boxed(
-    operation: &Arc<InstanceOperationImpl>,
-    repository: Arc<RepositoryContext>,
-    link_context: Arc<RepositoryContext>,
-    target: crate::link::LinkPinRealizeTarget,
-) -> std::pin::Pin<Box<dyn Future<Output = Result<(), crate::link::LinkError>> + Send + '_>> {
-    Box::pin(crate::link::realize_link_pin_change_in_operation(
-        operation,
-        repository,
-        link_context,
-        target,
-        false,
-    ))
 }
 
 /// Recovers from the refusal of a move's rename, `refused`: removes what `to` holds, for the node

@@ -198,6 +198,23 @@ impl LinkTracker {
         self.links.insert(link_context, false);
     }
 
+    /// Stops tracking the link to `link_repository_id` at `link_node_id` in
+    /// `parent_repository_id`, which the unstage dropped.
+    pub fn remove_link(
+        &self,
+        link_repository_id: RepositoryId,
+        link_node_id: NodeID,
+        parent_repository_id: RepositoryId,
+    ) {
+        self.links.retain(|link, _| {
+            (
+                link.link_repository_id,
+                link.link_node_id,
+                link.parent_repository_id,
+            ) != (link_repository_id, link_node_id, parent_repository_id)
+        });
+    }
+
     /// Marks the links into `repository` as needing rehashing.
     ///
     /// A link's target is always a repository reached through a link, so for any other
@@ -2104,6 +2121,24 @@ pub(crate) async fn realize_link_pin_change_in_operation(
         overwrite_local,
     )
     .await
+}
+
+/// [`realize_link_pin_change_in_operation`] for a cold path, boxed so it doesn't grow the future of
+/// its caller. Boxed with an explicit `Send`, which a caller the realize reaches again needs.
+pub(crate) fn realize_link_pin_change_boxed(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    link_context: Arc<RepositoryContext>,
+    pin_change: LinkPinRealizeTarget,
+    overwrite_local: bool,
+) -> crate::BoxFuture<'_, Result<(), LinkError>> {
+    Box::pin(realize_link_pin_change_in_operation(
+        operation,
+        repository,
+        link_context,
+        pin_change,
+        overwrite_local,
+    ))
 }
 
 /// Diffs the pinned subtree between the two pins, spelled from the mount path.

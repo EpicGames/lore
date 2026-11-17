@@ -1704,9 +1704,7 @@ fn reset_walk_named_path(
                         .forward::<ResetError>("Failed to find staged node")
                         .map(|node| (node.is_dirty_add(), node.is_link(), node.is_directory()))?;
 
-                    // `reset_staged_links_under_paths` unstaged this link, which a dry run does not
-                    // store, so the link is still staged here.
-                    if link && execution_context().globals().dry_run() {
+                    if dry_run_unstaged_link(link) {
                         return Ok(());
                     }
                     refuse_staged_node(&state_staged, &repository, staged_link.node).await?;
@@ -1790,6 +1788,13 @@ async fn refuse_staged(
         }
         None => refuse_staged_node(state_staged, repository, staged_link.node).await,
     }
+}
+
+/// Whether the reset passes over a staged node it meets, a link where `link`: in a dry run,
+/// [`reset_staged_links_under_paths`] unstaged that link without storing it, so the link is still
+/// staged here.
+fn dry_run_unstaged_link(link: bool) -> bool {
+    link && execution_context().globals().dry_run()
 }
 
 /// The refusal of a reset that would discard a staged change.
@@ -2704,6 +2709,9 @@ fn reset_walk_node(
 
         if let Some(staged) = staged {
             if staged.staged {
+                if dry_run_unstaged_link(node.is_link()) {
+                    return Ok(());
+                }
                 return Err(staged_node_refusal());
             }
 

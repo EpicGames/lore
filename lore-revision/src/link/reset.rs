@@ -6,9 +6,9 @@ use lore_error_set::prelude::*;
 
 use super::LinkError;
 use crate::errors::LocalModifications;
-use crate::errors::NotSupported;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::realize::open_mounted_tree;
 use crate::link;
 use crate::link::LinkFlags;
 use crate::lore::Hash;
@@ -35,34 +35,17 @@ pub(crate) async fn reset_staged_add_link(
     staged_link_node: Node,
     overwrite_local: bool,
 ) -> Result<(), LinkError> {
+    drop_staged_link(operation, &at, &staged_link_node, overwrite_local).await?;
     let NodeMapping {
         repository,
         state: state_staged,
         path: link_path,
         node: link_node_id,
     } = at;
-    let link_id = staged_link_node.linked_node().repository;
     let absolute_path = link_path
         .to_absolute_path(repository.require_path()?)
         .forward::<LinkError>("placing the link below the root")?;
     let dry_run = execution_context().globals().dry_run();
-
-    if !dry_run {
-        link::realize_link_pin_change_in_operation(
-            operation,
-            repository.clone(),
-            repository.to_link_context(link_id).await,
-            link::LinkPinRealizeTarget {
-                link_path: link_path.clone(),
-                old_signature: staged_link_node.address.hash,
-                new_signature: Hash::default(),
-                current_node: staged_link_node.child,
-                mount_source: link::LinkMountSource::Node(ROOT_NODE),
-            },
-            overwrite_local,
-        )
-        .await?;
-    }
 
     // If the link replaced a committed directory, `link::add` staged that
     // directory node for delete. Capture it so we can restore it. Resolve
@@ -79,11 +62,6 @@ pub(crate) async fn reset_staged_add_link(
         .ok()
         .filter(|node_link| node_link.is_valid())
         .map(|node_link| node_link.node);
-
-    state_staged
-        .link_remove(repository.clone(), link_id, link_node_id)
-        .await
-        .forward::<LinkError>("Failed to remove link registry entry")?;
 
     if let Some(committed_node_id) = committed_directory_node {
         // Restore the committed directory: recreate the empty placeholder on
@@ -128,6 +106,39 @@ pub(crate) async fn reset_staged_add_link(
     Ok(())
 }
 
+/// Removes the files and the registry row of the staged link `staged_link_node` at the mount
+/// `at`, refusing a local change to a file the link holds unless `overwrite_local`. A dry run
+/// leaves the files.
+async fn drop_staged_link(
+    operation: &Arc<InstanceOperationImpl>,
+    at: &NodeMapping,
+    staged_link_node: &Node,
+    overwrite_local: bool,
+) -> Result<(), LinkError> {
+    let link_id = staged_link_node.linked_node().repository;
+    if !execution_context().globals().dry_run() {
+        link::realize_link_pin_change_boxed(
+            operation,
+            at.repository.clone(),
+            at.repository.to_link_context(link_id).await,
+            link::LinkPinRealizeTarget {
+                link_path: at.path.clone(),
+                old_signature: staged_link_node.address.hash,
+                new_signature: Hash::default(),
+                current_node: staged_link_node.child,
+                mount_source: link::LinkMountSource::Node(ROOT_NODE),
+            },
+            overwrite_local,
+        )
+        .await?;
+    }
+
+    at.state
+        .link_remove(at.repository.clone(), link_id, at.node)
+        .await
+        .forward::<LinkError>("Failed to remove link registry entry")
+}
+
 /// Restores the link registry entry a staged removal dropped and re-realizes the pinned content
 /// at the mount, refusing to replace a file standing there or a local change to a file the link
 /// holds unless `overwrite_local` says to discard it.
@@ -141,18 +152,62 @@ pub(crate) async fn reset_staged_remove_link(
     current_link_node: Node,
     overwrite_local: bool,
 ) -> Result<(), LinkError> {
+    let restorable = restorable_link(&at, &state_current, &current_link_node).await?;
+    restore_link(
+        operation,
+        at,
+        restorable,
+        current_link_node,
+        overwrite_local,
+    )
+    .await
+}
+
+/// The current revision's registry row of the link `current_link_node` at `at`, and the context
+/// of the repository it links, refusing a mount that overlaps one staged since.
+async fn restorable_link(
+    at: &NodeMapping,
+    state_current: &State,
+    current_link_node: &Node,
+) -> Result<(LinkReference, Arc<RepositoryContext>), LinkError> {
+    let link_id = current_link_node.linked_node().repository;
+    let current_link_ref = state_current
+        .link_find(at.repository.clone(), link_id, at.node)
+        .await
+        .forward::<LinkError>("Failed to find link registry entry")?;
+
+    let linked_repository = at.repository.to_link_context(link_id).await;
+    let source_path = link::pinned_source_path(linked_repository.clone(), current_link_node)
+        .await
+        .forward::<LinkError>("Failed resolving link source path")?;
+    link::check_source_path_overlap(
+        &at.state,
+        at.repository.clone(),
+        linked_repository.clone(),
+        source_path,
+        at.node,
+    )
+    .await
+    .forward::<LinkError>("Failed checking link source paths")?;
+
+    Ok((current_link_ref, linked_repository))
+}
+
+/// Puts the registry row and the pinned content of `restorable`, from [`restorable_link`], back at
+/// the mount `at`, as [`reset_staged_remove_link`] describes. A dry run leaves the files.
+async fn restore_link(
+    operation: &Arc<InstanceOperationImpl>,
+    at: NodeMapping,
+    (current_link_ref, linked_repository): (LinkReference, Arc<RepositoryContext>),
+    current_link_node: Node,
+    overwrite_local: bool,
+) -> Result<(), LinkError> {
     let NodeMapping {
         repository,
         state: state_staged,
         path: link_path,
-        node: link_node_id,
+        ..
     } = at;
-    let link_id = current_link_node.linked_node().repository;
-
-    let current_link_ref = state_current
-        .link_find(repository.clone(), link_id, link_node_id)
-        .await
-        .forward::<LinkError>("Failed to find link registry entry")?;
 
     if operation
         .file_info(&link_path)
@@ -172,23 +227,6 @@ pub(crate) async fn reset_staged_remove_link(
             .forward::<LinkError>("Failed to remove the file at the link path")?;
     }
 
-    let linked_repository = repository.to_link_context(link_id).await;
-
-    // A mount added while this removal was staged can overlap the one being
-    // restored.
-    let source_path = link::pinned_source_path(linked_repository.clone(), &current_link_node)
-        .await
-        .forward::<LinkError>("Failed resolving link source path")?;
-    link::check_source_path_overlap(
-        &state_staged,
-        repository.clone(),
-        linked_repository.clone(),
-        source_path,
-        link_node_id,
-    )
-    .await
-    .forward::<LinkError>("Failed checking link source paths")?;
-
     state_staged
         .link_add(
             repository.clone(),
@@ -206,9 +244,12 @@ pub(crate) async fn reset_staged_remove_link(
         .await
         .forward::<LinkError>("Failed to recreate the link directory")?;
 
-    link::realize_link_pin_change_in_operation(
+    if execution_context().globals().dry_run() {
+        return Ok(());
+    }
+    link::realize_link_pin_change_boxed(
         operation,
-        repository.clone(),
+        repository,
         linked_repository,
         link::LinkPinRealizeTarget {
             link_path,
@@ -219,14 +260,11 @@ pub(crate) async fn reset_staged_remove_link(
         },
         overwrite_local,
     )
-    .await?;
-
-    Ok(())
+    .await
 }
 
 /// Puts a link whose pin, mount or registry row change was staged back to the pin, mount and row
-/// the current revision holds, on disk and in the registry. Refuses a link replaced by one to
-/// another repository before it changes anything.
+/// the current revision holds, on disk and in the registry.
 ///
 /// Realizes through the caller's `operation`, as [`reset_staged_remove_link`] does.
 pub(crate) async fn reset_staged_update_link(
@@ -244,14 +282,6 @@ pub(crate) async fn reset_staged_update_link(
         node: link_node_id,
     } = at;
     let link_id = current_link_node.linked_node().repository;
-    if staged_link_node.linked_node().repository != link_id {
-        return Err(NotSupported {
-            operation: format!(
-                "restoring the link at '{link_path}' replaced by a link to another repository"
-            ),
-        }
-        .into());
-    }
     let staged_pin = staged_link_node.address.hash;
     let current_pin = current_link_node.address.hash;
 
@@ -261,7 +291,7 @@ pub(crate) async fn reset_staged_update_link(
         .forward::<LinkError>("Failed to find link registry entry")?;
 
     if staged_pin != current_pin || !staged_link_node.mounts_same_source(&current_link_node) {
-        link::realize_link_pin_change_in_operation(
+        link::realize_link_pin_change_boxed(
             operation,
             repository.clone(),
             repository.to_link_context(link_id).await,
@@ -283,6 +313,51 @@ pub(crate) async fn reset_staged_update_link(
         .forward::<LinkError>("Failed to update link registry entry")?;
 
     Ok(())
+}
+
+/// Drops the staged link `staged_link_node` to another repository than the current revision's
+/// link `current_link_node` at the mount `at`, and restores the latter. Refuses before it changes
+/// anything where the latter's mount overlaps one staged since, or, unless `overwrite_local`, where
+/// a sync moving the link back would ([`crate::fs::realize::verify_mount_replacement`]).
+pub(crate) async fn reset_staged_relink(
+    operation: &Arc<InstanceOperationImpl>,
+    at: NodeMapping,
+    state_current: Arc<State>,
+    staged_link_node: Node,
+    current_link_node: Node,
+    overwrite_local: bool,
+) -> Result<(), LinkError> {
+    let restorable = restorable_link(&at, &state_current, &current_link_node).await?;
+    if !overwrite_local {
+        let (shown, incoming) = tokio::join!(
+            open_mounted_tree(&at.repository, &staged_link_node),
+            open_mounted_tree(&at.repository, &current_link_node),
+        );
+        let Some((node, (repository, state))) = incoming else {
+            return Err(LinkError::internal(format!(
+                "Failed to open the revision the link at {} pins",
+                at.path
+            )));
+        };
+        crate::fs::realize::verify_mount_replacement(
+            operation,
+            &at.repository,
+            &at.path,
+            shown,
+            NodeMapping {
+                repository,
+                state,
+                path: at.path.clone(),
+                node,
+            },
+        )
+        .await
+        .forward::<LinkError>("Failed verifying the link mount")?;
+    }
+
+    // Verified above, or discarded where `overwrite_local`.
+    drop_staged_link(operation, &at, &staged_link_node, true).await?;
+    restore_link(operation, at, restorable, current_link_node, true).await
 }
 
 /// Puts the branch and flags of the current revision's registry row for the link `link_id` at

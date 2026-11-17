@@ -1171,54 +1171,63 @@ async fn unstage_node(
 
         was_staged_delete = node.is_staged_delete();
 
-        let is_staged_update_link = link::is_staged_link_update(&node, repository.clone())
-            .await
-            .forward::<UnstageError>("Failed to check for a staged link change")?;
+        let kept_link = node.is_link() && current_node.is_link();
+        let relinked = kept_link
+            && !was_staged_delete
+            && current_node.linked_node().repository != node.linked_node().repository;
+        let is_staged_update_link = relinked
+            || link::is_staged_link_update(&node, repository.clone())
+                .await
+                .forward::<UnstageError>("Failed to check for a staged link change")?;
 
         // A staged modification of a file takes the current revision's mode and size back. A
         // staged change to a link takes back the current revision's pin, the node it exposes and
-        // its registry row, or only the row's branch and flags where changes inside the link are
-        // staged. The rest of the node stays as it is.
+        // its registry row, or only the row's branch and flags where changes inside a link to the
+        // same repository are staged. A link staged for delete takes back the pin, which a link
+        // added over it and removed again replaced. The rest of the node stays as it is.
         if node.is_staged_modify() && node.is_file() {
             node.mode = current_node.mode;
             node.size = current_node.size;
         } else if is_staged_update_link {
-            link::reset::reset_staged_update_link(
-                &operation,
-                NodeMapping {
-                    repository: repository.clone(),
-                    state: state_staged.clone(),
-                    path: node_path.clone(),
-                    node: node_id,
-                },
-                state_current.clone(),
-                node,
-                current_node,
-                overwrite_local(options),
-            )
-            .await
-            .forward::<UnstageError>("Failed to reset staged-update link")?;
-
-            node.address.hash = current_node.address.hash;
-            node.child = current_node.child;
-            state_staged
-                .node_set_link_target_in(
-                    &block,
-                    node_id,
-                    LinkPin::Whole {
-                        address: node.address,
-                        child: node.child,
-                    },
+            let at = NodeMapping {
+                repository: repository.clone(),
+                state: state_staged.clone(),
+                path: node_path.clone(),
+                node: node_id,
+            };
+            if relinked {
+                link::reset::reset_staged_relink(
+                    &operation,
+                    at,
+                    state_current.clone(),
+                    node,
+                    current_node,
+                    overwrite_local(options),
                 )
-                .forward::<UnstageError>("Failed to restore the link's pin")?;
+                .await
+            } else {
+                link::reset::reset_staged_update_link(
+                    &operation,
+                    at,
+                    state_current.clone(),
+                    node,
+                    current_node,
+                    overwrite_local(options),
+                )
+                .await
+            }
+            .forward::<UnstageError>("Failed to reset staged-update link")?;
+            if relinked {
+                link_tracker.remove_link(node.linked_node().repository, node_id, repository.id);
+            }
+
+            take_back_link_pin(&state_staged, &block, node_id, &mut node, &current_node)?;
             stats
                 .directory_unstaged_count
                 .fetch_add(1, Ordering::Relaxed);
-        } else if node.is_link()
-            && !was_staged_delete
-            && current_node.is_link()
-            && current_node.linked_node().repository == node.linked_node().repository
-        {
+        } else if kept_link && was_staged_delete {
+            take_back_link_pin(&state_staged, &block, node_id, &mut node, &current_node)?;
+        } else if kept_link {
             link::reset::reset_staged_link_branching(
                 repository.clone(),
                 &state_staged,
@@ -1576,6 +1585,29 @@ async fn process_link_unstage_updates(
     .forward::<UnstageError>("Failed to unstage link nodes")
 }
 
+/// Puts the pin and the mounted node of `current`, the current revision's link, back on `node`, the
+/// staged link at `node_id` in `block`.
+fn take_back_link_pin(
+    state: &State,
+    block: &Arc<NodeBlock>,
+    node_id: NodeID,
+    node: &mut Node,
+    current: &Node,
+) -> Result<(), UnstageError> {
+    node.address = current.address;
+    node.child = current.child;
+    state
+        .node_set_link_target_in(
+            block,
+            node_id,
+            LinkPin::Whole {
+                address: node.address,
+                child: node.child,
+            },
+        )
+        .forward::<UnstageError>("Failed to restore the link's pin")
+}
+
 /// Whether an unstage of `node` takes back the content of `current`, the node the current
 /// revision holds at the same node: where `node` is a staged file whose content hash is zero,
 /// content a forced stage took from the working tree over a merge, or an empty file, and `current`
@@ -1737,6 +1769,7 @@ async fn discard_staged_add(
         )
         .await
         .forward::<UnstageError>("Failed to reset staged-add link")?;
+        link_tracker.remove_link(node.linked_node().repository, at.node, at.repository.id);
     }
 
     if node.is_directory() {

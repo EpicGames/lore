@@ -735,15 +735,18 @@ def test_link_forced_unstage_puts_back_a_link_a_staged_file_replaced(new_lore_re
         ("replaced", True),
         ("removed-then-folder", False),
         ("added-then-replaced", False),
+        ("relinked-edited", True),
+        ("relinked-in-the-way", True),
     ],
 )
 def test_link_unstage_keeps_local_work_at_the_mount(new_lore_repo, change, refused):
     """`unstage` of a staged link change keeps the local work standing at the mount: it refuses
-    where restoring the link would overwrite that work, and otherwise leaves it in place."""
+    where restoring the link would overwrite that work, changing nothing, and otherwise leaves it
+    in place."""
     parent = make_repo(new_lore_repo, {"README.txt": "baseline\n"})
     link_repo = make_repo(new_lore_repo, {"linked.txt": "linked\n"})
     parent.link_add("shared", link_repo.get_id(), "/")
-    if change in ("replaced", "removed-then-folder"):
+    if change in ("replaced", "removed-then-folder") or change.startswith("relinked"):
         parent.commit("Add link")
         parent.push()
 
@@ -753,18 +756,31 @@ def test_link_unstage_keeps_local_work_at_the_mount(new_lore_repo, change, refus
         "replaced": "shared",
         "removed-then-folder": "shared/own.txt",
         "added-then-replaced": "shared",
+        "relinked-edited": "shared/other.txt",
+        "relinked-in-the-way": "shared/linked.txt",
     }[change]
     if change == "removed-then-folder":
         parent.link_remove("shared")
+    if change.startswith("relinked"):
+        other_repo = make_repo(new_lore_repo, {"other.txt": "other\n"})
+        remount(parent, "shared", other_repo.get_id(), "/", None)
     if local == "shared":
         parent.rmtree("shared")
     parent.write_files({local: "local\n"})
-    if change in ("replaced", "removed-then-folder", "added-then-replaced"):
+    if change in (
+        "replaced",
+        "removed-then-folder",
+        "added-then-replaced",
+        "relinked-edited",
+    ):
         parent.stage("shared", scan=True)
+
+    files = parent.read_files()
 
     if refused:
         with pytest.raises(LocalChanges):
             parent.unstage("shared")
+        assert parent.read_files() == files
     else:
         parent.unstage("shared")
     with parent.open_file(local) as f:
@@ -848,51 +864,45 @@ def link_branching(repo: Lore, link_path: str) -> tuple:
 
 @pytest.mark.smoke
 @pytest.mark.parametrize(
-    ("undo", "staged_inside"), [("unstage", False), ("unstage", True), ("reset", False)]
+    ("change", "undo"),
+    [
+        ("replaced", "unstage"),
+        ("edited-inside", "reset"),
+        ("edited-inside", "forced-unstage-of-both"),
+        ("removed-again", "unstage"),
+    ],
 )
-def test_link_branching_change_undone(new_lore_repo, undo, staged_inside):
-    """Unstaging or resetting a staged branching change puts the committed branch and flags back,
-    also where a change inside the link is staged, leaving nothing staged, so the branch can be
-    switched."""
-    link_path = "linked/repo"
-    parent, link_repo = make_parent_with_link(new_lore_repo, link_path)
-    parent.branch_create("feature")
-    committed = link_branching(parent, link_path)
-
-    remount(parent, link_path, link_repo.get_id(), "/", None, disable_branching=True)
-    if staged_inside:
-        parent.write_files({f"{link_path}/linked.txt": "local\n"})
-        parent.stage(f"{link_path}/linked.txt", scan=True)
-    getattr(parent, undo)(link_path)
-
-    assert link_branching(parent, link_path) == committed
-    assert not any(entry["flagStaged"] for entry in status_by_path(parent).values())
-    parent.branch_switch("main")
-    assert parent.branch_info().name == "main"
-
-
-@pytest.mark.smoke
-@pytest.mark.parametrize("staged_inside", [False, True])
-def test_link_unstage_of_a_link_replaced_by_another_repository(
-    new_lore_repo, staged_inside
+def test_link_undo_puts_back_a_link_replaced_by_another_repository(
+    new_lore_repo, change, undo
 ):
-    """Unstaging a link replaced by one to another repository refuses before it changes the
-    link's files, and with a change staged inside the link unstages that change."""
+    """`unstage` and `reset` of a link replaced by one to another repository put the original
+    link back, in the registry and on disk: over a change staged inside the replacement that
+    `reset` or a forced `unstage` discards, and after the replacement is removed again."""
     link_path = "linked/repo"
     parent, _ = make_parent_with_link(new_lore_repo, link_path)
+    committed = link_entry(parent, link_path)
+    files = parent.read_files()
     other_repo = make_repo(new_lore_repo, {"other.txt": "other\n"})
     remount(parent, link_path, other_repo.get_id(), "/", None)
-    if staged_inside:
-        parent.write_files({f"{link_path}/other.txt": "local\n"})
-        parent.stage(f"{link_path}/other.txt", scan=True)
-        parent.unstage(link_path)
-        assert not any(entry["flagStaged"] for entry in status_by_path(parent).values())
-        return
+    inside = f"{link_path}/other.txt"
+    if change == "edited-inside":
+        parent.write_files({inside: "local\n"})
+        parent.stage(inside, scan=True)
+    elif change == "removed-again":
+        parent.link_remove(link_path)
 
-    with pytest.raises(NotSupportedError):
+    if undo == "reset":
+        parent.reset(link_path)
+    elif undo == "forced-unstage-of-both":
+        parent.unstage([inside, link_path], force=True)
+        # A forced unstage repins every link it walks to its staged state.
+        committed["revision"] = link_entry(parent, link_path)["revision"]
+    else:
         parent.unstage(link_path)
-    assert link_entry(parent, link_path)["link"] == other_repo.get_id()
-    assert sorted(os.listdir(os.path.join(parent.path, link_path))) == ["other.txt"]
+
+    assert link_entry(parent, link_path) == committed
+    assert parent.read_files() == files
+    assert_crr_clean(parent, [], [], {other_repo.get_id(): False})
 
 
 @pytest.mark.smoke
@@ -1006,24 +1016,31 @@ def test_link_reset_idempotent(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_dry_run_unstage_and_reset_keep_a_staged_link_add(new_lore_repo):
-    """`unstage --dry-run` and `reset --dry-run` of a staged link addition keep the link's
-    files and the staged link, where `unstage` without it removes both."""
+@pytest.mark.parametrize("change", ["added", "relinked"])
+def test_dry_run_unstage_and_reset_keep_a_staged_link_change(new_lore_repo, change):
+    """`unstage --dry-run` and `reset --dry-run` of a staged link addition, or of a link replaced
+    by one to another repository holding the same path, keep the staged link and its files, where
+    `unstage` without it puts back what the current revision holds."""
     repo = make_repo(new_lore_repo, {"a.txt": "a\n"})
     link_repo = make_repo(new_lore_repo, {"linked.txt": "linked\n"})
-    repo.link_add("lnk", link_repo.get_id(), "/")
-    linked_file = os.path.join(repo.path, "lnk", "linked.txt")
-    assert os.path.isfile(linked_file)
-    links = repo.link_list()
+    if change == "relinked":
+        repo.link_add("lnk", link_repo.get_id(), "/")
+        repo.commit("Add link")
+        repo.push()
+    committed = (repo.link_list(), repo.read_files())
+    if change == "relinked":
+        other_repo = make_repo(new_lore_repo, {"linked.txt": "other\n"})
+        remount(repo, "lnk", other_repo.get_id(), "/", None)
+    else:
+        repo.link_add("lnk", link_repo.get_id(), "/")
+    staged = (repo.link_list(), repo.read_files())
 
     repo.unstage("lnk", dry_run=True)
     repo.reset("lnk", dry_run=True)
     repo.reset(dry_run=True)
 
-    assert os.path.isfile(linked_file), "a dry run removed the link's files"
-    assert repo.link_list() == links, "a dry run changed the staged links"
+    assert (repo.link_list(), repo.read_files()) == staged
 
     repo.unstage("lnk")
 
-    assert not os.path.exists(linked_file), "unstage kept the link's files"
-    assert repo.link_list() != links, "unstage kept the staged link"
+    assert (repo.link_list(), repo.read_files()) == committed
