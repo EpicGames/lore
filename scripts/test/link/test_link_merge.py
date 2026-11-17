@@ -15,21 +15,33 @@ from error_types import (
     UnresolvedConflictError,
 )
 from link_helpers import (
+    DEFAULT_PARENT_FILE,
+    SHARED_FOLDER,
+    add_inside_the_folder,
     assert_crr_clean,
+    assert_holds_folder,
+    assert_holds_link,
     assert_mount_exposes,
     assert_mount_source,
+    change_inside_the_folder,
+    delete_inside_the_folder,
+    delete_the_folder,
+    fail_unless_holds,
     folder_replaced_by_a_link,
     link_pin,
+    link_pins,
     link_replaced_by_its_folder,
     make_parent_with_link,
     make_parent_with_remount,
     make_repo,
     make_repo_renumbering_folder,
+    mounted_files,
     remote_branch_entries,
     remount,
+    replace_link_with_folder,
 )
 from lore_parsers import parse_jsonl, parse_status_json
-from test_utils import registered_links, unstaged_entries, working_tree_files
+from test_utils import registered_links, unstaged_entries
 
 from lore import Lore
 
@@ -234,15 +246,6 @@ def _merge_main_into_feature(repo: Lore):
     repo.push()
 
 
-def _mounted_files(repo: Lore, link_path: str) -> dict[str, str]:
-    mount = os.path.join(repo.path, link_path)
-    files = {}
-    for name in os.listdir(mount):
-        with open(os.path.join(mount, name)) as f:
-            files[name] = f.read()
-    return files
-
-
 def _assert_conflict_marked(repo: Lore, path: str):
     with repo.open_file(path) as f:
         assert "<<<<<<<" in f.read(), f"{path} should hold conflict markers"
@@ -250,12 +253,6 @@ def _assert_conflict_marked(repo: Lore, path: str):
 
 def _sorted_by_name(entries: list[dict]) -> list[dict]:
     return sorted(entries, key=lambda entry: entry["name"])
-
-
-def _link_pins(repo: Lore, source_id: str) -> list[str]:
-    return re.findall(
-        rf"Link\s+{source_id}.*?Revision:\s*(\w+)", repo.link_list(), re.DOTALL
-    )
 
 
 def _assert_pinned_at_linked_main(repo: Lore, source_repo: Lore):
@@ -294,7 +291,7 @@ def test_link_added_on_branch_merges_its_repository(
         repo.push()
 
     _assert_pinned_at_linked_main(repo, source_repo)
-    assert _mounted_files(repo, link_path) == {
+    assert mounted_files(repo, link_path) == {
         "link-file.txt": feature_edit or "link source content\n",
         **linked_main_files,
     }
@@ -323,8 +320,8 @@ def test_link_added_on_branch_to_a_repository_linked_already_shares_its_pin(new_
     repo.branch_merge_start("feature-branch", message="Merge feature-branch")
     repo.push()
 
-    assert _link_pins(repo.clone(), source_repo.get_id()) == [pin, pin]
-    assert _mounted_files(repo, "linked/b") == {"linked.txt": "linked content\n"}
+    assert link_pins(repo.clone(), source_repo.get_id()) == [pin, pin]
+    assert mounted_files(repo, "linked/b") == {"linked.txt": "linked content\n"}
 
 
 @pytest.mark.smoke
@@ -354,7 +351,7 @@ def test_link_added_on_branch_with_conflicting_edits_merges_once_resolved(
     repo.push()
 
     _assert_pinned_at_linked_main(repo, source_repo)
-    assert _mounted_files(repo.clone(), link_path) == {"link-file.txt": "resolved\n"}
+    assert mounted_files(repo.clone(), link_path) == {"link-file.txt": "resolved\n"}
 
 
 @pytest.mark.smoke
@@ -440,7 +437,7 @@ def test_link_added_on_branch_merge_abort_of_the_link_lands_it_on_linked_main(
 
     repo.branch_merge_abort(link=link_path)
 
-    assert _mounted_files(repo, link_path) == {"link-file.txt": "edited on linked main\n"}
+    assert mounted_files(repo, link_path) == {"link-file.txt": "edited on linked main\n"}
     assert link_pin(repo, source_repo.get_id()) == (
         source_repo.branch_info("main").remote_latest
     )
@@ -1037,14 +1034,6 @@ def _conflicted_count(output: str) -> int:
     return int(match.group(1))
 
 
-def _change_inside_the_folder(parent: Lore) -> None:
-    """Modify a file inside `shared/` and add another."""
-    parent.write_commit_push(
-        "Change files under shared/",
-        {"shared/a.txt": "a changed on main\n", "shared/c.txt": "c added on main\n"},
-    )
-
-
 def _conflicted_paths(parent: Lore) -> list[str]:
     """The paths `status` reports as conflicted."""
     return [
@@ -1052,19 +1041,6 @@ def _conflicted_paths(parent: Lore) -> list[str]:
         for entry in parse_status_json(parent.status(json=True))
         if entry.get("flagConflict")
     ]
-
-
-def _assert_mount_intact(parent: Lore, source: Lore, pin: str) -> None:
-    """The mount is still a link on the pin it held, serving its own content."""
-    info = parent.link_info("shared")
-    assert source.get_id() in info, (
-        f"the mount must still name the linked repository:\n{info}"
-    )
-    assert "Link path: shared" in info, f"the mount must still be a link:\n{info}"
-    assert f"Revision: {pin}" in info, f"the mount must still hold its pin:\n{info}"
-    assert parent.compare_file(source, "shared/b.txt", "b.txt"), (
-        "a file only the linked repository holds must still be served at the mount"
-    )
 
 
 def _assert_mount_conflict(
@@ -1102,6 +1078,9 @@ def _assert_mount_conflict(
     assert parent.branch_info().local_latest == head_before, (
         "aborting the merge must leave the branch on its pre-merge revision"
     )
+    assert parse_status_json(parent.status(json=True)) == [], (
+        "aborting the merge must leave nothing staged"
+    )
 
 
 @pytest.mark.smoke
@@ -1117,16 +1096,7 @@ def test_branch_diff_reports_a_link_replacing_a_folder(new_lore_repo):
     )
 
     parent.branch_create("restored")
-    parent.link_remove("shared")
-    parent.commit("Remove the link")
-    parent.make_dirs("shared")
-    with parent.open_file("shared/a.txt", "w+") as output_file:
-        output_file.writelines(["a restored\n"])
-    with parent.open_file("shared/b.txt", "w+") as output_file:
-        output_file.writelines(["b restored\n"])
-    parent.stage(scan=True)
-    parent.commit("Restore the folder")
-    parent.push()
+    replace_link_with_folder(parent)
 
     link_to_folder = parent.branch_diff("feature", source="restored")
     assert _change_actions(link_to_folder, "shared") == {"A", "D"}, (
@@ -1151,7 +1121,7 @@ def test_merge_outside_the_folder_keeps_a_link_replacing_it(new_lore_repo):
     parent.branch_merge_start("main", message="Merge main")
     parent.push()
 
-    _assert_mount_intact(parent, source, pin)
+    assert_holds_link(parent, source, pin)
     with parent.open_file("root.txt", "r") as input_file:
         assert "root changed on main" in input_file.read(), (
             "the merge must carry the change made outside the folder"
@@ -1216,7 +1186,7 @@ def test_merge_of_a_link_replacing_a_folder_lands_the_link(new_lore_repo):
     parent.branch_merge_start("feature", message="Merge feature")
     parent.push()
 
-    _assert_mount_intact(parent, source, pin)
+    assert_holds_link(parent, source, pin)
     assert "Verified repository state integrity" in parent.repository_verify(), (
         "the merged revision must verify"
     )
@@ -1242,34 +1212,39 @@ def test_merge_of_a_folder_replacing_a_link_lands_the_folder(new_lore_repo):
     parent.branch_merge_start("feature", message="Merge feature")
     parent.push()
 
-    assert working_tree_files(parent, "shared") == ["shared/a.txt", "shared/b.txt"], (
-        "shared/ must hold the folder's files"
+    assert_holds_folder(
+        parent, {**SHARED_FOLDER, "shared/a.txt": "a edited in the folder\n"}
     )
-    with parent.open_file("shared/a.txt", "r") as input_file:
-        assert input_file.read() == "a edited in the folder\n", (
-            "the folder's content must land"
-        )
-    assert parse_status_json(parent.status(json=True)) == [], "nothing may be staged"
-    assert unstaged_entries(parent) == [], "the file system must match the revision"
 
 
 @pytest.mark.smoke
-def test_merge_of_a_link_replacing_a_deleted_folder_conflicts(new_lore_repo):
-    """A branch that deleted the folder outright still meets the replacement at
-    the mount, where neither side holds what the other names."""
-    parent, _source = folder_replaced_by_a_link(new_lore_repo)
+@pytest.mark.parametrize("merged_branch", ["main", "feature"])
+@pytest.mark.parametrize(
+    "change_folder",
+    [add_inside_the_folder, delete_inside_the_folder, delete_the_folder],
+    ids=["add", "delete", "delete_folder"],
+)
+def test_merge_of_a_lone_add_or_delete_under_a_replaced_folder_conflicts(
+    new_lore_repo, change_folder, merged_branch
+):
+    """A file only added or only deleted under the folder a link replaced, or
+    the whole folder deleted, conflicts at the mount in both directions, and
+    aborting keeps each branch's side."""
+    parent, source = folder_replaced_by_a_link(new_lore_repo)
+    pin = link_pin(parent, source.get_id())
 
     parent.branch_switch("main")
-    parent.rmtree("shared")
-    parent.stage("shared", scan=True)
-    parent.commit("Delete shared/")
-    parent.push()
+    folder = change_folder(parent)
+    if merged_branch == "main":
+        parent.branch_switch("feature")
 
-    _assert_mount_conflict(parent, "feature", "Merge feature")
+    _assert_mount_conflict(parent, merged_branch, f"Merge {merged_branch}")
 
-    assert not parent.path_exists("shared"), (
-        "aborting the merge must leave the deleted folder deleted"
-    )
+    if merged_branch == "main":
+        assert_holds_link(parent, source, pin)
+    else:
+        assert_holds_folder(parent, folder)
+        assert registered_links(parent) == {}, "the branch must hold no link"
 
 
 @pytest.mark.smoke
@@ -1315,13 +1290,13 @@ def test_resolving_a_mount_conflict_is_refused_and_leaves_the_merge_open(
     pin = link_pin(parent, source.get_id())
 
     parent.branch_switch("main")
-    _change_inside_the_folder(parent)
+    change_inside_the_folder(parent)
     if merged_branch == "main":
         parent.branch_switch("feature")
 
     def assert_branch_side_kept():
         if merged_branch == "main":
-            _assert_mount_intact(parent, source, pin)
+            assert_holds_link(parent, source, pin)
         else:
             with parent.open_file("shared/a.txt", "r") as input_file:
                 assert "a changed on main" in input_file.read(), (
@@ -1359,7 +1334,7 @@ def test_resolving_a_cherry_picked_mount_conflict_is_refused(new_lore_repo):
     pin = link_pin(parent, source.get_id())
 
     parent.branch_switch("main")
-    _change_inside_the_folder(parent)
+    change_inside_the_folder(parent)
     picked = parent.branch_info().local_latest
     parent.branch_switch("feature")
     head_before = parent.branch_info().local_latest
@@ -1374,13 +1349,63 @@ def test_resolving_a_cherry_picked_mount_conflict_is_refused(new_lore_repo):
     assert parent.unresolved_paths() == {"shared"}, (
         "a refused resolve must leave the conflict at the mount unresolved"
     )
-    _assert_mount_intact(parent, source, pin)
+    assert_holds_link(parent, source, pin)
 
     parent.revision_cherry_pick_abort()
     assert parent.branch_info().local_latest == head_before, (
         "aborting the cherry-pick must leave the branch on its revision"
     )
-    _assert_mount_intact(parent, source, pin)
+    assert_holds_link(parent, source, pin)
+
+
+@pytest.mark.smoke
+def test_revert_of_a_link_add_removes_the_link(new_lore_repo):
+    """Reverting the revision that added a link removes the mount and its
+    registry row."""
+    parent, _source = make_parent_with_link(new_lore_repo, "linked/repo")
+
+    parent.revision_revert(parent.branch_info().local_latest)
+    parent.push()
+
+    assert parse_status_json(parent.status(json=True)) == []
+    for repo in (parent, parent.clone()):
+        assert registered_links(repo) == {}
+        assert not repo.path_exists("linked/repo")
+        assert repo.file_exists(DEFAULT_PARENT_FILE), "the revert must keep the rest"
+
+
+@pytest.mark.smoke
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="cherry-pick and revert drop the part of a revision inside a link",
+)
+@pytest.mark.parametrize("operation", ["cherry_pick", "revert"])
+def test_cherry_pick_and_revert_apply_the_part_inside_a_link(new_lore_repo, operation):
+    """Picking or reverting a revision that changed a file inside a link and one
+    outside it applies both."""
+    link_path = "linked/repo"
+    parent, _source = make_parent_with_link(
+        new_lore_repo, link_path, {"a.txt": "a\n"}, {"root.txt": "root\n"}
+    )
+    parent.branch_create("feature")
+    parent.write_commit_push(
+        "Edit inside and outside the link",
+        {f"{link_path}/a.txt": "a on feature\n", "root.txt": "root on feature\n"},
+    )
+    revision = parent.branch_info().local_latest
+
+    if operation == "cherry_pick":
+        parent.branch_switch("main")
+        parent.revision_cherry_pick(revision)
+        outside, inside = "root on feature\n", "a on feature\n"
+    else:
+        parent.revision_revert(revision)
+        outside, inside = "root\n", "a\n"
+
+    fail_unless_holds(parent, "root.txt", outside)
+    with parent.open_file(f"{link_path}/a.txt") as f:
+        assert f.read() == inside, "the part inside the link must be applied"
 
 
 @pytest.mark.smoke

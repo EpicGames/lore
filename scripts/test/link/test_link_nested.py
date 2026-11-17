@@ -4,7 +4,7 @@ import os
 
 import pytest
 from error_types import LOCAL_MODIFICATIONS, LocalChanges
-from link_helpers import build_nested_link_repos_at, link_pin
+from link_helpers import build_nested_link_repos_at, fail_unless_holds, link_pin
 from lore_parsers import parse_status_json
 from test_utils import to_posix, unstaged_entries, working_tree_files
 
@@ -676,6 +676,34 @@ def test_link_branch_archive_include_links_reaches_nested_link(new_lore_repo):
     assert sorted(repo_c.branch_list().remote_branches) == nested_before, (
         f"Expected nested link branches {nested_before}, got: {repo_c.branch_list()}"
     )
+
+
+@pytest.mark.smoke
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="a merge leaves a nested link at its pre-merge pin, dropping the edit inside it",
+)
+def test_merge_lands_an_edit_inside_a_nested_link(new_lore_repo):
+    """A branch editing a file inside a nested link and one inside its outer
+    link merges both edits."""
+    repo_a, _repo_b, _repo_c, b_mount, nested = build_nested_link_repos_at(
+        new_lore_repo, "vendor/b", "deps/c"
+    )
+    repo_a.branch_create("feature")
+    outer_path, outer_edit = f"{b_mount}/b-root.txt", "b on feature\n"
+    nested_path, nested_edit = f"{nested}/c-data/inner.txt", "c on feature\n"
+    repo_a.write_commit_push(
+        "Edit both links", {outer_path: outer_edit, nested_path: nested_edit}
+    )
+
+    repo_a.branch_switch("main")
+    repo_a.branch_merge_start("feature", message="Merge feature")
+    repo_a.push()
+
+    fail_unless_holds(repo_a, outer_path, outer_edit)
+    with repo_a.open_file(nested_path) as f:
+        assert f.read() == nested_edit, "the merge must land the nested edit"
 
 
 @pytest.mark.smoke

@@ -10,6 +10,8 @@ from error_types import BranchDivergedError, LinkDivergedError, LocalChanges
 from link_helpers import (
     DEFAULT_LINK_MOUNT,
     DEFAULT_PARENT_FILE,
+    assert_holds_folder,
+    assert_holds_link,
     build_nested_link_repos_at,
     folder_replaced_by_a_link,
     link_entry,
@@ -21,7 +23,7 @@ from link_helpers import (
     remount,
 )
 from lore_parsers import parse_jsonl, parse_status_json
-from test_utils import unstaged_entries, view_file, working_tree_files
+from test_utils import view_file
 
 from lore import Lore
 
@@ -1570,32 +1572,6 @@ def test_link_branch_archive_repository_linked_twice(new_lore_repo):
 # Switching between a folder and the link that replaced it.
 # ---------------------------------------------------------------------------
 
-_FOLDER = {"shared/a.txt": "a original\n", "shared/b.txt": "b original\n"}
-
-
-def _assert_holds_folder(repo: Lore) -> None:
-    """`shared/` holds exactly the folder's files, and nothing is reported as changed."""
-    assert working_tree_files(repo, "shared") == sorted(_FOLDER), (
-        "shared/ must hold the folder's files"
-    )
-    for path, content in _FOLDER.items():
-        with repo.open_file(path, "r") as input_file:
-            assert input_file.read() == content, (
-                f"{path} must hold the folder's content"
-            )
-    assert parse_status_json(repo.status(json=True)) == [], "nothing may be staged"
-    assert unstaged_entries(repo) == [], "the file system must match the revision"
-
-
-def _assert_holds_link(repo: Lore, source: Lore) -> None:
-    """`shared/` is the link, serving the linked repository's content."""
-    assert source.get_id() in repo.link_info("shared"), "shared must be the link"
-    assert repo.compare_file(source, "shared/b.txt", "b.txt"), (
-        "the mount must serve the linked repository's content"
-    )
-    assert unstaged_entries(repo) == [], "the file system must match the revision"
-
-
 # Each replacement's setup, with the branch holding the folder and the one holding
 # the link, which the setup leaves checked out.
 _REPLACEMENTS = {
@@ -1623,9 +1599,9 @@ def test_switching_off_a_link_onto_a_folder_restores_the_folder(
 
     for _ in range(2):
         parent.branch_switch(folder_branch)
-        _assert_holds_folder(parent)
+        assert_holds_folder(parent)
         parent.branch_switch(link_branch)
-        _assert_holds_link(parent, source)
+        assert_holds_link(parent, source)
 
 
 @pytest.mark.smoke
@@ -1636,9 +1612,9 @@ def test_syncing_off_a_link_that_replaced_a_folder_restores_the_folder(new_lore_
     folder_revision = parent.branch_info("main").local_latest
 
     parent.sync(folder_revision)
-    _assert_holds_folder(parent)
+    assert_holds_folder(parent)
     parent.sync()
-    _assert_holds_link(parent, source)
+    assert_holds_link(parent, source)
 
 
 @pytest.mark.smoke
@@ -1654,7 +1630,7 @@ def test_syncing_a_dependency_set_off_a_link_realizes_the_folder(new_lore_repo):
 
     parent.sync(folder_revision, root_files=["shared/a.txt"])
 
-    _assert_holds_folder(parent)
+    assert_holds_folder(parent)
     assert parse_jsonl(parent.link_list(json=True), "linkEntry") == [], (
         "the link must be removed"
     )
@@ -1674,23 +1650,30 @@ def test_syncing_off_a_link_while_widening_the_view_restores_the_folder(
     parent.write_files({"shared/a.txt": "a original\n"})
 
     parent.sync(folder_revision, view=view_file(scratch_dir, "wide", []))
-    _assert_holds_folder(parent)
+    assert_holds_folder(parent)
 
 
 @pytest.mark.smoke
-def test_switching_off_a_link_refuses_a_local_edit_the_folder_would_overwrite(
-    new_lore_repo,
+@pytest.mark.parametrize("discard", [None, "reset", "force"])
+def test_switching_off_a_link_over_a_local_edit_the_folder_would_overwrite(
+    new_lore_repo, discard
 ):
-    """A local edit to a linked file the folder holds differently is still
-    refused, and the edit is left in place."""
+    """A local edit to a linked file the folder holds differently refuses the
+    switch and is left in place, unless the switch is told to discard local
+    work, which lands the folder whole."""
     parent, _source = folder_replaced_by_a_link(new_lore_repo)
     parent.write_files({"shared/a.txt": "a edited locally\n"})
 
-    with pytest.raises(LocalChanges):
-        parent.branch_switch("main")
-
-    with parent.open_file("shared/a.txt", "r") as input_file:
-        assert input_file.read() == "a edited locally\n", "the local edit must be kept"
+    if discard:
+        parent.branch_switch("main", **{discard: True})
+        assert_holds_folder(parent)
+    else:
+        with pytest.raises(LocalChanges):
+            parent.branch_switch("main")
+        with parent.open_file("shared/a.txt", "r") as input_file:
+            assert input_file.read() == "a edited locally\n", (
+                "the local edit must be kept"
+            )
 
 
 @pytest.mark.smoke
@@ -1706,7 +1689,7 @@ def test_switching_off_a_link_keeps_a_local_edit_holding_the_folder_content(
     parent.write_files({"shared/a.txt": "a original\n"})
 
     parent.branch_switch("main")
-    _assert_holds_folder(parent)
+    assert_holds_folder(parent)
 
 
 # ---------------------------------------------------------------------------

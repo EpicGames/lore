@@ -8,13 +8,14 @@ import re
 import pytest
 from error_types import OverlappingLinkError
 from lore_parsers import parse_jsonl, parse_status_json
-from test_utils import staged_revision, unstaged_entries
+from test_utils import staged_revision, unstaged_entries, working_tree_files
 
 from lore import Lore
 
 DEFAULT_LINK_MOUNT = "vendor/lib"
 DEFAULT_PARENT_FILE = "README.txt"
 MAX_LINK_DEPTH = 8
+SHARED_FOLDER = {"shared/a.txt": "a original\n", "shared/b.txt": "b original\n"}
 
 
 def make_repo(new_lore_repo, files: dict, message: str = "Initial commit") -> Lore:
@@ -144,12 +145,17 @@ def link_entry(repo: Lore, link_path: str) -> dict:
     return next(e for e in entries if e["linkPath"] == link_path)
 
 
+def link_pins(repo: Lore, source_id: str) -> list[str]:
+    """The revisions the links to `source_id` pin, read from `link list`."""
+    entries = parse_jsonl(repo.link_list(json=True), "linkEntry")
+    return [e["revision"] for e in entries if e["link"] == source_id]
+
+
 def link_pin(repo: Lore, source_id: str) -> str:
     """The revision `source_id` is pinned at, read from `link list`."""
-    output = repo.link_list()
-    match = re.search(rf"Link\s+{source_id}.*?Revision:\s*(\w+)", output, re.DOTALL)
-    assert match, f"No pin for {source_id} in link list:\n{output}"
-    return match.group(1)
+    pins = link_pins(repo, source_id)
+    assert pins, f"No pin for {source_id} in link list"
+    return pins[0]
 
 
 def link_pin_at(repo: Lore, link_path: str) -> str:
@@ -194,29 +200,24 @@ def assert_crr_clean(
             )
 
 
+def fail_unless_holds(repo: Lore, path: str, content: str):
+    """Fails the test unless `path` holds `content`, with `pytest.fail` rather than an
+    `AssertionError`, so a test marked `xfail(raises=AssertionError)` still fails on it."""
+    with repo.open_file(path) as f:
+        held = f.read()
+    if held != content:
+        pytest.fail(f"{path} must hold {content!r}, got {held!r}")
+
+
 def folder_replaced_by_a_link(new_lore_repo) -> tuple[Lore, Lore]:
-    """Parent on `main` holding `shared/`, plus a `feature` branch where a link
+    """Parent on `main` holding `SHARED_FOLDER`, plus a `feature` branch where a link
     replaced that folder with a repository of its own, with `feature` checked out.
 
     The linked copy is byte-identical to the folder it replaces, which is what
     moving a folder out into its own repository leaves behind.
     """
-    parent = make_repo(
-        new_lore_repo,
-        {
-            "root.txt": "root\n",
-            "shared/a.txt": "a original\n",
-            "shared/b.txt": "b original\n",
-        },
-    )
-
-    source = make_repo(
-        new_lore_repo,
-        {
-            "a.txt": "a original\n",
-            "b.txt": "b original\n",
-        },
-    )
+    parent = make_repo(new_lore_repo, {"root.txt": "root\n", **SHARED_FOLDER})
+    source = make_repo(new_lore_repo, _unprefixed(SHARED_FOLDER))
 
     parent.branch_create("feature")
     parent.rmtree("shared")
@@ -232,17 +233,99 @@ def link_replaced_by_its_folder(new_lore_repo) -> tuple[Lore, Lore]:
     """Parent on `main` holding a link at `shared/`, plus a `feature` branch where
     a folder of the link's content replaced it, with `main` checked out."""
     parent, source = make_parent_with_link(
-        new_lore_repo, "shared", {"a.txt": "a original\n", "b.txt": "b original\n"}
+        new_lore_repo, "shared", _unprefixed(SHARED_FOLDER)
     )
     parent.branch_create("feature")
-    parent.link_remove("shared")
-    parent.commit("Remove the link")
-    parent.write_commit_push(
-        "Replace the link with its folder",
-        {"shared/a.txt": "a original\n", "shared/b.txt": "b original\n"},
-    )
+    replace_link_with_folder(parent)
     parent.branch_switch("main")
     return parent, source
+
+
+def _unprefixed(folder: dict[str, str]) -> dict[str, str]:
+    return {path.removeprefix("shared/"): content for path, content in folder.items()}
+
+
+def replace_link_with_folder(repo: Lore, files: dict[str, str] = SHARED_FOLDER):
+    """Commits the link at `shared/` removed, then `files` in its place, and pushes."""
+    repo.link_remove("shared")
+    repo.commit("Remove the link")
+    repo.write_commit_push("Replace the link with its folder", files)
+
+
+def change_inside_the_folder(repo: Lore) -> dict[str, str]:
+    """Commits a file of `shared/` modified and another added, and returns what
+    `shared/` holds."""
+    changes = {
+        "shared/a.txt": "a changed on main\n",
+        "shared/c.txt": "c added on main\n",
+    }
+    repo.write_commit_push("Change files under shared/", changes)
+    return {**SHARED_FOLDER, **changes}
+
+
+def add_inside_the_folder(repo: Lore) -> dict[str, str]:
+    """Commits a file added under `shared/`, and returns what `shared/` holds."""
+    added = {"shared/c.txt": "c\n"}
+    repo.write_commit_push("Add a file under shared/", added)
+    return {**SHARED_FOLDER, **added}
+
+
+def delete_inside_the_folder(repo: Lore) -> dict[str, str]:
+    """Commits a file deleted under `shared/`, and returns what `shared/` holds."""
+    repo.remove_file("shared/b.txt")
+    repo.stage("shared/b.txt")
+    repo.commit("Delete a file under shared/")
+    repo.push()
+    return {"shared/a.txt": SHARED_FOLDER["shared/a.txt"]}
+
+
+def delete_the_folder(repo: Lore) -> dict[str, str]:
+    """Commits `shared/` deleted, and returns what `shared/` holds."""
+    repo.rmtree("shared")
+    repo.stage("shared", scan=True)
+    repo.commit("Delete shared/")
+    repo.push()
+    return {}
+
+
+def assert_holds_folder(repo: Lore, files: dict[str, str] = SHARED_FOLDER):
+    """`shared/` holds exactly `files`, and nothing is reported as changed."""
+    assert working_tree_files(repo, "shared") == sorted(files), (
+        "shared/ must hold the folder's files"
+    )
+    for path, content in files.items():
+        with repo.open_file(path) as f:
+            assert f.read() == content, f"{path} must hold the folder's content"
+    assert parse_status_json(repo.status(json=True)) == [], "nothing may be staged"
+    assert unstaged_entries(repo) == [], "the file system must match the revision"
+
+
+def assert_holds_link(repo: Lore, source: Lore, pin: str | None = None):
+    """`shared/` is the link to `source`, at `pin` when given, serving its content."""
+    info = repo.link_info("shared")
+    assert source.get_id() in info, f"shared must link the repository:\n{info}"
+    assert "Link path: shared" in info, f"shared must be a link:\n{info}"
+    if pin:
+        assert f"Revision: {pin}" in info, f"shared must hold its pin:\n{info}"
+    assert repo.compare_file(source, "shared/b.txt", "b.txt"), (
+        "the mount must serve the linked repository's content"
+    )
+    assert unstaged_entries(repo) == [], "the file system must match the revision"
+
+
+def mount_listing(repo: Lore, link_path: str) -> list[str]:
+    """The names the mount at `link_path` holds at its top, sorted."""
+    return sorted(os.listdir(os.path.join(repo.path, link_path)))
+
+
+def mounted_files(repo: Lore, link_path: str) -> dict[str, str]:
+    """The files the mount at `link_path` holds at its top, with their contents."""
+    files = {}
+    for entry in os.scandir(os.path.join(repo.path, link_path)):
+        if entry.is_file():
+            with open(entry.path) as f:
+                files[entry.name] = f.read()
+    return files
 
 
 def assert_mount_source(repo: Lore, link_path: str, source_path: str):
@@ -258,7 +341,7 @@ def assert_mount_exposes(
 ):
     """The link at `link_path` mounts `source_path` and nothing else."""
     assert_mount_source(repo, link_path, source_path)
-    mounted = sorted(os.listdir(os.path.join(repo.path, link_path)))
+    mounted = mount_listing(repo, link_path)
     assert mounted == sorted(expected_names), (
         f"Mount {link_path} should expose exactly {sorted(expected_names)}, "
         f"got: {mounted}"
@@ -446,10 +529,8 @@ def resolve_the_only_conflict(urc: Lore, path: str):
 
 def assert_link_holds(repo: Lore, link_path: str, files: dict[str, str]):
     """The link at `link_path` exposes exactly `files`, with their contents."""
-    assert sorted(os.listdir(os.path.join(repo.path, link_path))) == sorted(files)
-    for name, content in files.items():
-        with repo.open_file(f"{link_path}/{name}") as f:
-            assert f.read() == content
+    assert mount_listing(repo, link_path) == sorted(files)
+    assert mounted_files(repo, link_path) == files
 
 
 SUBTREE_LINK = "linked/repo"

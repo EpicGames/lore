@@ -125,11 +125,13 @@ def test_link_commit_link_commits_changes_outside_a_subtree_link(new_lore_repo):
 @pytest.mark.smoke
 def test_link_merge_all_refuses_a_conflict_outside_a_subtree_link(new_lore_repo):
     """A conflict a merge leaves outside the subtree a link mounts refuses the commit, and an
-    abort restores the pin and the mount."""
+    abort restores the pin and the mount, leaving both repositories' branches where they were."""
     parent, linked = subtree_link_with_outside_change(
         new_lore_repo, inside_change=False, conflicting=True
     )
     pin_before = link_pin(parent, linked.get_id())
+    latest_before = parent.branch_info().local_latest
+    linked_latest_before = linked.branch_info("main").remote_latest
 
     parent.branch_merge_start("feature", message="Merge feature")
     with pytest.raises(UnresolvedConflictError):
@@ -137,6 +139,8 @@ def test_link_merge_all_refuses_a_conflict_outside_a_subtree_link(new_lore_repo)
 
     parent.branch_merge_abort()
     assert link_pin(parent, linked.get_id()) == pin_before
+    assert parent.branch_info().local_latest == latest_before
+    assert linked.branch_info("main").remote_latest == linked_latest_before
     assert parse_status_json(parent.status(json=True)) == []
     with parent.open_file(f"{SUBTREE_LINK}/a.txt") as f:
         assert f.read() == "a base\n"
