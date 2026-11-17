@@ -149,3 +149,39 @@ fn a_hold_is_refused_behind_a_settled_drain() {
         draining.await.expect("the draining task");
     });
 }
+
+/// A dispatcher handed back closes without the `End` its forwarder sends on a close, and returns
+/// the callback, which a call run elsewhere then reports to, `End` included.
+#[test]
+fn a_handed_back_dispatcher_returns_its_callback_without_an_end() {
+    let delivered: Arc<Mutex<Vec<LoreEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = delivered.clone();
+    let callback: lore_revision::interface::LoreEventCallback =
+        Some(Box::new(move |event: &LoreEvent| {
+            sink.lock().unwrap().push(event.clone());
+        }));
+
+    let handed_back = lore_base::runtime::runtime().block_on(async {
+        let dispatcher = EventDispatcher::new(callback);
+        dispatcher.hand_back().await
+    });
+
+    assert!(
+        delivered.lock().unwrap().is_empty(),
+        "no End reaches the callback"
+    );
+    let callback = handed_back.expect("the callback is handed back");
+    let status = lore_base::runtime::runtime().block_on(async {
+        EventDispatcher::new(Some(callback))
+            .complete(LoreErrorDetail::default())
+            .await
+    });
+    assert_eq!(status, 0);
+    let delivered = delivered.lock().unwrap();
+    assert_eq!(
+        delivered.len(),
+        2,
+        "the second dispatcher's Complete and End"
+    );
+    assert!(matches!(delivered[1], LoreEvent::End(_)));
+}

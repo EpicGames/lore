@@ -137,6 +137,27 @@ def test_clone_vfs_fuse_lists_and_reads(new_lore_repo, fuse_mounts):
 
 
 @pytest.mark.smoke
+def test_status_lists_each_mounted_instance_and_their_one_global_data_directory(
+    new_lore_repo, fuse_mounts, global_dir_name
+):
+    """`service status` lists the path of each FUSE instance the service mounts,
+    and the global data directory they were mounted for, once for both."""
+    repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    repo.write_commit_push("initial", {"readme.txt": b"hello through fuse\n"})
+    first = fuse_clone(repo, fuse_mounts)
+    second = fuse_clone(repo, fuse_mounts)
+
+    status = first.service_status()
+
+    lines = [line.strip() for line in status.splitlines()]
+    assert first.path in lines and second.path in lines, (
+        f"status lists both mounted instances: {status}"
+    )
+    data = str((Path(global_dir_name) / "data").resolve())
+    assert lines.count(data) == 1, f"status lists their global data directory once: {status}"
+
+
+@pytest.mark.smoke
 def test_reset_through_fuse_puts_back_the_spelling_the_revision_holds(
     new_lore_repo, fuse_mounts
 ):

@@ -27,6 +27,7 @@ use crate::fs::mount_manager::MountRecord;
 use crate::fs::mount_manager::PendingFuseMount;
 use crate::fs::mount_manager::external_dir_of;
 use crate::fs::swfs::paths::MountPath;
+use crate::global::external_dir::access::resolve_shared;
 use crate::global::external_dir::canonical_global_data_dir;
 use crate::global::external_dir::external_dir_for_instance;
 use crate::global::external_dir::external_dirs_root;
@@ -739,7 +740,7 @@ impl FuseMountManager {
         }
         let external = match recorded {
             Some(external) => external,
-            None => resolve()
+            None => resolve_shared()
                 .and_then(|state| external_dir_for_instance(&state, instance_id))
                 .forward::<MountManagerError>(
                     "Locating the abandoned FUSE instance's external directory",

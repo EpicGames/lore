@@ -26,6 +26,7 @@ from service_util import (
     service_claim_path,
     stop_lore_service,
     LORE_SERVICE_STATUS_LABELS,
+    LORE_EXTERNAL_ROOT_STATUS_LABELS,
 )
 
 logger = logging.getLogger(__name__)
@@ -330,8 +331,11 @@ def test_status_reports_the_running_service_and_its_metadata(
     assert LORE_NO_SERVICE_MESSAGE not in status, (
         f"status must not report the service as not running: {status}"
     )
-    for label in LORE_SERVICE_STATUS_LABELS:
+    for label in LORE_SERVICE_STATUS_LABELS + LORE_EXTERNAL_ROOT_STATUS_LABELS:
         assert label in status, f"status must report {label!r}: {status}"
+    assert "Runs inside another program: no" in status, (
+        f"the service the CLI runs is its own program: {status}"
+    )
 
     # The whole path rather than the file name, which every build of the client
     # shares: this is what makes the report worth reading, because an operator
@@ -372,11 +376,52 @@ def test_status_reports_no_service_rather_than_failing_to_reach_one(
         assert label not in status, (
             f"status must not report {label!r} with no service running: {status}"
         )
+    # The external directories belong to the global data directory, not to a
+    # service, so they are reported either way.
+    for label in LORE_EXTERNAL_ROOT_STATUS_LABELS:
+        assert label in status, (
+            f"status must report {label!r} with no service running: {status}"
+        )
 
     # Asking did not start one: a query must not change what it reports on.
     assert LORE_NO_SERVICE_MESSAGE in stop_lore_service(
         repo.lore_executable_path, lore_service_runner.global_dir_name
     ), "status must not start a service in order to report on one"
+
+
+@pytest.mark.smoke
+def test_start_against_a_running_service_prints_what_it_buffered(
+    new_lore_repo, global_dir_name, lore_service_runner
+):
+    """`service start` against a running service asks it for its status, and
+    prints the messages the service buffered while no command ran, as logs of
+    their level, and nothing else of the status.
+
+    A file stands where a registered shared store would be, so the service warns
+    at start that it can't open it. `service run` drains nothing, so the warning
+    is still buffered when the start asks."""
+    repo: Lore = new_lore_repo()
+    broken_store = Path(global_dir_name) / "a-file-in-place-of-a-shared-store"
+    broken_store.write_text("")
+    registry_path = Path(global_dir_name) / "data" / "stores" / "registry.toml"
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(registry_path, "a") as registry_file:
+        registry_file.write(
+            '\n[[entries]]\n'
+            'remote_url = "lore://broken"\n'
+            f"path = '{broken_store}'\n"
+        )
+    lore_service_runner.start()
+
+    started = repo.run(["service", "start"])
+
+    assert f"Unable to open shared store at {broken_store}" in started, (
+        f"the start prints the warning the service buffered: {started}"
+    )
+    for label in LORE_SERVICE_STATUS_LABELS + LORE_EXTERNAL_ROOT_STATUS_LABELS:
+        assert label not in started, (
+            f"the start prints none of the status's {label!r}: {started}"
+        )
 
 
 @pytest.mark.smoke

@@ -48,6 +48,7 @@ use crate::fs::filesystem_provider::InstanceCloneError;
 use crate::fs::filesystem_provider::clone_io_failure;
 use crate::fs::filesystem_provider::lore_directory_within;
 use crate::fs::mount_manager_state::MountManagerState;
+use crate::global::external_dir::access::resolve_shared;
 use crate::global::external_dir::external_dir_for_instance;
 use crate::global::external_dir::resolve::Lookup;
 use crate::global::external_dir::resolve::RootState;
@@ -1706,16 +1707,13 @@ fn external_presence(
     }
 }
 
-/// The VFS serving the instance at `path`, in the external root `state`, after checking as
-/// [`check_mount`] does that it can be acted on: the VFS of the service's mount of `instance_id`
-/// at `path`, which the check requires of an instance with an external directory, or
-/// [`VfsType::None`] for one in a directory of its own.
+/// The external root, and the VFS serving the instance at `path` once [`check_mount`] finds it can
+/// be acted on, resolved under shared access where the service mounts an instance at `path`.
 fn require_own_mount(
-    state: &RootState,
     instance_id: InstanceId,
     path: &str,
     action: &str,
-) -> Result<VfsType, InstanceError> {
+) -> Result<(RootState, VfsType), InstanceError> {
     let mount_manager = MountManagerState::mount_manager();
     let mounted = match &mount_manager {
         Some(mount_manager) => mount_manager
@@ -1723,6 +1721,12 @@ fn require_own_mount(
             .forward_any::<InstanceError>("failed to look up the mount")?,
         None => None,
     };
+    let state = if mounted.is_some() {
+        resolve_shared()
+    } else {
+        resolve()
+    }
+    .forward::<InstanceError>("resolving the external root")?;
     let lookup = state.lookup(instance_id);
     check_mount(
         instance_id,
@@ -1732,7 +1736,7 @@ fn require_own_mount(
         path,
         action,
     )?;
-    Ok(mounted.map_or(VfsType::None, |(_, vfs)| vfs))
+    Ok((state, mounted.map_or(VfsType::None, |(_, vfs)| vfs)))
 }
 
 /// Fail where Windows would refuse to rename or delete `instance_path` because a process has it
@@ -2104,8 +2108,7 @@ async fn instance_delete_with(
     let path = repository.path_for_display().to_string();
     // Everything that can fail on a bad configuration is checked before anything is changed, and
     // by a dry run too.
-    let state = resolve().forward::<InstanceError>("resolving the external root")?;
-    let vfs = require_own_mount(&state, instance_id, &path, "delete")?;
+    let (state, vfs) = require_own_mount(instance_id, &path, "delete")?;
 
     // Emit begin event
     LoreEvent::RepositoryInstanceDeleteBegin(LoreRepositoryInstanceDeleteBeginEventData {
@@ -2555,8 +2558,7 @@ async fn instance_move_with(
     }
     crate::repository::refuse_instance_nested_at(target)?;
 
-    let state = resolve().forward::<InstanceError>("resolving the external root")?;
-    let vfs = require_own_mount(&state, instance_id, &source_path, "move")?;
+    let (state, vfs) = require_own_mount(instance_id, &source_path, "move")?;
     if vfs.is_virtual()
         && let Some(mm) = MountManagerState::mount_manager()
         && mm.is_mounted(target).unwrap_or(false)
@@ -3078,9 +3080,7 @@ async fn instance_clone_plan_with(
     let instance_id = repository.instance_id;
     let source = repository.require_path()?.to_path_buf();
     let dot_path = repository.dot_dir_path()?.to_path_buf();
-    let state = resolve().forward::<InstanceError>("resolving the external root")?;
-    let vfs = require_own_mount(
-        &state,
+    let (state, vfs) = require_own_mount(
         instance_id,
         &repository.path_for_display().to_string(),
         "clone",

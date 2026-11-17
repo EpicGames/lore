@@ -953,3 +953,47 @@ fn revision_graph_commands_follow_the_last_existing_command() {
         other => panic!("Unexpected command: {other:?}"),
     }
 }
+
+/// The move reply is the variant after `ApiResult`. A client's decoder from before it read the
+/// existing variants from the same bytes, and refuses the move reply rather than reading it as
+/// another message.
+#[test]
+fn the_move_reply_follows_the_api_result() {
+    /// `MessageToClient` before the move reply.
+    #[derive(bitcode::Encode, bitcode::Decode)]
+    #[allow(clippy::large_enum_variant)]
+    enum OlderMessageToClient {
+        Event(LoreEvent),
+        ApiResult(i32),
+    }
+
+    let event = LoreEvent::Log(lore_revision::relay::EventDispatcher::make_log(
+        lore_base::log::LoreLogLevel::Info,
+        "an event".to_string(),
+    ));
+    assert_eq!(
+        encode_message(&MessageToClient::Event(&event)),
+        encode_message(&OlderMessageToClient::Event(event.clone())),
+        "an event keeps its encoding"
+    );
+    assert_eq!(
+        encode_message(&MessageToClient::<LoreEvent>::ApiResult(-7)),
+        encode_message(&OlderMessageToClient::ApiResult(-7)),
+        "a result keeps its encoding"
+    );
+
+    let reply = encode_message(&MessageToClient::<LoreEvent>::ExternalRootMove);
+    assert_eq!(
+        reply,
+        [2],
+        "the move reply takes the position after the result"
+    );
+    assert!(matches!(
+        bitcode::decode::<MessageToClient>(&reply),
+        Ok(MessageToClient::ExternalRootMove)
+    ));
+    assert!(
+        bitcode::decode::<OlderMessageToClient>(&reply).is_err(),
+        "a decoder from before the move reply refuses it"
+    );
+}

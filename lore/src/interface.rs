@@ -96,6 +96,7 @@ pub type LoreCompleteEventData = lore_revision::event::LoreCompleteEventData;
 pub type LoreMaintenanceEventData = lore_revision::event::LoreMaintenanceEventData;
 pub type LoreServiceStatusEventData = lore_revision::event::LoreServiceStatusEventData;
 pub type LoreServiceMessageEventData = lore_revision::event::LoreServiceMessageEventData;
+pub type LoreExternalRootState = lore_revision::event::LoreExternalRootState;
 
 pub mod metadata {
     pub const MESSAGE: &str = lore_revision::metadata::MESSAGE;
@@ -7573,9 +7574,13 @@ pub type LoreServiceStartArgs = crate::service::LoreServiceStartArgs;
 
 /// Start the Lore background service, unless one is already running.
 ///
-/// Connects to the running service, and starts one when nothing is listening.
-/// Returns `0` once a service is reachable, whether it was already running or
-/// was started by this call.
+/// Connects to the running service, and starts one when nothing is listening,
+/// then asks it for its status. Returns `0` once a service is reachable, whether
+/// it was already running or was started by this call. Each log message the
+/// service buffered while no command was running arrives as a `LORE_EVENT_LOG`
+/// event of its level, emptying the buffer. Fails with error code 32 (service
+/// unavailable) while a move of the external directories holds the service
+/// socket, as no service runs then.
 ///
 /// # Events
 ///
@@ -7633,6 +7638,8 @@ pub type LoreServiceStopArgs = crate::service::LoreServiceStopArgs;
 /// is running, since that is the state the call asks for. A mount the service
 /// cannot release because something holds it refuses the stop with `MountsBusy`,
 /// unless the global `force` argument is set, which detaches busy mounts lazily.
+/// Fails with error code 32 (service unavailable) while a move of the external
+/// directories holds the service socket.
 ///
 /// # Events
 ///
@@ -7689,9 +7696,14 @@ pub type LoreServiceStatusArgs = crate::service::LoreServiceStatusArgs;
 /// Answers from inside the service when called there, and otherwise reaches the
 /// one that is listening. Nothing listening is an answer rather than a failure:
 /// the call returns `0` with `running` set to `0`, so a caller branches on the
-/// event rather than on a connection error. Also hands back the log messages the
-/// service buffered while no command was running, emptying the buffer as it
-/// reads it.
+/// event rather than on a connection error. While a move of the external
+/// directories holds the service socket, no service runs: the call also returns
+/// `0` with `running` set to `0`, and `external_root_state` is
+/// `LORE_EXTERNAL_ROOT_STATE_INTERRUPTED`. The `external_root`,
+/// `external_root_state` and `external_leftovers` fields describe the external
+/// root of the caller's global data directory whether or not a service runs. Also
+/// hands back the log messages the service buffered while no command was running,
+/// emptying the buffer as it reads it.
 ///
 /// # Events
 ///

@@ -21,6 +21,22 @@ mod revision_tree;
 mod sandbox_tests;
 mod service;
 mod storage;
+#[path = "../test_util.rs"]
+mod test_util;
+
+/// Held by each test that listens on or connects to this process's service socket. The name is
+/// per process, so a connect made while another test listens there reaches that test's listener,
+/// and each then waits on the other.
+/// The code of `ServiceUnavailable`.
+pub(crate) fn service_unavailable() -> i32 {
+    use lore_error_set::FfiError;
+    lore_base::error::ServiceUnavailable {
+        reason: String::new(),
+    }
+    .ffi_code()
+}
+
+pub(crate) static SERVICE_SOCKET_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Points the unit tests at a global config, credential store and service socket of
 /// their own, rather than the machine's, and keeps them from relaying.

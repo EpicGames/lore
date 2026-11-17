@@ -77,7 +77,7 @@ Lore service is running
 
 ## Step 5 — See what the service is doing
 
-`lore service status` reports on the service without changing it. It names the build that is serving the machine, how long that service has been up, how many clients are connected to it, and how many SWFS mounts it holds. With nothing running it says so and still succeeds, so a script can branch on the output rather than on a connection failing.
+`lore service status` reports on the service without changing it. It names the build that is serving the machine, how long that service has been up, how many clients are connected to it, how many SWFS mounts it holds, its process ID, whether it runs inside another program, and the virtual instances it mounts with their global data directories. With nothing running it says so and still succeeds, so a script can branch on the output rather than on a connection failing. Either way it reports where the external directories of your virtual instances are, whether they can be used, and how many old directories are left to remove.
 
 ```bash
 lore service status
@@ -89,13 +89,20 @@ Lore service is running
   Uptime: 1h 4m 12s
   Connections: 1
   SWFS mounts: 0
+  Process ID: 4242
+  Runs inside another program: no
+  Mounted virtual instances: none
+  Global data directories of the mounts: none
+External directories: /home/you/.local/share/lore/external
+  State: can be used
+  Old directories to remove: 0
 ```
 
 The command counts its own connection, so a service nothing else is talking to reports one.
 
 Trouble the service ran into while no command was running is buffered and printed under the status that reports it: failures while it was initializing, failures in the loop that accepts connections, and errors raised by SWFS callbacks. A service that has hit none of those reports none, so a status with no messages under it is the healthy reading rather than a missing one.
 
-The buffer holds the most recent messages and is emptied as it is read, so each call shows what has arrived since the last one, and a call that finds messages were dropped says how many. These messages are the answer to the command that asked for them rather than diagnostics about it, so they are printed whatever `--log-level` is set to.
+The buffer holds the most recent messages and is emptied as it is read, so each call shows what has arrived since the last one, and a call that finds messages were dropped says how many. These messages are the answer to the command that asked for them rather than diagnostics about it, so they are printed whatever `--log-level` is set to. `lore service start` reads the buffer too, once a service is reachable, and prints its messages as logs of their level.
 
 ## Step 6 — Override the setting for one command
 

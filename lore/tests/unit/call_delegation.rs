@@ -25,10 +25,7 @@ use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreEventCallbackConfig;
 use lore_revision::interface::LoreGlobalArgs;
 
-/// Held by each test that listens on or connects to this process's service socket. The name is
-/// per process, so a connect made while another test listens there reaches that test's listener,
-/// and each then waits on the other.
-static SERVICE_SOCKET_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::service_unavailable;
 
 // A concrete error whose `NotFound` variant carries error code 79, so the
 // async failure path has a known non-`1` code to assert against.
@@ -589,7 +586,7 @@ fn a_default_vfs_clone_resolves_to_fuse_and_requires_the_service() {
 /// service isn't maintaining.
 #[tokio::test]
 async fn fuse_instance_without_a_service_to_reach_or_start_reports_where_to_name_one() {
-    let _socket = SERVICE_SOCKET_TESTS.lock().await;
+    let _socket = crate::SERVICE_SOCKET_TESTS.lock().await;
     let root = repository_with_config("fuse-unavailable", "[vfs]\nvfs_type = \"Fuse\"\n");
     let globals = globals_for(&root);
 
@@ -648,6 +645,41 @@ async fn fuse_instance_without_a_service_to_reach_or_start_reports_where_to_name
     );
 }
 
+/// A call in a FUSE instance, which only the service may run, never runs here when the service
+/// socket answers it with the move reply: it fails with `ServiceUnavailable`.
+#[tokio::test]
+async fn a_forced_call_answered_with_the_move_reply_is_unavailable() {
+    let _socket = crate::SERVICE_SOCKET_TESTS.lock().await;
+    let replier = crate::test_util::Replier::move_reply(lore::remote::service_socket_name());
+    let root = repository_with_config("fuse-moving", "[vfs]\nvfs_type = \"Fuse\"\n");
+    let (sink, callback, done) = recording_callback();
+
+    let reached = Arc::new(AtomicBool::new(false));
+    let handler_reached = reached.clone();
+    let status = dispatch_call(
+        globals_for(&root),
+        lore::revision_tree::close::LoreRevisionTreeCloseArgs::default(),
+        callback,
+        move |_globals, _args, _callback| {
+            let reached = handler_reached.clone();
+            async move {
+                reached.store(true, Ordering::Release);
+                0
+            }
+        },
+    )
+    .await;
+
+    let (reported, message) = reported(sink, &done);
+    assert!(
+        !reached.load(Ordering::Acquire),
+        "the call doesn't run here"
+    );
+    assert_eq!(status, service_unavailable(), "{message}");
+    assert_eq!(reported, Some(status));
+    assert_eq!(replier.answered(), 1, "the call reached the socket");
+}
+
 /// A sink registered for [`record_event`], the callback reporting to it, and the receiver
 /// its `End` releases.
 fn recording_callback() -> (&'static AsyncSink, LoreEventCallback, mpsc::Receiver<()>) {
@@ -672,13 +704,6 @@ fn reported(sink: &AsyncSink, done: &mpsc::Receiver<()>) -> (Option<i32>, String
         .expect("the call must complete");
     let message = sink.message.lock().unwrap().clone().unwrap_or_default();
     (*sink.status.lock().unwrap(), message)
-}
-
-fn service_unavailable() -> i32 {
-    lore_base::error::ServiceUnavailable {
-        reason: String::new(),
-    }
-    .ffi_code()
 }
 
 /// Whether [`dispatch_call`] of `args`, from no repository and with no service running, ran
@@ -714,7 +739,7 @@ async fn dispatched_without_a_service<ArgsType: LoreArgs>(
 /// `ServiceUnavailable` and its own reason.
 #[tokio::test]
 async fn fuse_clone_and_create_arguments_without_a_running_service_report_their_reasons() {
-    let _socket = SERVICE_SOCKET_TESTS.lock().await;
+    let _socket = crate::SERVICE_SOCKET_TESTS.lock().await;
     let clone = lore::repository::LoreRepositoryCloneArgs {
         vfs: lore::repository::LoreVfsType::Fuse,
         ..Default::default()
@@ -746,7 +771,7 @@ async fn fuse_clone_and_create_arguments_without_a_running_service_report_their_
 /// run here.
 #[tokio::test]
 async fn a_fuse_clone_command_without_a_running_service_reports_the_clone_reason() {
-    let _socket = SERVICE_SOCKET_TESTS.lock().await;
+    let _socket = crate::SERVICE_SOCKET_TESTS.lock().await;
     let (sink, callback, done) = recording_callback();
 
     let status = dispatch_command(

@@ -108,3 +108,100 @@ async fn the_lock_is_acquirable_once_the_guard_drops() {
     .expect("the lock must be acquirable once the guard drops")
     .expect("second acquisition");
 }
+
+/// A mode a test takes a lock in.
+#[derive(Clone, Copy, Debug)]
+enum Mode {
+    Shared,
+    Exclusive,
+}
+
+/// Tries the lock guarding `path` in `mode`, without waiting.
+fn try_in(path: &std::path::Path, mode: Mode) -> Option<FSLock> {
+    match mode {
+        Mode::Shared => FSLock::try_acquire_shared_file_lock(path),
+        Mode::Exclusive => FSLock::try_acquire_file_lock(path),
+    }
+    .expect("attempt")
+}
+
+/// The pairs of a held mode and a tried one, with whether the try takes the lock.
+const MODE_PAIRS: [(Mode, Mode, bool); 4] = [
+    (Mode::Shared, Mode::Shared, true),
+    (Mode::Shared, Mode::Exclusive, false),
+    (Mode::Exclusive, Mode::Shared, false),
+    (Mode::Exclusive, Mode::Exclusive, false),
+];
+
+/// **A shared lock stands beside another shared one, and excludes an exclusive one both ways.**
+/// Observed from a second open file description in this process, which contends with the first.
+#[test]
+fn a_shared_lock_admits_shared_holders_and_excludes_an_exclusive_one_in_one_process() {
+    let dir = TempDir::new("lore-base-lock-shared");
+    let path = dir.path().join("name");
+    for (held, tried, taken) in MODE_PAIRS {
+        let holder = try_in(&path, held).expect("a free lock is taken");
+        assert_eq!(
+            try_in(&path, tried).is_some(),
+            taken,
+            "{tried:?} beside {held:?}"
+        );
+        drop(holder);
+    }
+    assert!(
+        try_in(&path, Mode::Exclusive).is_some(),
+        "the released shared locks leave the lock free"
+    );
+}
+
+/// **The shared mode excludes and admits across processes as within one.** The child is this
+/// test binary run again, which tries the given mode on the parent's lock and passes only if the
+/// try answers as expected.
+#[test]
+fn a_shared_lock_admits_shared_holders_and_excludes_an_exclusive_one_across_processes() {
+    const LOCK_VAR: &str = "LORE_LOCK_TEST_CHILD_PATH";
+    const MODE_VAR: &str = "LORE_LOCK_TEST_CHILD_MODE";
+    const TAKEN_VAR: &str = "LORE_LOCK_TEST_CHILD_TAKES";
+    const TEST_NAME: &str = "fs::lock::a_shared_lock_admits_shared_holders_and_excludes_an_exclusive_one_across_processes";
+
+    if let Some(path) = std::env::var_os(LOCK_VAR) {
+        let mode = match std::env::var(MODE_VAR).as_deref() {
+            Ok("shared") => Mode::Shared,
+            _ => Mode::Exclusive,
+        };
+        let taken = try_in(std::path::Path::new(&path), mode).is_some();
+        assert_eq!(taken, std::env::var_os(TAKEN_VAR).is_some(), "{mode:?}");
+        return;
+    }
+
+    let dir = TempDir::new("lore-base-lock-shared-child");
+    let path = dir.path().join("name");
+    for (held, tried, taken) in MODE_PAIRS {
+        let holder = try_in(&path, held).expect("a free lock is taken");
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("this test binary"));
+        child
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(LOCK_VAR, &path)
+            .env(
+                MODE_VAR,
+                match tried {
+                    Mode::Shared => "shared",
+                    Mode::Exclusive => "exclusive",
+                },
+            );
+        if taken {
+            child.env(TAKEN_VAR, "1");
+        }
+        let output = child.output().expect("run the child");
+        assert!(
+            output.status.success(),
+            "{tried:?} in another process beside {held:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the child ran the test"
+        );
+        drop(holder);
+    }
+}

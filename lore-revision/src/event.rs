@@ -840,6 +840,53 @@ pub struct LoreServiceStatusEventData {
     pub connection_count: u32,
     /// Number of SWFS mounts currently active.
     pub swfs_mount_count: u32,
+    /// The path of the caller's external root, empty where its setting can't be read or there is
+    /// no global data directory. Reported whether or not the service is running.
+    pub external_root: LoreString,
+    /// Whether the external root can be used. Reported whether or not the service is running.
+    pub external_root_state: LoreExternalRootState,
+    /// The number of old external directory roots listed to be removed, 0 where the list can't be
+    /// read. Reported whether or not the service is running.
+    pub external_leftovers: u32,
+    /// Whether the service runs inside a program that doesn't serve from its own executable, as the
+    /// Lore CLI does: 1 if so, else 0.
+    pub embedded: u8,
+    /// The canonical path of each global data directory the service mounts virtual instances
+    /// for.
+    pub mounted_global_data_directories: LoreArray<LoreString>,
+    /// The path of each virtual instance the service mounts.
+    pub mounted_paths: LoreArray<LoreString>,
+    /// The service's process ID.
+    pub process_id: u32,
+}
+
+/// Whether the external root of a global data directory can be used.
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, bitcode::Encode, bitcode::Decode,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum LoreExternalRootState {
+    /// The root can be used.
+    #[default]
+    Available = 0,
+    /// The root can't be used.
+    Unavailable = 1,
+    /// A move of the root is under way, or was interrupted.
+    Interrupted = 2,
+}
+
+impl From<&crate::global::external_dir::resolve::Availability> for LoreExternalRootState {
+    fn from(availability: &crate::global::external_dir::resolve::Availability) -> Self {
+        use crate::global::external_dir::resolve::Availability;
+        match availability {
+            Availability::Available(_) => LoreExternalRootState::Available,
+            Availability::Unavailable(_) => LoreExternalRootState::Unavailable,
+            Availability::Interrupted => LoreExternalRootState::Interrupted,
+        }
+    }
 }
 
 /// Data for a service log message captured outside command execution.

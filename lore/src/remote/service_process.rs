@@ -178,6 +178,11 @@ pub fn serve_from_this_executable() {
     SERVES_FROM_THIS_EXECUTABLE.store(true, Ordering::Release);
 }
 
+/// Whether this program has called [`serve_from_this_executable`], as the Lore CLI does.
+pub(crate) fn serves_from_this_executable() -> bool {
+    SERVES_FROM_THIS_EXECUTABLE.load(Ordering::Acquire)
+}
+
 /// The executables a caller may start a service from when none is running.
 #[lore_macro::test_pub]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -588,7 +593,7 @@ pub(crate) async fn connect_or_spawn_service(
     let executable = executable_to_start(
         named,
         start,
-        config_read && SERVES_FROM_THIS_EXECUTABLE.load(Ordering::Acquire),
+        config_read && serves_from_this_executable(),
         std::env::current_exe,
     )?;
     let mut service = lore_base::lore_spawn_blocking!(move || spawn_service(executable))

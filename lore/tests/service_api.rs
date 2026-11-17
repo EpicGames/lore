@@ -48,6 +48,7 @@ mod tests {
     use rand::distr::SampleString;
     use serial_test::serial;
 
+    use super::test_util::Replier;
     use super::test_util::TempDir;
 
     /// Names the executable for one call, which is what these tests set rather
@@ -271,6 +272,13 @@ mod tests {
     /// Runs `call` with a C callback and returns what the callback received, up
     /// to and including `End`.
     fn delivered(call: impl FnOnce(LoreEventCallbackConfig)) -> Vec<Delivered> {
+        delivered_and_after(call).0
+    }
+
+    /// [`delivered`], with the receiver of whatever the callback receives after `End`.
+    fn delivered_and_after(
+        call: impl FnOnce(LoreEventCallbackConfig),
+    ) -> (Vec<Delivered>, mpsc::Receiver<Delivered>) {
         let (sender, receiver) = mpsc::channel();
         *RECORDED.lock().expect("the sender lock is not poisoned") = Some(sender);
         call(LoreEventCallbackConfig {
@@ -286,7 +294,7 @@ mod tests {
                     .expect("every call ends with an End event"),
             );
         }
-        received
+        (received, receiver)
     }
 
     /// What a call that failed with `code` delivers: one `Complete` carrying the
@@ -902,6 +910,230 @@ mod tests {
             events[0].swfs_mount_count, 0,
             "swfs_mount_count should be 0 when not running"
         );
+    }
+
+    /// A status of the service running in this process carries every field: it runs, it reads as
+    /// embedded, since this program never said it serves from its own executable, it reports
+    /// this process's ID and no mount, and the external root is the default location, which can
+    /// be used, with no leftovers.
+    #[test]
+    #[serial]
+    fn status_of_a_service_running_here_carries_every_field() {
+        let settings = machine_settings("service-api-status-running-");
+
+        let status_events: Arc<Mutex<Vec<lore_revision::event::LoreServiceStatusEventData>>> =
+            Arc::default();
+        let recorder = Arc::clone(&status_events);
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+            if let LoreEvent::ServiceStatus(data) = event {
+                recorder
+                    .lock()
+                    .expect("the collector lock is not poisoned")
+                    .push(data.clone());
+            }
+        }));
+
+        lore::runtime().block_on(async {
+            let service = run_service_here().await;
+            // The socket answers before the service records that it runs here, and a status
+            // asked in between is relayed to the socket instead.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !lore::remote::service_process::service_runs_in_this_process() {
+                assert!(Instant::now() < deadline, "the service runs here");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(status(callback).await, 0, "the status succeeds");
+            assert_eq!(quit().await, 0);
+            tokio::time::timeout(Duration::from_secs(15), service)
+                .await
+                .expect("the service must end after a quit")
+                .expect("the service task must not panic");
+        });
+
+        let events = status_events
+            .lock()
+            .expect("the collector lock is not poisoned");
+        assert_eq!(events.len(), 1, "exactly one ServiceStatus event expected");
+        let event = &events[0];
+        assert_eq!(event.running, 1);
+        assert_eq!(event.embedded, 1, "the service runs inside this program");
+        assert_eq!(event.process_id, std::process::id());
+        assert!(event.mounted_paths.is_empty());
+        assert!(event.mounted_global_data_directories.is_empty());
+        assert_eq!(
+            event.external_root.as_str(),
+            settings
+                .path()
+                .join("data")
+                .join("external")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            event.external_root_state,
+            lore::interface::LoreExternalRootState::Available
+        );
+        assert_eq!(event.external_leftovers, 0);
+    }
+
+    /// Turns relaying on toward this target's socket, where a [`Replier`] answers every
+    /// request with the move reply, and names an executable that doesn't exist, so no service is
+    /// started.
+    fn relaying_to_a_move(settings: &TempDir) -> Replier {
+        let missing = settings.path().join("no-such-lore");
+        lore::runtime().block_on(async {
+            assert_eq!(set_use_automatically(true).await, 0);
+            assert_eq!(set_executable(&missing.to_string_lossy()).await, 0);
+        });
+        Replier::move_reply(use_a_socket_of_our_own())
+    }
+
+    /// An ordinary instance of a local repository at `path`, created in this process.
+    fn ordinary_instance(path: &std::path::Path) {
+        std::fs::create_dir(path).expect("make the instance's directory");
+        let args = lore::repository::LoreRepositoryCreateArgs {
+            repository_url: LoreString::default(),
+            id: LoreString::default(),
+            description: LoreString::default(),
+            vfs: lore::repository::LoreVfsType::None,
+            use_shared_store: lore_revision::repository::LoreSharedStoreMode::Disabled,
+            shared_store_path: LoreString::default(),
+        };
+        let globals = LoreGlobalArgs {
+            repository_path: path.into(),
+            offline: 1,
+            ..LoreGlobalArgs::default()
+        };
+        lore::runtime().block_on(async {
+            assert_eq!(set_use_automatically(false).await, 0);
+            assert_eq!(lore::repository::create(globals, args, None).await, 0);
+        });
+    }
+
+    /// A call made with the C callback it is handed.
+    type CallWith<'a> = Box<dyn FnOnce(LoreEventCallbackConfig) + 'a>;
+
+    /// The arguments of a status that reports the tracked state alone.
+    fn plain_status() -> lore::repository::LoreRepositoryStatusArgs {
+        lore::repository::LoreRepositoryStatusArgs {
+            staged: 0,
+            scan: 0,
+            check_dirty: 0,
+            reset: 0,
+            sync_point: 0,
+            revision_only: 0,
+            count: 0,
+            paths: LoreArray::default(),
+        }
+    }
+
+    /// A relayed call in an ordinary instance that the service socket answers with the move
+    /// reply runs in this process with its own callback, through each relayed path: the
+    /// synchronous and the asynchronous C API, and the Rust API. Each delivers one `Complete`
+    /// and one `End`, and nothing after it.
+    #[test]
+    #[serial]
+    fn a_call_answered_with_the_move_reply_runs_in_this_process() {
+        let settings = machine_settings("service-api-move-reply-runs-");
+        let instance = settings.path().join("instance");
+        ordinary_instance(&instance);
+        let replier = relaying_to_a_move(&settings);
+        let globals = LoreGlobalArgs {
+            repository_path: instance.as_path().into(),
+            offline: 1,
+            ..LoreGlobalArgs::default()
+        };
+        let args = plain_status();
+        let ran = vec![
+            Delivered::Complete {
+                status: 0,
+                error_code: 0,
+                has_message: false,
+                has_trace: false,
+            },
+            Delivered::End,
+        ];
+
+        let calls: [(&str, CallWith<'_>); 3] = [
+            (
+                "synchronous",
+                Box::new(|callback| {
+                    assert_eq!(
+                        lore::interface::lore_repository_status(&globals, &args, callback),
+                        0
+                    );
+                }),
+            ),
+            (
+                "asynchronous",
+                Box::new(|callback| {
+                    lore::interface::lore_repository_status_async(&globals, &args, callback);
+                }),
+            ),
+            (
+                "Rust",
+                Box::new(|callback| {
+                    let status = lore::runtime().block_on(lore::repository::status(
+                        globals.clone(),
+                        args.clone(),
+                        lore_revision::event::convert_event_callback(callback),
+                    ));
+                    assert_eq!(status, 0);
+                }),
+            ),
+        ];
+        for (path, call) in calls {
+            let (received, after) = delivered_and_after(call);
+            assert_eq!(received, ran, "{path}");
+            assert!(
+                after.recv_timeout(Duration::from_millis(300)).is_err(),
+                "{path}: nothing follows the End"
+            );
+        }
+        assert_eq!(replier.answered(), 3, "each call reached the socket");
+    }
+
+    /// A relayed call outside any instance that the service socket answers with the move reply
+    /// runs in this process, as it would with no service.
+    #[test]
+    #[serial]
+    fn a_call_outside_an_instance_answered_with_the_move_reply_runs_in_this_process() {
+        let settings = machine_settings("service-api-move-reply-outside-");
+        let replier = relaying_to_a_move(&settings);
+
+        assert_eq!(
+            lore::interface::lore_shared_store_list(
+                &globals(),
+                &LoreSharedStoreListArgs::default(),
+                no_callback()
+            ),
+            0,
+            "the list runs here"
+        );
+        assert_eq!(replier.answered(), 1, "the call reached the socket");
+    }
+
+    /// A relayed call at a path that holds no Lore directory, as a virtual instance's mount
+    /// point holds none while the service is stopped, fails with `ServiceUnavailable` once the
+    /// service socket has answered with the move reply, in place of the open's own failure.
+    #[test]
+    #[serial]
+    fn a_call_without_a_lore_directory_answered_with_the_move_reply_is_unavailable() {
+        let settings = machine_settings("service-api-move-reply-no-lore-");
+        let replier = relaying_to_a_move(&settings);
+        let globals = LoreGlobalArgs {
+            repository_path: settings.path().into(),
+            ..LoreGlobalArgs::default()
+        };
+
+        let mut status = 0;
+        let received = delivered(|callback| {
+            status = lore::interface::lore_repository_status(&globals, &plain_status(), callback);
+        });
+
+        assert_eq!(received, failed_with(unavailable_code()));
+        assert_eq!(status, unavailable_code());
+        assert_eq!(replier.answered(), 1, "the call reached the socket");
     }
 
     /// A relayed call that reaches no service reports as a failing command does:

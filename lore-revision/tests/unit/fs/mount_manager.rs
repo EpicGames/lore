@@ -120,9 +120,9 @@ async fn a_store_that_cannot_be_opened_is_skipped() {
             );
             assert!(!opened(readable_store.path()));
 
-            let (mounted, pending, registered) = MountManager::mounts_of_entries(
+            let (mounted, pending, registered, _) = MountManager::mounts_of_entries(
                 registry.entries(),
-                &lore_revision::global::external_dir::resolve::resolve()
+                &mut lore_revision::global::external_dir::resolve::resolve()
                     .expect("resolve the external root"),
             )
             .await
@@ -185,9 +185,9 @@ async fn a_store_whose_instances_cannot_be_listed_is_skipped() {
             drop(reopened);
             assert!(!opened(readable_store.path()));
 
-            let (mounted, pending, registered) = MountManager::mounts_of_entries(
+            let (mounted, pending, registered, _) = MountManager::mounts_of_entries(
                 registry.entries(),
-                &lore_revision::global::external_dir::resolve::resolve()
+                &mut lore_revision::global::external_dir::resolve::resolve()
                     .expect("resolve the external root"),
             )
             .await
@@ -244,9 +244,9 @@ async fn an_instance_whose_config_cannot_be_read_is_skipped() {
             );
             assert!(!opened(next_store.path()));
 
-            let (mounted, pending, _) = MountManager::mounts_of_entries(
+            let (mounted, pending, _, _) = MountManager::mounts_of_entries(
                 registry.entries(),
-                &lore_revision::global::external_dir::resolve::resolve()
+                &mut lore_revision::global::external_dir::resolve::resolve()
                     .expect("resolve the external root"),
             )
             .await
@@ -291,9 +291,9 @@ async fn an_unlistable_store_does_not_stop_the_others() {
         "the sealed store opens"
     );
 
-    let (mounted, pending, _) = MountManager::mounts_of_entries(
+    let (mounted, pending, _, _) = MountManager::mounts_of_entries(
         registry.entries(),
-        &lore_revision::global::external_dir::resolve::resolve()
+        &mut lore_revision::global::external_dir::resolve::resolve()
             .expect("resolve the external root"),
     )
     .await
@@ -353,9 +353,9 @@ async fn a_store_whose_instances_cannot_be_listed_does_not_stop_the_others() {
     );
     let instance_id = register_fuse_instance(&registry.entries()[1], "").await;
 
-    let (mounted, pending, _) = MountManager::mounts_of_entries(
+    let (mounted, pending, _, _) = MountManager::mounts_of_entries(
         registry.entries(),
-        &lore_revision::global::external_dir::resolve::resolve()
+        &mut lore_revision::global::external_dir::resolve::resolve()
             .expect("resolve the external root"),
     )
     .await
@@ -403,9 +403,9 @@ async fn an_unreadable_instance_does_not_stop_the_rest_of_its_store() {
 
     let readable_id = register_fuse_instance(entry, "").await;
 
-    let (mounted, pending, registered) = MountManager::mounts_of_entries(
+    let (mounted, pending, registered, _) = MountManager::mounts_of_entries(
         registry.entries(),
-        &lore_revision::global::external_dir::resolve::resolve()
+        &mut lore_revision::global::external_dir::resolve::resolve()
             .expect("resolve the external root"),
     )
     .await
@@ -605,9 +605,9 @@ async fn a_start_skips_an_unknown_virtual_instance_and_removes_nothing() {
             .await
             .expect("save the record");
 
-            let (mounted, pending, _) = MountManager::mounts_of_entries(
+            let (mounted, pending, _, _) = MountManager::mounts_of_entries(
                 registry.entries(),
-                &lore_revision::global::external_dir::resolve::resolve()
+                &mut lore_revision::global::external_dir::resolve::resolve()
                     .expect("resolve the external root"),
             )
             .await
@@ -619,11 +619,12 @@ async fn a_start_skips_an_unknown_virtual_instance_and_removes_nothing() {
         .await;
 }
 
-/// A start resolves the external root once for every registration of every store, and each FUSE
-/// instance it finds carries the canonical path of the global data directory it was resolved for.
+/// A start resolves the external root once for every registration of every store, and once more
+/// under shared access at its first virtual instance, and each FUSE instance it finds carries the
+/// canonical path of the global data directory it was resolved for.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn a_start_resolves_the_external_root_once() {
+async fn a_start_resolves_the_external_root_once_and_once_under_shared_access() {
     use lore_revision::global::external_dir::resolve::test_util::reads_in;
 
     let global = TempDir::new("lore-mount-manager-once-global-");
@@ -645,9 +646,9 @@ async fn a_start_resolves_the_external_root_once() {
                 lore_revision::global::get_global_data_dir().expect("the global data directory");
             let before = reads_in(&data);
 
-            let (_, pending, _) = MountManager::mounts_of_entries(
+            let (_, pending, _, _) = MountManager::mounts_of_entries(
                 registry.entries(),
-                &lore_revision::global::external_dir::resolve::resolve()
+                &mut lore_revision::global::external_dir::resolve::resolve()
                     .expect("resolve the external root"),
             )
             .await
@@ -657,14 +658,113 @@ async fn a_start_resolves_the_external_root_once() {
             assert_eq!(pending.len(), 4);
             assert_eq!(
                 (after.setting, after.record),
-                (before.setting + 1, before.record + 1),
-                "one resolution"
+                (before.setting + 2, before.record + 2),
+                "one resolution, and one under shared access"
             );
             let canonical = std::fs::canonicalize(&data).expect("canonicalize");
             assert!(
                 pending
                     .iter()
                     .all(|fuse| fuse.global.as_ref() == canonical.as_path())
+            );
+        })
+        .await;
+}
+
+/// A start with no virtual instance registered takes no access to the external root, so a move of
+/// it can take exclusive access.
+#[tokio::test]
+async fn a_start_with_no_virtual_instance_takes_no_access_to_the_external_root() {
+    use lore_revision::util::config::SaveableConfig;
+
+    let global = TempDir::new("lore-mount-manager-ordinary-global-");
+    LORE_CONTEXT
+        .scope(crate::helper::execution_in(global.path()), async {
+            let store = TempDir::new("lore-mount-manager-ordinary-store-");
+            let parent = TempDir::new("lore-mount-manager-ordinary-path-");
+            let registry = registry_of(&[store.path()]);
+            let (_, lock) = SharedStoreRegistry::load_locked()
+                .await
+                .expect("lock the registry");
+            registry.save(lock).await.expect("save the registry");
+            let repository = registry.entries()[0]
+                .create_null_repository_context()
+                .await
+                .expect("store opens");
+            register_instance(
+                &repository,
+                InstanceId::generate(),
+                &parent.path().display().to_string(),
+            )
+            .await
+            .expect("an ordinary instance registers");
+            repository
+                .flush(FlushOptions::default())
+                .await
+                .expect("registration flushes to disk");
+            drop(repository);
+
+            let manager = MountManager::initialize()
+                .await
+                .expect("the start succeeds");
+
+            assert!(manager.mounts().is_empty());
+            let data =
+                lore_revision::global::get_global_data_dir().expect("the global data directory");
+            assert!(
+                lore_base::fs::lock::FSLock::try_acquire_file_lock(data.join("external"))
+                    .expect("attempt")
+                    .is_some(),
+                "a move can take exclusive access"
+            );
+        })
+        .await;
+}
+
+/// While a move of the external root holds exclusive access, a start mounts no virtual instance
+/// of that global data directory and goes on: a FUSE instance whose mount point is gone keeps its
+/// external directory, which a start holding shared access removes.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_start_refused_access_to_the_external_root_skips_every_virtual_instance() {
+    use lore_revision::global::external_dir::access::release_exclusive;
+    use lore_revision::global::external_dir::access::try_exclusive;
+    use lore_revision::util::config::SaveableConfig;
+
+    let global = TempDir::new("lore-mount-manager-refused-global-");
+    LORE_CONTEXT
+        .scope(crate::helper::execution_in(global.path()), async {
+            let store = TempDir::new("lore-mount-manager-refused-store-");
+            let parent = TempDir::new("lore-mount-manager-refused-path-");
+            let registry = registry_of(&[store.path()]);
+            let (_, lock) = SharedStoreRegistry::load_locked()
+                .await
+                .expect("lock the registry");
+            registry.save(lock).await.expect("save the registry");
+            let gone = parent.path().join("gone").display().to_string();
+            let instance_id = register_fuse_instance(&registry.entries()[0], &gone).await;
+            let external = external_dir_for_instance(
+                &lore_revision::global::external_dir::resolve::resolve()
+                    .expect("resolve the external root"),
+                instance_id,
+            )
+            .expect("external dir resolves");
+            let data =
+                lore_revision::global::get_global_data_dir().expect("the global data directory");
+            assert!(try_exclusive(&data).expect("attempt"));
+
+            let manager = MountManager::initialize().await.expect("the start goes on");
+            assert!(manager.mounts().is_empty());
+            assert!(
+                external.join(DOT_LORE).is_dir(),
+                "the instance whose mount point is gone is kept"
+            );
+
+            release_exclusive(&data).expect("shared access is taken");
+            MountManager::initialize().await.expect("the start goes on");
+            assert!(
+                !external.exists(),
+                "a start holding shared access removes it"
             );
         })
         .await;

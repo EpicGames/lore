@@ -190,6 +190,16 @@ typedef enum lore_error_code_t {
   LORE_ERROR_CODE_OVERSIZED = 118,
 } lore_error_code_t;
 
+// Whether the external root of a global data directory can be used.
+typedef enum lore_external_root_state_t {
+  // The root can be used.
+  LORE_EXTERNAL_ROOT_STATE_AVAILABLE = 0,
+  // The root can't be used.
+  LORE_EXTERNAL_ROOT_STATE_UNAVAILABLE = 1,
+  // A move of the root is under way, or was interrupted.
+  LORE_EXTERNAL_ROOT_STATE_INTERRUPTED = 2,
+} lore_external_root_state_t;
+
 // What a range of lines resolved to, or why it did not resolve.
 //
 // An outcome is named the same way wherever it is reported, as
@@ -3416,6 +3426,24 @@ typedef struct lore_service_status_event_data_t {
   uint32_t connection_count;
   // Number of SWFS mounts currently active.
   uint32_t swfs_mount_count;
+  // The path of the caller's external root, empty where its setting can't be read or there is
+  // no global data directory. Reported whether or not the service is running.
+  struct lore_string_t external_root;
+  // Whether the external root can be used. Reported whether or not the service is running.
+  enum lore_external_root_state_t external_root_state;
+  // The number of old external directory roots listed to be removed, 0 where the list can't be
+  // read. Reported whether or not the service is running.
+  uint32_t external_leftovers;
+  // Whether the service runs inside a program that doesn't serve from its own executable, as the
+  // Lore CLI does: 1 if so, else 0.
+  uint8_t embedded;
+  // The canonical path of each global data directory the service mounts virtual instances
+  // for.
+  struct lore_string_array_t mounted_global_data_directories;
+  // The path of each virtual instance the service mounts.
+  struct lore_string_array_t mounted_paths;
+  // The service's process ID.
+  uint32_t process_id;
 } lore_service_status_event_data_t;
 
 // Data for a service log message captured outside command execution.
@@ -12924,9 +12952,13 @@ void lore_storage_upload_async(const struct lore_global_args_t *globals,
 
 // Start the Lore background service, unless one is already running.
 //
-// Connects to the running service, and starts one when nothing is listening.
-// Returns `0` once a service is reachable, whether it was already running or
-// was started by this call.
+// Connects to the running service, and starts one when nothing is listening,
+// then asks it for its status. Returns `0` once a service is reachable, whether
+// it was already running or was started by this call. Each log message the
+// service buffered while no command was running arrives as a `LORE_EVENT_LOG`
+// event of its level, emptying the buffer. Fails with error code 32 (service
+// unavailable) while a move of the external directories holds the service
+// socket, as no service runs then.
 //
 // # Events
 //
@@ -12972,6 +13004,8 @@ void lore_service_start_async(const struct lore_global_args_t *globals,
 // is running, since that is the state the call asks for. A mount the service
 // cannot release because something holds it refuses the stop with `MountsBusy`,
 // unless the global `force` argument is set, which detaches busy mounts lazily.
+// Fails with error code 32 (service unavailable) while a move of the external
+// directories holds the service socket.
 //
 // # Events
 //
@@ -13016,9 +13050,14 @@ void lore_service_stop_async(const struct lore_global_args_t *globals,
 // Answers from inside the service when called there, and otherwise reaches the
 // one that is listening. Nothing listening is an answer rather than a failure:
 // the call returns `0` with `running` set to `0`, so a caller branches on the
-// event rather than on a connection error. Also hands back the log messages the
-// service buffered while no command was running, emptying the buffer as it
-// reads it.
+// event rather than on a connection error. While a move of the external
+// directories holds the service socket, no service runs: the call also returns
+// `0` with `running` set to `0`, and `external_root_state` is
+// `LORE_EXTERNAL_ROOT_STATE_INTERRUPTED`. The `external_root`,
+// `external_root_state` and `external_leftovers` fields describe the external
+// root of the caller's global data directory whether or not a service runs. Also
+// hands back the log messages the service buffered while no command was running,
+// emptying the buffer as it reads it.
 //
 // # Events
 //

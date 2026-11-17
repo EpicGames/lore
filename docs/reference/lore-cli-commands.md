@@ -2629,7 +2629,7 @@ Manage the repository in a service process
 * `run` — Run this process as the service
 * `start` — Start the service, unless one is already running
 * `stop` — Stop the running service
-* `status` — Report whether the service is running, and what it is doing
+* `status` — Report whether the service is running, what it is doing, and where the external directories are
 * `set-executable` — Set which executable is started as the service
 * `set-use-automatically` — Set whether commands are carried out by the service
 
@@ -2653,7 +2653,7 @@ Stop the running service
 
 ## `lore service status`
 
-Report whether the service is running, and what it is doing
+Report whether the service is running, what it is doing, and where the external directories are
 
 **Usage:** `lore service status`
 

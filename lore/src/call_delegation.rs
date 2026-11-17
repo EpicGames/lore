@@ -18,6 +18,9 @@ use lore_revision::interface::LoreGlobalArgs;
 use crate::args::LoreArgs;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreEventCallbackConfig;
+use crate::remote::call::EXTERNAL_ROOT_MOVING;
+use crate::remote::call::HandedBack;
+use crate::remote::call::Relayed;
 use crate::remote::call::ServiceCallError;
 use crate::remote::call::run_service_call;
 use crate::remote::command::LoreCommand;
@@ -339,7 +342,8 @@ async fn forced_service_call(
 ) -> i32 {
     let unreached = match connect_to_running_service().await {
         Ok(Some(connection)) => {
-            return run_service_call(Some(connection), globals, command, callback).await;
+            let relayed = run_service_call(Some(connection), globals, command, callback).await;
+            return forced_status(relayed).await;
         }
         Ok(None) => None,
         Err(error) => Some(error),
@@ -369,18 +373,13 @@ async fn unanswered_forced_service_call(
     if unreached.is_none() && starts_a_service(&globals, makes_instance).await {
         match connect_or_spawn_service(ServiceStart::NamedOrThisProgram).await {
             Ok(connection) => {
-                return run_service_call(Some(connection), globals, command, callback).await;
+                let relayed = run_service_call(Some(connection), globals, command, callback).await;
+                return forced_status(relayed).await;
             }
             Err(error) => unreached = Some(error),
         }
     }
-    let needs = match &command {
-        LoreCommand::RepositoryClone(_) => "A FUSE instance is mounted by the Lore service",
-        LoreCommand::RepositoryCreate(_) => {
-            "A FUSE instance is created and mounted by the Lore service"
-        }
-        _ => "This instance is served through a FUSE mount only the Lore service may use",
-    };
+    let needs = forced_need(&command);
     let reason = match unreached {
         None if makes_instance || !cfg!(target_os = "linux") => {
             format!("{needs}, and no service is running")
@@ -399,18 +398,79 @@ async fn unanswered_forced_service_call(
             format!("{needs}, and no service could be reached or started: {error}")
         }
     };
-    crate::call::no_repository_call(
+    forced_unavailable(globals, callback, "fuse_forced_relay", reason).await
+}
+
+/// Why a forced call of `command` needs the Lore service.
+fn forced_need(command: &LoreCommand) -> &'static str {
+    match command {
+        LoreCommand::RepositoryClone(_) => "A FUSE instance is mounted by the Lore service",
+        LoreCommand::RepositoryCreate(_) => {
+            "A FUSE instance is created and mounted by the Lore service"
+        }
+        _ => "This instance is served through a FUSE mount only the Lore service may use",
+    }
+}
+
+/// Fails the call `caller`, which never runs in this process, with `ServiceUnavailable` for
+/// `reason`.
+fn forced_unavailable(
+    globals: LoreGlobalArgs,
+    callback: LoreEventCallback,
+    caller: &'static str,
+    reason: String,
+) -> impl Future<Output = i32> {
+    crate::call::no_repository_call(globals, callback, (), caller, |()| async move {
+        Err::<(), ServiceCallError>(ServiceCallError::from(
+            lore_base::error::ServiceUnavailable { reason },
+        ))
+    })
+}
+
+/// The status of the forced call `relayed`, which fails with the move's `ServiceUnavailable`
+/// where a move of the external root held the service socket.
+async fn forced_status(relayed: Relayed) -> i32 {
+    match relayed {
+        Relayed::Ran(status) => status,
+        Relayed::HandedBack(call) => {
+            let need = forced_need(&call.command);
+            refuse_handed_back(call, "fuse_forced_relay", need).await
+        }
+    }
+}
+
+/// Fails the handed-back call `caller`, which `need` says needs the service, with the move's
+/// `ServiceUnavailable`. The failure is boxed: a cold path.
+pub(crate) async fn refuse_handed_back(
+    call: Box<HandedBack>,
+    caller: &'static str,
+    need: &str,
+) -> i32 {
+    let reason = format!("{need}, and {EXTERNAL_ROOT_MOVING}");
+    let HandedBack {
+        globals, callback, ..
+    } = *call;
+    Box::pin(forced_unavailable(globals, callback, caller, reason)).await
+}
+
+/// The status of the relayed call `relayed`, run in this process where a move of the external
+/// root held the service socket. That run is boxed: a cold path.
+async fn relayed_status(relayed: Relayed) -> i32 {
+    match relayed {
+        Relayed::Ran(status) => status,
+        Relayed::HandedBack(call) => Box::pin(handed_back_locally(*call)).await,
+    }
+}
+
+/// Runs `call`, which the service socket handed back during a move of the external root, in this
+/// process, with the move recorded for it.
+fn handed_back_locally(call: HandedBack) -> impl Future<Output = i32> {
+    let HandedBack {
         globals,
+        command,
         callback,
-        (),
-        "fuse_forced_relay",
-        |()| async move {
-            Err::<(), ServiceCallError>(ServiceCallError::from(
-                lore_base::error::ServiceUnavailable { reason },
-            ))
-        },
-    )
-    .await
+    } = call;
+    crate::call::during_external_root_move(command.invoke_local(globals, callback))
 }
 
 /// Runs `command` to completion, in the Lore service when the command requires one or one is in
@@ -444,7 +504,12 @@ fn run_forced(globals: LoreGlobalArgs, command: LoreCommand, callback: LoreEvent
 /// future is in a frame of its own rather than under every command run in this process.
 #[inline(never)]
 fn run_relayed(globals: LoreGlobalArgs, command: LoreCommand, callback: LoreEventCallback) -> i32 {
-    block_on_command(pin!(run_service_call(None, globals, command, callback)))
+    match crate::runtime().block_on(pin!(run_service_call(None, globals, command, callback))) {
+        Relayed::Ran(status) => status,
+        Relayed::HandedBack(call) => {
+            block_on_command(Box::pin(handed_back_locally(*call)).as_mut())
+        }
+    }
 }
 
 /// Runs `command` to completion in this process, for the commands that act on the Lore service
@@ -479,8 +544,11 @@ pub(crate) async fn dispatch_command(
         let relay = pin!(forced_service_call(globals, command, callback));
         relay.await
     } else if service_in_use().await {
-        let relay = pin!(run_service_call(None, globals, command, callback));
-        relay.await
+        let relayed = {
+            let relay = pin!(run_service_call(None, globals, command, callback));
+            relay.await
+        };
+        relayed_status(relayed).await
     } else {
         let handler = pin!(command.invoke_local(globals, callback));
         handler.await
@@ -512,7 +580,8 @@ pub(crate) async fn dispatch_call<
         return forced_service_call(globals, args.to_command(), callback).await;
     }
     if service_in_use().await {
-        run_service_call(None, globals, args.to_command(), callback).await
+        let relayed = run_service_call(None, globals, args.to_command(), callback).await;
+        relayed_status(relayed).await
     } else {
         handler(globals, args, callback).await
     }

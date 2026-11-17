@@ -4,8 +4,10 @@
 use clap::Args;
 use clap::Subcommand;
 use lore::call_delegation::run_command_locally;
+use lore::interface::LoreArray;
 use lore::interface::LoreEvent;
 use lore::interface::LoreEventCallback;
+use lore::interface::LoreExternalRootState;
 use lore::interface::LoreGlobalArgs;
 use lore::interface::LoreLogLevel;
 use lore::interface::LoreServiceMessageEventData;
@@ -15,6 +17,7 @@ use lore::interface::LoreServiceStartArgs;
 use lore::interface::LoreServiceStatusArgs;
 use lore::interface::LoreServiceStatusEventData;
 use lore::interface::LoreServiceStopArgs;
+use lore::interface::LoreString;
 use lore::runtime;
 use lore::service;
 use lore::service::LoreServiceQuitArgs;
@@ -77,7 +80,7 @@ pub enum ServiceCommands {
     /// Stop the running service
     Stop(ServiceStopArgs),
 
-    /// Report whether the service is running, and what it is doing
+    /// Report whether the service is running, what it is doing, and where the external directories are
     Status(ServiceStatusArgs),
 
     /// Set which executable is started as the service
@@ -216,41 +219,91 @@ fn format_uptime(uptime_ms: u64) -> String {
     }
 }
 
-/// Reports what the service is, where it is, and how busy it is. Nothing is
-/// printed beyond the first line when none is running: the fields are zeroed in
-/// that case, and printing them would read as a service that is running and
-/// idle.
+/// Reports what the service is, where it is, and how busy it is, then the external root of the
+/// caller's global data directory. Nothing about a service is printed beyond the
+/// first line when none is running: its fields are zeroed in that case, and printing them would
+/// read as a service that is running and idle.
 fn print_service_status(data: &LoreServiceStatusEventData) {
     if data.running == 0 {
         println!("No Lore service is running");
+    } else {
+        println!("Lore service is running");
+        println!(
+            "  {}Executable:{} {}",
+            CommonStyles::HEADERS,
+            anstyle::Reset,
+            data.binary_path.as_str()
+        );
+        println!(
+            "  {}Uptime:{} {}",
+            CommonStyles::HEADERS,
+            anstyle::Reset,
+            format_uptime(data.uptime_ms)
+        );
+        println!(
+            "  {}Connections:{} {}",
+            CommonStyles::HEADERS,
+            anstyle::Reset,
+            data.connection_count
+        );
+        println!(
+            "  {}SWFS mounts:{} {}",
+            CommonStyles::HEADERS,
+            anstyle::Reset,
+            data.swfs_mount_count
+        );
+        println!(
+            "  {}Process ID:{} {}",
+            CommonStyles::HEADERS,
+            anstyle::Reset,
+            data.process_id
+        );
+        println!(
+            "  {}Runs inside another program:{} {}",
+            CommonStyles::HEADERS,
+            anstyle::Reset,
+            if data.embedded == 0 { "no" } else { "yes" }
+        );
+        print_paths("Mounted virtual instances:", &data.mounted_paths);
+        print_paths(
+            "Global data directories of the mounts:",
+            &data.mounted_global_data_directories,
+        );
+    }
+    println!(
+        "{}External directories:{} {}",
+        CommonStyles::HEADERS,
+        anstyle::Reset,
+        data.external_root.as_str()
+    );
+    println!(
+        "  {}State:{} {}",
+        CommonStyles::HEADERS,
+        anstyle::Reset,
+        match data.external_root_state {
+            LoreExternalRootState::Available => "can be used",
+            LoreExternalRootState::Unavailable => "can't be used",
+            LoreExternalRootState::Interrupted => "a move hasn't finished",
+        }
+    );
+    println!(
+        "  {}Old directories to remove:{} {}",
+        CommonStyles::HEADERS,
+        anstyle::Reset,
+        data.external_leftovers
+    );
+}
+
+/// Prints `label` with each of `paths` on a line of its own below it, or `none` beside it.
+fn print_paths(label: &str, paths: &LoreArray<LoreString>) {
+    if paths.is_empty() {
+        println!("  {}{label}{} none", CommonStyles::HEADERS, anstyle::Reset);
         return;
     }
-
-    println!("Lore service is running");
-    println!(
-        "  {}Executable:{} {}",
-        CommonStyles::HEADERS,
-        anstyle::Reset,
-        data.binary_path.as_str()
-    );
-    println!(
-        "  {}Uptime:{} {}",
-        CommonStyles::HEADERS,
-        anstyle::Reset,
-        format_uptime(data.uptime_ms)
-    );
-    println!(
-        "  {}Connections:{} {}",
-        CommonStyles::HEADERS,
-        anstyle::Reset,
-        data.connection_count
-    );
-    println!(
-        "  {}SWFS mounts:{} {}",
-        CommonStyles::HEADERS,
-        anstyle::Reset,
-        data.swfs_mount_count
-    );
+    println!("  {}{label}{}", CommonStyles::HEADERS, anstyle::Reset);
+    for path in paths.as_slice() {
+        println!("    {}", path.as_str());
+    }
 }
 
 /// Reads a buffered service message as a line, naming the level it came in at.

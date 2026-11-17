@@ -26,6 +26,7 @@ use crate::fs::swfs::filesystem::SwfsFilesystem;
 use crate::fs::swfs::mount_manager::SwfsMount;
 use crate::fs::swfs::mount_manager::SwfsMountManager;
 use crate::fs::swfs::paths::MountPath;
+use crate::global::external_dir::access::resolve_shared_in;
 use crate::global::external_dir::canonical_global;
 use crate::global::external_dir::resolve::Lookup;
 use crate::global::external_dir::resolve::RootState;
@@ -96,16 +97,27 @@ impl MountManager {
     /// root `state` a start resolved once for them all. A store that cannot be opened or listed, and an
     /// instance whose external directory is unknown or whose config cannot be read, are logged
     /// and skipped rather than stopping the rest, and no external directory is removed for them.
+    ///
+    /// At the first virtual instance found, `state` is resolved again under shared access, and
+    /// whether it was is returned. Where shared access is refused, no virtual instance is mounted.
     #[lore_macro::test_pub]
     async fn mounts_of_entries(
         entries: &[SharedStoreRegistryEntry],
-        state: &RootState,
-    ) -> Result<(FoundSwfsMounts, Vec<PendingFuseMount>, RegisteredInstances), MountManagerError>
-    {
+        state: &mut RootState,
+    ) -> Result<
+        (
+            FoundSwfsMounts,
+            Vec<PendingFuseMount>,
+            RegisteredInstances,
+            bool,
+        ),
+        MountManagerError,
+    > {
         let mut swfs = Vec::new();
         #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut pending_fuse = Vec::new();
         let mut registered = Some(BTreeSet::new());
+        let mut shared = false;
         let global = canonical_global(&state.global)
             .forward::<MountManagerError>("resolving the external root")?;
         for entry in entries {
@@ -132,7 +144,14 @@ impl MountManager {
                 registered.extend(instances.iter().map(|instance| instance.instance_id));
             }
             for instance in &instances {
-                let dot_lore = match state.lookup(instance.instance_id) {
+                let lookup = match lookup_under_shared(state, &mut shared, instance.instance_id) {
+                    Ok(lookup) => lookup,
+                    Err(error) => {
+                        lore_warn!("Not mounting any virtual instance: {error}");
+                        return Ok((Vec::new(), Vec::new(), None, false));
+                    }
+                };
+                let dot_lore = match lookup {
                     Lookup::Present(dot_lore) => dot_lore,
                     Lookup::Absent => continue,
                     Lookup::Unknown(unknown) => {
@@ -201,24 +220,28 @@ impl MountManager {
                 }
             }
         }
-        Ok((swfs, pending_fuse, registered))
+        Ok((swfs, pending_fuse, registered, shared))
     }
 
+    /// The manager of a starting service, with every registered instance mounted, as
+    /// [`Self::mounts_of_entries`] mounts them, and what interrupted clones left removed.
     pub async fn initialize() -> Result<Arc<Self>, MountManagerError> {
         let registry = SharedStoreRegistry::load()
             .await
             .forward::<MountManagerError>("Unable to load shared store registry")?;
-        let state = resolve().forward::<MountManagerError>("resolving the external root")?;
-        let (swfs, pending_fuse, registered) =
-            Self::mounts_of_entries(registry.entries(), &state).await?;
+        let mut state = resolve().forward::<MountManagerError>("resolving the external root")?;
+        let (swfs, pending_fuse, registered, shared) =
+            Self::mounts_of_entries(registry.entries(), &mut state).await?;
         #[cfg(target_os = "linux")]
-        Box::pin(crate::fs::fuse::mount_manager::remove_interrupted_clones(
-            &state,
-            registered.as_ref(),
-        ))
-        .await;
+        if shared {
+            Box::pin(crate::fs::fuse::mount_manager::remove_interrupted_clones(
+                &state,
+                registered.as_ref(),
+            ))
+            .await;
+        }
         #[cfg(not(target_os = "linux"))]
-        let _ = registered;
+        let _ = (registered, shared);
         let manager = Arc::new(MountManager {
             swfs: SwfsMountManager::with_mounts(swfs).await?,
             #[cfg(target_os = "linux")]
@@ -335,6 +358,22 @@ impl MountManager {
             fuse: FuseMountManager::new(None),
         })
     }
+}
+
+/// The lookup of `instance_id` in `state`, which is resolved again under shared access at the
+/// first instance whose lookup is present, as `shared` records. Fails where it is refused.
+fn lookup_under_shared(
+    state: &mut RootState,
+    shared: &mut bool,
+    instance_id: InstanceId,
+) -> Result<Lookup, crate::global::external_dir::ExternalDirError> {
+    let lookup = state.lookup(instance_id);
+    if *shared || !matches!(lookup, Lookup::Present(_)) {
+        return Ok(lookup);
+    }
+    *state = resolve_shared_in(state.global.clone())?;
+    *shared = true;
+    Ok(state.lookup(instance_id))
 }
 
 /// The external directory that holds the Lore directory `dot_lore`.

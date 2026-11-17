@@ -3,6 +3,7 @@
 //! The external root: where every virtual instance's external directory lives, and the files of
 //! the global data directory that name it.
 
+pub mod access;
 pub mod leftovers;
 pub mod marker;
 pub mod record;
@@ -17,6 +18,7 @@ use lore_error_set::prelude::*;
 use self::resolve::Availability;
 use self::resolve::DefaultLocation;
 use self::resolve::RootState;
+use self::setting::Setting;
 use crate::global::get_global_data_dir;
 use crate::instance::InstanceId;
 
@@ -68,6 +70,19 @@ pub fn create_external_dir(
     };
     created.internal_with(|| format!("creating the external directory {}", dir.display()))?;
     Ok(dir)
+}
+
+/// The path a status reports for the root `state` resolved: the available root, else the setting's
+/// path, else the default location, and empty where the setting can't be read. Blocking.
+pub fn reported_root(state: &RootState) -> PathBuf {
+    if let Availability::Available(root) = &state.availability {
+        return root.clone();
+    }
+    match Setting::load(&state.global) {
+        Ok(Some(setting)) if !setting.path.is_empty() => PathBuf::from(setting.path),
+        Ok(_) => state.global.join(EXTERNAL),
+        Err(_) => PathBuf::new(),
+    }
 }
 
 /// The canonical path of the global data directory `global`, as a mount records it.

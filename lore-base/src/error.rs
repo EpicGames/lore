@@ -215,7 +215,8 @@ pub struct Maintenance;
 #[ffi_code(31)]
 pub struct SlowDown;
 
-/// No Lore service could be reached, and none could be started.
+/// No Lore service could be reached, and none could be started, or the service socket answered
+/// that no service runs while the external directories of its virtual instances move.
 ///
 /// Distinct from [`NotConnected`], which reports a remote: a caller that relays
 /// its calls through the local service handles this differently, because it is

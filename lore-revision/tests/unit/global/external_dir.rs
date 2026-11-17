@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 //! The external root's files and its resolution.
 
+mod access;
 mod leftovers;
 mod marker;
 mod record;
@@ -53,5 +54,59 @@ async fn an_external_directory_is_made_only_in_an_available_root() {
     assert!(
         !configured.path().join("external").exists(),
         "nothing is made at the default location"
+    );
+}
+
+/// A status reports the root a resolution finds available, else the path the setting names, else
+/// the default location, and an empty path where the setting can't be read.
+#[tokio::test]
+#[allow(clippy::disallowed_methods)] // A fixture in a global data directory of its own.
+async fn a_status_reports_the_available_root_else_the_one_the_setting_names() {
+    use std::num::NonZeroU64;
+
+    use lore_base::test_util::TempDir;
+    use lore_revision::global::external_dir::reported_root;
+    use lore_revision::global::external_dir::resolve::resolve_in;
+    use lore_revision::global::external_dir::setting::RootId;
+    use lore_revision::global::external_dir::setting::Setting;
+
+    let global = TempDir::new("lore-external-reported-");
+    let default = global.path().join("external");
+    assert_eq!(
+        reported_root(&resolve_in(global.path().to_path_buf())),
+        default,
+        "with no setting, the default location"
+    );
+
+    let missing = global.path().join("missing");
+    let mut setting = Setting {
+        path: missing.display().to_string(),
+        id: RootId::generate(),
+        generation: NonZeroU64::MIN,
+    };
+    setting
+        .save(global.path())
+        .await
+        .expect("write the setting");
+    assert_eq!(
+        reported_root(&resolve_in(global.path().to_path_buf())),
+        missing
+    );
+
+    setting.path = String::new();
+    setting
+        .save(global.path())
+        .await
+        .expect("write the setting");
+    assert_eq!(
+        reported_root(&resolve_in(global.path().to_path_buf())),
+        default,
+        "an empty path names the default location"
+    );
+
+    std::fs::write(global.path().join("external-root"), b"not toml = [").expect("corrupt it");
+    assert_eq!(
+        reported_root(&resolve_in(global.path().to_path_buf())),
+        std::path::PathBuf::new()
     );
 }

@@ -5,6 +5,7 @@ use std::ffi::OsString;
 mod network;
 mod service_process;
 
+use lore::remote::command::LoreCommand;
 use lore::remote::*;
 
 #[test]
@@ -70,4 +71,46 @@ fn anything_carrying_a_path_is_refused() {
             "{name:?} does not name a single file"
         );
     }
+}
+
+/// A relayed call's future holds its globals and command once, in its captures: the call the move
+/// reply hands back holds them a second time only behind a box. Inline, the second copy takes the
+/// future past three times their size.
+#[test]
+fn a_relayed_call_holds_its_arguments_once() {
+    let call = lore::remote::call::run_service_call(
+        None,
+        lore_revision::interface::LoreGlobalArgs::default(),
+        LoreCommand::RepositoryStatus(lore::repository::LoreRepositoryStatusArgs {
+            staged: 0,
+            scan: 0,
+            check_dirty: 0,
+            reset: 0,
+            sync_point: 0,
+            revision_only: 0,
+            count: 0,
+            paths: lore_revision::interface::LoreArray::default(),
+        }),
+        None,
+    );
+    let arguments =
+        size_of::<lore_revision::interface::LoreGlobalArgs>() + size_of::<LoreCommand>();
+    assert!(
+        size_of_val(&call) < 3 * arguments,
+        "the call holds {} bytes for arguments of {arguments}",
+        size_of_val(&call)
+    );
+}
+
+/// A move reply after the first message fails the call as internal: the service socket answers
+/// a move with it alone.
+#[test]
+fn a_move_reply_after_the_first_message_fails_the_call() {
+    let failed = lore::remote::call::handle_message(
+        &lore_revision::relay::EventDispatcher::no_dispatch(),
+        lore::remote::message::MessageToClient::ExternalRootMove,
+        bytes::Bytes::new(),
+    )
+    .expect_err("the call fails");
+    assert!(failed.is_internal());
 }

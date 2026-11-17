@@ -206,4 +206,7 @@ impl MessageToServer {
 pub enum MessageToClient<Event = LoreEvent> {
     Event(Event),
     ApiResult(i32),
+    /// The one answer of a service socket that a move of the external root holds: no service
+    /// runs, and the call didn't run.
+    ExternalRootMove,
 }

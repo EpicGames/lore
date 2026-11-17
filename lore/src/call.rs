@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use lore_base::env::CallEnvironment;
 use lore_base::error::RepositoryNotFound;
+use lore_base::error::ServiceUnavailable;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_error_set::FfiError;
 use lore_error_set::HasTrace;
@@ -26,16 +27,28 @@ use lore_revision::repository::get_dot_lore_path;
 use lore_revision::util;
 
 use crate::interface::LoreEventCallback;
+use crate::remote::call::EXTERNAL_ROOT_MOVING;
+use crate::remote::call::ServiceCallError;
 use crate::util::log_command_done;
 use crate::util::log_command_info;
 
 tokio::task_local! {
     /// The environment of the process a call running in this task was relayed from.
     static RELAYED_ENVIRONMENT: CallEnvironment;
+    /// Set for a call the service socket answered with a move of the external root, which runs in
+    /// this process instead.
+    static EXTERNAL_ROOT_MOVE: ();
+}
+
+/// Runs `call`, handed back by the move reply, here: an open that finds no Lore directory fails
+/// with the move's `ServiceUnavailable`, as the stopped service has unmounted its instances.
+pub(crate) fn during_external_root_move<F: Future>(call: F) -> impl Future<Output = F::Output> {
+    EXTERNAL_ROOT_MOVE.scope((), call)
 }
 
 /// Runs `call`, relayed from a process with `environment`, so that the execution context it sets
 /// up reads that environment in place of this process's.
+#[lore_macro::test_pub]
 pub(crate) fn with_relayed_environment<F: Future>(
     environment: CallEnvironment,
     call: F,
@@ -372,6 +385,14 @@ async fn prepare_repository_call(
         .await;
     let failure = match found {
         Ok(dotpath) if dotpath.is_dir() => return Ok((repository_path, execution)),
+        Ok(_) if EXTERNAL_ROOT_MOVE.try_with(|()| ()).is_ok() => {
+            LoreErrorDetail::from_error(&ServiceCallError::from(ServiceUnavailable {
+                reason: format!(
+                    "{} holds no Lore directory, and {EXTERNAL_ROOT_MOVING}",
+                    repository_path.display()
+                ),
+            }))
+        }
         Ok(_) => LoreErrorDetail::from_error(&RepositoryError::from(RepositoryNotFound {
             repository: repository_path.display().to_string(),
         })),

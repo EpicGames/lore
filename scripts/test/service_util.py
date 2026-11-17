@@ -74,9 +74,25 @@ LORE_SERVICE_RUNNING_MESSAGE = "Lore service is running"
 # Printed by the `service` setters when the two settings relaying needs are left
 # in a state that will not relay.
 LORE_NO_SERVICE_EXECUTABLE_MESSAGE = "No service executable is set"
-# Headings `lore service status` prints for the metadata it reports. Only the
-# labels, because the values are the machine's rather than the suite's.
-LORE_SERVICE_STATUS_LABELS = ("Executable:", "Uptime:", "Connections:", "SWFS mounts:")
+# Headings `lore service status` prints for the metadata of a running service.
+# Only the labels, because the values are the machine's rather than the suite's.
+LORE_SERVICE_STATUS_LABELS = (
+    "Executable:",
+    "Uptime:",
+    "Connections:",
+    "SWFS mounts:",
+    "Process ID:",
+    "Runs inside another program:",
+    "Mounted virtual instances:",
+    "Global data directories of the mounts:",
+)
+# Headings `lore service status` prints for the external directories of the
+# caller's global data directory, whether or not a service is running.
+LORE_EXTERNAL_ROOT_STATUS_LABELS = (
+    "External directories:",
+    "State:",
+    "Old directories to remove:",
+)
 
 
 def service_supported():

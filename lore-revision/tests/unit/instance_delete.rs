@@ -228,6 +228,29 @@ async fn a_deleted_instance_leaves_nothing_at_or_beside_its_path() {
     assert!(left.is_empty(), "the parent still holds {left:?}");
 }
 
+/// Outside the service, deleting an ordinary instance takes no access to the external root, so a
+/// move of the root can take exclusive access afterwards.
+#[tokio::test]
+async fn deleting_an_ordinary_instance_takes_no_access_to_the_external_root() {
+    let instance = Instance::new();
+
+    LORE_CONTEXT
+        .scope(execution_in(instance._global.path()), async {
+            instance_delete(instance.repository().await)
+                .await
+                .expect("delete the instance");
+            let data =
+                lore_revision::global::get_global_data_dir().expect("the global data directory");
+            assert!(
+                lore_base::fs::lock::FSLock::try_acquire_file_lock(data.join("external"))
+                    .expect("attempt")
+                    .is_some(),
+                "no access is held"
+            );
+        })
+        .await;
+}
+
 /// The files are deleted from the renamed directory, so a delete that cannot remove them has
 /// already freed the instance's path, and leaves them under the aside name.
 #[cfg(target_family = "unix")]

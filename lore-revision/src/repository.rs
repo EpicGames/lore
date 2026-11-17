@@ -3952,6 +3952,14 @@ pub async fn create_local(
     } else {
         None
     };
+    if config.vfs_type().is_virtual() {
+        lore_base::lore_spawn_blocking!(
+            crate::global::external_dir::access::require_shared_for_caller
+        )
+        .await
+        .internal("taking access to the external root")?
+        .forward::<RepositoryError>("taking access to the external root")?;
+    }
     let in_memory = no_tracking || execution_context().globals().in_memory();
     let shared_stores = if in_memory {
         None

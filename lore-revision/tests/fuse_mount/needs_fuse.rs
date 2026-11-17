@@ -891,6 +891,47 @@ async fn creating_a_fuse_instance_makes_no_missing_configured_root() {
     .await;
 }
 
+/// Creating a FUSE instance while a move of the external root holds exclusive access fails as
+/// internal before anything is written: nothing is mounted, the mount point stays empty, and no
+/// external directory is made.
+#[tokio::test(flavor = "multi_thread")]
+async fn creating_a_fuse_instance_is_refused_while_a_move_holds_the_external_root() {
+    skip_without_fuse!();
+    let _serial = SERIAL.lock().await;
+    service_execution().await;
+    let global = TempDir::new("lore-fuse-mount-held-root-");
+    let data = global.path().join("data");
+    std::fs::create_dir(&data).expect("the global data directory is made");
+    assert!(
+        lore_revision::global::external_dir::access::try_exclusive(&data).expect("attempt"),
+        "exclusive access is taken"
+    );
+    Box::pin(LORE_CONTEXT.scope(execution_in(global.path()), async move {
+        let (_store_dir, store) = canonical_dir("lore-fuse-mount-store-");
+        let (_dir, path) = canonical_dir("lore-fuse-mount-held-root-");
+        let _guard = MountGuard(path.clone());
+
+        let error = clone_fails(&store, &path)
+            .await
+            .expect("creating while a move holds the root fails");
+
+        assert!(error.is_internal(), "{error}");
+        assert!(!is_mounted(&path), "nothing is mounted");
+        assert_eq!(
+            std::fs::read_dir(&path)
+                .expect("list the mount point")
+                .count(),
+            0,
+            "nothing is written at the path"
+        );
+        assert!(
+            !data.join("external").exists(),
+            "no external directory is made"
+        );
+    }))
+    .await;
+}
+
 /// With an available root other than the default location, a FUSE instance is created in that
 /// root, mounted from it, moved with its external directory left there, and mounted from it again,
 /// and nothing of it is made at the default location.
@@ -2202,8 +2243,8 @@ async fn initialize_child() {
         );
         assert_eq!(
             reads_in(&data).setting,
-            before.setting + 1,
-            "the start resolves the external root once"
+            before.setting + 2,
+            "the start resolves the external root once, and once under shared access"
         );
         assert_eq!(
             restarted
@@ -2703,6 +2744,83 @@ async fn an_instance_clone_of_a_fuse_instance_that_would_copy_needs_a_copy_allow
             .unmount(&path, false)
             .await
             .expect("unmounts");
+    }))
+    .await;
+}
+
+/// Releases, when dropped, the exclusive access a test took to the external root of the global
+/// data directory it holds, so a failing test leaves the binary's later tests their mounts.
+struct ReleasesExclusive(std::path::PathBuf);
+
+impl Drop for ReleasesExclusive {
+    fn drop(&mut self) {
+        let _ = lore_revision::global::external_dir::access::release_exclusive(&self.0);
+    }
+}
+
+/// Cloning a FUSE instance while a move of the external root holds exclusive access is refused
+/// as internal before it writes anything: no destination and no external directory. Once the
+/// access is shared again, the instance is cloned.
+#[tokio::test(flavor = "multi_thread")]
+async fn cloning_a_fuse_instance_is_refused_while_a_move_holds_the_external_root() {
+    skip_without_fuse!();
+    let _serial = SERIAL.lock().await;
+    let execution = service_execution().await;
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        use lore_revision::global::external_dir::access::try_exclusive;
+
+        let (_store_dir, store) = canonical_dir("lore-fuse-mount-store-");
+        let (_dir, path) = canonical_dir("lore-fuse-mount-clone-source-");
+        let (_target_dir, target_parent) = canonical_dir("lore-fuse-mount-clone-target-");
+        let destination = target_parent.join("clone");
+        let _guard = MountGuard(path.clone());
+        let _clone_guard = MountGuard(destination.clone());
+        synced_fuse_instance(&store, &path, &[("readme.txt", b"tracked")]).await;
+        let root = lore_revision::global::external_dir::external_dirs_root(
+            &lore_revision::global::external_dir::resolve::resolve()
+                .expect("resolve the external root"),
+        )
+        .map(std::path::Path::to_path_buf)
+        .expect("external root");
+        let before = names_in(&root);
+        let data = lore_revision::global::get_global_data_dir().expect("the global data directory");
+        assert!(try_exclusive(&data).expect("attempt"));
+        let exclusive = ReleasesExclusive(data);
+
+        let refused = clone_instance_at(
+            &path,
+            &destination,
+            true,
+            async |_: CommandContext, _: &ClonePlan| -> Result<(), InstanceError> {
+                panic!("a refused call clones nothing")
+            },
+        )
+        .await;
+        drop(exclusive);
+
+        let error = refused.expect_err("cloning is refused");
+        assert!(error.is_internal(), "unexpected error: {error}");
+        assert!(!destination.exists());
+        assert_eq!(names_in(&root), before, "no external directory is written");
+        let cloned = clone_instance_at(
+            &path,
+            &destination,
+            true,
+            async |repository: CommandContext, plan: &ClonePlan| {
+                lore_revision::instance::instance_clone(repository, plan).await
+            },
+        )
+        .await
+        .expect("cloning succeeds");
+        assert!(cloned.is_some() && is_mounted(&destination));
+        let manager = MountManagerState::mount_manager().expect("manager is initialised");
+        for mounted in [&destination, &path] {
+            manager
+                .fuse()
+                .unmount(mounted, false)
+                .await
+                .expect("unmounts");
+        }
     }))
     .await;
 }
