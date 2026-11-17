@@ -6145,12 +6145,22 @@ typedef struct lore_storage_put_file_item_t {
   // no data, never written, or allocated and never written (an unwritten extent), as the file
   // system's extent map tells on Linux and `SEEK_DATA` on macOS, each with the file synced
   // first. APFS allocates a hole of under 16 MiB beside data as zeros when it writes that data
-  // out, so such a range is data there. Zeros written to the file are data and stored as such: a
-  // file with a hole and the same file with zeros written over it get different addresses. A
-  // file larger than one fragment that has holes gets a different address than it gets without
-  // this; one without holes gets the same. `lore_storage_get_file` leaves each hole unwritten, a
-  // hole of the file it writes. The field sits in what was padding, after `remote_query`, so
-  // zero the whole item before setting its fields, as for `remote_query`
+  // out, so such a range is data there. On Windows, on NTFS, everything at or past the
+  // file's valid data length was never written and is a hole, in a file that is sparse or not;
+  // below it, and on any other file system, a hole is a range a sparse file leaves unallocated,
+  // and every allocated range is data. Where the put cannot write the file's data out first, as
+  // for a read-only file or while another handle to it shares no write access, the whole file
+  // is data, with no hole, and so is a file whose data its file system may keep elsewhere until
+  // it is read, as a cloud placeholder, an offline file or one behind a reparse point. Without
+  // this field the file is read whole, and nothing here applies.
+  // Zeros written to the file are data and stored as such: a file with a hole and the same file
+  // with zeros written over it get different addresses, unless the file system itself leaves
+  // those zeros unallocated, as NTFS can for a small write of zeros alone in an allocation unit
+  // of a sparse file: then they are a hole. A file larger than one fragment that has holes gets
+  // a different address than it gets without this; one without holes gets the same.
+  // `lore_storage_get_file` leaves each hole unwritten, a hole of the file it writes. The field
+  // sits in what was padding, after `remote_query`, so zero the whole item before setting its
+  // fields, as for `remote_query`
   uint8_t skip_holes;
   // Leaf fragment size cap for large files; `0` lets `write_content` choose
   uint64_t fixed_size_chunk;
@@ -12763,8 +12773,9 @@ void lore_storage_put_file_async(const struct lore_global_args_t *globals,
 // written to it, so nothing a `<path>.loretmp` left by an earlier get held stays in it, except
 // where the write resumes from it, below. A hole the content was stored with (`skip_holes` on
 // `lore_storage_put_file`), a range holding no data, is left unwritten, so it is a hole of the
-// written file where its file system supports holes. Every range of data is written, zeros
-// included: written zeros are data. On macOS, APFS allocates a hole of under 16 MiB beside data
+// written file where its file system supports holes. On Windows a multi-fragment write makes its
+// file sparse before it sizes it, so a hole holds no storage there either. Every range of data is
+// written, zeros included: written zeros are data. On macOS, APFS allocates a hole of under 16 MiB beside data
 // as zeros when it writes that data out, so where the file system holds holes, once every range
 // of data is written the call writes the data out and deallocates the whole blocks of each hole
 // (`F_PUNCHHOLE`), and never a range of data. Where one cannot be deallocated, the call fails.
@@ -12778,14 +12789,15 @@ void lore_storage_put_file_async(const struct lore_global_args_t *globals,
 // once, reads back each fragment whose whole range is data there, and checks it against its
 // address, and fetches every other fragment: those that fail, and those of zeros. A hole is not
 // written, and of it the call reads back only the parts of the file-system blocks it shares with
-// the fragments beside it that hold data. Where a whole block of a hole holds data in the
-// temporary file, as every hole holding a whole block does on a file system that reports no holes,
-// where a part read back holds bytes other than zeros, where the temporary file cannot be mapped,
-// or where a part of a hole cannot be read back, the call empties the file and writes the range
-// again. On macOS, where the file system holds holes, as APFS does, a whole block of a hole
-// holding data does not empty the file, since the call deallocates the whole blocks of every hole
-// of the range before the rename. The read covers every fragment of the range, so on a slow disk
-// a resume of a mostly written range can take longer than fetching it again over a fast link.
+// the fragments beside it that hold data. A block is the unit a write allocates: on NTFS, 16
+// clusters. Where a whole block of a hole holds data in the temporary file, as every hole holding
+// a whole block does on a file system that reports no holes, where a part read back holds bytes
+// other than zeros, where the temporary file cannot be mapped, or where a part of a hole cannot
+// be read back, the call empties the file and writes the range again. On macOS, where the file
+// system holds holes, as APFS does, a whole block of a hole holding data does not empty the file,
+// since the call deallocates the whole blocks of every hole of the range before the rename. The
+// read covers every fragment of the range, so on a slow disk a resume of a mostly written range
+// can take longer than fetching it again over a fast link.
 // Where the file system refuses advisory locks, as some network file systems do, a write of any
 // length writes as a shorter one does.
 //

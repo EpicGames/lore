@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Positional reads and writes on Windows, issued through an `OVERLAPPED` this crate owns.
+//! Positional reads and writes, and file system controls, on Windows, issued through an
+//! `OVERLAPPED` this crate owns.
 //!
 //! Handles opened through this crate are overlapped, because a *synchronous* Windows handle
 //! serializes every operation issued on it inside the I/O manager, however many threads are
@@ -39,6 +40,7 @@ use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::ReadFile;
 use windows_sys::Win32::Storage::FileSystem::WriteFile;
 use windows_sys::Win32::System::IO::CancelIoEx;
+use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::IO::GetOverlappedResult;
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::Threading::CreateEventW;
@@ -78,9 +80,13 @@ fn create_completion_event() -> Option<CompletionEvent> {
 /// report `ERROR_IO_PENDING`, which is not a failure: the kernel has accepted the request and owns
 /// the buffer until it completes, so waiting here is what keeps the buffer alive for exactly as
 /// long as the kernel can touch it.
+///
+/// Where `unported`, the event carries its low-order bit, so no completion reaches a completion
+/// port `file` is bound to.
 fn run(
     file: &File,
     offset: u64,
+    unported: bool,
     issue: impl FnOnce(HANDLE, *mut u32, *mut OVERLAPPED) -> i32,
 ) -> std::io::Result<usize> {
     COMPLETION_EVENT.with(|event| {
@@ -94,7 +100,7 @@ fn run(
         let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
         overlapped.Anonymous.Anonymous.Offset = offset as u32;
         overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
-        overlapped.hEvent = event.0;
+        overlapped.hEvent = event.0.map_addr(|address| address | usize::from(unported));
 
         let mut transferred: u32 = 0;
         if issue(handle, &mut transferred, &mut overlapped) != 0 {
@@ -135,10 +141,39 @@ fn wait(
     Err(error)
 }
 
+/// Issues the file system control `code` on `file` with the `input` and `output` buffers, and does
+/// not return until the kernel is finished with both: the bytes written to `output`. No completion
+/// reaches a completion port `file` is bound to.
+pub(crate) fn control(
+    file: &File,
+    code: u32,
+    input: *const std::ffi::c_void,
+    input_size: u32,
+    output: *mut std::ffi::c_void,
+    output_size: u32,
+) -> std::io::Result<usize> {
+    run(file, 0, true, |handle, transferred, overlapped| {
+        // SAFETY: Calling OS functions. The buffers are valid for the sizes given, and they
+        // outlive the operation because `run` does not return while it is in flight.
+        unsafe {
+            DeviceIoControl(
+                handle,
+                code,
+                input,
+                input_size,
+                output,
+                output_size,
+                transferred,
+                overlapped,
+            )
+        }
+    })
+}
+
 pub(crate) fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
     let len = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
     let pointer: *mut u8 = buffer.as_mut_ptr();
-    let result = run(file, offset, |handle, transferred, overlapped| {
+    let result = run(file, offset, false, |handle, transferred, overlapped| {
         // SAFETY: Calling OS functions. `pointer` and `len` describe `buffer`, which outlives the
         // operation because `run` does not return while it is in flight.
         unsafe { ReadFile(handle, pointer, len, transferred, overlapped) }
@@ -155,7 +190,7 @@ pub(crate) fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::R
 pub(crate) fn write_at(file: &File, buffer: &[u8], offset: u64) -> std::io::Result<usize> {
     let len = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
     let pointer: *const u8 = buffer.as_ptr();
-    run(file, offset, |handle, transferred, overlapped| {
+    run(file, offset, false, |handle, transferred, overlapped| {
         // SAFETY: Calling OS functions. `pointer` and `len` describe `buffer`, which outlives the
         // operation because `run` does not return while it is in flight.
         unsafe { WriteFile(handle, pointer, len, transferred, overlapped) }

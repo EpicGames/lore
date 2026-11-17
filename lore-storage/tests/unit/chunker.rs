@@ -383,28 +383,19 @@ async fn a_failed_read_does_not_leave_the_chunker_usable() {
 }
 
 /// Chunking that skips holes, which needs a file system reporting them.
-#[cfg(unix)]
 mod skipping_holes {
     use super::*;
+    use crate::holes::holes_reported;
 
-    /// A file of `size` bytes holding random data at `extents`, `(offset, length)` each, and a hole
-    /// everywhere else, with the content it reads as.
-    fn sparse_file(dir: &TempDir, name: &str, size: usize, extents: &[(usize, usize)]) -> Vec<u8> {
-        use std::os::unix::fs::FileExt;
-
-        let path = dir.path().join(name);
-        let file = std::fs::File::create(&path).expect("create test file");
-        file.set_len(size as u64).expect("size test file");
-        let mut content = vec![0u8; size];
-        for &(offset, length) in extents {
-            let data = random_buffer(length);
-            file.write_all_at(&data, offset as u64)
-                .expect("write extent");
-            content[offset..offset + length].copy_from_slice(&data);
-        }
-        file.sync_all().expect("sync test file");
-        crate::holes::punch_gaps(&file, size, extents);
-        content
+    /// A file `name` in `dir` of `size` bytes holding random data at `extents`, `(offset, length)`
+    /// each, and a hole everywhere else, with the content it reads as.
+    async fn sparse_file(
+        dir: &TempDir,
+        name: &str,
+        size: usize,
+        extents: &[(usize, usize)],
+    ) -> Vec<u8> {
+        crate::holes::sparse_file(&dir.path().join(name), size, extents).await
     }
 
     /// The data ranges of `name` up to `size`, as `ContentHandle::next_data` reports them.
@@ -426,25 +417,6 @@ mod skipping_holes {
             ranges.push(range.start..range.end.min(size));
         }
         ranges
-    }
-
-    /// Whether the file system the tests run on reports holes, probed once with a file holding a
-    /// hole between two ranges of data. A test that needs holes reported returns early where they
-    /// are not, saying why.
-    async fn holes_reported() -> bool {
-        static REPORTED: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
-        let reported = *REPORTED
-            .get_or_init(|| async {
-                let dir = TempDir::new("lore-storage-chunker-holes-probe-");
-                let size = 4 << 20;
-                sparse_file(&dir, "probe", size, &[(0, 4096), (2 << 20, 4096)]);
-                reported_data(&dir, "probe", size as u64).await.len() == 2
-            })
-            .await;
-        if !reported {
-            eprintln!("the file system the test runs on reports no hole");
-        }
-        reported
     }
 
     /// Every chunk of `name`, skipping holes, cut every `fixed_size` bytes, or by content when
@@ -539,7 +511,7 @@ mod skipping_holes {
             (9 * MIB + 4096, 4096),
             (12 * MIB - 8 * 4096, 2 * MIB),
         ];
-        let content = sparse_file(&dir, "sparse", size, &extents);
+        let content = sparse_file(&dir, "sparse", size, &extents).await;
         let data = reported_data(&dir, "sparse", size as u64).await;
         let data_bytes: u64 = data.iter().map(|range| range.end - range.start).sum();
 
@@ -581,7 +553,7 @@ mod skipping_holes {
         let dir = TempDir::new("lore-storage-chunker-holes-cdc-");
         let size = 8 * MIB;
         let extents = [(MIB, MIB + 4096), (4 * MIB + 4096, 2 * MIB)];
-        let content = sparse_file(&dir, "sparse", size, &extents);
+        let content = sparse_file(&dir, "sparse", size, &extents).await;
         let data = reported_data(&dir, "sparse", size as u64).await;
 
         let chunks = chunks_skipping_holes(&dir, "sparse", 0).await;
@@ -619,7 +591,7 @@ mod skipping_holes {
         let dir = TempDir::new("lore-storage-chunker-holes-small-");
         let size = WINDOW_SIZE;
         let extents = [(4096, 64 * 1024), (256 * 1024, 8192), (400 * 1024, 4096)];
-        let content = sparse_file(&dir, "small", size, &extents);
+        let content = sparse_file(&dir, "small", size, &extents).await;
         let data = reported_data(&dir, "small", size as u64).await;
         for step in [0, FRAGMENT_SIZE_EXPECTED] {
             let chunks = chunks_skipping_holes(&dir, "small", step).await;
@@ -655,7 +627,7 @@ mod skipping_holes {
         }
         let dir = TempDir::new("lore-storage-chunker-holes-empty-");
         let size = 4 * FRAGMENT_SIZE_THRESHOLD;
-        let content = sparse_file(&dir, "hole", size, &[]);
+        let content = sparse_file(&dir, "hole", size, &[]).await;
         let data = reported_data(&dir, "hole", size as u64).await;
         let chunks = chunks_skipping_holes(&dir, "hole", FRAGMENT_SIZE_THRESHOLD).await;
         assert_tiles_with_holes(&chunks, &content, &data);
@@ -664,7 +636,8 @@ mod skipping_holes {
     }
 
     /// Whether a walk of the file at `path` takes `SEEK_DATA`, which keeps nothing between lookups:
-    /// on Linux where the file lives on tmpfs, which has no extent map, and everywhere else.
+    /// on Linux where the file lives on tmpfs, which has no extent map, and everywhere but Windows,
+    /// where a walk keeps its batch of allocated ranges.
     fn walked_with_seek(path: &std::path::Path) -> bool {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
@@ -684,7 +657,7 @@ mod skipping_holes {
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             let _ = path;
-            true
+            !cfg!(target_family = "windows")
         }
     }
 
@@ -732,7 +705,7 @@ mod skipping_holes {
         }
         const MIB: usize = 1 << 20;
         let dir = TempDir::new("lore-storage-chunker-holes-shrunk-data-");
-        sparse_file(&dir, "shrinks", 8 * MIB, &[(MIB, MIB), (5 * MIB, MIB)]);
+        sparse_file(&dir, "shrinks", 8 * MIB, &[(MIB, MIB), (5 * MIB, MIB)]).await;
         let seek = walked_with_seek(&dir.path().join("shrinks"));
         let chunked = chunks_of_a_file_shrunk_after_its_first_chunk(&dir, "shrinks", 3 << 20).await;
         if seek {
@@ -755,7 +728,7 @@ mod skipping_holes {
         }
         const MIB: usize = 1 << 20;
         let dir = TempDir::new("lore-storage-chunker-holes-shrunk-hole-");
-        sparse_file(&dir, "shrinks", 8 * MIB, &[(MIB, MIB)]);
+        sparse_file(&dir, "shrinks", 8 * MIB, &[(MIB, MIB)]).await;
         let chunks = chunks_of_a_file_shrunk_after_its_first_chunk(&dir, "shrinks", 4 << 20)
             .await
             .expect("the chunking succeeds");

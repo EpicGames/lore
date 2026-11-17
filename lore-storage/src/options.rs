@@ -52,12 +52,15 @@ pub struct WriteOptions {
     ///
     /// A hole is a range never written, or allocated and never written (an unwritten extent), as
     /// [`lore_io::IoFile::next_data`] finds it: from the extent map on Linux, so what the page
-    /// cache holds does not change it, and from `SEEK_DATA` on macOS, with the file's data written
-    /// out first, as APFS allocates the small holes beside data it writes out. Zeros written
-    /// to the file are data, stored as any other content: a hole is not zeros, even though it reads
-    /// as zeros. The address therefore depends on how the file is allocated as well as on what it
-    /// reads as. A file with a hole and the same file with zeros written over the hole have
-    /// different addresses.
+    /// cache holds does not change it, from `SEEK_DATA` on macOS, with the file's data written out
+    /// first, as APFS allocates the small holes beside data it writes out, and on Windows a range
+    /// a sparse file leaves unallocated, and on NTFS everything at or past the file's valid data
+    /// length too. Without this option the file is read whole. Zeros written to the file are data, stored as any other content: a hole
+    /// is not zeros, even though it reads as zeros. The address therefore depends on how the file
+    /// is allocated as well as on what it reads as. A file with a hole and the same file with
+    /// zeros written over the hole have different addresses, unless the file system itself leaves
+    /// those zeros unallocated, as NTFS can for a small write of zeros alone in an allocation unit
+    /// of a sparse file: then they are a hole.
     pub skip_holes: bool,
 }
 
@@ -214,6 +217,13 @@ pub struct ReadOptions {
     pub strict_local: bool,
     /// Write to file directly
     pub direct_write: bool,
+    /// Make the file a read of a fragment list writes sparse before sizing it
+    /// ([`lore_io::IoFile::set_len_sparse`]), so a hole of the content holds no storage on a file
+    /// system that holds none only for a file marked sparse, as those of Windows do. On Windows a
+    /// file it writes over is deallocated whole first ([`lore_io::IoFile::empty`]). A resuming
+    /// read ([`resume_write`](Self::resume_write)) writes its temporary file sparse whatever this
+    /// says.
+    pub sparse_write: bool,
     /// Resume a file read from what its file already holds. A read through a temporary file of a
     /// range of at least [`RESUME_WRITE_MIN_LEN`] keeps it when the read fails or stops, and resumes
     /// from a temporary file that a read of the same content and range left at the same path; any
@@ -261,6 +271,7 @@ impl Default for ReadOptions {
             no_local_write: false,
             strict_local: false,
             direct_write: false,
+            sparse_write: false,
             resume_write: false,
             resume_held: false,
             sync_data: false,
@@ -318,6 +329,12 @@ impl ReadOptions {
     /// See [`ReadOptions::strict_local`].
     pub fn with_strict_local(mut self) -> Self {
         self.strict_local = true;
+        self
+    }
+
+    /// See [`ReadOptions::sparse_write`].
+    pub fn sparse_writing(mut self) -> Self {
+        self.sparse_write = true;
         self
     }
 

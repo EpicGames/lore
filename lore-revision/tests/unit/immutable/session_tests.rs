@@ -292,6 +292,16 @@ async fn reads_trust_the_remote_where_the_globals_do() {
     assert!(!untrusting.trust_remote && trusting.trust_remote);
 }
 
+/// The revision layer's reads do not mark the files they write sparse: a revision's files hold no
+/// holes.
+#[tokio::test]
+async fn reads_write_files_that_are_not_sparse() {
+    let context = context_with_state(RemoteState::Offline).await;
+    let options =
+        under_execution_context(|| async { read_options_from_repository(&context) }).await;
+    assert!(!options.sparse_write);
+}
+
 /// A context that says whether to trust the remote is read as it says, whatever the globals say.
 #[tokio::test]
 async fn reads_trust_the_remote_as_the_context_says_over_the_globals() {

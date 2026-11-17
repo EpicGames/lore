@@ -258,7 +258,7 @@ mod write_to_file {
 
     /// A sized target file, opened the way the materialization path opens one.
     async fn target(dir: &TempDir, name: &str) -> IoFile {
-        lore_storage::defragment::open_file_write(dir.path().join(name), SIZE)
+        lore_storage::defragment::open_file_write(dir.path().join(name), SIZE, false)
             .await
             .expect("create target file")
     }
@@ -347,7 +347,7 @@ mod write_to_file {
         let dir = TempDir::new("lore-storage-sink-test-");
         let path = dir.path().join("reused");
         std::fs::write(&path, vec![0xEE; SIZE]).expect("write the earlier content");
-        let file = lore_storage::defragment::open_file_write(&path, SIZE)
+        let file = lore_storage::defragment::open_file_write(&path, SIZE, false)
             .await
             .expect("open the target");
         let (tx, rx) = channel::<DataMessage>(4);
@@ -930,10 +930,13 @@ mod defragment_integration {
         .await
         .expect("load root list");
 
-        let file =
-            lore_storage::defragment::open_file_write(dir.path().join("truncated.bin"), PAYLOAD)
-                .await
-                .expect("create target file");
+        let file = lore_storage::defragment::open_file_write(
+            dir.path().join("truncated.bin"),
+            PAYLOAD,
+            false,
+        )
+        .await
+        .expect("create target file");
 
         let err = defragment_pipeline(
             store.clone(),

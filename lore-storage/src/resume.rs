@@ -20,10 +20,11 @@
 //! it that hold data. Where a whole block of a hole holds data, a part read back holds bytes other
 //! than zeros, the file cannot be mapped, or a part of a hole cannot be read back, the read empties
 //! the file and writes it as a fresh one. Where the file system reports no holes, the whole file is
-//! data, so content with a hole holding a whole block is written as fresh. On Apple platforms,
-//! where the file system holds holes, a whole block of a hole holding data does not empty the file:
-//! APFS allocates the small holes beside data it writes out, and the write sink deallocates the
-//! whole blocks of every hole of the range before the rename.
+//! data, and where the temporary file could not be made sparse, so is all of it but, on NTFS, what
+//! lies past what was written to it, so content with a hole holding a whole block there is written
+//! as fresh. On Apple platforms, where the file system holds holes, a whole block of a hole holding
+//! data does not empty the file: APFS allocates the small holes beside data it writes out, and the
+//! write sink deallocates the whole blocks of every hole of the range before the rename.
 //!
 //! A resuming read holds the exclusive lock of its temporary file for as long as any handle to it
 //! lives, from before it reads or empties anything there until every task writing to it has ended,
@@ -108,10 +109,11 @@ pub(crate) fn record_path(temporary: &Path) -> PathBuf {
     PathBuf::from(record)
 }
 
-/// Opens the temporary file `temporary` for the `range` of the content `hash` names, locked and
-/// sized to the range, and answers whether it holds part of that content from an earlier read: it
-/// is not empty, and its resume record names the same hash and range. Any other temporary file is
-/// emptied, and its resume record written for this content, before the read writes anything to it.
+/// Opens the temporary file `temporary` for the `range` of the content `hash` names, locked, sparse
+/// and sized to the range ([`IoFile::set_len_sparse`]), and answers whether it holds part of that
+/// content from an earlier read: it is not empty, and its resume record names the same hash and
+/// range. Any other temporary file is emptied ([`IoFile::empty`]), and its resume record written
+/// for this content, before the read writes anything to it.
 ///
 /// # Errors
 ///
@@ -141,7 +143,7 @@ pub(crate) fn open<'a>(
                 .is_ok_and(|read| read.as_ref() == record.as_bytes());
         if !resumes {
             if held > 0 {
-                file.set_len(0, ()).await?;
+                file.empty(0).await?;
             }
             driver
                 .write_file_bytes(
@@ -151,7 +153,7 @@ pub(crate) fn open<'a>(
                 )
                 .await?;
         }
-        file.set_len(len, ()).await?;
+        file.set_len_sparse(len).await?;
         Ok(Opened::File(file, resumes))
     }
 }

@@ -47,7 +47,10 @@ pub mod file;
 mod find;
 #[cfg(all(target_family = "windows", feature = "test-util"))]
 pub mod find;
+#[cfg(not(feature = "test-util"))]
 mod holes;
+#[cfg(feature = "test-util")]
+pub mod holes;
 #[cfg(all(target_family = "windows", not(feature = "test-util")))]
 mod iocp;
 #[cfg(all(target_family = "windows", feature = "test-util"))]

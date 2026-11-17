@@ -28,6 +28,10 @@ libc = { workspace = true }
 # with its own `OVERLAPPED` instead. windows-sys is the workspace's Win32 binding already.
 [target.'cfg(target_family = "windows")'.dependencies]
 windows-sys = { workspace = true, features = [
+    # `NtQueryVolumeInformationFile` and its `FILE_FS_SIZE_INFORMATION`, which give the hole
+    # calls the cluster of a volume from a handle alone.
+    "Wdk_Storage_FileSystem",
+    "Wdk_System_SystemServices",
     "Win32_Foundation",
     # `CreateEventW` takes a `SECURITY_ATTRIBUTES`, so its module is only compiled with this. The
     # crate built without it while the workspace happened to enable it elsewhere; naming it here is
@@ -36,8 +40,8 @@ windows-sys = { workspace = true, features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     # `FSCTL_DUPLICATE_EXTENTS_TO_FILE` and the integrity and sparse controls the ReFS clone
-    # backend issues with it, and the reparse-point controls the clone copies a link or
-    # junction with.
+    # backend issues with it, the reparse-point controls the clone copies a link or junction
+    # with, and the sparse and region controls of the hole calls.
     "Win32_System_Ioctl",
     # For IO_REPARSE_TAG_MOUNT_POINT, which tells a directory that a rename would move without
     # the files it leads to.

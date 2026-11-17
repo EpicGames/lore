@@ -362,19 +362,31 @@ impl PsyncDriver {
             .await
     }
 
+    /// Sets the length of `file`, which [`crate::holes::make_sparse`] marks sparse first where
+    /// `sparse`, in one job on the pool.
     pub(crate) async fn set_len<C: Send + 'static>(
         &self,
         file: Arc<File>,
         len: u64,
+        sparse: bool,
         completion: C,
     ) -> std::io::Result<()> {
         SyscallPool::global()
             .submit(move || {
+                if sparse {
+                    crate::holes::make_sparse(&file);
+                }
                 let set = retry_on_interrupt(|| file.set_len(len));
                 drop(completion);
                 set
             })
             .await
+    }
+
+    /// Runs [`crate::holes::empty`] on the syscall pool, in one job. Returns the pool's task, as
+    /// [`Self::next_data`] does.
+    pub(crate) fn empty(file: Arc<File>, len: u64) -> SyscallTask<std::io::Result<()>> {
+        SyscallPool::global().submit(move || crate::holes::empty(&file, len))
     }
 
     /// Runs [`crate::holes::next_data`] on the syscall pool. Returns the pool's task rather than

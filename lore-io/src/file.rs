@@ -446,21 +446,51 @@ impl IoFile {
     /// as [`crate::IoDriver::write_file_segments_atomic`] drops its own.
     pub async fn set_len<C: Send + 'static>(&self, len: u64, completion: C) -> std::io::Result<()> {
         self.driver
-            .set_len_raw(Arc::clone(&self.file), len, completion)
+            .set_len_raw(Arc::clone(&self.file), len, false, completion)
             .await
+    }
+
+    /// Sets the file length as [`Self::set_len`] does, with the file made sparse first, so a range
+    /// of it never written holds no storage: on Windows `FSCTL_SET_SPARSE`. Where the marking
+    /// fails, as on a file system without sparse files, the file is sized all the same and is not
+    /// sparse, its unwritten ranges held as zeros, which read the same. Elsewhere a range never
+    /// written holds no storage already. Both run in one job on the syscall pool.
+    pub async fn set_len_sparse(&self, len: u64) -> std::io::Result<()> {
+        self.driver
+            .set_len_raw(Arc::clone(&self.file), len, true, ())
+            .await
+    }
+
+    /// Empties the file and sizes it to `len`, made sparse as [`Self::set_len_sparse`] makes it, so
+    /// every range of it is a hole that reads as zeros, whatever it held. On Windows the file is
+    /// deallocated whole first, as NTFS is observed, not documented, to keep a file's allocation
+    /// through a truncation while a handle to it is open, and version 3.14 of the Resilient File
+    /// System to record the ranges a sparse file held past a truncation as allocated again once it
+    /// grows, through any handle, unless its data was written out first. All of it runs in one job
+    /// on the syscall pool, which starts when this is called, as for [`Self::next_data`].
+    pub fn empty(&self, len: u64) -> impl Future<Output = std::io::Result<()>> + use<> {
+        IoDriver::empty_raw(Arc::clone(&self.file), len)
     }
 
     /// The first range at or after `offset` the file system holds data for, ending where the next
     /// hole begins: `None` when only holes follow `offset`, or `offset` is at or past the end. A
     /// hole is a range holding no written data: mapped to no storage, or allocated and never
-    /// written (an unwritten extent). It reads as zeros, but zeros written to the file are data.
+    /// written (an unwritten extent). It reads as zeros, but zeros written to the file are data
+    /// where the file system holds them as written.
     /// On Linux the map comes from `FIEMAP`, with the file synced first, and a range is widened to
-    /// whole blocks of the file system, so it may end past the end of the file. Elsewhere, and on a
-    /// file system without `FIEMAP`, it comes from `SEEK_DATA`, which takes an unwritten extent the
-    /// page cache holds pages for as data. On Apple platforms, where the file system holds holes,
-    /// the walk writes the file's data out before its first lookup, as APFS allocates the small
-    /// holes beside data it writes out. Where the platform reports no holes, everything from
-    /// `offset` to the end is one range of data.
+    /// whole blocks of the file system, so it may end past the end of the file. On the other
+    /// platforms but Windows, and on a Linux file system without `FIEMAP`, it comes from
+    /// `SEEK_DATA`, which takes an unwritten extent the page cache holds pages for as data. On
+    /// Apple platforms, where the file system holds holes, the walk writes the file's data out
+    /// before its first lookup, as APFS allocates the small holes beside data it writes out. On
+    /// Windows, on NTFS, everything at or past the file's valid data length, from
+    /// `FSCTL_QUERY_FILE_REGIONS` with the file's data flushed first, was never written and is a
+    /// hole; on any other file system the allocation alone decides. Below it a range is an
+    /// allocated range of a sparse file, from `FSCTL_QUERY_ALLOCATED_RANGES`, and a file that is
+    /// not sparse is data whole. Where the valid data length cannot be read, the allocation alone
+    /// decides. Where the file cannot be flushed, or its data may be held elsewhere until it is
+    /// read, as for a cloud placeholder or an offline file, it is data whole. Where the platform
+    /// reports no holes, everything from `offset` to the end is one range of data.
     ///
     /// `cursor` is what one walk of the file keeps between calls ([`crate::DataCursor`]): a new one
     /// for the first call of a walk, then the one each call hands back with its answer.

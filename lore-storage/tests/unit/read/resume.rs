@@ -263,18 +263,6 @@ fn temporary_file(target: &Path) -> PathBuf {
     target.with_extension("bin.loretmp")
 }
 
-/// Writes `bytes` at `offset` of the file at `path`, keeping its length where they end before it.
-#[cfg(unix)]
-fn write_at(path: &Path, offset: u64, bytes: &[u8]) {
-    use std::os::unix::fs::FileExt;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .expect("open the file")
-        .write_all_at(bytes, offset)
-        .expect("write into the file");
-}
-
 /// The names in `directory`, sorted.
 fn names(directory: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(directory)
@@ -428,8 +416,10 @@ async fn a_truncated_temporary_file_is_loaded_again_from_the_cut() {
 
 /// A temporary file cut inside a leaf whose second half is zeros is written again from the cut: the
 /// bytes there read as the whole leaf, but its second half is a hole of the file, so the leaf is
-/// loaded again and written whole.
-#[cfg(unix)]
+/// loaded again and written whole. The file is written out before the cut, so the cut leaves a hole
+/// past it on every file system: version 3.14 of the Resilient File System records the ranges past
+/// a cut of data not yet written out as allocated once the file grows again, and the resumed read
+/// then counts the leaf as held, which still reads back as the content.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leaf_cut_where_its_zeros_begin_is_written_again() {
     const CUT: usize = 5;
@@ -451,12 +441,15 @@ async fn a_leaf_cut_where_its_zeros_begin_is_written_again() {
     let (root, leaves, content) = put_list_of(&store, leaf_contents).await;
 
     read_failing_at(&store, root, leaves[last], &target, None).await;
-    std::fs::OpenOptions::new()
+    let temporary = std::fs::OpenOptions::new()
         .write(true)
         .open(temporary_file(&target))
-        .expect("open the temporary file")
+        .expect("open the temporary file");
+    temporary.sync_all().expect("write the temporary file out");
+    temporary
         .set_len((CUT * LEAF + LEAF / 2) as u64)
         .expect("cut the temporary file where the zeros begin");
+    drop(temporary);
 
     let (resumed, loads) = hooked(&store, None);
     read_resuming(resumed, root, &target, None)
@@ -749,7 +742,6 @@ async fn put_holed(store: &Arc<dyn ImmutableStore>) -> (Address, Vec<Option<Addr
 
 /// The ranges a file of [`put_holed`]'s content holds data for: every leaf, of zeros included, and
 /// no hole.
-#[cfg(unix)]
 fn holed_data() -> Vec<Range<u64>> {
     let mut ranges: Vec<Range<u64>> = Vec::new();
     for index in (0..LEAVES).filter(|index| holed_entry(*index).is_some()) {
@@ -781,7 +773,6 @@ const ZEROS: usize = 3;
 /// leaves each hole unallocated and each leaf of zeros written. The failed read fails at the
 /// address of every leaf of zeros, so it writes none of them, and every range of zeros reads as
 /// zeros in the temporary file when the read resumes.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_resumed_read_leaves_holes_unwritten_and_writes_zeros() {
     let (_store_dir, store) = make_test_store().await;
@@ -820,7 +811,7 @@ async fn a_resumed_read_leaves_holes_unwritten_and_writes_zeros() {
 /// the failed read, empties the file and writes it as a fresh one: the target is the content, and
 /// each hole is a hole again. On Apple platforms the write sink frees the hole instead, as
 /// [`a_resumed_read_on_apfs_loads_only_the_leaves_it_lacks_and_keeps_every_hole`] tests.
-#[cfg(all(unix, not(target_vendor = "apple")))]
+#[cfg(not(target_vendor = "apple"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hole_of_the_temporary_file_holding_data_empties_it() {
     const HOLE: usize = 1;
@@ -842,11 +833,12 @@ async fn a_hole_of_the_temporary_file_holding_data_empties_it() {
         None,
     )
     .await;
-    write_at(
+    crate::holes::write_at(
         &temporary_file(&target),
         (HOLE * LEAF + LEAF / 4) as u64,
         &[0xFF; 4096],
-    );
+    )
+    .await;
     read_resuming(store, root, &target, None)
         .await
         .expect("the resumed read completes");
@@ -899,7 +891,7 @@ async fn a_resumed_read_on_apfs_loads_only_the_leaves_it_lacks_and_keeps_every_h
         }),
         "the file system filled a hole of the temporary file: {filled:?}"
     );
-    write_at(&temporary, (HOLE * LEAF + LEAF / 4) as u64, &[0xFF; 4096]);
+    crate::holes::write_at(&temporary, (HOLE * LEAF + LEAF / 4) as u64, &[0xFF; 4096]).await;
 
     let (resumed, loads) = hooked(&store, None);
     read_resuming(resumed, root, &target, None)
@@ -945,11 +937,7 @@ async fn a_resumed_read_of_content_with_holes_writes_its_bytes_wherever_it_runs(
         .expect("the resumed read completes");
 
     assert_eq!(std::fs::read(&target).expect("read the target"), content);
-    // Off Unix, lore-io reports no holes (lore-zzi8).
-    #[cfg(unix)]
     let reported = crate::holes::holes_reported().await;
-    #[cfg(not(unix))]
-    let reported = false;
     assert_eq!(
         data_leaves_loaded(&loads, &leaves).contains(&0),
         !reported,
@@ -959,7 +947,6 @@ async fn a_resumed_read_of_content_with_holes_writes_its_bytes_wherever_it_runs(
 
 /// The entry at `index` of content whose holes start and end inside blocks of the file system: the
 /// first leaf is 512 bytes short of the others, and the rest are as [`holed_entry`] makes them.
-#[cfg(unix)]
 fn unaligned_entry(index: usize) -> Option<Vec<u8>> {
     if index == 0 {
         let mut bytes = leaf_bytes(index, 2);
@@ -973,7 +960,6 @@ fn unaligned_entry(index: usize) -> Option<Vec<u8>> {
 /// rather than taking the blocks its holes share with its leaves for data in a hole: it loads none
 /// of the leaves of data the failed read wrote, and writes the content's bytes, with its data where
 /// a read that does not resume puts it.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_resumed_read_of_holes_off_the_blocks_resumes() {
     let (_store_dir, store) = make_test_store().await;
@@ -1011,7 +997,6 @@ async fn a_resumed_read_of_holes_off_the_blocks_resumes() {
 /// file again as a fresh one where bytes other than zeros were written, after the failed read, into
 /// the part of a hole in a block it shares with a leaf beside it: at the hole's start, and at its
 /// end.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_resumed_read_finds_bytes_written_into_the_edge_of_a_hole() {
     const HOLE: usize = 1;
@@ -1029,7 +1014,7 @@ async fn a_resumed_read_finds_bytes_written_into_the_edge_of_a_hole() {
         let target_dir = TempDir::new("lore-storage-resume-hole-edge-");
         let target = target_dir.path().join("content.bin");
         read_failing_at(&store, root, failing, &target, None).await;
-        write_at(&temporary_file(&target), stray, &[0xFF; 16]);
+        crate::holes::write_at(&temporary_file(&target), stray, &[0xFF; 16]).await;
         read_resuming(store.clone(), root, &target, None)
             .await
             .expect("the resumed read completes");
@@ -1044,7 +1029,6 @@ async fn a_resumed_read_finds_bytes_written_into_the_edge_of_a_hole() {
 
 /// The entry at `index` of content ending in a hole that ends inside a block of the file system:
 /// as [`unaligned_entry`] makes them, but for the last entry, a hole.
-#[cfg(unix)]
 fn ending_entry(index: usize) -> Option<Vec<u8>> {
     if index == LEAVES - 1 {
         return None;
@@ -1057,7 +1041,6 @@ fn ending_entry(index: usize) -> Option<Vec<u8>> {
 /// shares that block, so data there is data in the hole, even zeros. On Apple platforms the read
 /// resumes instead, and the write sink frees the block. The target holds the content's bytes, with
 /// its data where a read that does not resume puts it, so that block is a hole again.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_resumed_read_finds_bytes_written_into_a_hole_ending_the_content() {
     let (_store_dir, store) = make_test_store().await;
@@ -1072,11 +1055,12 @@ async fn a_resumed_read_finds_bytes_written_into_a_hole_ending_the_content() {
     let failing = leaves[FAILING].expect("a leaf of data where the read fails");
 
     read_failing_at(&store, root, failing, &target, None).await;
-    write_at(
+    crate::holes::write_at(
         &temporary_file(&target),
         content.len() as u64 - 64,
         &[0; 16],
-    );
+    )
+    .await;
     let (resumed, loads) = hooked(&store, None);
     read_resuming(resumed, root, &target, None)
         .await
@@ -1101,7 +1085,6 @@ async fn a_resumed_read_finds_bytes_written_into_a_hole_ending_the_content() {
 /// The entry at `index` of content whose first and last entries are holes: a hole where the index
 /// is a multiple of 4, a leaf of written zeros where it is 2 past one, and a leaf of data
 /// otherwise.
-#[cfg(unix)]
 fn edged_entry(index: usize) -> Option<Vec<u8>> {
     match index % 4 {
         0 => None,
@@ -1113,7 +1096,6 @@ fn edged_entry(index: usize) -> Option<Vec<u8>> {
 /// A resumed read of a range that starts and ends inside holes, the first and the last entries of
 /// the content, writes the bytes of the range, with each hole of it unallocated and each leaf of
 /// zeros written.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_resumed_range_starting_and_ending_in_holes_keeps_them() {
     let range = LEAF / 2..LEAF / 2 + RESUME_WRITE_MIN_LEN;
@@ -1149,9 +1131,31 @@ async fn a_resumed_range_starting_and_ending_in_holes_keeps_them() {
     assert_eq!(crate::holes::data_ranges(&target).await, data);
 }
 
+/// A resuming read over the temporary file a failed read of other content left at its path, of the
+/// same length, empties it before writing: each hole of its content is unallocated, as in a read
+/// that does not resume, wherever the other content held data.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_temporary_file_of_other_content_is_emptied_of_its_storage() {
+    let (_store_dir, store) = make_test_store().await;
+    let target_dir = TempDir::new("lore-storage-resume-other-emptied-");
+    if !crate::holes::holes_reported().await {
+        return;
+    }
+    let target = target_dir.path().join("content.bin");
+    let (other, other_leaves, _) = put_leaves(&store, &[3; LEAVES]).await;
+    read_failing_at(&store, other, other_leaves[LEAVES - 1], &target, None).await;
+    let (root, _, content) = put_holed(&store).await;
+
+    read_resuming(store, root, &target, None)
+        .await
+        .expect("the read completes");
+
+    assert_eq!(std::fs::read(&target).expect("read the target"), content);
+    assert_eq!(crate::holes::data_ranges(&target).await, holed_data());
+}
+
 /// A resuming read over a temporary file that names no content, left with other bytes, empties it
 /// before writing: each hole reads as zeros and is unallocated, as in a read that does not resume.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_resuming_read_empties_a_temporary_file_it_does_not_resume() {
     let (_store_dir, store) = make_test_store().await;

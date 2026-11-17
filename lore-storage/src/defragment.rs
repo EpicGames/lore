@@ -2251,13 +2251,22 @@ fn refuse_list(leaf: bool, fragment: &Fragment) -> Result<(), StorageError> {
 ///
 /// Emptied first, so every range starts unallocated and reads as zeros, whatever the file held:
 /// a range left unwritten, as a hole is, holds none of a temporary file an interrupted read left
-/// behind, nor of the target a direct write replaces. Then sized rather than left empty, so a
-/// range no payload covers reads as zeros instead of shortening the file — which is what the
-/// sink's byte-count check exists to catch.
+/// behind, nor of the target a direct write replaces. Then sized rather than left empty, made
+/// sparse first where `sparse` ([`IoFile::set_len_sparse`]), so a range no payload covers reads as
+/// zeros instead of shortening the file — which is what the sink's byte-count check exists to
+/// catch — and is a hole.
+///
+/// On Windows a file written sparse is emptied by [`IoFile::empty`], which deallocates it whole
+/// before it truncates it: measured on version 3.14 of the Resilient File System, a sparse file
+/// truncated before its data is written out and grown again records the ranges it held past the
+/// cut as allocated, so the holes of the content written there would be allocated zeros. Every
+/// other file is truncated as it is opened, which frees its storage on the other platforms.
 pub async fn open_file_write(
     path: impl AsRef<Path>,
     size: usize,
+    sparse: bool,
 ) -> Result<IoFile, std::io::Error> {
+    let deallocate = sparse && cfg!(target_family = "windows");
     let file = IoDriver::global()
         .open(
             path,
@@ -2265,9 +2274,15 @@ pub async fn open_file_write(
                 .read(true)
                 .write(true)
                 .create(true)
-                .truncate(true),
+                .truncate(!deallocate),
         )
         .await?;
-    file.set_len(size as u64, ()).await?;
+    if deallocate {
+        file.empty(size as u64).await?;
+    } else if sparse {
+        file.set_len_sparse(size as u64).await?;
+    } else {
+        file.set_len(size as u64, ()).await?;
+    }
     Ok(file)
 }

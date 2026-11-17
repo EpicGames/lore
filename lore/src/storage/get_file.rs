@@ -198,7 +198,8 @@ async fn resolve_get_file_item(
 
     let mut read_options = effective
         .read_options(remote_session.is_some())
-        .resuming_write();
+        .resuming_write()
+        .sparse_writing();
     if item.local_cache != 0 {
         read_options = read_options.with_cache();
     }

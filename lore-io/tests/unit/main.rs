@@ -11,7 +11,11 @@ mod driver;
 mod file;
 #[cfg(target_family = "windows")]
 mod find;
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[cfg(any(
+    target_os = "linux",
+    target_vendor = "apple",
+    target_family = "windows"
+))]
 mod holes;
 #[cfg(target_family = "windows")]
 mod iocp;

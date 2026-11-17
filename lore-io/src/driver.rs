@@ -18,8 +18,9 @@
 //!
 //! The operations every backend runs the same way go to the psync backend directly, outside the
 //! backend surface, and a backend cannot override them: `write_file_segments_atomic`,
-//! `write_file_segments`, `set_len`, `is_at_raw`, `remove_dir_all_keeping` and `names_one_entry`
-//! run on the syscall pool, and `remove_dir_all_in_background` on a thread of its own.
+//! `write_file_segments`, `set_len`, `empty`, `next_data`, `is_at_raw`, `remove_dir_all_keeping`
+//! and `names_one_entry` run on the syscall pool, and `remove_dir_all_in_background` on a thread
+//! of its own.
 //!
 //! There is no trait, and none is needed to make that complete: adding a variant to
 //! [`DriverInner`] makes every match here non-exhaustive, and filling those arms in requires
@@ -713,9 +714,16 @@ impl IoDriver {
         &self,
         file: Arc<File>,
         len: u64,
+        sparse: bool,
         completion: C,
     ) -> std::io::Result<()> {
-        PsyncDriver.set_len(file, len, completion).await
+        PsyncDriver.set_len(file, len, sparse, completion).await
+    }
+
+    /// Every backend runs this on the syscall pool, as [`Self::set_len_raw`]. Returns the pool's
+    /// task, which runs whether or not it is awaited, as [`Self::next_data_raw`] does.
+    pub(crate) fn empty_raw(file: Arc<File>, len: u64) -> SyscallTask<std::io::Result<()>> {
+        PsyncDriver::empty(file, len)
     }
 
     /// Every backend runs this on the syscall pool, as [`Self::set_len_raw`]. Returns the pool's

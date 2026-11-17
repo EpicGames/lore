@@ -70,12 +70,22 @@ pub struct LoreStoragePutFileItem {
     /// no data, never written, or allocated and never written (an unwritten extent), as the file
     /// system's extent map tells on Linux and `SEEK_DATA` on macOS, each with the file synced
     /// first. APFS allocates a hole of under 16 MiB beside data as zeros when it writes that data
-    /// out, so such a range is data there. Zeros written to the file are data and stored as such: a
-    /// file with a hole and the same file with zeros written over it get different addresses. A
-    /// file larger than one fragment that has holes gets a different address than it gets without
-    /// this; one without holes gets the same. `lore_storage_get_file` leaves each hole unwritten, a
-    /// hole of the file it writes. The field sits in what was padding, after `remote_query`, so
-    /// zero the whole item before setting its fields, as for `remote_query`
+    /// out, so such a range is data there. On Windows, on NTFS, everything at or past the
+    /// file's valid data length was never written and is a hole, in a file that is sparse or not;
+    /// below it, and on any other file system, a hole is a range a sparse file leaves unallocated,
+    /// and every allocated range is data. Where the put cannot write the file's data out first, as
+    /// for a read-only file or while another handle to it shares no write access, the whole file
+    /// is data, with no hole, and so is a file whose data its file system may keep elsewhere until
+    /// it is read, as a cloud placeholder, an offline file or one behind a reparse point. Without
+    /// this field the file is read whole, and nothing here applies.
+    /// Zeros written to the file are data and stored as such: a file with a hole and the same file
+    /// with zeros written over it get different addresses, unless the file system itself leaves
+    /// those zeros unallocated, as NTFS can for a small write of zeros alone in an allocation unit
+    /// of a sparse file: then they are a hole. A file larger than one fragment that has holes gets
+    /// a different address than it gets without this; one without holes gets the same.
+    /// `lore_storage_get_file` leaves each hole unwritten, a hole of the file it writes. The field
+    /// sits in what was padding, after `remote_query`, so zero the whole item before setting its
+    /// fields, as for `remote_query`
     pub skip_holes: u8,
     /// Leaf fragment size cap for large files; `0` lets `write_content` choose
     pub fixed_size_chunk: u64,

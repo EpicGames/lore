@@ -326,7 +326,7 @@ Also see: revision graph.
 
 ### Hole
 
-A range of a file that holds no data: the file system maps it to no storage, or allocated it and never wrote it. It reads as zeros, and content stored with its holes skipped records each as a fragment reference with the zero hash.
+A range of a file the file system records as holding no written data: one never written, which it maps to no storage, or one it records as allocated and never written. It reads as zeros, and content stored with its holes skipped records each as a fragment reference with the zero hash.
 
 Also see: fragment reference.
 

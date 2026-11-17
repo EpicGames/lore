@@ -940,11 +940,13 @@ reads as zeros. A file the file system holds mostly as holes, such as a disk ima
 with its holes skipped: only the ranges the file system holds data for are read, chunked and stored,
 and each hole between them costs one reference, however large it is. Zeros written to the file are
 data, stored as any other content, so a file with a hole and the same file with zeros written over
-it are different content with different addresses. A fixed-size chunk wholly inside the data has the
-address it has without the holes skipped, so that data deduplicates against the same file stored
-whole. Writing the content to a file leaves its holes as holes wherever the file system supports
-them, a resumed write included (§14.4), and writes every range of data, zeros included. Readers of
-the storage API see zeros for a hole, but fragment delivery passes it on as a hole.
+it are different content with different addresses, unless the file system itself leaves those
+written zeros unallocated: then they are a hole, as Lore never reads content to decide what is a
+hole. A fixed-size chunk wholly inside the data has the address it has without the holes skipped,
+so that data deduplicates against the same file stored whole. Writing the content to a file leaves
+its holes as holes wherever the file system supports them, a resumed write included (§14.4), and
+writes every range of data, zeros included. Readers of the storage API see zeros for a hole, but
+fragment delivery passes it on as a hole.
 
 #### 8.6 Compression as an orthogonal concern
 

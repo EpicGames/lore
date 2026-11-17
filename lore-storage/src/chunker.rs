@@ -67,7 +67,8 @@ enum Holes {
     Read,
     /// Only the ranges of data are read; see [`FileChunker::skipping_holes`]. Boxed, so a chunker,
     /// and every future holding one, carries one pointer for it. A put skipping holes is the cold
-    /// path: it allocates this state, and its cursor allocates the `FIEMAP` batch, once per file.
+    /// path: it allocates this state, and its cursor allocates the batch of ranges the file system
+    /// maps, once per file.
     Skip(Box<SkipState>),
 }
 

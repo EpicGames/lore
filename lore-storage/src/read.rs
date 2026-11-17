@@ -1811,9 +1811,13 @@ fn write_root_to_file(
                         let opened = if resuming {
                             crate::resume::open(file_path.as_path(), &address.hash, &range).await
                         } else {
-                            crate::defragment::open_file_write(file_path.as_path(), range.len())
-                                .await
-                                .map(|file| Opened::File(file, false))
+                            crate::defragment::open_file_write(
+                                file_path.as_path(),
+                                range.len(),
+                                options.sparse_write,
+                            )
+                            .await
+                            .map(|file| Opened::File(file, false))
                         };
                         match opened {
                             Ok(Opened::File(file, held)) => break (file, held),
@@ -1964,10 +1968,11 @@ fn write_root_to_file(
 }
 
 /// The defragment pipeline of a read resuming from `file`, a temporary file that holds part of the
-/// content: written again as a fresh one, emptied and sized, where a hole of the content holds data
-/// there or its holes cannot be checked ([`crate::defragment::Unresumable`]). It takes the store's
-/// claim once, for every pass. Boxed by its caller, being a cold path, so that the restart it may
-/// take stays out of every other read's future.
+/// content: written again as a fresh one, emptied and sized ([`lore_io::IoFile::empty`]), where a
+/// hole of the content holds data there or its holes cannot be checked
+/// ([`crate::defragment::Unresumable`]). It takes the store's claim once, for every pass. Boxed by
+/// its caller, being a cold path, so that the restart it may take stays out of every other read's
+/// future.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -2017,9 +2022,9 @@ fn pipe_resumed<'a>(
                         temporary.display()
                     );
                     held = false;
-                    let emptied = |e| StorageError::internal_with_context(e, "empty a file");
-                    file.set_len(0, ()).await.map_err(emptied)?;
-                    file.set_len(size as u64, ()).await.map_err(emptied)?;
+                    file.empty(size as u64)
+                        .await
+                        .map_err(|e| StorageError::internal_with_context(e, "empty a file"))?;
                 }
                 pipelined => return pipelined,
             }
