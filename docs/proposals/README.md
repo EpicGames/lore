@@ -1,8 +1,9 @@
 # Lore Enhancement Proposals
 
 This directory holds **Lore Enhancement Proposals (LEPs)** — public-facing
-proposals for changes to the Lore wire protocol, on-disk
-format, public APIs (CLI, capi, JS bindings), and cross-cutting features. LEPs are where the design is debated; ADRs in
+proposals for changes that meet the [LEP bar](../../CONTRIBUTING.md#lore-enhancement-proposals):
+the wire protocol or on-disk format, public APIs (CLI, capi, JS bindings), new functionality, cross-cutting
+features that span multiple subsystems, and any breaking change. LEPs are where the design is debated; ADRs in
 [`../developing/decisions/`](../developing/decisions/README.md) record narrow architecture
 decisions after they are made.
 

@@ -26,9 +26,10 @@ When `context/team-workspace.md` exists, follow it before non-trivial work. It d
 
 ## Before writing code
 
-1. Search `docs/developing/decisions` for decisions about the work. Read those that apply, and follow them. If the work must depart from an accepted ADR, it comes with a new ADR that supersedes it, in the same change.
-2. Read the standards in [Guidance](#guidance) that apply to the work.
-3. Search the code for functions and types that already do what the work needs. Generalize one rather than add another beside it, unless the general form costs performance on a hot path, and say so in the new function's doc comment.
+1. Know the problem the work solves: from an issue or ticket, or stated in the change's description. When the work meets the LEP bar in `CONTRIBUTING.md`, the problem is stated in its LEP in `docs/proposals`. Work that meets the LEP bar needs its LEP: don't skip it, and don't let a ticket, spec, PR description or commit message stand in for it. If the problem isn't clear, or the work meets the LEP bar and has no LEP, ask the user before writing code.
+2. Search `docs/developing/decisions` for decisions about the work. Read those that apply, and follow them. If the work must depart from an accepted ADR, it comes with a new ADR that supersedes it, in the same change.
+3. Read the standards in [Guidance](#guidance) that apply to the work.
+4. Search the code for functions and types that already do what the work needs. Generalize one rather than add another beside it, unless the general form costs performance on a hot path, and say so in the new function's doc comment.
 
 ## While writing code
 
@@ -46,7 +47,7 @@ Follow the standards in [Guidance](#guidance) that apply to the code.
 
 Read the standards in [Guidance](#guidance) that apply to the finished work again, and check the work against them.
 
-1. Record an architectural decision the code made concrete, and that would take more than a day to reverse, as an ADR in `docs/developing/decisions`, following `adr-template.md` and that directory's `README.md`. Write it in this change or in a follow-up named in the change's description. A new ADR that supersedes one the work departed from belongs in this change. Set a superseded ADR's `status` field to `superseded by [ADR-NNNNN](NNNNN-slug.md)`.
+1. Record each decision the code made concrete that is hard to reverse, or that establishes a pattern later code should follow, as an ADR in `docs/developing/decisions`, following `adr-template.md` and that directory's `README.md`. When a decision meets this bar, the ADR is required: don't skip it, and don't let a ticket, spec, PR description or commit message stand in for it. Write it in this change or in a follow-up named in the change's description. A new ADR that supersedes one the work departed from belongs in this change. Set a superseded ADR's `status` field to `superseded by [ADR-NNNNN](NNNNN-slug.md)`.
 2. Update any page in `docs/explanation`, `docs/how-to`, or `docs/tutorials` that the change makes stale.
 3. Add a release note for every change to shipped behaviour: a file in `docs/release-notes/`, as its `README.md` describes, rather than an entry in `docs/release-notes.md`. Only tests, CI, tooling, docs and behaviour-preserving refactors need none.
 4. Check each claim in the comments and docs the change adds against the code, not against memory of writing it.
@@ -54,7 +55,7 @@ Read the standards in [Guidance](#guidance) that apply to the finished work agai
 
 ## Reviewing a change
 
-You must review every change with the `review-change` skill (`.claude/skills/review-change/SKILL.md`) before you submit it. It reviews the change in a fresh session as `docs/developing/code-standards/code-review.md` describes, fixes the findings that have one obvious fix, and reports the rest. Use the same skill to review another author's change.
+You must review every change locally with the `review-change` skill (`.claude/skills/review-change/SKILL.md`) before you push the change. It reviews the change in a fresh session as `docs/developing/code-standards/code-review.md` describes, fixes the findings that have one obvious fix, and reports the rest. Use the same skill to review another author's change.
 
 ## Submitting a change
 
@@ -63,6 +64,6 @@ You must review every change with the `review-change` skill (`.claude/skills/rev
 3. Commit with a message that carries no authorship or tool attribution, such as a `Written with`, `Generated with` or `Co-Authored-By` line. Record a co-author as revision metadata instead, with `lore revision metadata set co-author "<name> <email>"` before `lore commit`.
 4. Create the CR, with a description that follows `.crowd/change_request_template.md` and carries no such attribution either.
 
-For a pull request on GitHub, follow `CONTRIBUTING.md` for steps 3 and 4 instead: sign off every commit, disclose the AI tools used, and leave the pull request description to the human author.
+For a pull request on GitHub, follow `CONTRIBUTING.md` for steps 3 and 4 instead: sign off every commit, and disclose the AI tools used.
 
 For a small update to a submitted CR, a full smoke test run isn't needed. CI runs the smoke tests.

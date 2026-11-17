@@ -8,6 +8,7 @@ Contributor and maintainer docs, organized by purpose. Four subfolders: `interna
 
 ## Suggested starting points
 
+- **Setting up, building or testing Lore?** Start at [Set up, build and test Lore](getting-started.md).
 - **Writing a Lore doc?** Start at [`doc-standards/writing-a-doc.md`](doc-standards/writing-a-doc.md).
 - **Reviewing or self-validating a doc?** Open [`doc-standards/operational/review-checklist.md`](doc-standards/operational/review-checklist.md).
 - **Looking for a coding convention?** See [`code-standards/`](code-standards/README.md).

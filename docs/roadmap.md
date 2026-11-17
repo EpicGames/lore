@@ -106,6 +106,6 @@ Lore is built in the open, and this roadmap reflects community input as much as 
 
 - **Have an idea or a need?** Post in [`#feature-requests` on Discord](https://discord.gg/E4SFJKRPbg) or open a [GitHub Issue](https://github.com/EpicGames/lore/issues). Real-world use cases are what move items up this page.
 - **Want to build one of these?** Many of these themes are great places to contribute. Read [CONTRIBUTING.md](https://github.com/EpicGames/lore/blob/main/CONTRIBUTING.md) and look for the [`good-first-issue`](https://github.com/EpicGames/lore/labels/good-first-issue) label to get started.
-- **Proposing a significant change?** Changes to the wire protocol, on-disk format, or public APIs go through a [Lore Enhancement Proposal](https://github.com/EpicGames/lore/blob/main/CONTRIBUTING.md#lore-enhancement-proposals) — the place where the biggest roadmap items get designed in public.
+- **Proposing a significant change?** A change that meets the LEP bar goes through a [Lore Enhancement Proposal](https://github.com/EpicGames/lore/blob/main/CONTRIBUTING.md#lore-enhancement-proposals) — the place where the biggest roadmap items get designed in public.
 
 Governance of Lore is evolving toward a technical steering group drawn from both internal and external contributors, operating through public roadmaps, RFCs, and open meetings. This page is part of that commitment to deciding Lore's direction in the open.

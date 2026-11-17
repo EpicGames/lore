@@ -50,7 +50,7 @@ A new feature doesn't usually imply one doc. Walk this list:
 - **New CLI command, flag, config key, or API surface?** Write a **Reference** page (or update an existing one) cataloging the surface. Almost always required.
 - **New model, concept, or behavior the reader needs to understand?** Write an **Explanation** page describing the model. Required when the reader can't use the feature productively without understanding it.
 - **A discrete goal the feature unlocks ("set up X," "recover from Y")?** Write a **How-To** page. Optional. Add one when there is a real goal-oriented procedure that crosses two or more commands.
-- **Architectural decision worth recording for future contributors?** Write an **ADR** in `docs/developing/decisions/`. Optional. Add one when the decision involved a real trade-off and discarded alternatives need to outlive the discussion.
+- **Decision that is hard to reverse, or that establishes a pattern later code should follow?** Write an **ADR** in `docs/developing/decisions/`. Required when either holds.
 - **Implementation detail (byte layouts, internal protocols, struct shapes) other contributors will need?** Write an **Internals** page. Optional. Add one when contributors have to reason about the format from another tool or module.
 - **New coding rule the feature establishes for future code?** Write a **Code-Standard** page. Rare from a single feature, but possible.
 
@@ -357,9 +357,10 @@ An ADR — Architectural Decision Record — is the durable record of a single a
 
 ### When to use it
 
-- A decision shapes the project's architecture in a way that future contributors will need to understand to avoid relitigating.
-- A decision involves a trade-off where the discarded alternatives were plausible, and the rationale needs to outlive the discussion that produced it.
-- A decision constrains how downstream code or other decisions are made.
+- The decision is hard to reverse.
+- The decision establishes a pattern that later code should follow.
+
+When either holds, the ADR is required. Don't skip it, and don't let a ticket, spec, PR description or commit message stand in for it. A pattern that also becomes a coding rule gets both: the ADR records the decision, and the Code-Standard cites it.
 
 ### When not to use it
 

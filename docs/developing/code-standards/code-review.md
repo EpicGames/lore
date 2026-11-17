@@ -31,7 +31,7 @@ A review must run in a fresh session: a session or subagent that didn't write th
 5. Check that the change is concise: no code, comment, or doc longer than it needs to be, and nothing unrelated to its intent. Flag a change that bundles parts that can land on their own, and name the split.
 6. Check the change against [Guidance](#guidance).
 7. Check for [irreversible changes](#irreversible-changes) and [performance](#performance) issues. These matter most.
-8. Flag code that departs from an accepted ADR with no new ADR superseding it in the same change, a new architectural decision with no ADR recording it in the change or in a follow-up named in its description, and a superseded ADR whose `status` isn't updated.
+8. Flag code that departs from an accepted ADR with no new ADR superseding it in the same change, a decision that is hard to reverse, or that establishes a pattern later code should follow, with no ADR recording it in the change or in a follow-up named in its description, and a superseded ADR whose `status` isn't updated.
 9. Check that every change to shipped behaviour, including server, auth, storage and data-structure changes, adds a note to `docs/release-notes/` with the right `type`, rather than an entry in `docs/release-notes.md`.
 10. In async code, check that a restructured loop, `select!`, or match keeps its error precedence, draining, and channel-close semantics.
 11. Report the findings as [Reporting findings](#reporting-findings) describes.
