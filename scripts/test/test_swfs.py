@@ -46,12 +46,7 @@ def test_no_swfs_clone_outside_service(new_lore_repo):
 def test_swfs_creates_external_dot_lore(
     new_lore_repo, background_lore_service, global_dir_name
 ):
-    repo: Lore = new_lore_repo(
-        create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
-    )
-
-    repo.shared_store_create(repo.remote)
-    repo.repository_create(vfs="swfs", use_shared_store=True)
+    repo = _swfs_create(new_lore_repo)
 
     instance_id = get_instance_id(repo.repository_info())
     assert instance_id is not None
@@ -76,12 +71,7 @@ def test_swfs_creates_external_dot_lore(
 def test_swfs_repo_prevents_creating_non_swfs_repo(
     new_lore_repo, background_lore_service
 ):
-    repo: Lore = new_lore_repo(
-        create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
-    )
-
-    repo.shared_store_create(repo.remote)
-    repo.repository_create(vfs="swfs", use_shared_store=True)
+    repo = _swfs_create(new_lore_repo)
 
     # Creating a second repository on top of the first one should fail, even though there is no local .lore directory.
     # Also the .lore directory should still continue to not exist after the attempt.
@@ -154,7 +144,7 @@ def test_caches_file_contents(new_lore_repo, background_lore_service, scratch_di
 
 
 def _repositories_match_files(
-    expected_repo: Lore, actual_repo: Lore, files: typing.Sequence[str]
+    expected_repo: Lore, actual_repo: Lore, files: typing.Iterable[str]
 ):
     for file_name in files:
         assert expected_repo.compare_file(
@@ -170,21 +160,56 @@ def test_swfs_actually_mounted(new_lore_repo, lore_service_runner):
     lore_service_runner.start()
 
     original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
-    file_contents = {f"f{i}.txt": os.urandom(1024) for i in range(4)} | {
-        f"nested/f{i}.txt": os.urandom(1024) for i in range(4)
-    }
+    file_contents = _random_files()
     original_repo.write_commit_push(
         "test message",
         file_contents,
     )
 
-    original_repo.shared_store_create(original_repo.remote)
+    swfs_repo = _swfs_clone(original_repo)
 
-    swfs_repo = original_repo.clone(vfs="swfs", use_shared_store=True)
+    _assert_mounted_across_restart(
+        lore_service_runner, original_repo, swfs_repo, file_contents
+    )
 
-    # Assert that the SWFS instance exists both immediately and after a service restart, but not while the service is
-    # not running.
-    _repositories_match_files(original_repo, swfs_repo, file_contents)
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_created_instance_actually_mounted(new_lore_repo, lore_service_runner):
+    """An SWFS instance made by `lore repository create` is mounted while its service runs,
+    syncs what another instance pushed, and is mounted again when the service restarts."""
+    lore_service_runner.start()
+
+    swfs_repo = _swfs_create(new_lore_repo)
+
+    plain_repo = swfs_repo.clone(vfs="none")
+    file_contents = _random_files()
+    plain_repo.write_commit_push("test message", file_contents)
+
+    swfs_repo.sync("main@latest")
+
+    _assert_mounted_across_restart(
+        lore_service_runner, plain_repo, swfs_repo, file_contents
+    )
+
+
+def _random_files() -> dict[str, bytes]:
+    """Random contents for four files at the root and four in a nested directory."""
+    return {f"f{i}.txt": os.urandom(1024) for i in range(4)} | {
+        f"nested/f{i}.txt": os.urandom(1024) for i in range(4)
+    }
+
+
+def _assert_mounted_across_restart(
+    lore_service_runner,
+    expected_repo: Lore,
+    swfs_repo: Lore,
+    files: typing.Collection[str],
+):
+    """Asserts that `swfs_repo` holds `expected_repo`'s `files` while the service runs, is
+    absent while it is stopped, and holds them again once it restarts."""
+    _repositories_match_files(expected_repo, swfs_repo, files)
 
     lore_service_runner.terminate()
 
@@ -192,7 +217,7 @@ def test_swfs_actually_mounted(new_lore_repo, lore_service_runner):
 
     lore_service_runner.start()
 
-    _repositories_match_files(original_repo, swfs_repo, file_contents)
+    _repositories_match_files(expected_repo, swfs_repo, files)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
@@ -309,6 +334,16 @@ def test_swfs_sync(new_lore_repo, background_lore_service):
     _repositories_match_files(original_repo, swfs_repo, updated_file_contents)
     assert not swfs_repo.file_exists(deleted_file)
     assert not swfs_repo.file_exists(nested_deleted_file)
+
+
+def _swfs_create(new_lore_repo) -> Lore:
+    """An SWFS instance made by `lore repository create` over a shared store, in the service."""
+    repo: Lore = new_lore_repo(
+        create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
+    )
+    repo.shared_store_create(repo.remote)
+    repo.repository_create(vfs="swfs", use_shared_store=True)
+    return repo
 
 
 def _swfs_clone(original_repo: Lore) -> Lore:
