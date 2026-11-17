@@ -19,6 +19,7 @@ use crate::node::Node;
 use crate::node::NodeID;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
+use crate::repository::MountKind;
 use crate::repository::RepositoryContext;
 use crate::repository::is_reserved_node_name;
 use crate::state::MAX_LINK_DEPTH;
@@ -456,14 +457,14 @@ impl ServedTree {
 
 /// The linked repository `linked` at `revision`, reached from `repository`.
 ///
-/// Cold: a nested link's pin is opened once per tree, and boxed where it is awaited. Inline, its
-/// connection to the remote would make every resolve as large as opening a link.
+/// Cold: a nested link's pin is opened once per tree, and boxed where it is awaited. Inline, loading
+/// its state would make every resolve as large as opening a link.
 async fn open_link(
     repository: &Arc<RepositoryContext>,
     linked: RepositoryId,
     revision: Hash,
 ) -> Result<Entered, StateError> {
-    let linked = repository.to_link_context(linked).await;
+    let linked = repository.to_mounted_context_on_first_use(linked, MountKind::Link);
     let state = State::deserialize(linked.clone(), revision).await?;
     Ok((linked, state))
 }
@@ -553,7 +554,7 @@ async fn layer_mount(
             Err(error) => return Err(error),
         }
     }
-    let layered = repository.to_layer_context(layer.repository).await;
+    let layered = repository.to_mounted_context_on_first_use(layer.repository, MountKind::Layer);
     let layered_state = State::deserialize(layered.clone(), layer.current).await?;
     let source = if source_path.is_empty() {
         ROOT_NODE

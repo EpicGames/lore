@@ -9,6 +9,7 @@ import logging
 import os
 import pathlib
 import random
+import re
 import shutil
 import string
 import subprocess
@@ -260,6 +261,8 @@ class Lore:
         # the rest. Defaults to a list of its own so a directly constructed Lore
         # outside a fixture still works, just without the cleanup.
         self.created_paths = [] if created_paths is None else created_paths
+        # The VFS this repository was made with, `None` for a plain one.
+        self.vfs: str | None = None
         # If the caller picked a specific remote_url, mirror it into the env
         # subprocess overrides — otherwise repository_create inherits the
         # session-level LORE_REMOTE_URL pointing at the autouse server and
@@ -296,8 +299,13 @@ class Lore:
         """Return the full path to the repository metadata directory.
 
         A virtual instance keeps it outside its mount, in its external directory in the
-        external root, which is where Lore finds it through the mount table."""
+        external root. Lore finds a FUSE instance through the mount table; an SWFS
+        instance has no mount table entry, so its instance is the one
+        `lore repository info` names."""
         instance = lore_mount_instance(self.path)
+        if instance is None and self.vfs == "swfs":
+            match = re.search(r"Instance: (\S+)", self.repository_info())
+            instance = match.group(1) if match else None
         if instance is not None:
             global_dir = self.sandboxed_env()["LORE_GLOBAL_PATH"]
             return os.path.join(external_root(global_dir), instance, ".lore")
@@ -564,6 +572,8 @@ class Lore:
             + (["--shared-store-path", shared_store_path] if shared_store_path else []),
             **kwargs,
         )
+        if not kwargs.get("dry_run"):
+            self.vfs = vfs
         self._ensure_test_identity_in_config(kwargs.get("identity"))
         return output
 
@@ -2326,6 +2336,8 @@ class Lore:
             created_paths=self.created_paths,
             environment_vars=self.environment_vars,
         )
+        if not kwargs.get("dry_run"):
+            new_repo.vfs = vfs
         new_repo._ensure_test_identity_in_config()
         return new_repo
 

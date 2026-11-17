@@ -103,13 +103,34 @@ pub(crate) fn shared_connect(
     connect: impl Future<Output = Result<Arc<Connection>, ProtocolError>> + Send + 'static,
 ) -> RemoteFuture {
     let handle = lore_spawn_net!(connect);
+    async move { joined(handle).await }.boxed().shared()
+}
+
+/// [`shared_connect`] started by its first poll rather than now, and run in the `LORE_CONTEXT` of
+/// this call whichever task polls it first.
+pub(crate) fn lazy_shared_connect(
+    connect: impl Future<Output = Result<Arc<Connection>, ProtocolError>> + Send + 'static,
+) -> RemoteFuture {
+    let context = lore_base::runtime::try_lore_context();
     async move {
-        handle
-            .await
-            .unwrap_or_else(|_| Err(ProtocolError::internal("connect task failed")))
+        let handle = match context {
+            Some(context) => {
+                lore_base::runtime::LORE_CONTEXT.sync_scope(context, || lore_spawn_net!(connect))
+            }
+            None => lore_spawn_net!(connect),
+        };
+        joined(handle).await
     }
     .boxed()
     .shared()
+}
+
+async fn joined(
+    handle: tokio::task::JoinHandle<Result<Arc<Connection>, ProtocolError>>,
+) -> Result<Arc<Connection>, ProtocolError> {
+    handle
+        .await
+        .unwrap_or_else(|_| Err(ProtocolError::internal("connect task failed")))
 }
 
 /// The connection [`RemoteConnections`] holds for one repository. A connect's back-off is the

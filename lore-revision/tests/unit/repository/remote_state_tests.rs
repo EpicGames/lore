@@ -18,12 +18,15 @@
 //! - Session pools: the pool a context holds and reuses, and the endpoint it takes pools from
 //!   where one is set, over a detached connection.
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use lore_base::error::Disconnected;
 use lore_base::error::NoRemote;
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::test_util::TempDir;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::FragmentFlags;
@@ -33,17 +36,25 @@ use lore_revision::immutable::read_options_from_repository;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::lore::RepositoryId;
 use lore_revision::protocol::RemoteFuture;
+use lore_revision::repository::MountKind;
 use lore_revision::repository::RemoteState;
+use lore_revision::repository::RepositoryConfig;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::test_util::context_with_state;
 use lore_storage::options::ReadOptions;
+use lore_transport::Connection;
 use lore_transport::ProtocolError;
 
 use super::test_helpers::built_context;
+use super::test_helpers::cached_remote_url;
 use super::test_helpers::counted_endpoint;
 use super::test_helpers::store_fragment;
+use super::test_helpers::with_auth_path;
 use crate::helper::setup_test_execution;
 use crate::helper::test_execution_with;
+use crate::immutable::serving::Serving;
+use crate::immutable::serving::remote_copy;
+use crate::immutable::serving::serving_remote;
 
 fn disconnected() -> ProtocolError {
     ProtocolError::from(Disconnected)
@@ -335,6 +346,179 @@ async fn a_held_state_lock_does_not_answer_offline() {
     assert!(!context.is_offline());
     drop(guard);
     assert!(context.is_offline());
+}
+
+/// The configuration naming the remote at `remote_url`.
+fn remote_config(remote_url: String) -> RepositoryConfig {
+    RepositoryConfig {
+        remote_url: Some(remote_url),
+        ..Default::default()
+    }
+}
+
+/// A connected context keeps its connection, whatever the configuration names.
+#[tokio::test]
+async fn a_connected_context_keeps_its_connection_on_reconnect() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let held = Connection::detached(Vec::new());
+            let config = remote_config(cached_remote_url(Connection::detached(Vec::new())));
+            let context = context_with_state(RemoteState::Connected(held.clone())).await;
+
+            context.reconnect_if_lost(&config);
+            let remote = context.remote().await.expect("the context is connected");
+
+            assert!(Arc::ptr_eq(&remote, &held));
+        })
+        .await;
+}
+
+/// A context whose connection went stale, as one does once the transport gives up reconnecting
+/// it, reaches a new connection on reconnect.
+#[tokio::test]
+async fn a_context_whose_connection_went_stale_reconnects() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let stale = Connection::detached(Vec::new());
+            stale.stale.store(true, Ordering::Relaxed);
+            let fresh = Connection::detached(Vec::new());
+            let config = remote_config(cached_remote_url(fresh.clone()));
+            let context = context_with_state(RemoteState::Connected(stale)).await;
+
+            context.reconnect_if_lost(&config);
+            let remote = context.remote().await.expect("the context reconnects");
+
+            assert!(Arc::ptr_eq(&remote, &fresh));
+        })
+        .await;
+}
+
+/// A context whose connect failed reads through the connect armed in its place, not the storage
+/// session it held for the failed one.
+#[tokio::test]
+async fn a_context_reads_through_a_connect_armed_after_one_failed() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (source, address, _) = remote_copy(b"held by the remote alone", 3, 0).await;
+            let context =
+                context_with_state(RemoteState::Pending(ready_remote(Err(disconnected())))).await;
+            let failed = load_raw(
+                context.clone(),
+                address,
+                read_options_from_repository(&context),
+            )
+            .await;
+            let storage = serving_remote(&source, Serving::default());
+            let url = cached_remote_url(Connection::detached(vec![storage]));
+
+            context.reconnect_if_lost(&remote_config(url));
+            let read = load_raw(
+                context.clone(),
+                address,
+                read_options_from_repository(&context),
+            )
+            .await;
+
+            assert!(failed.is_err());
+            assert_eq!(
+                read.expect("the read reaches the remote").1.as_ref(),
+                b"held by the remote alone"
+            );
+        })
+        .await;
+}
+
+/// A reconnect runs in the execution context that armed it, so it reads the credential store of
+/// that call, whichever call polls it first.
+#[tokio::test]
+async fn a_reconnect_runs_in_the_context_that_armed_it() {
+    let armed_with = TempDir::new("lore-remote-armed-auth-");
+    let polled_with = TempDir::new("lore-remote-polled-auth-");
+    let connection = Connection::detached(Vec::new());
+    let context = LORE_CONTEXT
+        .scope(with_auth_path(&armed_with), async {
+            let config = remote_config(cached_remote_url(connection.clone()));
+            let context = context_with_state(RemoteState::Failed(disconnected())).await;
+            context.reconnect_if_lost(&config);
+            context
+        })
+        .await;
+
+    let remote = LORE_CONTEXT
+        .scope(with_auth_path(&polled_with), context.remote())
+        .await;
+
+    assert!(Arc::ptr_eq(
+        &remote.expect("the connect finds the connection of the arming call"),
+        &connection
+    ));
+}
+
+/// A context mounted on first use connects through its parent's remote only once it is used, and
+/// answers what its parent's connect answers.
+#[tokio::test]
+async fn a_context_mounted_on_first_use_connects_through_its_parent_when_used() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let polled = Arc::new(AtomicBool::new(false));
+            let connect = {
+                let polled = polled.clone();
+                async move {
+                    polled.store(true, Ordering::SeqCst);
+                    Err(disconnected())
+                }
+                .boxed()
+                .shared()
+            };
+            let parent = context_with_state(RemoteState::Pending(connect)).await;
+
+            let linked = parent
+                .to_mounted_context_on_first_use(RepositoryId::from([4; 16]), MountKind::Link);
+            tokio::task::yield_now().await;
+            let unused = polled.load(Ordering::SeqCst);
+            let remote = linked.remote().await;
+
+            assert!(
+                !unused,
+                "the parent's connect is not polled before the context is used"
+            );
+            assert!(matches!(remote, Err(ProtocolError::Disconnected(_))));
+        })
+        .await;
+}
+
+/// A caller that awaited a connect which failed leaves the connect armed in its place since as it
+/// is, rather than promoting the old failure over it.
+#[tokio::test]
+async fn an_awaited_connect_does_not_promote_over_one_armed_since() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (fail, failed) = tokio::sync::oneshot::channel::<()>();
+            let first = async move {
+                let _ = failed.await;
+                Err(disconnected())
+            }
+            .boxed()
+            .shared();
+            let context = context_with_state(RemoteState::Pending(first)).await;
+            let mut waiting = Box::pin(context.remote());
+            assert!(futures::poll!(&mut waiting).is_pending());
+            fail.send(()).expect("the first connect is awaited");
+            let promoted = context.remote().await;
+            let connection = Connection::detached(Vec::new());
+            context.reconnect_if_lost(&remote_config(cached_remote_url(connection.clone())));
+
+            let waited = waiting.await;
+            let remote = context.remote().await;
+
+            assert!(matches!(promoted, Err(ProtocolError::Disconnected(_))));
+            assert!(matches!(waited, Err(ProtocolError::Disconnected(_))));
+            assert!(Arc::ptr_eq(
+                &remote.expect("the connect armed since reaches the remote"),
+                &connection
+            ));
+        })
+        .await;
 }
 
 #[tokio::test]

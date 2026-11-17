@@ -103,9 +103,12 @@ async fn a_serving_context_reads_its_callers_environment_under_the_services_glob
         ..Default::default()
     };
     let service = ExecutionContext::new_client(globals, EventDispatcher::new(None));
-    let serving: Arc<dyn Any + Send + Sync> = Arc::new(service.serving(CallEnvironment {
-        values: [None, Some("/caller/auth".to_string()), None],
-    }));
+    let serving: Arc<dyn Any + Send + Sync> = Arc::new(service.serving(
+        service.globals().clone(),
+        Some(CallEnvironment {
+            values: [None, Some("/caller/auth".to_string()), None],
+        }),
+    ));
 
     let (global, auth, correlation_id) = LORE_CONTEXT
         .scope(serving, async {

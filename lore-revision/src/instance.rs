@@ -2209,6 +2209,7 @@ async fn instance_delete_with(
                 } else if let Some(mm) = MountManagerState::mount_manager() {
                     mm.swfs()
                         .remove_mount(Path::new(&path))
+                        .await
                         .forward::<InstanceError>("unmounting the instance")?;
                 }
             }

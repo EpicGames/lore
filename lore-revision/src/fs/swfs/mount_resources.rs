@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::ffi::CString;
 use std::ops::Range;
 use std::path::Path;
@@ -7,10 +8,12 @@ use std::sync::Arc;
 use lore_base::error::*;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::runtime;
+use lore_base::types::Hash;
 use lore_error_set::ForwardAny;
 use lore_error_set::ForwardStrict;
 use lore_error_set::WrapInternal;
 use lore_error_set::error_set;
+use lore_storage::FlushOptions;
 use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
 use parking_lot::RwLock;
 
@@ -32,12 +35,10 @@ use crate::immutable;
 use crate::instance::InstanceId;
 use crate::instance::load_current_anchor;
 use crate::instance::load_staged_revision;
-use crate::interface::ExecutionContext;
 use crate::interface::LoreGlobalArgs;
 use crate::layer;
 use crate::lore::RepositoryId;
 use crate::lore::execution_context;
-use crate::relay::EventDispatcher;
 use crate::repository::DOT_LORE;
 use crate::repository::DOT_LOREIGNORE;
 use crate::repository::ID;
@@ -52,7 +53,6 @@ use crate::repository::create_client_immutable_store;
 use crate::repository::create_client_mutable_store;
 use crate::repository::load_repository_config_from_dot_dir;
 use crate::repository::read_id_from_file;
-use crate::state;
 use crate::state::State;
 use crate::state::StateError;
 use crate::state::file_modified_time;
@@ -136,8 +136,12 @@ impl std::fmt::Debug for InternalState {
 /// itself.
 #[derive(Debug)]
 pub struct MountResources {
-    global_args: LoreGlobalArgs,
+    /// The execution context of the call that mounted the instance, which every callback runs in,
+    /// so the mount reads that caller's configuration and credentials.
+    context: Arc<dyn Any + Send + Sync>,
     repository: Arc<RepositoryContext>,
+    /// Names the remote a failed connect is retried against.
+    config: RepositoryConfig,
     internal_state: RwLock<InternalState>,
     /// The files SWFS has reported as modified. Fed by the `notify_*` callbacks.
     modified: Arc<ModifiedTree>,
@@ -253,6 +257,21 @@ impl MountResources {
 
         let name = hex::encode(instance_id.data());
 
+        let repo_path = mount_path
+            .as_ref()
+            .to_str()
+            .ok_or(SwfsMountError::internal("Unable to stringify mount path"))?;
+        let context: Arc<dyn Any + Send + Sync> = Arc::new(execution.serving(
+            LoreGlobalArgs {
+                repository_path: repo_path.into(),
+                ..execution.globals().clone()
+            },
+            execution.environment().cloned(),
+        ));
+        let remote = LORE_CONTEXT.sync_scope(context.clone(), || {
+            RemoteState::on_first_use(repository_id, config)
+        });
+
         let mutable_store: Arc<dyn lore_storage::MutableStore> = mutable_store;
         let repository = Arc::new(
             RepositoryContext::new_with_state(
@@ -264,7 +283,7 @@ impl MountResources {
                 mutable_store,
                 repository_id,
                 instance_id,
-                RemoteState::Offline,
+                remote,
                 Arc::new(Filter::default()),
                 Some(Arc::new(InvalidFilesystemProvider {})),
             )
@@ -272,19 +291,12 @@ impl MountResources {
         );
         repository.set_disable_cache(false);
 
-        let repo_path = mount_path
-            .as_ref()
-            .to_str()
-            .ok_or(SwfsMountError::internal("Unable to stringify mount path"))?;
-
         let resources = MountResources {
-            global_args: LoreGlobalArgs {
-                repository_path: repo_path.into(),
-                ..execution.globals().clone()
-            },
+            context,
             modified: Arc::new(ModifiedTree::new(repository.clone())),
             callbacks: CallbackCounters::default(),
             repository,
+            config: config.clone(),
             internal_state: RwLock::default(),
             _instance_id: instance_id,
             name_nul_terminated: CString::new(name.as_str())
@@ -299,7 +311,7 @@ impl MountResources {
             _mount_path: mount_path,
         };
         resources
-            .run_with_context(resources.update_state(SwfsExecutionToken::new()))
+            .update_state(SwfsExecutionToken::new())
             .await
             .internal("Updating state before mounting")?;
 
@@ -317,13 +329,7 @@ impl MountResources {
     }
 
     pub async fn run_with_context<F: Future>(&self, f: F) -> F::Output {
-        let execution_context = Arc::new(ExecutionContext::new_client(
-            self.global_args.clone(),
-            // TODO: Provide a useful `EventDispatcher` to handle errors.
-            EventDispatcher::new(None),
-        ));
-
-        LORE_CONTEXT.scope(execution_context, f).await
+        LORE_CONTEXT.scope(self.context.clone(), f).await
     }
 
     pub fn repository(&self) -> Arc<RepositoryContext> {
@@ -356,30 +362,45 @@ impl MountResources {
         &self.callbacks
     }
 
-    /// Loads what the mount serves from what the instance has stored: the current revision, the
-    /// links at the pins the staged state holds, and the layers at their current revisions.
+    /// Loads what the mount serves from what the instance has stored, and from the remote what the
+    /// store lacks: the current revision, the links at the pins the staged state holds, and the
+    /// layers at their current revisions. A remote whose connect failed is connected again. Runs
+    /// in the mount's execution context, whichever command thaws it.
+    ///
+    /// The load is boxed: it runs once per command, and inline it would make the thaw's future as
+    /// large as the load and the context scope together.
     pub async fn update_state(&self, token: SwfsExecutionToken) -> Result<(), SwfsWorkError> {
-        let current_anchor = load_current_anchor(&self.repository).await;
-        let current_revision = current_anchor.ok().map(|(revision, _)| revision);
-        let current = match current_revision {
-            Some(current_revision) => {
-                self.modified.observe_revision(current_revision).await;
-                Some(
-                    state::State::deserialize(self.repository.clone(), current_revision)
-                        .await
-                        .forward::<SwfsWorkError>("Failed to deserialize state")?,
-                )
-            }
-            None => None,
-        };
-        let staged = match load_staged_revision(&self.repository).await {
-            Ok(Some(staged_revision)) if Some(staged_revision) != current_revision => Some(
-                state::State::deserialize(self.repository.clone(), staged_revision)
+        self.run_with_context(Box::pin(self.load_served(token)))
+            .await
+    }
+
+    async fn load_served(&self, token: SwfsExecutionToken) -> Result<(), SwfsWorkError> {
+        self.repository.reconnect_if_lost(&self.config);
+        let current_revision = load_current_anchor(&self.repository)
+            .await
+            .ok()
+            .map(|(revision, _)| revision);
+        let staged_revision = load_staged_revision(&self.repository)
+            .await
+            .ok()
+            .flatten()
+            .filter(|staged| Some(*staged) != current_revision);
+        if let Some(current_revision) = current_revision {
+            self.modified.observe_revision(current_revision).await;
+        }
+        let deserialize = |revision: Option<Hash>, failure: &'static str| async move {
+            match revision {
+                Some(revision) => State::deserialize(self.repository.clone(), revision)
                     .await
-                    .forward::<SwfsWorkError>("Failed to deserialize the staged state")?,
-            ),
-            _ => None,
+                    .map(Some)
+                    .forward::<SwfsWorkError>(failure),
+                None => Ok(None),
+            }
         };
+        let (current, staged) = futures::try_join!(
+            deserialize(current_revision, "Failed to deserialize state"),
+            deserialize(staged_revision, "Failed to deserialize the staged state"),
+        )?;
         // An instance with no layer configuration has no layers.
         let layers = layer::list(self.repository.clone())
             .await
@@ -392,6 +413,14 @@ impl MountResources {
         self.internal_state.write().served = Some(served);
         self.update_ignore_filter(token).await;
         Ok(())
+    }
+
+    /// Writes to disk what the mount fetched from the remote into its store. Unflushed, it is
+    /// fetched again the next time the instance is mounted.
+    pub async fn flush_fetched(&self) {
+        if let Err(error) = self.repository.flush(FlushOptions::default()).await {
+            crate::lore_warn!("SWFS mount could not flush its stores: {error}");
+        }
     }
 
     /// Points the modified-file record at the ignore rules the current revision tracks. The
@@ -604,10 +633,14 @@ pub mod test_util {
             mount_path: MountPath,
         ) -> Self {
             let resources = MountResources {
-                global_args: LoreGlobalArgs::default(),
+                context: Arc::new(crate::interface::ExecutionContext::new_client(
+                    LoreGlobalArgs::default(),
+                    crate::relay::EventDispatcher::new(None),
+                )),
                 modified: Arc::new(ModifiedTree::new(repository.clone())),
                 callbacks: CallbackCounters::default(),
                 repository,
+                config: RepositoryConfig::default(),
                 internal_state: RwLock::default(),
                 _instance_id: InstanceId::default(),
                 name_nul_terminated: CString::default(),

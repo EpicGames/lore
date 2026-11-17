@@ -228,13 +228,18 @@ impl SwfsMountManager {
             .collect()
     }
 
-    /// Remove a mount, closing it. Returns the `instance_id` if a mount existed at the path.
-    pub fn remove_mount(&self, path: &Path) -> Result<Option<InstanceId>, MountManagerError> {
-        Ok(self.take_mount(path)?.map(|(instance_id, _)| instance_id))
+    /// Remove a mount, closing it and flushing what it fetched. Returns the `instance_id` if a
+    /// mount existed at the path.
+    pub async fn remove_mount(&self, path: &Path) -> Result<Option<InstanceId>, MountManagerError> {
+        Ok(self
+            .take_mount(path)
+            .await?
+            .map(|(instance_id, _)| instance_id))
     }
 
-    /// Removes the mount at `path`, closing it, and answers the instance it served and its record.
-    fn take_mount(
+    /// Removes the mount at `path`, closing it and flushing what it fetched, and answers the
+    /// instance it served and its record.
+    async fn take_mount(
         &self,
         path: &Path,
     ) -> Result<Option<(InstanceId, Arc<MountRecord>)>, MountManagerError> {
@@ -246,6 +251,7 @@ impl SwfsMountManager {
         self.handles.remove(&mount.interface.lookup_key());
         // Closed explicitly: other holders of the interface would keep the path mounted.
         mount.interface.close();
+        mount.interface.resources().flush_fetched().await;
         Ok(Some((mount.instance_id, mount.record)))
     }
 
@@ -332,7 +338,7 @@ impl SwfsMountManager {
 
         // The mount is closed, not just dropped: callers still hold references to the interface,
         // and the source path stays mounted until it is closed.
-        let Some((instance_id, record)) = self.take_mount(from_path)? else {
+        let Some((instance_id, record)) = self.take_mount(from_path).await? else {
             return Err(MountManagerError::internal(format!(
                 "Mount not found at path {}",
                 from_path.display()
@@ -357,7 +363,8 @@ impl SwfsMountManager {
         Err(error)
     }
 
-    /// Closes every SWFS mount, for the service to call as it exits, however it was stopped.
+    /// Closes every SWFS mount, for the service to call as it exits, however it was stopped, and
+    /// then flushes what each fetched.
     ///
     /// The mount manager is a static, which is never dropped, so a mount not closed here outlives
     /// the process only in the driver, which does not tear down a mount whose client went away
@@ -370,12 +377,17 @@ impl SwfsMountManager {
             .iter()
             .map(|mount| Arc::clone(&mount.interface))
             .collect();
-        lore_base::lore_spawn_blocking!(move || {
-            for mount in mounts {
+        let mounts = lore_base::lore_spawn_blocking!(move || {
+            for mount in &mounts {
                 mount.close();
             }
+            mounts
         })
         .await
-        .map_err(|error| MountManagerError::internal(format!("Closing SWFS mounts: {error}")))
+        .map_err(|error| MountManagerError::internal(format!("Closing SWFS mounts: {error}")))?;
+        for mount in &mounts {
+            mount.resources().flush_fetched().await;
+        }
+        Ok(())
     }
 }

@@ -614,16 +614,18 @@ const INTERNAL_SERVER_CONTEXT: InternalServerContext = InternalServerContext;
 
 /// State machine for the remote connection. Lives behind `Arc<RwLock<_>>` so related
 /// contexts (e.g. filter views) can share the same underlying connection state while
-/// link/layer contexts build their own against a freshly-connected module.
+/// link/layer contexts each connect to their module.
 #[lore_macro::test_pub]
 pub(crate) enum RemoteState {
     /// No remote configured, or globals set offline — permanent terminal state.
     Offline,
     /// Connection attempt in flight; awaiters poll the shared future.
     Pending(RemoteFuture),
-    /// Connection established.
+    /// Connection established. [`RepositoryContext::reconnect_if_lost`] replaces one that went
+    /// stale.
     Connected(Arc<Connection>),
-    /// Connection attempt failed; terminal state for this context.
+    /// Connection attempt failed. Terminal, except that
+    /// [`RepositoryContext::reconnect_if_lost`] arms a connect in its place.
     Failed(ProtocolError),
 }
 
@@ -767,6 +769,36 @@ impl RemoteState {
             Err(err) => RemoteState::Failed(err),
         }
     }
+
+    /// The state of a context whose connect is `connect`: pending on it, or what its failure to
+    /// start classifies as.
+    fn connecting(connect: Result<RemoteFuture, ProtocolError>) -> Self {
+        match connect {
+            Ok(future) => RemoteState::Pending(future),
+            Err(error) => RemoteState::from_result(Err(error)),
+        }
+    }
+
+    /// Whether this state holds a connect that failed, or a connection that went stale once the
+    /// transport gave up reconnecting it, so no read can reach the remote through it again.
+    fn is_lost(&self) -> bool {
+        match self {
+            RemoteState::Failed(_) => true,
+            RemoteState::Connected(connection) => connection.stale.load(Ordering::Relaxed),
+            RemoteState::Offline | RemoteState::Pending(_) => false,
+        }
+    }
+
+    /// The state of a context that connects to the remote `config` names at its first use, in the
+    /// execution context of this call, whatever the command was told about going offline.
+    pub(crate) fn on_first_use(repository: RepositoryId, config: &RepositoryConfig) -> Self {
+        let correlation_id = crate::runtime::try_execution_context()
+            .map_or_default(|context| context.globals().correlation_id.to_string());
+        Self::connecting(
+            remote_connect(repository, correlation_id, config, config.identity.clone())
+                .map(protocol::lazy_shared_connect),
+        )
+    }
 }
 
 fn remote_arc(state: RemoteState) -> SharedRemote {
@@ -907,18 +939,13 @@ impl RepositoryContext {
     /// modified-time keys answer for. A path within the mounted tree is derived from its node
     /// by [`State::node_path`](crate::state::State::node_path).
     ///
-    /// Takes the connection already resolved rather than awaiting it here, and its callers await
-    /// inline rather than through a shared `async fn`. Either would nest one future inside
-    /// another, and `to_link_context` is awaited on every link the read paths cross.
-    fn mounted(
-        &self,
-        id: RepositoryId,
-        mount: MountKind,
-        remote: Result<Arc<Connection>, ProtocolError>,
-    ) -> Self {
+    /// Takes the remote state already resolved or armed rather than awaiting a connect here, and
+    /// its callers await inline rather than through a shared `async fn`. Either would nest one
+    /// future inside another, and `to_link_context` is awaited on every link the read paths cross.
+    fn mounted(&self, id: RepositoryId, mount: MountKind, remote: RemoteState) -> Self {
         RepositoryContext {
             id,
-            remote: remote_arc(RemoteState::from_result(remote)),
+            remote: remote_arc(remote),
             mount: Some(mount),
             ..self.inherited()
         }
@@ -1059,20 +1086,53 @@ impl RepositoryContext {
         let correlation_id = crate::runtime::try_execution_context()
             .map_or_default(|context| context.globals().correlation_id.to_string());
         remote_arc(match config {
-            Some(config) => {
-                match connect_remote(self.id, correlation_id, &config, config.identity.clone()) {
-                    Ok(future) => RemoteState::Pending(future),
-                    Err(error) => RemoteState::from_result(Err(error)),
-                }
-            }
+            Some(config) => RemoteState::connecting(connect_remote(
+                self.id,
+                correlation_id,
+                &config,
+                config.identity.clone(),
+            )),
             None => RemoteState::Offline,
         })
     }
 
+    /// Arms a connect to the remote `config` names in place of one that failed or a connection
+    /// that went stale, as [`RemoteState::on_first_use`] does. Drops the session pool and the
+    /// storage session held for the lost one, so the next read takes the new connection. Skips a
+    /// state lock held elsewhere.
+    #[lore_macro::test_pub]
+    pub(crate) fn reconnect_if_lost(&self, config: &RepositoryConfig) {
+        let Ok(mut remote) = self.remote.try_write() else {
+            return;
+        };
+        if !remote.is_lost() {
+            return;
+        }
+        *remote = RemoteState::on_first_use(self.id, config);
+        *self.session_pool.write() = None;
+        *self.lazy_session.write() = None;
+    }
+
+    /// This context aimed at the repository mounted at `id` as `mount`, as
+    /// [`Self::to_link_context`] and [`Self::to_layer_context`] make it, but connected through
+    /// this context's remote at its first use rather than now.
+    #[lore_macro::test_pub]
+    pub(crate) fn to_mounted_context_on_first_use(
+        &self,
+        id: RepositoryId,
+        mount: MountKind,
+    ) -> Arc<Self> {
+        let parent = self.remote.clone();
+        let connect = protocol::lazy_shared_connect(async move {
+            resolve_remote(&parent).await?.connect_module(id).await
+        });
+        Arc::new(self.mounted(id, mount, RemoteState::Pending(connect)))
+    }
+
     /// Gives `remote`, a holder's shared remote ([`Self::serving_remote`]), this context's
-    /// connection, or its connect under way, where `remote` failed or never connected: a holder
-    /// whose own connect failed, as a remount before the network is up does, reaches the remote
-    /// again through the next command that does. Takes no lock another holds.
+    /// connection, or its connect under way, where `remote` failed, went stale or never
+    /// connected: a holder whose own connect failed, as a remount before the network is up does,
+    /// reaches the remote again through the next command that does. Takes no lock another holds.
     #[cfg(target_os = "linux")]
     pub(crate) fn repair_shared_remote(&self, remote: &SharedRemote) {
         if Arc::ptr_eq(&self.remote, remote) {
@@ -1081,7 +1141,7 @@ impl RepositoryContext {
         let Ok(mut shared) = remote.try_write() else {
             return;
         };
-        if !matches!(*shared, RemoteState::Failed(_) | RemoteState::Offline) {
+        if !(shared.is_lost() || matches!(*shared, RemoteState::Offline)) {
             return;
         }
         let Ok(own) = self.remote.try_read() else {
@@ -1412,10 +1472,12 @@ impl RepositoryContext {
                 .forward::<RepositoryError>("Failed to load repository view")?,
         );
         let context = execution_context();
-        let remote = match connect(id, context.globals(), config, config.identity.clone()) {
-            Ok(future) => RemoteState::Pending(future),
-            Err(error) => RemoteState::from_result(Err(error)),
-        };
+        let remote = RemoteState::connecting(connect(
+            id,
+            context.globals(),
+            config,
+            config.identity.clone(),
+        ));
         let mounted = Self::new_with_state(
             Some(RepositoryPaths::new(
                 root.to_path_buf(),
@@ -1456,7 +1518,7 @@ impl RepositoryContext {
             Ok(remote) => remote.connect_module(id).await,
             Err(err) => Err(err),
         };
-        Arc::new(self.mounted(id, MountKind::Link, remote))
+        Arc::new(self.mounted(id, MountKind::Link, RemoteState::from_result(remote)))
     }
 
     /// This context aimed at the repository a layer draws from, as
@@ -1467,7 +1529,7 @@ impl RepositoryContext {
             Ok(remote) => remote.connect_module(id).await,
             Err(err) => Err(err),
         };
-        Arc::new(self.mounted(id, MountKind::Layer, remote))
+        Arc::new(self.mounted(id, MountKind::Layer, RemoteState::from_result(remote)))
     }
 
     /// This context reading the same repository through `filter`, inheriting everything else as
@@ -1550,31 +1612,8 @@ impl RepositoryContext {
     /// Concurrent callers share a single in-flight connect via the state machine's
     /// `Shared` future. After resolution, the state is promoted so subsequent calls
     /// hit the read-lock fast path.
-    pub async fn remote(&self) -> Result<Arc<Connection>, ProtocolError> {
-        // Fast path: resolved states take only the read lock and return immediately.
-        let fut = match &*self.remote.read().await {
-            RemoteState::Offline => return Err(ProtocolError::from(NoRemote)),
-            RemoteState::Connected(c) => return Ok(c.clone()),
-            RemoteState::Failed(e) => return Err(e.clone()),
-            RemoteState::Pending(fut) => fut.clone(),
-        };
-
-        // Slow path: await the shared future. All concurrent callers awaken together
-        // when it resolves.
-        let result = fut.await;
-
-        // Opportunistically promote to the terminal state so future calls skip the
-        // shared future entirely. Racing writers are harmless — the matches! guard
-        // makes the second write a no-op.
-        let mut guard = self.remote.write().await;
-        if matches!(*guard, RemoteState::Pending(_)) {
-            *guard = match &result {
-                Ok(c) => RemoteState::Connected(c.clone()),
-                Err(ProtocolError::NoRemote(_)) => RemoteState::Offline,
-                Err(e) => RemoteState::Failed(e.clone()),
-            };
-        }
-        result
+    pub fn remote(&self) -> impl Future<Output = Result<Arc<Connection>, ProtocolError>> + '_ {
+        resolve_remote(&self.remote)
     }
 
     /// The storage session pool for this repository under `correlation_id`, resolved once and
@@ -3078,6 +3117,48 @@ fn connect_remote(
     config: &RepositoryConfig,
     identity: Option<String>,
 ) -> Result<RemoteFuture, ProtocolError> {
+    remote_connect(repository, correlation_id, config, identity).map(protocol::shared_connect)
+}
+
+/// The connection `remote` holds, as [`RepositoryContext::remote`] answers it. Only the connect
+/// awaited is promoted, not one armed in its place since.
+async fn resolve_remote(remote: &SharedRemote) -> Result<Arc<Connection>, ProtocolError> {
+    // Fast path: resolved states take only the read lock and return immediately.
+    let fut = match &*remote.read().await {
+        RemoteState::Offline => return Err(ProtocolError::from(NoRemote)),
+        RemoteState::Connected(c) => return Ok(c.clone()),
+        RemoteState::Failed(e) => return Err(e.clone()),
+        RemoteState::Pending(fut) => fut.clone(),
+    };
+
+    // Slow path: await the shared future. All concurrent callers awaken together
+    // when it resolves.
+    let result = fut.clone().await;
+
+    // Opportunistically promote to the terminal state so future calls skip the
+    // shared future entirely. Racing writers are harmless — the guard makes the
+    // second write a no-op.
+    let mut guard = remote.write().await;
+    if matches!(&*guard, RemoteState::Pending(current) if current.ptr_eq(&fut)) {
+        *guard = match &result {
+            Ok(c) => RemoteState::Connected(c.clone()),
+            Err(ProtocolError::NoRemote(_)) => RemoteState::Offline,
+            Err(e) => RemoteState::Failed(e.clone()),
+        };
+    }
+    result
+}
+
+/// The connect [`connect_remote`] runs, not yet started.
+fn remote_connect(
+    repository: RepositoryId,
+    correlation_id: String,
+    config: &RepositoryConfig,
+    identity: Option<String>,
+) -> Result<
+    impl Future<Output = Result<Arc<Connection>, ProtocolError>> + Send + 'static,
+    ProtocolError,
+> {
     let remote_url = config.remote_url.clone();
     remote_url.as_ref().inspect(|url| {
         lore_debug!("Using repository config remote: {url}",);
@@ -3089,7 +3170,7 @@ fn connect_remote(
     let remote_url = remote_url.as_deref().unwrap_or_default().to_string();
     let identity = identity.as_deref().unwrap_or_default().to_string();
 
-    Ok(protocol::shared_connect(async move {
+    Ok(async move {
         let connection =
             protocol::connect(remote_url.as_str(), identity.as_str(), repository).await?;
         // Pre-warm the session pool so it's ready when the command runs
@@ -3097,7 +3178,7 @@ fn connect_remote(
             let _ = connection.session_pool(repository, &correlation_id).await;
         }
         Ok(connection)
-    }))
+    })
 }
 
 pub fn read_id_from_file(path: PathBuf) -> io::Result<RepositoryId> {

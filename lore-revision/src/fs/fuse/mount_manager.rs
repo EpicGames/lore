@@ -967,7 +967,8 @@ impl FuseMountManager {
         });
         match (service, environment) {
             (Some(service), Some(environment)) => {
-                let serving: Arc<dyn Any + Send + Sync> = Arc::new(service.serving(environment));
+                let serving: Arc<dyn Any + Send + Sync> =
+                    Arc::new(service.serving(service.globals().clone(), Some(environment)));
                 LORE_CONTEXT.scope(serving, work).await
             }
             _ => self.in_service_context(work).await,

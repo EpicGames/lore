@@ -10,6 +10,7 @@ from error_types import (
     RepositoryAlreadyExistsError,
     SwfsOutsideServiceError,
 )
+from lore_parsers import parse_jsonl
 from service_util import LORE_SERVICE_ENVIRONMENT
 from test_repository_info import get_instance_id
 
@@ -553,3 +554,26 @@ def test_swfs_commands_in_succession_each_freeze_and_thaw(
         swfs_repo.file_diff("changed.txt")
 
     _repositories_match_files(original_repo, swfs_repo, ["changed.txt"])
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_mount_fetches_what_its_store_evicted(new_lore_repo, lore_service_runner):
+    """A mount the service restores, whose store has evicted what it serves, fetches it
+    from the instance's remote, where it used to serve the files as zeros."""
+    lore_service_runner.start()
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    file_contents = {f"f{i}.txt": os.urandom(256 * 1024) for i in range(8)}
+    original_repo.write_commit_push("first", file_contents)
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.set_store_caps(max_size="100", max_capacity="100")
+    lore_service_runner.terminate()
+    lore_service_runner.start()
+
+    gc_output = swfs_repo.repository_gc(json=True, offline=True)
+    evicted = parse_jsonl(gc_output, "evictionEnd")
+    assert evicted and evicted[0]["totalEvicted"] >= len(file_contents), gc_output
+
+    _repositories_match_files(original_repo, swfs_repo, list(file_contents))
+    swfs_repo.status()
