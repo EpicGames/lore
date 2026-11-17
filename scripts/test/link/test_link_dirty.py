@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
+import os
+
 import pytest
 from error_types import NotSupportedError
 from link_helpers import (
@@ -7,6 +9,7 @@ from link_helpers import (
     DEFAULT_PARENT_FILE,
     MAX_LINK_DEPTH,
     build_link_chain,
+    build_nested_link_repos_at,
     committed_link_pin,
     link_pin,
     make_parent_with_link,
@@ -168,6 +171,41 @@ def test_link_dirty_markers_survive_a_commit_and_a_branch_switch(new_lore_repo):
     assert all(staged[path].get("flagStaged") is True for path in linked_files), (
         f"Expected staging the directory above the mount to stage them, got: {staged}"
     )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("nested", [False, True])
+def test_link_commit_of_a_directory_replacing_a_file_marked_deleted(new_lore_repo, nested):
+    """A file in a link, or in a link inside a link, replaced by a directory, marked dirty and the
+    directory staged, commits as the directory alone, after which status is clean: the linked
+    repository's revision holds one node at the name, which an instance of that repository syncs
+    as a directory."""
+    if nested:
+        parent_repo, _, linked_repo, _, mount = build_nested_link_repos_at(
+            new_lore_repo, "vendor/b", "inner/c"
+        )
+        name = "c-data/inner.txt"
+    else:
+        parent_repo, linked_repo = make_parent_with_link(
+            new_lore_repo, link_files={"replaced.txt": "file\n"}
+        )
+        mount, name = DEFAULT_LINK_MOUNT, "replaced.txt"
+    replaced = f"{mount}/{name}"
+
+    parent_repo.remove_file(replaced)
+    parent_repo.make_dirs(replaced)
+    parent_repo.write_files({f"{replaced}/x.txt": b"below\n"})
+    parent_repo.dirty(replaced)
+    parent_repo.stage(replaced)
+    parent_repo.commit("Replaced by a directory", non_interactive=True)
+    parent_repo.push()
+    status = status_by_path(parent_repo)
+    assert status == {}, f"status is clean after the commit, got {status}"
+
+    linked_repo.sync()
+    assert os.path.isdir(os.path.join(linked_repo.path, name))
+    with open(os.path.join(linked_repo.path, name, "x.txt"), "rb") as held:
+        assert held.read() == b"below\n"
 
 
 @pytest.mark.smoke

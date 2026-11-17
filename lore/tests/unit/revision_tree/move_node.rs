@@ -1132,7 +1132,8 @@ async fn move_rejects_a_name_the_destination_already_holds() {
 }
 
 /// A child staged for deletion leaves the revision at the commit that freezes the
-/// tree, so the name it carries until then is not a name to collide with.
+/// tree, so the name it carries until then is not a name to collide with: the commit
+/// records the child's deletion and the move.
 #[tokio::test]
 async fn move_takes_a_name_only_a_deleted_child_holds() {
     let partition = Partition::from([0x6bu8; 16]);
@@ -1141,7 +1142,8 @@ async fn move_takes_a_name_only_a_deleted_child_holds() {
     let destination = seed(handle, ROOT_NODE, "dst", LoreNodeType::Directory).await;
     let occupant = seed(handle, destination, "data.bin", LoreNodeType::File).await;
     let node_id = seed(handle, ROOT_NODE, "data.bin", LoreNodeType::File).await;
-    settle(handle, &[destination, occupant, node_id]).await;
+    set_branch(handle, Context::from(uuid::Uuid::now_v7())).await;
+    run_commit(handle, 1).await;
     run_delete(handle, occupant).await;
 
     let (status, _events) =
@@ -1154,6 +1156,37 @@ async fn move_takes_a_name_only_a_deleted_child_holds() {
         fetch_node_info(handle, node_id).await.parent_id,
         destination,
         "the move must have landed"
+    );
+    run_commit(handle, 2).await;
+
+    let internal = rt_handle::lookup(handle).expect("the handle must resolve");
+    let execution = lore::call::setup_execution(LoreGlobalArgs::default(), None);
+    let actions = lore_base::runtime::LORE_CONTEXT
+        .scope(execution, async move {
+            let state = internal.state_for_tests();
+            let mut actions = Vec::new();
+            for node in [occupant, node_id] {
+                let delta = state
+                    .node_delta(internal.repository_context.clone(), node)
+                    .await
+                    .expect("the published revision must carry a delta");
+                actions.push(delta.map(|delta| delta.action));
+            }
+            actions
+        })
+        .await;
+    assert_eq!(
+        actions,
+        [
+            Some(FileAction::Delete as u16),
+            Some(FileAction::Move as u16)
+        ],
+        "the delta must record the child's deletion and the move"
+    );
+    assert_eq!(
+        children_of(handle, destination).await.len(),
+        1,
+        "the revision holds one child of the name"
     );
     release(handle, store_handle_id);
 }

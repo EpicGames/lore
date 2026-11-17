@@ -1761,13 +1761,7 @@ such file, and a commit the time of each file it stores.
 
 A file becomes marked dirty in one of three ways.
 
-The first is *notification*. A `file dirty` operation marks one or more paths as
-modified, classifying the action from the current filesystem state - modify if the
-file exists and is in the committed revision, add if it exists and is not, delete if
-it is missing but was in the revision. Move and copy variants record their actions
-without filesystem checks: the caller has already decided what happened. A
-notification costs a flag update on the staged anchor and a short walk up to the
-root; nothing else in the tree is touched.
+The first is *notification*. A `file dirty` operation marks one or more paths as modified, classifying the action from the current filesystem state - modify if the file exists and is in the committed revision, add if it exists and is not, delete if it is missing but was in the revision. Move and copy variants record their actions without filesystem checks: the caller has already decided what happened. A move onto a path another node holds marks that node deleted, or stages its deletion where it holds a staged change, as a staged move does. Marking a path costs a flag update on the staged anchor and a short walk up to the root, and a directory moved or replaced marks what it holds as well.
 
 The second is *scanning*. A status scan walks the working tree, compares each file
 against the committed revision, and updates the dirty set inline - marking modified
@@ -1839,7 +1833,7 @@ in the next revision." Second, it does *not* freeze the content. Between staging
 committing, the user can keep editing the file, and committing picks up whatever the
 file looks like at that moment - not whatever it looked like when it was staged.
 
-The commit takes what the working tree holds at a staged path: a staged node the working tree no longer holds, or holds a node of the other kind at, is committed as deleted, a directory with everything below it, and one staged as added is left out. A directory holding what the view excludes or a link's mount stays, as their absence from the working tree is no deletion. A node staged as moved that the working tree holds at its committed path again stays there as committed instead, a directory whatever it holds, and what was added in such a directory stays marked as added. A directory whose move or add is marked dirty takes it staged once something below it is staged.
+The commit takes what the working tree holds at a staged path: a staged node the working tree no longer holds, or holds a node of the other kind at, is committed as deleted, a directory with everything below it, and one staged as added is left out. A directory holding what the view excludes or a link's mount stays, as their absence from the working tree is no deletion. A node staged as moved that the working tree holds at its committed path again stays there as committed instead, a directory whatever it holds, and what was added in such a directory stays marked as added. A directory whose move or add is marked dirty takes it staged once something below it is staged. In a staged directory, an unstaged child marked dirty as deleted that shares its name with a staged child is committed as deleted with what it holds, as a revision holds one node of a name.
 
 This matches how iteration actually works. A developer stages a file, keeps editing,
 runs tests, fixes, and commits. Committing captures the latest state of the staged

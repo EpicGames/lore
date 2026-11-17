@@ -731,9 +731,14 @@ impl ChainWalk {
 }
 
 /// What [`State::find_subnode_in`] answers for the node it found, given whether that node is
-/// staged for deletion.
-trait FoundSubnode {
+/// staged for deletion, and where it finds none.
+trait FoundSubnode: Sized {
     fn found(node: NodeID, deleted: bool) -> Self;
+
+    /// The answer where the parent holds no node of the name or cannot take children.
+    fn absent() -> Result<Self, StateError> {
+        Err(NodeNotFound.into())
+    }
 }
 
 impl FoundSubnode for NodeID {
@@ -745,6 +750,16 @@ impl FoundSubnode for NodeID {
 impl FoundSubnode for (NodeID, bool) {
     fn found(node: NodeID, deleted: bool) -> Self {
         (node, deleted)
+    }
+}
+
+impl FoundSubnode for Option<(NodeID, bool)> {
+    fn found(node: NodeID, deleted: bool) -> Self {
+        Some((node, deleted))
+    }
+
+    fn absent() -> Result<Self, StateError> {
+        Ok(None)
     }
 }
 
@@ -3907,6 +3922,22 @@ impl State {
             .is_some_and(|(node, _)| !node.is_discarded() && node.node_type() == node_type))
     }
 
+    /// The record of the live node of `node_type` this tree holds at `id`, as [`Self::holds_node`]
+    /// answers whether it holds one. That one reads the slot itself rather than await this, which
+    /// would grow its future and its callers'.
+    pub(crate) async fn held_node(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        id: NodeID,
+        node_type: crate::interface::LoreNodeType,
+    ) -> Result<Option<Node>, StateError> {
+        Ok(self
+            .node_in_use(repository, id)
+            .await?
+            .map(|(node, _)| node)
+            .filter(|node| !node.is_discarded() && node.node_type() == node_type))
+    }
+
     /// The record this tree holds at `id`, with its block; `None` where the slot holds no node.
     async fn node_in_use(
         &self,
@@ -3942,6 +3973,9 @@ impl State {
     /// staged node holding the name, or a parent that is no live directory, keeps the node out for
     /// good ([`Return::Displaced`]). A node staged for deletion holds no name: the node goes back
     /// beside it.
+    ///
+    /// Where `options` asks for it, the node goes back beside a node holding the name, staged or not,
+    /// for the caller to mark it deleted there.
     ///
     /// A caller that parks asks of a node that holds no staged node, once it has asked of every
     /// node below it. Each of those then stands under the directory `base` holds it in, is no node
@@ -4014,8 +4048,7 @@ impl State {
         let moved = (id, parent, is_directory);
         let name = renamed.then_some(name);
         let returned =
-            Box::pin(self.node_return_to(repository, moved, committed, (name, options.park)))
-                .await?;
+            Box::pin(self.node_return_to(repository, moved, committed, (name, options))).await?;
         Ok((returned, path))
     }
 
@@ -4045,7 +4078,8 @@ impl State {
     }
 
     /// Moves `node` to the directory `parent`, renamed to `name` where one is given, or parks it
-    /// there where `park` allows, as [`Self::node_return_unstaged_move`] describes. `from` is the
+    /// there, or puts it beside a node holding the name, where `options` asks for it, as
+    /// [`Self::node_return_unstaged_move`] describes. `from` is the
     /// directory that holds the node now, `is_directory` whether the node is one, and `name_hash`
     /// the hash of the name it takes.
     ///
@@ -4058,8 +4092,9 @@ impl State {
         repository: &Arc<RepositoryContext>,
         (node, from, is_directory): (NodeID, NodeID, bool),
         (parent, name_hash): (NodeID, u64),
-        (name, park): (Option<&str>, bool),
+        (name, options): (Option<&str>, ReturnOptions),
     ) -> Result<Return, StateError> {
+        let park = options.park;
         if !self.is_live_directory(repository, parent).await? {
             return Ok(Return::Displaced);
         }
@@ -4076,13 +4111,17 @@ impl State {
                 "A move marked dirty would return into its own subtree",
             ));
         }
-        let holder = match self
-            .find_live_subnode(repository.clone(), parent, name_hash)
-            .await
-        {
-            Ok((holder, deleted)) => (holder != node && !deleted).then_some(holder),
-            Err(error) if error.is_node_not_found() => None,
-            Err(error) => return Err(error),
+        let holder = if options.beside {
+            None
+        } else {
+            match self
+                .find_live_subnode(repository.clone(), parent, name_hash)
+                .await
+            {
+                Ok((holder, deleted)) => (holder != node && !deleted).then_some(holder),
+                Err(error) if error.is_node_not_found() => None,
+                Err(error) => return Err(error),
+            }
         };
         if let Some(holder) = holder {
             let (staged, added_file) = {
@@ -5292,10 +5331,11 @@ impl State {
         self.find_subnode_in::<false, NodeID>(repository, parent_node, name_hash)
     }
 
-    /// [`Self::find_subnode`], preferring a node not staged for deletion where the directory holds
-    /// two of the name, as it does while a new node of the name stands beside one staged for
-    /// deletion until a commit drops that one. Answers the node staged for deletion where it holds
-    /// no other, with whether the node it answers is staged for deletion.
+    /// [`Self::find_subnode`], preferring a node not marked deleted, staged or dirty, where the
+    /// directory holds two of the name, as it does while a new node of the name stands beside a
+    /// deleted one until a commit drops that one. Where it holds no other, answers a node only
+    /// marked dirty as deleted before one staged for deletion, with whether the node it answers is
+    /// staged for deletion.
     pub fn find_live_subnode(
         &self,
         repository: Arc<RepositoryContext>,
@@ -5305,10 +5345,21 @@ impl State {
         self.find_subnode_in::<true, (NodeID, bool)>(repository, parent_node, name_hash)
     }
 
+    /// [`Self::find_live_subnode`], answering `None` where that answers [`NodeNotFound`], which
+    /// allocates.
+    pub fn find_live_subnode_if_present(
+        &self,
+        repository: Arc<RepositoryContext>,
+        parent_node: NodeID,
+        name_hash: u64,
+    ) -> impl Future<Output = Result<Option<(NodeID, bool)>, StateError>> + Send + '_ {
+        self.find_subnode_in::<true, Option<(NodeID, bool)>>(repository, parent_node, name_hash)
+    }
+
     /// The find of [`Self::find_subnode`]: the parent's block loaded, its head read with its
-    /// chain change count, and its chain walked; past a node staged for deletion where `LIVE`, a
-    /// parameter so the plain find carries no test of it. Answers `T`, so a caller that takes the
-    /// node alone holds no wrapper of the future.
+    /// chain change count, and its chain walked; past a deleted node where `LIVE`, a parameter so
+    /// the plain find carries no test of it. Answers `T`, so a caller that takes the node alone
+    /// holds no wrapper of the future.
     async fn find_subnode_in<const LIVE: bool, T: FoundSubnode>(
         &self,
         repository: Arc<RepositoryContext>,
@@ -5321,18 +5372,18 @@ impl State {
         let mut search = {
             let (parent, changes) = block.node_with_chain_changes(Node::index(parent_node));
             if !parent.is_directory() {
-                return Err(NodeNotFound.into());
+                return T::absent();
             }
             NameSearch::new(parent_node, &parent, block.clone(), changes, name_hash)
         };
         let mut iblock = NodeBlock::index(parent_node);
-        let mut deleted = INVALID_NODE;
+        let (mut deleted, mut staged_delete) = (INVALID_NODE, false);
         loop {
             let Some(node_id) = search.next(self)? else {
                 return if deleted == INVALID_NODE {
-                    Err(NodeNotFound.into())
+                    T::absent()
                 } else {
-                    Ok(T::found(deleted, true))
+                    Ok(T::found(deleted, staged_delete))
                 };
             };
             #[cfg(feature = "state-hooks")]
@@ -5343,21 +5394,21 @@ impl State {
             }
             let node = *block.read().node(Node::index(node_id));
             if search.found(node_id, &node)? {
-                if !LIVE || !node.is_staged_delete() {
+                if !LIVE || !node.is_deleted() {
                     return Ok(T::found(node_id, false));
                 }
-                if deleted == INVALID_NODE {
-                    deleted = node_id;
+                if deleted == INVALID_NODE || (staged_delete && !node.is_staged_delete()) {
+                    (deleted, staged_delete) = (node_id, node.is_staged_delete());
                 }
                 search.pass(&node);
             }
         }
     }
 
-    /// `found`, a child of a directory a listing answered for a name, or, where it is staged for
-    /// deletion, the first other of `carrying`, the children the listing holds carrying that name's
-    /// hash in sibling order, that is not, as [`Self::find_live_subnode`] prefers one. Reads a node
-    /// only where the listing holds two such children.
+    /// `found`, a child of a directory a listing answered for a name, or, where it is marked
+    /// deleted, the other of `carrying`, the children the listing holds carrying that name's hash
+    /// in sibling order, that [`Self::find_live_subnode`] prefers. Reads a node only where the
+    /// listing holds two such children.
     pub(crate) async fn live_among(
         &self,
         repository: &Arc<RepositoryContext>,
@@ -5367,24 +5418,27 @@ impl State {
         if !found.is_valid_node_id() || carrying.clone().nth(1).is_none() {
             return Ok(found);
         }
-        if !self
-            .node(repository.clone(), found)
-            .await?
-            .is_staged_delete()
-        {
+        let (first_deleted, first_staged_delete) = {
+            let first = self.node(repository.clone(), found).await?;
+            (first.is_deleted(), first.is_staged_delete())
+        };
+        if !first_deleted {
             return Ok(found);
         }
+        let (mut deleted, mut staged_delete) = (found, first_staged_delete);
         for child in carrying {
-            if child != found
-                && !self
-                    .node(repository.clone(), child)
-                    .await?
-                    .is_staged_delete()
-            {
+            if child == found {
+                continue;
+            }
+            let node = self.node(repository.clone(), child).await?;
+            if !node.is_deleted() {
                 return Ok(child);
             }
+            if staged_delete && !node.is_staged_delete() {
+                (deleted, staged_delete) = (child, false);
+            }
         }
-        Ok(found)
+        Ok(deleted)
     }
 
     /// [`Self::find_subnode`] through blocks in memory only, for a request that reads nothing
@@ -5563,7 +5617,7 @@ impl State {
     /// Where a walk of `path` below `root` stops: at its end, at the first link it crosses, or
     /// at a link it ends at where `ends_at_links` says, or at the deepest node it reaches where
     /// the tree holds nothing at the next component or the component is a name no node may
-    /// carry. Each component prefers a node not staged for deletion beside one that is
+    /// carry. Each component prefers a node not marked deleted beside one that is
     /// ([`Self::find_live_subnode`]): one below goes on under the live directory, and a path names
     /// the live node. Where not `LIVE`, the last component stops at the first node of its name, for
     /// a caller that asks only whether the path is held, as that search ends at a deleted node.
@@ -6928,6 +6982,9 @@ pub(crate) struct ReturnOptions {
     /// Parks the node by a name of its own ([`Return::Parked`]), rather than leave it where it
     /// stands ([`Return::Held`]).
     pub(crate) park: bool,
+    /// Moves the node back where a node holds its name too, staged or not, for a caller that marks
+    /// it deleted there beside that node ([`Return::Back`]).
+    pub(crate) beside: bool,
 }
 
 /// The name a node waits under while another node holds its own, which its ID spells, so no other
@@ -7042,6 +7099,13 @@ pub(crate) trait DirtyPathSink: Send {
     /// Records `node`, `id`, found at `path`, in a tree the walk reached through a link where
     /// `linked` says so.
     fn record(&mut self, path: &RelativePathBuf, id: NodeID, node: &Node, linked: bool);
+
+    /// Notes `node`, `id`, a new directory whose children carry it, which the walk records no path
+    /// of ([`marked_directory_carried_by_children`]), in a tree the walk reached through a link
+    /// where `linked` says so. Nothing by default.
+    fn carried_by_children(&mut self, id: NodeID, node: &Node, linked: bool) {
+        let _ = (id, node, linked);
+    }
 }
 
 impl DirtyPathSink for Vec<RelativePath> {
@@ -7315,6 +7379,8 @@ async fn collect_dirty_paths_linked<S: DirtyPathSink>(
         if !excluded {
             if contributes {
                 paths.record(parent_path, child_id, &child, link_depth > 0);
+            } else if marked_directory_carried_by_children(&child) {
+                paths.carried_by_children(child_id, &child, link_depth > 0);
             }
 
             if descends {

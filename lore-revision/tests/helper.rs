@@ -553,14 +553,31 @@ pub async fn test_status_files_at(
     paths: Option<Vec<lore_revision::util::path::RelativePath>>,
     scan: bool,
 ) -> std::collections::BTreeMap<String, (lore_revision::interface::LoreFileAction, bool)> {
-    let files = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    test_status_events_at(repository, paths, scan)
+        .await
+        .into_iter()
+        .map(|(path, action, dirty)| (path, (action, dirty)))
+        .collect()
+}
+
+/// Each change `status` reports of `paths`, or of the whole repository for `None`, in the order it
+/// reports them, two of one path among them: its path, its action and whether it is dirty. `scan`
+/// asks for `--scan`.
+#[allow(dead_code)]
+pub async fn test_status_events_at(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    paths: Option<Vec<lore_revision::util::path::RelativePath>>,
+    scan: bool,
+) -> Vec<(String, lore_revision::interface::LoreFileAction, bool)> {
+    let files = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured = files.clone();
     let callback: lore_revision::interface::LoreEventCallback = Some(Box::new(move |event| {
         if let lore_revision::event::LoreEvent::RepositoryStatusFile(data) = event {
-            captured.lock().expect("status files").insert(
+            captured.lock().expect("status files").push((
                 data.path.as_str().to_string(),
-                (data.action, data.flag_dirty != 0),
-            );
+                data.action,
+                data.flag_dirty != 0,
+            ));
         }
     }));
     let execution = std::sync::Arc::new(
@@ -590,7 +607,7 @@ pub async fn test_status_files_at(
         .await
         .expect("status");
     execution.dispatcher.drain().await;
-    files.lock().expect("status files").clone()
+    std::mem::take(&mut *files.lock().expect("status files"))
 }
 
 /// Each path's action in `reported`, as status lists it.

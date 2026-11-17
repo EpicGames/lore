@@ -1521,11 +1521,12 @@ fn staging_ignores_name(name: &str) -> bool {
 /// The index in `node_list` of the child an entry named `name_hash` claims, `None` where the
 /// directory holds none.
 ///
-/// Two children can share a folded name: a staged replacement sits beside the node it
-/// displaced, and two spellings of one name can both be committed. A staging walk claims one
-/// child per entry and prefers one not staged for delete, so a replacement is not replaced
-/// again; only a run of more than one child is read to decide. Every other intent reports
-/// against whichever the search reached, as it has.
+/// Two children can share a folded name: a replacement sits beside the node it displaced, marked
+/// deleted, staged or dirty, and two spellings of one name can both be committed. From a run of
+/// more than one child, every walk takes the first not yet claimed and not marked deleted, so an
+/// entry pairs with the live node and a replacement is not replaced again, or else the first not
+/// yet claimed; only such a run is read. A staging walk claims one child per entry; every other
+/// walk takes the child the search reached where the run is one child or each of it is claimed.
 async fn claim_named_child(
     node_list: &StateChildrenNodes,
     claimed: &[bool],
@@ -1536,9 +1537,6 @@ async fn claim_named_child(
     let Ok(found) = children.binary_search_by(|child| child.name.cmp(&name_hash)) else {
         return Ok(None);
     };
-    if !staging {
-        return Ok(Some(found));
-    }
 
     let mut start = found;
     while start > 0 && children[start - 1].name == name_hash {
@@ -1549,7 +1547,7 @@ async fn claim_named_child(
         end += 1;
     }
     if end - start == 1 {
-        return Ok((!claimed[start]).then_some(start));
+        return Ok((!staging || !claimed[start]).then_some(start));
     }
 
     let mut displaced = None;
@@ -1561,12 +1559,12 @@ async fn claim_named_child(
             .state
             .node(node_list.repository.clone(), children[index].node)
             .await?;
-        if !node.is_staged_delete() {
+        if !node.is_deleted() {
             return Ok(Some(index));
         }
         displaced = displaced.or(Some(index));
     }
-    Ok(displaced)
+    Ok(displaced.or((!staging).then_some(found)))
 }
 
 /// Whether the tree and the file system agree on the type at a path. A type change replaces
@@ -1839,7 +1837,13 @@ async fn diff_filesystem_directory_walk(
             // add — the file's presence on disk is the add. Comparing the
             // filesystem hash against the staged node's zero address would
             // misclassify, so emit Add+Dirty directly and skip the compare.
-            if ctx.intent.marks_dirty() && !current_node_id.is_valid_node_id() {
+            // A node `lore dirty move` moved onto a name state_current holds
+            // by another node, its move not staged, is a dirty-move
+            // destination all the same.
+            let moved_here = from_node.is_dirty_move()
+                && !from_node.is_staged()
+                && current_node_id != from_named_node.node;
+            if ctx.intent.marks_dirty() && (!current_node_id.is_valid_node_id() || moved_here) {
                 emit_unstaged_add(
                     node_list.repository.clone(),
                     node_list.state.clone(),

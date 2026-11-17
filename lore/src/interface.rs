@@ -2892,7 +2892,15 @@ pub type LoreFileDirtyMoveArgs = crate::file::LoreFileDirtyMoveArgs;
 ///
 /// Updates the source node's parent/name and flags it with `DirtyMove`, propagating
 /// `Dirty` to both the old and new parent directories. For directories, the move
-/// is propagated recursively to children. No filesystem access is performed.
+/// is propagated recursively to children. The destination path then names the moved
+/// node. A node the destination held is marked deleted, at the destination, or at its
+/// committed path where a dirty move had put it at the destination; one holding a staged
+/// change is staged for deletion. A destination that is a link's mount fails with
+/// `NotSupported`. A move onto a directory a dirty move put there whose committed directory
+/// now lies inside it, or onto a node one put there whose committed directory is gone, or onto
+/// a directory only marked added holding a node whose committed path another unstaged node
+/// holds, fails with an internal error, the staged state unchanged; `lore_file_stage_move`
+/// takes such a move. No filesystem access is performed.
 ///
 /// # Events
 ///
@@ -2908,6 +2916,16 @@ pub type LoreFileDirtyMoveArgs = crate::file::LoreFileDirtyMoveArgs;
 /// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+///
+/// ## File Events
+///
+/// Emitted only where the node the destination held holds a staged change:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_FILE_STAGE_BEGIN` | `lore_file_stage_begin_event_data_t` | Emitted when the staging of its deletion begins |
+/// | `LORE_EVENT_FILE_STAGE_FILE` | `lore_file_stage_file_event_data_t` | Emitted for each file of it staged for deletion |
+/// | `LORE_EVENT_FILE_STAGE_END` | `lore_file_stage_end_event_data_t` | Emitted when the staging of its deletion completes |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_file_dirty_move(
     globals: &LoreGlobalArgs,
@@ -2933,6 +2951,16 @@ pub extern "C" fn lore_file_dirty_move(
 /// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+///
+/// ## File Events
+///
+/// Emitted only where the node the destination held holds a staged change:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_FILE_STAGE_BEGIN` | `lore_file_stage_begin_event_data_t` | Emitted when the staging of its deletion begins |
+/// | `LORE_EVENT_FILE_STAGE_FILE` | `lore_file_stage_file_event_data_t` | Emitted for each file of it staged for deletion |
+/// | `LORE_EVENT_FILE_STAGE_END` | `lore_file_stage_end_event_data_t` | Emitted when the staging of its deletion completes |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_file_dirty_move_async(
     globals: &LoreGlobalArgs,

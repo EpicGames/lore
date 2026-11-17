@@ -1257,6 +1257,64 @@ async fn a_find_through_blocks_in_memory_counts_its_steps() {
     );
 }
 
+/// `find`'s answer, with the allocations it makes on this thread.
+async fn counting_allocations<T>(find: impl std::future::Future<Output = T>) -> (T, u64) {
+    struct StopCounting;
+    impl Drop for StopCounting {
+        fn drop(&mut self) {
+            lore_base::allocator::set_allocation_counting(false);
+        }
+    }
+    lore_base::allocator::set_allocation_counting(true);
+    let _stop = StopCounting;
+    let before = lore_base::allocator::thread_allocation_count();
+    let answer = find.await;
+    (
+        answer,
+        lore_base::allocator::thread_allocation_count() - before,
+    )
+}
+
+/// [`State::find_live_subnode_if_present`] answers `None`, allocating nothing, where
+/// [`State::find_live_subnode`] answers `NodeNotFound`: a name the directory does not hold, and a
+/// name below a file. It answers a name the directory holds as that does.
+#[tokio::test]
+async fn a_live_find_answers_an_absent_name_without_allocating() {
+    with_state(|repository, state| async move {
+        let dir = add(&state, &repository, ROOT_NODE, directory("dir"), "dir").await;
+        let f = add(&state, &repository, dir, file("f"), "f").await;
+        for (parent, name) in [(dir, "missing"), (f, "x")] {
+            let name_hash = hash::hash_string(name);
+            assert!(
+                state
+                    .find_live_subnode(repository.clone(), parent, name_hash)
+                    .await
+                    .is_err_and(|error| error.is_node_not_found()),
+                "{name}: the find answers NodeNotFound"
+            );
+            let (found, allocations) = counting_allocations(state.find_live_subnode_if_present(
+                repository.clone(),
+                parent,
+                name_hash,
+            ))
+            .await;
+            assert_eq!(
+                (found.expect("the find"), allocations),
+                (None, 0),
+                "{name}: (answer, allocations)"
+            );
+        }
+        assert_eq!(
+            state
+                .find_live_subnode_if_present(repository.clone(), dir, hash::hash_string("f"))
+                .await
+                .expect("the find"),
+            Some((f, false))
+        );
+    })
+    .await;
+}
+
 /// Serializing a State that takes new nodes from fresh blocks panics in a debug build.
 #[cfg(debug_assertions)]
 #[tokio::test]

@@ -29,8 +29,8 @@ use crate::util::path::RelativePath;
 
 /// The node at `path`, refused as not supported where `path` is in a link, whose node belongs to
 /// the linked repository's tree rather than this one, or names a link's mount, and
-/// `NodeNotFound` where the tree holds nothing at `path`. Each component prefers a node not staged
-/// for deletion beside one that is ([`State::find_to_link`]).
+/// `NodeNotFound` where the tree holds nothing at `path`. Each component prefers a node not marked
+/// deleted beside one that is ([`State::find_to_link`]).
 pub(crate) async fn node_outside_links(
     state: &State,
     repository: &Arc<RepositoryContext>,

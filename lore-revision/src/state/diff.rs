@@ -922,9 +922,9 @@ fn diff_subtree_node_walk(
 
 /// How far past `to_index` the to child that is `from_named_node`'s own node stands among the to
 /// children from there that carry its name, 0 where none does. A to tree holds a name twice where a
-/// node it adds stands beside the node of the other kind it replaces, which is the from side's
-/// node: the from node pairs with itself, deleted, and the added one is reported on its own,
-/// whatever order the sort left them in.
+/// node it adds or moves there stands beside the node it replaces, which is the from side's node:
+/// the from node pairs with itself, deleted, and the other is reported on its own, whatever order
+/// the sort left them in.
 fn same_node_offset(
     to_nodes: &StateChildrenNodes,
     to_index: usize,
@@ -1929,23 +1929,20 @@ async fn find_sorted_children(
             }))
         };
 
-        let from_nodes = from_nodes.await;
-        let to_nodes = to_nodes.await;
-
-        (
-            from_nodes
-                .internal("Task failure")
-                .map_err(StateError::from)??,
-            to_nodes
-                .internal("Task failure")
-                .map_err(StateError::from)??,
-            false,
-        )
+        let from_nodes = from_nodes
+            .await
+            .internal("Task failure")
+            .map_err(StateError::from)??;
+        let to_nodes = to_nodes
+            .await
+            .internal("Task failure")
+            .map_err(StateError::from)??;
+        (from_nodes, to_nodes, false)
     })
 }
 
-/// Orders each run of children sharing a name so the live ones precede those staged for
-/// delete, so a name the to side holds pairs with a live node where the from side holds both.
+/// Orders each run of children sharing a name so the live ones precede those marked deleted, so a
+/// name the to side holds pairs with a live node where the from side holds both.
 async fn live_before_deleted(nodes: &mut StateChildrenNodes) -> Result<(), StateError> {
     let mut start = 0;
     while start < nodes.children.len() {
@@ -1962,7 +1959,7 @@ async fn live_before_deleted(nodes: &mut StateChildrenNodes) -> Result<(), State
                     .state
                     .node(nodes.repository.clone(), child.node)
                     .await?;
-                run.push((node.is_staged_delete(), *child));
+                run.push((node.is_deleted(), *child));
             }
             run.sort_by_key(|(deleted, _)| *deleted);
             for (slot, (_, child)) in nodes.children[start..end].iter_mut().zip(run) {

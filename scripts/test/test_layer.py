@@ -229,6 +229,31 @@ def test_layer_stage_status_commit(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_layer_commit_of_a_directory_replacing_a_file_marked_deleted(new_lore_repo):
+    """A file in a layer replaced by a directory, marked dirty and the directory staged, commits as
+    the directory alone, after which status is clean: the layer's revision holds one node at the
+    name, which an instance of the layer repository syncs as a directory."""
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    replaced = os.path.join(repo.path, LAYER_FILE)
+    os.remove(replaced)
+    os.makedirs(replaced)
+    with open(os.path.join(replaced, "x.txt"), "wb") as out:
+        out.write(b"below")
+    repo.dirty(LAYER_FILE)
+    repo.stage(LAYER_FILE)
+    repo.commit("Replaced by a directory")
+    repo.push()
+    status = parse_status_json(repo.status(json=True))
+    assert status == [], f"status is clean after the commit, got {status}"
+
+    layer_repo.sync()
+    assert os.path.isdir(os.path.join(layer_repo.path, LAYER_FILE))
+    with open(os.path.join(layer_repo.path, LAYER_FILE, "x.txt"), "rb") as held:
+        assert held.read() == b"below"
+
+
+@pytest.mark.smoke
 def test_layer_branch_create(new_lore_repo):
     """
     An repo repository with layers can have branches created

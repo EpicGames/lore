@@ -26,11 +26,13 @@ use async_trait::async_trait;
 use lore_base::log::LoreLogLevel;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Hash;
+use lore_revision::change::FileAction;
 use lore_revision::commit::CommitOptions;
 use lore_revision::event::LoreEvent;
 use lore_revision::file::dirty::MovedNode;
 use lore_revision::file::dirty::SEARCHED_CHILDREN;
 use lore_revision::file::dirty::mark_moved_again;
+use lore_revision::file::dirty::warn_moves_not_kept;
 use lore_revision::fs::filesystem_provider::FilesystemProvider;
 use lore_revision::fs::filesystem_provider::FsError;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
@@ -43,15 +45,22 @@ use lore_revision::interface::LoreEventCallback;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::interface::LoreNodeType;
 use lore_revision::interface::LoreString;
+use lore_revision::node::INVALID_NODE;
+use lore_revision::node::Node;
+use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
 use lore_revision::node::NodeIDExt;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::relay::EventDispatcher;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::Ext;
+use lore_revision::state::Mark;
+use lore_revision::state::NameChange;
 use lore_revision::state::State;
 use parking_lot::Mutex;
 
 use crate::dirty_move_fixture::assert_addresses;
+use crate::dirty_move_fixture::assert_no_change_marked;
 use crate::dirty_move_fixture::chained;
 use crate::dirty_move_fixture::children_named;
 use crate::dirty_move_fixture::committed;
@@ -63,10 +72,14 @@ use crate::dirty_move_fixture::node_at;
 use crate::dirty_move_fixture::node_id_at;
 use crate::dirty_move_fixture::node_of;
 use crate::dirty_move_fixture::removed_directory;
+use crate::dirty_move_fixture::rename;
 use crate::dirty_move_fixture::restaged;
+use crate::dirty_move_fixture::scanned;
 use crate::dirty_move_fixture::stage_path;
 use crate::dirty_move_fixture::staged_moved;
 use crate::dirty_move_fixture::staged_tree;
+use crate::dirty_move_fixture::status_and_marks;
+use crate::dirty_move_fixture::status_changes;
 use crate::dirty_move_fixture::tree_paths;
 use crate::dirty_move_fixture::with_instance;
 use crate::dirty_move_fixture::written;
@@ -171,25 +184,6 @@ async fn assert_nothing_dirty(instance: &TestRepository) {
             .await
             .expect("the root's children");
         assert!(!dirty, "the staged tree holds dirty marks");
-    }
-}
-
-/// Asserts that the instance's staged tree, where it holds one, marks no node dirty with an action
-/// besides a move: a node marked moved keeps that mark past a commit that took the move.
-async fn assert_no_change_marked(instance: &TestRepository) {
-    let (_, staged, _) = State::deserialize_current_and_staged(instance.repository.clone())
-        .await
-        .expect("the states");
-    let Some(staged) = staged else {
-        return;
-    };
-    for (path, node) in tree_paths(instance, &staged).await {
-        let node = node_of(instance, &staged, node).await;
-        assert!(
-            !node.is_dirty_add() && !node.is_dirty_modify() && !node.is_dirty_delete(),
-            "{path}: flags {:#x}",
-            node.flags
-        );
     }
 }
 
@@ -910,27 +904,34 @@ async fn marking_moves_again_skips_paths_no_directory_takes() {
                 node: held["y.txt"],
                 node_type: LoreNodeType::File,
                 path: relative_path("f.txt/y.txt"),
+                below_deleted: false,
             },
             MovedNode {
                 node: held["z.txt"],
                 node_type: LoreNodeType::File,
                 path: relative_path("f.txt/sub/z.txt"),
+                below_deleted: false,
             },
             MovedNode {
                 node: a,
                 node_type: LoreNodeType::Directory,
                 path: relative_path(&format!(".lore-returning-{a}/sub/a")),
+                below_deleted: false,
             },
         ];
 
-        let (skipped, warnings) = warnings_of(mark_moved_again(
-            &instance.repository,
-            &first,
-            &staged,
-            &moves,
-        ))
+        let (again, warnings) = warnings_of(async {
+            let again = mark_moved_again(&instance.repository, &first, &staged, &moves, &[]).await;
+            if let Ok(again) = &again {
+                warn_moves_not_kept(&again.skipped);
+            }
+            again
+        })
         .await;
-        assert_eq!(skipped.expect("the marking completes").len(), moves.len());
+        let again = again.expect("the marking completes");
+        assert_eq!(again.skipped.len(), moves.len());
+        assert!(again.replaced.is_empty(), "replaced {:?}", again.replaced);
+        assert!(again.later.is_empty());
         assert_eq!(warnings, 1);
         for path in ["a", "y.txt", "z.txt"] {
             assert_eq!(
@@ -2880,140 +2881,174 @@ async fn lies_ahead(
     at(node) < at(other)
 }
 
-/// A path whose last name a directory holds twice, as a file staged for deletion and one `lore
-/// dirty move` took there and staged edited, names the live node: a lookup answers it, a status of
-/// the path reports it and not the deletion, and an unstage of the path unstages the edit and
-/// leaves the deletion staged. Whichever of the two the chain holds first: a move from another
-/// directory puts the moved file ahead, and a rename in place keeps its place, which `to_front`
-/// sets before the deletion.
-#[tokio::test]
-async fn a_path_whose_last_name_is_held_twice_names_the_live_node() {
-    let orders = Arc::new(Mutex::new(BTreeSet::new()));
-    for (source, front) in [("b", None), ("a/g", Some("a/f")), ("a/g", Some("a/g"))] {
-        let orders = orders.clone();
-        with_instance(|instance| async move {
-            let first = committed(&instance, &["a/f", "a/g", "b", "other.txt"]).await;
-            let held = tree_paths(&instance, &first).await;
-            if let Some(front) = front {
-                to_front(&instance, front).await;
-                without_front(&instance).await;
-            }
-            std::fs::remove_file(instance.path.join("a/f")).expect("the removal on disk");
-            stage_path(&instance, "a/f").await;
-            dirty_moved(&instance, source, "a/f").await;
-            restaged(&instance, "a/f").await;
-            let case = format!("{source} onto a/f, {front:?} at the front");
-
-            let state = staged_tree(&instance).await;
-            let ahead = lies_ahead(&instance, &state, held["a"], (held[source], held["a/f"])).await;
-            orders.lock().insert(ahead);
-            assert_eq!(
-                node_id_at(&instance, &state, "a/f").await,
-                held[source],
-                "{case}: a/f names the live node"
-            );
-            let moved = node_of(&instance, &state, held[source]).await;
-            assert!(
-                moved.is_staged(),
-                "{case}: the edit is staged, flags {:#x}",
-                moved.flags
-            );
-            let reported = lore_revision::state::diff_collect(
-                instance.repository.clone(),
-                first.clone(),
-                instance.repository.clone(),
-                state.clone(),
-                Some(lore_revision::util::path::RelativePath::new_from_clean_parts("a", "f")),
-                lore_revision::filter::FilterMode::CHANGES,
-            )
-            .await
-            .expect("the status of a/f");
-            assert!(
-                !reported.is_empty()
-                    && reported.iter().all(|change| {
-                        change.to.mapping.node == held[source]
-                            && change.action != lore_revision::change::FileAction::Delete
-                    }),
-                "{case}: a status of a/f reports the live node, {:?}",
-                reported
-                    .iter()
-                    .map(|change| (change.action, change.to.mapping.node))
-                    .collect::<Vec<_>>()
-            );
-
-            unstaged(&instance, "a/f").await;
-            let state = staged_tree(&instance).await;
-            let moved = node_of(&instance, &state, held[source]).await;
-            assert!(
-                !moved.is_staged() && moved.is_dirty(),
-                "{case}: the edit is unstaged, flags {:#x}",
-                moved.flags
-            );
-            let deleted = node_of(&instance, &state, held["a/f"]).await;
-            assert!(
-                deleted.is_staged_delete(),
-                "{case}: the deletion stays staged, flags {:#x}",
-                deleted.flags
-            );
-        })
-        .await;
-    }
-    assert_eq!(orders.lock().len(), 2, "both chain orders");
+/// How a test records the deletion of a path the working tree no longer holds.
+#[derive(Clone, Copy, Debug)]
+enum Deletion {
+    /// `lore stage` of the path.
+    Staged,
+    /// `lore dirty` of the path.
+    Dirty,
 }
 
-/// A path whose last name a directory holds twice, as a directory staged for deletion and one
-/// `lore dirty move` took there with an edit in it staged, names the live directory: a lookup
-/// answers it, and an unstage of the path unstages the edit below it and leaves the deletion staged.
-/// Whichever of the two the chain holds first, as `to_front` sets for a rename in place.
+impl Deletion {
+    /// Records the deletion of `path`, below `instance`'s working tree.
+    async fn record(self, instance: &TestRepository, path: &str) {
+        match self {
+            Deletion::Staged => stage_path(instance, path).await,
+            Deletion::Dirty => dirtied(instance, path).await,
+        };
+    }
+
+    /// Whether `node` carries the deletion as recorded.
+    fn holds(self, node: &Node) -> bool {
+        match self {
+            Deletion::Staged => node.is_staged_delete(),
+            Deletion::Dirty => node.is_dirty_delete() && !node.is_staged(),
+        }
+    }
+}
+
+/// A path whose last name a directory holds twice, as a file staged or marked dirty for deletion
+/// and one `lore dirty move` took there and staged edited, names the live node: a lookup answers
+/// it, a status of the path reports it and not the deletion, and an unstage of the path unstages
+/// the edit and leaves the deletion as recorded. Whichever of the two the chain holds first: a move
+/// from another directory puts the moved file ahead, and a rename in place keeps its place, which
+/// `to_front` sets before the deletion.
+#[tokio::test]
+async fn a_path_whose_last_name_is_held_twice_names_the_live_node() {
+    for deletion in [Deletion::Staged, Deletion::Dirty] {
+        let orders = Arc::new(Mutex::new(BTreeSet::new()));
+        for (source, front) in [("b", None), ("a/g", Some("a/f")), ("a/g", Some("a/g"))] {
+            let orders = orders.clone();
+            with_instance(|instance| async move {
+                let first = committed(&instance, &["a/f", "a/g", "b", "other.txt"]).await;
+                let held = tree_paths(&instance, &first).await;
+                if let Some(front) = front {
+                    to_front(&instance, front).await;
+                    without_front(&instance).await;
+                }
+                std::fs::remove_file(instance.path.join("a/f")).expect("the removal on disk");
+                deletion.record(&instance, "a/f").await;
+                dirty_moved(&instance, source, "a/f").await;
+                restaged(&instance, "a/f").await;
+                let case = format!("{deletion:?}, {source} onto a/f, {front:?} at the front");
+
+                let state = staged_tree(&instance).await;
+                let ahead =
+                    lies_ahead(&instance, &state, held["a"], (held[source], held["a/f"])).await;
+                orders.lock().insert(ahead);
+                assert_eq!(
+                    node_id_at(&instance, &state, "a/f").await,
+                    held[source],
+                    "{case}: a/f names the live node"
+                );
+                let moved = node_of(&instance, &state, held[source]).await;
+                assert!(
+                    moved.is_staged(),
+                    "{case}: the edit is staged, flags {:#x}",
+                    moved.flags
+                );
+                let reported = lore_revision::state::diff_collect(
+                    instance.repository.clone(),
+                    first.clone(),
+                    instance.repository.clone(),
+                    state.clone(),
+                    Some(lore_revision::util::path::RelativePath::new_from_clean_parts("a", "f")),
+                    lore_revision::filter::FilterMode::CHANGES,
+                )
+                .await
+                .expect("the status of a/f");
+                assert!(
+                    !reported.is_empty()
+                        && reported.iter().all(|change| {
+                            change.to.mapping.node == held[source]
+                                && change.action != lore_revision::change::FileAction::Delete
+                        }),
+                    "{case}: a status of a/f reports the live node, {:?}",
+                    reported
+                        .iter()
+                        .map(|change| (change.action, change.to.mapping.node))
+                        .collect::<Vec<_>>()
+                );
+
+                unstaged(&instance, "a/f").await;
+                let state = staged_tree(&instance).await;
+                let moved = node_of(&instance, &state, held[source]).await;
+                assert!(
+                    !moved.is_staged() && moved.is_dirty(),
+                    "{case}: the edit is unstaged, flags {:#x}",
+                    moved.flags
+                );
+                let deleted = node_of(&instance, &state, held["a/f"]).await;
+                assert!(
+                    deletion.holds(&deleted),
+                    "{case}: the deletion stays as recorded, flags {:#x}",
+                    deleted.flags
+                );
+            })
+            .await;
+        }
+        assert_eq!(orders.lock().len(), 2, "{deletion:?}: both chain orders");
+    }
+}
+
+/// A path whose last name a directory holds twice, as a directory staged or marked dirty for
+/// deletion and one `lore dirty move` took there with an edit in it staged, names the live
+/// directory: a lookup answers it, and an unstage of the path unstages the edit below it and leaves
+/// the deletion as recorded. Whichever of the two the chain holds first, as `to_front` sets for a
+/// rename in place.
 #[tokio::test]
 async fn a_directory_name_held_twice_names_the_live_directory() {
-    let orders = Arc::new(Mutex::new(BTreeSet::new()));
-    for (source, front) in [("b", None), ("p/c", Some("p/a")), ("p/c", Some("p/c"))] {
-        let orders = orders.clone();
-        with_instance(|instance| async move {
-            let first = committed(
-                &instance,
-                &["p/a/x.txt", "p/c/y.txt", "b/y.txt", "other.txt"],
-            )
-            .await;
-            let held = tree_paths(&instance, &first).await;
-            if let Some(front) = front {
-                to_front(&instance, front).await;
-                without_front(&instance).await;
-            }
-            removed_directory(&instance, "p/a");
-            stage_path(&instance, "p/a").await;
-            dirty_moved(&instance, source, "p/a").await;
-            restaged(&instance, "p/a/y.txt").await;
-            let case = format!("{source} onto p/a, {front:?} at the front");
+    for deletion in [Deletion::Staged, Deletion::Dirty] {
+        let orders = Arc::new(Mutex::new(BTreeSet::new()));
+        for (source, front) in [("b", None), ("p/c", Some("p/a")), ("p/c", Some("p/c"))] {
+            let orders = orders.clone();
+            with_instance(|instance| async move {
+                let first = committed(
+                    &instance,
+                    &["p/a/x.txt", "p/c/y.txt", "b/y.txt", "other.txt"],
+                )
+                .await;
+                let held = tree_paths(&instance, &first).await;
+                if let Some(front) = front {
+                    to_front(&instance, front).await;
+                    without_front(&instance).await;
+                }
+                removed_directory(&instance, "p/a");
+                deletion.record(&instance, "p/a").await;
+                dirty_moved(&instance, source, "p/a").await;
+                restaged(&instance, "p/a/y.txt").await;
+                let case = format!("{deletion:?}, {source} onto p/a, {front:?} at the front");
 
-            let state = staged_tree(&instance).await;
-            let ahead = lies_ahead(&instance, &state, held["p"], (held[source], held["p/a"])).await;
-            orders.lock().insert(ahead);
-            assert_eq!(
-                node_id_at(&instance, &state, "p/a").await,
-                held[source],
-                "{case}: p/a names the live directory"
-            );
-            let edited = held[&format!("{source}/y.txt")];
-            unstaged(&instance, "p/a").await;
-            let state = staged_tree(&instance).await;
-            let file = node_of(&instance, &state, edited).await;
-            assert!(
-                !file.is_staged() && file.is_dirty(),
-                "{case}: the edit is unstaged, flags {:#x}",
-                file.flags
-            );
-            let deleted = node_of(&instance, &state, held["p/a"]).await;
-            assert!(
-                deleted.is_staged_delete(),
-                "{case}: the deletion stays staged, flags {:#x}",
-                deleted.flags
-            );
-        })
-        .await;
+                let state = staged_tree(&instance).await;
+                let ahead =
+                    lies_ahead(&instance, &state, held["p"], (held[source], held["p/a"])).await;
+                orders.lock().insert(ahead);
+                assert_eq!(
+                    node_id_at(&instance, &state, "p/a").await,
+                    held[source],
+                    "{case}: p/a names the live directory"
+                );
+                let edited = held[&format!("{source}/y.txt")];
+                unstaged(&instance, "p/a").await;
+                let state = staged_tree(&instance).await;
+                let file = node_of(&instance, &state, edited).await;
+                assert!(
+                    !file.is_staged() && file.is_dirty(),
+                    "{case}: the edit is unstaged, flags {:#x}",
+                    file.flags
+                );
+                let deleted = node_of(&instance, &state, held["p/a"]).await;
+                assert!(
+                    deletion.holds(&deleted),
+                    "{case}: the deletion stays as recorded, flags {:#x}",
+                    deleted.flags
+                );
+            })
+            .await;
+        }
+        assert_eq!(orders.lock().len(), 2, "{deletion:?}: both chain orders");
     }
-    assert_eq!(orders.lock().len(), 2, "both chain orders");
 }
 
 /// A stage of an edit inside a directory `lore dirty move` renamed onto the name of a directory
@@ -3049,30 +3084,853 @@ async fn a_stage_inside_a_directory_moved_onto_the_name_of_a_deleted_one_stages_
     assert_eq!(orders.lock().len(), 2, "both chain orders");
 }
 
-/// A path through a name a directory staged for deletion and a directory `lore dirty move` renamed
-/// onto it both carry resolves through the live one, whichever of the two its parent lists first.
+/// A path through a name a directory staged or marked dirty for deletion and a directory `lore
+/// dirty move` renamed onto it both carry resolves through the live one, whichever of the two its
+/// parent lists first.
 #[tokio::test]
 async fn a_path_through_a_name_held_twice_resolves_through_the_live_directory() {
+    for deletion in [Deletion::Staged, Deletion::Dirty] {
+        let orders = Arc::new(Mutex::new(BTreeSet::new()));
+        for directories in [["p", "q"], ["q", "p"]] {
+            let orders = orders.clone();
+            with_instance(|instance| async move {
+                let first = committed(&instance, &["p/f", "q/g", "other.txt"]).await;
+                let held = tree_paths(&instance, &first).await;
+                put_first(&instance, directories[0]).await;
+                removed_directory(&instance, "p");
+                deletion.record(&instance, "p").await;
+                let state = dirty_moved(&instance, "q", "p").await;
+                let ahead = lies_ahead(&instance, &state, ROOT_NODE, (held["q"], held["p"])).await;
+                orders.lock().insert(ahead);
+
+                assert_eq!(
+                    node_id_at(&instance, &state, "p/g").await,
+                    held["q/g"],
+                    "{deletion:?}, {directories:?}"
+                );
+            })
+            .await;
+        }
+        assert_eq!(orders.lock().len(), 2, "{deletion:?}: both chain orders");
+    }
+}
+
+/// A status of a name `lore dirty move` took from the node holding it, a committed file the move
+/// marks deleted or a file staged or marked dirty for deletion, reports that file's deletion and
+/// the move, and a scan keeps both marks: whichever of the two the chain holds first.
+#[tokio::test]
+async fn a_status_of_a_name_a_dirty_move_took_reports_the_deletion_and_the_move() {
+    for deletion in [None, Some(Deletion::Dirty), Some(Deletion::Staged)] {
+        let orders = Arc::new(Mutex::new(BTreeSet::new()));
+        for (source, front) in [("b", None), ("a/g", Some("a/f")), ("a/g", Some("a/g"))] {
+            let orders = orders.clone();
+            with_instance(|instance| async move {
+                let first = committed(&instance, &["a/f", "a/g", "b", "other.txt"]).await;
+                let held = tree_paths(&instance, &first).await;
+                if let Some(front) = front {
+                    put_first(&instance, front).await;
+                }
+                if let Some(deletion) = deletion {
+                    std::fs::remove_file(instance.path.join("a/f")).expect("the removal on disk");
+                    deletion.record(&instance, "a/f").await;
+                }
+                let state = dirty_moved(&instance, source, "a/f").await;
+                let case = format!("{deletion:?}, {source} onto a/f, {front:?} at the front");
+                let (replaced, moved) = (held["a/f"], held[source]);
+                let ahead = lies_ahead(&instance, &state, held["a"], (moved, replaced)).await;
+                orders.lock().insert(ahead);
+
+                let expected = BTreeSet::from([
+                    (FileAction::Delete as u16, "a/f".to_string(), replaced),
+                    (FileAction::Move as u16, source.to_string(), moved),
+                ]);
+                assert_eq!(
+                    status_changes(&instance, &first, &state).await,
+                    expected,
+                    "{case}: the status"
+                );
+                scanned(&instance).await;
+                let state = staged_tree(&instance).await;
+                assert_eq!(
+                    status_changes(&instance, &first, &state).await,
+                    expected,
+                    "{case}: the status after a scan"
+                );
+                let deleted = node_of(&instance, &state, replaced).await;
+                assert!(
+                    deletion.unwrap_or(Deletion::Dirty).holds(&deleted),
+                    "{case}: the replaced file, flags {:#x}",
+                    deleted.flags
+                );
+                let moved = node_of(&instance, &state, moved).await;
+                assert!(
+                    moved.is_dirty_move() && !moved.is_staged(),
+                    "{case}: the moved file, flags {:#x}",
+                    moved.flags
+                );
+            })
+            .await;
+        }
+        assert_eq!(orders.lock().len(), 2, "{deletion:?}: both chain orders");
+    }
+}
+
+/// A status of a name `lore dirty move` took from a committed directory with a directory reports the
+/// deletion of the replaced directory, with what it holds, and the move, as a status reports a
+/// directory's move, and a scan keeps both: whichever of the two the chain holds first.
+#[tokio::test]
+async fn a_status_of_a_directory_name_a_dirty_move_took_reports_the_deletion_and_the_move() {
     let orders = Arc::new(Mutex::new(BTreeSet::new()));
-    for directories in [["p", "q"], ["q", "p"]] {
+    for (source, front) in [("b", None), ("a/g", Some("a/f")), ("a/g", Some("a/g"))] {
         let orders = orders.clone();
         with_instance(|instance| async move {
-            let first = committed(&instance, &["p/f", "q/g", "other.txt"]).await;
+            let first = committed(&instance, &["a/f/x", "a/g/y", "b/y", "other.txt"]).await;
             let held = tree_paths(&instance, &first).await;
-            put_first(&instance, directories[0]).await;
-            removed_directory(&instance, "p");
-            stage_path(&instance, "p").await;
-            let state = dirty_moved(&instance, "q", "p").await;
-            let ahead = lies_ahead(&instance, &state, ROOT_NODE, (held["q"], held["p"])).await;
+            if let Some(front) = front {
+                put_first(&instance, front).await;
+            }
+            removed_directory(&instance, "a/f");
+            let state = dirty_moved(&instance, source, "a/f").await;
+            let case = format!("{source} onto a/f, {front:?} at the front");
+            let (replaced, moved) = (held["a/f"], held[source]);
+            let ahead = lies_ahead(&instance, &state, held["a"], (moved, replaced)).await;
             orders.lock().insert(ahead);
 
+            let below = format!("{source}/y");
+            let expected = BTreeSet::from([
+                (FileAction::Delete as u16, "a/f".to_string(), replaced),
+                (FileAction::Delete as u16, "a/f/x".to_string(), INVALID_NODE),
+                (FileAction::Add as u16, "a/f".to_string(), moved),
+                (FileAction::Delete as u16, source.to_string(), INVALID_NODE),
+                (FileAction::Move as u16, below.clone(), held[&below]),
+            ]);
             assert_eq!(
-                node_id_at(&instance, &state, "p/g").await,
-                held["q/g"],
-                "{directories:?}"
+                status_changes(&instance, &first, &state).await,
+                expected,
+                "{case}: the status"
+            );
+            scanned(&instance).await;
+            let state = staged_tree(&instance).await;
+            assert_eq!(
+                status_changes(&instance, &first, &state).await,
+                expected,
+                "{case}: the status after a scan"
             );
         })
         .await;
     }
     assert_eq!(orders.lock().len(), 2, "both chain orders");
+}
+
+/// The action the delta of `revision` records for `node`, `None` where it names none.
+async fn delta_action(instance: &TestRepository, revision: &State, node: NodeID) -> Option<u16> {
+    revision
+        .node_delta(instance.repository.clone(), node)
+        .await
+        .expect("the revision's delta")
+        .map(|delta| delta.action)
+}
+
+/// A commit of a file staged edited, then moved with `lore dirty move` onto a path a committed file
+/// holds, deletes the replaced file and records the move: the revision holds the moved file alone
+/// at the path, with its staged edit, whether the move marked the replaced file deleted or its
+/// deletion was marked dirty or staged before, and whichever of the two the chain holds first.
+#[tokio::test]
+async fn a_commit_of_a_staged_file_dirty_moved_onto_a_committed_name_records_the_deletion_and_the_move()
+ {
+    for deletion in [None, Some(Deletion::Dirty), Some(Deletion::Staged)] {
+        let orders = Arc::new(Mutex::new(BTreeSet::new()));
+        for (source, front) in [("b", None), ("a/g", Some("a/f")), ("a/g", Some("a/g"))] {
+            let orders = orders.clone();
+            with_instance(|instance| async move {
+                let first = committed(&instance, &["a/f", "a/g", "b", "other.txt"]).await;
+                let held = tree_paths(&instance, &first).await;
+                if let Some(front) = front {
+                    put_first(&instance, front).await;
+                }
+                if let Some(deletion) = deletion {
+                    std::fs::remove_file(instance.path.join("a/f")).expect("the removal on disk");
+                    deletion.record(&instance, "a/f").await;
+                }
+                restaged(&instance, source).await;
+                let state = dirty_moved(&instance, source, "a/f").await;
+                let case = format!("{deletion:?}, {source} onto a/f, {front:?} at the front");
+                let (replaced, moved) = (held["a/f"], held[source]);
+                let ahead = lies_ahead(&instance, &state, held["a"], (moved, replaced)).await;
+                orders.lock().insert(ahead);
+
+                let (revision, _) = committed_warning(&instance, "Moved").await;
+                assert_no_change_marked(&instance).await;
+                let mut expected = without(&without(&held, "a/f"), source);
+                expected.insert("a/f".to_string(), moved);
+                assert_revision_holds(&instance, &revision, &expected).await;
+                let file = node_of(&instance, &revision, moved).await;
+                assert!(
+                    file.is_file() && file.size == b"edited".len() as u64,
+                    "{case}: the moved file's kind and content, size {}",
+                    file.size
+                );
+                assert_eq!(
+                    delta_action(&instance, &revision, replaced).await,
+                    Some(FileAction::Delete as u16),
+                    "{case}: the replaced file's delta"
+                );
+                assert_eq!(
+                    delta_action(&instance, &revision, moved).await,
+                    Some(FileAction::Move as u16),
+                    "{case}: the moved file's delta"
+                );
+            })
+            .await;
+        }
+        assert_eq!(orders.lock().len(), 2, "{deletion:?}: both chain orders");
+    }
+}
+
+/// A commit of an edit staged inside a directory `lore dirty move` moved onto a path a committed
+/// directory holds, which stages the directory's whole move, deletes the replaced directory with
+/// what it holds and records the move, whichever of the two the chain holds first.
+#[tokio::test]
+async fn a_commit_inside_a_directory_dirty_moved_onto_a_committed_one_deletes_the_replaced_one() {
+    let orders = Arc::new(Mutex::new(BTreeSet::new()));
+    for directories in [["p", "q"], ["q", "p"]] {
+        let orders = orders.clone();
+        with_instance(|instance| async move {
+            let first = committed(&instance, &["p/f", "q/g", "q/h", "other.txt"]).await;
+            let held = tree_paths(&instance, &first).await;
+            put_first(&instance, directories[0]).await;
+            removed_directory(&instance, "p");
+            let state = dirty_moved(&instance, "q", "p").await;
+            let ahead = lies_ahead(&instance, &state, ROOT_NODE, (held["q"], held["p"])).await;
+            orders.lock().insert(ahead);
+            restaged(&instance, "p/g").await;
+
+            let (revision, _) = committed_warning(&instance, "Moved").await;
+            assert_no_change_marked(&instance).await;
+            assert_revision(
+                &instance,
+                &revision,
+                &[
+                    ("other.txt", held["other.txt"]),
+                    ("p", held["q"]),
+                    ("p/g", held["q/g"]),
+                    ("p/h", held["q/h"]),
+                ],
+            )
+            .await;
+            let changed = [
+                ("p", FileAction::Delete),
+                ("p/f", FileAction::Delete),
+                ("q", FileAction::Move),
+            ];
+            for (path, action) in changed {
+                assert_eq!(
+                    delta_action(&instance, &revision, held[path]).await,
+                    Some(action as u16),
+                    "{directories:?}: the delta of {path}"
+                );
+            }
+        })
+        .await;
+    }
+    assert_eq!(orders.lock().len(), 2, "both chain orders");
+}
+
+/// Moves `node`, which the staged tree holds marked dirty as deleted under the root, to the front of
+/// the root's children through the directory `through`, and stores the staged tree: a chain order
+/// no command sets, as no path reaches a deleted node while a live one holds its name.
+async fn deleted_to_front(instance: &TestRepository, node: NodeID, through: NodeID) {
+    let state = staged_tree(instance).await;
+    let deleted = Mark::dirty(NodeFlags::DirtyDelete, Ext::Keep, true);
+    for parent in [through, ROOT_NODE] {
+        state
+            .node_move(
+                instance.repository.clone(),
+                node,
+                parent,
+                NameChange::Keep,
+                deleted,
+            )
+            .await
+            .expect("the move");
+    }
+    let signature = state
+        .serialize(instance.repository.clone(), &instance.write_token)
+        .await
+        .expect("the staged state serializes");
+    lore_revision::instance::store_staged_anchor(&instance.repository, signature)
+        .await
+        .expect("the staged anchor");
+}
+
+/// A commit of a node staged where a committed node of the other kind stood, a file replaced by a
+/// directory or a directory by a file, the old node's deletion only marked dirty, deletes the old
+/// node with what it holds: the revision holds the new node alone under the name, with its
+/// content, whichever of the two the chain holds first.
+#[tokio::test]
+async fn a_commit_of_a_node_staged_at_one_of_the_other_kind_marked_deleted_deletes_it() {
+    for to_directory in [true, false] {
+        for (staged, deleted_first) in [("f", false), ("f", true), (".", false), (".", true)] {
+            with_instance(|instance| async move {
+                let committed_paths: &[&str] = if to_directory {
+                    &["f", "t/keep", "other.txt"]
+                } else {
+                    &["f/x", "t/keep", "other.txt"]
+                };
+                let first = committed(&instance, committed_paths).await;
+                let held = tree_paths(&instance, &first).await;
+                if to_directory {
+                    std::fs::remove_file(instance.path.join("f")).expect("the removal on disk");
+                    made_directory(&instance, "f");
+                    written(&instance, &["f/x"]);
+                } else {
+                    removed_directory(&instance, "f");
+                    written(&instance, &["f"]);
+                }
+                let case = format!(
+                    "to a directory {to_directory}, staged {staged}, deleted first {deleted_first}"
+                );
+                let state = dirtied(&instance, "f").await;
+                let replaced = node_of(&instance, &state, held["f"]).await;
+                assert!(
+                    replaced.is_dirty_delete() && !replaced.is_staged(),
+                    "{case}: the old node, flags {:#x}",
+                    replaced.flags
+                );
+                let new = node_id_at(&instance, &state, "f").await;
+                if deleted_first {
+                    deleted_to_front(&instance, held["f"], held["t"]).await;
+                }
+                let state = staged_tree(&instance).await;
+                assert_eq!(
+                    lies_ahead(&instance, &state, ROOT_NODE, (held["f"], new)).await,
+                    deleted_first,
+                    "{case}: the order"
+                );
+                stage_path(&instance, staged).await;
+
+                let (revision, _) = committed_warning(&instance, "Retyped").await;
+                assert_no_change_marked(&instance).await;
+                let paths = tree_paths(&instance, &revision).await;
+                let (expected, content): (&[&str], _) = if to_directory {
+                    (&["f", "f/x", "other.txt", "t", "t/keep"], "f/x")
+                } else {
+                    (&["f", "other.txt", "t", "t/keep"], "f")
+                };
+                assert_eq!(
+                    paths.keys().map(String::as_str).collect::<Vec<_>>(),
+                    expected,
+                    "{case}: the revision's paths"
+                );
+                assert_eq!(paths["f"], new, "{case}: the node at f");
+                let f = node_of(&instance, &revision, paths["f"]).await;
+                assert_eq!(f.is_directory(), to_directory, "{case}: the kind of f");
+                assert_eq!(
+                    node_of(&instance, &revision, paths[content]).await.size,
+                    content.len() as u64,
+                    "{case}: the content of {content}"
+                );
+                for (path, node) in &held {
+                    if path.starts_with('f') {
+                        assert_eq!(
+                            delta_action(&instance, &revision, *node).await,
+                            Some(FileAction::Delete as u16),
+                            "{case}: the delta of {path}"
+                        );
+                    }
+                }
+            })
+            .await;
+        }
+    }
+}
+
+/// A commit of a directory's deletion staged, or of a file staged where it stood, after `lore dirty
+/// move` took a file out of the directory: the prune returns the moved file into the directory,
+/// the commit deletes the directory with it, and the move, its node gone, is not marked again: its
+/// path is marked added, with a warning.
+#[tokio::test]
+async fn a_commit_replacing_a_directory_a_dirty_move_took_a_file_out_of_deletes_the_file() {
+    for replaced in [true, false] {
+        with_instance(|instance| async move {
+            let first = committed(&instance, &["r/x", "r/keep", "other.txt"]).await;
+            let held = tree_paths(&instance, &first).await;
+            dirty_moved(&instance, "r/x", "y").await;
+            removed_directory(&instance, "r");
+            if replaced {
+                written(&instance, &["r"]);
+            }
+            dirtied(&instance, "r").await;
+            stage_path(&instance, "r").await;
+
+            let (revision, warnings) = committed_warning(&instance, "Replaced").await;
+            let paths = tree_paths(&instance, &revision).await;
+            let expected: &[&str] = if replaced {
+                &["other.txt", "r"]
+            } else {
+                &["other.txt"]
+            };
+            assert_eq!(
+                paths.keys().map(String::as_str).collect::<Vec<_>>(),
+                expected,
+                "replaced {replaced}: the revision's paths"
+            );
+            if replaced {
+                assert!(node_of(&instance, &revision, paths["r"]).await.is_file());
+            }
+            for path in ["r", "r/x", "r/keep"] {
+                assert_eq!(
+                    delta_action(&instance, &revision, held[path]).await,
+                    Some(FileAction::Delete as u16),
+                    "replaced {replaced}: the delta of {path}"
+                );
+            }
+            assert_eq!(
+                warnings, 1,
+                "replaced {replaced}: the move not marked again"
+            );
+            let staged = staged_tree(&instance).await;
+            let y = node_at(&instance, &staged, "y").await;
+            assert!(
+                y.is_dirty_add() && !y.is_dirty_move(),
+                "replaced {replaced}: y, flags {:#x}",
+                y.flags
+            );
+        })
+        .await;
+    }
+}
+
+/// A commit of a directory's deletion staged after `lore dirty move` took a directory out of it:
+/// the prune returns the moved directory into the deleted one, and the commit deletes it there
+/// with each node below it, while the moved directory's path and what it holds are marked added.
+#[tokio::test]
+async fn a_commit_deleting_a_directory_a_dirty_move_took_a_directory_out_of_deletes_its_subtree() {
+    with_instance(|instance| async move {
+        let first = committed(&instance, &["r/d/f", "r/d/g/h", "r/keep", "other.txt"]).await;
+        let held = tree_paths(&instance, &first).await;
+        dirty_moved(&instance, "r/d", "e").await;
+        removed_directory(&instance, "r");
+        dirtied(&instance, "r").await;
+        stage_path(&instance, "r").await;
+
+        let (revision, _) = committed_warning(&instance, "Deleted").await;
+        assert_eq!(
+            tree_paths(&instance, &revision)
+                .await
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["other.txt"],
+            "the revision's paths"
+        );
+        for path in ["r", "r/d", "r/d/f", "r/d/g", "r/d/g/h", "r/keep"] {
+            assert_eq!(
+                delta_action(&instance, &revision, held[path]).await,
+                Some(FileAction::Delete as u16),
+                "the delta of {path}"
+            );
+        }
+        let staged = staged_tree(&instance).await;
+        for path in ["e", "e/f", "e/g", "e/g/h"] {
+            let node = node_at(&instance, &staged, path).await;
+            assert!(
+                node.is_dirty_add() && !node.is_dirty_move(),
+                "{path}, flags {:#x}",
+                node.flags
+            );
+        }
+    })
+    .await;
+}
+
+/// A commit of a directory's deletion staged after `lore stage move` took a file or a directory
+/// out of it, where the working tree holds it at its committed path again and not at the move's
+/// destination: the commit returns it into the deleted directory and deletes it there, with each
+/// node below it.
+#[tokio::test]
+async fn a_commit_returning_a_staged_move_into_a_deleted_directory_deletes_its_subtree() {
+    for (moved, files, below) in [
+        ("r/x", &["r/x"][..], &[][..]),
+        ("r/d", &["r/d/f"][..], &["r/d/f"][..]),
+    ] {
+        with_instance(|instance| async move {
+            let first = committed(&instance, &[files, &["r/keep", "other.txt"]].concat()).await;
+            let held = tree_paths(&instance, &first).await;
+            staged_moved(&instance, moved, "e").await;
+            removed_directory(&instance, "r");
+            stage_path(&instance, "r").await;
+            written(&instance, files);
+            if instance.path.join("e").is_dir() {
+                removed_directory(&instance, "e");
+            } else {
+                std::fs::remove_file(instance.path.join("e")).expect("the removal of e");
+            }
+
+            let (revision, _) = committed_warning(&instance, "Deleted").await;
+            assert_eq!(
+                tree_paths(&instance, &revision)
+                    .await
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["other.txt"],
+                "{moved}: the revision's paths"
+            );
+            for path in [&["r", "r/keep", moved][..], below].concat() {
+                assert_eq!(
+                    delta_action(&instance, &revision, held[path]).await,
+                    Some(FileAction::Delete as u16),
+                    "{moved}: the delta of {path}"
+                );
+            }
+        })
+        .await;
+    }
+}
+
+/// `lore dirty move` onto a path a committed file holds marks that file deleted and puts the moved
+/// file beside it under the same name, which then names the moved file: from another directory,
+/// and renamed in place, whichever of the two the chain holds first.
+#[tokio::test]
+async fn a_dirty_move_onto_a_committed_file_marks_it_deleted_beside_the_moved_one() {
+    let orders = Arc::new(Mutex::new(BTreeSet::new()));
+    for (source, front) in [("b", None), ("a/g", Some("a/f")), ("a/g", Some("a/g"))] {
+        let orders = orders.clone();
+        with_instance(|instance| async move {
+            let first = committed(&instance, &["a/f", "a/g", "b", "other.txt"]).await;
+            let held = tree_paths(&instance, &first).await;
+            if let Some(front) = front {
+                put_first(&instance, front).await;
+            }
+            let state = dirty_moved(&instance, source, "a/f").await;
+            let case = format!("{source} onto a/f, {front:?} at the front");
+
+            let ahead = lies_ahead(&instance, &state, held["a"], (held[source], held["a/f"])).await;
+            orders.lock().insert(ahead);
+            assert_eq!(
+                children_named(&instance, &state, held["a"], "f").await,
+                2,
+                "{case}: the replaced file and the moved one at a/f"
+            );
+            let replaced = node_of(&instance, &state, held["a/f"]).await;
+            assert!(
+                replaced.is_dirty_delete() && !replaced.is_staged(),
+                "{case}: the replaced file, flags {:#x}",
+                replaced.flags
+            );
+            let moved = node_of(&instance, &state, held[source]).await;
+            assert!(
+                moved.is_dirty_move() && !moved.is_staged(),
+                "{case}: the moved file, flags {:#x}",
+                moved.flags
+            );
+            assert_eq!(
+                node_id_at(&instance, &state, "a/f").await,
+                held[source],
+                "{case}: a/f names the moved file"
+            );
+        })
+        .await;
+    }
+    assert_eq!(orders.lock().len(), 2, "both chain orders");
+}
+
+/// Runs `body` in an execution context of its own, answering what it answers and the stage events
+/// it sent, in order: `B` where a stage begins, `F` for each file it stages and `E` where it ends.
+async fn stage_events_of<F: Future>(body: F) -> (F::Output, String) {
+    let events = Arc::new(Mutex::new(String::new()));
+    let sent = events.clone();
+    let callback: LoreEventCallback = Some(Box::new(move |event| {
+        let tag = match event {
+            LoreEvent::FileStageBegin(_) => 'B',
+            LoreEvent::FileStageFile(_) => 'F',
+            LoreEvent::FileStageEnd(_) => 'E',
+            _ => return,
+        };
+        sent.lock().push(tag);
+    }));
+    let execution = Arc::new(ExecutionContext::new_client_with_user_id(
+        LoreGlobalArgs::default(),
+        EventDispatcher::new(callback),
+        "test-user".to_string(),
+    ));
+    let output = LORE_CONTEXT.scope(execution.clone(), body).await;
+    execution.dispatcher.drain().await;
+    let events = std::mem::take(&mut *events.lock());
+    (output, events)
+}
+
+/// `lore dirty move` onto a committed file holding a staged edit stages its deletion as one stage:
+/// the files it stages come between the events that open and close a stage.
+#[tokio::test]
+async fn a_dirty_move_staging_the_deletion_of_the_node_it_replaces_sends_one_stage() {
+    with_instance(|instance| async move {
+        committed(&instance, &["a.txt", "b.txt"]).await;
+        restaged(&instance, "b.txt").await;
+        rename(&instance, "a.txt", "b.txt");
+
+        let (_, events) = stage_events_of(dirty_move(&instance, "a.txt", "b.txt")).await;
+        let files = events.trim_start_matches('B').trim_end_matches('E');
+        assert!(
+            events.starts_with('B')
+                && events.ends_with('E')
+                && !files.is_empty()
+                && files.chars().all(|tag| tag == 'F'),
+            "the stage events {events}"
+        );
+    })
+    .await;
+}
+
+/// A commit of a staged edit elsewhere leaves out a `lore dirty move` onto a path a committed file
+/// or directory held, and keeps that node marked deleted, with what it holds, beside the moved one:
+/// the status and the dirty marks are what they were before it, whichever of the two the chain
+/// holds first.
+#[tokio::test]
+async fn a_commit_leaving_out_a_dirty_move_onto_a_committed_node_keeps_its_deletion() {
+    for directory in [false, true] {
+        let orders = Arc::new(Mutex::new(BTreeSet::new()));
+        for (source, front) in [("b", None), ("a/g", Some("a/f")), ("a/g", Some("a/g"))] {
+            let orders = orders.clone();
+            with_instance(|instance| async move {
+                let files: &[&str] = if directory {
+                    &["a/f/x", "a/g/y", "b/y", "other.txt"]
+                } else {
+                    &["a/f", "a/g", "b", "other.txt"]
+                };
+                let first = committed(&instance, files).await;
+                let held = tree_paths(&instance, &first).await;
+                if let Some(front) = front {
+                    put_first(&instance, front).await;
+                }
+                restaged(&instance, "other.txt").await;
+                if directory {
+                    removed_directory(&instance, "a/f");
+                }
+                let state = dirty_moved(&instance, source, "a/f").await;
+                let case = format!("directory {directory}, {source} onto a/f, {front:?} first");
+                let ahead =
+                    lies_ahead(&instance, &state, held["a"], (held[source], held["a/f"])).await;
+                orders.lock().insert(ahead);
+                let before = status_and_marks(&instance, &first, &state).await;
+
+                let revision = test_commit(&instance, "Edited").await;
+                let staged = staged_tree(&instance).await;
+                let after = status_and_marks(&instance, &revision, &staged).await;
+                assert_eq!(after, before, "{case}");
+            })
+            .await;
+        }
+        assert_eq!(
+            orders.lock().len(),
+            2,
+            "directory {directory}: both chain orders"
+        );
+    }
+}
+
+/// What a test moves into a new directory that a dirty move then puts onto a committed one.
+#[derive(Clone, Copy, Debug)]
+enum MovedIn {
+    /// Nothing.
+    Nothing,
+    /// A committed file, moved in before the directory's move.
+    FileBefore,
+    /// A committed file, moved in after the directory's move and edited there.
+    FileAfter,
+    /// A committed directory, moved in before the directory's move.
+    Directory,
+}
+
+/// A commit of a staged edit elsewhere leaves out a `lore dirty move` of a new directory holding
+/// files, marked dirty as added, onto a committed directory, and keeps the committed directory
+/// marked deleted, with what it holds, beside the new one, and a committed file or directory moved
+/// into the new one moved there, with its edit: the status and the dirty marks are what they were
+/// before it, whichever of the two the chain holds first.
+#[tokio::test]
+async fn a_commit_leaving_out_a_dirty_move_of_an_added_directory_onto_a_committed_one_keeps_both() {
+    for moved_in in [
+        MovedIn::Nothing,
+        MovedIn::FileBefore,
+        MovedIn::FileAfter,
+        MovedIn::Directory,
+    ] {
+        let orders = Arc::new(Mutex::new(BTreeSet::new()));
+        for front in [false, true] {
+            let orders = orders.clone();
+            with_instance(|instance| async move {
+                let first = committed(&instance, &["d/x", "d/y", "f", "g/h", "other.txt"]).await;
+                let held = tree_paths(&instance, &first).await;
+                written(&instance, &["n/y", "n/z"]);
+                let added = dirtied(&instance, "n").await;
+                let new = node_id_at(&instance, &added, "n").await;
+                match moved_in {
+                    MovedIn::FileBefore => {
+                        dirty_moved(&instance, "f", "n/f").await;
+                    }
+                    MovedIn::Directory => {
+                        dirty_moved(&instance, "g", "n/g").await;
+                    }
+                    MovedIn::Nothing | MovedIn::FileAfter => {}
+                }
+                if front {
+                    put_first(&instance, "d").await;
+                }
+                restaged(&instance, "other.txt").await;
+                removed_directory(&instance, "d");
+                let mut state = dirty_moved(&instance, "n", "d").await;
+                if matches!(moved_in, MovedIn::FileAfter) {
+                    dirty_moved(&instance, "f", "d/f").await;
+                    written(&instance, &["d/f"]);
+                    state = dirtied(&instance, "d/f").await;
+                    let edited = node_at(&instance, &state, "d/f").await;
+                    assert!(
+                        edited.is_dirty_move() && edited.is_dirty_modify(),
+                        "d first {front}: d/f, flags {:#x}",
+                        edited.flags
+                    );
+                }
+                let ahead = lies_ahead(&instance, &state, ROOT_NODE, (held["d"], new)).await;
+                orders.lock().insert(ahead);
+                let before = status_and_marks(&instance, &first, &state).await;
+
+                let revision = test_commit(&instance, "Edited").await;
+                let staged = staged_tree(&instance).await;
+                let after = status_and_marks(&instance, &revision, &staged).await;
+                assert_eq!(after, before, "{moved_in:?}, d first {front}");
+            })
+            .await;
+        }
+        assert_eq!(orders.lock().len(), 2, "{moved_in:?}: both chain orders");
+    }
+}
+
+/// The kind of a new node a test puts where a committed one stands.
+#[derive(Clone, Copy, Debug)]
+enum NewKind {
+    /// A file.
+    File,
+    /// A directory holding a file.
+    Directory,
+}
+
+impl NewKind {
+    /// Writes the new node at `path` below `instance`'s working tree.
+    fn write(self, instance: &TestRepository, path: &str) {
+        match self {
+            NewKind::File => written(instance, &[path]),
+            NewKind::Directory => written(instance, &[&format!("{path}/c")]),
+        }
+    }
+}
+
+/// A commit of a staged edit elsewhere leaves out a `lore dirty move` of a new file or directory,
+/// marked dirty as added, onto a committed directory holding a committed file another `lore dirty
+/// move` put there, whose committed name a third move gave another file: the file stays in the
+/// committed directory marked deleted, one node alone holds its committed name, and the status and
+/// the dirty marks are what they were before it, whichever of the two the chain holds first.
+#[tokio::test]
+async fn a_commit_leaving_out_a_dirty_move_onto_a_committed_directory_keeps_a_file_held_in_it() {
+    for kind in [NewKind::File, NewKind::Directory] {
+        let orders = Arc::new(Mutex::new(BTreeSet::new()));
+        for front in [false, true] {
+            let orders = orders.clone();
+            with_instance(|instance| async move {
+                let first = committed(&instance, &["a", "b", "d/x", "other.txt"]).await;
+                let held = tree_paths(&instance, &first).await;
+                dirty_moved(&instance, "a", "d/a").await;
+                dirty_moved(&instance, "b", "a").await;
+                kind.write(&instance, "n");
+                let added = dirtied(&instance, "n").await;
+                let new = node_id_at(&instance, &added, "n").await;
+                if front {
+                    put_first(&instance, "d").await;
+                }
+                restaged(&instance, "other.txt").await;
+                removed_directory(&instance, "d");
+                let state = dirty_moved(&instance, "n", "d").await;
+                let case = format!("{kind:?}, d first {front}");
+                let parent = node_of(&instance, &state, held["a"]).await.parent;
+                assert_eq!(parent, held["d"], "{case}: a in the committed directory");
+                let ahead = lies_ahead(&instance, &state, ROOT_NODE, (held["d"], new)).await;
+                orders.lock().insert(ahead);
+                let before = status_and_marks(&instance, &first, &state).await;
+
+                let revision = test_commit(&instance, "Edited").await;
+                let staged = staged_tree(&instance).await;
+                assert_eq!(
+                    children_named(&instance, &staged, ROOT_NODE, "a").await,
+                    1,
+                    "{case}: the nodes named a"
+                );
+                let parent = node_of(&instance, &staged, held["a"]).await.parent;
+                assert_eq!(parent, held["d"], "{case}: a in the committed directory");
+                let after = status_and_marks(&instance, &revision, &staged).await;
+                assert_eq!(after, before, "{case}");
+            })
+            .await;
+        }
+        assert_eq!(orders.lock().len(), 2, "{kind:?}: both chain orders");
+    }
+}
+
+/// A commit of a staged edit elsewhere leaves out a `lore dirty move` of a new directory, marked
+/// dirty as added, onto a committed one, the new one holding a committed directory another `lore
+/// dirty move` put there, in which a third took a new file or directory onto a committed file: the
+/// new node is kept marked added beside the committed file marked deleted, with a committed file
+/// moved into it, and the status and the dirty marks are what they were before it, whichever of the
+/// two the chain holds first.
+#[tokio::test]
+async fn a_commit_leaving_out_a_dirty_move_of_an_added_directory_onto_a_committed_one_keeps_an_add_nested_in_it()
+ {
+    for (kind, moved_in) in [
+        (NewKind::File, false),
+        (NewKind::Directory, false),
+        (NewKind::Directory, true),
+    ] {
+        let orders = Arc::new(Mutex::new(BTreeSet::new()));
+        for front in [false, true] {
+            let orders = orders.clone();
+            with_instance(|instance| async move {
+                let first = committed(&instance, &["d/x", "d/y", "f", "g/h", "other.txt"]).await;
+                let held = tree_paths(&instance, &first).await;
+                written(&instance, &["n/y"]);
+                kind.write(&instance, "n/new");
+                let added = dirtied(&instance, "n").await;
+                let new = node_id_at(&instance, &added, "n").await;
+                dirty_moved(&instance, "g", "n/g").await;
+                std::fs::remove_file(instance.path.join("n/g/h")).expect("the delete on disk");
+                let state = dirty_moved(&instance, "n/new", "n/g/h").await;
+                let case = format!("{kind:?}, moved in {moved_in}, d first {front}");
+                assert!(
+                    node_at(&instance, &state, "n/g/h").await.is_dirty_add(),
+                    "{case}: n/g/h marked added"
+                );
+                if moved_in {
+                    dirty_moved(&instance, "f", "n/g/h/f").await;
+                }
+                if front {
+                    put_first(&instance, "d").await;
+                }
+                restaged(&instance, "other.txt").await;
+                removed_directory(&instance, "d");
+                let state = dirty_moved(&instance, "n", "d").await;
+                let ahead = lies_ahead(&instance, &state, ROOT_NODE, (held["d"], new)).await;
+                orders.lock().insert(ahead);
+                let before = status_and_marks(&instance, &first, &state).await;
+
+                let revision = test_commit(&instance, "Edited").await;
+                let staged = staged_tree(&instance).await;
+                let after = status_and_marks(&instance, &revision, &staged).await;
+                assert_eq!(after, before, "{case}");
+            })
+            .await;
+        }
+        assert_eq!(
+            orders.lock().len(),
+            2,
+            "{kind:?}, moved in {moved_in}: both chain orders"
+        );
+    }
 }

@@ -14,6 +14,7 @@ use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use lore_storage::FragmentWriteCounts;
 use serde::Serialize;
+use smallvec::SmallVec;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
@@ -820,7 +821,7 @@ async fn commit_staged_with_layers(
     let pruned =
         prune_dirty_for_commit(state_staged.clone(), repository.clone(), current_revision).await?;
     let left_out: Vec<NodeID> = pruned.left_out().collect();
-    let mut added = Vec::new();
+    let mut left = LeftToMark::default();
 
     let mut signature = current_revision;
     if current_revision != staged_revision {
@@ -845,7 +846,7 @@ async fn commit_staged_with_layers(
                 reporting.clone(),
                 MissingPaths::Settle,
                 left_out,
-                Some(&mut added),
+                Some(&mut left),
             )
             .await
             {
@@ -873,13 +874,10 @@ async fn commit_staged_with_layers(
         }
     }
 
-    let (dirty_paths, carried) = dirty.carried(pruned, added);
+    let (dirty_paths, carried) = dirty.carried(pruned, left);
     if !dry_run
         && signature != current_revision
-        && (!dirty_paths.is_empty()
-            || !carried.moves.is_empty()
-            || !carried.marks.is_empty()
-            || !carried.added.is_empty())
+        && (!dirty_paths.is_empty() || !carried.is_empty())
         && let Err(error) = crate::file::dirty::dirty_relative_paths_in_operation(
             operation,
             repository.clone(),
@@ -1800,7 +1798,7 @@ async fn commit_staged_revision(
     reporting: CommitReporting,
     missing: MissingPaths,
     left_out: Vec<NodeID>,
-    added: Option<&mut Vec<crate::file::dirty::AddedNode>>,
+    left: Option<&mut LeftToMark>,
 ) -> Result<(Hash, Arc<RecordedModifiedTimes>), CommitError> {
     let context = execution_context();
     let globals = context.globals();
@@ -1834,11 +1832,12 @@ async fn commit_staged_revision(
         prune_dirty_for_commit(state_staged.clone(), repository.clone(), revision_current).await?;
     let gone = (missing == MissingPaths::Settle).then(|| {
         Arc::new(Gone {
-            added: added.is_some().then(parking_lot::Mutex::default),
+            added: left.is_some().then(parking_lot::Mutex::default),
+            replaced: left.is_some().then(Arc::default),
             ..Gone::left_out(left_out, &pruned)
         })
     });
-    let carried = gone.clone().filter(|_| added.is_some());
+    let carried = gone.clone().filter(|_| left.is_some());
 
     // Per-operation tracker for background fragment uploads. Write-producing
     // calls below dispatch leader tasks into it; await_all drains every
@@ -1939,10 +1938,13 @@ async fn commit_staged_revision(
         Ok((signature, collected))
     }
     .await;
-    if let (Some(added), Some(carried)) = (added, carried)
-        && let Some(found) = &carried.added
-    {
-        added.append(&mut found.lock());
+    if let (Some(left), Some(carried)) = (left, carried) {
+        if let Some(found) = &carried.added {
+            left.added.append(&mut found.lock());
+        }
+        if let Some(found) = &carried.replaced {
+            left.replaced.append(&mut found.lock());
+        }
     }
 
     // ALWAYS drain the tracker, regardless of whether the work above
@@ -2897,6 +2899,12 @@ impl CommitWalk {
         (walk, file_rx)
     }
 
+    /// Where the prune of a link below this walk's tree records the paths of the nodes it staged
+    /// for deletion ([`Gone::replaced`]).
+    fn replaced(&self) -> Option<Arc<parking_lot::Mutex<Vec<RelativePath>>>> {
+        self.gone.as_ref().and_then(|gone| gone.replaced.clone())
+    }
+
     /// What the walk makes of a staged path the working tree no longer holds
     /// ([`MissingPaths::of`]).
     fn missing(&self) -> MissingPaths {
@@ -3234,7 +3242,7 @@ fn commit_child(
                 walk.stats.clone(),
                 walk.parent_branch,
                 walk.tracker.clone(),
-                walk.missing(),
+                (walk.missing(), walk.replaced()),
             ))
         );
     } else if child_node.is_file() {
@@ -3316,6 +3324,20 @@ pub(crate) struct Gone {
     /// past it, marked dirty alone ([`crate::file::dirty::CarriedMarks::added`]); `None` for a
     /// walk whose tree another commit marks again, as a link's or a layer's.
     added: Option<parking_lot::Mutex<Vec<crate::file::dirty::AddedNode>>>,
+    /// The path from the instance's root of each node a link's prune staged for deletion as a
+    /// staged node of its name replaced it ([`Pruned::deleted`]), for a commit of the instance's
+    /// own tree to mark nothing again at ([`LeftToMark::replaced`]): shared with the walks of the
+    /// links below, `None` for a walk whose tree another commit marks again.
+    replaced: Option<Arc<parking_lot::Mutex<Vec<RelativePath>>>>,
+}
+
+/// What a commit of the instance's own tree leaves to the dirty marks it makes again past it,
+/// beside the dirty-only nodes it found: the staged adds [`Gone::added`] collects, and the paths of
+/// the replaced nodes [`Gone::replaced`] does, what they hold left out.
+#[derive(Default)]
+pub(crate) struct LeftToMark {
+    pub added: Vec<crate::file::dirty::AddedNode>,
+    pub replaced: Vec<RelativePath>,
 }
 
 impl Gone {
@@ -3825,8 +3847,10 @@ struct MovedBack {
 /// holds a file at that path and nothing else holds that place, as committed ([`return_moved_file`]).
 /// `walk_root` is the node the walk starts at and its working-tree path, below which `base` holds the
 /// place. A file standing under its committed parent by its committed name moved only with a
-/// directory, and is none. One file-info read of that path. Boxed by its caller, which takes it for
-/// a staged move alone.
+/// directory, and is none, as is one whose committed place is staged for deletion
+/// ([`place_staged_for_deletion`]): the walk has collected that directory's subtree to discard
+/// already, so the file leaves as one gone from the working tree. One file-info read of that path.
+/// Boxed by its caller, which takes it for a staged move alone.
 async fn moved_back_source(
     operation: &InstanceOperationImpl,
     repository: &Arc<RepositoryContext>,
@@ -3849,6 +3873,9 @@ async fn moved_back_source(
     else {
         return Ok(None);
     };
+    if place_staged_for_deletion(state, repository, place.0).await? {
+        return Ok(None);
+    }
     if record.parent == place.0
         && record.name_hash == place.1
         && state
@@ -4327,8 +4354,10 @@ async fn return_moved_directories(
 /// Where the directory `directory`, staged as moved, goes back to ([`return_moved_directories`]):
 /// its committed place, its name there copied into `name`, and its committed path below
 /// `walk_root`'s path. `None` for one not staged as moved, one `base` holds nowhere below
-/// `walk_root`'s node, and one standing at its committed place by its committed name, which moved
-/// only with a directory above it.
+/// `walk_root`'s node, one standing at its committed place by its committed name, which moved
+/// only with a directory above it, and one whose committed place is staged for deletion
+/// ([`place_staged_for_deletion`]), which leaves with what it holds, as the walk has collected that
+/// directory's subtree to discard already.
 async fn moved_directory_source(
     repository: &Arc<RepositoryContext>,
     state: &State,
@@ -4352,6 +4381,9 @@ async fn moved_directory_source(
     else {
         return Ok(None);
     };
+    if place_staged_for_deletion(state, repository, place.0).await? {
+        return Ok(None);
+    }
     if record.parent == place.0
         && record.name_hash == place.1
         && state
@@ -5409,7 +5441,10 @@ async fn commit_link_node(
     stats: Arc<CommitStats>,
     parent_branch: BranchId,
     parent_tracker: Arc<lore_storage::write_tracker::WriteTracker>,
-    missing: MissingPaths,
+    (missing, replaced): (
+        MissingPaths,
+        Option<Arc<parking_lot::Mutex<Vec<RelativePath>>>>,
+    ),
 ) -> Result<(), CommitError> {
     let block_index = NodeBlock::index(node_id);
     let node_index = Node::index(node_id);
@@ -5487,7 +5522,7 @@ async fn commit_link_node(
         link_messages,
         stats,
         parent_tracker,
-        missing,
+        (missing, replaced),
     )
     .await?;
 
@@ -5562,6 +5597,31 @@ async fn link_based_on(
     })
 }
 
+/// Adds to `replaced` the path from the instance's root of each of `deleted`, the nodes of the link
+/// state `state` whose deletion its prune staged, below the linked node `link_node`, which the
+/// instance mounts at `mount`: the paths the instance's dirty-only walk spells for them. Boxed by
+/// its caller, which takes it only where the prune staged one.
+async fn link_replaced_paths(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    (link_node, mount): (NodeID, &RelativePath),
+    deleted: &[NodeID],
+    replaced: &parking_lot::Mutex<Vec<RelativePath>>,
+) -> Result<(), CommitError> {
+    for &node in deleted {
+        let below = state
+            .node_path_below(repository.clone(), node, link_node)
+            .await
+            .forward::<CommitError>(
+                "Failed to read the path of a deletion a link's prune staged",
+            )?;
+        if let Some(below) = below {
+            replaced.lock().push(mount.join(below.as_str()));
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn commit_link(
     operation: Arc<InstanceOperationImpl>,
@@ -5576,7 +5636,10 @@ async fn commit_link(
     link_messages: Arc<HashMap<String, String>>,
     stats: Arc<CommitStats>,
     parent_tracker: Arc<lore_storage::write_tracker::WriteTracker>,
-    missing: MissingPaths,
+    (missing, replaced): (
+        MissingPaths,
+        Option<Arc<parking_lot::Mutex<Vec<RelativePath>>>>,
+    ),
 ) -> Result<(Hash, NodeID), CommitError> {
     // Per-link tracker: a linked sub-repo is a logically independent commit
     // and must carry its own durability gate. If we reused the parent's
@@ -5589,8 +5652,23 @@ async fn commit_link(
 
     let base = state.committed_revision();
     let pruned = prune_dirty_for_commit(state.clone(), repository.clone(), base).await?;
-    let gone =
-        (missing == MissingPaths::Settle).then(|| Arc::new(Gone::left_out(Vec::new(), &pruned)));
+    if let Some(replaced) = replaced.as_ref().filter(|_| !pruned.deleted.is_empty()) {
+        let below = (node_id, &relative_path);
+        Box::pin(link_replaced_paths(
+            &repository,
+            &state,
+            below,
+            &pruned.deleted,
+            replaced,
+        ))
+        .await?;
+    }
+    let gone = (missing == MissingPaths::Settle).then(|| {
+        Arc::new(Gone {
+            replaced,
+            ..Gone::left_out(Vec::new(), &pruned)
+        })
+    });
     let link_modified_times = Arc::new(RecordedModifiedTimes::below(
         operation.clock_floor(&repository).await,
     ));
@@ -6727,6 +6805,11 @@ async fn apply_merge_carry(
 /// staged node left, which a dirty move takes it from without staging the directory, is staged
 /// once the moves settle, so the commit rehashes it without that node ([`stage_left`]).
 ///
+/// A node only marked dirty as deleted that shares its name with a staged node of its directory
+/// is staged for deletion, with what it holds, as a revision holds one node of a name
+/// ([`take_replaced_deletions`]); [`Pruned::deleted`] answers each, and the commit marks nothing
+/// again at its path, which the staged node holds.
+///
 /// `state_staged` doubles as the source tree for the new committed revision
 /// and the carrier of staged-anchor tracking. Dirty-only nodes belong only to
 /// the latter — they were marked by `lore dirty <path>` (or `lore status
@@ -6734,7 +6817,7 @@ async fn apply_merge_carry(
 /// them. After pruning, the staged tracking is rebuilt against the new
 /// committed revision by marking the returned moves again, marking each other
 /// node with the dirty marks it carried, and re-running `file::dirty::dirty()`
-/// on the paths of the adds and deletions captured beforehand.
+/// on the paths of the adds and deletions captured beforehand ([`DirtyOnly::carried`]).
 ///
 /// The walk is post-order, so empty intermediate directories can collapse
 /// upward after their dirty-add children have already been removed, and a move
@@ -6758,13 +6841,16 @@ pub(crate) async fn prune_dirty_for_commit(
         .block(repository.clone(), NodeBlock::index(ROOT_NODE))
         .await
         .forward::<CommitError>("Failed deserializing state block")?;
-    let mut levels = vec![PruneLevel::new(ROOT_NODE, root)];
+    let mut levels = vec![PruneLevel::new(ROOT_NODE, root, 0)];
     let mut context = PruneContext {
         base,
         returned: Vec::new(),
         waiting: Vec::new(),
         left: Vec::new(),
+        replaced: Vec::new(),
+        deleted: Vec::new(),
         name: String::new(),
+        deleted_above: 0,
     };
     while let Some(child_id) = levels.last().map(|level| level.next_child) {
         if child_id.is_valid_node_id() {
@@ -6782,23 +6868,30 @@ pub(crate) async fn prune_dirty_for_commit(
             if let Some(level) = levels.last_mut() {
                 level.next_child = next_sibling;
                 level.holds_staged |= child_is_staged;
+                level.staged_child |= child_is_staged;
                 level.holds_content |= child_content;
             }
             if child_is_dirty {
-                levels.push(PruneLevel::new(child_id, child_block));
+                let level = PruneLevel::new(child_id, child_block, context.replaced.len());
+                context.deleted_above += usize::from(level.entered_deleted);
+                levels.push(level);
             }
             continue;
         }
 
         let Some(level) = levels.pop() else { break };
+        context.deleted_above -= usize::from(level.entered_deleted);
         let (node_id, holds_staged, holds_content) =
             (level.node_id, level.holds_staged, level.holds_content);
-        let discard = prune_dirty_leave(&state, &repository, level, &mut context).await?;
+        let leave = prune_dirty_leave(&state, &repository, level, &mut context).await?;
         if let Some(parent) = levels.last_mut() {
             parent.holds_staged |= holds_staged;
+            parent.staged_child |= holds_staged;
             parent.holds_content |= holds_content;
-            if discard {
-                parent.to_discard.push(node_id);
+            match leave {
+                Leave::Keep => {}
+                Leave::Discard => parent.to_discard.push(node_id),
+                Leave::Replaced(name_hash) => context.replaced.push((node_id, name_hash)),
             }
         }
     }
@@ -6813,8 +6906,10 @@ pub(crate) async fn prune_dirty_for_commit(
         .await
         .forward::<CommitError>("Failed to stage the move of a directory the commit stages")?;
     }
+    context.deleted.sort_unstable();
     Ok(Pruned {
         moves: context.returned,
+        deleted: context.deleted,
     })
 }
 
@@ -6825,9 +6920,36 @@ struct DirtyOnly {
     /// The path of each node marked dirty as added or deleted, which the commit marks again as the
     /// working tree holds it, or found through a link.
     paths: Vec<RelativePath>,
+    /// Each node of [`Self::paths`] marked dirty as added or deleted, and each new directory only
+    /// marked dirty whose children carry it, which the commit marks again by their paths
+    /// ([`state::DirtyPathSink::carried_by_children`]), not found through a link.
+    named: Vec<NamedPath>,
     /// Each other node of the tree, with its flags, which the revision holds where the tree does or
     /// a move left out takes back, and which keeps the dirty marks it carries.
     marks: Vec<(NodeID, NodeFlags)>,
+}
+
+/// A node [`DirtyOnly`] holds the path of, marked dirty as added or deleted: its directory and name
+/// hash, which a node of its name shares, its kind, and its path's index in [`DirtyOnly::paths`].
+/// A directory its children carry has no path there: it shares one with the node marked deleted
+/// that it pairs with, as both hold one name in one directory.
+struct NamedPath {
+    node: NodeID,
+    parent: NodeID,
+    name_hash: u64,
+    at: u32,
+    deleted: bool,
+    directory: bool,
+    by_children: bool,
+}
+
+const _: () = assert!(std::mem::size_of::<NamedPath>() == 24);
+
+impl NamedPath {
+    /// The name this node holds in its directory.
+    fn name(&self) -> (NodeID, u64) {
+        (self.parent, self.name_hash)
+    }
 }
 
 impl state::DirtyPathSink for DirtyOnly {
@@ -6835,28 +6957,132 @@ impl state::DirtyPathSink for DirtyOnly {
 
     fn record(&mut self, path: &RelativePathBuf, id: NodeID, node: &Node, linked: bool) {
         if linked || node.is_dirty_add() || node.is_dirty_delete() {
+            if !linked {
+                self.named.push(NamedPath {
+                    node: id,
+                    parent: node.parent,
+                    name_hash: node.name_hash,
+                    at: self.paths.len() as u32,
+                    deleted: node.is_dirty_delete(),
+                    directory: node.is_directory(),
+                    by_children: false,
+                });
+            }
             self.paths.push(path.clone().freeze());
         } else {
             self.marks
                 .push((id, NodeFlags::from_bits_retain(node.flags)));
         }
     }
+
+    fn carried_by_children(&mut self, id: NodeID, node: &Node, linked: bool) {
+        if linked {
+            return;
+        }
+        self.named.push(NamedPath {
+            node: id,
+            parent: node.parent,
+            name_hash: node.name_hash,
+            at: u32::MAX,
+            deleted: false,
+            directory: true,
+            by_children: true,
+        });
+    }
 }
 
 impl DirtyOnly {
     /// The paths to mark again past the commit, and the marks carried beside them, once the prune
     /// left out the moves of `pruned` and the commit the staged adds of `added`.
+    ///
+    /// The path of each node whose deletion the prune staged, or a link's prune did
+    /// ([`LeftToMark::replaced`]), is dropped: the commit took the deletion, and what the working
+    /// tree holds there now is the node that replaced it. A node marked deleted beside one marked
+    /// added under its name is carried by node, with that one, rather than by path: the working
+    /// tree holds the added node there, which a replay of the path would read as a change of the
+    /// deleted one. An added directory whose children carry it is added again so, and its children
+    /// by their paths below it.
     fn carried(
         self,
         pruned: Pruned,
-        added: Vec<crate::file::dirty::AddedNode>,
+        left: LeftToMark,
     ) -> (Vec<RelativePath>, crate::file::dirty::CarriedMarks) {
+        let DirtyOnly {
+            mut paths,
+            mut named,
+            marks,
+        } = self;
+        let LeftToMark {
+            mut added,
+            mut replaced,
+        } = left;
+        let mut dropped = Vec::new();
+        if !pruned.deleted.is_empty() {
+            named.retain(|path| {
+                let staged = path.deleted && pruned.deleted.binary_search(&path.node).is_ok();
+                if staged {
+                    dropped.push(path.at as usize);
+                }
+                !staged
+            });
+        }
+        let deletions = named.iter().filter(|path| path.deleted).count();
+        let mut deleted = Vec::new();
+        if deletions > 0 && deletions < named.len() {
+            named.sort_unstable_by_key(NamedPath::name);
+            for group in named.chunk_by(|one, other| one.name() == other.name()) {
+                let Some(shared) = group.iter().find(|path| path.deleted) else {
+                    continue;
+                };
+                if group.iter().all(|path| path.deleted) {
+                    continue;
+                }
+                let shared = shared.at as usize;
+                for path in group {
+                    let at = if path.by_children {
+                        paths[shared].clone()
+                    } else {
+                        dropped.push(path.at as usize);
+                        paths[path.at as usize].clone()
+                    };
+                    if path.deleted {
+                        deleted.push(crate::file::dirty::DeletedNode {
+                            node: path.node,
+                            directory: path.directory,
+                            path: at,
+                        });
+                    } else {
+                        added.push(crate::file::dirty::AddedNode {
+                            path: at,
+                            directory: path.directory,
+                        });
+                    }
+                }
+            }
+        }
+        if !dropped.is_empty() {
+            dropped.sort_unstable();
+            let mut at = 0;
+            paths.retain(|_| {
+                at += 1;
+                dropped.binary_search(&(at - 1)).is_err()
+            });
+        }
+        if !replaced.is_empty() {
+            replaced.sort_unstable_by(|one, other| one.as_str().cmp(other.as_str()));
+            paths.retain(|path| {
+                replaced
+                    .binary_search_by(|held| held.as_str().cmp(path.as_str()))
+                    .is_err()
+            });
+        }
         let carried = crate::file::dirty::CarriedMarks {
             moves: pruned.moves,
-            marks: self.marks,
+            marks,
+            deleted,
             added,
         };
-        (self.paths, carried)
+        (paths, carried)
     }
 }
 
@@ -6865,6 +7091,10 @@ pub(crate) struct Pruned {
     /// Each dirty-only move, gone back or left out, with the path the staged tree held its node at,
     /// in the order the walk left them.
     pub moves: Vec<MovedNode>,
+    /// Each node whose deletion the prune staged, with what it holds, as a staged node of its name
+    /// replaced it, sorted ([`take_replaced_deletions`]); empty where no node takes it. What it
+    /// holds is not listed: the commit marks no path below it again.
+    pub deleted: Vec<NodeID>,
 }
 
 impl Pruned {
@@ -6886,17 +7116,24 @@ struct PruneLevel {
     next_child: NodeID,
     /// The children found to be discarded, in the order visited.
     to_discard: Vec<NodeID>,
+    /// Where its children only marked dirty as deleted start in [`PruneContext::replaced`].
+    replaced_from: usize,
     /// Whether a staged node lies below it.
     holds_staged: bool,
+    /// Whether a child of it is staged, as entered or once left, which is what a child only marked
+    /// dirty as deleted can share its name with ([`take_replaced_deletions`]).
+    staged_child: bool,
     /// Whether staged content lies below it: a node staged in its own right, or a staged node the
     /// walk does not enter, which may hold one.
     holds_content: bool,
     /// Whether it was staged when entered.
     entered_staged: bool,
+    /// Whether it was marked dirty as deleted and not staged when entered.
+    entered_deleted: bool,
 }
 
 impl PruneLevel {
-    fn new(node_id: NodeID, block: Arc<NodeBlock>) -> Self {
+    fn new(node_id: NodeID, block: Arc<NodeBlock>, replaced_from: usize) -> Self {
         let node = block.node(Node::index(node_id));
         let next_child = if node.is_directory() {
             node.child
@@ -6904,14 +7141,18 @@ impl PruneLevel {
             INVALID_NODE
         };
         let entered_staged = node.is_staged();
+        let entered_deleted = node.is_dirty_delete() && !entered_staged;
         Self {
             node_id,
             block,
             next_child,
             to_discard: Vec::new(),
+            replaced_from,
             holds_staged: false,
+            staged_child: false,
             holds_content: false,
             entered_staged,
+            entered_deleted,
         }
     }
 }
@@ -6928,18 +7169,31 @@ struct PruneContext {
     waiting: Vec<NodeID>,
     /// The directory the base revision holds each staged node in that this tree holds in another.
     left: Vec<NodeID>,
+    /// Each node only marked dirty as deleted whose directory the walk has not left yet, with its
+    /// name hash. The entries from a level's [`PruneLevel::replaced_from`] on are its children's;
+    /// its leave settles and drops them ([`take_replaced_deletions`]). One list for the walk, so
+    /// no directory allocates for it.
+    replaced: Vec<(NodeID, u64)>,
+    /// Each node whose deletion the walk staged as a staged node of its name replaced it, without
+    /// what it holds ([`Pruned::deleted`]).
+    deleted: Vec<NodeID>,
     /// The buffer each committed name is read into.
     name: String,
+    /// How many nodes above the one the walk leaves were marked dirty as deleted and not staged
+    /// when entered ([`MovedNode::below_deleted`]).
+    deleted_above: usize,
 }
 
 /// Leaves a node of [`prune_dirty_for_commit`] once its children have been: discards the
-/// children found to be discarded, each with its subtree, returns it to the place the base
-/// revision holds it at where it is an unstaged dirty move ([`State::node_return_unstaged_move`]),
-/// recording it in `context`, clears its dirty flags unless it is an unstaged dirty add to be
-/// discarded, and returns `true` when its parent should discard it. A node that was not staged and
-/// holds staged content, or a dirty add that holds a staged node, is staged first, its ancestors
-/// with it, as staging that node would have staged it ([`stage_holder`]), its dirty move or add
-/// with it. One that holds only staged directories that no staged content lies below, as a
+/// children found to be discarded, each with its subtree, stages the deletion of those only marked
+/// dirty as deleted that a staged child of their name replaces ([`take_replaced_deletions`]),
+/// returns it to the place the base revision holds it at where it is an unstaged dirty move
+/// ([`State::node_return_unstaged_move`]), recording it in `context`, clears its dirty flags unless
+/// it is an unstaged dirty add to be discarded, and answers what its parent does with it, one only
+/// marked dirty as deleted named to its parent for that check. A node that was not staged
+/// and holds staged content, or a dirty add that holds a staged node, is staged first, its
+/// ancestors with it, as staging that node would have staged it ([`stage_holder`]), its dirty move
+/// or add with it. One that holds only staged directories that no staged content lies below, as a
 /// staged move out of them leaves them for the rehash, keeps its dirty move out and is staged
 /// once its dirty flags are cleared, so the commit reaches them.
 ///
@@ -6956,12 +7210,14 @@ async fn prune_dirty_leave(
     repository: &Arc<RepositoryContext>,
     level: PruneLevel,
     context: &mut PruneContext,
-) -> Result<bool, CommitError> {
+) -> Result<Leave, CommitError> {
     let PruneLevel {
         node_id,
         block,
         to_discard,
+        replaced_from,
         holds_staged,
+        staged_child,
         holds_content,
         entered_staged,
         ..
@@ -6971,6 +7227,19 @@ async fn prune_dirty_leave(
             .await
             .forward::<CommitError>("Failed discarding dirty node")?;
     }
+    if staged_child && context.replaced.len() > replaced_from {
+        let PruneContext {
+            replaced, deleted, ..
+        } = &mut *context;
+        Box::pin(take_replaced_deletions(
+            state,
+            repository,
+            node_id,
+            (&mut replaced[replaced_from..], deleted),
+        ))
+        .await?;
+    }
+    context.replaced.truncate(replaced_from);
 
     let is_root = node_id == ROOT_NODE;
     let (flags, child_now, link, parent) = {
@@ -6982,6 +7251,10 @@ async fn prune_dirty_leave(
             node.parent,
         )
     };
+    let replaced = !is_root
+        && link.is_none()
+        && flags.contains(NodeFlags::DirtyDelete)
+        && !flags.contains(NodeFlags::Staged);
     let is_staged = flags.contains(NodeFlags::Staged) || holds_staged;
     let takes_move = flags.contains(NodeFlags::Staged) || holds_content;
     let promotes = holds_content || (holds_staged && flags.contains(NodeFlags::DirtyAdd));
@@ -7001,7 +7274,7 @@ async fn prune_dirty_leave(
     }
 
     if !is_staged && flags.contains(NodeFlags::DirtyAdd) && !is_root {
-        return Ok(true);
+        return Ok(Leave::Discard);
     }
 
     if !takes_move
@@ -7009,7 +7282,7 @@ async fn prune_dirty_leave(
         && !is_root
         && return_unstaged_move(state, repository, context, node_id, flags).await?
     {
-        return Ok(true);
+        return Ok(Leave::Discard);
     }
 
     if flags.contains(NodeFlags::Dirty) {
@@ -7027,13 +7300,122 @@ async fn prune_dirty_leave(
         || child_now.is_valid_node_id()
         || is_root
     {
-        return Ok(false);
+        return Ok(kept(&block, node_id, replaced));
     }
 
     let tracked = Box::pin(state.base_holds(repository, context.base, node_id, flags.node_type()))
         .await
         .forward::<CommitError>("Failed reading the revision the staged tree was built on")?;
-    Ok(!tracked)
+    Ok(if tracked {
+        kept(&block, node_id, replaced)
+    } else {
+        Leave::Discard
+    })
+}
+
+/// What [`prune_dirty_leave`] answers for `node`, which `block` holds, kept in the tree:
+/// [`Leave::Replaced`] with its name hash where it was only marked dirty as deleted (`replaced`),
+/// and [`Leave::Keep`] otherwise.
+fn kept(block: &NodeBlock, node: NodeID, replaced: bool) -> Leave {
+    if replaced {
+        Leave::Replaced(block.node(Node::index(node)).name_hash)
+    } else {
+        Leave::Keep
+    }
+}
+
+/// What [`prune_dirty_leave`] leaves its node's parent to do with it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Leave {
+    /// Keep it as it stands.
+    Keep,
+    /// Discard it with its subtree.
+    Discard,
+    /// Keep it, a node only marked dirty as deleted carrying this name hash, whose deletion its
+    /// parent stages where a staged child of the name replaces it ([`take_replaced_deletions`]).
+    Replaced(u64),
+}
+
+/// Stages the deletion of each of `replaced`, the children of `directory` only marked dirty as
+/// deleted, each with its name hash, that a staged child not marked deleted stands beside under its
+/// name, as the working tree holds that child at the name and a revision holds one node of a name
+/// ([`stage_replaced_subtree`]), recording each of them in `deleted`. One pass over the
+/// directory's children, which its caller takes only where a child of it is staged and boxes.
+async fn take_replaced_deletions(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    directory: NodeID,
+    (replaced, deleted): (&mut [(NodeID, u64)], &mut Vec<NodeID>),
+) -> Result<(), CommitError> {
+    replaced.sort_unstable_by_key(|&(_, name_hash)| name_hash);
+    let mut held: SmallVec<[u64; 1]> = SmallVec::new();
+    let mut children = StateNodeChildrenIterator::new(state.clone(), repository.clone(), directory)
+        .await
+        .forward::<CommitError>("Failed reading a directory holding a deletion marked dirty")?;
+    while let Some((_, child)) = children
+        .next()
+        .await
+        .forward::<CommitError>("Failed reading a child beside a deletion marked dirty")?
+    {
+        if child.is_staged()
+            && !child.is_deleted()
+            && replaced
+                .binary_search_by_key(&child.name_hash, |&(_, name_hash)| name_hash)
+                .is_ok()
+        {
+            held.push(child.name_hash);
+        }
+    }
+    held.sort_unstable();
+    for &(node, name_hash) in replaced.iter() {
+        if held.binary_search(&name_hash).is_ok() {
+            stage_replaced_subtree(state, repository, node, deleted).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Stages the deletion of `node`, a node a staged node of its name replaces, with its subtree, as a
+/// staged move onto a held name stages the deletion of what it replaces
+/// ([`stage_subtree_deletion`]); records `node` in `deleted`, as only its path is one the commit
+/// marks again.
+async fn stage_replaced_subtree(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    node: NodeID,
+    deleted: &mut Vec<NodeID>,
+) -> Result<(), CommitError> {
+    stage_subtree_deletion(state, repository, node).await?;
+    deleted.push(node);
+    Ok(())
+}
+
+/// Stages the deletion of `node` and of each node below it not staged for deletion already, so the
+/// commit records each ([`State::node_mark_subtree`]).
+async fn stage_subtree_deletion(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    node: NodeID,
+) -> Result<(), CommitError> {
+    const DELETED: Mark = Mark::staged(NodeFlags::StagedDelete, true);
+    let is_directory = state
+        .node(repository.clone(), node)
+        .await
+        .forward::<CommitError>("Failed reading a node whose deletion the commit stages")?
+        .is_directory();
+    state
+        .node_mark(repository, node, DELETED)
+        .await
+        .forward::<CommitError>("Failed staging the deletion of a node")?;
+    if !is_directory {
+        return Ok(());
+    }
+    state
+        .node_mark_subtree(repository, node, |_, record| {
+            (!record.is_staged_delete()).then_some(DELETED)
+        })
+        .await
+        .forward::<CommitError>("Failed staging the deletion of a directory")
 }
 
 /// Stages `node`, which holds a staged node, its ancestors with it. Boxed by its caller, as only
@@ -7052,7 +7434,9 @@ async fn stage_holder(
 /// Returns `node_id`, carrying `flags`, a move marked dirty and not staged, to the place the base
 /// revision holds it at, as [`State::node_return_unstaged_move`] does, recording it in `context`,
 /// and as waiting where it waits; answers `true` where its parent is to discard it, as it cannot
-/// go back.
+/// go back. A node put back in a directory staged for deletion is staged for deletion with its
+/// subtree, as the stage of the directory's deletion marked each node it held then
+/// ([`stage_subtree_deletion`]).
 async fn return_unstaged_move(
     state: &Arc<State>,
     repository: &Arc<RepositoryContext>,
@@ -7069,6 +7453,7 @@ async fn return_unstaged_move(
             ReturnOptions {
                 want_path: true,
                 park: true,
+                beside: false,
             },
         )
         .await
@@ -7077,12 +7462,46 @@ async fn return_unstaged_move(
         node: node_id,
         node_type: flags.node_type(),
         path,
+        below_deleted: context.deleted_above > 0,
     });
     if returned == Return::Parked {
         context.waiting.push(node_id);
     }
     context.returned.extend(moved);
+    if matches!(returned, Return::Back | Return::Parked)
+        && returned_into_deletion(state, repository, node_id).await?
+    {
+        Box::pin(stage_subtree_deletion(state, repository, node_id)).await?;
+    }
     Ok(returned == Return::Displaced)
+}
+
+/// Whether the parent of `node` is staged for deletion ([`place_staged_for_deletion`]).
+async fn returned_into_deletion(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+    node: NodeID,
+) -> Result<bool, CommitError> {
+    let parent = state
+        .node(repository.clone(), node)
+        .await
+        .forward::<CommitError>("Failed reading a returned move")?
+        .parent;
+    place_staged_for_deletion(state, repository, parent).await
+}
+
+/// Whether `directory`, the committed place of a moved node, is staged for deletion. The stage of a
+/// directory's deletion marks each node it holds, so its own mark answers for each one above it.
+async fn place_staged_for_deletion(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+    directory: NodeID,
+) -> Result<bool, CommitError> {
+    Ok(state
+        .node(repository.clone(), directory)
+        .await
+        .forward::<CommitError>("Failed reading the committed place of a moved node")?
+        .is_staged_delete())
 }
 
 /// Settles the moves [`prune_dirty_for_commit`] left waiting, once its walk has discarded every

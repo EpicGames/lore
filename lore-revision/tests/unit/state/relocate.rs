@@ -1114,6 +1114,126 @@ async fn a_staged_move_marks_both_directories_and_their_ancestors() {
     .await;
 }
 
+/// A staged move of a directory, as the C API's move records it, leaves a child only marked dirty
+/// as deleted as it is and stages a child only marked dirty as added as an addition, as the CLI's
+/// moves do, and stages a moved node only marked dirty as added as an addition too.
+#[tokio::test]
+async fn a_staged_move_keeps_a_dirty_deletion_and_stages_a_dirty_add_as_an_add() {
+    with_state(|repository, state| async move {
+        let source = add(
+            &state,
+            &repository,
+            ROOT_NODE,
+            committed_directory("src"),
+            "src",
+        )
+        .await;
+        let destination = add(&state, &repository, ROOT_NODE, directory("dst"), "dst").await;
+        let deleted = add(&state, &repository, source, file("d"), "d").await;
+        let added = add(&state, &repository, source, file("n"), "n").await;
+        let moved_with = add(&state, &repository, source, file("k"), "k").await;
+        let loose = add(&state, &repository, ROOT_NODE, file("x"), "x").await;
+        for (node, flags) in [
+            (deleted, NodeFlags::DirtyDelete),
+            (added, NodeFlags::DirtyAdd),
+            (loose, NodeFlags::DirtyAdd),
+        ] {
+            state
+                .node_mark(&repository, node, Mark::dirty(flags, Ext::Keep, true))
+                .await
+                .expect("the dirty mark");
+        }
+
+        let permit = state.moves_permit().await.expect("the moves permit");
+        for (node, name) in [(source, "src"), (loose, "x")] {
+            state
+                .node_move_staged(
+                    repository.clone(),
+                    node,
+                    destination,
+                    (name, hash_string(name)),
+                    &permit,
+                    false,
+                )
+                .await
+                .expect("the move");
+        }
+
+        let held = record(&state, &repository, deleted).await;
+        assert!(
+            held.is_dirty_delete() && !held.is_staged(),
+            "the dirty deletion, flags {:#x}",
+            held.flags
+        );
+        for node in [added, loose] {
+            let held = record(&state, &repository, node).await;
+            assert!(held.is_staged_add(), "node {node}, flags {:#x}", held.flags);
+        }
+        let held = record(&state, &repository, moved_with).await;
+        assert!(held.is_staged_move(), "flags {:#x}", held.flags);
+    })
+    .await;
+}
+
+/// A staged move of a directory only marked dirty as deleted, as the C API's move records it,
+/// moves the nodes its deletion marked deleted with it, as the CLI's moves do.
+#[tokio::test]
+async fn a_staged_move_of_a_dirty_deleted_directory_moves_its_subtree() {
+    with_state(|repository, state| async move {
+        let source = add(
+            &state,
+            &repository,
+            ROOT_NODE,
+            committed_directory("src"),
+            "src",
+        )
+        .await;
+        let destination = add(&state, &repository, ROOT_NODE, directory("dst"), "dst").await;
+        let below = add(
+            &state,
+            &repository,
+            source,
+            committed_directory("sub"),
+            "sub",
+        )
+        .await;
+        let file_below = add(&state, &repository, below, file("f"), "f").await;
+        for node in [source, below, file_below] {
+            state
+                .node_mark(
+                    &repository,
+                    node,
+                    Mark::dirty(NodeFlags::DirtyDelete, Ext::Keep, true),
+                )
+                .await
+                .expect("the dirty deletion");
+        }
+
+        let permit = state.moves_permit().await.expect("the moves permit");
+        state
+            .node_move_staged(
+                repository.clone(),
+                source,
+                destination,
+                ("src", hash_string("src")),
+                &permit,
+                false,
+            )
+            .await
+            .expect("the move");
+
+        for node in [source, below, file_below] {
+            let held = record(&state, &repository, node).await;
+            assert!(
+                held.is_staged_move() && !held.is_deleted(),
+                "node {node}, flags {:#x}",
+                held.flags
+            );
+        }
+    })
+    .await;
+}
+
 /// A staged move notes a node not staged for addition moved into a directory staged for addition,
 /// before which a tracked node moved into a tracked directory and an added node moved into an
 /// added one note nothing.

@@ -1044,8 +1044,8 @@ impl StageDescent {
     /// Each component is staged under the name `remainder_path` spells it with, which the caller
     /// resolves against the file system, so `stage_node_from_metadata` does not look up its case
     /// again. The first component is the child `known` answers where the caller established it,
-    /// and every later one is looked up in its directory, once, a node not staged for deletion
-    /// before one that is ([`State::find_live_subnode`]): the search a directory takes for the
+    /// and every later one is looked up in its directory, once, a node not marked deleted before
+    /// one that is ([`State::find_live_subnode`]): the search a directory takes for the
     /// nested repository check answers its stage as well. The final component is the staged
     /// path, staged as `info`; every other one is staged as a directory. `Some` is the link of a
     /// component that was not staged, which ends the descent.
@@ -2550,8 +2550,9 @@ pub(crate) async fn claim_child(
 }
 
 /// `claimed`, the child of `children`'s directory an entry carrying `name_hash` claimed, or,
-/// where it is staged for deletion, the first other child carrying the name hash that is not,
-/// claimed now too, so the pass over what nothing claimed leaves both ([`State::live_among`]).
+/// where it is marked deleted, the other child carrying the name hash that
+/// [`State::live_among`] prefers, claimed now too, so the pass over what nothing claimed leaves
+/// both.
 async fn claim_live(
     repository: &Arc<RepositoryContext>,
     state: &State,
@@ -3326,8 +3327,8 @@ async fn holds_both_spellings(
 }
 
 /// Stage the child `name` of `base` from the file information the caller already holds, the child
-/// `known_child` answers or, unresolved, the one a search finds, a node not staged for deletion
-/// before one that is ([`State::find_live_subnode`]).
+/// `known_child` answers or, unresolved, the one a search finds, a node not marked deleted before
+/// one that is ([`State::find_live_subnode`]).
 ///
 /// `parent_states` is the filter verdict for `base`'s path, which the child named here steps from
 /// rather than folding its whole path.

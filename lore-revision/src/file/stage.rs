@@ -459,7 +459,7 @@ impl TargetDirectory {
 
     /// The child carrying `name_hash` in the listing; unresolved where nothing is listed and
     /// where two children carry `name_hash`, so the stage walk's search answers, which takes a node
-    /// not staged for deletion before one that is ([`State::find_live_subnode`]).
+    /// not marked deleted before one that is ([`State::find_live_subnode`]).
     fn child(&self, name_hash: u64) -> KnownChild {
         let Self::Listed(children) = self else {
             return KnownChild::Unresolved;
@@ -1329,62 +1329,26 @@ pub(crate) async fn stage_directory_move(
 /// node added, staged or dirty, stays an addition. A node deleted, staged or dirty, is left as it
 /// is and not descended into, as a mark of the move would take the deletion off it: the two halves
 /// share their action bits. Where the moved directory was deleted itself (`undelete`), every node
-/// below carries its deletion, which the move takes off them all.
+/// below carries its deletion, which the move takes off them all. One walk of the subtree
+/// ([`State::node_mark_subtree`]), boxed by this function, as only a directory's move takes it.
 async fn mark_children_moved(
-    repository: Arc<RepositoryContext>,
-    state: Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
     parent_node: crate::node::NodeID,
     move_flag: NodeFlags,
     undelete: bool,
 ) -> Result<(), crate::state::StateError> {
-    use std::future::Future;
-    use std::pin::Pin;
-
-    fn mark_children_moved_recursive(
-        repository: Arc<RepositoryContext>,
-        state: Arc<State>,
-        parent_node: crate::node::NodeID,
-        move_flag: NodeFlags,
-        undelete: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<(), crate::state::StateError>> + Send>> {
-        Box::pin(async move {
-            let children = state.node_children(repository.clone(), parent_node).await?;
-
-            for child_id in children {
-                let (deleted, added, is_directory) = {
-                    let child = state.node(repository.clone(), child_id).await?;
-                    (child.is_deleted(), child.is_added(), child.is_directory())
-                };
-                if !undelete && deleted {
-                    continue;
-                }
-
-                let child_flag = if added {
-                    NodeFlags::StagedAdd
-                } else {
-                    move_flag
-                };
-                state
-                    .node_mark(&repository, child_id, Mark::staged(child_flag, false))
-                    .await?;
-
-                if is_directory {
-                    mark_children_moved_recursive(
-                        repository.clone(),
-                        state.clone(),
-                        child_id,
-                        move_flag,
-                        undelete,
-                    )
-                    .await?;
-                }
-            }
-
-            Ok(())
-        })
-    }
-
-    mark_children_moved_recursive(repository, state, parent_node, move_flag, undelete).await
+    Box::pin(
+        state.node_mark_subtree(repository, parent_node, |_, child| {
+            let child_flag = if child.is_added() {
+                NodeFlags::StagedAdd
+            } else {
+                move_flag
+            };
+            (undelete || !child.is_deleted()).then_some(Mark::staged(child_flag, false))
+        }),
+    )
+    .await
 }
 
 /// Marks each of `paths` as merged, reporting the counts staged so far while one runs.
@@ -1589,7 +1553,7 @@ pub async fn stage_move(
     let mut parent_options = options;
     parent_options.no_children = true;
 
-    let parent = with_operation(repository.file_system(), async |operation| {
+    let parent_link = with_operation(repository.file_system(), async |operation| {
         let to_info = operation
             .file_info(&to_path)
             .await
@@ -1634,8 +1598,14 @@ pub async fn stage_move(
         ))
         .await
     })
-    .await?
-    .node;
+    .await?;
+    if parent_link.repository != repository.id {
+        return Err(StageError::internal(format!(
+            "The parent of the move's destination {to_path} lies in a linked repository, past \
+             the refusal of a destination in or through a link"
+        )));
+    }
+    let parent = parent_link.node;
 
     let from_name = from_path.name();
     let to_name = to_path.name();
@@ -1680,15 +1650,9 @@ pub async fn stage_move(
 
     // If this is a directory move, recursively mark all children as moved
     if is_directory {
-        mark_children_moved(
-            repository.clone(),
-            state.clone(),
-            from_node,
-            move_flag,
-            deleted,
-        )
-        .await
-        .forward::<StageError>("Failed to mark node as staged")?;
+        mark_children_moved(&repository, &state, from_node, move_flag, deleted)
+            .await
+            .forward::<StageError>("Failed to mark node as staged")?;
     }
     let left_committed = left != parent
         && left != ROOT_NODE

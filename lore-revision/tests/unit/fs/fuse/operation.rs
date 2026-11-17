@@ -1702,6 +1702,102 @@ async fn a_marking_diff_marks_a_case_only_rename_as_a_move() {
     .await;
 }
 
+/// The directory inode holding `path` and its last name.
+async fn parent_and_name<'a>(fs: &FuseFilesystem, path: &'a str) -> (u64, &'a str) {
+    match path.rsplit_once('/') {
+        Some((parent, name)) => (
+            ino_at(fs, parent)
+                .await
+                .unwrap_or_else(|| panic!("{parent} is served")),
+            name,
+        ),
+        None => (ROOT_INO, path),
+    }
+}
+
+/// Renames `from` to `to` through the mount, then marks the move dirty, as `lore dirty move` does.
+async fn dirty_moved(w: &Working, from: &str, to: &str) {
+    let (from_parent, from_name) = parent_and_name(&w.fs, from).await;
+    let (to_parent, to_name) = parent_and_name(&w.fs, to).await;
+    rename(&w.fs, from_parent, from_name, to_parent, to_name).await;
+    let token = RepositoryWriteToken::acquire(&w.path).await;
+    lore_revision::file::dirty::dirty_move(
+        w.command_context(&w.fs, Some(token)),
+        w.path.join(from).to_string_lossy().into_owned(),
+        w.path.join(to).to_string_lossy().into_owned(),
+    )
+    .await
+    .expect("the dirty move");
+}
+
+/// Moves the file at `path` to the front of its directory's children, so a walk of them meets it
+/// first: to the root and back, each move marked dirty.
+async fn to_front(w: &Working, path: &str) {
+    let through = path.replace('/', "_");
+    dirty_moved(w, path, &through).await;
+    dirty_moved(w, &through, path).await;
+}
+
+/// A status through the mount of a name `lore dirty move` took from a committed file reports that
+/// file's deletion and the move: the name the mount holds pairs with the moved file, not the one
+/// marked deleted beside it, whichever of the two the staged chain holds first. A move from another
+/// directory puts the moved file ahead, and a rename in place keeps its place, which `to_front`
+/// sets before the deletion.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_through_the_mount_of_a_name_a_dirty_move_took_reports_the_deletion_and_the_move()
+{
+    in_context(async {
+        let mut orders = std::collections::BTreeSet::new();
+        for (source, front) in [("b", None), ("a/g", Some("a/f")), ("a/g", Some("a/g"))] {
+            let w = working(&[("a/f", b"eff"), ("a/g", b"gee"), ("b", b"bee")]).await;
+            if let Some(front) = front {
+                to_front(&w, front).await;
+            }
+            dirty_moved(&w, source, "a/f").await;
+            let case = format!("{source} onto a/f, {front:?} at the front");
+
+            let staged = w.staged().await;
+            let a_node = staged
+                .find_node_link(w.repository.clone(), "a")
+                .await
+                .expect("a")
+                .node;
+            let first = staged
+                .node_children(w.repository.clone(), a_node)
+                .await
+                .expect("the children of a")
+                .into_iter()
+                .next()
+                .expect("a child of a");
+            orders.insert(
+                staged
+                    .node(w.repository.clone(), first)
+                    .await
+                    .expect("the first child of a")
+                    .is_deleted(),
+            );
+            let token = RepositoryWriteToken::acquire(&w.path).await;
+            let mut reported = crate::helper::test_status_events_at(
+                w.command_context(&w.fs, Some(token)),
+                None,
+                false,
+            )
+            .await;
+            reported.sort_by_key(|(path, action, _)| (path.clone(), *action as u32));
+            assert_eq!(
+                reported,
+                vec![
+                    ("a/f".to_string(), LoreFileAction::Delete, true),
+                    ("a/f".to_string(), LoreFileAction::Move, true),
+                ],
+                "{case}"
+            );
+        }
+        assert_eq!(orders.len(), 2, "both chain orders");
+    })
+    .await;
+}
+
 /// A file renamed only in case below a directory is reported under its new spelling as a move,
 /// as one at the root is: the walk reaches the directory holding it.
 #[tokio::test]
