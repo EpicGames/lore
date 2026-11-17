@@ -115,10 +115,16 @@ fn copy_children_of_leaves_the_record_intact() {
     record.record(1, 6, b"file", true);
     record.record(2, 7, b"inner", true);
 
+    record.record(3, 8, b"other", true);
+
     let mut out = Vec::new();
-    record.copy_children_of(1, &mut out);
+    record.copy_children_of(&[1, 2], &mut out);
     out.sort();
-    assert_eq!(out, [&b"Dir"[..], b"dir", b"file"].map(Name::from_slice));
+    assert_eq!(
+        out,
+        [(1, &b"Dir"[..]), (1, b"dir"), (1, b"file"), (2, b"inner")]
+            .map(|(parent, name)| (parent, Name::from_slice(name)))
+    );
     assert_eq!(record.take(1, 5).map(|s| s.seen.len()), Some(2));
     assert!(record.take(2, 7).is_some());
 }

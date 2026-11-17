@@ -477,69 +477,73 @@ fn session_config() -> SessionConfig {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn stat_of_root_after_init_is_dir() {
-    skip_without_fuse!();
+mod needs_fuse {
+    use super::*;
 
-    let dir = TempDir::new("lore-fuse-session-stat-test-");
-    let options = MountOptions {
-        fsname: "lore:session-stat".to_string(),
-        max_read: 1 << 20,
-        fusermount: None,
-    };
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stat_of_root_after_init_is_dir() {
+        skip_without_fuse!();
 
-    let mount_handle = Arc::new(mount(dir.path(), &options).expect("mount"));
-    let guard = PathUnmountGuard(dir.path().to_path_buf());
+        let dir = TempDir::new("lore-fuse-session-stat-test-");
+        let options = MountOptions {
+            fsname: "lore:session-stat".to_string(),
+            max_read: 1 << 20,
+            fusermount: None,
+        };
 
-    let transport = Arc::new(DeviceTransport::new(Arc::clone(&mount_handle)));
-    let fs = Arc::new(RootOnlyFilesystem);
+        let mount_handle = Arc::new(mount(dir.path(), &options).expect("mount"));
+        let guard = PathUnmountGuard(dir.path().to_path_buf());
 
-    let session = Session::start(fs, transport, session_config())
-        .await
-        .expect("INIT must negotiate against a real kernel");
+        let transport = Arc::new(DeviceTransport::new(Arc::clone(&mount_handle)));
+        let fs = Arc::new(RootOnlyFilesystem);
 
-    let path = dir.path().to_path_buf();
-    let metadata = lore_base::lore_spawn_blocking!(move || std::fs::metadata(&path))
-        .await
-        .expect("spawn_blocking must not panic")
-        .expect("stat must succeed against the mounted root");
+        let session = Session::start(fs, transport, session_config())
+            .await
+            .expect("INIT must negotiate against a real kernel");
 
-    assert!(
-        metadata.is_dir(),
-        "the mount root must report as a directory"
-    );
+        let path = dir.path().to_path_buf();
+        let metadata = lore_base::lore_spawn_blocking!(move || std::fs::metadata(&path))
+            .await
+            .expect("spawn_blocking must not panic")
+            .expect("stat must succeed against the mounted root");
 
-    session.shutdown().await;
-    unmount_with_retry(dir.path()).await;
-    drop(guard);
-}
+        assert!(
+            metadata.is_dir(),
+            "the mount root must report as a directory"
+        );
 
-#[tokio::test(flavor = "multi_thread")]
-async fn session_ends_after_unmount() {
-    skip_without_fuse!();
+        session.shutdown().await;
+        unmount_with_retry(dir.path()).await;
+        drop(guard);
+    }
 
-    let dir = TempDir::new("lore-fuse-session-unmount-test-");
-    let options = MountOptions {
-        fsname: "lore:session-unmount".to_string(),
-        max_read: 1 << 20,
-        fusermount: None,
-    };
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_ends_after_unmount() {
+        skip_without_fuse!();
 
-    let mount_handle = Arc::new(mount(dir.path(), &options).expect("mount"));
-    let guard = PathUnmountGuard(dir.path().to_path_buf());
+        let dir = TempDir::new("lore-fuse-session-unmount-test-");
+        let options = MountOptions {
+            fsname: "lore:session-unmount".to_string(),
+            max_read: 1 << 20,
+            fusermount: None,
+        };
 
-    let transport = Arc::new(DeviceTransport::new(Arc::clone(&mount_handle)));
-    let fs = Arc::new(RootOnlyFilesystem);
+        let mount_handle = Arc::new(mount(dir.path(), &options).expect("mount"));
+        let guard = PathUnmountGuard(dir.path().to_path_buf());
 
-    let session = Session::start(fs, transport, session_config())
-        .await
-        .expect("INIT must negotiate against a real kernel");
+        let transport = Arc::new(DeviceTransport::new(Arc::clone(&mount_handle)));
+        let fs = Arc::new(RootOnlyFilesystem);
 
-    unmount_with_retry(dir.path()).await;
+        let session = Session::start(fs, transport, session_config())
+            .await
+            .expect("INIT must negotiate against a real kernel");
 
-    tokio::time::timeout(Duration::from_secs(5), session.wait())
-        .await
-        .expect("the worker loop must end once the device disconnects");
+        unmount_with_retry(dir.path()).await;
 
-    drop(guard);
+        tokio::time::timeout(Duration::from_secs(5), session.wait())
+            .await
+            .expect("the worker loop must end once the device disconnects");
+
+        drop(guard);
+    }
 }

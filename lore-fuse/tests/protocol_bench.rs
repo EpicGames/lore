@@ -140,82 +140,86 @@ fn forget_family_count(session: &Session<SyntheticFs, DeviceTransport>) -> u64 {
     metrics.snapshot(Opcode::Forget).count + metrics.snapshot(Opcode::BatchForget).count
 }
 
-/// Decision 21's zero-allocation assertion: `Session` with a single worker on a `current_thread`
-/// runtime, so the session's own worker executes every request on one stable OS thread -- the
-/// same thread `dispatch()`'s thread-local allocation counter (spec: "Allocation discipline")
-/// then measures. All syscalls against the mount are driven from a plain `std::thread`, never
-/// this test's own runtime thread.
-#[tokio::test(flavor = "current_thread")]
-async fn allocations_per_opcode_are_zero_after_warmup() {
-    skip_without_fuse!();
+mod needs_fuse {
+    use super::*;
 
-    let dir = TempDir::new("lore-fuse-protocol-bench-alloc-test-");
-    let fs = SyntheticFs::from_tree(bench_tree(4096));
-    let (_mount, session) = mount_synthetic(dir.path(), fs, session_config())
-        .await
-        .expect("mount must negotiate against a real kernel");
-    let guard = PathUnmountGuard(dir.path().to_path_buf());
-    let notifier = session.notifier().expect("notifier must be available");
-    let root = dir.path().to_path_buf();
+    /// Decision 21's zero-allocation assertion: `Session` with a single worker on a `current_thread`
+    /// runtime, so the session's own worker executes every request on one stable OS thread -- the
+    /// same thread `dispatch()`'s thread-local allocation counter (spec: "Allocation discipline")
+    /// then measures. All syscalls against the mount are driven from a plain `std::thread`, never
+    /// this test's own runtime thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn allocations_per_opcode_are_zero_after_warmup() {
+        skip_without_fuse!();
 
-    // Warmup pass, no allocation counting: absorbs one-time costs (lazy static data, first-touch
-    // page faults, buffer growth) that would otherwise look like a per-opcode allocation.
-    run_pass(&root, &notifier, "warmup").await;
-    let warmup_deadline = Instant::now() + Duration::from_secs(2);
-    while forget_family_count(&session) == 0 {
-        assert!(
-            Instant::now() < warmup_deadline,
-            "the warmup pass's explicit inval_entry must produce a real FORGET/BATCH_FORGET"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+        let dir = TempDir::new("lore-fuse-protocol-bench-alloc-test-");
+        let fs = SyntheticFs::from_tree(bench_tree(4096));
+        let (_mount, session) = mount_synthetic(dir.path(), fs, session_config())
+            .await
+            .expect("mount must negotiate against a real kernel");
+        let guard = PathUnmountGuard(dir.path().to_path_buf());
+        let notifier = session.notifier().expect("notifier must be available");
+        let root = dir.path().to_path_buf();
 
-    let before_forget = forget_family_count(&session);
-    lore_base::allocator::set_allocation_counting(true);
-    let _restore = DisableCountingOnDrop;
-    run_pass(&root, &notifier, "measured").await;
+        // Warmup pass, no allocation counting: absorbs one-time costs (lazy static data, first-touch
+        // page faults, buffer growth) that would otherwise look like a per-opcode allocation.
+        run_pass(&root, &notifier, "warmup").await;
+        let warmup_deadline = Instant::now() + Duration::from_secs(2);
+        while forget_family_count(&session) == 0 {
+            assert!(
+                Instant::now() < warmup_deadline,
+                "the warmup pass's explicit inval_entry must produce a real FORGET/BATCH_FORGET"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
-    let measured_deadline = Instant::now() + Duration::from_secs(2);
-    while forget_family_count(&session) == before_forget {
-        assert!(
-            Instant::now() < measured_deadline,
-            "the measured pass's explicit inval_entry must produce a real FORGET/BATCH_FORGET"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+        let before_forget = forget_family_count(&session);
+        lore_base::allocator::set_allocation_counting(true);
+        let _restore = DisableCountingOnDrop;
+        run_pass(&root, &notifier, "measured").await;
 
-    for &op in &[
-        Opcode::Lookup,
-        Opcode::Getattr,
-        Opcode::Open,
-        Opcode::Read,
-        Opcode::Release,
-        Opcode::Readdirplus,
-        Opcode::Statfs,
-    ] {
-        let snapshot = session.metrics().snapshot(op);
-        assert!(
-            snapshot.count > 0,
-            "{op:?} must have been exercised at least once, got {snapshot:?}"
-        );
-        assert_eq!(
-            snapshot.max_allocations, 0,
-            "{op:?} must not allocate: {snapshot:?}"
-        );
-    }
-    for &op in &[Opcode::Forget, Opcode::BatchForget] {
-        let snapshot = session.metrics().snapshot(op);
-        if snapshot.count > 0 {
+        let measured_deadline = Instant::now() + Duration::from_secs(2);
+        while forget_family_count(&session) == before_forget {
+            assert!(
+                Instant::now() < measured_deadline,
+                "the measured pass's explicit inval_entry must produce a real FORGET/BATCH_FORGET"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        for &op in &[
+            Opcode::Lookup,
+            Opcode::Getattr,
+            Opcode::Open,
+            Opcode::Read,
+            Opcode::Release,
+            Opcode::Readdirplus,
+            Opcode::Statfs,
+        ] {
+            let snapshot = session.metrics().snapshot(op);
+            assert!(
+                snapshot.count > 0,
+                "{op:?} must have been exercised at least once, got {snapshot:?}"
+            );
             assert_eq!(
                 snapshot.max_allocations, 0,
                 "{op:?} must not allocate: {snapshot:?}"
             );
         }
-    }
+        for &op in &[Opcode::Forget, Opcode::BatchForget] {
+            let snapshot = session.metrics().snapshot(op);
+            if snapshot.count > 0 {
+                assert_eq!(
+                    snapshot.max_allocations, 0,
+                    "{op:?} must not allocate: {snapshot:?}"
+                );
+            }
+        }
 
-    drop(_restore);
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
-        .await
-        .expect("shutdown must complete promptly");
-    drop(guard);
+        drop(_restore);
+        tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+            .await
+            .expect("shutdown must complete promptly");
+        drop(guard);
+    }
 }

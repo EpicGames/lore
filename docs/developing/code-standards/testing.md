@@ -445,6 +445,32 @@ without the driver sets `LORE_TEST_NO_SWFS=1`, and they return at once, passing
 without testing anything. A new Rust test that mounts SWFS must check
 that variable first.
 
+### Running the FUSE tests
+
+The tests that mount FUSE run on Linux, with `/dev/fuse` open to the user running
+them and `fusermount3` on `PATH`. Without either, the smoke tests in
+`test_fuse.py` skip, and the Rust tests return at once, passing without testing
+anything, as they do when `LORE_TEST_SKIP_FUSE` is set.
+
+A Rust test that mounts FUSE is declared in a module named `needs_fuse`, in one of
+the packages `lore_fuse::test_support::FUSE_TEST_PACKAGES` names, and starts with
+`lore_fuse::skip_without_fuse!()`, which panics in a test declared anywhere else.
+The filter `needs_fuse::` then selects every test that mounts, so CI runs them
+alone in a container that has `/dev/fuse`:
+
+```bash
+cargo test --release -p lore-fuse -p lore-revision -- needs_fuse::
+```
+
+The FUSE tests of `lore-integration-tests` also need its `integration_tests`
+feature and the services its integration tests use.
+
+A test that writes through a shared mapping of a mount its own process serves
+writes from a child process. In the test's process, the page fault waits for a
+WRITE the process's own session serves while it holds the mapping's lock, and a
+`fork` elsewhere in the process meanwhile keeps the session's threads from taking
+a page fault, so the WRITE is never served.
+
 ### Running the machine server's container tests
 
 The tests in `test_uds_containers.py` run a machine server with a container on

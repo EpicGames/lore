@@ -84,11 +84,14 @@ impl SpellingRecord {
         });
     }
 
-    /// Copies out every spelling recorded under `parent`, leaving the record as it is.
-    pub fn copy_children_of(&self, parent: u64, out: &mut Vec<Name>) {
+    /// Copies out every spelling recorded under each of `parents`, which are sorted, paired with
+    /// its parent, leaving the record as it is. One walk of the record serves every parent.
+    pub fn copy_children_of(&self, parents: &[u64], out: &mut Vec<(u64, Name)>) {
+        debug_assert!(parents.is_sorted(), "parents are sorted");
         for entry in self.keys.iter() {
-            if entry.key().0 == parent {
-                out.extend(entry.seen.iter().cloned());
+            let parent = entry.key().0;
+            if parents.binary_search(&parent).is_ok() {
+                out.extend(entry.seen.iter().map(|name| (parent, name.clone())));
             }
         }
     }

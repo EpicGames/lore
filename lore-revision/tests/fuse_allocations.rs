@@ -277,192 +277,6 @@ fn ino_of(path: &Path) -> u64 {
     std::fs::symlink_metadata(path).expect("stat").ino()
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn warm_lookup_getattr_readdirplus_open_release_forget_statfs_allocate_zero() {
-    skip_without_fuse!();
-    let _counting = COUNTING.lock().await;
-    let m = Box::pin(mount()).await;
-    let root = m.root.clone();
-
-    // Warm-up, uncounted: builds listings, creates every inode the measured pass touches, and
-    // answers the one OPEN a zero-message-open connection ever sends.
-    let (held, dir_ino, forget_ino, [warmup_ino, measured_ino]) = blocking({
-        let root = root.clone();
-        move || {
-            list_with_attributes(&root);
-            list_with_attributes(&root);
-            read_file(&root.join("warm.bin"));
-            let held = std::fs::File::open(root.join("dir/held.txt")).expect("open held");
-            forced_getattr(&held);
-            statvfs(&root);
-            (
-                held,
-                ino_of(&root.join("dir")),
-                ino_of(&root.join("forget")),
-                ["forget/warmup.txt", "forget/measured.txt"].map(|name| ino_of(&root.join(name))),
-            )
-        }
-    })
-    .await;
-    m.notifier
-        .inval_entry(forget_ino, b"warmup.txt", false)
-        .expect("inval_entry");
-    m.await_forgotten(warmup_ino).await;
-
-    // Make the kernel ask again: drop the held file's dentry (its open fd keeps the inode, so
-    // the provider still has it) and the root's cached directory pages.
-    m.notifier
-        .inval_entry(dir_ino, b"held.txt", false)
-        .expect("inval_entry");
-    m.notifier.inval_inode(ROOT_ID, 0, 0).expect("inval_inode");
-
-    const MEASURED: [Opcode; 4] = [
-        Opcode::Lookup,
-        Opcode::Getattr,
-        Opcode::Readdirplus,
-        Opcode::Statfs,
-    ];
-    let counts_before = MEASURED.map(|op| m.session.metrics().snapshot(op).count);
-    let before_forget = m.forgets();
-    lore_base::allocator::set_allocation_counting(true);
-    let restore = DisableCountingOnDrop;
-    let held = blocking({
-        let root = root.clone();
-        move || {
-            std::fs::symlink_metadata(root.join("dir/held.txt")).expect("lookup");
-            forced_getattr(&held);
-            list_with_attributes(&root);
-            statvfs(&root);
-            held
-        }
-    })
-    .await;
-    m.notifier
-        .inval_entry(forget_ino, b"measured.txt", false)
-        .expect("inval_entry");
-    m.await_forgotten(measured_ino).await;
-    assert!(m.forgets() > before_forget, "a FORGET ran while counting");
-    drop(restore);
-    drop(held);
-
-    let metrics = m.session.metrics();
-    for (op, before) in MEASURED.iter().zip(counts_before) {
-        assert!(
-            metrics.snapshot(*op).count > before,
-            "{op:?} must run in the measured pass"
-        );
-    }
-    for op in [
-        Opcode::Lookup,
-        Opcode::Getattr,
-        Opcode::Readdirplus,
-        Opcode::Open,
-        Opcode::Statfs,
-    ] {
-        let snapshot = metrics.snapshot(op);
-        assert!(snapshot.count > 0, "{op:?} must have run: {snapshot:?}");
-        assert_eq!(
-            snapshot.max_allocations, 0,
-            "{op:?} must not allocate: {snapshot:?}"
-        );
-    }
-    assert_eq!(
-        metrics.snapshot(Opcode::Open).count,
-        1,
-        "zero-message open: the kernel sends one OPEN per connection"
-    );
-    for op in [Opcode::Release, Opcode::Forget, Opcode::BatchForget] {
-        let snapshot = metrics.snapshot(op);
-        assert_eq!(
-            snapshot.max_allocations, 0,
-            "{op:?} must not allocate: {snapshot:?}"
-        );
-    }
-    assert!(m.fs.inodes().len() > 1);
-    m.shutdown().await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn read_of_local_fragment_reports_allocations_within_budget() {
-    skip_without_fuse!();
-    let _counting = COUNTING.lock().await;
-    let m = Box::pin(mount()).await;
-    let root = m.root.clone();
-
-    blocking({
-        let root = root.clone();
-        move || {
-            list_with_attributes(&root);
-            read_file(&root.join("warm.bin"));
-        }
-    })
-    .await;
-    let reads_before = m.session.metrics().snapshot(Opcode::Read).count;
-
-    lore_base::allocator::set_allocation_counting(true);
-    let restore = DisableCountingOnDrop;
-    blocking({
-        let root = root.clone();
-        move || read_file(&root.join("measured.bin"))
-    })
-    .await;
-    drop(restore);
-
-    let read = m.session.metrics().snapshot(Opcode::Read);
-    assert!(
-        read.count > reads_before,
-        "the measured read must reach the provider"
-    );
-    println!(
-        "READ of a local fragment: max_allocations = {} (budget {READ_ALLOCATION_BUDGET})",
-        read.max_allocations
-    );
-    assert!(
-        read.max_allocations <= READ_ALLOCATION_BUDGET,
-        "READ allocated {} times, over the budget of {READ_ALLOCATION_BUDGET}",
-        read.max_allocations
-    );
-    m.shutdown().await;
-}
-
-/// A hot READ of an uncompressed fragmented file under the default strategy, served from the leaves
-/// it keeps, allocates nothing.
-#[tokio::test(flavor = "current_thread")]
-async fn hot_read_of_an_uncompressed_fragmented_file_allocates_zero() {
-    skip_without_fuse!();
-    let _counting = COUNTING.lock().await;
-    let m = Box::pin(mount()).await;
-    let path = m.root.join("fragmented.bin");
-    // Eight pages span at most two leaves, each at least 32 KiB, which the default keeps.
-    let offsets: Arc<Vec<u64>> = Arc::new((0..8).map(|i| (1 << 20) + i * PAGE as u64).collect());
-    let expected = Arc::new(fuse_test_util::incompressible(
-        FRAGMENTED_LEN,
-        FRAGMENTED_SEED,
-    ));
-    blocking({
-        let (path, offsets, expected) = (path.clone(), offsets.clone(), expected.clone());
-        move || read_direct(&path, PAGE, &offsets, &expected)
-    })
-    .await;
-    let reads_before = m.session.metrics().snapshot(Opcode::Read).count;
-
-    lore_base::allocator::set_allocation_counting(true);
-    let restore = DisableCountingOnDrop;
-    blocking(move || read_direct(&path, PAGE, &offsets, &expected)).await;
-    drop(restore);
-
-    let read = m.session.metrics().snapshot(Opcode::Read);
-    assert!(
-        read.count >= reads_before + 8,
-        "every measured read reaches the provider"
-    );
-    assert_eq!(
-        read.max_allocations, 0,
-        "a hot READ of an uncompressed fragmented file must not allocate: {read:?}"
-    );
-    m.shutdown().await;
-}
-
 /// A writable provider on a read-write mount with one worker, its local changes in `external`.
 async fn mount_writable(external: &TempDir) -> Mounted {
     mount_writable_over(external, &[("keep.txt", b"k")]).await
@@ -555,92 +369,6 @@ fn write_direct(file: &std::fs::File, data: &fuse_test_util::Aligned, offsets: &
     }
 }
 
-/// Warm READ and WRITE of an open local file allocate nothing, the WRITEs through the write
-/// generation's bracket around their host operation.
-#[tokio::test(flavor = "current_thread")]
-async fn read_and_write_of_an_open_local_file_allocate_zero() {
-    skip_without_fuse!();
-    let _counting = COUNTING.lock().await;
-    let external = TempDir::new("lore-fuse-allocations-local-file-");
-    let m = Box::pin(mount_writable(&external)).await;
-    let path = m.root.join("output.o");
-    let len = 64 << 10;
-    let offsets: Vec<u64> = (0..8u64).map(|i| i * len as u64).collect();
-
-    // Warm-up, uncounted: CREATE caches the host file, and the kernel's first WRITE and READ
-    // of it land.
-    let (file, reader) = blocking({
-        let path = path.clone();
-        let offsets = offsets.clone();
-        move || {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .custom_flags(libc::O_DIRECT)
-                .open(&path)
-                .expect("create through the mount");
-            let data = fuse_test_util::Aligned::new(len);
-            write_direct(&file, &data, &offsets);
-            let reader = fuse_test_util::open_direct(&path);
-            let buf = fuse_test_util::Aligned::new(len);
-            assert_eq!(fuse_test_util::pread(&reader, &buf, len, 0), len);
-            (file, reader)
-        }
-    })
-    .await;
-    let metrics = m.session.metrics();
-    let (writes, reads) = (
-        metrics.snapshot(Opcode::Write).count,
-        metrics.snapshot(Opcode::Read).count,
-    );
-    let ino = blocking({
-        let path = path.clone();
-        move || ino_of(&path)
-    })
-    .await;
-    let generation = m.fs.write_generation(ino).expect("the output's inode");
-
-    lore_base::allocator::set_allocation_counting(true);
-    let restore = DisableCountingOnDrop;
-    blocking(move || {
-        let data = fuse_test_util::Aligned::new(len);
-        write_direct(&file, &data, &offsets);
-        let buf = fuse_test_util::Aligned::new(len);
-        for &offset in &offsets {
-            assert_eq!(fuse_test_util::pread(&reader, &buf, len, offset), len);
-        }
-        // Closing sends FLUSH, which only this runtime's thread can answer.
-        drop((file, reader));
-    })
-    .await;
-    drop(restore);
-
-    let write = metrics.snapshot(Opcode::Write);
-    let read = metrics.snapshot(Opcode::Read);
-    assert!(
-        write.count >= writes + 8,
-        "every measured WRITE reaches the provider"
-    );
-    assert!(
-        read.count >= reads + 8,
-        "every measured READ reaches the provider"
-    );
-    assert_eq!(
-        write.max_allocations, 0,
-        "WRITE must not allocate: {write:?}"
-    );
-    assert_eq!(read.max_allocations, 0, "READ must not allocate: {read:?}");
-    assert_eq!(
-        m.fs.write_generation(ino),
-        Some(generation + 2 * (write.count - writes)),
-        "each WRITE moved the write generation around its host operation"
-    );
-    m.shutdown().await;
-}
-
 /// Writes `files` under `external`'s `write/`, as earlier writes through a mount left them.
 // The test plants local content outside any repository write, as a mount does.
 #[allow(clippy::disallowed_methods)]
@@ -650,116 +378,6 @@ fn plant(external: &TempDir, files: &[(&str, &[u8])]) {
         std::fs::create_dir_all(at.parent().expect("a parent")).expect("parent directories");
         std::fs::write(&at, bytes).expect("a local file");
     }
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn warm_lookup_getattr_readdirplus_and_read_of_local_entries_allocate_zero() {
-    skip_without_fuse!();
-    let _counting = COUNTING.lock().await;
-    let external = TempDir::new("lore-fuse-allocations-local-");
-    let local = contents(3);
-    plant(
-        &external,
-        &[
-            ("local.bin", &local),
-            ("dir/local.txt", b"local"),
-            ("dir/held.txt", b"edited"),
-            ("made/inside.txt", b"inside"),
-        ],
-    );
-    let m = Box::pin(mount_writable_over(
-        &external,
-        &[("keep.txt", b"k"), ("dir/held.txt", b"held")],
-    ))
-    .await;
-    let root = m.root.clone();
-    let expected = Arc::new(local);
-
-    // Warm-up, uncounted: builds the listings, creates every inode the measured pass touches
-    // and opens their host files.
-    let (held, dir_ino) = blocking({
-        let root = root.clone();
-        let expected = expected.clone();
-        move || {
-            list_with_attributes(&root);
-            list_with_attributes(&root.join("dir"));
-            list_with_attributes(&root);
-            read_direct(&root.join("local.bin"), FILE_LEN, &[0], &expected);
-            let held = std::fs::File::open(root.join("dir/held.txt")).expect("open held");
-            forced_getattr(&held);
-            (held, ino_of(&root.join("dir")))
-        }
-    })
-    .await;
-    // Make the kernel ask again: drop the held file's dentry (its open fd keeps the inode, so
-    // the provider still has it) and the root's cached directory pages.
-    m.notifier
-        .inval_entry(dir_ino, b"held.txt", false)
-        .expect("inval_entry");
-    m.notifier.inval_inode(ROOT_ID, 0, 0).expect("inval_inode");
-
-    const MEASURED: [Opcode; 4] = [
-        Opcode::Lookup,
-        Opcode::Getattr,
-        Opcode::Readdirplus,
-        Opcode::Read,
-    ];
-    let counts_before = MEASURED.map(|op| m.session.metrics().snapshot(op).count);
-    lore_base::allocator::set_allocation_counting(true);
-    let restore = DisableCountingOnDrop;
-    let held = blocking({
-        let root = root.clone();
-        let expected = expected.clone();
-        move || {
-            std::fs::symlink_metadata(root.join("dir/held.txt")).expect("lookup");
-            forced_getattr(&held);
-            list_with_attributes(&root);
-            read_direct(&root.join("local.bin"), FILE_LEN, &[0], &expected);
-            held
-        }
-    })
-    .await;
-    drop(restore);
-    drop(held);
-
-    let metrics = m.session.metrics();
-    for (op, before) in MEASURED.iter().zip(counts_before) {
-        let snapshot = metrics.snapshot(*op);
-        assert!(
-            snapshot.count > before,
-            "{op:?} must run in the measured pass: {snapshot:?}"
-        );
-        assert_eq!(
-            snapshot.max_allocations, 0,
-            "{op:?} of a local entry must not allocate: {snapshot:?}"
-        );
-    }
-    m.shutdown().await;
-}
-
-/// Warm CREATEs in a tree that records file metadata, two commits in, allocate as many times as
-/// in a tree that records none, within CREATE's budget: new nodes take fresh blocks, so neither
-/// reads file metadata.
-#[tokio::test(flavor = "current_thread")]
-async fn create_over_a_tree_recording_file_metadata_stays_within_its_budget() {
-    skip_without_fuse!();
-    let _counting = COUNTING.lock().await;
-    let first: [(&str, &[u8]); 2] = [("tracked.o", b"one"), ("other.o", b"o")];
-    let second: [(&str, &[u8]); 1] = [("tracked.o", b"two")];
-    let plain = Box::pin(create_max_allocations(&[&first], false)).await;
-    let recorded = Box::pin(create_max_allocations(&[&first, &second], true)).await;
-    println!(
-        "CREATE max_allocations: {recorded} over a tree recording file metadata, {plain} over one \
-         recording none (budget {CREATE_ALLOCATION_BUDGET})"
-    );
-    assert_eq!(
-        recorded, plain,
-        "file metadata adds no allocation to a CREATE"
-    );
-    assert!(
-        recorded <= CREATE_ALLOCATION_BUDGET,
-        "CREATE allocated {recorded} times, over the budget of {CREATE_ALLOCATION_BUDGET}"
-    );
 }
 
 /// The most allocations one of a run of warm CREATEs makes on a mount of the last of
@@ -819,264 +437,655 @@ async fn create_max_allocations(
     create.max_allocations
 }
 
-/// CREATE, UNLINK and RENAME, of local files and over and of tracked ones, each allocate within
-/// their measured budget, and so does UNLINK of a tracked file a write copied up. The most one
-/// request made only rises, so UNLINK is measured in passes of increasing budget: tracked
-/// files, then local ones, then copied-up ones.
-#[tokio::test(flavor = "current_thread")]
-// The test changes names through the mount, as a user does.
-#[allow(clippy::disallowed_methods)]
-async fn create_unlink_and_rename_stay_within_their_budget() {
-    skip_without_fuse!();
-    const ROUNDS: usize = 8;
-    let _counting = COUNTING.lock().await;
-    let external = TempDir::new("lore-fuse-allocations-namespace-");
-    let tracked: Vec<(String, Vec<u8>)> = (0..3 * ROUNDS + 1)
-        .map(|i| (format!("tracked-{i}.o"), contents(i as u8)))
-        .collect();
-    let files: Vec<(&str, &[u8])> = tracked
-        .iter()
-        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
-        .collect();
-    let m = Box::pin(mount_writable_over(&external, &files)).await;
-    let root = m.root.clone();
+mod needs_fuse {
+    use super::*;
 
-    // Warm-up, uncounted: the root's listing is built, and one of each request lands.
-    blocking({
-        let root = root.clone();
-        move || {
-            std::fs::write(root.join("warm.tmp"), b"w").expect("create");
-            std::fs::rename(root.join("warm.tmp"), root.join("tracked-0.o")).expect("rename over");
-            std::fs::remove_file(root.join("tracked-0.o")).expect("unlink");
-        }
-    })
-    .await;
-    // Copied up uncounted, so only their UNLINKs are measured.
-    blocking({
-        let root = root.clone();
-        let write = external.path().join("write");
-        move || {
-            use std::io::Write as _;
-            for i in 1..=ROUNDS {
-                let name = format!("tracked-{}.o", 2 * ROUNDS + i);
-                std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(root.join(&name))
-                    .expect("open for writing")
-                    .write_all(b"more")
-                    .expect("write");
-                assert!(write.join(&name).exists(), "{name} is copied up");
-            }
-        }
-    })
-    .await;
-    let metrics = m.session.metrics();
-    let before = [
-        Opcode::Create,
-        Opcode::Unlink,
-        Opcode::Rename,
-        Opcode::Rename2,
-    ]
-    .map(|op| metrics.snapshot(op).count);
+    #[tokio::test(flavor = "current_thread")]
+    async fn warm_lookup_getattr_readdirplus_open_release_forget_statfs_allocate_zero() {
+        skip_without_fuse!();
+        let _counting = COUNTING.lock().await;
+        let m = Box::pin(mount()).await;
+        let root = m.root.clone();
 
-    lore_base::allocator::set_allocation_counting(true);
-    let restore = DisableCountingOnDrop;
-    blocking({
-        let root = root.clone();
-        move || {
-            for i in 1..=ROUNDS {
-                std::fs::remove_file(root.join(format!("tracked-{}.o", ROUNDS + i)))
-                    .expect("unlink tracked");
+        // Warm-up, uncounted: builds listings, creates every inode the measured pass touches, and
+        // answers the one OPEN a zero-message-open connection ever sends.
+        let (held, dir_ino, forget_ino, [warmup_ino, measured_ino]) = blocking({
+            let root = root.clone();
+            move || {
+                list_with_attributes(&root);
+                list_with_attributes(&root);
+                read_file(&root.join("warm.bin"));
+                let held = std::fs::File::open(root.join("dir/held.txt")).expect("open held");
+                forced_getattr(&held);
+                statvfs(&root);
+                (
+                    held,
+                    ino_of(&root.join("dir")),
+                    ino_of(&root.join("forget")),
+                    ["forget/warmup.txt", "forget/measured.txt"]
+                        .map(|name| ino_of(&root.join(name))),
+                )
             }
+        })
+        .await;
+        m.notifier
+            .inval_entry(forget_ino, b"warmup.txt", false)
+            .expect("inval_entry");
+        m.await_forgotten(warmup_ino).await;
+
+        // Make the kernel ask again: drop the held file's dentry (its open fd keeps the inode, so
+        // the provider still has it) and the root's cached directory pages.
+        m.notifier
+            .inval_entry(dir_ino, b"held.txt", false)
+            .expect("inval_entry");
+        m.notifier.inval_inode(ROOT_ID, 0, 0).expect("inval_inode");
+
+        const MEASURED: [Opcode; 4] = [
+            Opcode::Lookup,
+            Opcode::Getattr,
+            Opcode::Readdirplus,
+            Opcode::Statfs,
+        ];
+        let counts_before = MEASURED.map(|op| m.session.metrics().snapshot(op).count);
+        let before_forget = m.forgets();
+        lore_base::allocator::set_allocation_counting(true);
+        let restore = DisableCountingOnDrop;
+        let held = blocking({
+            let root = root.clone();
+            move || {
+                std::fs::symlink_metadata(root.join("dir/held.txt")).expect("lookup");
+                forced_getattr(&held);
+                list_with_attributes(&root);
+                statvfs(&root);
+                held
+            }
+        })
+        .await;
+        m.notifier
+            .inval_entry(forget_ino, b"measured.txt", false)
+            .expect("inval_entry");
+        m.await_forgotten(measured_ino).await;
+        assert!(m.forgets() > before_forget, "a FORGET ran while counting");
+        drop(restore);
+        drop(held);
+
+        let metrics = m.session.metrics();
+        for (op, before) in MEASURED.iter().zip(counts_before) {
+            assert!(
+                metrics.snapshot(*op).count > before,
+                "{op:?} must run in the measured pass"
+            );
         }
-    })
-    .await;
-    let tracked_unlink = metrics.snapshot(Opcode::Unlink);
-    blocking({
-        let root = root.clone();
-        move || {
-            for i in 1..=ROUNDS {
-                let tmp = root.join(format!("save-{i}.tmp"));
-                drop(
+        for op in [
+            Opcode::Lookup,
+            Opcode::Getattr,
+            Opcode::Readdirplus,
+            Opcode::Open,
+            Opcode::Statfs,
+        ] {
+            let snapshot = metrics.snapshot(op);
+            assert!(snapshot.count > 0, "{op:?} must have run: {snapshot:?}");
+            assert_eq!(
+                snapshot.max_allocations, 0,
+                "{op:?} must not allocate: {snapshot:?}"
+            );
+        }
+        assert_eq!(
+            metrics.snapshot(Opcode::Open).count,
+            1,
+            "zero-message open: the kernel sends one OPEN per connection"
+        );
+        for op in [Opcode::Release, Opcode::Forget, Opcode::BatchForget] {
+            let snapshot = metrics.snapshot(op);
+            assert_eq!(
+                snapshot.max_allocations, 0,
+                "{op:?} must not allocate: {snapshot:?}"
+            );
+        }
+        assert!(m.fs.inodes().len() > 1);
+        m.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_of_local_fragment_reports_allocations_within_budget() {
+        skip_without_fuse!();
+        let _counting = COUNTING.lock().await;
+        let m = Box::pin(mount()).await;
+        let root = m.root.clone();
+
+        blocking({
+            let root = root.clone();
+            move || {
+                list_with_attributes(&root);
+                read_file(&root.join("warm.bin"));
+            }
+        })
+        .await;
+        let reads_before = m.session.metrics().snapshot(Opcode::Read).count;
+
+        lore_base::allocator::set_allocation_counting(true);
+        let restore = DisableCountingOnDrop;
+        blocking({
+            let root = root.clone();
+            move || read_file(&root.join("measured.bin"))
+        })
+        .await;
+        drop(restore);
+
+        let read = m.session.metrics().snapshot(Opcode::Read);
+        assert!(
+            read.count > reads_before,
+            "the measured read must reach the provider"
+        );
+        println!(
+            "READ of a local fragment: max_allocations = {} (budget {READ_ALLOCATION_BUDGET})",
+            read.max_allocations
+        );
+        assert!(
+            read.max_allocations <= READ_ALLOCATION_BUDGET,
+            "READ allocated {} times, over the budget of {READ_ALLOCATION_BUDGET}",
+            read.max_allocations
+        );
+        m.shutdown().await;
+    }
+
+    /// A hot READ of an uncompressed fragmented file under the default strategy, served from the leaves
+    /// it keeps, allocates nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hot_read_of_an_uncompressed_fragmented_file_allocates_zero() {
+        skip_without_fuse!();
+        let _counting = COUNTING.lock().await;
+        let m = Box::pin(mount()).await;
+        let path = m.root.join("fragmented.bin");
+        // Eight pages span at most two leaves, each at least 32 KiB, which the default keeps.
+        let offsets: Arc<Vec<u64>> =
+            Arc::new((0..8).map(|i| (1 << 20) + i * PAGE as u64).collect());
+        let expected = Arc::new(fuse_test_util::incompressible(
+            FRAGMENTED_LEN,
+            FRAGMENTED_SEED,
+        ));
+        blocking({
+            let (path, offsets, expected) = (path.clone(), offsets.clone(), expected.clone());
+            move || read_direct(&path, PAGE, &offsets, &expected)
+        })
+        .await;
+        let reads_before = m.session.metrics().snapshot(Opcode::Read).count;
+
+        lore_base::allocator::set_allocation_counting(true);
+        let restore = DisableCountingOnDrop;
+        blocking(move || read_direct(&path, PAGE, &offsets, &expected)).await;
+        drop(restore);
+
+        let read = m.session.metrics().snapshot(Opcode::Read);
+        assert!(
+            read.count >= reads_before + 8,
+            "every measured read reaches the provider"
+        );
+        assert_eq!(
+            read.max_allocations, 0,
+            "a hot READ of an uncompressed fragmented file must not allocate: {read:?}"
+        );
+        m.shutdown().await;
+    }
+
+    /// Warm READ and WRITE of an open local file allocate nothing, the WRITEs through the write
+    /// generation's bracket around their host operation.
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_and_write_of_an_open_local_file_allocate_zero() {
+        skip_without_fuse!();
+        let _counting = COUNTING.lock().await;
+        let external = TempDir::new("lore-fuse-allocations-local-file-");
+        let m = Box::pin(mount_writable(&external)).await;
+        let path = m.root.join("output.o");
+        let len = 64 << 10;
+        let offsets: Vec<u64> = (0..8u64).map(|i| i * len as u64).collect();
+
+        // Warm-up, uncounted: CREATE caches the host file, and the kernel's first WRITE and READ
+        // of it land.
+        let (file, reader) = blocking({
+            let path = path.clone();
+            let offsets = offsets.clone();
+            move || {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(&path)
+                    .expect("create through the mount");
+                let data = fuse_test_util::Aligned::new(len);
+                write_direct(&file, &data, &offsets);
+                let reader = fuse_test_util::open_direct(&path);
+                let buf = fuse_test_util::Aligned::new(len);
+                assert_eq!(fuse_test_util::pread(&reader, &buf, len, 0), len);
+                (file, reader)
+            }
+        })
+        .await;
+        let metrics = m.session.metrics();
+        let (writes, reads) = (
+            metrics.snapshot(Opcode::Write).count,
+            metrics.snapshot(Opcode::Read).count,
+        );
+        let ino = blocking({
+            let path = path.clone();
+            move || ino_of(&path)
+        })
+        .await;
+        let generation = m.fs.write_generation(ino).expect("the output's inode");
+
+        lore_base::allocator::set_allocation_counting(true);
+        let restore = DisableCountingOnDrop;
+        blocking(move || {
+            let data = fuse_test_util::Aligned::new(len);
+            write_direct(&file, &data, &offsets);
+            let buf = fuse_test_util::Aligned::new(len);
+            for &offset in &offsets {
+                assert_eq!(fuse_test_util::pread(&reader, &buf, len, offset), len);
+            }
+            // Closing sends FLUSH, which only this runtime's thread can answer.
+            drop((file, reader));
+        })
+        .await;
+        drop(restore);
+
+        let write = metrics.snapshot(Opcode::Write);
+        let read = metrics.snapshot(Opcode::Read);
+        assert!(
+            write.count >= writes + 8,
+            "every measured WRITE reaches the provider"
+        );
+        assert!(
+            read.count >= reads + 8,
+            "every measured READ reaches the provider"
+        );
+        assert_eq!(
+            write.max_allocations, 0,
+            "WRITE must not allocate: {write:?}"
+        );
+        assert_eq!(read.max_allocations, 0, "READ must not allocate: {read:?}");
+        assert_eq!(
+            m.fs.write_generation(ino),
+            Some(generation + 2 * (write.count - writes)),
+            "each WRITE moved the write generation around its host operation"
+        );
+        m.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn warm_lookup_getattr_readdirplus_and_read_of_local_entries_allocate_zero() {
+        skip_without_fuse!();
+        let _counting = COUNTING.lock().await;
+        let external = TempDir::new("lore-fuse-allocations-local-");
+        let local = contents(3);
+        plant(
+            &external,
+            &[
+                ("local.bin", &local),
+                ("dir/local.txt", b"local"),
+                ("dir/held.txt", b"edited"),
+                ("made/inside.txt", b"inside"),
+            ],
+        );
+        let m = Box::pin(mount_writable_over(
+            &external,
+            &[("keep.txt", b"k"), ("dir/held.txt", b"held")],
+        ))
+        .await;
+        let root = m.root.clone();
+        let expected = Arc::new(local);
+
+        // Warm-up, uncounted: builds the listings, creates every inode the measured pass touches
+        // and opens their host files.
+        let (held, dir_ino) = blocking({
+            let root = root.clone();
+            let expected = expected.clone();
+            move || {
+                list_with_attributes(&root);
+                list_with_attributes(&root.join("dir"));
+                list_with_attributes(&root);
+                read_direct(&root.join("local.bin"), FILE_LEN, &[0], &expected);
+                let held = std::fs::File::open(root.join("dir/held.txt")).expect("open held");
+                forced_getattr(&held);
+                (held, ino_of(&root.join("dir")))
+            }
+        })
+        .await;
+        // Make the kernel ask again: drop the held file's dentry (its open fd keeps the inode, so
+        // the provider still has it) and the root's cached directory pages.
+        m.notifier
+            .inval_entry(dir_ino, b"held.txt", false)
+            .expect("inval_entry");
+        m.notifier.inval_inode(ROOT_ID, 0, 0).expect("inval_inode");
+
+        const MEASURED: [Opcode; 4] = [
+            Opcode::Lookup,
+            Opcode::Getattr,
+            Opcode::Readdirplus,
+            Opcode::Read,
+        ];
+        let counts_before = MEASURED.map(|op| m.session.metrics().snapshot(op).count);
+        lore_base::allocator::set_allocation_counting(true);
+        let restore = DisableCountingOnDrop;
+        let held = blocking({
+            let root = root.clone();
+            let expected = expected.clone();
+            move || {
+                std::fs::symlink_metadata(root.join("dir/held.txt")).expect("lookup");
+                forced_getattr(&held);
+                list_with_attributes(&root);
+                read_direct(&root.join("local.bin"), FILE_LEN, &[0], &expected);
+                held
+            }
+        })
+        .await;
+        drop(restore);
+        drop(held);
+
+        let metrics = m.session.metrics();
+        for (op, before) in MEASURED.iter().zip(counts_before) {
+            let snapshot = metrics.snapshot(*op);
+            assert!(
+                snapshot.count > before,
+                "{op:?} must run in the measured pass: {snapshot:?}"
+            );
+            assert_eq!(
+                snapshot.max_allocations, 0,
+                "{op:?} of a local entry must not allocate: {snapshot:?}"
+            );
+        }
+        m.shutdown().await;
+    }
+
+    /// Warm CREATEs in a tree that records file metadata, two commits in, allocate as many times as
+    /// in a tree that records none, within CREATE's budget: new nodes take fresh blocks, so neither
+    /// reads file metadata.
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_over_a_tree_recording_file_metadata_stays_within_its_budget() {
+        skip_without_fuse!();
+        let _counting = COUNTING.lock().await;
+        let first: [(&str, &[u8]); 2] = [("tracked.o", b"one"), ("other.o", b"o")];
+        let second: [(&str, &[u8]); 1] = [("tracked.o", b"two")];
+        let plain = Box::pin(create_max_allocations(&[&first], false)).await;
+        let recorded = Box::pin(create_max_allocations(&[&first, &second], true)).await;
+        println!(
+            "CREATE max_allocations: {recorded} over a tree recording file metadata, {plain} over one \
+         recording none (budget {CREATE_ALLOCATION_BUDGET})"
+        );
+        assert_eq!(
+            recorded, plain,
+            "file metadata adds no allocation to a CREATE"
+        );
+        assert!(
+            recorded <= CREATE_ALLOCATION_BUDGET,
+            "CREATE allocated {recorded} times, over the budget of {CREATE_ALLOCATION_BUDGET}"
+        );
+    }
+
+    /// CREATE, UNLINK and RENAME, of local files and over and of tracked ones, each allocate within
+    /// their measured budget, and so does UNLINK of a tracked file a write copied up. The most one
+    /// request made only rises, so UNLINK is measured in passes of increasing budget: tracked
+    /// files, then local ones, then copied-up ones.
+    #[tokio::test(flavor = "current_thread")]
+    // The test changes names through the mount, as a user does.
+    #[allow(clippy::disallowed_methods)]
+    async fn create_unlink_and_rename_stay_within_their_budget() {
+        skip_without_fuse!();
+        const ROUNDS: usize = 8;
+        let _counting = COUNTING.lock().await;
+        let external = TempDir::new("lore-fuse-allocations-namespace-");
+        let tracked: Vec<(String, Vec<u8>)> = (0..3 * ROUNDS + 1)
+            .map(|i| (format!("tracked-{i}.o"), contents(i as u8)))
+            .collect();
+        let files: Vec<(&str, &[u8])> = tracked
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let m = Box::pin(mount_writable_over(&external, &files)).await;
+        let root = m.root.clone();
+
+        // Warm-up, uncounted: the root's listing is built, and one of each request lands.
+        blocking({
+            let root = root.clone();
+            move || {
+                std::fs::write(root.join("warm.tmp"), b"w").expect("create");
+                std::fs::rename(root.join("warm.tmp"), root.join("tracked-0.o"))
+                    .expect("rename over");
+                std::fs::remove_file(root.join("tracked-0.o")).expect("unlink");
+            }
+        })
+        .await;
+        // Copied up uncounted, so only their UNLINKs are measured.
+        blocking({
+            let root = root.clone();
+            let write = external.path().join("write");
+            move || {
+                use std::io::Write as _;
+                for i in 1..=ROUNDS {
+                    let name = format!("tracked-{}.o", 2 * ROUNDS + i);
                     std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&tmp)
-                        .expect("create"),
-                );
-                std::fs::rename(&tmp, root.join(format!("tracked-{i}.o"))).expect("rename over");
-                let free = root.join(format!("free-{i}.tmp"));
-                drop(std::fs::File::create_new(&free).expect("create"));
-                std::fs::rename(&free, root.join(format!("renamed-{i}.o"))).expect("rename");
-                // A stat of a name the kernel holds no dentry for first, so a rebuild of the
-                // listing an overflow of the root's log left stale lands in LOOKUP.
-                assert!(std::fs::symlink_metadata(root.join(format!("absent-{i}"))).is_err());
-                std::fs::remove_file(root.join(format!("renamed-{i}.o"))).expect("unlink local");
+                        .append(true)
+                        .open(root.join(&name))
+                        .expect("open for writing")
+                        .write_all(b"more")
+                        .expect("write");
+                    assert!(write.join(&name).exists(), "{name} is copied up");
+                }
             }
-        }
-    })
-    .await;
-    let local_unlink = metrics.snapshot(Opcode::Unlink);
-    blocking({
-        let root = root.clone();
-        move || {
-            for i in 1..=ROUNDS {
-                std::fs::remove_file(root.join(format!("tracked-{}.o", 2 * ROUNDS + i)))
-                    .expect("unlink copied up");
-            }
-        }
-    })
-    .await;
-    drop(restore);
+        })
+        .await;
+        let metrics = m.session.metrics();
+        let before = [
+            Opcode::Create,
+            Opcode::Unlink,
+            Opcode::Rename,
+            Opcode::Rename2,
+        ]
+        .map(|op| metrics.snapshot(op).count);
 
-    let [creates, unlinks, renames, renames2] = before;
-    let create = metrics.snapshot(Opcode::Create);
-    let unlink = metrics.snapshot(Opcode::Unlink);
-    let rename = metrics.snapshot(Opcode::Rename);
-    let rename2 = metrics.snapshot(Opcode::Rename2);
-    assert!(
-        create.count >= creates + 2 * ROUNDS as u64,
-        "every CREATE is counted"
-    );
-    assert!(
-        unlink.count >= unlinks + 3 * ROUNDS as u64,
-        "every UNLINK is counted"
-    );
-    assert!(
-        rename.count + rename2.count >= renames + renames2 + 2 * ROUNDS as u64,
-        "every RENAME is counted"
-    );
-    let rename_max = rename.max_allocations.max(rename2.max_allocations);
-    println!(
-        "max_allocations: CREATE {} (budget {CREATE_ALLOCATION_BUDGET}), UNLINK of a tracked \
+        lore_base::allocator::set_allocation_counting(true);
+        let restore = DisableCountingOnDrop;
+        blocking({
+            let root = root.clone();
+            move || {
+                for i in 1..=ROUNDS {
+                    std::fs::remove_file(root.join(format!("tracked-{}.o", ROUNDS + i)))
+                        .expect("unlink tracked");
+                }
+            }
+        })
+        .await;
+        let tracked_unlink = metrics.snapshot(Opcode::Unlink);
+        blocking({
+            let root = root.clone();
+            move || {
+                for i in 1..=ROUNDS {
+                    let tmp = root.join(format!("save-{i}.tmp"));
+                    drop(
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&tmp)
+                            .expect("create"),
+                    );
+                    std::fs::rename(&tmp, root.join(format!("tracked-{i}.o")))
+                        .expect("rename over");
+                    let free = root.join(format!("free-{i}.tmp"));
+                    drop(std::fs::File::create_new(&free).expect("create"));
+                    std::fs::rename(&free, root.join(format!("renamed-{i}.o"))).expect("rename");
+                    // A stat of a name the kernel holds no dentry for first, so a rebuild of the
+                    // listing an overflow of the root's log left stale lands in LOOKUP.
+                    assert!(std::fs::symlink_metadata(root.join(format!("absent-{i}"))).is_err());
+                    std::fs::remove_file(root.join(format!("renamed-{i}.o")))
+                        .expect("unlink local");
+                }
+            }
+        })
+        .await;
+        let local_unlink = metrics.snapshot(Opcode::Unlink);
+        blocking({
+            let root = root.clone();
+            move || {
+                for i in 1..=ROUNDS {
+                    std::fs::remove_file(root.join(format!("tracked-{}.o", 2 * ROUNDS + i)))
+                        .expect("unlink copied up");
+                }
+            }
+        })
+        .await;
+        drop(restore);
+
+        let [creates, unlinks, renames, renames2] = before;
+        let create = metrics.snapshot(Opcode::Create);
+        let unlink = metrics.snapshot(Opcode::Unlink);
+        let rename = metrics.snapshot(Opcode::Rename);
+        let rename2 = metrics.snapshot(Opcode::Rename2);
+        assert!(
+            create.count >= creates + 2 * ROUNDS as u64,
+            "every CREATE is counted"
+        );
+        assert!(
+            unlink.count >= unlinks + 3 * ROUNDS as u64,
+            "every UNLINK is counted"
+        );
+        assert!(
+            rename.count + rename2.count >= renames + renames2 + 2 * ROUNDS as u64,
+            "every RENAME is counted"
+        );
+        let rename_max = rename.max_allocations.max(rename2.max_allocations);
+        println!(
+            "max_allocations: CREATE {} (budget {CREATE_ALLOCATION_BUDGET}), UNLINK of a tracked \
          file {} (budget {TRACKED_UNLINK_ALLOCATION_BUDGET}), of a local one {} (budget \
          {LOCAL_UNLINK_ALLOCATION_BUDGET}), of a copied-up one {} (budget \
          {COPIED_UP_UNLINK_ALLOCATION_BUDGET}), RENAME {rename_max} (budget \
          {RENAME_ALLOCATION_BUDGET})",
-        create.max_allocations,
-        tracked_unlink.max_allocations,
-        local_unlink.max_allocations,
-        unlink.max_allocations
-    );
-    assert!(
-        create.max_allocations <= CREATE_ALLOCATION_BUDGET
-            && tracked_unlink.max_allocations <= TRACKED_UNLINK_ALLOCATION_BUDGET
-            && local_unlink.max_allocations <= LOCAL_UNLINK_ALLOCATION_BUDGET
-            && unlink.max_allocations <= COPIED_UP_UNLINK_ALLOCATION_BUDGET
-            && rename_max <= RENAME_ALLOCATION_BUDGET,
-        "CREATE {create:?}, UNLINK of tracked {tracked_unlink:?}, of local {local_unlink:?}, \
-         of copied-up {unlink:?}, RENAME {rename:?}, RENAME2 {rename2:?}"
-    );
-    m.shutdown().await;
-}
-
-/// Warm LOOKUP and GETATTR of a file in a directory MKDIR made, answered through the empty
-/// listing MKDIR cached and the nodes attached to it since, then warm READDIRPLUS once the
-/// listing is rebuilt, allocate nothing.
-#[tokio::test(flavor = "current_thread")]
-#[allow(clippy::disallowed_methods)]
-async fn warm_lookup_getattr_and_readdirplus_in_a_directory_mkdir_made_allocate_zero() {
-    skip_without_fuse!();
-    let _counting = COUNTING.lock().await;
-    let external = TempDir::new("lore-fuse-allocations-mkdir-");
-    let m = Box::pin(mount_writable(&external)).await;
-    let made_path = m.root.join("made");
-    let file_path = made_path.join("new.bin");
-    // The root's listing is built before the count is taken.
-    blocking({
-        let root = m.root.clone();
-        move || {
-            std::fs::symlink_metadata(root.join("keep.txt")).expect("keep.txt");
-        }
-    })
-    .await;
-    let built = m.fs.listings_built();
-    let (held, made_ino) = blocking({
-        let (made_path, file_path) = (made_path.clone(), file_path.clone());
-        move || {
-            std::fs::create_dir(&made_path).expect("mkdir");
-            std::fs::write(&file_path, contents(5)).expect("create and write");
-            let held = std::fs::File::open(&file_path).expect("open");
-            forced_getattr(&held);
-            (held, ino_of(&made_path))
-        }
-    })
-    .await;
-    // Warm-up, uncounted: one LOOKUP of the name once the kernel holds no dentry for it.
-    m.notifier
-        .inval_entry(made_ino, b"new.bin", false)
-        .expect("inval_entry");
-    blocking({
-        let file_path = file_path.clone();
-        move || {
-            std::fs::symlink_metadata(&file_path).expect("lookup");
-        }
-    })
-    .await;
-    m.notifier
-        .inval_entry(made_ino, b"new.bin", false)
-        .expect("inval_entry");
-
-    let metrics = m.session.metrics();
-    let before = [Opcode::Lookup, Opcode::Getattr].map(|op| metrics.snapshot(op).count);
-    lore_base::allocator::set_allocation_counting(true);
-    let restore = DisableCountingOnDrop;
-    let held = blocking({
-        let file_path = file_path.clone();
-        move || {
-            std::fs::symlink_metadata(&file_path).expect("lookup");
-            forced_getattr(&held);
-            held
-        }
-    })
-    .await;
-    drop(restore);
-    assert_eq!(
-        m.fs.listings_built(),
-        built,
-        "a listing of the directory MKDIR made was built"
-    );
-    for (op, before) in [Opcode::Lookup, Opcode::Getattr].into_iter().zip(before) {
-        let snapshot = metrics.snapshot(op);
+            create.max_allocations,
+            tracked_unlink.max_allocations,
+            local_unlink.max_allocations,
+            unlink.max_allocations
+        );
         assert!(
-            snapshot.count > before,
-            "{op:?} must have run: {snapshot:?}"
+            create.max_allocations <= CREATE_ALLOCATION_BUDGET
+                && tracked_unlink.max_allocations <= TRACKED_UNLINK_ALLOCATION_BUDGET
+                && local_unlink.max_allocations <= LOCAL_UNLINK_ALLOCATION_BUDGET
+                && unlink.max_allocations <= COPIED_UP_UNLINK_ALLOCATION_BUDGET
+                && rename_max <= RENAME_ALLOCATION_BUDGET,
+            "CREATE {create:?}, UNLINK of tracked {tracked_unlink:?}, of local {local_unlink:?}, \
+         of copied-up {unlink:?}, RENAME {rename:?}, RENAME2 {rename2:?}"
         );
-        assert_eq!(
-            snapshot.max_allocations, 0,
-            "{op:?} in a directory MKDIR made must not allocate: {snapshot:?}"
-        );
+        m.shutdown().await;
     }
 
-    // Warm-up, uncounted: the READDIRPLUS that rebuilds the listing the CREATE left behind.
-    blocking({
-        let made_path = made_path.clone();
-        move || list_with_attributes(&made_path)
-    })
-    .await;
-    // The kernel answers the next listing from its cache unless the directory is invalidated.
-    m.notifier
-        .inval_entry(made_ino, b"new.bin", false)
-        .expect("inval_entry");
-    m.notifier.inval_inode(made_ino, 0, 0).expect("inval_inode");
-    let before = metrics.snapshot(Opcode::Readdirplus).count;
-    lore_base::allocator::set_allocation_counting(true);
-    let restore = DisableCountingOnDrop;
-    blocking({
-        let made_path = made_path.clone();
-        move || list_with_attributes(&made_path)
-    })
-    .await;
-    drop(restore);
-    drop(held);
-    let readdirplus = metrics.snapshot(Opcode::Readdirplus);
-    assert!(
-        readdirplus.count > before,
-        "READDIRPLUS must have run: {readdirplus:?}"
-    );
-    assert_eq!(
-        readdirplus.max_allocations, 0,
-        "READDIRPLUS of a directory MKDIR made must not allocate: {readdirplus:?}"
-    );
-    m.shutdown().await;
+    /// Warm LOOKUP and GETATTR of a file in a directory MKDIR made, answered through the empty
+    /// listing MKDIR cached and the nodes attached to it since, then warm READDIRPLUS once the
+    /// listing is rebuilt, allocate nothing.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::disallowed_methods)]
+    async fn warm_lookup_getattr_and_readdirplus_in_a_directory_mkdir_made_allocate_zero() {
+        skip_without_fuse!();
+        let _counting = COUNTING.lock().await;
+        let external = TempDir::new("lore-fuse-allocations-mkdir-");
+        let m = Box::pin(mount_writable(&external)).await;
+        let made_path = m.root.join("made");
+        let file_path = made_path.join("new.bin");
+        // The root's listing is built before the count is taken.
+        blocking({
+            let root = m.root.clone();
+            move || {
+                std::fs::symlink_metadata(root.join("keep.txt")).expect("keep.txt");
+            }
+        })
+        .await;
+        let built = m.fs.listings_built();
+        let (held, made_ino) = blocking({
+            let (made_path, file_path) = (made_path.clone(), file_path.clone());
+            move || {
+                std::fs::create_dir(&made_path).expect("mkdir");
+                std::fs::write(&file_path, contents(5)).expect("create and write");
+                let held = std::fs::File::open(&file_path).expect("open");
+                forced_getattr(&held);
+                (held, ino_of(&made_path))
+            }
+        })
+        .await;
+        // Warm-up, uncounted: one LOOKUP of the name once the kernel holds no dentry for it.
+        m.notifier
+            .inval_entry(made_ino, b"new.bin", false)
+            .expect("inval_entry");
+        blocking({
+            let file_path = file_path.clone();
+            move || {
+                std::fs::symlink_metadata(&file_path).expect("lookup");
+            }
+        })
+        .await;
+        m.notifier
+            .inval_entry(made_ino, b"new.bin", false)
+            .expect("inval_entry");
+
+        let metrics = m.session.metrics();
+        let before = [Opcode::Lookup, Opcode::Getattr].map(|op| metrics.snapshot(op).count);
+        lore_base::allocator::set_allocation_counting(true);
+        let restore = DisableCountingOnDrop;
+        let held = blocking({
+            let file_path = file_path.clone();
+            move || {
+                std::fs::symlink_metadata(&file_path).expect("lookup");
+                forced_getattr(&held);
+                held
+            }
+        })
+        .await;
+        drop(restore);
+        assert_eq!(
+            m.fs.listings_built(),
+            built,
+            "a listing of the directory MKDIR made was built"
+        );
+        for (op, before) in [Opcode::Lookup, Opcode::Getattr].into_iter().zip(before) {
+            let snapshot = metrics.snapshot(op);
+            assert!(
+                snapshot.count > before,
+                "{op:?} must have run: {snapshot:?}"
+            );
+            assert_eq!(
+                snapshot.max_allocations, 0,
+                "{op:?} in a directory MKDIR made must not allocate: {snapshot:?}"
+            );
+        }
+
+        // Warm-up, uncounted: the READDIRPLUS that rebuilds the listing the CREATE left behind.
+        blocking({
+            let made_path = made_path.clone();
+            move || list_with_attributes(&made_path)
+        })
+        .await;
+        // The kernel answers the next listing from its cache unless the directory is invalidated.
+        m.notifier
+            .inval_entry(made_ino, b"new.bin", false)
+            .expect("inval_entry");
+        m.notifier.inval_inode(made_ino, 0, 0).expect("inval_inode");
+        let before = metrics.snapshot(Opcode::Readdirplus).count;
+        lore_base::allocator::set_allocation_counting(true);
+        let restore = DisableCountingOnDrop;
+        blocking({
+            let made_path = made_path.clone();
+            move || list_with_attributes(&made_path)
+        })
+        .await;
+        drop(restore);
+        drop(held);
+        let readdirplus = metrics.snapshot(Opcode::Readdirplus);
+        assert!(
+            readdirplus.count > before,
+            "READDIRPLUS must have run: {readdirplus:?}"
+        );
+        assert_eq!(
+            readdirplus.max_allocations, 0,
+            "READDIRPLUS of a directory MKDIR made must not allocate: {readdirplus:?}"
+        );
+        m.shutdown().await;
+    }
 }

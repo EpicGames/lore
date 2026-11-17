@@ -686,190 +686,195 @@ async fn lookups_under_writers(label: &str, writers: [(&str, Writes); 4], budget
         .expect("shutdown must complete promptly");
 }
 
-/// Warm LOOKUPs in one directory while four threads create, write, rename and unlink, two in the
-/// same directory and two in others: every LOOKUP finds its file and the writes run throughout.
-/// On a quiet machine the LOOKUPs keep to p50 < 20 µs and p99 < 100 µs.
-#[tokio::test(flavor = "multi_thread")]
-async fn warm_lookups_under_concurrent_writes_stay_within_budget() {
-    skip_without_fuse!();
-    lookups_under_writers(
-        "LOOKUP under concurrent writes",
-        [
-            ("d00", Writes::Saves),
-            ("d00", Writes::Saves),
-            ("d01", Writes::Saves),
-            ("d02", Writes::Saves),
-        ],
-        true,
-    )
-    .await;
-}
+mod needs_fuse {
+    use super::*;
 
-/// Task 14 diagnostic: the same LOOKUPs with the four writers' saves only in other directories,
-/// which leaves the measured listing current, so what remains of the tail is contention.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "task 14 diagnostic: run through lore-fuse/bench/m2/latency.sh"]
-async fn warm_lookups_with_saves_only_in_other_directories() {
-    skip_without_fuse!();
-    lookups_under_writers(
-        "LOOKUP with saves elsewhere",
-        [
-            ("d01", Writes::Saves),
-            ("d01", Writes::Saves),
-            ("d02", Writes::Saves),
-            ("d03", Writes::Saves),
-        ],
-        false,
-    )
-    .await;
-}
-
-/// Task 14 diagnostic: the same LOOKUPs while four writers only create files in the measured
-/// directory, so a LOOKUP finds the listing patched by up to 64 attaches and walks them first.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "task 14 diagnostic: run through lore-fuse/bench/m2/latency.sh"]
-async fn warm_lookups_among_creates_in_their_directory() {
-    skip_without_fuse!();
-    lookups_under_writers(
-        "LOOKUP among creates",
-        [
-            ("d00", Writes::Creates),
-            ("d00", Writes::Creates),
-            ("d00", Writes::Creates),
-            ("d00", Writes::Creates),
-        ],
-        false,
-    )
-    .await;
-}
-
-/// Warm LOOKUPs in two directories while syncs swap the mount between two revisions back to back,
-/// each rewriting [`SYNC_CHANGES`] files across every directory, the measured ones included: every
-/// LOOKUP finds its file and a sync completes during them. On a quiet machine the LOOKUPs keep to
-/// p50 < 20 µs and p99 < 100 µs.
-#[tokio::test(flavor = "multi_thread")]
-async fn warm_lookups_during_a_sync_stay_within_budget() {
-    skip_without_fuse!();
-    let (immutable, mutable, execution) =
-        fuse_fixture::test_store_create().await.expect("test store");
-    let tree = wide_tree();
-    let (instance, first, second, rewritten) = lore_base::runtime::LORE_CONTEXT
-        .scope(execution.clone(), async {
-            let instance = fuse_fixture::test_repository_create(
-                immutable,
-                mutable,
-                RepositoryId::from(uuid::Uuid::now_v7()),
-            )
-            .await;
-            for dir in 0..WIDE_DIRS {
-                std::fs::create_dir_all(instance.path.join(format!("d{dir:02}")))
-                    .expect("a directory of the tree");
-            }
-            for (path, contents) in &tree {
-                fuse_fixture::test_file_write(&instance.path.join(path), contents);
-            }
-            let first = fuse_fixture::test_commit_tree(&instance, "sync from").await;
-            for (path, _) in tree.iter().step_by(tree.len() / SYNC_CHANGES) {
-                fuse_fixture::test_file_write(
-                    &instance.path.join(path),
-                    format!("synced {path}").as_bytes(),
-                );
-            }
-            let second = fuse_fixture::test_commit_tree(&instance, "sync to").await;
-            let diff = |from: &Arc<State>, to: &Arc<State>| {
-                state::diff_collect(
-                    instance.repository.clone(),
-                    from.clone(),
-                    instance.repository.clone(),
-                    to.clone(),
-                    None,
-                    FilterMode::View,
-                )
-            };
-            let rewritten = diff(&first, &second).await.expect("diff").len();
-            (instance, first, second, rewritten)
-        })
-        .await;
-    // Kept to the end: its directory holds the repository's `.lore`.
-    let repository = instance.repository.clone();
-    assert!(
-        rewritten >= SYNC_CHANGES,
-        "the sync rewrites {rewritten} files"
-    );
-
-    let fs = lore_base::runtime::LORE_CONTEXT
-        .scope(
-            execution.clone(),
-            FuseFilesystem::new(repository.clone(), first.clone(), attr_context()),
+    /// Warm LOOKUPs in one directory while four threads create, write, rename and unlink, two in the
+    /// same directory and two in others: every LOOKUP finds its file and the writes run throughout.
+    /// On a quiet machine the LOOKUPs keep to p50 < 20 µs and p99 < 100 µs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warm_lookups_under_concurrent_writes_stay_within_budget() {
+        skip_without_fuse!();
+        lookups_under_writers(
+            "LOOKUP under concurrent writes",
+            [
+                ("d00", Writes::Saves),
+                ("d00", Writes::Saves),
+                ("d01", Writes::Saves),
+                ("d02", Writes::Saves),
+            ],
+            true,
         )
-        .await
-        .expect("provider");
-    let measured_nodes = vec![
-        dir_node(&fs, &repository, "d00").await,
-        dir_node(&fs, &repository, "d01").await,
-    ];
-    let builds = count_builds(&fs, measured_nodes);
-    let mounted = mount(fs.clone(), 8).await;
-    let measured = [mounted.root.join("d00"), mounted.root.join("d01")];
-    for dir in &measured {
-        std::fs::symlink_metadata(dir.join("f00000")).expect("warm-up stat");
+        .await;
     }
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let syncs = Arc::new(AtomicU64::new(0));
-    // The task carries its own execution scope.
-    #[allow(clippy::disallowed_methods)]
-    let syncer = {
-        let (fs, stop, syncs) = (fs.clone(), stop.clone(), syncs.clone());
-        tokio::spawn(
-            lore_base::runtime::LORE_CONTEXT.scope(execution.clone(), async move {
-                let operation = InstanceOperationImpl::new(
-                    StaticDispatchInstanceOperation::Fuse(FuseOperation::new(fs.clone())),
-                    true,
-                );
-                let mut at_first = true;
-                while !stop.load(Ordering::SeqCst) {
-                    let to = if at_first {
-                        second.clone()
-                    } else {
-                        first.clone()
-                    };
-                    swap_mounted(&fs, &operation, repository.clone(), to)
-                        .await
-                        .expect("sync");
-                    at_first = !at_first;
-                    syncs.fetch_add(1, Ordering::SeqCst);
-                }
-            }),
+    /// Task 14 diagnostic: the same LOOKUPs with the four writers' saves only in other directories,
+    /// which leaves the measured listing current, so what remains of the tail is contention.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "task 14 diagnostic: run through lore-fuse/bench/m2/latency.sh"]
+    async fn warm_lookups_with_saves_only_in_other_directories() {
+        skip_without_fuse!();
+        lookups_under_writers(
+            "LOOKUP with saves elsewhere",
+            [
+                ("d01", Writes::Saves),
+                ("d01", Writes::Saves),
+                ("d02", Writes::Saves),
+                ("d03", Writes::Saves),
+            ],
+            false,
         )
-    };
-    // Syncs run back to back from here, so the LOOKUPs overlap one throughout.
-    wait_for_first_changes(&syncs, 1, || syncer.is_finished()).await;
+        .await;
+    }
 
-    let paths = measured
-        .iter()
-        .flat_map(|dir| {
-            (1..WIDE_FILES).map(move |file| bench_stats::c_path(&dir.join(format!("f{file:05}"))))
-        })
-        .collect();
-    let syncs_before = syncs.load(Ordering::SeqCst);
-    let builds_before = builds.load(Ordering::SeqCst);
-    let lookups = timed_lookups(&mounted, paths, &builds).await;
-    let builds_during = builds.load(Ordering::SeqCst) - builds_before;
-    let syncs_during = syncs.load(Ordering::SeqCst) - syncs_before;
-    stop.store(true, Ordering::SeqCst);
-    tokio::time::timeout(WAIT_LIMIT, syncer)
-        .await
-        .expect("the syncs stop")
-        .expect("syncer");
+    /// Task 14 diagnostic: the same LOOKUPs while four writers only create files in the measured
+    /// directory, so a LOOKUP finds the listing patched by up to 64 attaches and walks them first.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "task 14 diagnostic: run through lore-fuse/bench/m2/latency.sh"]
+    async fn warm_lookups_among_creates_in_their_directory() {
+        skip_without_fuse!();
+        lookups_under_writers(
+            "LOOKUP among creates",
+            [
+                ("d00", Writes::Creates),
+                ("d00", Writes::Creates),
+                ("d00", Writes::Creates),
+                ("d00", Writes::Creates),
+            ],
+            false,
+        )
+        .await;
+    }
 
-    println!(
-        "syncs of {SYNC_CHANGES} changes completed during the LOOKUPs: {syncs_during}, with \
+    /// Warm LOOKUPs in two directories while syncs swap the mount between two revisions back to back,
+    /// each rewriting [`SYNC_CHANGES`] files across every directory, the measured ones included: every
+    /// LOOKUP finds its file and a sync completes during them. On a quiet machine the LOOKUPs keep to
+    /// p50 < 20 µs and p99 < 100 µs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warm_lookups_during_a_sync_stay_within_budget() {
+        skip_without_fuse!();
+        let (immutable, mutable, execution) =
+            fuse_fixture::test_store_create().await.expect("test store");
+        let tree = wide_tree();
+        let (instance, first, second, rewritten) = lore_base::runtime::LORE_CONTEXT
+            .scope(execution.clone(), async {
+                let instance = fuse_fixture::test_repository_create(
+                    immutable,
+                    mutable,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                for dir in 0..WIDE_DIRS {
+                    std::fs::create_dir_all(instance.path.join(format!("d{dir:02}")))
+                        .expect("a directory of the tree");
+                }
+                for (path, contents) in &tree {
+                    fuse_fixture::test_file_write(&instance.path.join(path), contents);
+                }
+                let first = fuse_fixture::test_commit_tree(&instance, "sync from").await;
+                for (path, _) in tree.iter().step_by(tree.len() / SYNC_CHANGES) {
+                    fuse_fixture::test_file_write(
+                        &instance.path.join(path),
+                        format!("synced {path}").as_bytes(),
+                    );
+                }
+                let second = fuse_fixture::test_commit_tree(&instance, "sync to").await;
+                let diff = |from: &Arc<State>, to: &Arc<State>| {
+                    state::diff_collect(
+                        instance.repository.clone(),
+                        from.clone(),
+                        instance.repository.clone(),
+                        to.clone(),
+                        None,
+                        FilterMode::View,
+                    )
+                };
+                let rewritten = diff(&first, &second).await.expect("diff").len();
+                (instance, first, second, rewritten)
+            })
+            .await;
+        // Kept to the end: its directory holds the repository's `.lore`.
+        let repository = instance.repository.clone();
+        assert!(
+            rewritten >= SYNC_CHANGES,
+            "the sync rewrites {rewritten} files"
+        );
+
+        let fs = lore_base::runtime::LORE_CONTEXT
+            .scope(
+                execution.clone(),
+                FuseFilesystem::new(repository.clone(), first.clone(), attr_context()),
+            )
+            .await
+            .expect("provider");
+        let measured_nodes = vec![
+            dir_node(&fs, &repository, "d00").await,
+            dir_node(&fs, &repository, "d01").await,
+        ];
+        let builds = count_builds(&fs, measured_nodes);
+        let mounted = mount(fs.clone(), 8).await;
+        let measured = [mounted.root.join("d00"), mounted.root.join("d01")];
+        for dir in &measured {
+            std::fs::symlink_metadata(dir.join("f00000")).expect("warm-up stat");
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let syncs = Arc::new(AtomicU64::new(0));
+        // The task carries its own execution scope.
+        #[allow(clippy::disallowed_methods)]
+        let syncer = {
+            let (fs, stop, syncs) = (fs.clone(), stop.clone(), syncs.clone());
+            tokio::spawn(
+                lore_base::runtime::LORE_CONTEXT.scope(execution.clone(), async move {
+                    let operation = InstanceOperationImpl::new(
+                        StaticDispatchInstanceOperation::Fuse(FuseOperation::new(fs.clone())),
+                        true,
+                    );
+                    let mut at_first = true;
+                    while !stop.load(Ordering::SeqCst) {
+                        let to = if at_first {
+                            second.clone()
+                        } else {
+                            first.clone()
+                        };
+                        swap_mounted(&fs, &operation, repository.clone(), to)
+                            .await
+                            .expect("sync");
+                        at_first = !at_first;
+                        syncs.fetch_add(1, Ordering::SeqCst);
+                    }
+                }),
+            )
+        };
+        // Syncs run back to back from here, so the LOOKUPs overlap one throughout.
+        wait_for_first_changes(&syncs, 1, || syncer.is_finished()).await;
+
+        let paths = measured
+            .iter()
+            .flat_map(|dir| {
+                (1..WIDE_FILES)
+                    .map(move |file| bench_stats::c_path(&dir.join(format!("f{file:05}"))))
+            })
+            .collect();
+        let syncs_before = syncs.load(Ordering::SeqCst);
+        let builds_before = builds.load(Ordering::SeqCst);
+        let lookups = timed_lookups(&mounted, paths, &builds).await;
+        let builds_during = builds.load(Ordering::SeqCst) - builds_before;
+        let syncs_during = syncs.load(Ordering::SeqCst) - syncs_before;
+        stop.store(true, Ordering::SeqCst);
+        tokio::time::timeout(WAIT_LIMIT, syncer)
+            .await
+            .expect("the syncs stop")
+            .expect("syncer");
+
+        println!(
+            "syncs of {SYNC_CHANGES} changes completed during the LOOKUPs: {syncs_during}, with \
          {builds_during} builds of the measured listings"
-    );
-    assert!(syncs_during > 0, "a sync must complete during the LOOKUPs");
-    report_lookups("LOOKUP during a sync", lookups, true);
-    tokio::time::timeout(Duration::from_secs(5), mounted.session.shutdown())
-        .await
-        .expect("shutdown must complete promptly");
+        );
+        assert!(syncs_during > 0, "a sync must complete during the LOOKUPs");
+        report_lookups("LOOKUP during a sync", lookups, true);
+        tokio::time::timeout(Duration::from_secs(5), mounted.session.shutdown())
+            .await
+            .expect("shutdown must complete promptly");
+    }
 }

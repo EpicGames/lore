@@ -57,7 +57,7 @@ const MAX_READ: u32 = 1 << 20;
 const DRAIN_WAIT: Duration = Duration::from_secs(2);
 
 /// How long an unmount checking for leaks waits for the kernel's FORGETs before it invalidates
-/// the root's children again.
+/// again.
 const DRAIN_RESEND: Duration = Duration::from_millis(50);
 
 /// How long the inode table must count no lookups before an unmount checking for leaks goes on.
@@ -282,17 +282,20 @@ impl FuseMount {
 
     /// Makes the kernel forget every inode it holds, so the table can be checked against it:
     /// once the superblock is torn down the kernel sends no FORGET for what it still holds.
-    /// Invalidating the root's children, by every spelling the kernel may cache them under,
-    /// prunes every dentry beneath them. Another process, such as a desktop's file monitor, can
-    /// look a name up again after that, so the invalidations go out again every [`DRAIN_RESEND`]
-    /// while the table counts lookups. The drain ends once the table has counted none for
-    /// [`DRAIN_SETTLE`], or [`DRAIN_WAIT`] after its first invalidations. A lookup made after it
-    /// ends and before the umount still counts as leaked.
+    /// Invalidating the root's children prunes every dentry the kernel reaches through them. Two
+    /// kinds outlast that: another process, such as a desktop's file monitor, can look a name up
+    /// again, and the kernel keeps the dentries below a directory whose name it dropped while a
+    /// file below it was open, which no path from the root reaches. So while the table counts
+    /// lookups, the invalidations go out again every [`DRAIN_RESEND`], with the children of every
+    /// directory that holds a looked-up inode ([`Self::drain_names`]). The drain ends once the
+    /// table has counted none for [`DRAIN_SETTLE`], or [`DRAIN_WAIT`] after its first
+    /// invalidations. A lookup made after it ends and before the umount still counts as leaked.
+    #[lore_macro::test_pub]
     async fn drain_kernel_lookups(&self) {
         let Some(queue) = self.filesystem.notifications() else {
             return;
         };
-        let (mut entries, mut names, mut live) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut entries, mut live) = (Vec::new(), Vec::new());
         let mut deadline = None;
         let mut resend = Instant::now();
         let mut drained_since = None;
@@ -313,7 +316,7 @@ impl FuseMount {
                 return;
             }
             if drained_since.is_none() && now >= resend {
-                self.root_child_names(&mut entries, &mut names, &mut live);
+                self.drain_names(deadline.is_some(), &mut entries, &mut live);
                 entries = queue
                     .send(Invalidations {
                         entries,
@@ -328,32 +331,32 @@ impl FuseMount {
         }
     }
 
-    /// Fills `entries` with the root's children by every spelling the kernel may cache them
-    /// under, each paired with the root. `names` and `live` are scratch.
-    fn root_child_names(
-        &self,
-        entries: &mut Vec<(u64, Name)>,
-        names: &mut Vec<Name>,
-        live: &mut Vec<u64>,
-    ) {
-        names.clear();
-        self.filesystem
-            .spellings()
-            .copy_children_of(ROOT_INO, names);
+    /// Fills `entries` with the names the drain invalidates, each paired with its directory: the
+    /// root's children, and with `below_root` the children of every directory that holds an
+    /// inode the table counts lookups of, each by every spelling the kernel may cache it under.
+    /// The kernel finds a child's dentry through its directory's inode rather than its name, so
+    /// the names below the root reach the dentries below a directory whose name it dropped.
+    /// `live` is scratch.
+    fn drain_names(&self, below_root: bool, entries: &mut Vec<(u64, Name)>, live: &mut Vec<u64>) {
+        entries.clear();
         live.clear();
         self.filesystem.inodes().live(live);
         for &ino in live.iter() {
             if let Some(entry) = self.filesystem.inodes().get(ino)
                 && entry.ino != ROOT_INO
-                && entry.parent == ROOT_INO
+                && (below_root || entry.parent == ROOT_INO)
             {
-                names.push(entry.name.clone());
+                entries.push((entry.parent, entry.name.clone()));
             }
         }
-        names.sort_unstable();
-        names.dedup();
-        entries.clear();
-        entries.extend(names.drain(..).map(|name| (ROOT_INO, name)));
+        live.clear();
+        live.push(ROOT_INO);
+        live.extend(entries.iter().map(|&(parent, _)| parent));
+        live.sort_unstable();
+        live.dedup();
+        self.filesystem.spellings().copy_children_of(live, entries);
+        entries.sort_unstable();
+        entries.dedup();
     }
 
     fn check_leaks(&self) {

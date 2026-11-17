@@ -360,8 +360,11 @@ first, lose the socket and leave dead endpoints.
   service's own.
 - With debug assertions, a plain unmount first invalidates the root's children, again every
   50 ms while the inode table counts lookups, until it has counted none for 100 ms or 2 s have
-  passed. After it, the unmount warns about inodes still holding lookups
-  (`drain_kernel_lookups`, `check_leaks`, `fs/fuse/mount.rs`).
+  passed. The invalidations after the first also name the children of every directory holding a
+  looked-up inode, which the kernel finds through the directory's inode: they reach the dentries
+  below a directory whose name the kernel dropped while a file below it was open, which no path
+  from the root reaches. After the drain, the unmount warns about inodes still holding
+  lookups (`drain_kernel_lookups`, `drain_names`, `check_leaks`, `fs/fuse/mount.rs`).
 
 ### The served State and swaps
 
@@ -768,7 +771,7 @@ State is rebuilt at every mount.
   `write/` answers `NotSupported` (`FuseOperation::writable`, `operation.rs`).
 - **Desktop trash.** GNOME's `gvfsd-trash` treats every lore mount as a volume of its own and looks
   up `.Trash` and `.Trash-<uid>` in its root (`loading_a_fuse_instance_never_enters_the_mount`,
-  `lore-revision/tests/fuse_mount.rs`), and any file created there, which a debug build's unmount
+  `lore-revision/tests/fuse_mount/needs_fuse.rs`), and any file created there, which a debug build's unmount
   invalidates again. A file-manager delete in a FUSE instance may therefore create `.Trash-<uid>` at
   the repository root, where status shows it; an ordinary instance uses `~/.local/share/Trash`. The
   `x-gvfs-notrash` mount option would opt out, but `fusermount3` fails to set it (lore-9fr).
@@ -1258,7 +1261,7 @@ The round trip of each get bounds the prefetch on this link, so throughput grows
 
 | Variable | Used by | Default | Effect |
 |---|---|---|---|
-| `LORE_TEST_SKIP_FUSE` | all mount tests (`SKIP_ENV_VAR`, `src/test_support.rs`) | unset | Skips every FUSE-gated test. |
+| `LORE_TEST_SKIP_FUSE` | all mount tests (`SKIP_ENV_VAR`, `src/test_support.rs`) | unset | Skips every test that mounts. Each is declared in a `needs_fuse` module, so `-- needs_fuse::` runs them alone (`NEEDS_FUSE_FILTER`, `skip_without_fuse!`). |
 | `LORE_BENCH_CONTENT` | `fs::fuse::read_cache_bench` | `random` | `random` or `compressible` (about 2:1 under zstd). |
 | `LORE_BENCH_STRATEGIES` | `fs::fuse::read_cache_bench` | all | Comma-separated strategy labels. |
 | `LORE_BENCH_W4_MB` | `fs::fuse::read_cache_bench` | 64 | MiB per W4 file. |
@@ -1871,8 +1874,6 @@ Service, stores and platform:
   one ZFS record mixes fragments of many files and cold reads pull extra data from disk.
 - **FUSE over io_uring** (lore-3a9). Not implemented. The transport boundary (`src/transport/mod.rs`) is where
   it goes; the kernel's `fuse.enable_uring` parameter is off by default.
-- **CI** (lore-57l). No workflow installs fuse3 or checks `/dev/fuse`; mount tests skip through
-  `skip_without_fuse!` when FUSE is unusable, so a green run does not show they ran.
 - **Debug unmount time** (lore-70p). A plain unmount in a debug build waits at least 100 ms
   (`DRAIN_SETTLE`) and up to 2 s (`DRAIN_WAIT`) for FORGETs before unmounting.
 - **Automatic open-mode fallback** (lore-kqn). The service mount always answers OPEN with `ENOSYS`; no code

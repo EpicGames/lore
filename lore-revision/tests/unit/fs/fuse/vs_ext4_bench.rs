@@ -285,15 +285,30 @@ async fn publish_median(repository: Arc<RepositoryContext>, state: Arc<State>) -
     Duration::from_nanos(Summary::of(&mut samples).p50)
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "benchmark"]
-async fn bench_fuse_vs_ext4_target_table() {
-    skip_without_fuse!();
-    let files = env_usize("LORE_BENCH_FILES", 100_000);
-    let big_file_mb = env_usize("LORE_BENCH_FILE_MB", 1024);
-    let (immutable, mutable, execution) =
-        fuse_fixture::test_store_create().await.expect("test store");
-    Box::pin(LORE_CONTEXT.scope(execution, async move {
+/// `ls -l` of `dir`: list it, then stat every entry.
+fn ls_long(dir: &Path) -> (usize, Duration) {
+    let started = Instant::now();
+    let mut entries = 0;
+    for entry in std::fs::read_dir(dir).expect("read_dir") {
+        let entry = entry.expect("entry");
+        std::hint::black_box(statx_ns(&c_path(&entry.path()), libc::AT_SYMLINK_NOFOLLOW));
+        entries += 1;
+    }
+    (entries, started.elapsed())
+}
+
+mod needs_fuse {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "benchmark"]
+    async fn bench_fuse_vs_ext4_target_table() {
+        skip_without_fuse!();
+        let files = env_usize("LORE_BENCH_FILES", 100_000);
+        let big_file_mb = env_usize("LORE_BENCH_FILE_MB", 1024);
+        let (immutable, mutable, execution) =
+            fuse_fixture::test_store_create().await.expect("test store");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
             let tree = generated_tree(files);
             let baseline = BaselineDir::new();
             let baseline_root = baseline.path.clone();
@@ -481,104 +496,93 @@ async fn bench_fuse_vs_ext4_target_table() {
             drop(baseline);
         }))
         .await;
-}
-
-/// `ls -l` of `dir`: list it, then stat every entry.
-fn ls_long(dir: &Path) -> (usize, Duration) {
-    let started = Instant::now();
-    let mut entries = 0;
-    for entry in std::fs::read_dir(dir).expect("read_dir") {
-        let entry = entry.expect("entry");
-        std::hint::black_box(statx_ns(&c_path(&entry.path()), libc::AT_SYMLINK_NOFOLLOW));
-        entries += 1;
     }
-    (entries, started.elapsed())
-}
 
-/// Cold `find -type f` over the whole tree and cold `ls -l` of ten directories, each on a fresh
-/// mount, under the READDIRPLUS policy and under plain-first READDIRPLUS.
-/// `LORE_BENCH_FILES` sizes the tree (default 100000); `LORE_BENCH_REPS` repeats (default 3).
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "benchmark"]
-async fn bench_readdir_policy_find_and_ls_long() {
-    skip_without_fuse!();
-    let files = env_usize("LORE_BENCH_FILES", 100_000);
-    let reps = env_usize("LORE_BENCH_REPS", 3);
-    let (immutable, mutable, execution) =
-        fuse_fixture::test_store_create().await.expect("test store");
-    Box::pin(LORE_CONTEXT.scope(execution, async move {
-        let tree = generated_tree(files);
-        let live = live_tree(immutable.clone(), mutable.clone(), &tree, 0, None).await;
-        let mut dirs: Vec<String> = tree
-            .iter()
-            .map(|(p, _)| p.rsplit_once('/').expect("dir").0.to_string())
-            .collect();
-        dirs.dedup();
-        dirs.truncate(10);
-        for rep in 0..reps {
-            for plain_first in [false, true] {
-                let policy = if plain_first { "plain-first" } else { "plus" };
-                let mount_dir = TempDir::new("lore-fuse-policy-mount-");
-                let root = std::fs::canonicalize(mount_dir.path()).expect("canonical");
-                let mount = FuseMount::mount(
-                    live.repository(),
-                    live.state.clone(),
-                    &root,
-                    InstanceId::generate(),
-                    BASE_TIME,
-                )
-                .await
-                .expect("mount");
-                mount.filesystem.set_readdirplus_plain_first(plain_first);
-                let count = |op: Opcode| mount.metrics().snapshot(op).count;
-                let before = [Opcode::Readdir, Opcode::Readdirplus, Opcode::Lookup].map(count);
-                let find_root = root.clone();
-                let (found, find) = blocking(move || find_files(&find_root)).await;
-                let after = [Opcode::Readdir, Opcode::Readdirplus, Opcode::Lookup].map(count);
-                println!(
-                    "rep {rep} {policy:<11} find: {found} files in {:>8.3} ms; READDIR {} \
+    /// Cold `find -type f` over the whole tree and cold `ls -l` of ten directories, each on a fresh
+    /// mount, under the READDIRPLUS policy and under plain-first READDIRPLUS.
+    /// `LORE_BENCH_FILES` sizes the tree (default 100000); `LORE_BENCH_REPS` repeats (default 3).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "benchmark"]
+    async fn bench_readdir_policy_find_and_ls_long() {
+        skip_without_fuse!();
+        let files = env_usize("LORE_BENCH_FILES", 100_000);
+        let reps = env_usize("LORE_BENCH_REPS", 3);
+        let (immutable, mutable, execution) =
+            fuse_fixture::test_store_create().await.expect("test store");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let tree = generated_tree(files);
+            let live = live_tree(immutable.clone(), mutable.clone(), &tree, 0, None).await;
+            let mut dirs: Vec<String> = tree
+                .iter()
+                .map(|(p, _)| p.rsplit_once('/').expect("dir").0.to_string())
+                .collect();
+            dirs.dedup();
+            dirs.truncate(10);
+            for rep in 0..reps {
+                for plain_first in [false, true] {
+                    let policy = if plain_first { "plain-first" } else { "plus" };
+                    let mount_dir = TempDir::new("lore-fuse-policy-mount-");
+                    let root = std::fs::canonicalize(mount_dir.path()).expect("canonical");
+                    let mount = FuseMount::mount(
+                        live.repository(),
+                        live.state.clone(),
+                        &root,
+                        InstanceId::generate(),
+                        BASE_TIME,
+                    )
+                    .await
+                    .expect("mount");
+                    mount.filesystem.set_readdirplus_plain_first(plain_first);
+                    let count = |op: Opcode| mount.metrics().snapshot(op).count;
+                    let before = [Opcode::Readdir, Opcode::Readdirplus, Opcode::Lookup].map(count);
+                    let find_root = root.clone();
+                    let (found, find) = blocking(move || find_files(&find_root)).await;
+                    let after = [Opcode::Readdir, Opcode::Readdirplus, Opcode::Lookup].map(count);
+                    println!(
+                        "rep {rep} {policy:<11} find: {found} files in {:>8.3} ms; READDIR {} \
                      READDIRPLUS {} LOOKUP {}",
-                    find.as_secs_f64() * 1e3,
-                    after[0] - before[0],
-                    after[1] - before[1],
-                    after[2] - before[2]
-                );
-                mount.unmount(false).await.expect("unmount");
+                        find.as_secs_f64() * 1e3,
+                        after[0] - before[0],
+                        after[1] - before[1],
+                        after[2] - before[2]
+                    );
+                    mount.unmount(false).await.expect("unmount");
 
-                let mount_dir = TempDir::new("lore-fuse-policy-mount-");
-                let root = std::fs::canonicalize(mount_dir.path()).expect("canonical");
-                let mount = FuseMount::mount(
-                    live.repository(),
-                    live.state.clone(),
-                    &root,
-                    InstanceId::generate(),
-                    BASE_TIME,
-                )
-                .await
-                .expect("mount");
-                mount.filesystem.set_readdirplus_plain_first(plain_first);
-                let count = |op: Opcode| mount.metrics().snapshot(op).count;
-                let before = [Opcode::Readdir, Opcode::Readdirplus, Opcode::Lookup].map(count);
-                let paths: Vec<PathBuf> = dirs.iter().map(|dir| root.join(dir)).collect();
-                let (listed, ls) = blocking(move || {
-                    paths.iter().fold((0, Duration::ZERO), |(n, t), dir| {
-                        let (entries, elapsed) = ls_long(dir);
-                        (n + entries, t + elapsed)
+                    let mount_dir = TempDir::new("lore-fuse-policy-mount-");
+                    let root = std::fs::canonicalize(mount_dir.path()).expect("canonical");
+                    let mount = FuseMount::mount(
+                        live.repository(),
+                        live.state.clone(),
+                        &root,
+                        InstanceId::generate(),
+                        BASE_TIME,
+                    )
+                    .await
+                    .expect("mount");
+                    mount.filesystem.set_readdirplus_plain_first(plain_first);
+                    let count = |op: Opcode| mount.metrics().snapshot(op).count;
+                    let before = [Opcode::Readdir, Opcode::Readdirplus, Opcode::Lookup].map(count);
+                    let paths: Vec<PathBuf> = dirs.iter().map(|dir| root.join(dir)).collect();
+                    let (listed, ls) = blocking(move || {
+                        paths.iter().fold((0, Duration::ZERO), |(n, t), dir| {
+                            let (entries, elapsed) = ls_long(dir);
+                            (n + entries, t + elapsed)
+                        })
                     })
-                })
-                .await;
-                let after = [Opcode::Readdir, Opcode::Readdirplus, Opcode::Lookup].map(count);
-                println!(
-                    "rep {rep} {policy:<11} ls -l: {listed} entries in {:>8.3} ms; READDIR {} \
+                    .await;
+                    let after = [Opcode::Readdir, Opcode::Readdirplus, Opcode::Lookup].map(count);
+                    println!(
+                        "rep {rep} {policy:<11} ls -l: {listed} entries in {:>8.3} ms; READDIR {} \
                      READDIRPLUS {} LOOKUP {}",
-                    ls.as_secs_f64() * 1e3,
-                    after[0] - before[0],
-                    after[1] - before[1],
-                    after[2] - before[2]
-                );
-                mount.unmount(false).await.expect("unmount");
+                        ls.as_secs_f64() * 1e3,
+                        after[0] - before[0],
+                        after[1] - before[1],
+                        after[2] - before[2]
+                    );
+                    mount.unmount(false).await.expect("unmount");
+                }
             }
-        }
-    }))
-    .await;
+        }))
+        .await;
+    }
 }

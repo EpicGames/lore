@@ -27,63 +27,67 @@ impl Drop for PathUnmountGuard {
     }
 }
 
-#[tokio::test]
-async fn device_transport_clones_a_distinct_fd_per_worker() {
-    skip_without_fuse!();
+mod needs_fuse {
+    use super::*;
 
-    let dir = TempDir::new("lore-fuse-transport-clone-test-");
-    let options = MountOptions {
-        fsname: "lore:clone".to_string(),
-        max_read: 1 << 20,
-        fusermount: None,
-    };
+    #[tokio::test]
+    async fn device_transport_clones_a_distinct_fd_per_worker() {
+        skip_without_fuse!();
 
-    let mount_handle = Arc::new(mount(dir.path(), &options).expect("mount"));
-    let guard = PathUnmountGuard(dir.path().to_path_buf());
+        let dir = TempDir::new("lore-fuse-transport-clone-test-");
+        let options = MountOptions {
+            fsname: "lore:clone".to_string(),
+            max_read: 1 << 20,
+            fusermount: None,
+        };
 
-    let transport = DeviceTransport::new(mount_handle.clone());
-    let worker_a = transport.worker().expect("worker a");
-    let worker_b = transport.worker().expect("worker b");
+        let mount_handle = Arc::new(mount(dir.path(), &options).expect("mount"));
+        let guard = PathUnmountGuard(dir.path().to_path_buf());
 
-    assert_ne!(worker_a.as_raw_fd(), worker_b.as_raw_fd());
+        let transport = DeviceTransport::new(mount_handle.clone());
+        let worker_a = transport.worker().expect("worker a");
+        let worker_b = transport.worker().expect("worker b");
 
-    drop(worker_a);
-    drop(worker_b);
-    // Lazily: nothing answers INIT here, so a desktop service probing the new mount blocks in it
-    // and holds it busy until the connection closes.
-    mount_handle.unmount(true).expect("unmount");
-    drop(guard);
-}
+        assert_ne!(worker_a.as_raw_fd(), worker_b.as_raw_fd());
 
-#[tokio::test]
-async fn receive_after_unmount_returns_disconnected() {
-    skip_without_fuse!();
+        drop(worker_a);
+        drop(worker_b);
+        // Lazily: nothing answers INIT here, so a desktop service probing the new mount blocks in it
+        // and holds it busy until the connection closes.
+        mount_handle.unmount(true).expect("unmount");
+        drop(guard);
+    }
 
-    let dir = TempDir::new("lore-fuse-transport-disconnect-test-");
-    let options = MountOptions {
-        // Nothing answers INIT here, so a desktop service probing the new mount would block in it
-        // and hold it busy, and only a plain unmount ends the connection. GIO's services (such as
-        // gvfsd-trash) skip a mount whose source is `none`.
-        fsname: "none".to_string(),
-        max_read: 1 << 20,
-        fusermount: None,
-    };
+    #[tokio::test]
+    async fn receive_after_unmount_returns_disconnected() {
+        skip_without_fuse!();
 
-    let mount_handle = Arc::new(mount(dir.path(), &options).expect("mount"));
-    let guard = PathUnmountGuard(dir.path().to_path_buf());
+        let dir = TempDir::new("lore-fuse-transport-disconnect-test-");
+        let options = MountOptions {
+            // Nothing answers INIT here, so a desktop service probing the new mount would block in it
+            // and hold it busy, and only a plain unmount ends the connection. GIO's services (such as
+            // gvfsd-trash) skip a mount whose source is `none`.
+            fsname: "none".to_string(),
+            max_read: 1 << 20,
+            fusermount: None,
+        };
 
-    let transport = DeviceTransport::new(mount_handle.clone());
-    let mut worker = transport.worker().expect("worker");
+        let mount_handle = Arc::new(mount(dir.path(), &options).expect("mount"));
+        let guard = PathUnmountGuard(dir.path().to_path_buf());
 
-    mount_handle.unmount(false).expect("unmount");
+        let transport = DeviceTransport::new(mount_handle.clone());
+        let mut worker = transport.worker().expect("worker");
 
-    let mut buffer = RequestBuffer::new();
-    let outcome = tokio::time::timeout(Duration::from_secs(5), worker.receive(&mut buffer))
-        .await
-        .expect("worker.receive did not observe the unmount within 5s");
+        mount_handle.unmount(false).expect("unmount");
 
-    let error = outcome.expect_err("must report disconnection");
-    assert!(matches!(error, TransportError::Disconnected));
+        let mut buffer = RequestBuffer::new();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), worker.receive(&mut buffer))
+            .await
+            .expect("worker.receive did not observe the unmount within 5s");
 
-    drop(guard);
+        let error = outcome.expect_err("must report disconnection");
+        assert!(matches!(error, TransportError::Disconnected));
+
+        drop(guard);
+    }
 }

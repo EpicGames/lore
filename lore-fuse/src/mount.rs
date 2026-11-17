@@ -15,7 +15,6 @@ use std::os::fd::OwnedFd;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -43,7 +42,8 @@ pub enum MountAccess {
 }
 
 impl MountOptions {
-    /// The `-o` option string passed to `fusermount3` for a mount with `access`.
+    /// The `-o` option string passed to `fusermount3` for a mount with `access`. It sets no
+    /// `auto_unmount`, with which `fusermount3` refuses the stdin descriptor a mount hands it.
     pub fn option_string_for(&self, access: MountAccess) -> String {
         let read_only = match access {
             MountAccess::ReadOnly => "ro,",
@@ -152,6 +152,8 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// Mounts `path` through `fusermount3`, which sends the `/dev/fuse` fd back over a socket pair.
+#[lore_macro::test_pub]
 fn mount_via_fusermount(
     path: &Path,
     options: &MountOptions,
@@ -160,33 +162,15 @@ fn mount_via_fusermount(
     let fusermount = options.fusermount_path()?;
     let (parent_end, child_end) = fusermount_socketpair()?;
 
-    let child_fd = child_end.as_raw_fd();
-    let mut command = Command::new(&fusermount);
-    command
-        .arg("-o")
-        .arg(options.option_string_for(access))
-        .arg("--")
-        .arg(path)
-        .env("_FUSE_COMMFD", child_fd.to_string());
-    // Only `fusermount3` keeps `child_end` across its exec.
-    // SAFETY: `fcntl` is async-signal-safe, and `child_end` stays open until after the spawn.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::fcntl(child_fd, libc::F_SETFD, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-
-    let mut child = command.spawn().map_err(|error| {
+    let mut child = spawn_fusermount(
+        &fusermount,
+        &options.option_string_for(access),
+        path,
+        child_end,
+    )
+    .map_err(|error| {
         FuseError::MountFailed(format!("spawning {}: {error}", fusermount.display()))
     })?;
-
-    // The parent's copy of the child's end is no longer needed; dropping it here (rather than
-    // waiting for the whole `Mount` build to finish) means EOF on `parent_end` reflects only
-    // the child's own fd table, not this process holding a spare reference open.
-    drop(child_end);
 
     let received = receive_fd(&parent_end);
     let status = child.wait().map_err(|error| {
@@ -206,6 +190,32 @@ fn mount_via_fusermount(
         path: path.to_path_buf(),
         mounted: AtomicBool::new(true),
     })
+}
+
+/// Starts `fusermount` to mount `path` with the `-o` options `option_string`, with `child_end` as
+/// its stdin, the descriptor `_FUSE_COMMFD` names. `fusermount3` refuses a descriptor below 3 only
+/// with `auto_unmount`, which [`MountOptions::option_string_for`] does not set. The command, and
+/// with it this process's copy of `child_end`, drops on return, so EOF on the other end reflects
+/// only the child's fd table.
+///
+/// Passing the end as stdin takes no `pre_exec` closure, which would make the command start the
+/// child with `fork`, copying this process's memory before the exec, rather than with
+/// `posix_spawn`, which shares it. During that copy the child holds every file the process has
+/// open, on its own mounts too, and an unmount of one of them fails as busy.
+fn spawn_fusermount(
+    fusermount: &Path,
+    option_string: &str,
+    path: &Path,
+    child_end: OwnedFd,
+) -> std::io::Result<std::process::Child> {
+    Command::new(fusermount)
+        .arg("-o")
+        .arg(option_string)
+        .arg("--")
+        .arg(path)
+        .stdin(child_end)
+        .env("_FUSE_COMMFD", "0")
+        .spawn()
 }
 
 /// The socket pair `fusermount3` sends the `/dev/fuse` fd back over: this process's end, then

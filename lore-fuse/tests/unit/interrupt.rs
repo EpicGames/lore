@@ -558,178 +558,184 @@ async fn wait_for_request(release: &Notify, reader: &mut Reader) {
     }
 }
 
-/// A reader blocked in a `READ` the session holds open is ended by `SIGINT`. The kernel sends
-/// `FUSE_INTERRUPT` to a free worker, and the session cancels the handler and answers `EINTR`.
-/// Only that answer lets the kernel finish the request and deliver the signal. The bounded
-/// shutdown then shows that the worker which served the read came free.
-#[tokio::test(flavor = "multi_thread")]
-async fn sigint_ends_a_reader_blocked_on_read_and_frees_its_worker() {
-    skip_without_fuse!();
+mod needs_fuse {
+    use super::*;
 
-    let dir = TempDir::new("lore-fuse-interrupt-read-test-");
-    let release = Arc::new(Notify::new());
-    let fs = SyntheticFs::from_tree(vec![(
-        "blocked".to_string(),
-        SynthNode::BlockingRead {
-            release: Arc::clone(&release),
-        },
-    )]);
-    let (_mount, session) = mount_synthetic(dir.path(), fs, session_config())
-        .await
-        .expect("mount must negotiate against a real kernel");
-    let guard = PathUnmountGuard(dir.path().to_path_buf());
-    let connection = fuse_connection_id(dir.path())
-        .expect("the mount's sysfs connection directory must exist once INIT has negotiated");
-    let mut reader = spawn_reader(
-        ReaderOperation::Read,
-        &dir.path().join("blocked"),
-        connection,
-    );
+    /// A reader blocked in a `READ` the session holds open is ended by `SIGINT`. The kernel sends
+    /// `FUSE_INTERRUPT` to a free worker, and the session cancels the handler and answers `EINTR`.
+    /// Only that answer lets the kernel finish the request and deliver the signal. The bounded
+    /// shutdown then shows that the worker which served the read came free.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sigint_ends_a_reader_blocked_on_read_and_frees_its_worker() {
+        skip_without_fuse!();
 
-    // Waits for our own `read` handler to confirm it is holding the request open, rather than
-    // sleeping and hoping the reader has reached its `read(2)` by then.
-    wait_for_request(&release, &mut reader).await;
-
-    let pid = reader.child.id() as libc::pid_t;
-    // SAFETY: `pid` is the reader's own pid, still alive (we have not reaped it yet).
-    let ret = unsafe { libc::kill(pid, libc::SIGINT) };
-    assert_eq!(ret, 0, "kill(2) must succeed against a live child");
-
-    let signal = wait_for_exit_signal(&mut reader.child, STEP_BOUND).await;
-    assert_eq!(
-        signal,
-        Some(libc::SIGINT),
-        "the reader must be terminated by the SIGINT we sent, not exit some other way"
-    );
-
-    // Bounded rather than a bare `.await`: `shutdown()` awaits every worker's `JoinHandle`, and a
-    // regression that lets a handler stay stuck past its interrupt would otherwise hang the test
-    // suite instead of failing it.
-    tokio::time::timeout(STEP_BOUND, session.shutdown())
-        .await
-        .expect("shutdown must complete promptly once the interrupted read is no longer blocked");
-    // A worker counts the INTERRUPT once it has woken the request's slot, which can be after the
-    // reader has exited, so the count is read once shutdown has joined every worker.
-    assert!(
-        session.metrics().snapshot(Opcode::Interrupt).count >= 1,
-        "the session must have received the kernel's FUSE_INTERRUPT"
-    );
-    drop(guard);
-}
-
-/// DEVIATION (see report): this test is `#[ignore]`d. Plan task 16 assumes a plain `SIGINT` to a
-/// caller blocked on a real kernel's LOOKUP is enough to make the kernel reject the daemon's
-/// eventual `EINTR` reply with `ENOENT` (`SendOutcome::Aborted`), driving `Filesystem::
-/// reply_failed`. Against this machine's kernel (7.0.0-30-generic) that premise does not hold, as
-/// three real-mount experiments (kept here, in order of what was tried) show:
-///
-/// 1. Plain `SIGINT`, no abort: `fs/fuse/dev.c`'s `request_wait_answer` only uses
-///    `FUSE_INTERRUPT` as a hint for the daemon to hurry up. Once a request has been read by the
-///    daemon (`FR_SENT`), the calling task's own wait becomes uninterruptible (by any signal,
-///    including `SIGKILL`) until the daemon actually answers. Debug tracing confirmed a real
-///    `FUSE_INTERRUPT` reaches our worker (`slot_hit=true`) and the daemon's resulting `EINTR`
-///    reply write returns `Ok(())` (`Sent`), never `Aborted`. The caller only exits once that
-///    reply lets its kernel-side wait finish; the already-pending `SIGINT` is then delivered on the
-///    way back to userspace -- so the caller dying "by SIGINT" is not evidence the kernel ever gave
-///    up on the request.
-/// 2. `SIGINT` immediately followed by forcing the connection down via
-///    `/sys/fs/fuse/connections/<id>/abort` (the knob `fusermount -uz` uses to recover a hung
-///    daemon): `Aborted` was not observed. The daemon's own `guard.interrupted()` only resolves
-///    once dispatch has processed a real `FUSE_INTERRUPT` request; aborting earlier can tear the
-///    connection down before that request is delivered, leaving the handler parked on
-///    `std::future::pending()` forever with no reply attempted.
-/// 3. Same, but gated on first observing `session.metrics().snapshot(Opcode::Interrupt).count >=
-///    1` (confirming dispatch really did call `slots.interrupt()`) before aborting. `Aborted`
-///    needs the abort to land between the session waking on the `FUSE_INTERRUPT` and its `EINTR`
-///    reply: a reply written first is accepted as `Sent`. The test cannot force that order, so it
-///    fails in most runs.
-///
-/// The dispatch/interrupt code this test exercises is independently known-correct (see
-/// `dispatch::aborted_send_calls_reply_failed_with_entry_outcome`, which drives the same
-/// `reply_failed` path with `MockTransport::abort_next_send`). What is missing is a *real*, kernel
-/// -level trigger for `Aborted` that an ordinary `SIGINT` scenario reaches every time; this needs
-/// either a different reproduction (e.g. racing a real non-lazy `umount` against the in-flight
-/// reply, which risks the exact hang this task's binding constraints forbid) or plan revision.
-/// Left in place (attempt 3's version, the closest approximation) rather than deleted, so it can
-/// be re-enabled if a reliable trigger is found.
-#[ignore = "SendOutcome::Aborted needs the abort to land between the INTERRUPT and the EINTR \
-            reply, an order the test cannot force; see doc comment"]
-#[tokio::test(flavor = "multi_thread")]
-async fn reply_failed_fires_for_lookup_aborted_by_sigint() {
-    skip_without_fuse!();
-
-    let dir = TempDir::new("lore-fuse-interrupt-lookup-test-");
-    let release = Arc::new(Notify::new());
-    let fs = SyntheticFs::from_tree(vec![(
-        "blocked".to_string(),
-        SynthNode::BlockingLookup {
-            release: Arc::clone(&release),
-        },
-    )]);
-    let fs_handle = Arc::clone(&fs);
-    let (_mount, session) = mount_synthetic(dir.path(), fs, session_config())
-        .await
-        .expect("mount must negotiate against a real kernel");
-    let guard = PathUnmountGuard(dir.path().to_path_buf());
-    let conn_id = fuse_connection_id(dir.path())
-        .expect("the mount's sysfs connection directory must exist once INIT has negotiated");
-    let mut reader = spawn_reader(
-        ReaderOperation::Lookup,
-        &dir.path().join("blocked"),
-        conn_id,
-    );
-
-    // Confirms our `lookup` handler is the one blocking (not, say, the reader still resolving
-    // earlier path components), before sending the signal.
-    wait_for_request(&release, &mut reader).await;
-
-    let pid = reader.child.id() as libc::pid_t;
-    // SAFETY: `pid` is the reader's own pid, still alive (we have not reaped it yet).
-    let ret = unsafe { libc::kill(pid, libc::SIGINT) };
-    assert_eq!(ret, 0, "kill(2) must succeed against a live child");
-
-    // Races the connection abort against our own daemon's `EINTR` reply write: the abort must
-    // land after the daemon has woken up from `guard.interrupted()` (else it never attempts a
-    // reply at all -- the request just stays parked forever, since nothing else ever resolves
-    // it) but before that reply's `write(2)` reaches the kernel (else it is accepted as `Sent`,
-    // per the doc comment above). A tight busy-spin (not `poll_until`'s 5ms ticks, which would
-    // lose the race outright) on the `Interrupt` opcode's metrics count is the earliest
-    // observable signal that `slots.interrupt()` has fired. The session's own workers run on a
-    // separate runtime (`lore_spawn!`'s core runtime), so spinning here never delays them.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while session
-        .metrics()
-        .snapshot(lore_fuse::abi::Opcode::Interrupt)
-        .count
-        == 0
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "a real FUSE_INTERRUPT must be processed within 2s of the signal"
+        let dir = TempDir::new("lore-fuse-interrupt-read-test-");
+        let release = Arc::new(Notify::new());
+        let fs = SyntheticFs::from_tree(vec![(
+            "blocked".to_string(),
+            SynthNode::BlockingRead {
+                release: Arc::clone(&release),
+            },
+        )]);
+        let (_mount, session) = mount_synthetic(dir.path(), fs, session_config())
+            .await
+            .expect("mount must negotiate against a real kernel");
+        let guard = PathUnmountGuard(dir.path().to_path_buf());
+        let connection = fuse_connection_id(dir.path())
+            .expect("the mount's sysfs connection directory must exist once INIT has negotiated");
+        let mut reader = spawn_reader(
+            ReaderOperation::Read,
+            &dir.path().join("blocked"),
+            connection,
         );
+
+        // Waits for our own `read` handler to confirm it is holding the request open, rather than
+        // sleeping and hoping the reader has reached its `read(2)` by then.
+        wait_for_request(&release, &mut reader).await;
+
+        let pid = reader.child.id() as libc::pid_t;
+        // SAFETY: `pid` is the reader's own pid, still alive (we have not reaped it yet).
+        let ret = unsafe { libc::kill(pid, libc::SIGINT) };
+        assert_eq!(ret, 0, "kill(2) must succeed against a live child");
+
+        let signal = wait_for_exit_signal(&mut reader.child, STEP_BOUND).await;
+        assert_eq!(
+            signal,
+            Some(libc::SIGINT),
+            "the reader must be terminated by the SIGINT we sent, not exit some other way"
+        );
+
+        // Bounded rather than a bare `.await`: `shutdown()` awaits every worker's `JoinHandle`, and a
+        // regression that lets a handler stay stuck past its interrupt would otherwise hang the test
+        // suite instead of failing it.
+        tokio::time::timeout(STEP_BOUND, session.shutdown())
+            .await
+            .expect(
+                "shutdown must complete promptly once the interrupted read is no longer blocked",
+            );
+        // A worker counts the INTERRUPT once it has woken the request's slot, which can be after the
+        // reader has exited, so the count is read once shutdown has joined every worker.
+        assert!(
+            session.metrics().snapshot(Opcode::Interrupt).count >= 1,
+            "the session must have received the kernel's FUSE_INTERRUPT"
+        );
+        drop(guard);
     }
-    force_abort_connection(conn_id)
-        .expect("writing to the fuse connection's abort file must succeed");
 
-    let signal = wait_for_exit_signal(&mut reader.child, STEP_BOUND).await;
-    assert_eq!(
-        signal,
-        Some(libc::SIGINT),
-        "the reader must be terminated by the SIGINT we sent, not exit some other way"
-    );
+    /// DEVIATION (see report): this test is `#[ignore]`d. Plan task 16 assumes a plain `SIGINT` to a
+    /// caller blocked on a real kernel's LOOKUP is enough to make the kernel reject the daemon's
+    /// eventual `EINTR` reply with `ENOENT` (`SendOutcome::Aborted`), driving `Filesystem::
+    /// reply_failed`. Against this machine's kernel (7.0.0-30-generic) that premise does not hold, as
+    /// three real-mount experiments (kept here, in order of what was tried) show:
+    ///
+    /// 1. Plain `SIGINT`, no abort: `fs/fuse/dev.c`'s `request_wait_answer` only uses
+    ///    `FUSE_INTERRUPT` as a hint for the daemon to hurry up. Once a request has been read by the
+    ///    daemon (`FR_SENT`), the calling task's own wait becomes uninterruptible (by any signal,
+    ///    including `SIGKILL`) until the daemon actually answers. Debug tracing confirmed a real
+    ///    `FUSE_INTERRUPT` reaches our worker (`slot_hit=true`) and the daemon's resulting `EINTR`
+    ///    reply write returns `Ok(())` (`Sent`), never `Aborted`. The caller only exits once that
+    ///    reply lets its kernel-side wait finish; the already-pending `SIGINT` is then delivered on the
+    ///    way back to userspace -- so the caller dying "by SIGINT" is not evidence the kernel ever gave
+    ///    up on the request.
+    /// 2. `SIGINT` immediately followed by forcing the connection down via
+    ///    `/sys/fs/fuse/connections/<id>/abort` (the knob `fusermount -uz` uses to recover a hung
+    ///    daemon): `Aborted` was not observed. The daemon's own `guard.interrupted()` only resolves
+    ///    once dispatch has processed a real `FUSE_INTERRUPT` request; aborting earlier can tear the
+    ///    connection down before that request is delivered, leaving the handler parked on
+    ///    `std::future::pending()` forever with no reply attempted.
+    /// 3. Same, but gated on first observing `session.metrics().snapshot(Opcode::Interrupt).count >=
+    ///    1` (confirming dispatch really did call `slots.interrupt()`) before aborting. `Aborted`
+    ///    needs the abort to land between the session waking on the `FUSE_INTERRUPT` and its `EINTR`
+    ///    reply: a reply written first is accepted as `Sent`. The test cannot force that order, so it
+    ///    fails in most runs.
+    ///
+    /// The dispatch/interrupt code this test exercises is independently known-correct (see
+    /// `dispatch::aborted_send_calls_reply_failed_with_entry_outcome`, which drives the same
+    /// `reply_failed` path with `MockTransport::abort_next_send`). What is missing is a *real*, kernel
+    /// -level trigger for `Aborted` that an ordinary `SIGINT` scenario reaches every time; this needs
+    /// either a different reproduction (e.g. racing a real non-lazy `umount` against the in-flight
+    /// reply, which risks the exact hang this task's binding constraints forbid) or plan revision.
+    /// Left in place (attempt 3's version, the closest approximation) rather than deleted, so it can
+    /// be re-enabled if a reliable trigger is found.
+    #[ignore = "SendOutcome::Aborted needs the abort to land between the INTERRUPT and the EINTR \
+            reply, an order the test cannot force; see doc comment"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reply_failed_fires_for_lookup_aborted_by_sigint() {
+        skip_without_fuse!();
 
-    let fired = poll_until(Duration::from_secs(2), || {
-        fs_handle.reply_failed_count.load(Ordering::SeqCst) >= 1
-    })
-    .await;
-    assert!(
-        fired,
-        "reply_failed must fire once the kernel aborts the LOOKUP reply for a request whose \
+        let dir = TempDir::new("lore-fuse-interrupt-lookup-test-");
+        let release = Arc::new(Notify::new());
+        let fs = SyntheticFs::from_tree(vec![(
+            "blocked".to_string(),
+            SynthNode::BlockingLookup {
+                release: Arc::clone(&release),
+            },
+        )]);
+        let fs_handle = Arc::clone(&fs);
+        let (_mount, session) = mount_synthetic(dir.path(), fs, session_config())
+            .await
+            .expect("mount must negotiate against a real kernel");
+        let guard = PathUnmountGuard(dir.path().to_path_buf());
+        let conn_id = fuse_connection_id(dir.path())
+            .expect("the mount's sysfs connection directory must exist once INIT has negotiated");
+        let mut reader = spawn_reader(
+            ReaderOperation::Lookup,
+            &dir.path().join("blocked"),
+            conn_id,
+        );
+
+        // Confirms our `lookup` handler is the one blocking (not, say, the reader still resolving
+        // earlier path components), before sending the signal.
+        wait_for_request(&release, &mut reader).await;
+
+        let pid = reader.child.id() as libc::pid_t;
+        // SAFETY: `pid` is the reader's own pid, still alive (we have not reaped it yet).
+        let ret = unsafe { libc::kill(pid, libc::SIGINT) };
+        assert_eq!(ret, 0, "kill(2) must succeed against a live child");
+
+        // Races the connection abort against our own daemon's `EINTR` reply write: the abort must
+        // land after the daemon has woken up from `guard.interrupted()` (else it never attempts a
+        // reply at all -- the request just stays parked forever, since nothing else ever resolves
+        // it) but before that reply's `write(2)` reaches the kernel (else it is accepted as `Sent`,
+        // per the doc comment above). A tight busy-spin (not `poll_until`'s 5ms ticks, which would
+        // lose the race outright) on the `Interrupt` opcode's metrics count is the earliest
+        // observable signal that `slots.interrupt()` has fired. The session's own workers run on a
+        // separate runtime (`lore_spawn!`'s core runtime), so spinning here never delays them.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while session
+            .metrics()
+            .snapshot(lore_fuse::abi::Opcode::Interrupt)
+            .count
+            == 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a real FUSE_INTERRUPT must be processed within 2s of the signal"
+            );
+        }
+        force_abort_connection(conn_id)
+            .expect("writing to the fuse connection's abort file must succeed");
+
+        let signal = wait_for_exit_signal(&mut reader.child, STEP_BOUND).await;
+        assert_eq!(
+            signal,
+            Some(libc::SIGINT),
+            "the reader must be terminated by the SIGINT we sent, not exit some other way"
+        );
+
+        let fired = poll_until(Duration::from_secs(2), || {
+            fs_handle.reply_failed_count.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        assert!(
+            fired,
+            "reply_failed must fire once the kernel aborts the LOOKUP reply for a request whose \
          connection was torn down"
-    );
+        );
 
-    tokio::time::timeout(STEP_BOUND, session.shutdown())
-        .await
-        .expect("shutdown must complete promptly even after the connection was force-aborted");
-    drop(guard);
+        tokio::time::timeout(STEP_BOUND, session.shutdown())
+            .await
+            .expect("shutdown must complete promptly even after the connection was force-aborted");
+        drop(guard);
+    }
 }

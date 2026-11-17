@@ -9,7 +9,7 @@
 //! and the mounted repository starts with empty local stores.
 
 #[cfg(all(test, feature = "integration_tests", target_os = "linux"))]
-mod fuse_remote_tests {
+mod needs_fuse {
     use std::os::fd::AsRawFd as _;
     use std::path::Path;
     use std::path::PathBuf;

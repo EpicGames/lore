@@ -757,242 +757,12 @@ async fn first_leaf(
     "too deep".to_string()
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "benchmark"]
-async fn bench_fragment_cache_matrix() {
-    skip_without_fuse!();
-    let content = content();
-    let w4_mb = env_usize("LORE_BENCH_W4_MB", 64);
-    let small = env_usize("LORE_BENCH_FILES", 100_000);
-    let (_immutable, _mutable, execution) =
-        fuse_fixture::test_store_create().await.expect("test store");
-    Box::pin(LORE_CONTEXT.scope(execution, async move {
-        let started = Instant::now();
-        let tree = tree(content, &dataset(w4_mb, small)).await;
-        println!(
-            "fixture {content:?}: 1 GiB + {W4_FILES}x{w4_mb} MiB + {small} small files in {:?}",
-            started.elapsed()
-        );
-        let mut first = true;
-        println!(
-            "| strategy | content | workload | throughput | syscall p50 us | syscall p99 us | READ p50 us | READ p99 us | READs | peak cache bytes |"
-        );
-        println!("|---|---|---|---|---|---|---|---|---|---|");
-        for (label, strategy) in strategies() {
-            let row = |workload: &str, throughput: String, summary: &Summary, read: lore_fuse::metrics::OpcodeSnapshot, peak: usize| {
-                println!(
-                    "| {label} | {content:?} | {workload} | {throughput} | {} | {} | {} | {} | {} | {peak} |",
-                    us(summary.p50),
-                    us(summary.p99),
-                    us(read.p50_ns),
-                    us(read.p99_ns),
-                    read.count
-                );
-            };
-
-            let (mount, _dir, _guard, root) = mount_with(&tree, Some(strategy)).await;
-            if first {
-                first = false;
-                println!(
-                    "compression: {}",
-                    first_leaf(&tree.repository, &mount.filesystem, &root.join(BIG_FILE)).await
-                );
-            }
-            let cache = || mount.filesystem.fragment_cache();
-            let path = root.join(BIG_FILE);
-            let t = Instant::now();
-            let (bytes, mut samples) = blocking(move || sequential(&path)).await;
-            let elapsed = t.elapsed();
-            assert_eq!(bytes, 1 << 30);
-            row(
-                "W1 seq 1MiB",
-                format!("{:.2} GB/s", gb_per_s(bytes, elapsed)),
-                &Summary::of(&mut samples),
-                mount.metrics().snapshot(Opcode::Read),
-                cache().peak_bytes(),
-            );
-            mount.unmount(false).await.expect("unmount");
-
-            for (workload, len, count) in [("W2 rand 4KiB", PAGE, W2_READS), ("W3 rand 128KiB", 128 << 10, W3_READS)] {
-                let (mount, _dir, _guard, root) = mount_with(&tree, Some(strategy)).await;
-                let path = root.join(BIG_FILE);
-                let t = Instant::now();
-                let mut samples = blocking(move || random_direct(&path, len, count, 7)).await;
-                let elapsed = t.elapsed();
-                row(
-                    workload,
-                    format!("{:.0} IOPS", count as f64 / elapsed.as_secs_f64()),
-                    &Summary::of(&mut samples),
-                    mount.metrics().snapshot(Opcode::Read),
-                    mount.filesystem.fragment_cache().peak_bytes(),
-                );
-                mount.unmount(false).await.expect("unmount");
-            }
-
-            let (mount, _dir, _guard, root) = mount_with(&tree, Some(strategy)).await;
-            let t = Instant::now();
-            let (bytes, mut samples) = blocking(move || w4(&root)).await;
-            let elapsed = t.elapsed();
-            assert_eq!(bytes, (W4_FILES * w4_mb * MIB) as u64);
-            row(
-                "W4 64 files x16",
-                format!("{:.2} GB/s", gb_per_s(bytes, elapsed)),
-                &Summary::of(&mut samples),
-                mount.metrics().snapshot(Opcode::Read),
-                mount.filesystem.fragment_cache().peak_bytes(),
-            );
-            mount.unmount(false).await.expect("unmount");
-
-            let single_leaf_variant = matches!(
-                strategy,
-                FragmentCacheStrategy::Storage
-                    | FragmentCacheStrategy::PerInode(LeafPolicy::Load)
-            );
-            if small > 0 && single_leaf_variant {
-                let (mount, _dir, _guard, root) = mount_with(&tree, Some(strategy)).await;
-                let files: Arc<Vec<PathBuf>> =
-                    Arc::new(tree.small_files.iter().map(|path| root.join(path)).collect());
-                // Lookups warm first, so the pass times READs rather than listing builds.
-                let warm = files.clone();
-                blocking(move || {
-                    for path in warm.iter() {
-                        std::fs::metadata(path).expect("stat");
-                    }
-                })
-                .await;
-                let reads_before = mount.metrics().snapshot(Opcode::Read).count;
-                let t = Instant::now();
-                let mut samples = blocking(move || {
-                    let mut samples = Vec::with_capacity(files.len());
-                    for path in files.iter() {
-                        let started = Instant::now();
-                        let read = std::fs::read(path).expect("small read");
-                        samples.push(started.elapsed().as_nanos() as u64);
-                        assert!(!read.is_empty());
-                    }
-                    samples
-                })
-                .await;
-                let elapsed = t.elapsed();
-                let read = mount.metrics().snapshot(Opcode::Read);
-                assert!(read.count > reads_before);
-                row(
-                    &format!("W5 {} small", tree.small_files.len()),
-                    format!("{:.0} files/s", samples.len() as f64 / elapsed.as_secs_f64()),
-                    &Summary::of(&mut samples),
-                    read,
-                    mount.filesystem.fragment_cache().peak_bytes(),
-                );
-                mount.unmount(false).await.expect("unmount");
-            }
-        }
-    }))
-    .await;
-}
-
 struct DisableCountingOnDrop;
 
 impl Drop for DisableCountingOnDrop {
     fn drop(&mut self) {
         lore_base::allocator::set_allocation_counting(false);
     }
-}
-
-/// Most allocations one READ made, per strategy: a single worker on a `current_thread` runtime,
-/// so the dispatcher's thread-local count covers the whole request. `seq` reads 56 MiB in
-/// order after 8 MiB of warm-up; `hot` re-reads one 128 KiB range the READ before read.
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "benchmark"]
-async fn bench_fragment_cache_allocations() {
-    skip_without_fuse!();
-    let content = content();
-    let mut file = vec![0u8; 64 * MIB];
-    for (index, chunk) in file.chunks_mut(MIB).enumerate() {
-        fill(content, 9, index as u64, chunk);
-    }
-    let fixture = fuse_fixture::committed(&[("f.bin", &file)]).await;
-    println!("| strategy | content | pass | READs | max allocations per READ |");
-    println!("|---|---|---|---|---|");
-    for (label, strategy) in strategies() {
-        for pass in ["seq", "hot"] {
-            let fs = LORE_CONTEXT
-                .scope(
-                    fuse_fixture::setup_test_execution(),
-                    FuseFilesystem::new(
-                        fixture.repository.clone(),
-                        fixture.state.clone(),
-                        AttrContext::for_mounting_user(1 << 17, BASE_TIME),
-                    ),
-                )
-                .await
-                .expect("provider");
-            fs.fragment_cache().set_strategy(strategy);
-            let dir = TempDir::new("lore-fuse-cache-alloc-");
-            let options = MountOptions {
-                fsname: "lore:cache-alloc".to_string(),
-                max_read: 1 << 17,
-                fusermount: None,
-            };
-            let mount = Arc::new(lore_fuse::mount::mount(dir.path(), &options).expect("mount"));
-            let guard = fuse_test_util::MountGuard(dir.path().to_path_buf());
-            let session = Session::start(
-                fs.clone(),
-                Arc::new(DeviceTransport::new(mount)),
-                SessionConfig {
-                    workers: 1,
-                    init: InitConfig {
-                        zero_message_open: true,
-                        ..InitConfig::default()
-                    },
-                },
-            )
-            .await
-            .expect("session");
-            let path = dir.path().join("f.bin");
-            let len = 128 << 10;
-            let warm_path = path.clone();
-            // Warm-up outside counting: the lookup, the per-inode state, the first lists, and
-            // any per-thread or pooled codec state.
-            blocking(move || {
-                let file = open_direct(&warm_path);
-                let buf = Aligned::new(len);
-                for i in 0..64u64 {
-                    pread(&file, &buf, len, i * len as u64);
-                }
-            })
-            .await;
-            lore_base::allocator::set_allocation_counting(true);
-            let restore = DisableCountingOnDrop;
-            let reads_before = session.metrics().snapshot(Opcode::Read).count;
-            blocking(move || {
-                let file = open_direct(&path);
-                let buf = Aligned::new(len);
-                match pass {
-                    "seq" => {
-                        for i in 64..512u64 {
-                            pread(&file, &buf, len, i * len as u64);
-                        }
-                    }
-                    _ => {
-                        for _ in 0..256 {
-                            pread(&file, &buf, len, 63 * len as u64);
-                        }
-                    }
-                }
-            })
-            .await;
-            drop(restore);
-            let read = session.metrics().snapshot(Opcode::Read);
-            println!(
-                "| {label} | {content:?} | {pass} | {} | {} |",
-                read.count - reads_before,
-                read.max_allocations
-            );
-            session.shutdown().await;
-            drop(guard);
-        }
-    }
-    drop(fixture);
 }
 
 /// The store `LORE_BENCH_DISK_STORE=1` asks for, in a temporary directory, or in memory.
@@ -1279,112 +1049,6 @@ async fn bench_hot_inode_reads() {
     .await;
 }
 
-/// Every workload on the FUSE mount (default strategy, then S0) and on the `LORE_BENCH_NATIVE`
-/// roots, over one byte-identical dataset verified by hash on every target first. Each runs
-/// `cold` (caches dropped, fresh mount), then `warm` and `warm2` (again, caches kept), since the
-/// ARC regrows only gradually after a drop; FUSE also runs `remount` (fresh mount, caches kept). Needs `LORE_BENCH_DISK_STORE=1` and passwordless
-/// `sudo -n /usr/sbin/sysctl -q vm.drop_caches=3`; `LORE_BENCH_TARGETS` and
-/// `LORE_BENCH_WORKLOADS` (comma-separated label prefixes) narrow the rows.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "benchmark"]
-async fn bench_read_targets() {
-    skip_without_fuse!();
-    assert_eq!(
-        env_usize("LORE_BENCH_DISK_STORE", 0),
-        1,
-        "cold FUSE rows need the store on disk"
-    );
-    let selected = |name: &str, label: &str| {
-        std::env::var(name).map_or(true, |wanted| {
-            wanted.split(',').any(|prefix| label.starts_with(prefix))
-        })
-    };
-    let content = content();
-    let files = Arc::new(dataset(
-        env_usize("LORE_BENCH_W4_MB", 64),
-        env_usize("LORE_BENCH_FILES", 100_000),
-    ));
-    let manifest = Arc::new(manifest(content, &files));
-    let digest = manifest_digest(content, &files, &manifest);
-    println!(
-        "dataset {content:?}: seed {SEED}, {} files, manifest digest {digest}",
-        files.len()
-    );
-    let (_immutable, _mutable, execution) =
-        fuse_fixture::test_store_create().await.expect("test store");
-    Box::pin(LORE_CONTEXT.scope(execution, async move {
-        let mut natives = Vec::new();
-        for (label, root) in native_targets() {
-            let (files, manifest, digest) = (files.clone(), manifest.clone(), digest.clone());
-            let dir = blocking(move || {
-                let dir = native_dataset(&root, content, &files, &digest);
-                verify(&dir, &files, &manifest);
-                dir
-            })
-            .await;
-            println!("target {label}: {} verified", dir.display());
-            natives.push((label, dir));
-        }
-        let started = Instant::now();
-        let tree = tree(content, &files).await;
-        let store = tree.store_dir.as_ref().expect("disk store").path();
-        println!(
-            "FUSE store on {} at {}, committed in {:?}",
-            filesystem_name(store),
-            store.display(),
-            started.elapsed()
-        );
-        let (mount, _dir, _guard, root) = mount_with(&tree, None).await;
-        println!(
-            "default strategy {:?}, sequential prefetch {}",
-            mount.filesystem.fragment_cache().strategy(),
-            env_usize("LORE_BENCH_PREFETCH", 0) == 1
-        );
-        let (files, manifest) = (files.clone(), manifest.clone());
-        blocking(move || verify(&root, &files, &manifest)).await;
-        mount.unmount(false).await.expect("unmount");
-        println!("target FUSE: mount verified");
-
-        let small = Arc::new(tree.small_files.clone());
-        let workloads: Vec<Workload> = Workload::ALL
-            .into_iter()
-            .filter(|w| selected("LORE_BENCH_WORKLOADS", w.label()))
-            .collect();
-        let fuse = [
-            ("FUSE default", None),
-            ("FUSE S0", Some(FragmentCacheStrategy::Storage)),
-        ];
-        for (target, strategy) in fuse
-            .into_iter()
-            .filter(|(t, _)| selected("LORE_BENCH_TARGETS", t))
-        {
-            for &workload in &workloads {
-                blocking(drop_caches).await;
-                let (mount, _dir, _guard, root) = mount_with(&tree, strategy).await;
-                for mode in ["cold", "warm", "warm2"] {
-                    row(target, workload, mode, &root, &small, Some(&mount)).await;
-                }
-                mount.unmount(false).await.expect("unmount");
-                let (mount, _dir, _guard, root) = mount_with(&tree, strategy).await;
-                row(target, workload, "remount", &root, &small, Some(&mount)).await;
-                mount.unmount(false).await.expect("unmount");
-            }
-        }
-        for (target, root) in natives
-            .iter()
-            .filter(|(t, _)| selected("LORE_BENCH_TARGETS", t))
-        {
-            for &workload in &workloads {
-                blocking(drop_caches).await;
-                for mode in ["cold", "warm", "warm2"] {
-                    row(target, workload, mode, root, &small, None).await;
-                }
-            }
-        }
-    }))
-    .await;
-}
-
 #[test]
 fn every_label_names_one_strategy() {
     let labels: Vec<&str> = all_strategies().iter().map(|(label, _)| *label).collect();
@@ -1392,4 +1056,344 @@ fn every_label_names_one_strategy() {
     unique.sort_unstable();
     unique.dedup();
     assert_eq!(unique.len(), labels.len());
+}
+
+mod needs_fuse {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "benchmark"]
+    async fn bench_fragment_cache_matrix() {
+        skip_without_fuse!();
+        let content = content();
+        let w4_mb = env_usize("LORE_BENCH_W4_MB", 64);
+        let small = env_usize("LORE_BENCH_FILES", 100_000);
+        let (_immutable, _mutable, execution) =
+            fuse_fixture::test_store_create().await.expect("test store");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let started = Instant::now();
+        let tree = tree(content, &dataset(w4_mb, small)).await;
+        println!(
+            "fixture {content:?}: 1 GiB + {W4_FILES}x{w4_mb} MiB + {small} small files in {:?}",
+            started.elapsed()
+        );
+        let mut first = true;
+        println!(
+            "| strategy | content | workload | throughput | syscall p50 us | syscall p99 us | READ p50 us | READ p99 us | READs | peak cache bytes |"
+        );
+        println!("|---|---|---|---|---|---|---|---|---|---|");
+        for (label, strategy) in strategies() {
+            let row = |workload: &str, throughput: String, summary: &Summary, read: lore_fuse::metrics::OpcodeSnapshot, peak: usize| {
+                println!(
+                    "| {label} | {content:?} | {workload} | {throughput} | {} | {} | {} | {} | {} | {peak} |",
+                    us(summary.p50),
+                    us(summary.p99),
+                    us(read.p50_ns),
+                    us(read.p99_ns),
+                    read.count
+                );
+            };
+
+            let (mount, _dir, _guard, root) = mount_with(&tree, Some(strategy)).await;
+            if first {
+                first = false;
+                println!(
+                    "compression: {}",
+                    first_leaf(&tree.repository, &mount.filesystem, &root.join(BIG_FILE)).await
+                );
+            }
+            let cache = || mount.filesystem.fragment_cache();
+            let path = root.join(BIG_FILE);
+            let t = Instant::now();
+            let (bytes, mut samples) = blocking(move || sequential(&path)).await;
+            let elapsed = t.elapsed();
+            assert_eq!(bytes, 1 << 30);
+            row(
+                "W1 seq 1MiB",
+                format!("{:.2} GB/s", gb_per_s(bytes, elapsed)),
+                &Summary::of(&mut samples),
+                mount.metrics().snapshot(Opcode::Read),
+                cache().peak_bytes(),
+            );
+            mount.unmount(false).await.expect("unmount");
+
+            for (workload, len, count) in [("W2 rand 4KiB", PAGE, W2_READS), ("W3 rand 128KiB", 128 << 10, W3_READS)] {
+                let (mount, _dir, _guard, root) = mount_with(&tree, Some(strategy)).await;
+                let path = root.join(BIG_FILE);
+                let t = Instant::now();
+                let mut samples = blocking(move || random_direct(&path, len, count, 7)).await;
+                let elapsed = t.elapsed();
+                row(
+                    workload,
+                    format!("{:.0} IOPS", count as f64 / elapsed.as_secs_f64()),
+                    &Summary::of(&mut samples),
+                    mount.metrics().snapshot(Opcode::Read),
+                    mount.filesystem.fragment_cache().peak_bytes(),
+                );
+                mount.unmount(false).await.expect("unmount");
+            }
+
+            let (mount, _dir, _guard, root) = mount_with(&tree, Some(strategy)).await;
+            let t = Instant::now();
+            let (bytes, mut samples) = blocking(move || w4(&root)).await;
+            let elapsed = t.elapsed();
+            assert_eq!(bytes, (W4_FILES * w4_mb * MIB) as u64);
+            row(
+                "W4 64 files x16",
+                format!("{:.2} GB/s", gb_per_s(bytes, elapsed)),
+                &Summary::of(&mut samples),
+                mount.metrics().snapshot(Opcode::Read),
+                mount.filesystem.fragment_cache().peak_bytes(),
+            );
+            mount.unmount(false).await.expect("unmount");
+
+            let single_leaf_variant = matches!(
+                strategy,
+                FragmentCacheStrategy::Storage
+                    | FragmentCacheStrategy::PerInode(LeafPolicy::Load)
+            );
+            if small > 0 && single_leaf_variant {
+                let (mount, _dir, _guard, root) = mount_with(&tree, Some(strategy)).await;
+                let files: Arc<Vec<PathBuf>> =
+                    Arc::new(tree.small_files.iter().map(|path| root.join(path)).collect());
+                // Lookups warm first, so the pass times READs rather than listing builds.
+                let warm = files.clone();
+                blocking(move || {
+                    for path in warm.iter() {
+                        std::fs::metadata(path).expect("stat");
+                    }
+                })
+                .await;
+                let reads_before = mount.metrics().snapshot(Opcode::Read).count;
+                let t = Instant::now();
+                let mut samples = blocking(move || {
+                    let mut samples = Vec::with_capacity(files.len());
+                    for path in files.iter() {
+                        let started = Instant::now();
+                        let read = std::fs::read(path).expect("small read");
+                        samples.push(started.elapsed().as_nanos() as u64);
+                        assert!(!read.is_empty());
+                    }
+                    samples
+                })
+                .await;
+                let elapsed = t.elapsed();
+                let read = mount.metrics().snapshot(Opcode::Read);
+                assert!(read.count > reads_before);
+                row(
+                    &format!("W5 {} small", tree.small_files.len()),
+                    format!("{:.0} files/s", samples.len() as f64 / elapsed.as_secs_f64()),
+                    &Summary::of(&mut samples),
+                    read,
+                    mount.filesystem.fragment_cache().peak_bytes(),
+                );
+                mount.unmount(false).await.expect("unmount");
+            }
+        }
+    }))
+    .await;
+    }
+
+    /// Most allocations one READ made, per strategy: a single worker on a `current_thread` runtime,
+    /// so the dispatcher's thread-local count covers the whole request. `seq` reads 56 MiB in
+    /// order after 8 MiB of warm-up; `hot` re-reads one 128 KiB range the READ before read.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "benchmark"]
+    async fn bench_fragment_cache_allocations() {
+        skip_without_fuse!();
+        let content = content();
+        let mut file = vec![0u8; 64 * MIB];
+        for (index, chunk) in file.chunks_mut(MIB).enumerate() {
+            fill(content, 9, index as u64, chunk);
+        }
+        let fixture = fuse_fixture::committed(&[("f.bin", &file)]).await;
+        println!("| strategy | content | pass | READs | max allocations per READ |");
+        println!("|---|---|---|---|---|");
+        for (label, strategy) in strategies() {
+            for pass in ["seq", "hot"] {
+                let fs = LORE_CONTEXT
+                    .scope(
+                        fuse_fixture::setup_test_execution(),
+                        FuseFilesystem::new(
+                            fixture.repository.clone(),
+                            fixture.state.clone(),
+                            AttrContext::for_mounting_user(1 << 17, BASE_TIME),
+                        ),
+                    )
+                    .await
+                    .expect("provider");
+                fs.fragment_cache().set_strategy(strategy);
+                let dir = TempDir::new("lore-fuse-cache-alloc-");
+                let options = MountOptions {
+                    fsname: "lore:cache-alloc".to_string(),
+                    max_read: 1 << 17,
+                    fusermount: None,
+                };
+                let mount = Arc::new(lore_fuse::mount::mount(dir.path(), &options).expect("mount"));
+                let guard = fuse_test_util::MountGuard(dir.path().to_path_buf());
+                let session = Session::start(
+                    fs.clone(),
+                    Arc::new(DeviceTransport::new(mount)),
+                    SessionConfig {
+                        workers: 1,
+                        init: InitConfig {
+                            zero_message_open: true,
+                            ..InitConfig::default()
+                        },
+                    },
+                )
+                .await
+                .expect("session");
+                let path = dir.path().join("f.bin");
+                let len = 128 << 10;
+                let warm_path = path.clone();
+                // Warm-up outside counting: the lookup, the per-inode state, the first lists, and
+                // any per-thread or pooled codec state.
+                blocking(move || {
+                    let file = open_direct(&warm_path);
+                    let buf = Aligned::new(len);
+                    for i in 0..64u64 {
+                        pread(&file, &buf, len, i * len as u64);
+                    }
+                })
+                .await;
+                lore_base::allocator::set_allocation_counting(true);
+                let restore = DisableCountingOnDrop;
+                let reads_before = session.metrics().snapshot(Opcode::Read).count;
+                blocking(move || {
+                    let file = open_direct(&path);
+                    let buf = Aligned::new(len);
+                    match pass {
+                        "seq" => {
+                            for i in 64..512u64 {
+                                pread(&file, &buf, len, i * len as u64);
+                            }
+                        }
+                        _ => {
+                            for _ in 0..256 {
+                                pread(&file, &buf, len, 63 * len as u64);
+                            }
+                        }
+                    }
+                })
+                .await;
+                drop(restore);
+                let read = session.metrics().snapshot(Opcode::Read);
+                println!(
+                    "| {label} | {content:?} | {pass} | {} | {} |",
+                    read.count - reads_before,
+                    read.max_allocations
+                );
+                session.shutdown().await;
+                drop(guard);
+            }
+        }
+        drop(fixture);
+    }
+
+    /// Every workload on the FUSE mount (default strategy, then S0) and on the `LORE_BENCH_NATIVE`
+    /// roots, over one byte-identical dataset verified by hash on every target first. Each runs
+    /// `cold` (caches dropped, fresh mount), then `warm` and `warm2` (again, caches kept), since the
+    /// ARC regrows only gradually after a drop; FUSE also runs `remount` (fresh mount, caches kept). Needs `LORE_BENCH_DISK_STORE=1` and passwordless
+    /// `sudo -n /usr/sbin/sysctl -q vm.drop_caches=3`; `LORE_BENCH_TARGETS` and
+    /// `LORE_BENCH_WORKLOADS` (comma-separated label prefixes) narrow the rows.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "benchmark"]
+    async fn bench_read_targets() {
+        skip_without_fuse!();
+        assert_eq!(
+            env_usize("LORE_BENCH_DISK_STORE", 0),
+            1,
+            "cold FUSE rows need the store on disk"
+        );
+        let selected = |name: &str, label: &str| {
+            std::env::var(name).map_or(true, |wanted| {
+                wanted.split(',').any(|prefix| label.starts_with(prefix))
+            })
+        };
+        let content = content();
+        let files = Arc::new(dataset(
+            env_usize("LORE_BENCH_W4_MB", 64),
+            env_usize("LORE_BENCH_FILES", 100_000),
+        ));
+        let manifest = Arc::new(manifest(content, &files));
+        let digest = manifest_digest(content, &files, &manifest);
+        println!(
+            "dataset {content:?}: seed {SEED}, {} files, manifest digest {digest}",
+            files.len()
+        );
+        let (_immutable, _mutable, execution) =
+            fuse_fixture::test_store_create().await.expect("test store");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let mut natives = Vec::new();
+            for (label, root) in native_targets() {
+                let (files, manifest, digest) = (files.clone(), manifest.clone(), digest.clone());
+                let dir = blocking(move || {
+                    let dir = native_dataset(&root, content, &files, &digest);
+                    verify(&dir, &files, &manifest);
+                    dir
+                })
+                .await;
+                println!("target {label}: {} verified", dir.display());
+                natives.push((label, dir));
+            }
+            let started = Instant::now();
+            let tree = tree(content, &files).await;
+            let store = tree.store_dir.as_ref().expect("disk store").path();
+            println!(
+                "FUSE store on {} at {}, committed in {:?}",
+                filesystem_name(store),
+                store.display(),
+                started.elapsed()
+            );
+            let (mount, _dir, _guard, root) = mount_with(&tree, None).await;
+            println!(
+                "default strategy {:?}, sequential prefetch {}",
+                mount.filesystem.fragment_cache().strategy(),
+                env_usize("LORE_BENCH_PREFETCH", 0) == 1
+            );
+            let (files, manifest) = (files.clone(), manifest.clone());
+            blocking(move || verify(&root, &files, &manifest)).await;
+            mount.unmount(false).await.expect("unmount");
+            println!("target FUSE: mount verified");
+
+            let small = Arc::new(tree.small_files.clone());
+            let workloads: Vec<Workload> = Workload::ALL
+                .into_iter()
+                .filter(|w| selected("LORE_BENCH_WORKLOADS", w.label()))
+                .collect();
+            let fuse = [
+                ("FUSE default", None),
+                ("FUSE S0", Some(FragmentCacheStrategy::Storage)),
+            ];
+            for (target, strategy) in fuse
+                .into_iter()
+                .filter(|(t, _)| selected("LORE_BENCH_TARGETS", t))
+            {
+                for &workload in &workloads {
+                    blocking(drop_caches).await;
+                    let (mount, _dir, _guard, root) = mount_with(&tree, strategy).await;
+                    for mode in ["cold", "warm", "warm2"] {
+                        row(target, workload, mode, &root, &small, Some(&mount)).await;
+                    }
+                    mount.unmount(false).await.expect("unmount");
+                    let (mount, _dir, _guard, root) = mount_with(&tree, strategy).await;
+                    row(target, workload, "remount", &root, &small, Some(&mount)).await;
+                    mount.unmount(false).await.expect("unmount");
+                }
+            }
+            for (target, root) in natives
+                .iter()
+                .filter(|(t, _)| selected("LORE_BENCH_TARGETS", t))
+            {
+                for &workload in &workloads {
+                    blocking(drop_caches).await;
+                    for mode in ["cold", "warm", "warm2"] {
+                        row(target, workload, mode, root, &small, None).await;
+                    }
+                }
+            }
+        }))
+        .await;
+    }
 }

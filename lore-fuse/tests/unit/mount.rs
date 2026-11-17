@@ -75,6 +75,50 @@ fn missing_fusermount_gives_named_error() {
     assert!(matches!(error, FuseError::FusermountMissing));
 }
 
+thread_local! {
+    /// The forks this thread has started, which [`count_fork`] counts.
+    static FORKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+extern "C" fn count_fork() {
+    FORKS.with(|forks| forks.set(forks.get() + 1));
+}
+
+/// A mount starts `fusermount3` without forking this process: while a fork copies the process's
+/// memory, the child holds every file the process has open, on its own mounts too, and an
+/// unmount of one of them fails as busy.
+#[test]
+fn a_mount_starts_fusermount3_without_forking() {
+    static COUNTING: std::sync::Once = std::sync::Once::new();
+    // SAFETY: `count_fork` only updates a thread-local counter, which is safe before a fork.
+    COUNTING.call_once(|| unsafe {
+        assert_eq!(libc::pthread_atfork(Some(count_fork), None, None), 0);
+    });
+    let stand_in = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .map(|dir| dir.join("true"))
+        .find(|candidate| candidate.is_file())
+        .expect("true on PATH");
+    let dir = TempDir::new("lore-fuse-spawn-test-");
+    let options = MountOptions {
+        fsname: "none".to_string(),
+        max_read: 1 << 20,
+        // Exits without sending a descriptor, so the mount fails once it has started it.
+        fusermount: Some(stand_in),
+    };
+    let forks = FORKS.with(std::cell::Cell::get);
+
+    let Err(error) = mount_via_fusermount(dir.path(), &options, MountAccess::ReadOnly) else {
+        panic!("true sends no descriptor");
+    };
+
+    assert!(matches!(error, FuseError::MountFailed(_)), "{error}");
+    assert_eq!(
+        FORKS.with(std::cell::Cell::get),
+        forks,
+        "starting fusermount3 forked this process"
+    );
+}
+
 #[test]
 fn options_string_matches_spec() {
     let options = MountOptions {
@@ -145,31 +189,6 @@ fn mounted_fstype(path: &Path) -> Option<String> {
     })
 }
 
-#[test]
-fn mount_appears_in_mountinfo_as_fuse_lore_then_unmounts() {
-    skip_without_fuse!();
-
-    let dir = TempDir::new("lore-fuse-mount-test-");
-    let options = MountOptions {
-        // Nothing answers INIT here, so a desktop service probing the new mount would block in it
-        // and hold it busy, failing the plain unmount. GIO's services (such as gvfsd-trash) skip a
-        // mount whose source is `none`.
-        fsname: "none".to_string(),
-        max_read: 1 << 20,
-        fusermount: None,
-    };
-
-    let mount_handle = mount(dir.path(), &options).expect("mount");
-    let guard = PathUnmountGuard(dir.path().to_path_buf());
-
-    assert_eq!(mounted_fstype(dir.path()).as_deref(), Some("fuse.lore"));
-
-    mount_handle.unmount(false).expect("unmount");
-    assert_eq!(mounted_fstype(dir.path()), None);
-
-    drop(guard);
-}
-
 /// Whether `fd` closes on exec.
 fn closes_on_exec(fd: BorrowedFd<'_>) -> bool {
     // SAFETY: `fcntl` only reads the flags of a descriptor the borrow keeps open.
@@ -180,29 +199,6 @@ fn closes_on_exec(fd: BorrowedFd<'_>) -> bool {
         std::io::Error::last_os_error()
     );
     flags & libc::FD_CLOEXEC != 0
-}
-
-/// A process started while the mount is up does not inherit its device fd, which would keep the
-/// connection open after the session ends.
-#[test]
-fn mount_device_fd_closes_on_exec() {
-    skip_without_fuse!();
-
-    let dir = TempDir::new("lore-fuse-mount-cloexec-test-");
-    let options = MountOptions {
-        fsname: "none".to_string(),
-        max_read: 1 << 20,
-        fusermount: None,
-    };
-    let mount_handle = mount(dir.path(), &options).expect("mount");
-    let guard = PathUnmountGuard(dir.path().to_path_buf());
-
-    assert!(
-        closes_on_exec(mount_handle.device_fd()),
-        "the device fd must close on exec"
-    );
-
-    drop(guard);
 }
 
 /// Both ends of the socket pair `fusermount3` answers over close on exec as created, so a process
@@ -216,7 +212,7 @@ fn fusermount_socketpair_ends_close_on_exec() {
     );
     assert!(
         closes_on_exec(child_end.as_fd()),
-        "fusermount3's end must close on exec until the child that runs fusermount3 clears it"
+        "fusermount3's end must close on exec; the spawn gives the child a duplicate as its stdin"
     );
 }
 
@@ -232,55 +228,107 @@ fn mount_options(path: &Path) -> Option<String> {
     })
 }
 
-#[test]
-fn read_write_mount_is_rw_and_the_default_mount_is_ro() {
-    skip_without_fuse!();
+mod needs_fuse {
+    use super::*;
 
-    let options = MountOptions {
-        fsname: "lore:access".to_string(),
-        max_read: 1 << 20,
-        fusermount: None,
-    };
+    #[test]
+    fn mount_appears_in_mountinfo_as_fuse_lore_then_unmounts() {
+        skip_without_fuse!();
 
-    let ro_dir = TempDir::new("lore-fuse-mount-ro-test-");
-    let ro = mount(ro_dir.path(), &options).expect("read-only mount");
-    let ro_guard = PathUnmountGuard(ro_dir.path().to_path_buf());
-    let rw_dir = TempDir::new("lore-fuse-mount-rw-test-");
-    let rw = mount_with_access(rw_dir.path(), &options, MountAccess::ReadWrite)
-        .expect("read-write mount");
-    let rw_guard = PathUnmountGuard(rw_dir.path().to_path_buf());
+        let dir = TempDir::new("lore-fuse-mount-test-");
+        let options = MountOptions {
+            // Nothing answers INIT here, so a desktop service probing the new mount would block in it
+            // and hold it busy, failing the plain unmount. GIO's services (such as gvfsd-trash) skip a
+            // mount whose source is `none`.
+            fsname: "none".to_string(),
+            max_read: 1 << 20,
+            fusermount: None,
+        };
 
-    let ro_options = mount_options(ro_dir.path()).expect("read-only mount is listed");
-    let rw_options = mount_options(rw_dir.path()).expect("read-write mount is listed");
-    assert_eq!(ro_options.split(',').next(), Some("ro"), "{ro_options}");
-    assert_eq!(rw_options.split(',').next(), Some("rw"), "{rw_options}");
+        let mount_handle = mount(dir.path(), &options).expect("mount");
+        let guard = PathUnmountGuard(dir.path().to_path_buf());
 
-    ro.unmount(true).expect("unmount read-only");
-    rw.unmount(true).expect("unmount read-write");
-    drop(ro_guard);
-    drop(rw_guard);
-}
+        assert_eq!(mounted_fstype(dir.path()).as_deref(), Some("fuse.lore"));
 
-#[test]
-fn stale_mount_detected_after_fd_close() {
-    skip_without_fuse!();
+        mount_handle.unmount(false).expect("unmount");
+        assert_eq!(mounted_fstype(dir.path()), None);
 
-    let dir = TempDir::new("lore-fuse-stale-test-");
-    let options = MountOptions {
-        fsname: "lore:stale".to_string(),
-        max_read: 1 << 20,
-        fusermount: None,
-    };
+        drop(guard);
+    }
 
-    let mount_handle = mount(dir.path(), &options).expect("mount");
-    let guard = PathUnmountGuard(dir.path().to_path_buf());
+    /// A process started while the mount is up does not inherit its device fd, which would keep the
+    /// connection open after the session ends.
+    #[test]
+    fn mount_device_fd_closes_on_exec() {
+        skip_without_fuse!();
 
-    // Dropping the handle without calling `unmount` closes its sole device fd while the
-    // mountpoint itself stays attached: exactly the "stale" state `is_stale_mount` detects.
-    drop(mount_handle);
+        let dir = TempDir::new("lore-fuse-mount-cloexec-test-");
+        let options = MountOptions {
+            fsname: "none".to_string(),
+            max_read: 1 << 20,
+            fusermount: None,
+        };
+        let mount_handle = mount(dir.path(), &options).expect("mount");
+        let guard = PathUnmountGuard(dir.path().to_path_buf());
 
-    assert!(is_stale_mount(dir.path()));
+        assert!(
+            closes_on_exec(mount_handle.device_fd()),
+            "the device fd must close on exec"
+        );
 
-    drop(guard);
-    assert_eq!(mounted_fstype(dir.path()), None);
+        drop(guard);
+    }
+
+    #[test]
+    fn read_write_mount_is_rw_and_the_default_mount_is_ro() {
+        skip_without_fuse!();
+
+        let options = MountOptions {
+            fsname: "lore:access".to_string(),
+            max_read: 1 << 20,
+            fusermount: None,
+        };
+
+        let ro_dir = TempDir::new("lore-fuse-mount-ro-test-");
+        let ro = mount(ro_dir.path(), &options).expect("read-only mount");
+        let ro_guard = PathUnmountGuard(ro_dir.path().to_path_buf());
+        let rw_dir = TempDir::new("lore-fuse-mount-rw-test-");
+        let rw = mount_with_access(rw_dir.path(), &options, MountAccess::ReadWrite)
+            .expect("read-write mount");
+        let rw_guard = PathUnmountGuard(rw_dir.path().to_path_buf());
+
+        let ro_options = mount_options(ro_dir.path()).expect("read-only mount is listed");
+        let rw_options = mount_options(rw_dir.path()).expect("read-write mount is listed");
+        assert_eq!(ro_options.split(',').next(), Some("ro"), "{ro_options}");
+        assert_eq!(rw_options.split(',').next(), Some("rw"), "{rw_options}");
+
+        ro.unmount(true).expect("unmount read-only");
+        rw.unmount(true).expect("unmount read-write");
+        drop(ro_guard);
+        drop(rw_guard);
+    }
+
+    #[test]
+    fn stale_mount_detected_after_fd_close() {
+        skip_without_fuse!();
+
+        let dir = TempDir::new("lore-fuse-stale-test-");
+        let options = MountOptions {
+            fsname: "lore:stale".to_string(),
+            max_read: 1 << 20,
+            fusermount: None,
+        };
+
+        let mount_handle = mount(dir.path(), &options).expect("mount");
+        let guard = PathUnmountGuard(dir.path().to_path_buf());
+
+        // Dropping the handle without calling `unmount` closes its sole device fd while the
+        // mountpoint itself stays attached: exactly the "stale" state `is_stale_mount` detects.
+        drop(mount_handle);
+
+        assert!(is_stale_mount(dir.path()));
+
+        drop(guard);
+        assert_eq!(mounted_fstype(dir.path()), None);
+    }
 }

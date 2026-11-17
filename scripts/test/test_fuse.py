@@ -14,6 +14,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 from time import monotonic, sleep
 
@@ -35,7 +36,7 @@ from lore import Lore, external_root
 pytestmark = [
     pytest.mark.skipif(
         platform.system() != "Linux"
-        or not os.path.exists("/dev/fuse")
+        or not os.access("/dev/fuse", os.R_OK | os.W_OK)
         or shutil.which("fusermount3") is None,
         reason="FUSE needs Linux with /dev/fuse and fusermount3",
     ),
@@ -691,14 +692,31 @@ def test_a_committed_file_keeps_its_time_across_a_service_restart(
     )
 
 
+def wait_for_a_reset_time_past(directory: str, mtime_ns: int) -> None:
+    """Waits until a reset's time is later than `mtime_ns`: until a file written in `directory`
+    takes a time whose millisecond, less one, is later than `mtime_ns`, which is the time a reset
+    records from the filesystem's clock."""
+    deadline = monotonic() + 5
+    with tempfile.TemporaryDirectory(dir=directory) as probes:
+        probe = Path(probes, "probe")
+        while True:
+            probe.write_bytes(b"\0")
+            if (probe.stat().st_mtime_ns // 1_000_000 - 1) * 1_000_000 > mtime_ns:
+                return
+            assert monotonic() < deadline, f"the clock in {directory} did not pass {mtime_ns}"
+            sleep(0.001)
+
+
 @pytest.mark.smoke
 def test_a_reset_file_reports_a_time_later_than_its_edit_across_a_service_restart(
-    new_lore_repo, fuse_mounts, lore_service_runner
+    new_lore_repo, fuse_mounts, lore_service_runner, global_dir_name
 ):
     """A tracked file edited through a virtual clone and reset to its revision, which the mount
     then serves from the store, reports a time later than the edit's to a process holding it open
     across the reset, and once a replacement service remounts the instance: the reset records a
-    new time in the instance's records, as a build tool needs to rebuild what the edit built."""
+    new time in the instance's records, as a build tool needs to rebuild what the edit built. The
+    test waits for the filesystem's clock to pass the edit before resetting: the time a reset
+    records can be earlier than a file written in the clock's last tick before the reset reads it."""
     repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
     repo.write_commit_push("initial", {"readme.txt": b"tracked\n"})
     fuse = fuse_clone(repo, fuse_mounts)
@@ -707,6 +725,7 @@ def test_a_reset_file_reports_a_time_later_than_its_edit_across_a_service_restar
         written.write(b"edited through the mount\n")
         os.fsync(written.fileno())
     edited = os.stat(tracked).st_mtime_ns
+    wait_for_a_reset_time_past(external_root(global_dir_name), edited)
 
     with open(tracked, "rb") as held:
         fuse.reset(["readme.txt"])
@@ -1273,3 +1292,60 @@ def test_instance_clone_mounts_a_copy_of_a_fuse_instance_with_its_changes(
     clone.stage(["edited.txt"])
     clone.commit("from the new instance")
     assert cat(os.path.join(target, "edited.txt")) == b"edited in the new instance\n"
+
+
+@pytest.mark.smoke
+def test_a_fuse_instance_and_an_instance_cloned_from_it_change_apart(
+    new_lore_repo, scratch_dir, fuse_mounts, lore_service_runner
+):
+    """What either of a FUSE instance and an instance cloned from it writes or deletes after
+    cloning, in place in a file both hold included, stays out of the other, and does so again once
+    a new service mounts them both."""
+    repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    repo.write_commit_push(
+        "initial",
+        {
+            "tracked.txt": b"tracked\n",
+            "gone.txt": b"gone\n",
+            "deleted_in_source.txt": b"deleted in the source\n",
+        },
+    )
+    fuse = fuse_clone(repo, fuse_mounts)
+    target = scratch_dir("fuse_clone_apart_parent", create=True) / "cloned_fuse"
+    fuse_mounts.append(str(target))
+    written = os.urandom(1 << 20)
+    fuse.write_files({"written.bin": written})
+    fuse.remove_file("gone.txt")
+    cloned = fuse.repository_instance_clone(str(target), allow_copy=True)
+
+    for root, offset, data in ((target, 4096, b"clone"), (fuse.path, 8192, b"source")):
+        with open(os.path.join(root, "written.bin"), "r+b") as file:
+            file.seek(offset)
+            file.write(data)
+    cloned.write_files({"gone.txt": b"back in the cloned instance\n"})
+    cloned.remove_file("tracked.txt")
+    fuse.remove_file("deleted_in_source.txt")
+    fuse.write_files({"added_in_source.txt": b"added in the source\n"})
+
+    def assert_apart(mounted_by: str):
+        assert cat(os.path.join(fuse.path, "written.bin")) == (
+            written[:8192] + b"source" + written[8192 + 6 :]
+        ), f"the source keeps only its own write in place, under {mounted_by}"
+        assert cat(os.path.join(target, "written.bin")) == (
+            written[:4096] + b"clone" + written[4096 + 5 :]
+        ), f"and the cloned instance only its own, under {mounted_by}"
+        assert not os.path.exists(os.path.join(fuse.path, "gone.txt"))
+        assert cat(os.path.join(target, "gone.txt")) == b"back in the cloned instance\n"
+        assert cat(os.path.join(fuse.path, "tracked.txt")) == b"tracked\n"
+        assert not os.path.exists(os.path.join(target, "tracked.txt"))
+        assert not os.path.exists(os.path.join(fuse.path, "deleted_in_source.txt"))
+        assert cat(os.path.join(target, "deleted_in_source.txt")) == b"deleted in the source\n"
+        assert not os.path.exists(os.path.join(target, "added_in_source.txt"))
+
+    assert_apart("the service that cloned")
+    killed = lore_service_runner.service_processes[None]
+    killed.kill()
+    killed.wait()
+    fuse.status()
+    assert is_mounted(fuse.path) and is_mounted(str(target)), "a new service mounts both"
+    assert_apart("a new service")

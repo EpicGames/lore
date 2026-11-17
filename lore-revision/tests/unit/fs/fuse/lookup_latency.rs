@@ -88,12 +88,14 @@ struct LatencyStore {
     name_tables: HashSet<Hash>,
     file_metadata: HashSet<Hash>,
     delays: Delays,
+    /// Whether reads wait their delays; until it is set, each is answered at once.
+    armed: Arc<AtomicBool>,
     name_table_reads: NameTableReads,
 }
 
 impl LatencyStore {
     fn delay(&self, address: &Address) -> Duration {
-        if self.name_tables.contains(&address.hash) {
+        let delay = if self.name_tables.contains(&address.hash) {
             *self
                 .name_table_reads
                 .lock()
@@ -104,6 +106,11 @@ impl LatencyStore {
             self.delays.file_metadata
         } else {
             self.delays.other
+        };
+        if self.armed.load(Ordering::Acquire) {
+            delay
+        } else {
+            Duration::ZERO
         }
     }
 }
@@ -313,7 +320,8 @@ async fn cold_provider_counting(
     fixture: &fuse_fixture::FuseFixture,
     delays: Delays,
 ) -> (Arc<FuseFilesystem>, NameTableReads) {
-    let (repository, state, name_table_reads) = cold_state(fixture, delays).await;
+    let (repository, state, name_table_reads) =
+        cold_state(fixture, delays, Arc::new(AtomicBool::new(true))).await;
     let fs = lore_base::runtime::LORE_CONTEXT
         .scope(
             fuse_fixture::setup_test_execution(),
@@ -324,11 +332,12 @@ async fn cold_provider_counting(
     (fs, name_table_reads)
 }
 
-/// A cold copy of the fixture's state read through a [`LatencyStore`], with the store's
-/// name-table read counts.
+/// A cold copy of the fixture's state read through a [`LatencyStore`] that waits its delays once
+/// `armed` is set, with the store's name-table read counts.
 async fn cold_state(
     fixture: &fuse_fixture::FuseFixture,
     delays: Delays,
+    armed: Arc<AtomicBool>,
 ) -> (Arc<RepositoryContext>, Arc<State>, NameTableReads) {
     let (name_tables, file_metadata) = lore_base::runtime::LORE_CONTEXT
         .scope(
@@ -342,6 +351,7 @@ async fn cold_state(
         name_tables,
         file_metadata,
         delays,
+        armed,
         name_table_reads: name_table_reads.clone(),
     });
     let mutable_store = fixture
@@ -561,50 +571,6 @@ async fn a_dropped_listing_build_leaves_no_build_in_flight() {
     assert_eq!(fs.listing_builds_in_flight(), 0);
 }
 
-/// An unmount cancels the background prefetch a clone started on the mount, however far the
-/// prefetch has come.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_unmount_cancels_a_running_prefetch() {
-    skip_without_fuse!();
-    let fixture = committed_wide_tree().await;
-    let delays = Delays {
-        name_table: Duration::from_secs(5),
-        file_metadata: Duration::from_secs(5),
-        other: Duration::from_secs(5),
-    };
-    let (repository, state, _) = cold_state(&fixture, delays).await;
-    let dir = TempDir::new("lore-fuse-prefetch-cancel-");
-    let mount = lore_base::runtime::LORE_CONTEXT
-        .scope(
-            fuse_fixture::setup_test_execution(),
-            FuseMount::mount(
-                repository,
-                state,
-                dir.path(),
-                InstanceId::generate(),
-                1_700_000_000_000,
-            ),
-        )
-        .await
-        .expect("mount");
-    lore_base::runtime::LORE_CONTEXT
-        .scope(fuse_fixture::setup_test_execution(), async {
-            mount.filesystem.start_prefetch(PrefetchPlan {
-                tree: TreePrefetch::Blocks,
-                recording: None,
-            });
-        })
-        .await;
-    assert!(mount.filesystem.prefetch_running());
-
-    // Lazy: a desktop service's LOOKUP in the new mount waits on the same slow reads and holds
-    // it busy, which would refuse a plain unmount.
-    mount.unmount(true).await.expect("unmount");
-    tokio::time::timeout(Duration::from_secs(1), mount.filesystem.prefetch_finished())
-        .await
-        .expect("the prefetch stops with the mount");
-}
-
 /// A tree warm-up of a revision no longer served starts no work: no block batch, which would
 /// reach for the fixture's missing remote, and no block of a walk.
 #[tokio::test]
@@ -726,42 +692,6 @@ async fn committed_seeded_tree() -> fuse_fixture::FuseFixture {
     fuse_fixture::committed_revisions(&revisions).await
 }
 
-/// Cold LOOKUPs in different directories each wait on their own listing build off the session's
-/// workers: eight of them on two workers have more listing builds under way at once than two
-/// workers each holding a LOOKUP could.
-#[tokio::test(flavor = "multi_thread")]
-async fn concurrent_cold_lookups_in_different_directories_build_their_listings_at_once() {
-    skip_without_fuse!();
-    let fixture = committed_seeded_tree().await;
-    let delays = Delays {
-        name_table: Duration::from_millis(100),
-        file_metadata: Duration::from_millis(5),
-        other: Duration::from_millis(100),
-    };
-    let fs = cold_provider(&fixture, delays).await;
-    let mounted = mount(fs.clone(), 2).await;
-    let top = mounted.root.join("top");
-
-    let subdirectories = (0..SUBDIRECTORIES).map(|dir| top.join(format!("d{dir:02}")));
-    for result in stat_all(subdirectories.collect()).await {
-        result.expect("stat of a subdirectory");
-    }
-    let files = (0..SUBDIRECTORIES).map(|dir| top.join(format!("d{dir:02}/seed.txt")));
-    let (results, most) = with_most_listing_builds(&fs, stat_all(files.collect())).await;
-    for result in results {
-        result.expect("stat of a file in a cold subdirectory");
-    }
-
-    tokio::time::timeout(Duration::from_secs(5), mounted.session.shutdown())
-        .await
-        .expect("shutdown must complete promptly");
-    assert!(
-        most > 2,
-        "{SUBDIRECTORIES} cold lookups on 2 workers had at most {most} listing builds under way at \
-         once"
-    );
-}
-
 /// What `work` yields, and the most listing builds `fs` had under way at once while it ran,
 /// sampled every millisecond.
 async fn with_most_listing_builds<T>(
@@ -840,142 +770,228 @@ fn fuse_connection_id(path: &Path) -> Option<u32> {
     })
 }
 
-/// A swap whose entry invalidation reaches a directory a LOOKUP holds, the LOOKUP's answer held
-/// in the daemon until the swap sends, completes once that LOOKUP is answered. The kernel takes
-/// the directory's lock for the invalidation, which the LOOKUP holds until it is answered, and
-/// the answer runs on the one runtime worker the swap shares with the session.
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn a_swap_invalidating_an_entry_beside_a_held_lookup_completes() {
-    skip_without_fuse!();
-    let (immutable, mutable, execution) =
-        fuse_fixture::test_store_create().await.expect("test store");
-    let (instance, first, second) = lore_base::runtime::LORE_CONTEXT
-        .scope(execution.clone(), async {
-            let instance = fuse_fixture::test_repository_create(
-                immutable,
-                mutable,
-                RepositoryId::from(uuid::Uuid::now_v7()),
+mod needs_fuse {
+    use super::*;
+
+    /// An unmount cancels the background prefetch a clone started on the mount, however far the
+    /// prefetch has come.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unmount_cancels_a_running_prefetch() {
+        skip_without_fuse!();
+        let fixture = committed_wide_tree().await;
+        let delays = Delays {
+            name_table: Duration::from_secs(5),
+            file_metadata: Duration::from_secs(5),
+            other: Duration::from_secs(5),
+        };
+        let armed = Arc::new(AtomicBool::new(false));
+        let (repository, state, _) = cold_state(&fixture, delays, armed.clone()).await;
+        let dir = TempDir::new("lore-fuse-prefetch-cancel-");
+        let mount = lore_base::runtime::LORE_CONTEXT
+            .scope(
+                fuse_fixture::setup_test_execution(),
+                FuseMount::mount(
+                    repository,
+                    state,
+                    dir.path(),
+                    InstanceId::generate(),
+                    1_700_000_000_000,
+                ),
             )
+            .await
+            .expect("mount");
+        armed.store(true, Ordering::Release);
+        lore_base::runtime::LORE_CONTEXT
+            .scope(fuse_fixture::setup_test_execution(), async {
+                mount.filesystem.start_prefetch(PrefetchPlan {
+                    tree: TreePrefetch::Blocks,
+                    recording: None,
+                });
+            })
             .await;
-            std::fs::create_dir_all(instance.path.join("d00")).expect("d00");
-            for name in ["gone", "held"] {
-                fuse_fixture::test_file_write(&instance.path.join("d00").join(name), b"file");
-            }
-            let first = fuse_fixture::test_commit_tree(&instance, "with gone").await;
-            // A fixture edit, outside any repository write.
-            #[allow(clippy::disallowed_methods)]
-            std::fs::remove_file(instance.path.join("d00/gone")).expect("remove gone");
-            let second = fuse_fixture::test_commit_tree(&instance, "without gone").await;
-            (instance, first, second)
-        })
-        .await;
-    let repository = instance.repository.clone();
-    let fs = lore_base::runtime::LORE_CONTEXT
-        .scope(
-            execution.clone(),
-            FuseFilesystem::new(repository.clone(), first.clone(), attr_context()),
-        )
-        .await
-        .expect("provider");
-    let d00 = dir_node(&fs, &repository, "d00").await;
-    let holding = Arc::new(AtomicBool::new(false));
-    let release = Arc::new(tokio::sync::Notify::new());
-    let (held, held_now) = std::sync::mpsc::channel();
-    {
-        let (holding, release) = (holding.clone(), release.clone());
-        fs.set_listing_hook(Arc::new(
-            move |node| -> lore_revision::BoxFuture<'static, ()> {
-                if node != d00 || !holding.swap(false, Ordering::SeqCst) {
-                    return Box::pin(async {});
-                }
-                let _ = held.send(());
-                let release = release.clone();
-                Box::pin(async move { release.notified().await })
-            },
-        ));
+        assert!(mount.filesystem.prefetch_running());
+
+        // Lazy: a desktop service's LOOKUP in the new mount waits on the same slow reads and holds
+        // it busy, which would refuse a plain unmount.
+        mount.unmount(true).await.expect("unmount");
+        tokio::time::timeout(Duration::from_secs(1), mount.filesystem.prefetch_finished())
+            .await
+            .expect("the prefetch stops with the mount");
     }
-    let (entered, entered_now) = std::sync::mpsc::channel();
-    let sink = Arc::new(SignallingSink {
-        notifier: std::sync::OnceLock::new(),
-        target: std::sync::OnceLock::new(),
-        entered,
-        released: AtomicBool::new(false),
-        returned_after_release: AtomicBool::new(false),
-    });
-    fs.set_notifications(sink.clone())
-        .expect("the notification thread");
-    let mounted = mount(fs.clone(), 2).await;
-    let _ = sink
-        .notifier
-        .set(fs.notifier().expect("the mount's notifier").clone());
-    // A deadlock is ended by aborting the connection; without that, the test would hang.
-    let Some(connection) = fuse_connection_id(&mounted.root)
-        .filter(|id| Path::new(&format!("/sys/fs/fuse/connections/{id}/abort")).exists())
-    else {
-        // Past libtest's capture, so a skip shows in a passing run.
-        let _ = std::io::stderr().write_all(
+
+    /// Cold LOOKUPs in different directories each wait on their own listing build off the session's
+    /// workers: eight of them on two workers have more listing builds under way at once than two
+    /// workers each holding a LOOKUP could.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_cold_lookups_in_different_directories_build_their_listings_at_once() {
+        skip_without_fuse!();
+        let fixture = committed_seeded_tree().await;
+        let delays = Delays {
+            name_table: Duration::from_millis(100),
+            file_metadata: Duration::from_millis(5),
+            other: Duration::from_millis(100),
+        };
+        let fs = cold_provider(&fixture, delays).await;
+        let mounted = mount(fs.clone(), 2).await;
+        let top = mounted.root.join("top");
+
+        let subdirectories = (0..SUBDIRECTORIES).map(|dir| top.join(format!("d{dir:02}")));
+        for result in stat_all(subdirectories.collect()).await {
+            result.expect("stat of a subdirectory");
+        }
+        let files = (0..SUBDIRECTORIES).map(|dir| top.join(format!("d{dir:02}/seed.txt")));
+        let (results, most) = with_most_listing_builds(&fs, stat_all(files.collect())).await;
+        for result in results {
+            result.expect("stat of a file in a cold subdirectory");
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), mounted.session.shutdown())
+            .await
+            .expect("shutdown must complete promptly");
+        assert!(
+            most > 2,
+            "{SUBDIRECTORIES} cold lookups on 2 workers had at most {most} listing builds under way at \
+         once"
+        );
+    }
+
+    /// A swap whose entry invalidation reaches a directory a LOOKUP holds, the LOOKUP's answer held
+    /// in the daemon until the swap sends, completes once that LOOKUP is answered. The kernel takes
+    /// the directory's lock for the invalidation, which the LOOKUP holds until it is answered, and
+    /// the answer runs on the one runtime worker the swap shares with the session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_swap_invalidating_an_entry_beside_a_held_lookup_completes() {
+        skip_without_fuse!();
+        let (immutable, mutable, execution) =
+            fuse_fixture::test_store_create().await.expect("test store");
+        let (instance, first, second) = lore_base::runtime::LORE_CONTEXT
+            .scope(execution.clone(), async {
+                let instance = fuse_fixture::test_repository_create(
+                    immutable,
+                    mutable,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                std::fs::create_dir_all(instance.path.join("d00")).expect("d00");
+                for name in ["gone", "held"] {
+                    fuse_fixture::test_file_write(&instance.path.join("d00").join(name), b"file");
+                }
+                let first = fuse_fixture::test_commit_tree(&instance, "with gone").await;
+                // A fixture edit, outside any repository write.
+                #[allow(clippy::disallowed_methods)]
+                std::fs::remove_file(instance.path.join("d00/gone")).expect("remove gone");
+                let second = fuse_fixture::test_commit_tree(&instance, "without gone").await;
+                (instance, first, second)
+            })
+            .await;
+        let repository = instance.repository.clone();
+        let fs = lore_base::runtime::LORE_CONTEXT
+            .scope(
+                execution.clone(),
+                FuseFilesystem::new(repository.clone(), first.clone(), attr_context()),
+            )
+            .await
+            .expect("provider");
+        let d00 = dir_node(&fs, &repository, "d00").await;
+        let holding = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (held, held_now) = std::sync::mpsc::channel();
+        {
+            let (holding, release) = (holding.clone(), release.clone());
+            fs.set_listing_hook(Arc::new(
+                move |node| -> lore_revision::BoxFuture<'static, ()> {
+                    if node != d00 || !holding.swap(false, Ordering::SeqCst) {
+                        return Box::pin(async {});
+                    }
+                    let _ = held.send(());
+                    let release = release.clone();
+                    Box::pin(async move { release.notified().await })
+                },
+            ));
+        }
+        let (entered, entered_now) = std::sync::mpsc::channel();
+        let sink = Arc::new(SignallingSink {
+            notifier: std::sync::OnceLock::new(),
+            target: std::sync::OnceLock::new(),
+            entered,
+            released: AtomicBool::new(false),
+            returned_after_release: AtomicBool::new(false),
+        });
+        fs.set_notifications(sink.clone())
+            .expect("the notification thread");
+        let mounted = mount(fs.clone(), 2).await;
+        let _ = sink
+            .notifier
+            .set(fs.notifier().expect("the mount's notifier").clone());
+        // A deadlock is ended by aborting the connection; without that, the test would hang.
+        let Some(connection) = fuse_connection_id(&mounted.root)
+            .filter(|id| Path::new(&format!("/sys/fs/fuse/connections/{id}/abort")).exists())
+        else {
+            // Past libtest's capture, so a skip shows in a passing run.
+            let _ = std::io::stderr().write_all(
             b"SKIPPED a_swap_invalidating_an_entry_beside_a_held_lookup_completes: no fusectl abort \
               file for the mount\n",
         );
-        return;
-    };
-    // Looked up, so the swap that deletes it invalidates its entry in d00.
-    std::fs::symlink_metadata(mounted.root.join("d00/gone")).expect("stat of gone");
-    let d00_ino = fs
-        .inodes()
-        .find_child(ROOT_INO, hash_string("d00"), "d00")
-        .expect("d00's inode");
-    let _ = sink.target.set((d00_ino, b"gone"));
-    fs.served().listings.remove(d00);
-    holding.store(true, Ordering::SeqCst);
-    let held_path = mounted.root.join("d00/held");
-    let lookup = std::thread::spawn(move || std::fs::symlink_metadata(held_path).map(|_| ()));
-    held_now
-        .recv_timeout(HELD_WAIT)
-        .expect("the LOOKUP of d00/held waits in the listing hook");
+            return;
+        };
+        // Looked up, so the swap that deletes it invalidates its entry in d00.
+        std::fs::symlink_metadata(mounted.root.join("d00/gone")).expect("stat of gone");
+        let d00_ino = fs
+            .inodes()
+            .find_child(ROOT_INO, hash_string("d00"), "d00")
+            .expect("d00's inode");
+        let _ = sink.target.set((d00_ino, b"gone"));
+        fs.served().listings.remove(d00);
+        holding.store(true, Ordering::SeqCst);
+        let held_path = mounted.root.join("d00/held");
+        let lookup = std::thread::spawn(move || std::fs::symlink_metadata(held_path).map(|_| ()));
+        held_now
+            .recv_timeout(HELD_WAIT)
+            .expect("the LOOKUP of d00/held waits in the listing hook");
 
-    let (swapped, swapped_now) = std::sync::mpsc::channel();
-    // The task carries its own execution scope.
-    #[allow(clippy::disallowed_methods)]
-    let _swap = {
-        let fs = fs.clone();
-        tokio::spawn(
-            lore_base::runtime::LORE_CONTEXT.scope(execution.clone(), async move {
-                let operation = InstanceOperationImpl::new(
-                    StaticDispatchInstanceOperation::Fuse(FuseOperation::new(fs.clone())),
-                    true,
-                );
-                let result = swap_mounted(&fs, &operation, repository, second).await;
-                let _ = swapped.send(result.is_ok());
-            }),
-        )
-    };
-    let sent = entered_now.recv_timeout(HELD_WAIT);
-    sink.released.store(true, Ordering::SeqCst);
-    release.notify_one();
-    let swap = swapped_now.recv_timeout(HELD_WAIT);
-    if swap.is_err() {
-        // Ends the held LOOKUP, so the kernel lets the invalidation through and the suite moves on.
-        // The kernel's control file for the test's own mount, outside any repository.
+        let (swapped, swapped_now) = std::sync::mpsc::channel();
+        // The task carries its own execution scope.
         #[allow(clippy::disallowed_methods)]
-        std::fs::write(format!("/sys/fs/fuse/connections/{connection}/abort"), b"1")
-            .expect("aborting the mount's connection");
-        let _ = swapped_now.recv_timeout(HELD_WAIT);
-    }
-    let looked_up = lookup.join().expect("the LOOKUP thread");
-    sent.expect("the swap sends gone's entry invalidation in d00 through the mount's thread");
-    assert_eq!(
-        swap,
-        Ok(true),
-        "the swap's invalidation waited on the held LOOKUP, whose answer waited on the runtime \
+        let _swap = {
+            let fs = fs.clone();
+            tokio::spawn(
+                lore_base::runtime::LORE_CONTEXT.scope(execution.clone(), async move {
+                    let operation = InstanceOperationImpl::new(
+                        StaticDispatchInstanceOperation::Fuse(FuseOperation::new(fs.clone())),
+                        true,
+                    );
+                    let result = swap_mounted(&fs, &operation, repository, second).await;
+                    let _ = swapped.send(result.is_ok());
+                }),
+            )
+        };
+        let sent = entered_now.recv_timeout(HELD_WAIT);
+        sink.released.store(true, Ordering::SeqCst);
+        release.notify_one();
+        let swap = swapped_now.recv_timeout(HELD_WAIT);
+        if swap.is_err() {
+            // Ends the held LOOKUP, so the kernel lets the invalidation through and the suite moves on.
+            // The kernel's control file for the test's own mount, outside any repository.
+            #[allow(clippy::disallowed_methods)]
+            std::fs::write(format!("/sys/fs/fuse/connections/{connection}/abort"), b"1")
+                .expect("aborting the mount's connection");
+            let _ = swapped_now.recv_timeout(HELD_WAIT);
+        }
+        let looked_up = lookup.join().expect("the LOOKUP thread");
+        sent.expect("the swap sends gone's entry invalidation in d00 through the mount's thread");
+        assert_eq!(
+            swap,
+            Ok(true),
+            "the swap's invalidation waited on the held LOOKUP, whose answer waited on the runtime \
          worker the invalidation blocked"
-    );
-    assert!(
-        sink.returned_after_release.load(Ordering::SeqCst),
-        "gone's entry invalidation waited for the held LOOKUP"
-    );
-    looked_up.expect("the held LOOKUP is answered");
-    tokio::time::timeout(Duration::from_secs(5), mounted.session.shutdown())
-        .await
-        .expect("shutdown must complete promptly");
+        );
+        assert!(
+            sink.returned_after_release.load(Ordering::SeqCst),
+            "gone's entry invalidation waited for the held LOOKUP"
+        );
+        looked_up.expect("the held LOOKUP is answered");
+        tokio::time::timeout(Duration::from_secs(5), mounted.session.shutdown())
+            .await
+            .expect("shutdown must complete promptly");
+    }
 }
