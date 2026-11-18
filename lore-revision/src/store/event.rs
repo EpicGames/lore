@@ -208,6 +208,23 @@ pub struct LoreStorageUploadItemCompleteEventData {
     pub error: LoreErrorDetail,
 }
 
+/// What one `lore_storage_put*` or `lore_storage_upload` call cost, sent once
+/// every item of the call has finished, at statistics level one and above.
+///
+/// A call that runs no item sends none. The counts cover the whole call, so a
+/// call of one item reports that item's cost.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreStoragePutStatsEventData {
+    /// Items the call ran.
+    pub items: u64,
+    /// Of `items`, those that failed.
+    pub items_failed: u64,
+    /// What the call's fragment writes cost.
+    pub fragments: lore_storage::FragmentWriteCounts,
+}
+
 /// Terminal per-item event for `mutable_load`. On success `error.error_code == 0` and `value`
 /// is the loaded value hash (`Hash::default()` when the key holds a null/removed value); on
 /// miss `error` carries the miss the answering backend raised — `AddressNotFound` from a local

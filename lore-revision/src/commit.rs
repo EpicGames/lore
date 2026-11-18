@@ -523,16 +523,6 @@ impl CommitReporting {
         }
     }
 
-    /// Everything this commit has counted since `baseline`, or `None` outside an
-    /// execution context — which is also no context to send an event through.
-    fn snapshot(&self, baseline: &FragmentWriteCounts) -> Option<LoreRevisionCommitStatsEventData> {
-        let context = crate::runtime::try_execution_context()?;
-        Some(LoreRevisionCommitStatsEventData {
-            files: self.stats.file_stats(),
-            fragments: context.fragment_stats().snapshot().since(baseline),
-        })
-    }
-
     /// A guard that emits the statistics event when dropped, so the commit that
     /// fails reports as the one that succeeds does.
     ///
@@ -559,9 +549,12 @@ struct CommitStatsReport {
 
 impl Drop for CommitStatsReport {
     fn drop(&mut self) {
-        if let Some(snapshot) = self.reporting.snapshot(&self.baseline) {
-            event::LoreEvent::RevisionCommitStats(snapshot).send();
-        }
+        immutable::send_fragment_stats(&self.baseline, |fragments| {
+            event::LoreEvent::RevisionCommitStats(LoreRevisionCommitStatsEventData {
+                files: self.reporting.stats.file_stats(),
+                fragments,
+            })
+        });
     }
 }
 

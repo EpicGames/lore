@@ -3759,6 +3759,20 @@ typedef struct lore_branch_merge_link_pin_resolved_event_data_t {
   enum lore_link_pin_resolution_t resolution;
 } lore_branch_merge_link_pin_resolved_event_data_t;
 
+// What one `lore_storage_put*` or `lore_storage_upload` call cost, sent once
+// every item of the call has finished, at statistics level one and above.
+//
+// A call that runs no item sends none. The counts cover the whole call, so a
+// call of one item reports that item's cost.
+typedef struct lore_storage_put_stats_event_data_t {
+  // Items the call ran.
+  uint64_t items;
+  // Of `items`, those that failed.
+  uint64_t items_failed;
+  // What the call's fragment writes cost.
+  struct lore_fragment_stats_data_t fragments;
+} lore_storage_put_stats_event_data_t;
+
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
 enum lore_event_id_t {
@@ -4272,6 +4286,8 @@ enum lore_event_id_t {
   LORE_EVENT_BRANCH_MERGE_LINK_PIN_CONFLICT,
   // A divergent link row was settled to one side.
   LORE_EVENT_BRANCH_MERGE_LINK_PIN_RESOLVED,
+  // What one storage put or upload call cost.
+  LORE_EVENT_STORAGE_PUT_STATS,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -4532,6 +4548,7 @@ typedef struct lore_event_t {
     struct lore_revision_graph_branch_synced_event_data_t revision_graph_branch_synced;
     struct lore_branch_merge_link_pin_conflict_event_data_t branch_merge_link_pin_conflict;
     struct lore_branch_merge_link_pin_resolved_event_data_t branch_merge_link_pin_resolved;
+    struct lore_storage_put_stats_event_data_t storage_put_stats;
   };
 } lore_event_t;
 
@@ -4613,11 +4630,14 @@ typedef struct lore_global_args_t {
   // How much an operation reports about what it cost.
   //
   // - `0` — no statistics event, and no per-fragment counters kept for one.
-  // - `1` — one statistics event when the operation finishes: per-action file
-  //   counts, and the fragment, local-store and remote-store totals.
+  // - `1` — one statistics event when the operation finishes: a commit reports
+  //   per-action file counts and the fragment, local-store and remote-store
+  //   totals, a storage put or upload call its item counts and the same totals,
+  //   and a push the fragments it deduplicated, copied and put.
   // - `2` — also a `FragmentWrite` event per stored fragment, which describes
   //   the shape of what was written rather than its sums. One event per
-  //   fragment is the cost of this level.
+  //   fragment is the cost of this level. A storage put or upload call sends
+  //   none, so this level reports for it what level `1` does.
   //
   // A level above the highest known behaves as the highest known.
   uint32_t stats;
@@ -12640,7 +12660,7 @@ void lore_storage_open_async(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item — success or failure; `stored_local`/`stored_remote` report where the content landed |
-// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_STORAGE_PUT_STATS` | `lore_storage_put_stats_event_data_t` | Emitted once at `stats >= 1`, after every item has finished and before `LORE_EVENT_COMPLETE`, whether or not items failed; not emitted for a call with no items or one that fails before its items run |
 // | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 int32_t lore_storage_put(const struct lore_global_args_t *globals,
                          const struct lore_storage_put_args_t *args,
@@ -12750,7 +12770,7 @@ void lore_storage_get_resolved_async(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item; `address` is the content the key now resolves to, and `stored_local`/`stored_remote` report where it landed |
-// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_STORAGE_PUT_STATS` | `lore_storage_put_stats_event_data_t` | Emitted once at `stats >= 1`, after every item has finished and before `LORE_EVENT_COMPLETE`, whether or not items failed; not emitted for a call with no items or one that fails before its items run |
 // | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 int32_t lore_storage_put_resolved(const struct lore_global_args_t *globals,
                                   const struct lore_storage_put_resolved_args_t *args,
@@ -12941,9 +12961,15 @@ void lore_storage_copy_async(const struct lore_global_args_t *globals,
 
 // Read one or more files into the content-addressed store.
 //
-// Each item emits `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` carrying the
-// computed address. Empty files short-circuit to the zero-hash address
-// without opening for read.
+// Empty files short-circuit to the zero-hash address without opening for read.
+//
+// # Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item, carrying the computed address; `stored_local`/`stored_remote` report where the content landed |
+// | `LORE_EVENT_STORAGE_PUT_STATS` | `lore_storage_put_stats_event_data_t` | Emitted once at `stats >= 1`, after every item has finished and before `LORE_EVENT_COMPLETE`, whether or not items failed; not emitted for a call with no items or one that fails before its items run |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 int32_t lore_storage_put_file(const struct lore_global_args_t *globals,
                               const struct lore_storage_put_file_args_t *args,
                               struct lore_event_callback_config_t callback);
@@ -13039,7 +13065,7 @@ void lore_storage_get_file_async(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item; `address` is the content the key now resolves to, and `stored_local`/`stored_remote` report where it landed |
-// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_STORAGE_PUT_STATS` | `lore_storage_put_stats_event_data_t` | Emitted once at `stats >= 1`, after every item has finished and before `LORE_EVENT_COMPLETE`, whether or not items failed; not emitted for a call with no items or one that fails before its items run |
 // | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 int32_t lore_storage_put_file_resolved(const struct lore_global_args_t *globals,
                                        const struct lore_storage_put_file_resolved_args_t *args,
@@ -13102,6 +13128,14 @@ void lore_storage_get_file_resolved_async(const struct lore_global_args_t *globa
 // already-durable both succeed with `already_durable=1` and no remote call; missing local
 // payload → `ADDRESS_NOT_FOUND`. Otherwise the bytes are uploaded and the local entry is
 // updated with `PayloadStoredDurable` set.
+//
+// # Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_STORAGE_UPLOAD_ITEM_COMPLETE` | `lore_storage_upload_item_complete_event_data_t` | Emitted once per input item — success or failure; `already_durable` is `1` where no upload was needed |
+// | `LORE_EVENT_STORAGE_PUT_STATS` | `lore_storage_put_stats_event_data_t` | Emitted once at `stats >= 1`, after every item has finished and before `LORE_EVENT_COMPLETE`, whether or not items failed; not emitted for a call with no items or one that fails before its items run |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 int32_t lore_storage_upload(const struct lore_global_args_t *globals,
                             const struct lore_storage_upload_args_t *args,
                             struct lore_event_callback_config_t callback);

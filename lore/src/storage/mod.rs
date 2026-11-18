@@ -85,7 +85,10 @@ use lore_base::types::Address;
 use lore_error_set::prelude::*;
 use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
+use lore_revision::immutable::send_fragment_stats;
 use lore_revision::store::event::LoreStoragePutItemCompleteEventData;
+use lore_revision::store::event::LoreStoragePutStatsEventData;
+use lore_storage::FragmentWriteCounts;
 use lore_storage::StorageError;
 use lore_storage::StoreResult;
 
@@ -294,13 +297,15 @@ fn severity(err: &StorageError) -> u8 {
 /// Every spawned item is joined before returning, and a task that yields no result counts as an
 /// internal failure, so no item's slot is lost.
 ///
+/// With `stats = $stats` true, the call sends `STORAGE_PUT_STATS` once every item has finished
+/// ([`ItemOutcomes::into_put_call_result`]).
+///
 /// A macro rather than a function because `ObservedTask` records `Location::caller()` and the server
 /// labels its task metrics with it: expanding at the op's own line keeps one label per op, where a
 /// shared function body would report every op at a single location.
 macro_rules! fan_out_items {
-    ($items:expr, $op_name:literal, |$item:ident| $future:expr) => {{
+    (@outcomes $items:expr, |$item:ident| $future:expr) => {{
         let items = $items;
-        let total = items.len();
         if let [single] = items {
             let $item = single;
             let mut outcomes = $crate::storage::ItemOutcomes::default();
@@ -309,7 +314,7 @@ macro_rules! fan_out_items {
             #[allow(clippy::needless_borrow)]
             let result = $future.await;
             outcomes.push(result);
-            outcomes.into_call_result(total, $op_name)
+            outcomes
         } else {
             let mut tasks: ::tokio::task::JoinSet<
                 ::std::result::Result<(), ::lore_storage::StorageError>,
@@ -317,10 +322,20 @@ macro_rules! fan_out_items {
             for $item in items.iter().cloned() {
                 ::lore_base::lore_spawn!(tasks, $future);
             }
-            $crate::storage::ItemOutcomes::drain(tasks)
-                .await
-                .into_call_result(total, $op_name)
+            $crate::storage::ItemOutcomes::drain(tasks).await
         }
+    }};
+    ($items:expr, $op_name:literal, stats = $stats:expr, |$item:ident| $future:expr) => {{
+        let items = $items;
+        let total = items.len();
+        $crate::storage::fan_out_items!(@outcomes items, |$item| $future)
+            .into_put_call_result($stats, total, $op_name)
+    }};
+    ($items:expr, $op_name:literal, |$item:ident| $future:expr) => {{
+        let items = $items;
+        let total = items.len();
+        $crate::storage::fan_out_items!(@outcomes items, |$item| $future)
+            .into_call_result(total, $op_name)
     }};
 }
 pub(crate) use fan_out_items;
@@ -382,6 +397,29 @@ impl ItemOutcomes {
             }));
         }
         outcomes
+    }
+
+    /// [`Self::into_call_result`] of a put or upload call, after sending its `STORAGE_PUT_STATS`
+    /// for the `total` items where `stats` is set.
+    ///
+    /// The call's execution context is its own, so its fragment counters cover exactly the writes
+    /// of these items and need no baseline.
+    pub(crate) fn into_put_call_result(
+        self,
+        stats: bool,
+        total: usize,
+        op_name: &str,
+    ) -> Result<(), StorageError> {
+        if stats {
+            send_fragment_stats(&FragmentWriteCounts::default(), |fragments| {
+                LoreEvent::StoragePutStats(LoreStoragePutStatsEventData {
+                    items: total as u64,
+                    items_failed: self.failed as u64,
+                    fragments,
+                })
+            });
+        }
+        self.into_call_result(total, op_name)
     }
 
     /// The call-level result: the dominant failure, reported with its own code and message. How

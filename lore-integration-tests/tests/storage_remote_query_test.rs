@@ -32,6 +32,7 @@ mod storage_remote_query_tests {
     use lore_revision::interface::LoreEventCallback;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
+    use lore_storage::FragmentWriteCounts;
 
     use crate::common::net_common::CountingStore;
     use crate::common::net_common::Partitions;
@@ -90,7 +91,8 @@ mod storage_remote_query_tests {
     type Completion = (Address, i32, u8);
 
     /// Stores `file`'s content in `partition` through `handle` with `call`, as one item with
-    /// `flags`, and returns how the item completed. The resolved calls publish `key`.
+    /// `flags`, and returns how the item completed and what the call's fragment writes cost. The
+    /// resolved calls publish `key`.
     async fn put_with(
         call: Call,
         handle: LoreStore,
@@ -98,17 +100,21 @@ mod storage_remote_query_tests {
         file: &TempFile,
         content: &[u8],
         flags: Flags,
-    ) -> Completion {
+    ) -> (Completion, FragmentWriteCounts) {
         let completed: Arc<Mutex<Vec<Completion>>> = Arc::new(Mutex::new(Vec::new()));
+        let reported: Arc<Mutex<Vec<FragmentWriteCounts>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = completed.clone();
-        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
-            if let LoreEvent::StoragePutItemComplete(data) = event {
+        let stats_sink = reported.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::StoragePutItemComplete(data) => {
                 sink.lock().unwrap().push((
                     data.address,
                     data.error.error_code,
                     data.stored_remote,
                 ));
             }
+            LoreEvent::StoragePutStats(data) => stats_sink.lock().unwrap().push(data.fragments),
+            _ => {}
         }));
         let context = Context::from([0x7C; 16]);
         let key = lore_base::types::Hash::hash_buffer(b"a key for remote_query");
@@ -117,7 +123,10 @@ mod storage_remote_query_tests {
             len: content.len(),
         };
         let path = LoreString::from(file.path().to_str().expect("the path is text"));
-        let globals = LoreGlobalArgs::default();
+        let globals = LoreGlobalArgs {
+            stats: 1,
+            ..LoreGlobalArgs::default()
+        };
         let status = match call {
             Call::Put => {
                 lore::storage::put::put(
@@ -207,7 +216,9 @@ mod storage_remote_query_tests {
         assert_eq!(status, 0, "{call:?}: the put succeeds");
         let completed = completed.lock().unwrap();
         assert_eq!(completed.len(), 1, "{call:?}: the item completes once");
-        completed[0]
+        let reported = reported.lock().unwrap();
+        assert_eq!(reported.len(), 1, "{call:?}: the call reports once");
+        (completed[0], reported[0])
     }
 
     /// Content of several fragments, whose bytes vary so content-defined cutting finds
@@ -239,7 +250,7 @@ mod storage_remote_query_tests {
                         completion
                     };
 
-                    let (uploaded, code, remote) = put(Flags {
+                    let ((uploaded, code, remote), first) = put(Flags {
                         remote_write: 1,
                         remote_query: 0,
                     })
@@ -247,14 +258,24 @@ mod storage_remote_query_tests {
                     assert_eq!((code, remote), (0, 1), "{call:?}: the upload succeeds");
                     let fragments = server.counted.traffic().payload_puts;
                     assert!(fragments > 2, "{call:?}: the content is several fragments");
+                    assert_eq!(first.remote_put_writes, fragments as u64, "{call:?}");
+                    assert!(first.remote_put_bytes > 0, "{call:?}");
+                    assert_eq!(first.remote_queries, 0, "{call:?}");
 
                     server.counted.reset();
-                    let (address, code, remote) = put(Flags {
+                    let ((address, code, remote), queried) = put(Flags {
                         remote_write: 1,
                         remote_query: 1,
                     })
                     .await;
                     assert_eq!((address, code, remote), (uploaded, 0, 1));
+                    assert_eq!(queried.remote_queries, fragments as u64, "{call:?}");
+                    assert_eq!(
+                        queried.remote_query_hits, fragments as u64,
+                        "{call:?}: the call reports every fragment the server holds"
+                    );
+                    assert!(queried.remote_query_unsent_bytes > 0, "{call:?}");
+                    assert_eq!(queried.remote_put_bytes, 0, "{call:?}");
                     assert_eq!(
                         server.counted.traffic().payload_puts,
                         0,
@@ -267,7 +288,7 @@ mod storage_remote_query_tests {
                     );
 
                     server.counted.reset();
-                    let (_, code, remote) = put(Flags {
+                    let ((_, code, remote), _) = put(Flags {
                         remote_write: 0,
                         remote_query: 1,
                     })
@@ -280,7 +301,7 @@ mod storage_remote_query_tests {
                     assert_eq!((code, remote), (0, 0));
 
                     server.counted.reset();
-                    let (_, code, remote) = put(Flags {
+                    let ((_, code, remote), _) = put(Flags {
                         remote_write: 1,
                         remote_query: 0,
                     })

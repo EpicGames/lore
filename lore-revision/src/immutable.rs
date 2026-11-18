@@ -118,6 +118,19 @@ pub fn counted_write_context() -> lore_storage::WriteContext {
     lore_storage::WriteContext::counted(ambient_fragment_stats())
 }
 
+/// Sends the statistics event `event` builds from what this call's fragment writes
+/// cost since `baseline`. Outside an execution context nothing is sent.
+///
+/// Call it once the operation has drained its writes; the counters settle only then.
+pub fn send_fragment_stats(
+    baseline: &lore_storage::FragmentWriteCounts,
+    event: impl FnOnce(lore_storage::FragmentWriteCounts) -> crate::event::LoreEvent,
+) {
+    if let Some(context) = crate::runtime::try_execution_context() {
+        event(context.fragment_stats().snapshot().since(baseline)).send();
+    }
+}
+
 /// Construct [`WriteOptions`] from a repository context. Writes reach the remote only where the
 /// context uploads and the call is not a dry run.
 ///

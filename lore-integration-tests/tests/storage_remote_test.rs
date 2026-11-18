@@ -3053,6 +3053,79 @@ mod storage_remote_tests {
             .await
     }
 
+    /// An upload at statistics level one reports its items, the one that failed among them, and
+    /// the payload it uploaded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upload_reports_what_it_cost() -> TestResult {
+        use lore::storage::upload::LoreStorageUploadArgs;
+        use lore::storage::upload::LoreStorageUploadItem;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_revision::interface::LoreArray;
+        use lore_revision::store::event::LoreStoragePutStatsEventData;
+
+        let execution = setup_execution("storage-remote-upload-stats".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xaau8; 16]);
+                    let handle = open_handle(Some(&server.url)).await;
+                    let payload = b"upload payload a stats event reports".to_vec();
+                    let stored = put_local_via_handle(handle, partition, payload.as_slice()).await;
+                    let absent = Address {
+                        hash: Hash::from([0xfcu8; 32]),
+                        context: Context::default(),
+                    };
+
+                    let reported: Arc<Mutex<Vec<LoreStoragePutStatsEventData>>> =
+                        Arc::new(Mutex::new(Vec::new()));
+                    let sink = reported.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                        if let LoreEvent::StoragePutStats(data) = event {
+                            sink.lock().unwrap().push(*data);
+                        }
+                    }));
+                    let status = lore::storage::upload::upload(
+                        LoreGlobalArgs {
+                            stats: 1,
+                            ..LoreGlobalArgs::default()
+                        },
+                        LoreStorageUploadArgs {
+                            handle,
+                            items: LoreArray::from_vec(vec![
+                                LoreStorageUploadItem {
+                                    id: 1,
+                                    partition,
+                                    address: stored,
+                                },
+                                LoreStorageUploadItem {
+                                    id: 2,
+                                    partition,
+                                    address: absent,
+                                },
+                            ]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_ne!(status, 0, "the absent address fails the call");
+
+                    let reported = std::mem::take(&mut *reported.lock().unwrap());
+                    assert_eq!(reported.len(), 1, "the call reports once");
+                    assert_eq!((reported[0].items, reported[0].items_failed), (2, 1));
+                    assert_eq!(reported[0].fragments.remote_put_writes, 1);
+                    assert!(reported[0].fragments.remote_put_bytes > 0);
+
+                    close_handle(handle).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn upload_local_only_payload_pushes_to_remote_and_marks_durable() -> TestResult {
         use lore_base::types::Partition;

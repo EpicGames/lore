@@ -722,11 +722,14 @@ pub struct LoreGlobalArgs {
     /// How much an operation reports about what it cost.
     ///
     /// - `0` — no statistics event, and no per-fragment counters kept for one.
-    /// - `1` — one statistics event when the operation finishes: per-action file
-    ///   counts, and the fragment, local-store and remote-store totals.
+    /// - `1` — one statistics event when the operation finishes: a commit reports
+    ///   per-action file counts and the fragment, local-store and remote-store
+    ///   totals, a storage put or upload call its item counts and the same totals,
+    ///   and a push the fragments it deduplicated, copied and put.
     /// - `2` — also a `FragmentWrite` event per stored fragment, which describes
     ///   the shape of what was written rather than its sums. One event per
-    ///   fragment is the cost of this level.
+    ///   fragment is the cost of this level. A storage put or upload call sends
+    ///   none, so this level reports for it what level `1` does.
     ///
     /// A level above the highest known behaves as the highest known.
     pub stats: u32,

@@ -564,6 +564,7 @@ include = [
 "LoreArray_lore_storage_mutable_list_item" = "lore_storage_mutable_list_item_array_t"
 "LoreStorageOpenedEventData" = "lore_storage_opened_event_data_t"
 "LoreStoragePutItemCompleteEventData" = "lore_storage_put_item_complete_event_data_t"
+"LoreStoragePutStatsEventData" = "lore_storage_put_stats_event_data_t"
 "LoreStorageGetHeaderEventData" = "lore_storage_get_header_event_data_t"
 "LoreStorageGetDataEventData" = "lore_storage_get_data_event_data_t"
 "LoreStorageGetFragmentEventData" = "lore_storage_get_fragment_event_data_t"

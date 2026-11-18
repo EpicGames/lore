@@ -83,6 +83,7 @@ async fn upload_local(
 ) -> i32 {
     let handle = args.handle;
     let per_call = crate::storage::store::PerCallFlags::from_globals(&globals);
+    let stats = globals.stats();
     storage_call(
         globals,
         callback,
@@ -110,7 +111,7 @@ async fn upload_local(
 
             let mut reuse = crate::storage::store::SessionReuse::default();
 
-            crate::storage::fan_out_items!(items, "upload", |item| {
+            crate::storage::fan_out_items!(items, "upload", stats = stats, |item| {
                 let session = reuse.session_for(&store, item.partition, true);
                 let store = store.clone();
                 async move { upload_item(store, &item, session).await }

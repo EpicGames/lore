@@ -146,6 +146,7 @@ async fn put_resolved_local(
 ) -> i32 {
     let handle = args.handle;
     let per_call = crate::storage::store::PerCallFlags::from_globals(&globals);
+    let stats = globals.stats();
     storage_call(
         globals,
         callback,
@@ -162,7 +163,7 @@ async fn put_resolved_local(
             let effective = store.effective_flags(per_call)?;
             let mut reuse = crate::storage::store::SessionReuse::default();
 
-            crate::storage::fan_out_items!(items, "put_resolved", |item| {
+            crate::storage::fan_out_items!(items, "put_resolved", stats = stats, |item| {
                 let session = reuse.session_for(
                     &store,
                     item.partition,

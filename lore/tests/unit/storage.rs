@@ -18,6 +18,7 @@ mod held;
 mod lent;
 mod lock_interleave;
 mod open;
+mod put_stats;
 mod store;
 
 use std::sync::Arc;

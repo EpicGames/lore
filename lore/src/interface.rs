@@ -6948,7 +6948,7 @@ pub type LoreStoragePutArgs = crate::storage::put::LoreStoragePutArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item — success or failure; `stored_local`/`stored_remote` report where the content landed |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_STORAGE_PUT_STATS` | `lore_storage_put_stats_event_data_t` | Emitted once at `stats >= 1`, after every item has finished and before `LORE_EVENT_COMPLETE`, whether or not items failed; not emitted for a call with no items or one that fails before its items run |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_storage_put(
@@ -7097,7 +7097,7 @@ pub type LoreStoragePutResolvedArgs = crate::storage::put_resolved::LoreStorageP
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item; `address` is the content the key now resolves to, and `stored_local`/`stored_remote` report where it landed |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_STORAGE_PUT_STATS` | `lore_storage_put_stats_event_data_t` | Emitted once at `stats >= 1`, after every item has finished and before `LORE_EVENT_COMPLETE`, whether or not items failed; not emitted for a call with no items or one that fails before its items run |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_storage_put_resolved(
@@ -7415,9 +7415,15 @@ pub type LoreStoragePutFileArgs = crate::storage::put_file::LoreStoragePutFileAr
 
 /// Read one or more files into the content-addressed store.
 ///
-/// Each item emits `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` carrying the
-/// computed address. Empty files short-circuit to the zero-hash address
-/// without opening for read.
+/// Empty files short-circuit to the zero-hash address without opening for read.
+///
+/// # Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item, carrying the computed address; `stored_local`/`stored_remote` report where the content landed |
+/// | `LORE_EVENT_STORAGE_PUT_STATS` | `lore_storage_put_stats_event_data_t` | Emitted once at `stats >= 1`, after every item has finished and before `LORE_EVENT_COMPLETE`, whether or not items failed; not emitted for a call with no items or one that fails before its items run |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_storage_put_file(
     globals: &LoreGlobalArgs,
@@ -7540,7 +7546,7 @@ pub type LoreStoragePutFileResolvedArgs =
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item; `address` is the content the key now resolves to, and `stored_local`/`stored_remote` report where it landed |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_STORAGE_PUT_STATS` | `lore_storage_put_stats_event_data_t` | Emitted once at `stats >= 1`, after every item has finished and before `LORE_EVENT_COMPLETE`, whether or not items failed; not emitted for a call with no items or one that fails before its items run |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_storage_put_file_resolved(
@@ -7630,6 +7636,14 @@ pub type LoreStorageUploadArgs = crate::storage::upload::LoreStorageUploadArgs;
 /// already-durable both succeed with `already_durable=1` and no remote call; missing local
 /// payload → `ADDRESS_NOT_FOUND`. Otherwise the bytes are uploaded and the local entry is
 /// updated with `PayloadStoredDurable` set.
+///
+/// # Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_STORAGE_UPLOAD_ITEM_COMPLETE` | `lore_storage_upload_item_complete_event_data_t` | Emitted once per input item — success or failure; `already_durable` is `1` where no upload was needed |
+/// | `LORE_EVENT_STORAGE_PUT_STATS` | `lore_storage_put_stats_event_data_t` | Emitted once at `stats >= 1`, after every item has finished and before `LORE_EVENT_COMPLETE`, whether or not items failed; not emitted for a call with no items or one that fails before its items run |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_storage_upload(
     globals: &LoreGlobalArgs,

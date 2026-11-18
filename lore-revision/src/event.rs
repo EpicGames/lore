@@ -257,6 +257,7 @@ use crate::store::event::LoreStorageMutableStoreItemCompleteEventData;
 use crate::store::event::LoreStorageObliterateItemCompleteEventData;
 use crate::store::event::LoreStorageOpenedEventData;
 use crate::store::event::LoreStoragePutItemCompleteEventData;
+use crate::store::event::LoreStoragePutStatsEventData;
 use crate::store::event::LoreStorageUploadItemCompleteEventData;
 
 pub fn convert_event_callback(callback: LoreEventCallbackConfig) -> LoreEventCallback {
@@ -1426,6 +1427,8 @@ pub enum LoreEvent {
     BranchMergeLinkPinConflict(crate::branch::merge::LoreBranchMergeLinkPinConflictEventData),
     /// A divergent link row was settled to one side.
     BranchMergeLinkPinResolved(crate::branch::merge::LoreBranchMergeLinkPinResolvedEventData),
+    /// What one storage put or upload call cost.
+    StoragePutStats(LoreStoragePutStatsEventData),
 }
 
 /// Encodes as the event it refers to, so that a sender can encode an event it only borrows.
