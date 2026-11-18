@@ -12,8 +12,10 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use lore_base::runtime::LORE_CONTEXT;
+use lore_fuse::mount::test_util::PlantedBusyWindow;
 use lore_revision::fs::mount_manager_state::MountManagerState;
 use lore_revision::global::external_dir::external_dir_for_instance;
 use lore_revision::instance::InstanceMetadata;
@@ -218,17 +220,29 @@ pub async fn inode_of(path: PathBuf) -> u64 {
         .expect("stat through the mount succeeds")
 }
 
-/// An open directory handle on the mount root, which keeps the mount busy until dropped.
-pub struct Holder(Option<std::fs::File>);
+/// How long a plain unmount retries a mount that a [`Holder`] keeps busy. A holder lets go only
+/// when closed, so a short window tests the refusal as well as a long one.
+const HELD_BUSY_WINDOW: Duration = Duration::from_millis(100);
+
+/// An open directory handle on the mount root, which keeps the mount busy until dropped. While it
+/// is held, a plain unmount of the mount retries for the busy window it planted.
+pub struct Holder(Option<std::fs::File>, PlantedBusyWindow);
 
 impl Holder {
+    /// Holds the mount at `path` with a busy window of [`HELD_BUSY_WINDOW`].
     pub async fn open(path: &Path) -> Self {
+        Self::open_for(path, HELD_BUSY_WINDOW).await
+    }
+
+    /// Holds the mount at `path`, which a plain unmount retries for `window`.
+    pub async fn open_for(path: &Path, window: Duration) -> Self {
+        let window = PlantedBusyWindow::new(path, window);
         let path = path.to_path_buf();
         let file = lore_base::lore_spawn_blocking!(move || std::fs::File::open(&path))
             .await
             .expect("open task completes")
             .expect("the mount root opens");
-        Self(Some(file))
+        Self(Some(file), window)
     }
 
     pub async fn close(mut self) {

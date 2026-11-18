@@ -5,6 +5,8 @@ use std::os::fd::AsRawFd;
 use std::os::fd::BorrowedFd;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
+use std::time::Instant;
 
 use lore_base::test_util::TempDir;
 use lore_fuse::FuseError;
@@ -13,7 +15,9 @@ use lore_fuse::mount::MountOptions;
 use lore_fuse::mount::is_stale_mount;
 use lore_fuse::mount::mount;
 use lore_fuse::mount::mount_with_access;
+use lore_fuse::mount::test_util::PlantedBusyWindow;
 use lore_fuse::mount::unmount_path;
+use lore_fuse::mount::unmount_path_retrying_busy;
 use lore_fuse::mount::*;
 use lore_fuse::skip_without_fuse;
 
@@ -59,6 +63,30 @@ fn unprivileged_unmount_failure_reports_fusermount_not_umount2() {
     assert!(
         !text.contains("umount2"),
         "an unprivileged caller must see fusermount3's reason, not a masking EPERM: {text}"
+    );
+}
+
+/// A plain unmount of a path where nothing is mounted fails at once and not as busy, though the
+/// path, which `fusermount3` repeats in its report, holds the word.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plain_unmount_of_an_unmounted_path_named_busy_is_not_retried() {
+    if locate_fusermount3().is_none() {
+        return;
+    }
+    let dir = TempDir::new("lore-fuse-busybox-");
+    let window = Duration::from_secs(4);
+    let _planted = PlantedBusyWindow::new(dir.path(), window);
+
+    let started = Instant::now();
+    let unmounted = unmount_path_retrying_busy(dir.path(), started).await;
+
+    assert!(
+        matches!(unmounted, Err(FuseError::UnmountFailed(_))),
+        "nothing mounted is not busy: {unmounted:?}"
+    );
+    assert!(
+        started.elapsed() < window,
+        "an unmount that is not busy must not be retried"
     );
 }
 

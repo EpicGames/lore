@@ -188,14 +188,14 @@ impl FuseMount {
                 Ok(()) => session,
                 Err(error) => {
                     session.shutdown().await;
-                    let _ = unmount_blocking(path.to_path_buf(), true).await;
+                    let _ = lore_fuse::mount::unmount_path_on_blocking_thread(path, true).await;
                     return Err(FuseMountError::internal(format!(
                         "starting the notification thread: {error}"
                     )));
                 }
             },
             Err(error) => {
-                let _ = unmount_blocking(path.to_path_buf(), true).await;
+                let _ = lore_fuse::mount::unmount_path_on_blocking_thread(path, true).await;
                 return Err(FuseMountError::internal_with_context(
                     error,
                     "starting the FUSE session",
@@ -214,22 +214,42 @@ impl FuseMount {
         }))
     }
 
-    /// Unmounts and stops serving. A plain unmount of a busy mount fails with `MountsBusy` and
-    /// leaves it mounted and served; a lazy one detaches it whatever holds it. A mount already
-    /// gone from the mount table, detached by someone else, counts as unmounted. Once the session
-    /// has stopped, the background prefetch is cancelled; nothing is left to record, as every
-    /// request changed the filesystem State and `write/` before it was answered, and the
-    /// notification thread sends what is queued and ends. With debug assertions a plain unmount
-    /// first drains the kernel's lookups, then records and warns about any the table still counts.
-    pub async fn unmount(&self, lazy: bool) -> Result<(), FuseMountError> {
+    /// Unmounts and stops serving, as [`Self::unmount_retrying_busy_since`] does with the busy
+    /// window starting now.
+    pub fn unmount(&self, lazy: bool) -> impl Future<Output = Result<(), FuseMountError>> + '_ {
+        self.unmount_retrying_busy_since(lazy, Instant::now())
+    }
+
+    /// Unmounts and stops serving. A plain unmount retries a busy mount until its busy window
+    /// after `since` ends, as [`lore_fuse::mount::unmount_path_retrying_busy`] does; a mount still
+    /// busy then fails with `MountsBusy` and stays mounted and served. A lazy unmount detaches the
+    /// mount whatever holds it. A mount already gone from the mount table, detached by someone
+    /// else, counts as unmounted. Once the session has stopped, the background prefetch is
+    /// cancelled; nothing is left to record, as every request changed the filesystem State and
+    /// `write/` before it was answered, and the notification thread sends what is queued and ends.
+    /// With debug assertions a plain unmount first drains the kernel's lookups, which its busy
+    /// window does not count, then records and warns about any the table still counts.
+    pub async fn unmount_retrying_busy_since(
+        &self,
+        lazy: bool,
+        since: Instant,
+    ) -> Result<(), FuseMountError> {
         let check_leaks = cfg!(debug_assertions) && !lazy;
-        if check_leaks {
+        let since = if check_leaks {
+            let draining = Instant::now();
             self.drain_kernel_lookups().await;
-        }
-        match unmount_blocking(self.path.clone(), lazy).await {
+            since + draining.elapsed()
+        } else {
+            since
+        };
+        let unmounted = if lazy {
+            lore_fuse::mount::unmount_path_on_blocking_thread(&self.path, true).await
+        } else {
+            lore_fuse::mount::unmount_path_retrying_busy(&self.path, since).await
+        };
+        match unmounted {
             Ok(()) => {}
-            // fusermount3 reports only text; EBUSY reads "Device or resource busy".
-            Err(FuseError::UnmountFailed(reason)) if !lazy && reason.contains("busy") => {
+            Err(FuseError::UnmountBusy(_)) if !lazy => {
                 return Err(MountsBusy {
                     paths: self.path.display().to_string(),
                 }
@@ -438,16 +458,6 @@ impl FuseMount {
 /// The source an instance's mount carries in the mount table.
 fn fsname(instance_id: InstanceId) -> String {
     format!("lore:{}", instance_id.text_encoding())
-}
-
-async fn unmount_blocking(path: PathBuf, lazy: bool) -> Result<(), FuseError> {
-    lore_base::lore_spawn_blocking!(move || lore_fuse::mount::unmount_path(&path, lazy))
-        .await
-        .unwrap_or_else(|panicked| {
-            Err(FuseError::Internal(format!(
-                "unmount task panicked: {panicked}"
-            )))
-        })
 }
 
 pub struct FuseFilesystemProvider {

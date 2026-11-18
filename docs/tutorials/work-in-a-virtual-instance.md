@@ -307,7 +307,7 @@ When cloning with `--vfs fuse` fails, for example on a revision that doesn't exi
 [Error] Mounts are busy: /home/you/my-project-fuse
 ```
 
-A shell or a program has its working directory or an open file inside a virtual instance. Leave the virtual instance and close the program, then stop again. `lore service stop --force` detaches every mount at once instead, and the programs inside a detached virtual instance lose access to it.
+A shell or a program has its working directory or an open file inside a virtual instance. The stop waits up to five seconds for it to let go, since some programs look into a new mount for a moment. While it waits, the virtual instances it has already unmounted look empty, and when it gives up it mounts them again. Leave the virtual instance and close the program, then stop again. `lore service stop --force` detaches every mount at once instead, and the programs inside a detached virtual instance lose access to it.
 
 ### `Transport endpoint is not connected`
 

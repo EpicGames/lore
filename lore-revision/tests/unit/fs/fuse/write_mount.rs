@@ -13,6 +13,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::test_util::TempDir;
@@ -27,6 +28,7 @@ use lore_fuse::init::InitConfig;
 use lore_fuse::mount::MountAccess;
 use lore_fuse::mount::MountOptions;
 use lore_fuse::mount::unmount_path;
+use lore_fuse::mount::unmount_path_retrying_busy;
 use lore_fuse::reply::Errno;
 use lore_fuse::reply::ReadFault;
 use lore_fuse::session::Session;
@@ -81,8 +83,9 @@ struct Mounted {
 impl Mounted {
     /// Unmounts and stops serving, as a service stop does.
     async fn unmount(self) {
-        let root = self.root.clone();
-        blocking(move || unmount_path(&root, false).expect("an idle mount unmounts")).await;
+        unmount_path_retrying_busy(&self.root, Instant::now())
+            .await
+            .expect("an idle mount unmounts");
         tokio::time::timeout(Duration::from_secs(5), self.session.shutdown())
             .await
             .expect("shutdown completes");

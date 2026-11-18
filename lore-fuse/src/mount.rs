@@ -20,6 +20,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
 use crate::error::FuseError;
 
@@ -373,41 +375,51 @@ fn mount_privileged(
     })
 }
 
-/// Unmounts whatever is mounted at `path`: `fusermount3 -u [-z]` first, falling back to
-/// `umount2(2)` when `fusermount3` is unavailable or fails.
-const UNMOUNT_BUSY_RETRIES: u32 = 5;
-const UNMOUNT_BUSY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
+/// How long a plain unmount of a busy mount is retried before it fails as busy.
+#[lore_macro::test_pub]
+const UNMOUNT_BUSY_WINDOW: Duration = Duration::from_secs(5);
 
+/// The pause before the first retry of a busy unmount, in milliseconds, doubled for each retry
+/// after it up to [`UNMOUNT_BUSY_LONGEST_PAUSE_MILLIS`].
+const UNMOUNT_BUSY_FIRST_PAUSE_MILLIS: u64 = 20;
+
+/// The longest pause between retries of a busy unmount, in milliseconds, so that an unmount follows
+/// soon after a holder lets go late in [`UNMOUNT_BUSY_WINDOW`].
+const UNMOUNT_BUSY_LONGEST_PAUSE_MILLIS: u64 = 250;
+
+/// How `fusermount3` ends its report of an unmount the kernel refused with `EBUSY`: `strerror`'s
+/// text, in the C locale, as `fusermount3` sets none.
+const FUSERMOUNT_BUSY: &str = "Device or resource busy";
+
+/// Unmounts whatever is mounted at `path`, once: with `fusermount3 -u [-z]` where it is on `PATH`,
+/// and with `umount2(2)` where it is not or, as root, where it fails. A plain unmount the kernel
+/// refuses as busy fails with [`FuseError::UnmountBusy`].
 pub fn unmount_path(path: &Path, lazy: bool) -> Result<(), FuseError> {
     // SAFETY: geteuid has no preconditions.
     let privileged = unsafe { libc::geteuid() } == 0;
     if let Some(fusermount) = locate_fusermount3() {
-        let mut reason = String::new();
-        // Desktop indexers and file managers probe new mounts and briefly hold them busy, so a
-        // plain unmount gets a few short retries before it is reported as busy.
-        for attempt in 0..UNMOUNT_BUSY_RETRIES {
-            let mut command = Command::new(&fusermount);
-            command.arg("-u");
-            if lazy {
-                command.arg("-z");
-            }
-            command.arg(path);
-            match command.output() {
-                Ok(output) if output.status.success() => return Ok(()),
-                Ok(output) => {
-                    reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                }
-                Err(error) => reason = format!("running fusermount3: {error}"),
-            }
-            if lazy || !reason.contains("busy") || attempt + 1 == UNMOUNT_BUSY_RETRIES {
-                break;
-            }
-            std::thread::sleep(UNMOUNT_BUSY_BACKOFF);
+        let mut command = Command::new(&fusermount);
+        command.arg("-u");
+        if lazy {
+            command.arg("-z");
         }
+        command.arg(path);
+        let failure = match command.output() {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => {
+                let reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                if reason.ends_with(FUSERMOUNT_BUSY) {
+                    FuseError::UnmountBusy(reason)
+                } else {
+                    FuseError::UnmountFailed(reason)
+                }
+            }
+            Err(error) => FuseError::UnmountFailed(format!("running fusermount3: {error}")),
+        };
         // Only root can unmount directly; for anyone else umount2 would just mask the real
         // reason behind EPERM.
         if !privileged {
-            return Err(FuseError::UnmountFailed(reason));
+            return Err(failure);
         }
     }
 
@@ -421,12 +433,135 @@ pub fn unmount_path(path: &Path, lazy: bool) -> Result<(), FuseError> {
     // SAFETY: `target` is a valid, NUL-terminated `CString` kept alive for the call.
     let ret = unsafe { libc::umount2(target.as_ptr(), flags) };
     if ret != 0 {
-        return Err(FuseError::UnmountFailed(format!(
-            "umount2: {}",
-            std::io::Error::last_os_error()
-        )));
+        let error = std::io::Error::last_os_error();
+        let reason = format!("umount2: {error}");
+        return Err(if error.raw_os_error() == Some(libc::EBUSY) {
+            FuseError::UnmountBusy(reason)
+        } else {
+            FuseError::UnmountFailed(reason)
+        });
     }
     Ok(())
+}
+
+/// [`unmount_path`] on a blocking thread, held only while the attempt runs.
+pub async fn unmount_path_on_blocking_thread(path: &Path, lazy: bool) -> Result<(), FuseError> {
+    let path = path.to_path_buf();
+    lore_base::lore_spawn_blocking!(move || unmount_path(&path, lazy))
+        .await
+        .unwrap_or_else(|panicked| {
+            Err(FuseError::Internal(format!(
+                "unmount task panicked: {panicked}"
+            )))
+        })
+}
+
+/// Unmounts whatever is mounted at `path` with a plain [`unmount_path`], retried while it fails as
+/// busy until [`UNMOUNT_BUSY_WINDOW`] after `since` has passed, as a program can hold a mount busy
+/// for a moment. Each attempt runs with [`unmount_path_on_blocking_thread`], and the pauses
+/// between attempts wait on the runtime's timer. A caller that unmounts several mounts passes the
+/// same `since` to each, so that together they retry for one window.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn unmount_path_retrying_busy(
+    path: &Path,
+    since: Instant,
+) -> impl Future<Output = Result<(), FuseError>> + '_ {
+    async move {
+        let mut retry = lore_base::retry::retry_with_jitter(
+            UNMOUNT_BUSY_FIRST_PAUSE_MILLIS,
+            UNMOUNT_BUSY_LONGEST_PAUSE_MILLIS,
+            usize::MAX,
+            0.0,
+        );
+        let deadline = since + unmount_busy_window(path);
+        let mut attempts = 1usize;
+        loop {
+            match unmount_path_on_blocking_thread(path, false).await {
+                Err(FuseError::UnmountBusy(reason)) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    let Some(pause) = retry.next_interval().filter(|_| !left.is_zero()) else {
+                        lore_base::lore_warn!(
+                            "{} stayed busy through {attempts} unmount attempts, {:.1} seconds after unmounting began",
+                            path.display(),
+                            since.elapsed().as_secs_f32()
+                        );
+                        return Err(FuseError::UnmountBusy(reason));
+                    };
+                    tokio::time::sleep(pause.min(left)).await;
+                    attempts += 1;
+                }
+                Ok(()) if attempts > 1 => {
+                    lore_base::lore_debug!(
+                        "{} unmounted at attempt {attempts}, {:.1} seconds after unmounting began",
+                        path.display(),
+                        since.elapsed().as_secs_f32()
+                    );
+                    return Ok(());
+                }
+                other => return other,
+            }
+        }
+    }
+}
+
+/// How long a plain unmount of `path` retries a busy mount: [`UNMOUNT_BUSY_WINDOW`], or, built with
+/// `test-util`, the window a test planted for `path`.
+fn unmount_busy_window(path: &Path) -> Duration {
+    #[cfg(feature = "test-util")]
+    if let Some(window) = test_util::planted_busy_window(path) {
+        return window;
+    }
+    #[cfg(not(feature = "test-util"))]
+    let _ = path;
+    UNMOUNT_BUSY_WINDOW
+}
+
+/// Busy windows a test plants for the mount paths it holds busy, so that a test of a refused
+/// unmount retries only as long as it needs, and no other test's unmount retries less.
+#[cfg(feature = "test-util")]
+pub mod test_util {
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use parking_lot::Mutex;
+
+    static PLANTED: Mutex<Vec<(PathBuf, Duration)>> = parking_lot::const_mutex(Vec::new());
+
+    /// A busy window planted for a mount path, which a plain unmount of that path retries for
+    /// until this drops.
+    #[must_use]
+    pub struct PlantedBusyWindow(PathBuf, Duration);
+
+    impl PlantedBusyWindow {
+        /// Plants `window` for `path`, the path the unmount is given.
+        pub fn new(path: &Path, window: Duration) -> Self {
+            PLANTED.lock().push((path.to_path_buf(), window));
+            Self(path.to_path_buf(), window)
+        }
+    }
+
+    impl Drop for PlantedBusyWindow {
+        fn drop(&mut self) {
+            let mut planted = PLANTED.lock();
+            if let Some(index) = planted
+                .iter()
+                .position(|(path, window)| *path == self.0 && *window == self.1)
+            {
+                planted.swap_remove(index);
+            }
+        }
+    }
+
+    pub(super) fn planted_busy_window(path: &Path) -> Option<Duration> {
+        PLANTED
+            .lock()
+            .iter()
+            .find(|(planted, _)| planted == path)
+            .map(|(_, window)| *window)
+    }
 }
 
 #[lore_macro::test_pub]

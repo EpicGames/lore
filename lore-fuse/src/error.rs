@@ -11,6 +11,9 @@ pub enum FuseError {
     MountFailed(String),
     #[error("unmount failed: {0}")]
     UnmountFailed(String),
+    /// A plain unmount the kernel refused with `EBUSY`, as something holds the mount.
+    #[error("unmount failed: {0}")]
+    UnmountBusy(String),
     #[error("kernel FUSE protocol {minor} is older than the required {required}")]
     ProtocolTooOld { minor: u32, required: u32 },
     #[error("invalid request: {0}")]

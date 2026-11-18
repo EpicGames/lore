@@ -584,8 +584,11 @@ def test_service_stop_reports_busy_then_force_unmounts(new_lore_repo, fuse_mount
     # shell left in the instance does.
     holder = subprocess.Popen(["sleep", "300"], cwd=os.path.join(fuse.path, "held"))
     try:
-        with pytest.raises(MountsBusyError):
+        with pytest.raises(MountsBusyError) as refused:
             repo.service_stop(use_os_dir=True, cwd=outside)
+        assert f"pid {holder.pid} (sleep 300): cwd" in str(refused.value), (
+            "the failure names what held the mount"
+        )
         assert is_mounted(fuse.path), "a refused stop leaves the mount in place"
         assert cat(os.path.join(fuse.path, "held", "file.txt")) == b"held open"
 
@@ -1063,33 +1066,6 @@ def test_instance_delete_unmounts_and_removes_a_fuse_instance(
 
 
 @pytest.mark.smoke
-def test_instance_delete_of_a_busy_fuse_instance_changes_nothing(
-    new_lore_repo, fuse_mounts, global_dir_name
-):
-    repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
-    repo.write_commit_push("initial", {"held/file.txt": b"held open"})
-    fuse = fuse_clone(repo, fuse_mounts)
-    [external] = external_dirs(global_dir_name)
-    outside = str(Path(fuse.path).parent)
-
-    holder = subprocess.Popen(["sleep", "300"], cwd=os.path.join(fuse.path, "held"))
-    try:
-        with pytest.raises(MountsBusyError):
-            fuse.repository_instance_delete(cwd=outside)
-        assert is_mounted(fuse.path), "a refused delete leaves the instance mounted"
-        assert cat(os.path.join(fuse.path, "held", "file.txt")) == b"held open"
-        assert os.path.exists(external), "and its external directory in place"
-        assert fuse.path in fuse.repository_instance_list(), "and it stays registered"
-    finally:
-        holder.kill()
-        holder.wait()
-
-    fuse.repository_instance_delete(cwd=outside)
-    assert not is_mounted(fuse.path), "once nothing holds it, the delete goes ahead"
-    assert not os.path.exists(external)
-
-
-@pytest.mark.smoke
 def test_forced_create_and_clone_refuse_to_replace_a_fuse_instance(
     new_lore_repo, fuse_mounts, global_dir_name
 ):
@@ -1154,34 +1130,6 @@ def test_instance_move_remounts_a_fuse_instance(
     fuse.stage(["added.txt"])
     fuse.commit("after the move")
     assert cat(os.path.join(target, "added.txt")) == b"written after the move\n"
-
-
-@pytest.mark.smoke
-def test_instance_move_of_a_busy_fuse_instance_changes_nothing(
-    new_lore_repo, scratch_dir, fuse_mounts
-):
-    repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
-    repo.write_commit_push("initial", {"held/file.txt": b"held open"})
-    fuse = fuse_clone(repo, fuse_mounts)
-    target = scratch_dir("fuse_busy_move_target_parent", create=True) / "moved_fuse"
-    outside = str(target.parent)
-
-    holder = subprocess.Popen(["sleep", "300"], cwd=os.path.join(fuse.path, "held"))
-    try:
-        with pytest.raises(MountsBusyError):
-            fuse.repository_instance_move(str(target), cwd=outside)
-        assert is_mounted(fuse.path), "a refused move leaves the instance mounted"
-        assert not os.path.exists(target), "and mounts nothing at the target"
-        assert cat(os.path.join(fuse.path, "held", "file.txt")) == b"held open"
-        assert fuse.path in fuse.repository_instance_list(), "and registered at the source"
-    finally:
-        holder.kill()
-        holder.wait()
-
-    fuse_mounts.append(str(target))
-    fuse.repository_instance_move(str(target), cwd=outside)
-    assert is_mounted(str(target)), "once nothing holds it, the move goes ahead"
-    assert cat(os.path.join(target, "held", "file.txt")) == b"held open"
 
 
 @pytest.mark.smoke

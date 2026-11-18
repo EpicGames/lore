@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Exponential back-off with jitter, shared by every crate that retries a remote operation.
+//! Exponential back-off with jitter, shared by every crate that retries an operation.
 
 use std::time::Duration;
 

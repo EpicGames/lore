@@ -747,6 +747,108 @@ async fn unmount_all_reports_busy_paths_and_leaves_them_mounted() {
     .await;
 }
 
+/// A refused stop retries its busy mounts for one busy window in all, not for one window each.
+#[tokio::test(flavor = "multi_thread")]
+async fn unmount_all_retries_its_busy_mounts_for_one_window_in_all() {
+    skip_without_fuse!();
+    let _serial = SERIAL.lock().await;
+    let execution = service_execution().await;
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let (_store_dir, store) = canonical_dir("lore-fuse-mount-store-");
+        let (_first_dir, first_path) = canonical_dir("lore-fuse-mount-busy-");
+        let (_second_dir, second_path) = canonical_dir("lore-fuse-mount-busy-");
+        let _first_guard = MountGuard(first_path.clone());
+        let _second_guard = MountGuard(second_path.clone());
+        let _first = fresh_fuse_instance(&store, &first_path).await;
+        let _second = fresh_fuse_instance(&store, &second_path).await;
+        let window = Duration::from_secs(1);
+        let first_holder = Holder::open_for(&first_path, window).await;
+        let second_holder = Holder::open_for(&second_path, window).await;
+        let manager = MountManagerState::mount_manager().expect("manager is initialised");
+        let _resume = ResumeMounting(manager.clone());
+
+        let started = std::time::Instant::now();
+        let error = manager
+            .fuse()
+            .unmount_all(false)
+            .await
+            .expect_err("busy mounts fail a plain unmount_all");
+        let waited = started.elapsed();
+
+        assert!(error.is_mounts_busy(), "unexpected error: {error}");
+        assert!(
+            waited < window + window / 2,
+            "the stop must retry for one window in all, not {waited:?}"
+        );
+        first_holder.close().await;
+        second_holder.close().await;
+        manager
+            .fuse()
+            .unmount_all(false)
+            .await
+            .expect("once idle, every mount unmounts");
+    }))
+    .await;
+}
+
+/// A plain unmount that waits for a held mount holds none of the core runtime's blocking threads
+/// between its attempts, so the service's other commands, which read their requests and write
+/// their events on those threads, go on meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiting_unmount_leaves_the_blocking_threads_free() {
+    skip_without_fuse!();
+    let _serial = SERIAL.lock().await;
+    let execution = service_execution().await;
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let (_store_dir, store) = canonical_dir("lore-fuse-mount-store-");
+        let (_dir, path) = canonical_dir("lore-fuse-mount-busy-");
+        let _guard = MountGuard(path.clone());
+        let _instance = fresh_fuse_instance(&store, &path).await;
+        let holder = Holder::open_for(&path, Duration::from_secs(2)).await;
+        // Every blocking thread but one stays parked, as the service's accept loop parks one.
+        let mut releases = Vec::new();
+        let blocking_threads =
+            lore_base::runtime::core_blocking_threads(lore_base::runtime::thread_counts());
+        for _ in 1..blocking_threads {
+            let (parked, ready) = tokio::sync::oneshot::channel::<()>();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            drop(lore_base::lore_spawn_blocking!(move || {
+                let _ = parked.send(());
+                let _ = released.recv();
+            }));
+            ready.await.expect("a blocking thread parks");
+            releases.push(release);
+        }
+        let manager = MountManagerState::mount_manager().expect("manager is initialised");
+        let unmounting = {
+            let manager = manager.clone();
+            let path = path.clone();
+            lore_base::lore_spawn!(async move { manager.fuse().unmount(&path, false).await })
+        };
+        // Within the window, after the first attempt has found the mount busy.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let probed = std::time::Instant::now();
+        lore_base::lore_spawn_blocking!(|| ())
+            .await
+            .expect("the probe runs");
+        let probe = probed.elapsed();
+
+        drop(releases);
+        holder.close().await;
+        let unmounted = unmounting.await.expect("the unmount task completes");
+        assert!(
+            probe < Duration::from_millis(500),
+            "a blocking task waited {probe:?} behind the unmount's wait"
+        );
+        assert!(
+            unmounted.is_ok(),
+            "the unmount must succeed once the holder lets go: {unmounted:?}"
+        );
+    }))
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn unmount_all_force_lazily_unmounts_busy_paths() {
     skip_without_fuse!();
@@ -2149,6 +2251,7 @@ async fn deleting_or_moving_a_busy_instance_is_refused_as_busy() {
             instance.instance_id,
         )
         .expect("external dir");
+        let instance_id = instance.instance_id;
         let holder = Holder::open(&path).await;
         let command = opened_as_a_command(instance, &path).await;
 
@@ -2156,20 +2259,34 @@ async fn deleting_or_moving_a_busy_instance_is_refused_as_busy() {
             .await
             .expect_err("a busy instance refuses the delete");
         assert!(error.is_mounts_busy(), "unexpected error: {error}");
-        let error = lore_revision::instance::instance_move(command, &target.display().to_string())
-            .await
-            .expect_err("a busy instance refuses the move");
+        let error =
+            lore_revision::instance::instance_move(command.clone(), &target.display().to_string())
+                .await
+                .expect_err("a busy instance refuses the move");
         assert!(error.is_mounts_busy(), "unexpected error: {error}");
         assert!(is_mounted(&path), "still mounted");
         assert!(external.exists(), "with its external directory");
         assert!(!target.exists(), "and nothing at the target");
-        holder.close().await;
-        let manager = MountManagerState::mount_manager().expect("manager is initialised");
-        manager
-            .fuse()
-            .unmount(&path, false)
+        let registered = load_and_connect(&path, RepositoryAccess::ReadOnly)
             .await
-            .expect("unmounts");
+            .expect("the instance opens");
+        let instances = lore_revision::instance::list_instances(&registered)
+            .await
+            .expect("list the instances");
+        drop(registered);
+        assert!(
+            instances
+                .iter()
+                .any(|registered| registered.instance_id == instance_id
+                    && Path::new(&registered.path) == path),
+            "and registered at its path: {instances:?}"
+        );
+        holder.close().await;
+        lore_revision::instance::instance_delete(command)
+            .await
+            .expect("once released, the instance is deleted");
+        assert!(!is_mounted(&path), "unmounted");
+        assert!(!external.exists(), "its external directory is removed");
     }))
     .await;
 }

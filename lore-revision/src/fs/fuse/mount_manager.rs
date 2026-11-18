@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use dashmap::DashMap;
 use lore_base::error::InvalidPath;
@@ -769,18 +770,21 @@ impl FuseMountManager {
     /// Unmounts every FUSE instance, as the service does when it stops.
     ///
     /// Without `force`, each mount gets a plain unmount, which the kernel refuses while anything
-    /// holds the mount. If any is refused, the ones this call already unmounted are mounted
-    /// again at the revision they served, so a refused stop leaves every instance mounted and
-    /// served; derived inode numbers make the remount invisible to anything that looks up paths
-    /// afresh. Busy paths are reported in `MountsBusy`. Asking first is not an option:
-    /// `umount2(MNT_EXPIRE)` needs `CAP_SYS_ADMIN`, and a `/proc` scan cannot see other users'
-    /// or root's processes and still races the unmount. With `force`, every mount is detached
-    /// lazily and forgotten; nothing is remounted, and a path that stays attached is named in a
-    /// warning while the stop goes ahead. From the snapshot of the mounts on, a mount another
-    /// command makes is detached and fails, unless the stop is refused; once a stop goes ahead,
-    /// always. A mount someone else unmounted or abandoned meanwhile is never mounted again, nor
-    /// is one whose mount point a start would find missing (`InstanceStaleness::PathMissing`),
-    /// which is forgotten rather than its mount point made again.
+    /// holds the mount. A refused one is retried until one busy window after the stop began, as
+    /// [`FuseMount::unmount_retrying_busy_since`] does, so the stop waits one window in all rather
+    /// than one per busy mount. If any is still refused, the ones this call already unmounted,
+    /// which stay unmounted while it retries, are mounted again at the revision they served, so a
+    /// refused stop leaves every instance mounted and served; derived inode numbers make the
+    /// remount invisible to anything that looks up paths afresh. Busy paths are reported in
+    /// `MountsBusy`. Asking first is not an option: `umount2(MNT_EXPIRE)` needs `CAP_SYS_ADMIN`,
+    /// and a `/proc` scan cannot see other users' or root's processes and still races the unmount.
+    /// With `force`, every mount is detached lazily and forgotten; nothing is remounted, and a path
+    /// that stays attached is named in a warning while the stop goes ahead. From the snapshot of
+    /// the mounts on, a mount another command makes is detached and fails, unless the stop is
+    /// refused; once a stop goes ahead, always. A mount someone else unmounted or abandoned
+    /// meanwhile is never mounted again, nor is one whose mount point a start would find missing
+    /// (`InstanceStaleness::PathMissing`), which is forgotten rather than its mount point made
+    /// again.
     ///
     /// SWFS mounts are not this manager's:
     /// [`SwfsMountManager::close_all`](crate::fs::swfs::mount_manager::SwfsMountManager::close_all)
@@ -803,13 +807,14 @@ impl FuseMountManager {
         let mut busy = Vec::new();
         let mut attached = Vec::new();
         let mut failure = None;
+        let started = Instant::now();
         for (mount_path, mount) in fuse_mounts {
             // A mount the map no longer holds was unmounted by someone else, as a move or another
             // stop does; its path may hold another mount now, which detaching by path would take.
             if !self.tracks_at(&mount_path, &mount) {
                 continue;
             }
-            match mount.unmount(force).await {
+            match mount.unmount_retrying_busy_since(force, started).await {
                 Ok(()) => unmounted.push((mount_path, mount)),
                 Err(error) if error.is_mounts_busy() => busy.push(mount.path.display().to_string()),
                 // One the map dropped meanwhile counts as unmounted too: gone from its path is

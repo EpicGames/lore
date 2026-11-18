@@ -8,10 +8,16 @@ use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
+use std::time::Instant;
 
 use lore_base::test_util::TempDir;
+use lore_fuse::FuseError;
 use lore_fuse::init::InitConfig;
+use lore_fuse::mount::UNMOUNT_BUSY_WINDOW;
+use lore_fuse::mount::test_util::PlantedBusyWindow;
 use lore_fuse::mount::unmount_path;
+use lore_fuse::mount::unmount_path_retrying_busy;
 use lore_fuse::session::SessionConfig;
 use lore_fuse::skip_without_fuse;
 
@@ -378,6 +384,97 @@ mod needs_fuse {
             None,
             "the mountinfo entry must be gone after unmount"
         );
+    }
+
+    /// A plain unmount outlasts a process that holds the mount for a second, as a program probing
+    /// a new mount does, rather than report the mount busy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plain_unmount_outlasts_a_brief_holder() {
+        skip_without_fuse!();
+
+        let dir = TempDir::new("lore-fuse-synth-brief-holder-test-");
+        let fs = SyntheticFs::from_tree(vec![]);
+        let (_mount, session) = mount_synthetic(dir.path(), fs, session_config())
+            .await
+            .expect("mount must negotiate against a real kernel");
+        let guard = PathUnmountGuard(dir.path().to_path_buf());
+        let path = dir.path().to_path_buf();
+        let holder_dir = path.clone();
+        let mut holder = lore_base::lore_spawn_blocking!(move || {
+            Command::new("sleep")
+                .arg("1")
+                .current_dir(&holder_dir)
+                .spawn()
+        })
+        .await
+        .expect("spawn_blocking must not panic")
+        .expect("sleep must start inside the mount");
+
+        let started = Instant::now();
+        let unmounted = unmount_path_retrying_busy(&path, started).await;
+        let waited = started.elapsed();
+
+        lore_base::lore_spawn_blocking!(move || holder.wait())
+            .await
+            .expect("spawn_blocking must not panic")
+            .expect("sleep must end");
+        assert!(
+            unmounted.is_ok(),
+            "the unmount must wait for the holder: {unmounted:?}"
+        );
+        assert!(
+            waited >= Duration::from_millis(500),
+            "the unmount must have waited for the holder to exit, not {waited:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(5), session.wait())
+            .await
+            .expect("the worker loop must end once the device disconnects");
+        assert_eq!(mounted_fstype(dir.path()), None);
+        drop(guard);
+    }
+
+    /// A plain unmount of a mount held for longer than the busy window fails as busy once it has
+    /// retried for the whole window, and leaves the mount in place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plain_unmount_of_a_mount_held_past_the_busy_window_fails() {
+        skip_without_fuse!();
+
+        let dir = TempDir::new("lore-fuse-synth-held-past-window-test-");
+        let fs = SyntheticFs::from_tree(vec![]);
+        let (_mount, _session) = mount_synthetic(dir.path(), fs, session_config())
+            .await
+            .expect("mount must negotiate against a real kernel");
+        let guard = PathUnmountGuard(dir.path().to_path_buf());
+        let window = Duration::from_millis(200);
+        let _planted = PlantedBusyWindow::new(dir.path(), window);
+        let path = dir.path().to_path_buf();
+        let root = path.clone();
+        let holder = lore_base::lore_spawn_blocking!(move || std::fs::File::open(&root))
+            .await
+            .expect("spawn_blocking must not panic")
+            .expect("the mount root opens");
+
+        let started = Instant::now();
+        let unmounted = unmount_path_retrying_busy(&path, started).await;
+        let waited = started.elapsed();
+
+        lore_base::lore_spawn_blocking!(move || drop(holder))
+            .await
+            .expect("spawn_blocking must not panic");
+        assert!(
+            matches!(unmounted, Err(FuseError::UnmountBusy(_))),
+            "a held mount must fail a plain unmount as busy: {unmounted:?}"
+        );
+        assert!(
+            waited >= window,
+            "the unmount must retry for the whole window, not {waited:?}"
+        );
+        assert!(
+            waited < UNMOUNT_BUSY_WINDOW,
+            "the planted window must stand in for the shipped one, not {waited:?}"
+        );
+        assert_eq!(mounted_fstype(dir.path()).as_deref(), Some("fuse.lore"));
+        drop(guard);
     }
 
     #[tokio::test(flavor = "multi_thread")]

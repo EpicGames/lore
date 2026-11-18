@@ -24,6 +24,7 @@ from typing import TypedDict, Unpack, overload
 
 from cleanup_util import lore_mount_instance
 from error_types import (
+    MountsBusyError,
     ServerConnectionError,
     UnknownLoreError,
     get_error_type,
@@ -55,6 +56,7 @@ from lore_parsers import (
     parse_shared_store_list,
     parse_status_json,
 )
+from mount_holders import busy_mounts_report
 from service_util import LORE_TEST_VFS_VAR, name_service_executable
 
 logger = logging.getLogger(__name__)
@@ -479,6 +481,8 @@ class Lore:
                     sleep(attempt)
                     if attempt < max_attempts:
                         continue
+                if error_type == MountsBusyError:
+                    output += busy_mounts_report(output, env.get("LORE_GLOBAL_PATH"))
                 error = error_type(f"Command: {command_string}\n{output}")
                 error.returncode = e.returncode
                 raise error from None

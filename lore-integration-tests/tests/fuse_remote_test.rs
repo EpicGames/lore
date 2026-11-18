@@ -26,6 +26,7 @@ mod needs_fuse {
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::test_util::TempDir;
     use lore_fuse::abi::Opcode;
+    use lore_fuse::mount::test_util::PlantedBusyWindow;
     use lore_fuse::mount::unmount_path;
     use lore_fuse::skip_without_fuse;
     use lore_revision::fs::fuse::inode::InodeKind;
@@ -33,7 +34,6 @@ mod needs_fuse {
     use lore_revision::fs::fuse::listing_cache::LISTING_CACHE_BYTES;
     use lore_revision::fs::fuse::listing_cache::ListingCache;
     use lore_revision::fs::fuse::mount::FuseMount;
-    use lore_revision::fs::fuse::mount::FuseMountError;
     use lore_revision::fs::mount_manager::MountManager;
     use lore_revision::fs::mount_manager::MountManagerError;
     use lore_revision::fs::mount_manager_state::MountManagerState;
@@ -580,53 +580,6 @@ mod needs_fuse {
             .clone()
     }
 
-    /// How long a test's unmount waits out a hold on its mount from outside the test, as a
-    /// desktop service probing a new mount under `/tmp` briefly takes.
-    const OUTSIDE_HOLD: Duration = Duration::from_secs(5);
-    const UNMOUNT_RETRY: Duration = Duration::from_millis(50);
-
-    /// Runs `unmount`, a plain one, again while it finds the mount busy, for at most
-    /// [`OUTSIDE_HOLD`]: answers how many times it found the mount busy first, or its last error,
-    /// which names the busy paths. Never lazy, so a hold the test itself leaks still fails it.
-    async fn waiting_out_holds<E>(
-        unmount: impl AsyncFn() -> Result<(), E>,
-        busy: impl Fn(&E) -> bool,
-    ) -> Result<usize, E> {
-        let deadline = Instant::now() + OUTSIDE_HOLD;
-        let mut found_busy = 0;
-        loop {
-            match unmount().await {
-                Ok(()) => return Ok(found_busy),
-                Err(error) if busy(&error) && Instant::now() < deadline => {
-                    found_busy += 1;
-                    tokio::time::sleep(UNMOUNT_RETRY).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
-    /// The manager's plain unmount of the mount at `root`, waiting out an outside hold.
-    async fn unmount_through(
-        manager: &MountManager,
-        root: &Path,
-    ) -> Result<usize, MountManagerError> {
-        waiting_out_holds(
-            async || manager.fuse().unmount(root, false).await,
-            |error| matches!(error, MountManagerError::MountsBusy(_)),
-        )
-        .await
-    }
-
-    /// `mount`'s plain unmount, waiting out an outside hold.
-    async fn unmount_mount(mount: &FuseMount) -> Result<usize, FuseMountError> {
-        waiting_out_holds(
-            async || mount.unmount(false).await,
-            |error| matches!(error, FuseMountError::MountsBusy(_)),
-        )
-        .await
-    }
-
     struct Fixture {
         // Field order is drop order: unmount before the directories go.
         mount: Arc<FuseMount>,
@@ -645,11 +598,12 @@ mod needs_fuse {
             self.mount.metrics().snapshot(Opcode::Read).count
         }
 
-        /// Unmounts, waiting out an outside hold; answers how many times the mount was busy.
-        async fn unmount(self) -> usize {
-            unmount_through(&self.manager, &self.root)
+        async fn unmount(self) {
+            self.manager
+                .fuse()
+                .unmount(&self.root, false)
                 .await
-                .expect("unmount")
+                .expect("unmount");
         }
     }
 
@@ -733,7 +687,11 @@ mod needs_fuse {
             .await
             .expect("flushes");
         drop(token);
-        unmount_through(&manager, &root).await.expect("unmounts");
+        manager
+            .fuse()
+            .unmount(&root, false)
+            .await
+            .expect("unmounts");
 
         let state = lore_revision::global::external_dir::resolve::resolve()
             .expect("resolve the external root");
@@ -871,45 +829,6 @@ mod needs_fuse {
             .await;
     }
 
-    /// A hold on the mount root from outside the test, as a desktop service probing a new mount
-    /// under `/tmp` takes, released once the unmount has found the mount busy, does not fail the
-    /// unmount.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_fixture_unmount_waits_out_a_brief_outside_hold() {
-        skip_without_fuse!();
-        LORE_CONTEXT
-            .scope(execution("brief-hold"), async move {
-                let fixture = remote_fixture().await;
-                let held = std::fs::File::open(&fixture.root).expect("open the mount root");
-                let (release, busy_seen) = std::sync::mpsc::channel::<()>();
-                let releasing = std::thread::spawn(move || {
-                    // Released early only where the unmount ended without finding it busy.
-                    let _ = busy_seen.recv();
-                    drop(held);
-                });
-                let busy =
-                    |error: &MountManagerError| matches!(error, MountManagerError::MountsBusy(_));
-                let found_busy = waiting_out_holds(
-                    async || {
-                        let answer = fixture.manager.fuse().unmount(&fixture.root, false).await;
-                        if answer.as_ref().is_err_and(busy) {
-                            let _ = release.send(());
-                        }
-                        answer
-                    },
-                    busy,
-                )
-                .await;
-                drop(release);
-                releasing.join().expect("the hold is released");
-                assert!(
-                    found_busy.as_ref().is_ok_and(|&found| found > 0),
-                    "the unmount answered {found_busy:?}, not after finding the mount held"
-                );
-            })
-            .await;
-    }
-
     /// A hold on the mount root that is never released fails the unmount, naming the mount.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_fixture_unmount_fails_under_a_hold_never_released() {
@@ -918,7 +837,8 @@ mod needs_fuse {
             .scope(execution("leaked-hold"), async move {
                 let fixture = remote_fixture().await;
                 let held = std::fs::File::open(&fixture.root).expect("open the mount root");
-                let refused = unmount_through(&fixture.manager, &fixture.root).await;
+                let _window = PlantedBusyWindow::new(&fixture.root, Duration::from_millis(100));
+                let refused = fixture.manager.fuse().unmount(&fixture.root, false).await;
                 let root = fixture.root.display().to_string();
                 assert!(
                     matches!(&refused, Err(MountManagerError::MountsBusy(busy)) if busy.paths == root),
@@ -1459,7 +1379,7 @@ mod needs_fuse {
                 );
 
                 // A fresh mount has no page cache: the second pass is all local.
-                unmount_mount(&fixture.mount).await.expect("unmounts");
+                fixture.mount.unmount(false).await.expect("unmounts");
                 let remounted = fixture.mount.remount().await.expect("remounts");
                 let root = fixture.root.clone();
                 blocking(move || assert_tree_reads_back(&root, &expected)).await;
@@ -1468,7 +1388,7 @@ mod needs_fuse {
                     0,
                     "the second pass fetches nothing"
                 );
-                unmount_mount(&remounted).await.expect("unmounts");
+                remounted.unmount(false).await.expect("unmounts");
             })
             .await;
     }
@@ -3028,7 +2948,9 @@ mod needs_fuse {
         }
 
         async fn unmount(self) {
-            unmount_through(&self.manager, &self.root)
+            self.manager
+                .fuse()
+                .unmount(&self.root, false)
                 .await
                 .expect("unmount");
         }

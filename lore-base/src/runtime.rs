@@ -1146,6 +1146,7 @@ fn core_thread_counts(settings: &TokioSettings) -> ThreadCounts {
 
 /// The core runtime's blocking pool: the budgeted blocking threads less the one
 /// the net runtime holds, and never zero — a pool of none runs nothing.
+#[lore_macro::test_pub]
 fn core_blocking_threads(counts: ThreadCounts) -> usize {
     counts.blocking.saturating_sub(NET_BLOCKING_THREADS).max(1)
 }

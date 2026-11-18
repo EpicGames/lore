@@ -326,11 +326,13 @@ first, lose the socket and leave dead endpoints.
 | Stale endpoint | Detected by `statfs` → `ENOTCONN`, lazily unmounted before remount. | `remount_instance`, `mount_manager.rs` |
 | Delete | `lore repository instance delete`: unmounts the instance, which a busy mount refuses with `MountsBusy`, then removes its registration, its external directory and the empty mount point. | `instance_delete`, `lore-revision/src/instance.rs` |
 | Move | `lore repository instance move`: refused while the service stops; unmounts the instance, which a busy mount refuses with `MountsBusy`; mounts it on a mount point made at the target at the revision it served; registers it there; removes the old mount point. When mounting or registering at the target fails, it mounts the instance at its source again. A crash after the mount at the target and before the registration leaves a stale endpoint there, which `fusermount3 -uz <target>` detaches; the next start mounts the instance at its source. | `move_mount`, `mount_manager.rs`; `instance_move_with`, `instance.rs` |
-| Stop | Plain unmount of every FUSE mount. If any is busy, the ones already unmounted are remounted at the revision they served, and the stop fails with `MountsBusy` (exit code 51) naming the paths. A mount someone else already detached counts as unmounted. From its snapshot of the mounts until it is refused, a stop makes a mount another command creates detach and fail. | `unmount_all`, `refuse_while_stopping`, `mount_manager.rs` |
+| Stop | Plain unmount of every FUSE mount, a busy one retried until 5 seconds after the stop began. If any is still busy, the ones already unmounted, which stay unmounted until then, are remounted at the revision they served, and the stop fails with `MountsBusy` (exit code 51) naming the paths. A mount someone else already detached counts as unmounted. From its snapshot of the mounts until it is refused, a stop makes a mount another command creates detach and fail. | `unmount_all`, `refuse_while_stopping`, `mount_manager.rs` |
 | Stop with the global `--force` | Every mount is detached lazily (`fusermount3 -u -z`, or `umount2(MNT_DETACH)` as root) and forgotten; nothing is remounted, and a path that stays attached is named in a warning while the stop goes ahead. Mounts a refused stop remounted are back in the table, so a later forced stop detaches them too. | `unmount_all`, `mount_manager.rs`; `unmount_path`, `src/mount.rs` |
 
-- Unmount retries a busy `fusermount3 -u` 5 times, 20 ms apart, since desktop indexers briefly
-  hold new mounts (`unmount_path`, `src/mount.rs`).
+- A plain unmount the kernel refuses as busy is retried for 5 seconds, since a program can hold
+  a mount for a moment. Each attempt runs on a blocking thread, and the pauses between them,
+  doubling from 20 ms to 250 ms, wait on the runtime's timer. A stop retries its busy mounts until 5 seconds after it began, not 5 seconds each
+  (`unmount_path_retrying_busy`, `src/mount.rs`; `unmount_all`, `mount_manager.rs`).
 - Busy cannot be asked in advance: `umount2(MNT_EXPIRE)` needs `CAP_SYS_ADMIN`, and a `/proc`
   scan cannot see other users' processes (`unmount_all`, `mount_manager.rs`).
 - An unmount, plain or lazy, detaches the mount, stops the session and cancels the background
@@ -1228,7 +1230,8 @@ in the code.
 | `DELETION_LIST` | constant (`fs/fuse/deletions.rs`) | `deleted` | Deletion list below the instance's external directory. |
 | `STAGING_DIRECTORY` | constant (`fs/fuse/write.rs`) | `write-staging` | Staging directory beside `write/`. |
 | `MAX_READ` | constant (`fs/fuse/mount.rs`) | 1 MiB | `max_read` and `st_blksize`. |
-| `UNMOUNT_BUSY_RETRIES`, `UNMOUNT_BUSY_BACKOFF` | constants (`src/mount.rs`) | 5, 20 ms | Busy-unmount retries. |
+| `UNMOUNT_BUSY_WINDOW` | constant (`src/mount.rs`) | 5 s | How long a plain unmount retries a busy mount. |
+| `UNMOUNT_BUSY_FIRST_PAUSE_MILLIS`, `UNMOUNT_BUSY_LONGEST_PAUSE_MILLIS` | constants (`src/mount.rs`) | 20 ms, 250 ms | First and longest pause between busy-unmount attempts. |
 | `DRAIN_WAIT` | constant (`fs/fuse/mount.rs`) | 2 s | Debug-build FORGET drain on plain unmount. |
 | `DRAIN_RESEND`, `DRAIN_SETTLE` | constants (`fs/fuse/mount.rs`) | 50 ms, 100 ms | The drain's interval between invalidations, and how long the table must count no lookups before it ends. |
 | `vfs.base_time` | instance config (`VfsConfig::base_time`, `lore-revision/src/repository.rs`) | time of cloning | Time a file served from the store reports until a time is recorded for its path. |
