@@ -4,6 +4,7 @@
 //! counts the reads reaching it.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -330,8 +331,8 @@ pub(crate) async fn stored_locally(
 
 /// The in-memory stores of a client.
 pub(crate) struct ClientStores {
-    immutable: Arc<dyn ImmutableStore>,
-    mutable: Arc<dyn MutableStore>,
+    pub immutable: Arc<dyn ImmutableStore>,
+    pub mutable: Arc<dyn MutableStore>,
     /// A context over the stores that can write the revisions the client holds locally.
     pub writer: Arc<RepositoryContext>,
 }
@@ -353,6 +354,8 @@ pub(crate) async fn counted_client_stores() -> (ClientStores, Arc<CountingStore>
         payloads: AtomicUsize::new(0),
         queries: AtomicUsize::new(0),
         failing: AtomicBool::new(false),
+        failing_hashes: Mutex::new(Vec::new()),
+        durable_only: AtomicBool::new(false),
     });
     (stores_over(counting.clone(), mutable), counting)
 }
@@ -410,12 +413,15 @@ pub(crate) struct Reads {
 }
 
 /// An immutable store that counts the reads reaching the store it wraps, and fails each payload
-/// read after [`Self::fail_reads`] is called.
+/// read after [`Self::fail_reads`] is called, and each of the hashes [`Self::fail_reads_of`]
+/// names. After [`Self::report_durable_only`] it answers each query as a server's store does.
 pub(crate) struct CountingStore {
     inner: Arc<dyn ImmutableStore>,
     payloads: AtomicUsize,
     queries: AtomicUsize,
     failing: AtomicBool,
+    failing_hashes: Mutex<Vec<Hash>>,
+    durable_only: AtomicBool,
 }
 
 impl CountingStore {
@@ -430,6 +436,29 @@ impl CountingStore {
     /// Answer each payload read from now on with `Disconnected`, which no local read retries.
     pub(crate) fn fail_reads(&self) {
         self.failing.store(true, Ordering::Relaxed);
+    }
+
+    /// Answer each payload read of one of `hashes` from now on with `Disconnected`.
+    pub(crate) fn fail_reads_of(&self, hashes: impl IntoIterator<Item = Hash>) {
+        self.failing_hashes
+            .lock()
+            .expect("the failing hashes are never poisoned")
+            .extend(hashes);
+    }
+
+    /// Answer each query from now on with what it holds as durable and none of it as held
+    /// locally, as a server's store reports what it holds.
+    pub(crate) fn report_durable_only(&self) {
+        self.durable_only.store(true, Ordering::Relaxed);
+    }
+
+    fn fails(&self, hash: &Hash) -> bool {
+        self.failing.load(Ordering::Relaxed)
+            || self
+                .failing_hashes
+                .lock()
+                .expect("the failing hashes are never poisoned")
+                .contains(hash)
     }
 }
 
@@ -462,7 +491,7 @@ impl ImmutableStore for CountingStore {
         partition: Partition,
         address: Address,
     ) -> Result<StoreGetData, StoreError> {
-        if self.failing.load(Ordering::Relaxed) {
+        if self.fails(&address.hash) {
             return Err(StoreError::from(Disconnected));
         }
         self.payloads.fetch_add(1, Ordering::Relaxed);
@@ -487,7 +516,14 @@ impl ImmutableStore for CountingStore {
         self.inner
             .clone()
             .query(partition, addresses, results)
-            .await
+            .await?;
+        if self.durable_only.load(Ordering::Relaxed) {
+            for result in results.iter_mut() {
+                result.stored_durable |= result.stored_local;
+                result.stored_local = false;
+            }
+        }
+        Ok(())
     }
 
     async fn put(

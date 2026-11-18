@@ -543,3 +543,169 @@ mod revision_state {
             .await;
     }
 }
+
+mod page_in_line {
+    use std::sync::Arc;
+
+    use lore_base::error::NotAuthorized;
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_base::types::BranchId;
+    use lore_base::types::Hash;
+    use lore_revision::find::page_in_line;
+    use lore_transport::ProtocolError;
+
+    use crate::branch::write_line;
+    use crate::helper::setup_test_execution;
+    use crate::paged_remote::Anchor;
+    use crate::paged_remote::ClientStores;
+    use crate::paged_remote::PagedRemote;
+    use crate::paged_remote::RemoteRevision;
+    use crate::paged_remote::client_on;
+    use crate::paged_remote::client_stores;
+    use crate::paged_remote::counted_client_stores;
+    use crate::paged_remote::remote_revision;
+    use crate::paged_remote::stored_locally;
+
+    /// Five revisions numbered 1 to 5 that only the remote holds, oldest first.
+    async fn remote_line() -> Vec<RemoteRevision> {
+        let mut line: Vec<RemoteRevision> = Vec::new();
+        for number in 1..=5 {
+            let parent = line.last().map_or(Hash::default(), |below| below.signature);
+            line.push(remote_revision(number, parent, Hash::from([0xA0; 32])).await);
+        }
+        line
+    }
+
+    /// A remote holding `line`, which lists it whole from its newest revision, or refuses to.
+    fn remote(line: &[RemoteRevision], refusing: bool) -> Arc<PagedRemote> {
+        let newest = line.last().expect("the line has revisions").signature;
+        let remote = PagedRemote::new(BranchId::from([7; 16]), newest).holding(line);
+        let remote = if refusing {
+            remote.failing(
+                Anchor::Signature(newest),
+                ProtocolError::from(NotAuthorized),
+            )
+        } else {
+            remote.page(
+                Anchor::Signature(newest),
+                line.iter()
+                    .rev()
+                    .zip((1..=5).rev())
+                    .map(|(revision, number)| (number, revision.signature))
+                    .collect(),
+                Hash::default(),
+            )
+        };
+        Arc::new(remote)
+    }
+
+    fn signatures(line: &[RemoteRevision]) -> Vec<Hash> {
+        line.iter().map(|revision| revision.signature).collect()
+    }
+
+    /// The page from a revision the store lacks is read in one request and stored down to its
+    /// first revision numbered at or below the floor, and none below that.
+    #[tokio::test]
+    async fn a_page_is_stored_down_to_the_floor() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let line = remote_line().await;
+                let stores: ClientStores = client_stores().await;
+                let remote = remote(&line, false);
+                let client = client_on(&stores, remote.clone());
+
+                let paged = page_in_line(client.clone(), line[4].signature, 3).await;
+
+                assert!(paged);
+                assert_eq!(remote.lists(), 1);
+                assert_eq!(
+                    stored_locally(&client, &signatures(&line)).await,
+                    [false, false, true, true, true]
+                );
+            })
+            .await;
+    }
+
+    /// A revision the store holds asks the remote for nothing.
+    #[tokio::test]
+    async fn a_revision_the_store_holds_asks_the_remote_nothing() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let line = remote_line().await;
+                let stores = client_stores().await;
+                let local = write_line(&stores.writer, line[4].signature, 6, 1).await[0];
+                let remote = remote(&line, false);
+                let client = client_on(&stores, remote.clone());
+
+                let paged = page_in_line(client, local, 3).await;
+
+                assert!(paged);
+                assert_eq!(remote.lists(), 0);
+            })
+            .await;
+    }
+
+    /// A page the remote refuses answers that the line is not paged in, so a walk stops asking.
+    #[tokio::test]
+    async fn a_refused_page_answers_the_line_is_not_paged_in() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let line = remote_line().await;
+                let stores = client_stores().await;
+                let remote = remote(&line, true);
+                let client = client_on(&stores, remote.clone());
+
+                let paged = page_in_line(client.clone(), line[4].signature, 3).await;
+
+                assert!(!paged);
+                assert_eq!(
+                    stored_locally(&client, &signatures(&line)).await,
+                    [false; 5]
+                );
+            })
+            .await;
+    }
+
+    /// An empty page answers that the line is not paged in.
+    #[tokio::test]
+    async fn an_empty_page_answers_the_line_is_not_paged_in() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let line = remote_line().await;
+                let newest = line[4].signature;
+                let stores = client_stores().await;
+                let remote = Arc::new(
+                    PagedRemote::new(BranchId::from([7; 16]), newest)
+                        .holding(&line)
+                        .page(Anchor::Signature(newest), Vec::new(), Hash::default()),
+                );
+                let client = client_on(&stores, remote.clone());
+
+                let paged = page_in_line(client, newest, 3).await;
+
+                assert!(!paged);
+                assert_eq!(remote.lists(), 1);
+            })
+            .await;
+    }
+
+    /// A store that reports nothing held locally, as a server's does, without a remote, answers
+    /// that the line is not paged in without reading a payload, so a walk reads each revision
+    /// from the store on its own.
+    #[tokio::test]
+    async fn a_store_without_a_remote_answers_the_line_is_not_paged_in() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (stores, counting) = counted_client_stores().await;
+                let revision = write_line(&stores.writer, Hash::default(), 1, 1).await[0];
+                counting.report_durable_only();
+                counting.take_reads();
+
+                let paged = page_in_line(stores.writer.clone(), revision, 0).await;
+
+                assert!(!paged);
+                assert_eq!(counting.take_reads().payloads, 0);
+            })
+            .await;
+    }
+}

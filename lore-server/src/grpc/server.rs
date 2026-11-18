@@ -206,12 +206,16 @@ pub struct FeatureSettings {
     pub revision_diff_source_cap: Option<usize>,
     /// Permit count for the semaphore gating parallel
     /// `is_last_change_merged` history walks inside
-    /// `revision::diff3`. Defaults to
+    /// `revision::diff3`, and for the revision comparisons the walks
+    /// of the history lines for deleted paths keep in flight between
+    /// them. Defaults to
     /// `lore_revision::revision::DEFAULT_HISTORY_WALK_CONCURRENCY`
     /// (24, set empirically — see comments in `revision::diff3`).
     /// Higher values cost RSS per concurrent walk because each
-    /// holds an `Arc<State>` over a deserialised revision blob;
-    /// the wall-clock benefit saturates well below 64.
+    /// holds an `Arc<State>` over a deserialised revision blob, and
+    /// each comparison two; the wall-clock benefit saturates well
+    /// below 64. Each comparison keeps up to 64 path lookups in
+    /// flight, so the comparisons keep up to 64 times this many.
     pub revision_diff_history_walk_concurrency: Option<usize>,
     /// Number of branches the v1 `BranchList` handler loads at once.
     /// Defaults to 100.

@@ -476,23 +476,79 @@ pub async fn batch_load_history(
     if revision.is_zero() || history.len() >= BATCH_COUNT {
         return Ok(history);
     }
+    // Boxed: a remote request, a cold path once a page, whose future would otherwise make every
+    // caller's as large as the page's caching.
+    Box::pin(remote_page(repository, revision, None, Some(&mut history))).await?;
+    Ok(history)
+}
 
+/// Reads the page of the line from `revision` from the remote into the local store, where the
+/// store lacks `revision`'s state, so that a walk down the line reads a page per request rather
+/// than a revision. The page ends at its first revision numbered `floor` or lower, and only the
+/// states of the revisions it lists are cached, without their metadata: the remote answers a page
+/// whole, so the bound saves no request, but keeps the walk from storing what it will not read.
+///
+/// Answers whether the store holds `revision`'s state, or the remote listed its page. A walk that
+/// asks for each revision the store lacks stops asking once the answer is no, and reads each
+/// revision on its own: where the repository has no remote, as on a server, or the remote lists
+/// nothing. The page is read on a cold path, once a page, so its future is boxed.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
+#[allow(clippy::manual_async_fn)]
+pub(crate) fn page_in_line(
+    repository: Arc<RepositoryContext>,
+    revision: Hash,
+    floor: u64,
+) -> impl Future<Output = bool> + Send {
+    async move {
+        if immutable::is_stored_local(repository.clone(), Address::zero_context_hash(revision))
+            .await
+        {
+            return true;
+        }
+        matches!(
+            Box::pin(remote_page(repository, revision, Some(floor), None)).await,
+            Ok(listed) if listed > 0
+        )
+    }
+}
+
+/// Reads the remote's page of the line from `revision`, which the local store lacks, ending at its
+/// first revision numbered `floor` or lower where there is a floor. Answers how many revisions of
+/// the line it listed, none where the remote cannot list it, and appends each to `history`, if
+/// any, with its number as [`verified_number`] reads it.
+///
+/// Without a floor the page's states and the metadata of the revisions on the line are cached, as
+/// [`batch_load_history`] describes. With one, only the states of the listed revisions are, as
+/// [`page_in_line`] describes.
+async fn remote_page(
+    repository: Arc<RepositoryContext>,
+    revision: Hash,
+    floor: Option<u64>,
+    mut history: Option<&mut Vec<(u64, Hash)>>,
+) -> Result<usize, FindError> {
     let Ok(remote) = repository.remote().await else {
-        return Ok(history);
+        return Ok(0);
     };
     let Ok(revision_protocol) = remote.revision(repository.id).await else {
-        return Ok(history);
+        return Ok(0);
     };
 
-    lore_debug!("Query remote for revision state history");
+    if let Some(floor) = floor {
+        lore_debug!("Query remote for revision state history down to revision number {floor}");
+    } else {
+        lore_debug!("Query remote for revision state history");
+    }
 
     let Ok(response) = revision_protocol.revision_list(revision.into()).await else {
-        return Ok(history);
+        return Ok(0);
     };
 
     lore_debug!("Got {} revisions", response.items.len(),);
 
     let line = response.items_from(revision);
+    let mut listed = 0;
     for item in line {
         let Some(number) = verified_number(item) else {
             return Err(FindError::internal(format!(
@@ -500,8 +556,19 @@ pub async fn batch_load_history(
                 item.signature
             )));
         };
-        history.push((number, item.signature));
+        if let Some(history) = history.as_deref_mut() {
+            history.push((number, item.signature));
+        }
+        listed += 1;
+        if floor.is_some_and(|floor| number <= floor) {
+            break;
+        }
     }
+    if floor.is_some() {
+        cache_page_states(repository, &line[..listed], 0).await;
+        return Ok(listed);
+    }
+
     let metadata_addresses: Vec<Address> = line
         .iter()
         .map(|item| Address::zero_context_hash(item.metadata))
@@ -511,7 +578,7 @@ pub async fn batch_load_history(
     let _ = immutable::cache(repository.clone(), metadata_addresses, true).await;
     cache_page_states(repository, &response.items, unverified).await;
 
-    Ok(history)
+    Ok(listed)
 }
 
 /// Cache the per-item state blobs from a remote `revision_list` response into

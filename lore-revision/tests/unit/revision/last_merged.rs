@@ -15,7 +15,10 @@ use lore_revision::commit::weave_history;
 use lore_revision::lore::BranchId;
 use lore_revision::node::*;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::revision::MergesAcross;
+use lore_revision::revision::deletions::Deletions;
 use lore_revision::revision::find_last_merged_revision;
+use lore_revision::revision::stands_unwalked;
 use lore_revision::state::NodeMapping;
 use lore_revision::state::State;
 use lore_revision::util::path::RelativePathBuf;
@@ -29,6 +32,18 @@ use crate::helper::in_memory::file;
 use crate::helper::in_memory::revision_state;
 use crate::helper::in_memory::token;
 use crate::helper::test_store_create;
+
+/// The deletions of a diff whose conflicts delete nothing, which the changes here are.
+async fn no_deletions(repository: &RepositoryContext) -> Deletions {
+    Deletions::walk(
+        std::iter::empty::<&(NodeChange, NodeChange)>(),
+        repository.id,
+        0,
+        1,
+    )
+    .await
+    .expect("walking no history lines")
+}
 
 /// Sets the history of `node_id` in `state` to `first` along the first parent and `second` along
 /// the second, each a revision and the file's node ID there, both as modifications, and serializes
@@ -191,6 +206,7 @@ async fn the_last_merged_revision_is_found_past_a_merge_that_gives_the_file_anot
             source,
             target,
             state_branch_point,
+            &no_deletions(&repository).await,
         )
         .await
         .expect("walking the history");
@@ -276,6 +292,7 @@ async fn a_file_the_target_adds_in_the_start_revision_has_no_last_merge() {
             source,
             target,
             revision_state(&repository, branch_point).await,
+            &no_deletions(&repository).await,
         )
         .await
         .expect("walking the history");
@@ -346,6 +363,7 @@ async fn the_walk_stops_at_the_revision_the_target_added_the_file_in() {
             source,
             target,
             revision_state(&repository, branch_point).await,
+            &no_deletions(&repository).await,
         )
         .await
         .expect("walking the history");
@@ -465,6 +483,7 @@ async fn the_last_merged_revision_is_found_past_a_woven_merge_of_divergent_histo
             source,
             target,
             revision_state(&repository, branch_point).await,
+            &no_deletions(&repository).await,
         )
         .await
         .expect("walking the history");
@@ -473,6 +492,41 @@ async fn the_last_merged_revision_is_found_past_a_woven_merge_of_divergent_histo
         assert_eq!(
             found,
             Some((merged_from_source, source_revision.revision_number()))
+        );
+    }))
+    .await
+    .expect("Task failed");
+}
+
+/// Told that no merge in the repository joins the sides above the base, a conflict whose every
+/// side is in the repository stands without a walk, and a conflict below a link, whose sides are
+/// in the linked repository, does not: the base search read none of that repository's history.
+#[tokio::test]
+async fn only_a_conflict_in_the_repository_the_base_search_read_stands_unwalked() {
+    let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
+    lore_spawn!(LORE_CONTEXT.scope(execution, async move {
+        let repository = in_memory::repository(immutable, mutable);
+        let linked = Arc::new(
+            repository
+                .to_link_context(lore_revision::lore::RepositoryId::from([7; 16]))
+                .await,
+        );
+        let state = State::new();
+        let in_repository = change_at(&repository, &state, ROOT_NODE, "a.txt");
+        let below_link = change_at(&linked, &state, ROOT_NODE, "lib/a.txt");
+
+        let stands = |change: &NodeChange, merges| {
+            stands_unwalked(&(change.clone(), change.clone()), repository.id, merges)
+        };
+
+        assert!(stands(&in_repository, MergesAcross::NoneAboveBase));
+        assert!(
+            !stands(&in_repository, MergesAcross::Unknown),
+            "Nothing is proven of the merges"
+        );
+        assert!(
+            !stands(&below_link, MergesAcross::NoneAboveBase),
+            "The linked repository's history may hold a merge"
         );
     }))
     .await

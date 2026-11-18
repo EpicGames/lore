@@ -3,6 +3,11 @@
 pub mod amend;
 pub mod bisect;
 pub mod cherry_pick;
+// Public to the tests alone, as `lore_macro::test_pub` makes an item.
+#[cfg(feature = "test-util")]
+pub mod deletions;
+#[cfg(not(feature = "test-util"))]
+mod deletions;
 pub mod diff;
 pub mod history;
 pub mod info;
@@ -303,9 +308,22 @@ pub async fn diff3(
         None,
         None,
         None,
+        MergesAcross::Unknown,
         tx,
     )
     .await
+}
+
+/// What the search for the base of a 3-way diff proved about merges between its two sides, for
+/// the pass that asks whether a conflicting change was already merged across.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergesAcross {
+    /// Nothing proven: a change of either side may have been merged into the other.
+    Unknown,
+    /// No merge in the diff's repository joins the two sides above the base, so no change either
+    /// made there since the base was merged into the other, and every conflict in it stands. A
+    /// conflict below a link has the linked repository's history, which this proves nothing of.
+    NoneAboveBase,
 }
 
 /// Default in-flight count for the history-walk parallel pass when
@@ -326,8 +344,14 @@ pub const DEFAULT_HISTORY_WALK_CONCURRENCY: usize = 24;
 ///   rather than by matching the message. Library callers (filesystem diff,
 ///   merge, capi, CLI) pass `None` via `diff3` to stay unbounded.
 /// * `history_walk_concurrency` — permit count for the semaphore
-///   gating parallel `is_last_change_merged` history walks. Passing
-///   `None` falls back to `DEFAULT_HISTORY_WALK_CONCURRENCY`.
+///   gating parallel `is_last_change_merged` history walks, and for the
+///   revision comparisons the walks of the history lines for deleted paths
+///   keep in flight between them, each with up to 64 path lookups in
+///   flight. Passing `None` falls back to
+///   `DEFAULT_HISTORY_WALK_CONCURRENCY`.
+/// * `merges` — what the search for `base` proved about merges between
+///   the sides. With [`MergesAcross::NoneAboveBase`] a conflict in
+///   `repository` stands without a history walk.
 #[allow(clippy::too_many_arguments)]
 pub async fn diff3_with_source_cap(
     repository: Arc<RepositoryContext>,
@@ -341,6 +365,7 @@ pub async fn diff3_with_source_cap(
     // Decides which subtrees the view excludes and may be adopted whole.
     // `None` disables adoption.
     graft_view: Option<Arc<crate::filter::Filter>>,
+    merges: MergesAcross,
     tx: mpsc::Sender<Result<DiffItem, StateError>>,
 ) -> Result<Diff3Summary, StateError> {
     let (state_base, state_source, state_target) = join!(
@@ -531,93 +556,22 @@ pub async fn diff3_with_source_cap(
         lore_debug!("Identify resolved conflicts through merges");
     }
 
-    // Producer loop acquires a permit before spawning, so the in-flight
-    // set never exceeds `permits` tasks — each in-flight walk pins an
-    // `Arc<State>` over a deserialised revision blob, and at 10k+
-    // conflicts unbounded fan-out blows past tens of GB of pinned state.
-    //
-    // No abort path: on error we stop spawning and let in-flight tasks
-    // finish naturally. Cancel-safety is not something the surrounding
-    // code is designed to tolerate today (e.g. a task aborted mid-write
-    // to a downstream channel could surface a partial value), so let
-    // them run to completion.
-    let permits = history_walk_concurrency.unwrap_or(DEFAULT_HISTORY_WALK_CONCURRENCY);
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(permits));
-    let mut history_walks: JoinSet<Result<HistoryWalkOutcome, StateError>> = JoinSet::new();
-    let mut outcomes: Vec<HistoryWalkOutcome> = Vec::with_capacity(joined_conflicts.len());
-    let mut walk_err: Option<StateError> = None;
-    for (idx, (source_conflict, target_conflict)) in joined_conflicts.iter().enumerate() {
-        let permit = match semaphore.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(err) => {
-                walk_err = Some(StateError::internal_with_context(
-                    err,
-                    "history-walk semaphore closed",
-                ));
-                break;
-            }
-        };
-        while let Some(joined) = history_walks.try_join_next() {
-            match joined {
-                Ok(Ok(outcome)) => outcomes.push(outcome),
-                Ok(Err(err)) => walk_err = walk_err.or(Some(err)),
-                Err(join_err) => {
-                    walk_err = walk_err.or(Some(StateError::internal_with_context(
-                        join_err,
-                        "history-walk task failed",
-                    )));
-                }
-            }
-        }
-        if walk_err.is_some() {
-            drop(permit);
-            break;
-        }
-        let source_conflict = source_conflict.clone();
-        let target_conflict = target_conflict.clone();
-        let state_branch_point = state_base.clone();
-        lore_spawn!(history_walks, async move {
-            let _permit = permit;
-            let is_merged_from_target = is_last_change_merged(
-                target_conflict.clone(),
-                target_branch,
-                source_conflict.clone(),
-                source_branch,
-                state_branch_point.clone(),
-            )
-            .await?;
-            let is_merged_from_source = is_last_change_merged(
-                source_conflict,
-                source_branch,
-                target_conflict,
-                target_branch,
-                state_branch_point,
-            )
-            .await?;
-            Ok(HistoryWalkOutcome {
-                index: idx,
-                is_merged_from_source,
-                is_merged_from_target,
-            })
-        });
-    }
-
-    while let Some(joined) = history_walks.join_next().await {
-        match joined {
-            Ok(Ok(outcome)) => outcomes.push(outcome),
-            Ok(Err(err)) => walk_err = walk_err.or(Some(err)),
-            Err(join_err) => {
-                walk_err = walk_err.or(Some(StateError::internal_with_context(
-                    join_err,
-                    "history-walk task failed",
-                )));
-            }
-        }
-    }
-    if let Some(err) = walk_err {
-        return Err(err);
-    }
-    outcomes.sort_unstable_by_key(|o| o.index);
+    // Boxed: a cold path, run once a diff, whose walks would otherwise make every diff's future
+    // as large as theirs.
+    let outcomes = if joined_conflicts.is_empty() {
+        Vec::new()
+    } else {
+        Box::pin(merged_across(
+            &joined_conflicts,
+            repository.id,
+            merges,
+            source_branch,
+            target_branch,
+            state_base.clone(),
+            history_walk_concurrency.unwrap_or(DEFAULT_HISTORY_WALK_CONCURRENCY),
+        ))
+        .await?
+    };
 
     let mut final_conflicts: Vec<(NodeChange, NodeChange)> = Vec::new();
     for outcome in outcomes {
@@ -696,6 +650,162 @@ pub async fn diff3_with_source_cap(
         )))));
     }
     Ok(summary)
+}
+
+/// Whether the change of each side in each of `conflicts` was already merged into the other side,
+/// as [`is_last_change_merged`] answers, in the order of `conflicts`.
+///
+/// Where `merges` proves that no merge in `repository` joins the sides above `state_base`, a
+/// conflict whose every side is in `repository` stands without a walk. For the rest, the paths a
+/// side deleted are first found on its history line, in one walk of the line for all of them
+/// ([`deletions::Deletions::walk`]), down to `state_base`. Then up to `permits` conflicts are
+/// checked at once.
+#[allow(clippy::too_many_arguments)]
+async fn merged_across(
+    joined_conflicts: &[(NodeChange, NodeChange)],
+    repository: RepositoryId,
+    merges: MergesAcross,
+    source_branch: BranchId,
+    target_branch: BranchId,
+    state_base: Arc<State>,
+    permits: usize,
+) -> Result<Vec<HistoryWalkOutcome>, StateError> {
+    let stands =
+        |conflict: &(NodeChange, NodeChange)| stands_unwalked(conflict, repository, merges);
+    let standing = joined_conflicts
+        .iter()
+        .filter(|conflict| stands(conflict))
+        .count();
+    if standing > 0 {
+        lore_debug!(
+            "No merge joins the two sides above the base, so {standing} of {} conflicts stand",
+            joined_conflicts.len()
+        );
+    }
+    let mut outcomes: Vec<HistoryWalkOutcome> = Vec::with_capacity(joined_conflicts.len());
+    let deletions = Arc::new(
+        deletions::Deletions::walk(
+            joined_conflicts.iter().filter(|conflict| !stands(conflict)),
+            repository,
+            state_base.revision_number(),
+            permits,
+        )
+        .await?,
+    );
+
+    // Producer loop acquires a permit before spawning, so the in-flight
+    // set never exceeds `permits` tasks — each in-flight walk pins an
+    // `Arc<State>` over a deserialised revision blob, and at 10k+
+    // conflicts unbounded fan-out blows past tens of GB of pinned state.
+    //
+    // No abort path: on error we stop spawning and let in-flight tasks
+    // finish naturally. Cancel-safety is not something the surrounding
+    // code is designed to tolerate today (e.g. a task aborted mid-write
+    // to a downstream channel could surface a partial value), so let
+    // them run to completion.
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(permits));
+    let mut history_walks: JoinSet<Result<HistoryWalkOutcome, StateError>> = JoinSet::new();
+    let mut walk_err: Option<StateError> = None;
+    for (idx, conflict) in joined_conflicts.iter().enumerate() {
+        if stands(conflict) {
+            outcomes.push(HistoryWalkOutcome {
+                index: idx,
+                is_merged_from_source: false,
+                is_merged_from_target: false,
+            });
+            continue;
+        }
+        let (source_conflict, target_conflict) = conflict;
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(err) => {
+                walk_err = Some(StateError::internal_with_context(
+                    err,
+                    "history-walk semaphore closed",
+                ));
+                break;
+            }
+        };
+        while let Some(joined) = history_walks.try_join_next() {
+            match joined {
+                Ok(Ok(outcome)) => outcomes.push(outcome),
+                Ok(Err(err)) => walk_err = walk_err.or(Some(err)),
+                Err(join_err) => {
+                    walk_err = walk_err.or(Some(StateError::internal_with_context(
+                        join_err,
+                        "history-walk task failed",
+                    )));
+                }
+            }
+        }
+        if walk_err.is_some() {
+            drop(permit);
+            break;
+        }
+        let source_conflict = source_conflict.clone();
+        let target_conflict = target_conflict.clone();
+        let state_branch_point = state_base.clone();
+        let deletions = deletions.clone();
+        lore_spawn!(history_walks, async move {
+            let _permit = permit;
+            let is_merged_from_target = is_last_change_merged(
+                target_conflict.clone(),
+                target_branch,
+                source_conflict.clone(),
+                source_branch,
+                state_branch_point.clone(),
+                &deletions,
+            )
+            .await?;
+            let is_merged_from_source = is_last_change_merged(
+                source_conflict,
+                source_branch,
+                target_conflict,
+                target_branch,
+                state_branch_point,
+                &deletions,
+            )
+            .await?;
+            Ok(HistoryWalkOutcome {
+                index: idx,
+                is_merged_from_source,
+                is_merged_from_target,
+            })
+        });
+    }
+
+    while let Some(joined) = history_walks.join_next().await {
+        match joined {
+            Ok(Ok(outcome)) => outcomes.push(outcome),
+            Ok(Err(err)) => walk_err = walk_err.or(Some(err)),
+            Err(join_err) => {
+                walk_err = walk_err.or(Some(StateError::internal_with_context(
+                    join_err,
+                    "history-walk task failed",
+                )));
+            }
+        }
+    }
+    if let Some(err) = walk_err {
+        return Err(err);
+    }
+    outcomes.sort_unstable_by_key(|o| o.index);
+    Ok(outcomes)
+}
+
+/// Whether `conflict` stands without a walk of its history: where `merges` proves that no merge in
+/// `repository` joins the sides above the base, and every side of the conflict is in `repository`.
+/// A conflict below a link has the linked repository's history, which the proof says nothing of.
+#[lore_macro::test_pub]
+fn stands_unwalked(
+    (source, target): &(NodeChange, NodeChange),
+    repository: RepositoryId,
+    merges: MergesAcross,
+) -> bool {
+    merges == MergesAcross::NoneAboveBase
+        && [&source.from, &source.to, &target.from, &target.to]
+            .iter()
+            .all(|side| side.mapping.repository.id == repository)
 }
 
 #[lore_macro::test_pub]
@@ -2321,13 +2431,15 @@ async fn is_last_change_merged(
     target_conflict: NodeChange,
     target_branch: BranchId,
     state_branch_point: Arc<State>,
+    deletions: &deletions::Deletions,
 ) -> Result<bool, StateError> {
     lore_debug!(
         "{} find last modified source revision",
         source_conflict.path().as_str()
     );
     let (last_source_modified_revision, last_source_modified_revision_number) =
-        find_last_modified_revision(&source_conflict, state_branch_point.clone()).await?;
+        find_last_modified_revision(&source_conflict, state_branch_point.clone(), deletions)
+            .await?;
     lore_debug!(
         "{} last modified source {} revision {} -> {}",
         source_conflict.path().as_str(),
@@ -2348,6 +2460,7 @@ async fn is_last_change_merged(
             source_branch,
             target_branch,
             state_branch_point.clone(),
+            deletions,
         )
         .await?
     {
@@ -2386,48 +2499,33 @@ async fn is_last_change_merged(
     }
 }
 
+/// The revision of the side of `change` that last modified its file, and its number.
+///
+/// A file the side deleted was last modified by the revision that deleted it, found on the side's
+/// history line ([`deletions::Deletions::last_held`]) down to `state_branch_point`. Where the line
+/// holds the file in no revision from there up, the branch point answers.
 async fn find_last_modified_revision(
     change: &NodeChange,
     state_branch_point: Arc<State>,
+    deletions: &deletions::Deletions,
 ) -> Result<(Hash, u64), StateError> {
     if !change.to.mapping.node.is_valid_node_id() {
-        // File was deleted from the target state, need to walk history to find it
-        // TODO(mjansson): Figure out a better way to store this metadata around file deletions
-        lore_debug!("Find last modified revision without to state, iterate revisions");
-
-        let repository = change.from.mapping.repository.clone();
-        let mut state_current = change.to.mapping.state.clone();
-        let mut state_parent = state_current.clone();
-        while state_current.revision_number() >= state_branch_point.revision_number() {
-            if let Ok(node_link) = state_current
-                .find_node_link(repository.clone(), change.path().as_str())
-                .await
-            {
-                // If the node was existing in the current state, it means it was deleted in the previous (parent) revision
-                lore_debug!(
-                    "Found {} existing in revision {} - {}",
-                    change.path().as_str(),
-                    state_current.revision(),
-                    state_current.revision_number()
-                );
-                if node_link.is_valid() {
-                    lore_debug!(
-                        "Last modified {} in parent revision {} - {}",
-                        change.path().as_str(),
-                        state_parent.revision(),
-                        state_parent.revision_number()
-                    );
-                    return Ok((state_parent.revision(), state_parent.revision_number()));
-                }
-            }
-
-            let parent_revision = state_current.parent_self();
-            if parent_revision.is_zero() {
-                break;
-            }
-
-            state_parent = state_current.clone();
-            state_current = State::deserialize(repository.clone(), parent_revision).await?;
+        let bound = state_branch_point.revision_number();
+        let last_held = deletions.last_held(
+            &change.to.mapping.repository,
+            &change.to.mapping.state,
+            change.path().as_str(),
+        )?;
+        if let Some(last_held) = last_held
+            && last_held.held_number >= bound
+        {
+            lore_debug!(
+                "Last modified {} in revision {} - {}, which deleted it",
+                change.path().as_str(),
+                last_held.removed_in,
+                last_held.removed_in_number
+            );
+            return Ok((last_held.removed_in, last_held.removed_in_number));
         }
 
         lore_debug!(
@@ -2505,65 +2603,44 @@ async fn find_last_modified_revision(
 /// Each step reads the earlier revision's history at the node ID the history records for the file
 /// there, as a revision need not number the file as its first parent does. The walk ends at a
 /// revision that [adds the file without a merge](added_without_merge), the start revision included.
+///
+/// A file the target side deleted is found on its history line through `deletions`: the walk
+/// starts at the revision that deleted it, at the node the file had before. There is no merged
+/// revision where the line holds the file in no revision down to the branch point.
 #[lore_macro::test_pub]
 async fn find_last_merged_revision(
     change: &NodeChange,
     source_branch: BranchId,
     target_branch: BranchId,
     state_branch_point: Arc<State>,
+    deletions: &deletions::Deletions,
 ) -> Result<Option<(Hash, u64)>, StateError> {
     let (state_start, mut node_current) = if change.to.mapping.node.is_valid_node_id() {
         (change.to.mapping.state.clone(), change.to.mapping.node)
     } else {
-        // TODO(mjansson): Figure out a better way to store this metadata around file deletions
-        lore_debug!("Find last merged revision without to state, iterate revisions");
-
         let repository = change.to.mapping.repository.clone();
-        let mut state_current = change.to.mapping.state.clone();
-        let mut state_parent = state_current.clone();
-        loop {
-            if let Ok(node_link) = state_current
-                .find_node_link(repository.clone(), change.path().as_str())
-                .await
-            {
-                lore_debug!(
-                    "Found {} existing in revision {} - {} for last merged",
-                    change.path().as_str(),
-                    state_current.revision(),
-                    state_current.revision_number()
-                );
-
-                // If the node was existing in the current state, it means it was deleted in the previous (parent) revision
-                if node_link.is_valid() {
-                    lore_debug!(
-                        "Using {} parent revision {} - {} as last merged start revision",
-                        change.path().as_str(),
-                        state_parent.revision(),
-                        state_parent.revision_number()
-                    );
-                    break (state_parent, node_link.node);
-                }
-            }
-
-            if state_current.revision_number() <= state_branch_point.revision_number() {
-                lore_debug!(
-                    "Did not find node {} last modified, no merged revision",
-                    change.path().as_str()
-                );
-                return Ok(None);
-            }
-
+        let Some(last_held) = deletions.last_held(
+            &repository,
+            &change.to.mapping.state,
+            change.path().as_str(),
+        )?
+        else {
             lore_debug!(
-                "Node {} not present in revision {} - {} for last merged start, move to parent",
-                change.path().as_str(),
-                state_current.revision(),
-                state_current.revision_number()
+                "Did not find node {} last modified, no merged revision",
+                change.path().as_str()
             );
-
-            state_parent = state_current.clone();
-            state_current =
-                State::deserialize(repository.clone(), state_current.parent_self()).await?;
-        }
+            return Ok(None);
+        };
+        lore_debug!(
+            "Using {} deleting revision {} - {} as last merged start revision",
+            change.path().as_str(),
+            last_held.removed_in,
+            last_held.removed_in_number
+        );
+        (
+            State::deserialize(repository, last_held.removed_in).await?,
+            last_held.node,
+        )
     };
 
     // Now walk the history for the file from the target branch LATEST revision and

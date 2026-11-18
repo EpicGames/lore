@@ -19,6 +19,7 @@ use crate::fs::filesystem_provider::setup_test_execution;
 use crate::fs::filesystem_provider::test_store_create;
 
 mod case_rename;
+mod deletion_walk;
 mod diff;
 mod instance;
 mod interrupted_commit;

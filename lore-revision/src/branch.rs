@@ -5010,13 +5010,15 @@ pub async fn diff3_with_source_cap(
         "Branch diff branch {source_branch} revision {source_revision} -> branch {target_branch} revision {target_revision}"
     );
 
-    let base_revision = resolve_diff3_base(
+    // Boxed: a cold path, run once a diff, whose history walks would otherwise make the diff's
+    // future as large as theirs.
+    let (base_revision, merges) = Box::pin(resolve_diff3_base_and_merges(
         repository.clone(),
         source_branch,
         source_revision,
         target_branch,
         target_revision,
-    )
+    ))
     .await?;
 
     // `resolve_diff3_base` is documented never to return this, so reaching it is a
@@ -5050,6 +5052,7 @@ pub async fn diff3_with_source_cap(
         source_cap,
         history_walk_concurrency,
         graft_view,
+        merges,
         inner_tx,
     ));
     relay_revision_diff3(driver, inner_rx, auto_resolve, &tx).await?;
@@ -5370,7 +5373,7 @@ async fn diff3_stack(
 /// Two branches resolve in two steps.
 /// `find_common_ancestor_from_branch_points` reads the stacks for the branch
 /// both sides descend from and the revision on it each side branched at, and
-/// answers from those. `find_common_ancestor_from_merges` then improves on that
+/// answers from those. `search_common_ancestor_from_merges` then improves on that
 /// answer where a merge has already carried one branch into the other, which the
 /// branch points cannot show.
 ///
@@ -5386,13 +5389,36 @@ async fn diff3_stack(
 /// fails with `BranchError::Divergent` when its two revisions share no history.
 ///
 /// Never returns the zero revision.
-pub async fn resolve_diff3_base(
+pub fn resolve_diff3_base(
     repository: Arc<RepositoryContext>,
     source_branch: BranchId,
     source_revision: Hash,
     target_branch: BranchId,
     target_revision: Hash,
-) -> Result<Hash, BranchError> {
+) -> impl Future<Output = Result<Hash, BranchError>> + Send {
+    futures::FutureExt::map(
+        resolve_diff3_base_and_merges(
+            repository,
+            source_branch,
+            source_revision,
+            target_branch,
+            target_revision,
+        ),
+        |resolved| resolved.map(|(base, _merges)| base),
+    )
+}
+
+/// [`resolve_diff3_base`], also answering what the search for the base proved about merges
+/// between the two branches: [`revision::MergesAcross::NoneAboveBase`] where the branches differ
+/// and no merge in the repository joins them above the base.
+#[lore_macro::test_pub]
+pub(crate) async fn resolve_diff3_base_and_merges(
+    repository: Arc<RepositoryContext>,
+    source_branch: BranchId,
+    source_revision: Hash,
+    target_branch: BranchId,
+    target_revision: Hash,
+) -> Result<(Hash, revision::MergesAcross), BranchError> {
     lore_debug!(
         "Resolve diff base between source branch {source_branch} revision {source_revision} and target branch {target_branch} revision {target_revision}"
     );
@@ -5442,16 +5468,25 @@ pub async fn resolve_diff3_base(
         common_ancestor
     };
 
-    let base_revision = find_common_ancestor_from_merges(
+    // Boxed: a cold path, run once a diff, whose walks would otherwise make every caller's future
+    // as large as theirs.
+    let search = Box::pin(search_common_ancestor_from_merges(
         repository.clone(),
         source_branch,
         source_revision,
         target_branch,
         target_revision,
         common_ancestor,
-    )
-    .await?
-    .unwrap_or(common_ancestor);
+    ))
+    .await?;
+    let base_revision = search.found.unwrap_or(common_ancestor);
+    // A branch's own history merges into itself, so the search proves nothing between a branch
+    // and itself.
+    let merges = if search.none_above_floor && source_branch != target_branch {
+        revision::MergesAcross::NoneAboveBase
+    } else {
+        revision::MergesAcross::Unknown
+    };
 
     lore_debug!(
         "Resolved diff base {base_revision} for source branch {source_branch} revision {source_revision} and target branch {target_branch} revision {target_revision}"
@@ -5464,7 +5499,7 @@ pub async fn resolve_diff3_base(
         return Err(BranchError::from(Divergent));
     }
 
-    Ok(base_revision)
+    Ok((base_revision, merges))
 }
 
 /// `diff3` minus the streaming wrapper. Resolves the common ancestor
@@ -5752,7 +5787,7 @@ enum HistoryLineSearch {
 /// that the two sit on one line, which makes the older one their base.
 ///
 /// Self parents only. A revision merged in from elsewhere is not on this line,
-/// and `find_common_ancestor_from_merges` is what reaches those.
+/// and `search_common_ancestor_from_merges` is what reaches those.
 ///
 /// Only this direction can succeed: a revision's number is one past its parents',
 /// so a walk backwards never reaches a higher numbered revision. The walk stops
@@ -5990,7 +6025,7 @@ struct WalkVisit {
     target: bool,
 }
 
-/// State shared by every walker of one `find_common_ancestor_from_merges` search.
+/// State shared by every walker of one `search_common_ancestor_from_merges` search.
 struct AncestorWalk {
     /// Which of the two walks has reached each revision. A revision reached by
     /// both is a common ancestor.
@@ -6029,6 +6064,22 @@ impl AncestorWalk {
             None => self.floor_revision_number,
         }
     }
+
+    /// Waits for every walk of `tasks`. A walk that panicked or was cancelled left history
+    /// unwalked, so it counts as a failure to read it.
+    async fn join(&self, tasks: &mut JoinSet<()>) {
+        while let Some(joined) = tasks.join_next().await {
+            if let Err(err) = joined {
+                let mut failure = self.failure.write().await;
+                if failure.is_none() {
+                    *failure = Some(StateError::internal_with_context(
+                        err,
+                        "Failed to walk a history line for a common ancestor",
+                    ));
+                }
+            }
+        }
+    }
 }
 
 async fn find_ancestor_walker(
@@ -6040,7 +6091,15 @@ async fn find_ancestor_walker(
     let mut tasks = JoinSet::new();
 
     let mut revision = revision_start;
+    let mut paging = true;
     while revision != Hash::default() {
+        // Read the line a page at a time rather than a revision per request, no further down than
+        // the walks prune: the floor, or the newest common ancestor found so far. A refused page
+        // leaves each state to be read on its own below.
+        if paging {
+            let floor = walk.prune_at_or_below().await;
+            paging = find::page_in_line(repository.clone(), revision, floor).await;
+        }
         let state = match state::State::deserialize(repository.clone(), revision).await {
             Ok(state) => state,
             Err(err) => {
@@ -6122,7 +6181,7 @@ async fn find_ancestor_walker(
         revision = state.parent_self();
     }
 
-    while let Some(_result) = tasks.join_next().await {}
+    walk.join(&mut tasks).await;
 }
 
 fn find_ancestor_walker_recurse(
@@ -6139,6 +6198,21 @@ fn find_ancestor_walker_recurse(
     ))
 }
 
+/// What [`search_common_ancestor_from_merges`] found.
+#[lore_macro::test_pub]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MergeSearch {
+    /// The newest revision both walks reached, where they reached one.
+    found: Option<Hash>,
+    /// Whether the walks read both histories down to the floor, and found no revision both reach
+    /// numbered other than the floor is. A revision is numbered above each of its parents, so
+    /// each revision either side made since the floor is numbered above it, and a merge that took
+    /// one into the other would leave it on both histories. Neither side holds one, so no merge in
+    /// this repository joins them above the floor, which the base is then numbered as. It proves
+    /// nothing of the repositories links mount.
+    none_above_floor: bool,
+}
+
 /// Walk both branches' histories backwards for the newest revision reachable
 /// from both, which is the best available 3-way base.
 ///
@@ -6150,32 +6224,35 @@ fn find_ancestor_walker_recurse(
 /// revision at or below its revision number. Pass `Hash::default()` to search
 /// with no floor.
 ///
-/// Returns `Ok(None)` when the walks completed without finding anything above
-/// the floor, so the caller keeps its own base. Returns `Err` when a revision
-/// state could not be read and no common ancestor was found, so a transient read
-/// failure is never reported as an absent common ancestor.
+/// Answers the newest revision both walks reached, which is at or below the floor
+/// where they reach nothing newer, or none where they never met, so the caller keeps
+/// its own base, and whether they proved that no merge joins the two histories above
+/// the floor. Returns `Err` when a revision state could not be read and no common
+/// ancestor was found, so a transient read failure is never reported as an absent
+/// common ancestor.
 #[lore_macro::test_pub]
-async fn find_common_ancestor_from_merges(
+async fn search_common_ancestor_from_merges(
     repository: Arc<RepositoryContext>,
     source_branch: BranchId,
     source_revision: Hash,
     target_branch: BranchId,
     target_revision: Hash,
     base_revision: Hash,
-) -> Result<Option<Hash>, BranchError> {
+) -> Result<MergeSearch, BranchError> {
     let mut tasks = JoinSet::new();
 
-    let floor_revision_number = match State::deserialize(repository.clone(), base_revision).await {
-        Ok(state) => state.revision_number(),
+    let floor = match State::deserialize(repository.clone(), base_revision).await {
+        Ok(state) => Some(state.revision_number()),
         Err(err) => {
             // Leaves the search unbounded, which still answers correctly but walks
             // both histories to their root revisions.
             lore_warn!(
                 "Could not read base revision {base_revision} to bound the common ancestor search: {err}"
             );
-            0
+            None
         }
     };
+    let floor_revision_number = floor.unwrap_or(0);
 
     lore_debug!(
         "Find common ancestor from merges of source branch {source_branch} revision {source_revision} and target branch {target_branch} revision {target_revision}, above base revision {base_revision} -> {floor_revision_number}"
@@ -6209,12 +6286,17 @@ async fn find_common_ancestor_from_merges(
         }
     });
 
-    while let Some(_result) = tasks.join_next().await {}
+    walk.join(&mut tasks).await;
 
     let found = *walk.common.read().await;
     let failure = walk.failure.write().await.take();
+    // A revision both walks reach below the floor becomes the base, and the walks left the
+    // revisions between it and the floor unread, so only one at the floor's number proves
+    // anything.
+    let none_above_floor = failure.is_none()
+        && floor.is_some_and(|floor| found.is_none_or(|(number, _)| number == floor));
 
-    match (found, failure) {
+    let found = match (found, failure) {
         (Some((revision_number, revision)), failure) => {
             if let Some(err) = failure {
                 lore_warn!(
@@ -6224,19 +6306,25 @@ async fn find_common_ancestor_from_merges(
                 lore_debug!("Revision {revision} -> {revision_number} found as common ancestor");
             }
 
-            Ok(Some(revision))
+            Some(revision)
         }
-        (None, Some(err)) => Err(err).forward::<BranchError>(
-            "Failed to read revision history while searching for a common ancestor",
-        ),
+        (None, Some(err)) => {
+            return Err(err).forward::<BranchError>(
+                "Failed to read revision history while searching for a common ancestor",
+            );
+        }
         (None, None) => {
             lore_debug!(
                 "Walk found no common ancestor newer than revision {base_revision} -> {floor_revision_number}, keeping it as base"
             );
 
-            Ok(None)
+            None
         }
-    }
+    };
+    Ok(MergeSearch {
+        found,
+        none_above_floor,
+    })
 }
 
 /// Send the event that begins a branch diff, reporting the resolved branches

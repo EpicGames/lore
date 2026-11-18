@@ -77,7 +77,9 @@ pub struct RevisionDiffConfig {
     /// `BranchError::Oversized` before target's walk runs.
     pub source_cap: usize,
     /// Permit count for the parallel history-walk semaphore inside
-    /// `revision::diff3_with_source_cap`. `None` falls back to
+    /// `revision::diff3_with_source_cap`, and for the revision
+    /// comparisons of its walks of the history lines for deleted paths.
+    /// `None` falls back to
     /// `lore_revision::revision::DEFAULT_HISTORY_WALK_CONCURRENCY`.
     pub history_walk_concurrency: Option<usize>,
 }

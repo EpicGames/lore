@@ -911,6 +911,27 @@ async fn common_ancestor_falls_back_to_the_older_branch_point() {
     .await;
 }
 
+/// The common ancestor [`search_common_ancestor_from_merges`] finds.
+async fn find_common_ancestor_from_merges(
+    repository: Arc<RepositoryContext>,
+    source_branch: BranchId,
+    source_revision: Hash,
+    target_branch: BranchId,
+    target_revision: Hash,
+    base_revision: Hash,
+) -> Result<Option<Hash>, BranchError> {
+    Box::pin(search_common_ancestor_from_merges(
+        repository,
+        source_branch,
+        source_revision,
+        target_branch,
+        target_revision,
+        base_revision,
+    ))
+    .await
+    .map(|search| search.found)
+}
+
 /// A trunk 2000 revisions past the branch point, against a search depth of 500,
 /// with the branch having merged the trunk once in between. The base is the
 /// revision that merge carried across, which only the merge search can find.
@@ -1039,6 +1060,251 @@ async fn common_ancestor_is_what_the_trunk_already_merged_of_the_branch() {
         );
     }))
     .await;
+}
+
+/// Two branches that parted at a branch point and never merged. Both walks reach the branch
+/// point, and nothing above it, so the search proves that no merge joins them.
+#[tokio::test]
+async fn merges_search_proves_nothing_joins_branches_that_never_merged() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let trunk = write_line(&repository, Hash::default(), 1, 1500).await;
+        let branch_point = trunk[999];
+        let trunk_tip = *trunk.last().expect("the trunk has revisions");
+        let branch_first = write_branch_revision(&repository, branch_point, 1001, 230).await;
+        let branch_tip = write_branch_revision(&repository, branch_first, 1002, 231).await;
+
+        let search = search_common_ancestor_from_merges(
+            repository,
+            branch_id(9),
+            trunk_tip,
+            branch_id(1),
+            branch_tip,
+            branch_point,
+        )
+        .await
+        .expect("the walk must not fail on readable history");
+
+        assert_eq!(
+            search,
+            MergeSearch {
+                found: Some(branch_point),
+                none_above_floor: true,
+            },
+            "Only the branch point is reached from both sides"
+        );
+    }))
+    .await;
+}
+
+/// The branch merged the trunk once since the branch point, so the search finds a base above
+/// the floor and proves nothing about merges.
+#[tokio::test]
+async fn merges_search_proves_nothing_once_a_merge_joins_the_branches() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let trunk = write_line(&repository, Hash::default(), 1, 1500).await;
+        let branch_point = trunk[999];
+        let merged_in = trunk[1199];
+        let trunk_tip = *trunk.last().expect("the trunk has revisions");
+        let branch_first = write_branch_revision(&repository, branch_point, 1001, 240).await;
+        let branch_merge = write_merge_revision(&repository, branch_first, merged_in, 1201).await;
+
+        let search = search_common_ancestor_from_merges(
+            repository,
+            branch_id(9),
+            trunk_tip,
+            branch_id(1),
+            branch_merge,
+            branch_point,
+        )
+        .await
+        .expect("the walk must not fail on readable history");
+
+        assert_eq!(
+            search,
+            MergeSearch {
+                found: Some(merged_in),
+                none_above_floor: false,
+            },
+            "The merged revision is the base, above the floor"
+        );
+    }))
+    .await;
+}
+
+/// Both walks first reach a revision below the floor, the branch point of a floor only the source
+/// holds, so the search stops above a revision the target merged from the source's history, which
+/// it never read. That revision is numbered above the base, so the search proves nothing about
+/// merges.
+#[tokio::test]
+async fn merges_search_proves_nothing_where_the_walks_meet_below_the_floor() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let trunk = write_line(&repository, Hash::default(), 1, 5).await;
+        let branch_point = trunk[4];
+        let merged = write_branch_revision(&repository, branch_point, 6, 200).await;
+        let floor = write_branch_revision(&repository, merged, 10, 201).await;
+        let source = write_merge_revision(&repository, branch_point, floor, 11).await;
+        let target = write_merge_revision(&repository, branch_point, merged, 12).await;
+
+        let search = search_common_ancestor_from_merges(
+            repository,
+            branch_id(9),
+            source,
+            branch_id(1),
+            target,
+            floor,
+        )
+        .await
+        .expect("the walk must not fail on readable history");
+
+        assert_eq!(
+            search,
+            MergeSearch {
+                found: Some(branch_point),
+                none_above_floor: false,
+            },
+            "The target merged a revision of the source's history above the base"
+        );
+    }))
+    .await;
+}
+
+/// A merged revision one walk cannot read leaves part of its history unwalked, so the search
+/// finds the branch point both walks reach and proves nothing about merges.
+#[tokio::test]
+async fn merges_search_proves_nothing_where_a_revision_cannot_be_read() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let trunk = write_line(&repository, Hash::default(), 1, 20).await;
+        let branch_point = trunk[9];
+        let trunk_tip = *trunk.last().expect("the trunk has revisions");
+        let branch_first = write_branch_revision(&repository, branch_point, 11, 250).await;
+        let unreadable = Hash::from([0x5A; 32]);
+        let branch_merge = write_merge_revision(&repository, branch_first, unreadable, 21).await;
+
+        let search = search_common_ancestor_from_merges(
+            repository,
+            branch_id(9),
+            trunk_tip,
+            branch_id(1),
+            branch_merge,
+            branch_point,
+        )
+        .await
+        .expect("the walks meet at the branch point");
+
+        assert_eq!(
+            search,
+            MergeSearch {
+                found: Some(branch_point),
+                none_above_floor: false,
+            },
+            "The merged revision may join the branches above the branch point"
+        );
+    }))
+    .await;
+}
+
+/// A base that cannot be read leaves the search without a floor, so walks that never meet prove
+/// nothing about merges above it.
+#[tokio::test]
+async fn merges_search_proves_nothing_where_the_base_cannot_be_read() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let one = write_line(&repository, Hash::default(), 1, 5).await;
+        let other = write_line(&repository, Hash::default(), 101, 5).await;
+
+        let search = search_common_ancestor_from_merges(
+            repository,
+            branch_id(9),
+            *one.last().expect("the line has revisions"),
+            branch_id(1),
+            *other.last().expect("the line has revisions"),
+            Hash::from([0x5B; 32]),
+        )
+        .await
+        .expect("the walks read both lines");
+
+        assert_eq!(
+            search,
+            MergeSearch {
+                found: None,
+                none_above_floor: false,
+            },
+            "Without the base the search has no floor to prove anything above"
+        );
+    }))
+    .await;
+}
+
+/// The walks read a line the local store lacks from the remote a page at a time, down to the
+/// floor, rather than a revision per request.
+#[tokio::test]
+async fn merges_search_reads_a_remote_line_a_page_at_a_time() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let mut line: Vec<crate::paged_remote::RemoteRevision> = Vec::new();
+            for number in 1..=20 {
+                let parent = line.last().map_or(Hash::default(), |below| below.signature);
+                line.push(
+                    crate::paged_remote::remote_revision(number, parent, Hash::from([0xA0; 32]))
+                        .await,
+                );
+            }
+            let tip = line[19].signature;
+            let remote = Arc::new(
+                PagedRemote::new(branch_id(9), tip).holding(&line).page(
+                    crate::paged_remote::Anchor::Signature(tip),
+                    line.iter()
+                        .rev()
+                        .zip((1..=20).rev())
+                        .map(|(revision, number)| (number, revision.signature))
+                        .collect(),
+                    Hash::default(),
+                ),
+            );
+            let stores = client_stores().await;
+            // A local revision on a branch from revision 4 of the remote line, the floor.
+            let state = State::new();
+            state.set_parent_self(line[3].signature);
+            state.set_revision_number(5);
+            let token = stores
+                .writer
+                .try_write_token()
+                .expect("a null context carries a write token");
+            let local = state
+                .serialize(stores.writer.clone(), token)
+                .await
+                .expect("serializing the local revision");
+            let client = crate::paged_remote::client_on(&stores, remote.clone());
+
+            let search = search_common_ancestor_from_merges(
+                client,
+                branch_id(9),
+                tip,
+                branch_id(1),
+                local,
+                local,
+            )
+            .await
+            .expect("the walks read the remote line");
+
+            assert_eq!(
+                search,
+                MergeSearch {
+                    found: None,
+                    none_above_floor: true,
+                }
+            );
+            assert_eq!(
+                remote.lists(),
+                1,
+                "One page holds the line down to the floor"
+            );
+        })
+        .await;
 }
 
 /// The source carries the earlier merge, and the revision it took sits 1500
@@ -1549,6 +1815,7 @@ async fn each_relayed_diff_item_is_held_once() {
             None,
             None,
             None,
+            revision::MergesAcross::Unknown,
             inner_tx,
         ));
         let relay = relay_revision_diff3(driver, inner_rx, true, &tx);
