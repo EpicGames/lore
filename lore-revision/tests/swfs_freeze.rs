@@ -23,7 +23,7 @@ use lore_revision::fs::swfs::filesystem::SwfsFilesystem;
 use lore_revision::fs::swfs::mount_resources::MountResources;
 use lore_revision::fs::swfs::mount_resources::SwfsExecutionToken;
 use lore_revision::fs::swfs::paths::MountPath;
-use lore_revision::global::external_dir::external_dir_for_instance;
+use lore_revision::global::external_dir::create_external_dir;
 use lore_revision::global::external_dir::resolve::resolve;
 use lore_revision::instance::InstanceId;
 use lore_revision::interface::ExecutionContext;
@@ -59,7 +59,7 @@ async fn mount_at(
 ) -> Arc<SwfsInterface> {
     let state = resolve().expect("resolve the external root");
     let instance_directory =
-        external_dir_for_instance(&state, instance_id).expect("the external directory");
+        create_external_dir(&state, instance_id).expect("create the external directory");
     let resources = MountResources::premount_instance_with_config(
         RepositoryId::default(),
         instance_id,
