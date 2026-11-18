@@ -659,12 +659,12 @@ def test_link_branch_archive_include_links_reaches_nested_link(new_lore_repo):
         new_lore_repo, "vendor/b", "vendor/c"
     )
 
-    nested_before = sorted(repo_c.branch_list().remote_branches)
+    nested_before = sorted(repo_c.branch_list(remote=True).remote_branches)
 
     repo_a.branch_create("feature")
     repo_a.push()
-    assert repo_b.branch_list().has_remote_branch("feature"), (
-        f"Expected create to cascade into the top-level link, got: {repo_b.branch_list()}"
+    assert repo_b.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected create to cascade into the top-level link, got: {repo_b.branch_list(remote=True)}"
     )
 
     repo_a.branch_switch("main")
@@ -673,8 +673,8 @@ def test_link_branch_archive_include_links_reaches_nested_link(new_lore_repo):
     assert repo_c.get_id() in output, (
         f"Expected the cascade to reach nested link {repo_c.get_id()}, got: {output}"
     )
-    assert sorted(repo_c.branch_list().remote_branches) == nested_before, (
-        f"Expected nested link branches {nested_before}, got: {repo_c.branch_list()}"
+    assert sorted(repo_c.branch_list(remote=True).remote_branches) == nested_before, (
+        f"Expected nested link branches {nested_before}, got: {repo_c.branch_list(remote=True)}"
     )
 
 

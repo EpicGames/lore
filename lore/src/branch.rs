@@ -244,13 +244,14 @@ fn diff_local(
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(list_local)]
-/// Arguments for listing all branches in the repository.
+/// Arguments for listing the branches of the repository.
 pub struct LoreBranchListArgs {
     /// Include archived local branches in listing
     pub archived: u8,
 }
 
-/// Lists all branches in the repository.
+/// Lists the local branches of the repository, or the remote's branches when the `remote` global
+/// option is set.
 ///
 /// # Events
 ///
@@ -270,7 +271,7 @@ pub struct LoreBranchListArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::BranchListBegin`](crate::interface::LoreEvent::BranchListBegin) | Emitted before branch list entries begin streaming |
-/// | [`LoreEvent::BranchListEntry`](crate::interface::LoreEvent::BranchListEntry) | Emitted for each branch in the repository |
+/// | [`LoreEvent::BranchListEntry`](crate::interface::LoreEvent::BranchListEntry) | Emitted for each listed branch |
 /// | [`LoreEvent::BranchListEnd`](crate::interface::LoreEvent::BranchListEnd) | Emitted after all branch entries have been streamed |
 pub async fn list(
     globals: LoreGlobalArgs,
@@ -288,7 +289,6 @@ fn list_local(
     repository_call_read(globals, callback, args, list, move |repository, args| {
         branch::list_output(
             repository,
-            execution_context().globals().local(),
             execution_context().globals().remote(),
             args.archived != 0,
         )

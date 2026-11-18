@@ -32,10 +32,6 @@ class BranchList:
     def has_remote_branch(self, name: str) -> bool:
         return name in self.remote_branches
 
-    def has_branch(self, name: str) -> bool:
-        """Check if a branch exists locally or remotely."""
-        return self.has_local_branch(name) or self.has_remote_branch(name)
-
     def has_archived_branch(self, name: str) -> bool:
         return name in self.archived_branches
 
@@ -359,16 +355,7 @@ def parse_branch_list(output: str):
     # Split off archived section first
     archived_split = output.strip().split("Archived local branches:")
     main_output = archived_split[0]
-    archived_string = archived_split[1] if len(archived_split) > 1 else ""
-
-    # If there's a remote section after archived, split it out
-    if "Remote branches:" in archived_string:
-        archived_part, remote_after_archived = archived_string.split(
-            "Remote branches:", 1
-        )
-    else:
-        archived_part = archived_string
-        remote_after_archived = ""
+    archived_part = archived_split[1] if len(archived_split) > 1 else ""
 
     output_split = main_output.split("Remote branches:")
     local_branches = []
@@ -383,13 +370,7 @@ def parse_branch_list(output: str):
         else:
             local_branches.append(line)
 
-    remote_string = ""
-    if len(output_split) > 1:
-        remote_string = output_split[1].strip()
-    if remote_after_archived:
-        if remote_string:
-            remote_string += "\n"
-        remote_string += remote_after_archived.strip()
+    remote_string = output_split[1].strip() if len(output_split) > 1 else ""
 
     remote_branches = [
         branch.lstrip("*").strip()

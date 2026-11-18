@@ -295,12 +295,12 @@ class TestForwardedBranch:
         branch_name = f"feature-{uuid.uuid4().hex[:8]}"
 
         # Confirm the branch does not yet exist on either server
-        assert not server_1_repo.branch_list().has_remote_branch(branch_name), (
-            f"Branch '{branch_name}' should not exist on server 1 before creation"
-        )
-        assert not server_2_repo.branch_list().has_remote_branch(branch_name), (
-            f"Branch '{branch_name}' should not exist on server 2 before creation"
-        )
+        assert not server_1_repo.branch_list(remote=True).has_remote_branch(
+            branch_name
+        ), f"Branch '{branch_name}' should not exist on server 1 before creation"
+        assert not server_2_repo.branch_list(remote=True).has_remote_branch(
+            branch_name
+        ), f"Branch '{branch_name}' should not exist on server 2 before creation"
 
         # branch_create is local-only; the BranchCreate RPC is only sent to
         # the server when the branch is explicitly pushed. branch_push triggers
@@ -312,7 +312,7 @@ class TestForwardedBranch:
         server_2_repo.branch_push(branch_name)
 
         # The write went to Server 1's mutable store — branch exists there
-        assert server_1_repo.branch_list().has_remote_branch(branch_name), (
+        assert server_1_repo.branch_list(remote=True).has_remote_branch(branch_name), (
             f"Branch '{branch_name}' should exist on server 1 after delegated create"
         )
 
@@ -334,14 +334,16 @@ class TestForwardedBranch:
 
         # Server 1's store has all branches
         for branch_name in branch_names:
-            assert server_1_repo.branch_list().has_remote_branch(branch_name), (
-                f"Branch '{branch_name}' should exist on server 1 after direct push"
-            )
+            assert server_1_repo.branch_list(remote=True).has_remote_branch(
+                branch_name
+            ), f"Branch '{branch_name}' should exist on server 1 after direct push"
 
         # Listing via Server 2 delegates to Server 1 — all branches appear even
         # though none were written to Server 2's mutable store.
         for branch_name in branch_names:
-            assert server_2_repo.branch_list().has_remote_branch(branch_name), (
+            assert server_2_repo.branch_list(remote=True).has_remote_branch(
+                branch_name
+            ), (
                 f"Branch '{branch_name}' should appear in server 2's delegated list "
                 "(BranchList was forwarded to server 1)"
             )

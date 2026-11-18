@@ -873,7 +873,9 @@ pub extern "C" fn lore_branch_archive_async(
 
 pub type LoreBranchListArgs = crate::branch::LoreBranchListArgs;
 
-/// List all branches in the repository.
+/// List the local branches of the repository, or the remote's branches when `remote` is set in
+/// `lore_global_args_t`. A remote listing ignores `archived` in `lore_branch_list_args_t`, and a
+/// remote that can't be reached or listed fails the call.
 ///
 /// # Events
 ///
@@ -895,7 +897,7 @@ pub type LoreBranchListArgs = crate::branch::LoreBranchListArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_BRANCH_LIST_BEGIN` | `lore_branch_list_begin_event_data_t` | Emitted before branch list entries begin streaming |
-/// | `LORE_EVENT_BRANCH_LIST_ENTRY` | `lore_branch_list_entry_event_data_t` | Emitted for each branch in the repository |
+/// | `LORE_EVENT_BRANCH_LIST_ENTRY` | `lore_branch_list_entry_event_data_t` | Emitted for each listed branch |
 /// | `LORE_EVENT_BRANCH_LIST_END` | `lore_branch_list_end_event_data_t` | Emitted after all branch entries have been streamed |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_branch_list(
@@ -928,7 +930,7 @@ pub extern "C" fn lore_branch_list(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_BRANCH_LIST_BEGIN` | `lore_branch_list_begin_event_data_t` | Emitted before branch list entries begin streaming |
-/// | `LORE_EVENT_BRANCH_LIST_ENTRY` | `lore_branch_list_entry_event_data_t` | Emitted for each branch in the repository |
+/// | `LORE_EVENT_BRANCH_LIST_ENTRY` | `lore_branch_list_entry_event_data_t` | Emitted for each listed branch |
 /// | `LORE_EVENT_BRANCH_LIST_END` | `lore_branch_list_end_event_data_t` | Emitted after all branch entries have been streamed |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_branch_list_async(

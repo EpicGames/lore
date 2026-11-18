@@ -175,7 +175,7 @@ def test_link(new_lore_repo):
     clone.push()
     sync_repo.branch_switch("another-feature")
 
-    linked_branch_list = link_repo.branch_list()
+    linked_branch_list = link_repo.branch_list(remote=True)
     assert "another-feature" in linked_branch_list.remote_branches, (
         "Branch for linked repository was not created"
     )

@@ -699,7 +699,7 @@ Branch commands
 
 ###### **Subcommands:**
 
-* `list` — List available branches
+* `list` — List the local branches, or the remote's branches with `--remote`
 * `info` — Get info about the given branch
 * `create` — Create a new branch
 * `switch` — Switch to a different branch
@@ -717,7 +717,7 @@ Branch commands
 
 ## `lore branch list`
 
-List available branches
+List the local branches, or the remote's branches with `--remote`
 
 **Usage:** `lore branch list [OPTIONS]`
 

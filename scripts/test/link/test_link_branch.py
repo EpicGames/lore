@@ -119,7 +119,7 @@ def test_link_branching_and_pinning(new_lore_repo):
     )
 
     # Verify branch was created in linked repo
-    branch_list_a = link_repo_a.branch_list()
+    branch_list_a = link_repo_a.branch_list(remote=True)
     assert "feature-test" in branch_list_a.remote_branches, (
         "Case A: feature-test branch should be created in linked repo"
     )
@@ -150,7 +150,7 @@ def test_link_branching_and_pinning(new_lore_repo):
     )
 
     # Verify branch was created in linked repo (branching enabled)
-    branch_list_b = link_repo_b.branch_list()
+    branch_list_b = link_repo_b.branch_list(remote=True)
     assert "feature-test" in branch_list_b.remote_branches, (
         "Case B: feature-test branch should be created in linked repo even with --pin"
     )
@@ -184,7 +184,7 @@ def test_link_branching_and_pinning(new_lore_repo):
     )
 
     # Verify NO branch was created in linked repo
-    branch_list_c = link_repo_c.branch_list()
+    branch_list_c = link_repo_c.branch_list(remote=True)
     assert "feature-test" not in branch_list_c.remote_branches, (
         "Case C: feature-test branch should NOT be created when --disable-branching"
     )
@@ -221,7 +221,7 @@ def test_link_branching_and_pinning(new_lore_repo):
     )
 
     # Verify NO new branch was created in linked repo
-    branch_list_d = link_repo_d.branch_list()
+    branch_list_d = link_repo_d.branch_list(remote=True)
     assert "feature-test" not in branch_list_d.remote_branches, (
         "Case D: feature-test branch should NOT be created when --disable-branching"
     )
@@ -253,22 +253,22 @@ def test_link_branching_and_pinning(new_lore_repo):
     parent_repo.branch_create("auto-follow-test")
     parent_repo.push()
 
-    branch_list_a = link_repo_a.branch_list()
+    branch_list_a = link_repo_a.branch_list(remote=True)
     assert "auto-follow-test" in branch_list_a.remote_branches, (
         "Auto-follow: branch should propagate to link A (no disable-branching)"
     )
 
-    branch_list_b = link_repo_b.branch_list()
+    branch_list_b = link_repo_b.branch_list(remote=True)
     assert "auto-follow-test" in branch_list_b.remote_branches, (
         "Auto-follow: branch should propagate to link B (no disable-branching)"
     )
 
-    branch_list_c = link_repo_c.branch_list()
+    branch_list_c = link_repo_c.branch_list(remote=True)
     assert "auto-follow-test" not in branch_list_c.remote_branches, (
         "Auto-follow: branch should NOT propagate to link C (disable-branching)"
     )
 
-    branch_list_d = link_repo_d.branch_list()
+    branch_list_d = link_repo_d.branch_list(remote=True)
     assert "auto-follow-test" not in branch_list_d.remote_branches, (
         "Auto-follow: branch should NOT propagate to link D (disable-branching)"
     )
@@ -485,7 +485,7 @@ def test_link_branch_create_reports_creation_in_event(new_lore_repo):
         f"Event must name the linked repository.\nGot: {event['linkRepository']}"
     )
 
-    branch_list = link_repo.branch_list()
+    branch_list = link_repo.branch_list(remote=True)
     assert branch_name in branch_list.remote_branches, (
         f"The branch must exist in the linked repository.\nGot: {branch_list}"
     )
@@ -1313,22 +1313,24 @@ def test_link_branch_archive_include_links(new_lore_repo):
     """
     repo, link_repo = make_parent_with_link(new_lore_repo)
 
-    branches_before = sorted(link_repo.branch_list().remote_branches)
+    branches_before = sorted(link_repo.branch_list(remote=True).remote_branches)
 
     repo.branch_create("feature")
     repo.push()
-    assert link_repo.branch_list().has_remote_branch("feature"), (
+    assert link_repo.branch_list(remote=True).has_remote_branch("feature"), (
         "Expected branch create to cascade into the linked repository"
     )
 
     repo.branch_switch("main")
     repo.branch_archive("feature", include_links=True)
 
-    assert sorted(repo.branch_list().remote_branches) == ["main"], (
-        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    assert sorted(repo.branch_list(remote=True).remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list(remote=True)}"
     )
-    assert sorted(link_repo.branch_list().remote_branches) == branches_before, (
-        f"Expected link branches {branches_before}, got: {link_repo.branch_list()}"
+    assert (
+        sorted(link_repo.branch_list(remote=True).remote_branches) == branches_before
+    ), (
+        f"Expected link branches {branches_before}, got: {link_repo.branch_list(remote=True)}"
     )
 
 
@@ -1340,7 +1342,7 @@ def test_link_branch_archive_multiple_links(new_lore_repo):
     repo.branch_create("feature")
     repo.push()
     for link in (second_repo, third_repo):
-        assert link.branch_list().has_remote_branch("feature"), (
+        assert link.branch_list(remote=True).has_remote_branch("feature"), (
             f"Expected branch create to cascade into {link.name}"
         )
 
@@ -1348,8 +1350,8 @@ def test_link_branch_archive_multiple_links(new_lore_repo):
     repo.branch_archive("feature", include_links=True)
 
     for link in (second_repo, third_repo):
-        assert sorted(link.branch_list().remote_branches) == ["main"], (
-            f"Expected only 'main' remaining in {link.name}, got: {link.branch_list()}"
+        assert sorted(link.branch_list(remote=True).remote_branches) == ["main"], (
+            f"Expected only 'main' remaining in {link.name}, got: {link.branch_list(remote=True)}"
         )
 
 
@@ -1364,11 +1366,11 @@ def test_link_branch_archive_single_link(new_lore_repo):
 
     repo.branch_archive("feature", link="sec")
 
-    assert sorted(second_repo.branch_list().remote_branches) == ["main"], (
-        f"Expected the scoped link to be archived, got: {second_repo.branch_list()}"
+    assert sorted(second_repo.branch_list(remote=True).remote_branches) == ["main"], (
+        f"Expected the scoped link to be archived, got: {second_repo.branch_list(remote=True)}"
     )
-    assert third_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the other link to be left alone, got: {third_repo.branch_list()}"
+    assert third_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the other link to be left alone, got: {third_repo.branch_list(remote=True)}"
     )
 
 
@@ -1386,8 +1388,8 @@ def test_link_branch_archive_unknown_link_errors(new_lore_repo):
     assert "not a link" in output.lower(), (
         f"Expected a non-link path to be reported, got: {output}"
     )
-    assert link_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the link to be left alone, got: {link_repo.branch_list()}"
+    assert link_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the link to be left alone, got: {link_repo.branch_list(remote=True)}"
     )
 
 
@@ -1421,8 +1423,8 @@ def test_link_branch_archive_local_keeps_link_remote(new_lore_repo):
     assert sorted(repo.branch_list().local_branches) == ["main"], (
         f"Expected only 'main' remaining locally, got: {repo.branch_list()}"
     )
-    assert link_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the link remote branch to remain, got: {link_repo.branch_list()}"
+    assert link_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the link remote branch to remain, got: {link_repo.branch_list(remote=True)}"
     )
 
 
@@ -1440,11 +1442,11 @@ def test_link_branch_archive_tolerates_already_archived_link(new_lore_repo):
 
     repo.branch_archive("feature", include_links=True)
 
-    assert sorted(repo.branch_list().remote_branches) == ["main"], (
-        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    assert sorted(repo.branch_list(remote=True).remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list(remote=True)}"
     )
-    assert sorted(link_repo.branch_list().remote_branches) == ["main"], (
-        f"Expected only 'main' remaining in the link, got: {link_repo.branch_list()}"
+    assert sorted(link_repo.branch_list(remote=True).remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the link, got: {link_repo.branch_list(remote=True)}"
     )
 
 
@@ -1474,8 +1476,8 @@ def test_link_branch_archive_current_leaves_links(new_lore_repo):
 
     repo.branch_archive("feature", include_links=True, check=False)
 
-    assert link_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the link branch to be untouched, got: {link_repo.branch_list()}"
+    assert link_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the link branch to be untouched, got: {link_repo.branch_list(remote=True)}"
     )
 
 
@@ -1486,7 +1488,7 @@ def test_link_branch_archive_skips_auto_follow_disabled_link(new_lore_repo):
     """
     repo, link_repo = make_parent_with_link(new_lore_repo, disable_branching=True)
 
-    branches_before = sorted(link_repo.branch_list().remote_branches)
+    branches_before = sorted(link_repo.branch_list(remote=True).remote_branches)
 
     repo.branch_create("feature")
     repo.push()
@@ -1494,11 +1496,13 @@ def test_link_branch_archive_skips_auto_follow_disabled_link(new_lore_repo):
 
     repo.branch_archive("feature", include_links=True)
 
-    assert sorted(repo.branch_list().remote_branches) == ["main"], (
-        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    assert sorted(repo.branch_list(remote=True).remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list(remote=True)}"
     )
-    assert sorted(link_repo.branch_list().remote_branches) == branches_before, (
-        f"Expected link branches {branches_before}, got: {link_repo.branch_list()}"
+    assert (
+        sorted(link_repo.branch_list(remote=True).remote_branches) == branches_before
+    ), (
+        f"Expected link branches {branches_before}, got: {link_repo.branch_list(remote=True)}"
     )
 
 
@@ -1509,7 +1513,7 @@ def test_link_branch_archive_single_auto_follow_disabled_link_errors(new_lore_re
     """
     repo, link_repo = make_parent_with_link(new_lore_repo, disable_branching=True)
 
-    branches_before = sorted(link_repo.branch_list().remote_branches)
+    branches_before = sorted(link_repo.branch_list(remote=True).remote_branches)
 
     repo.branch_create("feature")
     repo.push()
@@ -1520,8 +1524,10 @@ def test_link_branch_archive_single_auto_follow_disabled_link_errors(new_lore_re
     assert "does not follow the parent's branches" in output.lower(), (
         f"Expected the opted-out link to be reported, got: {output}"
     )
-    assert sorted(link_repo.branch_list().remote_branches) == branches_before, (
-        f"Expected link branches {branches_before}, got: {link_repo.branch_list()}"
+    assert (
+        sorted(link_repo.branch_list(remote=True).remote_branches) == branches_before
+    ), (
+        f"Expected link branches {branches_before}, got: {link_repo.branch_list(remote=True)}"
     )
 
 
@@ -1541,7 +1547,7 @@ def test_link_branch_archive_repository_linked_twice(new_lore_repo):
     repo.commit("add links")
     repo.push()
 
-    branches_before = sorted(link_repo.branch_list().remote_branches)
+    branches_before = sorted(link_repo.branch_list(remote=True).remote_branches)
 
     repo.branch_create("feature")
     repo.push()
@@ -1552,8 +1558,10 @@ def test_link_branch_archive_repository_linked_twice(new_lore_repo):
     assert output.count("Archived branch") == 1, (
         f"Expected one archive line for the outer repository, got: {output}"
     )
-    assert sorted(link_repo.branch_list().remote_branches) == branches_before, (
-        f"Expected link branches {branches_before}, got: {link_repo.branch_list()}"
+    assert (
+        sorted(link_repo.branch_list(remote=True).remote_branches) == branches_before
+    ), (
+        f"Expected link branches {branches_before}, got: {link_repo.branch_list(remote=True)}"
     )
 
 

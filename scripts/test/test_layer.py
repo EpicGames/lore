@@ -287,8 +287,8 @@ def test_layer_branch_create(new_lore_repo):
     repo.branch_create("test-branch")
     repo.push()
 
-    repo_branch_list = repo.branch_list()
-    second_branch_list = second_repo.branch_list()
+    repo_branch_list = repo.branch_list(remote=True)
+    second_branch_list = second_repo.branch_list(remote=True)
 
     print(str(repo_branch_list))
     print(str(second_branch_list))
@@ -307,18 +307,18 @@ def test_layer_branch_archive_leaves_layers_by_default(new_lore_repo):
 
     repo.branch_create("feature")
     repo.push()
-    assert layer_repo.branch_list().has_remote_branch("feature"), (
+    assert layer_repo.branch_list(remote=True).has_remote_branch("feature"), (
         "Expected branch create to cascade into the layer repository"
     )
 
     repo.branch_switch("main")
     repo.branch_archive("feature")
 
-    assert sorted(repo.branch_list().remote_branches) == ["main"], (
-        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    assert sorted(repo.branch_list(remote=True).remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list(remote=True)}"
     )
-    assert layer_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the layer branch to be left alone, got: {layer_repo.branch_list()}"
+    assert layer_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the layer branch to be left alone, got: {layer_repo.branch_list(remote=True)}"
     )
 
 
@@ -329,22 +329,24 @@ def test_layer_branch_archive_include_layers(new_lore_repo):
     """
     repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
 
-    branches_before = sorted(layer_repo.branch_list().remote_branches)
+    branches_before = sorted(layer_repo.branch_list(remote=True).remote_branches)
 
     repo.branch_create("feature")
     repo.push()
-    assert layer_repo.branch_list().has_remote_branch("feature"), (
+    assert layer_repo.branch_list(remote=True).has_remote_branch("feature"), (
         "Expected branch create to cascade into the layer repository"
     )
 
     repo.branch_switch("main")
     repo.branch_archive("feature", include_layers=True)
 
-    assert sorted(repo.branch_list().remote_branches) == ["main"], (
-        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    assert sorted(repo.branch_list(remote=True).remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list(remote=True)}"
     )
-    assert sorted(layer_repo.branch_list().remote_branches) == branches_before, (
-        f"Expected layer branches {branches_before}, got: {layer_repo.branch_list()}"
+    assert (
+        sorted(layer_repo.branch_list(remote=True).remote_branches) == branches_before
+    ), (
+        f"Expected layer branches {branches_before}, got: {layer_repo.branch_list(remote=True)}"
     )
 
 
@@ -356,7 +358,7 @@ def test_layer_branch_archive_multiple_layers(new_lore_repo):
     repo.branch_create("feature")
     repo.push()
     for layer in (second_repo, third_repo):
-        assert layer.branch_list().has_remote_branch("feature"), (
+        assert layer.branch_list(remote=True).has_remote_branch("feature"), (
             f"Expected branch create to cascade into {layer.name}"
         )
 
@@ -364,8 +366,8 @@ def test_layer_branch_archive_multiple_layers(new_lore_repo):
     repo.branch_archive("feature", include_layers=True)
 
     for layer in (second_repo, third_repo):
-        assert sorted(layer.branch_list().remote_branches) == ["main"], (
-            f"Expected only 'main' remaining in {layer.name}, got: {layer.branch_list()}"
+        assert sorted(layer.branch_list(remote=True).remote_branches) == ["main"], (
+            f"Expected only 'main' remaining in {layer.name}, got: {layer.branch_list(remote=True)}"
         )
 
 
@@ -380,11 +382,11 @@ def test_layer_branch_archive_single_layer(new_lore_repo):
 
     repo.branch_archive("feature", layer="sec")
 
-    assert not second_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the scoped layer to be archived, got: {second_repo.branch_list()}"
+    assert not second_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the scoped layer to be archived, got: {second_repo.branch_list(remote=True)}"
     )
-    assert third_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the other layer to be left alone, got: {third_repo.branch_list()}"
+    assert third_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the other layer to be left alone, got: {third_repo.branch_list(remote=True)}"
     )
 
 
@@ -434,8 +436,8 @@ def test_layer_branch_archive_local_keeps_layer_remote(new_lore_repo):
     assert not repo.branch_list().has_local_branch("feature"), (
         f"Expected the local branch to be archived, got: {repo.branch_list()}"
     )
-    assert layer_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the layer remote branch to remain, got: {layer_repo.branch_list()}"
+    assert layer_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the layer remote branch to remain, got: {layer_repo.branch_list(remote=True)}"
     )
 
 
@@ -460,8 +462,8 @@ def test_layer_branch_archive_skips_layer_without_branch(new_lore_repo):
     repo.branch_switch("main")
 
     repo.layer_add("lay", layer_repo, "lay/")
-    assert not layer_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the layer to never have seen the branch, got: {layer_repo.branch_list()}"
+    assert not layer_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the layer to never have seen the branch, got: {layer_repo.branch_list(remote=True)}"
     )
 
     output = repo.branch_archive("feature", include_layers=True)
@@ -469,8 +471,8 @@ def test_layer_branch_archive_skips_layer_without_branch(new_lore_repo):
     assert "not found" not in output.lower(), (
         f"Expected the missing layer branch to be skipped quietly, got: {output}"
     )
-    assert sorted(repo.branch_list().remote_branches) == ["main"], (
-        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    assert sorted(repo.branch_list(remote=True).remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list(remote=True)}"
     )
 
 
@@ -488,8 +490,8 @@ def test_layer_branch_archive_tolerates_already_archived_layer(new_lore_repo):
 
     repo.branch_archive("feature", include_layers=True)
 
-    assert sorted(repo.branch_list().remote_branches) == ["main"], (
-        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    assert sorted(repo.branch_list(remote=True).remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list(remote=True)}"
     )
 
 
@@ -522,11 +524,11 @@ def test_layer_branch_archive_continues_past_refusing_layer(new_lore_repo):
 
     repo.branch_archive("feature", include_layers=True, check=False)
 
-    assert second_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the protected layer branch to survive, got: {second_repo.branch_list()}"
+    assert second_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the protected layer branch to survive, got: {second_repo.branch_list(remote=True)}"
     )
-    assert not third_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the remaining layer to still be archived, got: {third_repo.branch_list()}"
+    assert not third_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the remaining layer to still be archived, got: {third_repo.branch_list(remote=True)}"
     )
 
 
@@ -540,8 +542,8 @@ def test_layer_branch_archive_current_leaves_layers(new_lore_repo):
 
     repo.branch_archive("feature", include_layers=True, check=False)
 
-    assert layer_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the layer branch to be untouched, got: {layer_repo.branch_list()}"
+    assert layer_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the layer branch to be untouched, got: {layer_repo.branch_list(remote=True)}"
     )
 
 
@@ -560,12 +562,12 @@ def test_layer_branch_archive_converges_after_partial_archive(new_lore_repo):
     repo.branch_switch("main")
 
     repo.branch_archive("feature", local=True, include_layers=True)
-    assert layer_repo.branch_list().has_remote_branch("feature")
+    assert layer_repo.branch_list(remote=True).has_remote_branch("feature")
 
     repo.branch_archive("feature", include_layers=True, check=False)
 
-    assert not layer_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the repeat archive to reach the layer, got: {layer_repo.branch_list()}"
+    assert not layer_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the repeat archive to reach the layer, got: {layer_repo.branch_list(remote=True)}"
     )
 
 
@@ -640,7 +642,7 @@ def test_layer_branch_switch_creates_missing_branch(new_lore_repo):
     repo.layer_add("lay", layer_repo, "lay/")
 
     # Verify the branch does NOT exist in the layer yet
-    layer_branch_list = layer_repo.branch_list()
+    layer_branch_list = layer_repo.branch_list(remote=True)
     assert not layer_branch_list.has_remote_branch("new-feature"), (
         "Branch should not exist in layer before switch"
     )
@@ -651,7 +653,7 @@ def test_layer_branch_switch_creates_missing_branch(new_lore_repo):
     repo.push()
 
     # The branch should now exist in the layer repo
-    layer_branch_list = layer_repo.branch_list()
+    layer_branch_list = layer_repo.branch_list(remote=True)
     assert layer_branch_list.has_remote_branch("new-feature"), (
         f"Expected 'new-feature' branch in layer repo, got: {layer_branch_list}"
     )

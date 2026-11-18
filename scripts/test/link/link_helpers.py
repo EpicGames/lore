@@ -121,22 +121,14 @@ def make_parent_with_remount(
 
 
 def remote_branch_entries(repo: Lore) -> list[dict]:
-    """Remote branch list entries for a repository.
-
-    Archived branches are deliberately not requested. The remote leg reports
-    every entry as unarchived and the client asks for archived branches to be
-    excluded, so an archived branch is absent from this list entirely rather than
-    present with a flag set — its absence is the signal, and asking for archived
-    entries would only cost an extra scan.
+    """Remote branch list entries for a repository. An archived branch is absent
+    from the list.
 
     Read from JSON rather than the text parser because the text form drops the
     branch id, and the id is what branch creation shares between a parent branch
     and the branch it creates in a linked repository.
     """
-    output = repo.branch_list(json=True)
-    return [
-        e for e in parse_jsonl(output, "branchListEntry") if e["location"] == "remote"
-    ]
+    return parse_jsonl(repo.branch_list(remote=True, json=True), "branchListEntry")
 
 
 def link_entry(repo: Lore, link_path: str) -> dict:

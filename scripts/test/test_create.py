@@ -274,8 +274,8 @@ class TestCreate:
                 in output
             )
 
-        branch_list = new_repo.branch_list()
-        assert len(branch_list.remote_branches) == 1
+        branch_list = new_repo.branch_list(remote=True)
+        assert branch_list.remote_branches == ["main"]
 
     def test_instance_id_created_on_clone(self, new_lore_repo):
         """

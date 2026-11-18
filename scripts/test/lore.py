@@ -2830,11 +2830,10 @@ class Lore:
         )
 
     def has_branch(self, branch):
-        branch_list = self.branch_list()
+        """Whether the branch is in the local or the remote branch list. Needs the remote."""
         return (
-            branch_list.current_branch == branch
-            or branch in branch_list.local_branches
-            or branch in branch_list.remote_branches
+            branch in self.branch_list().local_branches
+            or branch in self.branch_list(remote=True).remote_branches
         )
 
     def write_files(

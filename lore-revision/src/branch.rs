@@ -4523,14 +4523,15 @@ pub(crate) async fn list_remote_bounded(
     Ok(response.map(|response| response.list))
 }
 
+/// Emit the local branches, followed by the archived local branches when `archived` is set, or
+/// the remote's branches alone when `remote` is set.
 pub async fn list_output(
     repository: Arc<RepositoryContext>,
-    local: bool,
     remote: bool,
     archived: bool,
 ) -> Result<(), BranchError> {
     if remote {
-        return list_remote_output(repository, true).await;
+        return list_remote_output(repository).await;
     }
 
     // List local branches
@@ -4690,31 +4691,16 @@ pub async fn list_output(
         .send();
     }
 
-    if local {
-        return Ok(());
-    }
-
-    list_remote_output(repository, false).await
+    Ok(())
 }
 
-/// Emit the remote branch list. When `required` (an explicit `--remote`), a
-/// missing connection or a failed remote listing is propagated as an error;
-/// otherwise the remote is optional and such failures emit no remote events.
-async fn list_remote_output(
-    repository: Arc<RepositoryContext>,
-    required: bool,
-) -> Result<(), BranchError> {
-    let remote = match repository.remote().await {
-        Ok(remote) => remote,
-        Err(_) if !required => return Ok(()),
-        connection => connection.forward::<BranchError>("Failed to connect to remote")?,
-    };
-
-    let list = match list_remote(remote, repository.id).await {
-        Ok(list) => list,
-        Err(err) if required => return Err(err),
-        Err(_) => return Ok(()),
-    };
+/// Emit the remote's branch list. A missing connection or a failed listing is an error.
+async fn list_remote_output(repository: Arc<RepositoryContext>) -> Result<(), BranchError> {
+    let remote = repository
+        .remote()
+        .await
+        .forward::<BranchError>("connecting to the remote")?;
+    let list = list_remote(remote, repository.id).await?;
 
     event::LoreEvent::BranchListBegin(LoreBranchListBeginEventData {
         location: LoreBranchLocation::Remote,

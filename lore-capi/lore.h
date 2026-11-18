@@ -4816,7 +4816,7 @@ typedef struct lore_branch_archive_args_t {
   uint8_t include_links;
 } lore_branch_archive_args_t;
 
-// Arguments for listing all branches in the repository.
+// Arguments for listing the branches of the repository.
 typedef struct lore_branch_list_args_t {
   // Include archived local branches in listing
   uint8_t archived;
@@ -7699,7 +7699,9 @@ void lore_branch_archive_async(const struct lore_global_args_t *globals,
                                const struct lore_branch_archive_args_t *args,
                                struct lore_event_callback_config_t callback);
 
-// List all branches in the repository.
+// List the local branches of the repository, or the remote's branches when `remote` is set in
+// `lore_global_args_t`. A remote listing ignores `archived` in `lore_branch_list_args_t`, and a
+// remote that can't be reached or listed fails the call.
 //
 // # Events
 //
@@ -7721,7 +7723,7 @@ void lore_branch_archive_async(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_BRANCH_LIST_BEGIN` | `lore_branch_list_begin_event_data_t` | Emitted before branch list entries begin streaming |
-// | `LORE_EVENT_BRANCH_LIST_ENTRY` | `lore_branch_list_entry_event_data_t` | Emitted for each branch in the repository |
+// | `LORE_EVENT_BRANCH_LIST_ENTRY` | `lore_branch_list_entry_event_data_t` | Emitted for each listed branch |
 // | `LORE_EVENT_BRANCH_LIST_END` | `lore_branch_list_end_event_data_t` | Emitted after all branch entries have been streamed |
 int32_t lore_branch_list(const struct lore_global_args_t *globals,
                          const struct lore_branch_list_args_t *args,
@@ -7749,7 +7751,7 @@ int32_t lore_branch_list(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_BRANCH_LIST_BEGIN` | `lore_branch_list_begin_event_data_t` | Emitted before branch list entries begin streaming |
-// | `LORE_EVENT_BRANCH_LIST_ENTRY` | `lore_branch_list_entry_event_data_t` | Emitted for each branch in the repository |
+// | `LORE_EVENT_BRANCH_LIST_ENTRY` | `lore_branch_list_entry_event_data_t` | Emitted for each listed branch |
 // | `LORE_EVENT_BRANCH_LIST_END` | `lore_branch_list_end_event_data_t` | Emitted after all branch entries have been streamed |
 void lore_branch_list_async(const struct lore_global_args_t *globals,
                             const struct lore_branch_list_args_t *args,
