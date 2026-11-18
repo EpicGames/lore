@@ -273,6 +273,45 @@ struct PoolInner {
     max_threads: usize,
 }
 
+thread_local! {
+    /// Whether this thread runs the work it submits itself
+    /// ([`run_file_operations_on_this_thread`]).
+    static RUNS_OWN_WORK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the current thread is inside [`run_file_operations_on_this_thread`].
+#[lore_macro::test_pub]
+pub(crate) fn runs_file_operations_on_this_thread() -> bool {
+    RUNS_OWN_WORK.get()
+}
+
+/// Runs `call` with every job this thread submits to a syscall pool within it run on this thread,
+/// inside the submission, rather than on a pool thread, which saves the two thread hand-offs of
+/// each job.
+///
+/// Only for a thread that meets all of these:
+///
+/// - It isn't an async runtime worker, which a job would block.
+/// - It blocks until the operations it starts within `call` finish, as a thread inside `block_on`
+///   does, so that running them delays nothing else.
+/// - The work awaits its file operations one at a time. Joined ones run one after another, and a
+///   timeout around one can't fire while it runs.
+///
+/// It applies to every pool and to all code `call` reaches on this thread, and to no other
+/// thread. Work given a thread of its own still gets one
+/// ([`crate::IoDriver::remove_dir_all_in_background`]), and the positional reads and writes of
+/// the completion backends, which submit no job, are issued as they are without it.
+pub fn run_file_operations_on_this_thread<T>(call: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RUNS_OWN_WORK.set(self.0);
+        }
+    }
+    let _restore = Restore(RUNS_OWN_WORK.replace(true));
+    call()
+}
+
 /// Threads of a [`SyscallPool`]'s cap that [`SyscallPool::lend`] lent, given back when dropped.
 #[lore_macro::test_pub]
 pub(crate) struct Lent<'a> {
@@ -388,6 +427,9 @@ impl SyscallPool {
         Lent { pool: self, count }
     }
 
+    /// Queues `work` for a pool thread, or runs it before returning on a thread inside
+    /// [`run_file_operations_on_this_thread`]. Either way the task answers with its result, and
+    /// resumes a panic of the work on its awaiter.
     #[lore_macro::test_pub]
     pub(crate) fn submit<T, F>(&self, work: F) -> SyscallTask<T>
     where
@@ -395,6 +437,10 @@ impl SyscallPool {
         F: FnOnce() -> T + Send + 'static,
     {
         let (job, task) = new_task(work);
+        if runs_file_operations_on_this_thread() {
+            job.run();
+            return task;
+        }
         self.enqueue(job);
         task
     }
@@ -564,12 +610,12 @@ fn worker_loop(inner: &PoolInner) {
 /// Completion future for work submitted to the syscall pool.
 ///
 /// Wakes through a plain waker and therefore runs under any executor. A
-/// panic on the pool thread resumes on the awaiting task.
+/// panic of the work resumes on the awaiting task.
 ///
 /// Dropping this cancels nothing: the work owns its buffer and runs to completion, publishing a
-/// result nobody reads, and the allocation — with that buffer in it — is freed when the pool
-/// thread releases its own handle. That is what makes an early free of kernel-visible memory
-/// unrepresentable rather than merely avoided.
+/// result nobody reads, and the allocation — with that buffer in it — is freed once the thread
+/// running the work has released its own handle. That is what makes an early free of
+/// kernel-visible memory unrepresentable rather than merely avoided.
 ///
 /// Work that is discarded rather than run leaves this pending forever. Only a pool dropped with a
 /// non-empty queue can do that, which the process-wide pool never is. Detecting it here is not

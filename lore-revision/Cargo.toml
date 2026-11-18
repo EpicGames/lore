@@ -95,6 +95,7 @@ required-features = ["state-stress"]
 ctor = { workspace = true }
 keyring-core = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
+lore-io = { workspace = true, features = ["test-util"] }
 lore-revision = { workspace = true, features = ["test-util"] }
 lore-storage = { workspace = true, features = ["test-util"] }
 lore-transport = { workspace = true, features = ["test-util"] }

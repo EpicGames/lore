@@ -619,3 +619,30 @@ async fn a_mounts_callbacks_read_the_environment_of_the_call_that_mounted_it() {
 
     assert_eq!(read, Some(auth_path));
 }
+
+/// A callback's work runs with its thread marked to run the file operations it starts, and the
+/// mark ends with the callback.
+#[tokio::test]
+async fn a_callback_runs_with_its_thread_running_its_own_file_operations() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let mount = evicted_mount().await;
+
+            // On a thread of its own, as SWFS calls it: the callback blocks its thread.
+            let (during, after) = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let during = mount.resources.run_in_runtime_with_context(async |_token| {
+                            lore_io::pool::runs_file_operations_on_this_thread()
+                        });
+                        (during, lore_io::pool::runs_file_operations_on_this_thread())
+                    })
+                    .join()
+                    .expect("the callback's thread")
+            });
+
+            assert!(during, "marked for the callback");
+            assert!(!after, "and no longer");
+        })
+        .await;
+}

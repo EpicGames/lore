@@ -97,6 +97,7 @@ pub use holes::DataCursor;
 pub use iocp::IocpStats;
 pub use pool::PoolStats;
 pub use pool::requested_max_threads;
+pub use pool::run_file_operations_on_this_thread;
 pub use pool::set_max_threads;
 pub use psync::create_dir_all_private;
 pub use psync::create_dir_in_existing_parent;

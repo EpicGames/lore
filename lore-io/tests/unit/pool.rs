@@ -66,6 +66,94 @@ async fn work_on_its_own_thread_leaves_the_pool_free() {
     );
 }
 
+/// Work submitted inside `run_file_operations_on_this_thread` has run, on the submitting thread,
+/// by the time `submit` returns, and no pool thread is started for it.
+#[test]
+fn work_submitted_inside_the_call_runs_on_the_submitting_thread() {
+    let pool = SyscallPool::new(2);
+    let caller = std::thread::current().id();
+    let ran = Arc::new(AtomicUsize::new(0));
+
+    let task = run_file_operations_on_this_thread(|| {
+        let counted = ran.clone();
+        let task = pool.submit(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::thread::current().id()
+        });
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "run at the submission");
+        task
+    });
+
+    let mut task = std::pin::pin!(task);
+    let std::task::Poll::Ready(ran_on) =
+        task.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+    else {
+        panic!("the result is ready without a pool thread");
+    };
+    assert_eq!(ran_on, caller);
+    assert_eq!(pool.stats().threads_high_water, 0, "no pool thread");
+}
+
+/// The thread submits to the pool again once `run_file_operations_on_this_thread` returns, a
+/// nested call leaves the outer one in force, and another thread's submissions go to the pool
+/// meanwhile.
+#[tokio::test]
+async fn the_thread_goes_back_to_the_pool_after_the_call() {
+    let pool = Arc::new(SyscallPool::new(1));
+    let caller = std::thread::current().id();
+    let submitted_by = |pool: &SyscallPool| pool.submit(|| std::thread::current().id());
+
+    let (after_nested, elsewhere) = run_file_operations_on_this_thread(|| {
+        run_file_operations_on_this_thread(|| {});
+        let after_nested = submitted_by(&pool);
+
+        let other_pool = pool.clone();
+        let elsewhere = std::thread::spawn(move || {
+            let submitter = std::thread::current().id();
+            (submitter, submitted_by(&other_pool))
+        });
+        (after_nested, elsewhere.join().expect("the other thread"))
+    });
+    assert_eq!(
+        after_nested.await,
+        caller,
+        "the outer call is still in force"
+    );
+    let (other_submitter, ran_on) = elsewhere;
+    assert_ne!(ran_on.await, other_submitter, "the other thread's work");
+
+    assert_ne!(submitted_by(&pool).await, caller, "back on a pool thread");
+}
+
+/// Work that panics when it runs at its submission leaves `submit` to return, and resumes the
+/// panic on its awaiter, as work on a pool thread does.
+#[test]
+fn panic_at_the_submission_resumes_on_awaiter() {
+    let pool = SyscallPool::new(1);
+    let task = run_file_operations_on_this_thread(|| pool.submit(|| panic!("deliberate")));
+
+    let mut task = std::pin::pin!(task);
+    let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        task.as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+    }));
+    assert!(polled.is_err(), "the awaiter takes the panic");
+}
+
+/// A panic in the call ends it for the thread, which submits to the pool again.
+#[tokio::test]
+async fn a_panic_in_the_call_leaves_the_thread_submitting_to_the_pool() {
+    let pool = SyscallPool::new(1);
+    let panicked =
+        std::panic::catch_unwind(|| run_file_operations_on_this_thread(|| panic!("deliberate")));
+    assert!(panicked.is_err());
+
+    let caller = std::thread::current().id();
+    let ran_on = pool.submit(|| std::thread::current().id()).await;
+    assert_ne!(ran_on, caller, "back on a pool thread");
+}
+
 /// The snapshot is taken under one lock, so a burst cannot be observed with more threads
 /// than the cap allows or with counts that do not add up.
 #[tokio::test(flavor = "multi_thread")]

@@ -1623,6 +1623,57 @@ fn operations_complete_under_a_foreign_executor() {
     }
 }
 
+/// Every backend's operations give the results they give on the pool when the calling thread
+/// runs its own jobs, and on `psync`, where every operation is a job, each is finished by the
+/// time it is first polled.
+#[test]
+fn operations_complete_on_a_thread_that_runs_its_own_jobs() {
+    for driver in drivers() {
+        lore_io::run_file_operations_on_this_thread(|| {
+            futures::executor::block_on(async {
+                let dir = TempDir::new("lore-io-own-jobs-");
+                let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
+                let data = pattern(64 * 1024, 53);
+
+                file.write_all_at(Bytes::from(data.clone()), 0)
+                    .await
+                    .unwrap();
+                let mut read = Box::pin(file.read_exact_at(data.len(), 0));
+                let first_poll = futures::poll!(&mut read);
+                if driver.backend_name() == "psync" {
+                    assert!(first_poll.is_ready(), "the read ran at its submission");
+                }
+                let read = match first_poll {
+                    std::task::Poll::Ready(read) => read,
+                    std::task::Poll::Pending => read.await,
+                }
+                .unwrap();
+                assert_eq!(&read[..], &data[..], "{}", driver.backend_name());
+                file.sync_data().await.unwrap();
+                assert_eq!(file.metadata().await.unwrap().len(), data.len() as u64);
+
+                let path = dir.child("blob");
+                driver
+                    .write_file_bytes(&path, Bytes::from(data.clone()), false)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    driver.read_file_bytes(&path).await.unwrap(),
+                    Bytes::from(data.clone())
+                );
+
+                let mut listing = driver.read_dir(dir.path()).await.unwrap();
+                let mut names = Vec::new();
+                while let Some(entry) = listing.next().await {
+                    names.push(entry.unwrap().file_name.to_string_lossy().to_string());
+                }
+                names.sort();
+                assert_eq!(names, ["blob", "data"], "{}", driver.backend_name());
+            });
+        });
+    }
+}
+
 /// Cancelling abandons the result, not the operation. A read's buffer is allocated inside the job
 /// and freed there, so a dropped future cannot free memory the kernel is still writing into —
 /// there is no caller-held buffer to free early. A write's buffer travels into the job the same

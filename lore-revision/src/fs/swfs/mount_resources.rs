@@ -366,13 +366,18 @@ impl MountResources {
     }
 
     /// Runs the async callback in a Lore execution context, providing access to things like the
-    /// global arguments.
+    /// global arguments. Call it from a thread that isn't a runtime worker: the thread blocks
+    /// until the callback finishes, and runs the file operations the callback itself starts
+    /// ([`lore_io::run_file_operations_on_this_thread`]) rather than waiting for a pool thread to.
     pub fn run_in_runtime_with_context<F: Future, RunFunc: FnOnce(SwfsExecutionToken) -> F>(
         &self,
         f: RunFunc,
     ) -> F::Output {
         let runtime = runtime();
-        runtime.block_on(async move { self.run_with_context(f(SwfsExecutionToken::new())).await })
+        lore_io::run_file_operations_on_this_thread(|| {
+            runtime
+                .block_on(async move { self.run_with_context(f(SwfsExecutionToken::new())).await })
+        })
     }
 
     pub async fn run_with_context<F: Future>(&self, f: F) -> F::Output {

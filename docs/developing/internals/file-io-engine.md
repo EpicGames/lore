@@ -31,7 +31,7 @@ A handle opened without the flag is a synchronous file object, and the I/O manag
 
 `std`'s positional calls cannot be used on such a handle. They place the offset in an `OVERLAPPED`, pass no event, and report `ERROR_IO_PENDING` as an ordinary error. That status means the kernel has accepted the request and still owns the buffer, so a caller treating it as a failure frees memory the kernel is about to write into. Each operation therefore owns its completion: its own `OVERLAPPED`, a per-thread manual-reset event, and a `GetOverlappedResult` wait that a pending operation cannot return past. A null event signals the file handle instead, which two concurrent operations on one handle cannot share. A failed wait cancels and waits again rather than returning while the kernel can still touch the buffer.
 
-The wait blocks, which is the purpose of the syscall pool. It runs on every operation: a buffered read on an overlapped handle reports `ERROR_IO_PENDING` in every case measured, at every thread count. Each positional operation therefore parks a pool thread until the kernel completes it, and the pool cap bounds how many can be in flight. Removing that bound is what the `iocp` backend does.
+The wait blocks, which is the purpose of the syscall pool. It runs on every operation: a buffered read on an overlapped handle reports `ERROR_IO_PENDING` in every case measured, at every thread count. Each positional operation therefore parks the thread running it until the kernel completes it, and the pool cap bounds how many the pool has in flight; a thread that runs its own jobs, as the syscall pool section describes, adds one. Removing that bound is what the `iocp` backend does.
 
 Two further consequences. Overlapped handles maintain no file cursor, so `positional_reads_have_no_cursor` in the conformance suite pins a property of the handle as well as of the API. And these operations work on synchronous handles, which they must, because the whole-file composites open their own.
 
@@ -103,7 +103,7 @@ Two driver operations complete a whole file in a single backend dispatch, matchi
 
 Their callers are the shapes they were built for: `write_file_bytes` writes an unfragmented fragment's content in the materialization path, and `read_file_bytes` reads a fan-out level marker, a file that is one 16-byte header.
 
-Both are bounded by `WHOLE_FILE_LIMIT`, 8 MiB, and fail with `InvalidInput` above it. Each holds a pool thread and the whole file resident for its duration, so a large file would occupy one of at most `min(2 × cores, 16)` threads for the transfer; such a caller wants `open` with `read_exact_at` or `write_all_at`. The write's size check runs before the open, so a rejected call cannot have truncated an existing file.
+Both are bounded by `WHOLE_FILE_LIMIT`, 8 MiB, and fail with `InvalidInput` above it. Each holds the thread running it, a pool thread unless the caller runs its own jobs, and the whole file resident for its duration, so a large file would occupy one of at most `min(2 × cores, 16)` threads for the transfer; such a caller wants `open` with `read_exact_at` or `write_all_at`. The write's size check runs before the open, so a rejected call cannot have truncated an existing file.
 
 ## Syscall pool
 
@@ -119,9 +119,11 @@ Both are bounded by `WHOLE_FILE_LIMIT`, 8 MiB, and fail with `InvalidInput` abov
 
 Pooled rather than inline execution is deliberate: a syscall against cold media or a network filesystem blocks for milliseconds or indefinitely, and running it inline on an async worker would allow a small number of such operations to stall the runtime. The cap is an eighth of the tokio blocking pool's 128-thread ceiling, and the pool is dedicated, so file I/O does not compete with unrelated blocking work for threads.
 
-`submit` returns a `SyscallTask<T>`, which resolves through an ordinary waker and therefore runs under any executor — the multi-thread runtime in production, and the single-threaded runtimes `#[tokio::test]` creates. Work is wrapped in `catch_unwind`, so a panic on a pool thread resumes on the awaiting task rather than terminating the worker.
+One kind of thread runs its jobs itself: a thread that isn't an async worker and blocks until the operations it starts finish, such as the thread SWFS calls a mount's callbacks on, which polls the callback's future in `block_on`. Handing its job to a pool thread costs two thread hand-offs and frees nothing, since the thread only waits. Such a thread wraps its work in `run_file_operations_on_this_thread`, and `submit` then runs each job it submits before returning, on every pool. Jobs submitted by other threads go to the pool, including those of tasks the wrapped work spawns, which run on runtime workers. [ADR-00041](../decisions/00041-thread-that-blocks-for-file-operations-runs-them.md) records the decision.
 
-`pool_stats()` returns a `PoolStats` snapshot: queued, executing and live threads, the thread and queue high-water marks, and the cap. It is taken under the pool's own lock, so the counts are consistent rather than independently sampled, and the marks are maintained inside the critical section the submission path already enters. The high-water figures are what makes the cap checkable against a real workload, since a queue running deep alongside idle threads indicates the cap is not the limiting factor.
+`submit` returns a `SyscallTask<T>`, which resolves through an ordinary waker and therefore runs under any executor — the multi-thread runtime in production, and the single-threaded runtimes `#[tokio::test]` creates. Work is wrapped in `catch_unwind`, so a panic of the work resumes on the awaiting task rather than terminating the thread that ran it.
+
+`pool_stats()` returns a `PoolStats` snapshot: queued, executing and live threads, the thread and queue high-water marks, and the cap. The snapshot is taken under the pool's own lock, so the counts are consistent rather than independently sampled, and the marks are maintained inside the critical section the submission path already enters. The high-water figures are what makes the cap checkable against a real workload, since a queue running deep alongside idle threads indicates the cap is not the limiting factor. A job a thread runs itself is in none of the counts.
 
 The pool size is fixed at first use. `LORE_IO_POOL_THREADS` overrides the formula, rejecting zero and anything above 128 — the ceiling of the pool this engine replaces, so the override cannot size the engine above it — and reporting an unusable value before falling back to the formula. The override is for measurement and rollback; sizing for a deployment belongs to the `ThreadCounts` apportionment in `lore-base/src/runtime.rs`, which the engine joins when the blocking pool shrinks to its residual.
 
@@ -203,7 +205,7 @@ The measured consequence is that the ring's advantage is workload- and filesyste
 
 The backend shares its submission machinery with `overlapped.rs` — the handles, the per-operation `OVERLAPPED`, and the kernel-owned buffers. What differs is what happens after the submission: a wait on a pool thread there, a packet on a port here.
 
-Because a positional operation on this platform always defers, `psync` parks a pool thread across every operation and its cap bounds how many can be in flight. `iocp` holds no thread across an operation: submission costs one syscall on the calling thread, and the completion arrives as a packet. It measures 1.76× and 4.80× on the two synthetic read phases while running two threads — one reaper, and one pool thread serving the open — against a syscall pool saturated at thirty-two with a queue up to 99 deep. For a library sharing a process-wide thread budget with a host application, the thread count is as material as the throughput.
+Because a positional operation on this platform always defers, `psync` parks the thread running the job across every operation, a pool thread unless the caller runs its own jobs, and the pool's cap bounds how many the pool has in flight. `iocp` holds no thread across an operation: submission costs one syscall on the calling thread, and the completion arrives as a packet. It measures 1.76× and 4.80× on the two synthetic read phases while running two threads — one reaper, and one pool thread serving the open — against a syscall pool saturated at thirty-two with a queue up to 99 deep. For a library sharing a process-wide thread budget with a host application, the thread count is as material as the throughput.
 
 Four structural properties:
 
@@ -228,7 +230,7 @@ Cold, the two backends tie on the 64 KiB phase — both saturate a SATA SSD at 4
 - `lore-io/src/uring.rs::UringDriver` — the `io_uring` backend: shard selection, submission, inline drain, and the reaper loop.
 - `lore-io/src/overlapped.rs` — the Windows positional operations, the per-thread completion event, and why `std`'s shims are unusable against an overlapped handle.
 - `lore-io/src/iocp.rs::IocpDriver` — the completion-port backend: handle registration, submission, the entry layout the port round-trips through, and the reaper loop.
-- `lore-io/src/pool.rs::SyscallPool`, `::SyscallTask`, `::default_max_threads` — the bounded pool and its runtime-independent completion future.
+- `lore-io/src/pool.rs::SyscallPool`, `::SyscallTask`, `::default_max_threads`, `::run_file_operations_on_this_thread` — the bounded pool, its runtime-independent completion future, and the mark of a thread that runs its own jobs.
 - `lore-io/src/buffer.rs::StableBuf`, `::uninit_buffer` — the write-side buffer contract, and the uninitialised allocation reads fill.
 - `lore-io/src/file.rs::IoFile`, `::OpenOptions` — the positional handle operations.
 - `lore-io/src/dir.rs::DirStream`, `::DirEntry` — the chunked listing and what an entry describes.
@@ -241,3 +243,4 @@ Cold, the two backends tie on the 64 KiB phase — both saturate a SATA SSD at 4
 
 - The enhancement proposal `docs/proposals/2026-07-24-tokio-runtime-split-and-async-io.md` records the decision, the thread-budget arithmetic, the rejected alternatives, and the migration slicing.
 - [System design](../../explanation/system-design.md) — where the storage layer's fragment sizes come from.
+- [ADR-00041](../decisions/00041-thread-that-blocks-for-file-operations-runs-them.md) — when a thread runs its file operations itself.

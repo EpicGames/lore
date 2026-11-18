@@ -19,13 +19,14 @@
 //!
 //! So each operation owns its completion: its own `OVERLAPPED`, a per-thread event, and a wait
 //! that a pending operation cannot return past. The wait blocks, which is right rather than a
-//! concession — these run on the syscall pool, whose purpose is to hold a thread across a blocking
-//! syscall, and the pool never abandons a job it has started.
+//! concession — these run as syscall pool jobs, on a pool thread, whose purpose is to hold a thread
+//! across a blocking syscall, or on a thread that blocks for the job anyway
+//! ([`crate::run_file_operations_on_this_thread`]), and a job that has started is never abandoned.
 //!
 //! **The wait is the common path.** A buffered read on an overlapped handle reports
 //! `ERROR_IO_PENDING` rather than transferring, so every positional operation on a handle this
-//! crate opened parks its pool thread until the kernel is done — which makes the pool size a
-//! ceiling on how many can be in flight, and is why [`crate::iocp`] exists.
+//! crate opened parks the thread running it until the kernel is done — which makes the pool size
+//! a ceiling on how many the pool can have in flight, and is why [`crate::iocp`] exists.
 //!
 //! The inline branch below is not dead for that: the whole-file composites open their own
 //! *synchronous* handles through `File::open`, and those complete inside the call.
@@ -50,8 +51,9 @@ use windows_sys::Win32::System::Threading::CreateEventW;
 /// Supplying an event is not optional. With a null `hEvent` the I/O manager signals the *file
 /// handle* instead, and two concurrent operations on one shared handle cannot both wait on that —
 /// which is precisely the sharing this backend exists to allow. One event per thread rather than
-/// per operation is enough because a thread runs one operation at a time: the pool hands a thread
-/// a job and the job returns before the next begins.
+/// per operation is enough because a thread runs one operation at a time: a job returns before
+/// the thread running it begins the next, on a pool thread and on a thread that runs its own jobs
+/// alike, and no job submits a job.
 struct CompletionEvent(HANDLE);
 
 impl Drop for CompletionEvent {
