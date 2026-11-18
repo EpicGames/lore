@@ -305,15 +305,26 @@ pub enum BranchStep {
     ProtectMetadataRead,
 }
 
-/// Where a stepped task reports each step it reaches, and what it waits for to go on.
+/// Where a held task reports each point it reaches, and what it waits for to go on.
 #[derive(Clone)]
-struct Stepped {
-    reached: tokio::sync::mpsc::UnboundedSender<BranchStep>,
+struct Hold<T> {
+    reached: tokio::sync::mpsc::UnboundedSender<T>,
     resume: Arc<Notify>,
 }
 
+/// Stops this task at `point`, where it runs held by `hold`: `point` is sent on the hold's
+/// `reached`, and the task waits for a notification of its `resume` before it goes on.
+async fn stop_where_held<T: Clone>(hold: &'static tokio::task::LocalKey<Hold<T>>, point: T) {
+    let Ok(hold) = hold.try_with(Hold::clone) else {
+        return;
+    };
+    if hold.reached.send(point).is_ok() {
+        hold.resume.notified().await;
+    }
+}
+
 tokio::task_local! {
-    static STEPPED: Stepped;
+    static STEPPED: Hold<BranchStep>;
 }
 
 /// Runs `future`, stopping at each [`BranchStep`] it reaches: the step is sent on `reached`, and
@@ -324,17 +335,12 @@ pub fn step_branch_writes<F: Future>(
     resume: Arc<Notify>,
     future: F,
 ) -> impl Future<Output = F::Output> {
-    STEPPED.scope(Stepped { reached, resume }, future)
+    STEPPED.scope(Hold { reached, resume }, future)
 }
 
 /// Stops this task at `step`, where it runs under [`step_branch_writes`].
 pub(crate) async fn branch_step(step: BranchStep) {
-    let Ok(stepped) = STEPPED.try_with(Stepped::clone) else {
-        return;
-    };
-    if stepped.reached.send(step).is_ok() {
-        stepped.resume.notified().await;
-    }
+    stop_where_held(&STEPPED, step).await;
 }
 
 /// A pause a test arms: once armed, the next [`pass`](Self::pass) stops, whichever task makes it,
@@ -371,18 +377,10 @@ impl ArmedPause {
     }
 }
 
-/// Where a task run under [`hold_unmount_drains`] reports that a FUSE unmount's drain found the
-/// inode table counting no lookups, and what it waits for to go on.
-#[cfg(target_os = "linux")]
-#[derive(Clone)]
-struct DrainHold {
-    reached: tokio::sync::mpsc::UnboundedSender<()>,
-    resume: Arc<Notify>,
-}
-
 tokio::task_local! {
     #[cfg(target_os = "linux")]
-    static DRAIN_HOLD: DrainHold;
+    static DRAIN_HOLD: Hold<()>;
+    static IN_MEMORY_STORES_HOLD: Hold<()>;
 }
 
 /// Runs `future`, stopping each FUSE unmount's drain it runs wherever the drain finds the inode
@@ -395,17 +393,30 @@ pub fn hold_unmount_drains<F: Future>(
     resume: Arc<Notify>,
     future: F,
 ) -> impl Future<Output = F::Output> {
-    DRAIN_HOLD.scope(DrainHold { reached, resume }, future)
+    DRAIN_HOLD.scope(Hold { reached, resume }, future)
 }
 
 /// Stops this task where a FUSE unmount's drain has found the inode table counting no lookups,
 /// where it runs under [`hold_unmount_drains`].
 #[cfg(target_os = "linux")]
 pub(crate) async fn unmount_drain_emptied() {
-    let Ok(hold) = DRAIN_HOLD.try_with(DrainHold::clone) else {
-        return;
-    };
-    if hold.reached.send(()).is_ok() {
-        hold.resume.notified().await;
-    }
+    stop_where_held(&DRAIN_HOLD, ()).await;
+}
+
+/// Runs `future`, stopping each open of an instance with in-memory stores it makes that finds none
+/// of the instance's stores cached, before it looks for them again and creates them where none are
+/// cached: a `()` is sent on `reached`, and the open waits for a notification of `resume` before it
+/// goes on. Tasks `future` spawns don't stop.
+pub fn hold_in_memory_store_misses<F: Future>(
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    resume: Arc<Notify>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    IN_MEMORY_STORES_HOLD.scope(Hold { reached, resume }, future)
+}
+
+/// Stops this task where an open of an instance with in-memory stores has found none of its stores
+/// cached, where it runs under [`hold_in_memory_store_misses`].
+pub(crate) async fn in_memory_stores_missed() {
+    stop_where_held(&IN_MEMORY_STORES_HOLD, ()).await;
 }

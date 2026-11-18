@@ -25,14 +25,20 @@ use lore_revision::records::Record;
 use lore_revision::records::RecordBatch;
 use lore_revision::records::RecordKey;
 use lore_revision::records::SHARD_RECORDS_MAX;
+use lore_revision::repository::DOT_LORE;
+use lore_revision::repository::RecordsLocation;
 use lore_revision::repository::RepositoryAccess;
 use lore_revision::repository::RepositoryConfig;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::repository::VfsConfig;
 use lore_revision::repository::VfsType;
-use lore_revision::repository::keeps_records_on_disk;
+use lore_revision::repository::get_cached_in_memory_stores;
+use lore_revision::repository::load_and_connect;
+use lore_revision::repository::records_location;
+use lore_revision::repository::repository_release;
 use lore_revision::state;
+use lore_revision::test_util::hold_in_memory_store_misses;
 use lore_revision::util::path::RelativePath;
 use lore_storage::FlushOptions;
 use lore_storage::test_util::fail_packfile_syncs;
@@ -40,6 +46,7 @@ use lore_storage::test_util::packfile_sync_failures_left;
 
 use crate::helper::committed_repository;
 use crate::helper::relative_path;
+use crate::helper::stage_paths;
 use crate::helper::test_execution_with;
 use crate::helper::test_file_write;
 use crate::repository::test_helpers::store_fragment;
@@ -200,6 +207,32 @@ async fn records_tell_whether_they_changed_since_they_were_opened() {
         assert!(!records.has_changed());
         records.remove(&key(5, 1)).await;
         assert!(records.has_changed(), "a removal is a change");
+    })
+    .await;
+}
+
+/// Records kept in memory hold the times set in them, read no mutable store, and mark no shard to
+/// write back.
+#[tokio::test]
+async fn records_kept_in_memory_mark_no_shard_to_write_back() {
+    in_context(async {
+        let records = InstanceRecords::in_memory();
+        assert!(!records.has_store_records());
+        records.set(key(1, 1), 100).await;
+        records.set(key(1, 2), 200).await;
+        records.remove(&key(1, 2)).await;
+        let mut batch = RecordBatch::with_capacity(1);
+        batch.push(Record::new(key(9, 1), 900));
+        records.set_all(batch).await.expect("set the batch");
+
+        assert_eq!(records.lookup(&key(1, 1)).await, Lookup::Recorded(100));
+        assert!(matches!(
+            records.lookup(&key(1, 2)).await,
+            Lookup::Missing(_)
+        ));
+        assert_eq!(records.lookup(&key(9, 1)).await, Lookup::Recorded(900));
+        assert!(records.has_changed());
+        assert!(!records.is_dirty(), "no shard to write back");
     })
     .await;
 }
@@ -788,13 +821,22 @@ where
     Fut: std::future::Future<Output = ()> + Send,
 {
     let files: Vec<String> = files.iter().map(|file| file.to_string()).collect();
+    in_execution_with(args, async move {
+        let (repository, tempdir) = committed_repository("", &files).await;
+        test(repository, tempdir.to_path_buf()).await;
+        drop(tempdir);
+    })
+    .await;
+}
+
+/// Runs `body` in the execution context of a command given `args`.
+async fn in_execution_with(
+    args: LoreGlobalArgs,
+    body: impl std::future::Future<Output = ()> + Send + 'static,
+) {
     #[allow(clippy::disallowed_methods)]
     runtime()
-        .spawn(LORE_CONTEXT.scope(test_execution_with(args), async move {
-            let (repository, tempdir) = committed_repository("", &files).await;
-            test(repository, tempdir.to_path_buf()).await;
-            drop(tempdir);
-        }))
+        .spawn(LORE_CONTEXT.scope(test_execution_with(args), body))
         .await
         .expect("Test task failed");
 }
@@ -1071,30 +1113,273 @@ async fn a_failed_store_flush_writes_no_records() {
     .await;
 }
 
-/// An in-memory instance keeps its records in the mutable store.
-#[tokio::test]
-async fn an_in_memory_instance_keeps_its_records_in_the_store() {
-    let args = LoreGlobalArgs {
+/// The arguments of a command over an instance whose stores are in memory.
+fn in_memory_args() -> LoreGlobalArgs {
+    LoreGlobalArgs {
         in_memory: 1,
         ..LoreGlobalArgs::default()
-    };
-    in_repository_with(args, &[], |repository, path| async move {
-        assert!(repository.instance_records().is_none());
+    }
+}
+
+/// An in-memory instance keeps its records in memory beside its stores: a commit, a time recorded
+/// and a batch reach them, and neither its mutable store nor its Lore directory holds any.
+#[tokio::test]
+async fn an_in_memory_instance_keeps_its_records_in_memory() {
+    in_repository_with(in_memory_args(), &[], |repository, path| async move {
+        let committed = relative_path("committed.file");
+        let committed_path = path.join("committed.file");
+        test_file_write(&committed_path, b"committed");
+        std::fs::File::options()
+            .write(true)
+            .open(&committed_path)
+            .and_then(|file| {
+                file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1 << 30))
+            })
+            .expect("date the file before any clock the commit reads");
+        stage_paths(&repository, &path, &["committed.file"], true, false).await;
+        assert!(matches!(
+            instance_record(&repository, &committed).await,
+            Lookup::Missing(_)
+        ));
+        lore_revision::commit::commit_boxed(
+            repository.clone(),
+            repository
+                .try_write_token()
+                .expect("the repository is open for writing"),
+            lore_revision::commit::CommitOptions::new("Commit".to_string()),
+        )
+        .await
+        .expect("commit");
+        assert_eq!(
+            instance_record(&repository, &committed).await,
+            Lookup::Recorded((1 << 30) * 1000),
+            "the commit recorded the file's time"
+        );
+
         let file = relative_path("in-memory.file");
         state::file_modified_time_store(repository.clone(), &file, 5678).await;
-        assert_eq!(store_time(&repository, &file).await, 5678);
         assert_eq!(
             state::file_modified_time(repository.clone(), &file).await,
             5678
         );
+        assert_eq!(store_time(&repository, &file).await, 0, "not in the store");
         state::file_modified_time_clear(repository.clone(), &file).await;
-        assert_eq!(store_time(&repository, &file).await, 0);
-        assert!(
-            !path
-                .join(lore_revision::repository::DOT_LORE)
-                .join(RECORDS_DIR)
-                .exists()
+        assert_eq!(
+            state::file_modified_time(repository.clone(), &file).await,
+            0
         );
+
+        let cloned = relative_path("cloned.file");
+        let collected = state::RecordedModifiedTimes::default();
+        collected.push(state::file_modified_time_entry(&repository, &cloned, 6789));
+        collected.store(repository.clone()).await;
+        assert_eq!(
+            instance_record(&repository, &cloned).await,
+            Lookup::Recorded(6789)
+        );
+        assert_eq!(
+            store_time(&repository, &cloned).await,
+            0,
+            "not in the store"
+        );
+
+        repository
+            .flush(FlushOptions::default())
+            .await
+            .expect("flush the instance");
+        assert!(!path.join(DOT_LORE).join(RECORDS_DIR).exists());
+    })
+    .await;
+}
+
+/// Every context over an in-memory instance's stores shares its records, which the process keeps
+/// with the stores until it releases them.
+#[tokio::test]
+async fn contexts_over_an_in_memory_instance_share_its_records() {
+    in_repository_with(in_memory_args(), &[], |repository, path| async move {
+        let file = relative_path("shared.file");
+        state::file_modified_time_store(repository.clone(), &file, 5678).await;
+        let other = load_and_connect(&path, RepositoryAccess::ReadOnly)
+            .await
+            .expect("open the instance again");
+        let records = repository
+            .instance_records()
+            .expect("the instance keeps its records in memory");
+        assert!(Arc::ptr_eq(
+            records,
+            other
+                .instance_records()
+                .expect("the instance keeps its records in memory")
+        ));
+        assert_eq!(state::file_modified_time(other.clone(), &file).await, 5678);
+
+        let records = Arc::downgrade(records);
+        drop((repository, other));
+        assert!(
+            records.upgrade().is_some(),
+            "kept for the instance's next command"
+        );
+        repository_release(&path);
+        assert!(records.upgrade().is_none(), "released with the stores");
+    })
+    .await;
+}
+
+/// Opens of an instance with in-memory stores that both find none of its stores cached share the
+/// stores and records the first of them creates, which the cache keeps.
+#[tokio::test]
+async fn racing_first_opens_of_an_in_memory_instance_share_its_records() {
+    in_repository(|repository, path| async move {
+        drop(repository);
+        let (reached, mut missed) = tokio::sync::mpsc::unbounded_channel();
+        let open_held = |resume: Arc<tokio::sync::Notify>| {
+            let path = path.clone();
+            lore_spawn!(LORE_CONTEXT.scope(
+                test_execution_with(in_memory_args()),
+                hold_in_memory_store_misses(reached.clone(), resume, async move {
+                    load_and_connect(&path, RepositoryAccess::ReadOnly).await
+                }),
+            ))
+        };
+        let (first_resume, second_resume) = (Arc::default(), Arc::default());
+        let first = open_held(Arc::clone(&first_resume));
+        let within = std::time::Duration::from_secs(10);
+        assert!(
+            matches!(
+                tokio::time::timeout(within, missed.recv()).await,
+                Ok(Some(()))
+            ),
+            "the first open finds no stores cached"
+        );
+        let second = open_held(Arc::clone(&second_resume));
+        assert!(
+            matches!(
+                tokio::time::timeout(within, missed.recv()).await,
+                Ok(Some(()))
+            ),
+            "the second open finds no stores cached"
+        );
+
+        first_resume.notify_one();
+        let first = first
+            .await
+            .expect("the first open ran")
+            .expect("open the instance");
+        second_resume.notify_one();
+        let second = second
+            .await
+            .expect("the second open ran")
+            .expect("open the instance");
+        let records = first
+            .instance_records()
+            .expect("the instance keeps its records in memory");
+        assert!(Arc::ptr_eq(
+            records,
+            second
+                .instance_records()
+                .expect("the instance keeps its records in memory")
+        ));
+        let cached =
+            get_cached_in_memory_stores(&path.join(DOT_LORE)).expect("the stores are cached");
+        assert!(Arc::ptr_eq(records, &cached.records));
+        drop((first, second, cached));
+        repository_release(&path);
+    })
+    .await;
+}
+
+/// The context that creates an in-memory instance records in the set cached beside its stores,
+/// which the instance's later commands share.
+#[tokio::test]
+async fn creating_an_in_memory_instance_records_beside_its_stores() {
+    in_execution_with(in_memory_args(), async {
+        let tempdir = crate::helper::generate_tempdir();
+        let path = tempdir.to_path_buf();
+        let token = RepositoryWriteToken::acquire(&path).await;
+        let created = lore_revision::repository::create_local(
+            &path,
+            &token,
+            lore_revision::lore::RepositoryId::from(uuid::Uuid::now_v7()),
+            lore_revision::lore::BranchId::from(uuid::Uuid::now_v7()),
+            lore_revision::branch::DEFAULT_DEFAULT_NAME.to_string(),
+            RepositoryConfig::default(),
+            false,
+        )
+        .await
+        .expect("create the instance");
+        let cached = get_cached_in_memory_stores(&path.join(DOT_LORE))
+            .expect("the instance's stores are cached");
+        assert!(Arc::ptr_eq(
+            created
+                .instance_records()
+                .expect("the instance keeps its records in memory"),
+            &cached.records
+        ));
+        drop((created, cached, token));
+        repository_release(&path);
+    })
+    .await;
+}
+
+/// A command over an instance with in-memory stores keeps its records apart from the set in the
+/// instance's Lore directory, where it shares the repository lock a command over the stores on
+/// disk took, and writes none of that lock's records back: its flush does not reach the stores on
+/// disk they describe.
+#[tokio::test]
+async fn an_in_memory_command_keeps_its_records_apart_from_the_lore_directory() {
+    in_repository(|repository, path| async move {
+        let on_disk = load_and_connect(&path, RepositoryAccess::ReadOnly)
+            .await
+            .expect("open the instance");
+        drop(repository);
+        let in_memory = LORE_CONTEXT
+            .scope(
+                test_execution_with(in_memory_args()),
+                load_and_connect(&path, RepositoryAccess::ReadWrite),
+            )
+            .await
+            .expect("open the instance with in-memory stores");
+        let on_disk_records = on_disk
+            .instance_records()
+            .expect("the instance keeps its records on disk");
+        assert!(!Arc::ptr_eq(
+            on_disk_records,
+            in_memory
+                .instance_records()
+                .expect("the command keeps its records in memory")
+        ));
+
+        let file = relative_path("apart.file");
+        state::file_modified_time_store(in_memory.clone(), &file, 5678).await;
+        assert_eq!(
+            state::file_modified_time(in_memory.clone(), &file).await,
+            5678
+        );
+        assert_eq!(state::file_modified_time(on_disk.clone(), &file).await, 0);
+
+        on_disk_records.set(key(4, 1), 400).await;
+        in_memory
+            .flush(FlushOptions::default())
+            .await
+            .expect("flush the in-memory stores");
+        in_memory
+            .write_back_instance_records()
+            .await
+            .expect("write back the records");
+        assert!(
+            on_disk_records.is_dirty(),
+            "left to the commands over the stores on disk"
+        );
+        in_memory.try_spawn_post_command_flush(FlushOptions::default());
+        drop(in_memory);
+        // A flush that writes the records back holds a sibling of the instance's token until it
+        // ends.
+        drop(RepositoryWriteToken::acquire(&path).await);
+        assert!(
+            on_disk_records.is_dirty(),
+            "left to the commands over the stores on disk"
+        );
+        repository_release(&path);
     })
     .await;
 }
@@ -1202,10 +1487,11 @@ async fn clearing_removes_the_record_and_zeroes_an_older_instances_store_record(
     .await;
 }
 
-/// Only SWFS and in-memory instances keep their records in the store. Every other instance,
-/// a FUSE mount included, keeps them in its Lore directory.
+/// SWFS instances keep their records in the mutable store, other instances whose stores are in
+/// memory keep them in memory, and every other instance, a FUSE mount included, in its Lore
+/// directory.
 #[test]
-fn only_swfs_and_in_memory_instances_keep_their_records_in_the_store() {
+fn each_instance_keeps_its_records_where_its_kind_and_its_stores_say() {
     for vfs_type in [VfsType::None, VfsType::Fuse, VfsType::Swfs] {
         let config = RepositoryConfig {
             vfs: Some(VfsConfig {
@@ -1214,14 +1500,17 @@ fn only_swfs_and_in_memory_instances_keep_their_records_in_the_store() {
             }),
             ..RepositoryConfig::default()
         };
-        assert_eq!(
-            keeps_records_on_disk(&config, false),
-            vfs_type != VfsType::Swfs,
-            "{vfs_type}"
-        );
-        assert!(
-            !keeps_records_on_disk(&config, true),
-            "{vfs_type} in memory"
-        );
+        for in_memory in [false, true] {
+            let expected = match (vfs_type, in_memory) {
+                (VfsType::Swfs, _) => RecordsLocation::MutableStore,
+                (_, true) => RecordsLocation::Memory,
+                _ => RecordsLocation::DotDirectory,
+            };
+            assert_eq!(
+                records_location(&config, in_memory),
+                expected,
+                "{vfs_type}, in memory: {in_memory}"
+            );
+        }
     }
 }

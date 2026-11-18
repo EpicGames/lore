@@ -123,12 +123,12 @@ pub fn statfs(ctx: &AttrContext, tree_bytes: u64, node_slots: u64) -> Kstatfs {
 /// The modification times of the files a mount serves from the store: for each path, the time it
 /// took the content it holds.
 ///
-/// They are the instance's modified-time records ([`InstanceRecords`]), the set its commands
-/// share: a swap records its time for each path it changes, before it publishes, an operation
-/// that serves files from the store again sets its time for each before it serves it and writes
-/// them back as it ends, and a commit records the time it read for each file it stores. The
-/// mount's scans compare addresses and read no record, so a record only answers what the mount
-/// reports. A copy of the Lore directory carries them.
+/// They are the instance's modified-time records ([`InstanceRecords`]), the set its commands over
+/// stores on disk share: a swap records its time for each path it changes, before it publishes,
+/// an operation that serves files from the store again sets its time for each before it serves it
+/// and writes them back as it ends, and a commit records the time it read for each file it
+/// stores. The mount's scans compare addresses and read no record, so a record only answers what
+/// the mount reports. A copy of the Lore directory carries them.
 ///
 /// A new instance records none, so until a time is recorded every path reports the base time and
 /// no lookup is made. The gate opens at mount where the records hold a shard file, and once a time
@@ -142,7 +142,7 @@ pub struct RecordedTimes {
 
 impl RecordedTimes {
     /// Opens the times of the instance whose Lore directory is `dot_path`: its records, the set its
-    /// commands share.
+    /// commands over stores on disk share.
     pub async fn load(dot_path: &Path) -> Self {
         let records = InstanceRecords::open(dot_path).await;
         let stored = records.has_shard_files().await;

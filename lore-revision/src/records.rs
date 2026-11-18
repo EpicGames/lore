@@ -2,15 +2,17 @@
 // SPDX-License-Identifier: MIT
 
 //! The modified times an instance has recorded for the files of its working tree, kept in the
-//! instance's own dot directory.
+//! instance's own dot directory, or in memory for an instance whose stores are in memory.
 //!
 //! A record states that a path held the current revision's content at a modification time, so a
 //! scan can skip hashing a file whose time still matches. A virtual clone's mount reports the time
 //! as the modification time of a file it serves from the store, and its scans compare addresses,
 //! reading no record. Only the instance reads its records: the commands holding its repository
 //! lock and its mount, which share one set per directory in a process
-//! ([`InstanceRecords::open_canonical`]). A record's key is taken from the path and not the
-//! instance, so a copy of the dot directory carries records that describe the copy's files.
+//! ([`InstanceRecords::open_canonical`]). An instance whose stores are in memory keeps a set beside
+//! them that no file holds ([`InstanceRecords::in_memory`]). A record's key is taken from the path
+//! and not the instance, so a copy of the dot directory carries records that describe the copy's
+//! files.
 //!
 //! The records are split into shards by the first byte of the key. A shard is an array of 24-byte
 //! records sorted by key, and its file is a header followed by the same bytes. A record whose time
@@ -186,8 +188,9 @@ impl Shard {
         }
     }
 
-    /// The latest time `pending` holds for `key`, 0 where it holds none. `pending` is empty once
-    /// the shard has merged, so only a lookup while times wait to be merged scans it.
+    /// The latest time `pending` holds for `key`, 0 where it holds none. `pending` holds none once
+    /// the shard has merged, as a batch, a write-back and a time set past [`Self::merge_if_due`]'s
+    /// threshold merge it.
     fn pending_time(&self, key: &RecordKey) -> u64 {
         self.pending
             .iter()
@@ -283,10 +286,12 @@ struct ShardSlot {
 }
 
 /// One instance's records, loaded a shard at a time as keys reach them and written back by
-/// [`write_back`](Self::write_back).
+/// [`write_back`](Self::write_back), or kept in memory alone ([`Self::in_memory`]).
 pub struct InstanceRecords {
-    directory: PathBuf,
-    /// Whether the instance is marked as one that has never kept records in the mutable store.
+    /// The directory the shard files are kept in, or `None` for records kept in memory alone.
+    directory: Option<PathBuf>,
+    /// Whether the instance is marked as one that has never kept records in the mutable store, as
+    /// records kept in memory always are.
     no_store_records: bool,
     /// Set by the first change, never cleared.
     changed: AtomicBool,
@@ -323,7 +328,25 @@ impl InstanceRecords {
             .metadata(directory.join(NO_STORE_RECORDS))
             .await
             .is_ok();
-        let records = Arc::new(Self {
+        let records = Arc::new(Self::new(Some(directory.clone()), no_store_records));
+        let mut open = OPEN_RECORDS.lock();
+        if let Some(opened) = open_records(&open, &directory) {
+            return opened;
+        }
+        open.retain(|(_, records)| records.strong_count() > 0);
+        open.push((directory, Arc::downgrade(&records)));
+        records
+    }
+
+    /// Records kept in memory alone, for an instance whose stores are in memory and which end
+    /// with them. They start empty, read no file and no mutable store, and no change marks a
+    /// shard to write back.
+    pub fn in_memory() -> Arc<Self> {
+        Arc::new(Self::new(None, true))
+    }
+
+    fn new(directory: Option<PathBuf>, no_store_records: bool) -> Self {
+        Self {
             directory,
             no_store_records,
             changed: AtomicBool::new(false),
@@ -339,14 +362,7 @@ impl InstanceRecords {
             loads: AtomicUsize::new(0),
             #[cfg(feature = "test-util")]
             lookup_pause: crate::test_util::ArmedPause::default(),
-        });
-        let mut open = OPEN_RECORDS.lock();
-        if let Some(opened) = open_records(&open, &records.directory) {
-            return opened;
         }
-        open.retain(|(_, records)| records.strong_count() > 0);
-        open.push((records.directory.clone(), Arc::downgrade(&records)));
-        records
     }
 
     /// The record key taken from a hash of the path.
@@ -473,7 +489,7 @@ impl InstanceRecords {
 
     /// Writes every shard changed since it was loaded or last written, all at once, each synced to
     /// disk before it replaces its file where `durable`. `hold` is kept until each write has
-    /// landed, whether or not this call is still awaited.
+    /// landed, whether or not this call is still awaited. Records kept in memory write nothing.
     ///
     /// # Errors
     ///
@@ -485,11 +501,11 @@ impl InstanceRecords {
         durable: bool,
         hold: H,
     ) -> std::io::Result<()> {
-        if !self.is_dirty() {
+        let Some(directory) = self.directory.as_ref().filter(|_| self.is_dirty()) else {
             return Ok(());
-        }
+        };
         lore_io::IoDriver::global()
-            .create_dir_all(&self.directory)
+            .create_dir_all(directory)
             .await?;
         let mut tasks = JoinSet::new();
         for index in 0..SHARD_COUNT {
@@ -507,9 +523,12 @@ impl InstanceRecords {
     }
 
     /// Whether the directory holds a shard file, read from its listing without loading a shard.
-    /// A directory that cannot be listed holds none.
+    /// A directory that cannot be listed, and records kept in memory, hold none.
     pub async fn has_shard_files(&self) -> bool {
-        let Ok(mut entries) = lore_io::IoDriver::global().read_dir(&self.directory).await else {
+        let Some(directory) = &self.directory else {
+            return false;
+        };
+        let Ok(mut entries) = lore_io::IoDriver::global().read_dir(directory).await else {
             return false;
         };
         loop {
@@ -547,17 +566,17 @@ impl InstanceRecords {
         &self.lookup_pause
     }
 
+    /// Marks the records changed, and shard `index` as holding a change its file does not, where
+    /// they are kept in a directory.
     fn mark_dirty(&self, index: u8) {
-        self.shards[index as usize]
-            .dirty
-            .store(true, Ordering::Release);
+        if self.directory.is_some() {
+            self.shards[index as usize]
+                .dirty
+                .store(true, Ordering::Release);
+        }
         if !self.changed.load(Ordering::Relaxed) {
             self.changed.store(true, Ordering::Release);
         }
-    }
-
-    fn shard_path(&self, index: u8) -> PathBuf {
-        self.directory.join(format!("{index:02x}"))
     }
 
     /// Applies `change` to shard `index` under its write lock. Where the shard is loaded and no
@@ -584,23 +603,28 @@ impl InstanceRecords {
         shard
     }
 
+    /// Reads shard `index` from its file into `shard`. A shard of records kept in memory has no
+    /// file, and starts empty.
     async fn load(&self, index: u8, shard: &mut Shard) {
-        #[cfg(feature = "test-util")]
-        self.loads.fetch_add(1, Ordering::Relaxed);
-        match read_shard(&self.shard_path(index), index).await {
-            Ok(records) => {
-                shard.removed = records.iter().filter(|record| record.mtime() == 0).count();
-                shard.records = records;
-            }
-            Err(ShardError::Absent) => {}
-            Err(ShardError::Unreadable) => {
-                lore_warn!(
-                    "Ignoring unreadable modified time records {}",
-                    self.shard_path(index).display()
-                );
-                // Replaced at the next write-back, so no record it still holds outlives a change
-                // this client made to the path.
-                self.mark_dirty(index);
+        if let Some(directory) = &self.directory {
+            #[cfg(feature = "test-util")]
+            self.loads.fetch_add(1, Ordering::Relaxed);
+            let path = shard_path(directory, index);
+            match read_shard(&path, index).await {
+                Ok(records) => {
+                    shard.removed = records.iter().filter(|record| record.mtime() == 0).count();
+                    shard.records = records;
+                }
+                Err(ShardError::Absent) => {}
+                Err(ShardError::Unreadable) => {
+                    lore_warn!(
+                        "Ignoring unreadable modified time records {}",
+                        path.display()
+                    );
+                    // Replaced at the next write-back, so no record it still holds outlives a
+                    // change this client made to the path.
+                    self.mark_dirty(index);
+                }
             }
         }
         shard.deserialized = true;
@@ -612,7 +636,7 @@ impl InstanceRecords {
     /// Writes shard `index` beside its file and renames it over, so a reader or a crash never
     /// sees a partial shard, syncing it first where `durable`. The shard stays read-locked until
     /// the write has its bytes, and the shard's `writing` lock and `hold` are kept until the file
-    /// has landed.
+    /// has landed. Records kept in memory write nothing.
     #[lore_macro::test_pub]
     async fn write_shard_file<H: Send + 'static>(
         self: Arc<Self>,
@@ -627,6 +651,9 @@ impl InstanceRecords {
         }
         let mut failure = SerializeFailureGuard::new(&slot.dirty);
         let mut shard = Arc::clone(&slot.shard).write_owned().await;
+        let Some(directory) = &self.directory else {
+            return Ok(());
+        };
         shard.merge();
         let segments = ShardWriteSegments {
             header: Box::new(header()),
@@ -634,8 +661,8 @@ impl InstanceRecords {
         };
         lore_io::IoDriver::global()
             .write_file_segments_atomic(
-                self.directory.join(format!("{index:02x}.tmp")),
-                self.shard_path(index),
+                directory.join(format!("{index:02x}.tmp")),
+                shard_path(directory, index),
                 &lore_io::OpenOptions::new()
                     .write(true)
                     .create(true)
@@ -698,6 +725,11 @@ fn open_records(
     open.iter()
         .filter(|(path, _)| path == directory)
         .find_map(|(_, records)| records.upgrade())
+}
+
+/// The path of shard `index`'s file in `directory`.
+fn shard_path(directory: &Path, index: u8) -> PathBuf {
+    directory.join(format!("{index:02x}"))
 }
 
 /// Whether `name` is the name of a shard file: the shard's index as two hexadecimal digits.

@@ -1746,11 +1746,12 @@ its tracked node by size first, then modification time, and only by content hash
 when the size matches but the recorded modification time differs. The per-file
 modification time is held in the instance's own Lore directory, in `.lore/records/`,
 keyed by path, rather than on the tree node - so the common case (size and mtime
-unchanged) is confirmed unmodified without ever reading the file's bytes. An SWFS or
-in-memory instance keeps its times in the local mutable store, keyed by instance and
-path, and an instance an older client created still reads a time from there when its
-own records hold none. This is what keeps a full scan linear in file count rather than
-in total bytes: most files are dismissed on metadata alone.
+unchanged) is confirmed unmodified without ever reading the file's bytes. An SWFS
+instance keeps its times in the local mutable store, keyed by instance and path, any
+other instance whose stores are in memory keeps them in memory beside its stores until
+the process releases them, and an instance an older client created still reads a time from
+the mutable store when its own records hold none. This is what keeps a full scan linear
+in file count rather than in total bytes: most files are dismissed on metadata alone.
 
 A FUSE instance compares no file by time. It holds the working tree as a state tree, so
 a scan diffs addresses and descends only where either side is dirty, and a single file is

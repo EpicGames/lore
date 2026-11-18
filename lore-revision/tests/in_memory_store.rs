@@ -7,6 +7,8 @@ mod tests {
     use bytes::Bytes;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::lore::*;
+    use lore_revision::records::InstanceRecords;
+    use lore_revision::repository::InMemoryStores;
     use lore_revision::repository::cache_in_memory_stores;
     use lore_revision::repository::create_client_memory_stores;
     use lore_revision::repository::get_cached_in_memory_stores;
@@ -192,7 +194,14 @@ mod tests {
                 .expect("Failed to put immutable value");
 
                 // Cache the stores
-                cache_in_memory_stores(dot_path.clone(), imm, mut_);
+                cache_in_memory_stores(
+                    dot_path.clone(),
+                    InMemoryStores {
+                        immutable: imm,
+                        mutable: mut_,
+                        records: InstanceRecords::in_memory(),
+                    },
+                );
 
                 // Verify the cache is populated
                 assert!(
@@ -213,7 +222,14 @@ mod tests {
                 let (new_imm, new_mut) = create_client_memory_stores()
                     .await
                     .expect("Failed to create new in-memory stores");
-                cache_in_memory_stores(dot_path.clone(), new_imm.clone(), new_mut.clone());
+                cache_in_memory_stores(
+                    dot_path.clone(),
+                    InMemoryStores {
+                        immutable: new_imm.clone(),
+                        mutable: new_mut.clone(),
+                        records: InstanceRecords::in_memory(),
+                    },
+                );
 
                 // Mutable store should not contain the previously stored value
                 let load_result = new_mut

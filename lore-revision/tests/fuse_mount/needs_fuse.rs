@@ -116,6 +116,70 @@ async fn create_local_with_fuse_mounts_and_lists_empty_root() {
     .await;
 }
 
+/// **The contexts over a FUSE instance's in-memory stores carry the records cached beside them**:
+/// the one `create_local` returns once the instance is mounted, and the one that serves the mount
+/// once it moves, as every context over the stores does.
+#[tokio::test(flavor = "multi_thread")]
+async fn contexts_over_an_in_memory_fuse_instance_carry_its_cached_records() {
+    skip_without_fuse!();
+    let _serial = SERIAL.lock().await;
+    service_execution().await;
+    let execution = helper::test_execution_with(lore_revision::interface::LoreGlobalArgs {
+        in_memory: 1,
+        ..lore_revision::interface::LoreGlobalArgs::default()
+    });
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let (_store_dir, store) = canonical_dir("lore-fuse-mount-store-");
+        let (_dir, path) = canonical_dir("lore-fuse-mount-in-memory-");
+        let (_target_dir, target_parent) = canonical_dir("lore-fuse-mount-in-memory-target-");
+        let target = target_parent.join("moved");
+        let _guard = MountGuard(path.clone());
+        let _target_guard = MountGuard(target.clone());
+
+        let (repository, _token) = create_instance(
+            &path,
+            RepositoryId::from(uuid::Uuid::now_v7()),
+            shared_store_config(&store, VfsType::Fuse),
+        )
+        .await;
+        let dot_dir = repository
+            .dot_dir_path()
+            .expect("the instance has a Lore directory")
+            .to_path_buf();
+        let cached = lore_revision::repository::get_cached_in_memory_stores(&dot_dir)
+            .expect("the instance's stores are cached");
+        assert!(Arc::ptr_eq(
+            repository
+                .instance_records()
+                .expect("the context carries the instance's records"),
+            &cached.records
+        ));
+
+        let manager = MountManagerState::mount_manager().expect("manager is initialised");
+        manager
+            .fuse()
+            .move_mount(repository.instance_id, &path, &target)
+            .await
+            .expect("the mount moves");
+        assert!(Arc::ptr_eq(
+            served_repository(&manager, &target)
+                .instance_records()
+                .expect("the moved mount's context carries the instance's records"),
+            &cached.records
+        ));
+
+        manager
+            .fuse()
+            .unmount(&target, false)
+            .await
+            .expect("an idle mount unmounts");
+        lore_revision::repository::repository_release(
+            dot_dir.parent().expect("the Lore directory has a parent"),
+        );
+    }))
+    .await;
+}
+
 /// **A mounted instance holds its stores for as long as it is mounted.** The kernel's requests
 /// arrive outside any command, so the mount claims the stores as a command does for its duration,
 /// and lets them go once it is unmounted and nothing serves through it. A context it served

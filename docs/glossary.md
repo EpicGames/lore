@@ -466,7 +466,7 @@ Also see: conflict, resolve.
 
 ### Modified-time record
 
-The time at which a file of an instance last held its revision's content, kept so a scan can skip hashing a file whose time has not moved: in the instance's Lore directory, or in the mutable store for an SWFS or in-memory instance. A FUSE instance's mount reports the record as the modification time of a file it serves from the store, and its scans read none. Cloning an instance carries over its source's records.
+The time at which a file of an instance last held its revision's content, kept so a scan can skip hashing a file whose time has not moved. Cloning an instance carries over its source's records.
 
 Also see: repository instance, scan.
 
