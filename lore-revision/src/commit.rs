@@ -1280,6 +1280,7 @@ async fn commit_link_only(
         &repository,
         &state_parent_staged,
         Some(resolved_staged.link_reference.local_node),
+        &link::Mount::root(),
     )
     .await?;
 
@@ -1338,29 +1339,19 @@ async fn commit_link_only(
             format!("Failed to deserialize revision state {link_staged_revision}")
         })?;
     let Ok(link_mount_path) = RelativePath::from_str(&link_path);
-    if let Some(conflict) = unresolved_link_conflict(&link_repository, &link_state_staged).await? {
-        return Err(link_conflict(
-            &link_repository,
-            &link_state_staged,
-            (&link_mount_path, resolved_staged.link_node.child),
-            conflict,
-        )
-        .await);
-    }
-    let source = link::link_source_path(
-        link_repository.clone(),
+    let link_mount = link::Mount::of_link(
+        &link_repository,
         &link_state_staged,
         resolved_staged.link_node.child,
+        link_mount_path,
     )
     .await
     .forward::<CommitError>("Failed resolving the path the link exposes")?;
-    reject_unresolved_link_merge_conflicts(
+    reject_unresolved_link_tree(
         &link_repository,
         &link_state_staged,
-        &link::Mount {
-            path: link_mount_path.clone(),
-            source,
-        },
+        &link_mount,
+        resolved_staged.link_node.child,
     )
     .await?;
 
@@ -1399,7 +1390,7 @@ async fn commit_link_only(
         link_state_current.clone(),
         link_state_staged.clone(),
         link_built_on,
-        link_mount_path,
+        link_mount.path,
         resolved_staged.link_node.child,
         metadata,
         Arc::new(HashMap::new()),
@@ -1844,7 +1835,7 @@ async fn commit_staged_revision(
         }
     }
 
-    reject_unresolved_link_pins(&repository, &state_staged, None).await?;
+    reject_unresolved_link_pins(&repository, &state_staged, None, &link::Mount::root()).await?;
 
     // A merge reconciling divergent history is staged on its second parent, and a state moved onto
     // another revision keeps the node IDs of the one it was staged on.
@@ -2769,23 +2760,32 @@ struct FileToCommit {
 /// A commit drops the merge's link rows, so a row still awaiting the user's choice has to be
 /// refused before the record of it is gone. Link rows carry no node flags, so the walk that
 /// rejects an unresolved file cannot see them. With `only`, just the row of that link node counts.
+/// `mount` is where the working tree materializes `state_staged`'s repository.
 ///
 /// Only an open merge records link rows, so their read is boxed rather than held by every commit.
 async fn reject_unresolved_link_pins(
     repository: &Arc<RepositoryContext>,
-    state_staged: &Arc<State>,
+    state_staged: &State,
     only: Option<NodeID>,
+    mount: &link::Mount,
 ) -> Result<(), CommitError> {
     if state_staged.link_merge_hash().is_zero() {
         return Ok(());
     }
-    Box::pin(reject_recorded_link_pins(repository, state_staged, only)).await
+    Box::pin(reject_recorded_link_pins(
+        repository,
+        state_staged,
+        only,
+        mount,
+    ))
+    .await
 }
 
 async fn reject_recorded_link_pins(
     repository: &Arc<RepositoryContext>,
-    state_staged: &Arc<State>,
+    state_staged: &State,
     only: Option<NodeID>,
+    mount: &link::Mount,
 ) -> Result<(), CommitError> {
     let entries = state_staged
         .deserialize_link_merge_state(repository.clone())
@@ -2802,8 +2802,11 @@ async fn reject_recorded_link_pins(
         .link_merge_entry_path(repository.clone(), entry)
         .await
         .forward::<CommitError>("Failed resolving link node path")?;
-
-    Err(Conflict { path }.into())
+    let Ok(path) = RelativePath::from_str(&path);
+    Err(Conflict {
+        path: mount.spell(&path).unwrap_or(path).to_string(),
+    }
+    .into())
 }
 
 /// A commit walk clears the flags of every node it freezes, so a conflict has to be refused before
@@ -2820,8 +2823,9 @@ fn reject_unresolved_conflict(node: &Node, path: &str) -> Result<(), CommitError
 
 /// Refuses the commit of `state`, which the working tree materializes at `mount`, where a link it
 /// merges, or a link nested in one that the merge merged too, holds a conflict not resolved
-/// anywhere in the linked tree, or a link row still awaiting the user's choice. The walks refuse each conflict they meet as well, but only once
-/// the links committed beside it, and the files met before it, are written.
+/// anywhere in the linked tree, or a row of a nested link still awaiting the user's choice. The
+/// walks refuse each conflict they meet as well, but only once the links committed beside it, and
+/// the files met before it, are written.
 async fn reject_unresolved_link_merge_conflicts(
     repository: &Arc<RepositoryContext>,
     state: &State,
@@ -2831,18 +2835,7 @@ async fn reject_unresolved_link_merge_conflicts(
         .deserialize_link_merge_state(repository.clone())
         .await
         .forward::<CommitError>("Failed reading link merge state")?;
-    for entry in merged {
-        if entry.is_conflict() {
-            if entry.is_unresolved() {
-                let path = path_for_message(repository, state, entry.local_node).await;
-                let Ok(path) = RelativePath::from_str(&path);
-                return Err(Conflict {
-                    path: mount.spell(&path).unwrap_or(path).to_string(),
-                }
-                .into());
-            }
-            continue;
-        }
+    for entry in merged.iter().filter(|entry| !entry.is_conflict()) {
         let link_node = {
             let block = state
                 .block(repository.clone(), NodeBlock::index(entry.local_node))
@@ -2860,30 +2853,39 @@ async fn reject_unresolved_link_merge_conflicts(
             .forward::<CommitError>("Failed to deserialize link state")?;
         let path = path_for_message(repository, state, entry.local_node).await;
         let Ok(path) = RelativePath::from_str(&path);
-        let link_mount = mount.spell(&path).unwrap_or(path);
-        if let Some(conflict) = unresolved_link_conflict(&link_repository, &link_state).await? {
-            return Err(link_conflict(
-                &link_repository,
-                &link_state,
-                (&link_mount, link.node),
-                conflict,
-            )
-            .await);
-        }
-        let source = link::link_source_path(link_repository.clone(), &link_state, link.node)
-            .await
-            .forward::<CommitError>("Failed resolving the path the link exposes")?;
-        Box::pin(reject_unresolved_link_merge_conflicts(
+        let link_mount = link::Mount::of_link(
             &link_repository,
             &link_state,
-            &link::Mount {
-                path: link_mount,
-                source,
-            },
-        ))
-        .await?;
+            link.node,
+            mount.spell(&path).unwrap_or(path),
+        )
+        .await
+        .forward::<CommitError>("Failed resolving the path the link exposes")?;
+        reject_unresolved_link_tree(&link_repository, &link_state, &link_mount, link.node).await?;
     }
     Ok(())
+}
+
+/// Refuses the commit of `link_state`, a link's merge mounting its `node` at `mount`, where it
+/// holds a conflict, a row awaiting the user's choice, or such a link nested in it.
+async fn reject_unresolved_link_tree(
+    link_repository: &Arc<RepositoryContext>,
+    link_state: &Arc<State>,
+    mount: &link::Mount,
+    node: NodeID,
+) -> Result<(), CommitError> {
+    if let Some(conflict) = unresolved_link_conflict(link_repository, link_state).await? {
+        return Err(
+            link_conflict(link_repository, link_state, (&mount.path, node), conflict).await,
+        );
+    }
+    reject_unresolved_link_pins(link_repository, link_state, None, mount).await?;
+    Box::pin(reject_unresolved_link_merge_conflicts(
+        link_repository,
+        link_state,
+        mount,
+    ))
+    .await
 }
 
 /// The refusal of `conflict` in `state`, a linked repository's, named as a walk of the link at
@@ -7966,7 +7968,7 @@ pub async fn commit_in_memory_revision(
         .forward::<CommitError>("Revision state is not valid to commit")
         .map_err(InMemoryCommitFailure::rejected)?;
 
-    reject_unresolved_link_pins(&repository, &state_staged, None)
+    reject_unresolved_link_pins(&repository, &state_staged, None, &link::Mount::root())
         .await
         .map_err(InMemoryCommitFailure::rejected)?;
 

@@ -5082,6 +5082,64 @@ struct LinkGroup {
     link_branch: BranchId,
 }
 
+/// Whether the link mounted at `mount` inside `group`'s link, mounting `node_link`, was merged with
+/// it and holds something its merge left to resolve.
+async fn nested_link_holds_a_merge(
+    group: &LinkGroup,
+    mount: &RelativePath,
+    node_link: NodeLink,
+) -> Result<bool, StageError> {
+    let Some(below) = mount.below(&group.link_path_rel) else {
+        return Ok(false);
+    };
+    let in_link = group.source_path.join(below);
+    let Some((local_node, link_node)) = crate::link::link_node_to(
+        &group.link_state_staged,
+        &group.link_context,
+        in_link.as_str(),
+        node_link.repository,
+    )
+    .await
+    .forward::<StageError>("Failed to read a nested link")?
+    else {
+        return Ok(false);
+    };
+    let merged = group
+        .link_state_staged
+        .deserialize_link_merge_state(group.link_context.clone())
+        .await
+        .forward::<StageError>("Failed to read the link's link merge state")?;
+    if !merged
+        .iter()
+        .any(|entry| entry.local_node == local_node && !entry.is_conflict())
+    {
+        return Ok(false);
+    }
+    let nested_context = group
+        .link_context
+        .to_link_context(node_link.repository)
+        .await;
+    let nested_state = state::State::deserialize(nested_context.clone(), link_node.address.hash)
+        .await
+        .forward::<StageError>("Failed to deserialize the nested link's state")?;
+    if !nested_state.link_merge_hash().is_zero() {
+        return Ok(true);
+    }
+    let unresolved = collect_merge_paths(
+        nested_context,
+        nested_state,
+        link_node.child,
+        mount.clone(),
+        MergeWalk {
+            nodes: MergeNodes::Unresolved,
+            whole_directories: true,
+        },
+        None,
+    )
+    .await?;
+    Ok(!unresolved.files.is_empty())
+}
+
 /// Groups `paths`, which lie inside linked repositories, by link, and checks each against
 /// `refusal` without staging anything. A link the merge did not merge holds nothing to resolve.
 async fn collect_link_groups(
@@ -5252,17 +5310,8 @@ async fn collect_link_groups(
                 Some(refusal.clone()),
             )
             .await?;
-            if !collected.links.is_empty() {
-                let merged = group
-                    .link_state_staged
-                    .deserialize_link_merge_state(group.link_context.clone())
-                    .await
-                    .forward::<StageError>("Failed to read the link's link merge state")?;
-                if let Some((nested, _)) = collected.links.iter().find(|(_, node_link)| {
-                    merged
-                        .iter()
-                        .any(|entry| entry.base.repository == node_link.repository)
-                }) {
+            for (nested, node_link) in collected.links {
+                if nested_link_holds_a_merge(group, &nested, node_link).await? {
                     return Err(NotSupported {
                         operation: format!("resolving {nested} to one side inside a nested link"),
                     }

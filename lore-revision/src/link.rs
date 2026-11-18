@@ -1066,6 +1066,7 @@ pub async fn resolve_pin(
 ///
 /// A link's mount is a node of the revision it pins, and node ids differ between revisions, so it
 /// has to be found again whenever the pin moves.
+#[derive(Clone, Copy)]
 pub enum LinkMountSource {
     /// The path the link exposes today, found again in the revision the link moves to.
     SamePath,
@@ -1075,6 +1076,7 @@ pub enum LinkMountSource {
 
 /// What to realize at a mount: the revisions the pin moves between, the node the mount stands at
 /// in the one it leaves, and the subtree it exposes once it lands.
+#[derive(Clone)]
 pub struct LinkPinRealizeTarget {
     pub link_path: RelativePath,
     pub old_signature: Hash,
@@ -2328,6 +2330,20 @@ impl Mount {
         }
     }
 
+    /// The mount at `path` of the subtree whose root is `node` in `link_state`, a linked
+    /// repository's state.
+    pub(crate) async fn of_link(
+        link_context: &Arc<RepositoryContext>,
+        link_state: &State,
+        node: NodeID,
+        path: RelativePath,
+    ) -> Result<Self, StateError> {
+        Ok(Self {
+            source: link_source_path(link_context.clone(), link_state, node).await?,
+            path,
+        })
+    }
+
     /// Where the working tree holds `path`, a path of the repository, or `None` outside the
     /// subtree.
     pub(crate) fn spell(&self, path: &RelativePath) -> Option<RelativePath> {
@@ -2923,16 +2939,12 @@ pub async fn verify_link_pins(
     for planned_pin in planned {
         let link_path = RelativePath::from_str(&planned_pin.link_path)
             .internal_with(|| format!("Invalid link path {}", planned_pin.link_path))?;
-        if repository
-            .filter
-            .excludes_tree(&link_path, true, FilterMode::View)
-        {
-            continue;
-        }
         let link_context = repository
             .to_link_context(planned_pin.link_node.address.context.into())
             .await;
-        let pin = ResolvedLinkPin::resolve(
+        verify_link_pin_change(
+            operation,
+            repository,
             &link_context,
             LinkPinRealizeTarget {
                 link_path,
@@ -2943,10 +2955,35 @@ pub async fn verify_link_pins(
             },
         )
         .await?;
-        let diff = link_pin_diff(&link_context, &pin).await?;
-        verify_link_pin_diff(operation, link_context, pin.new_signature, diff, false).await?;
     }
     Ok(())
+}
+
+/// Check the working tree against what realizing `target`, a pin move of a link to
+/// `link_context`, writes, refusing where a local modification would be overwritten.
+pub(crate) async fn verify_link_pin_change(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    link_context: &Arc<RepositoryContext>,
+    target: LinkPinRealizeTarget,
+) -> Result<(), LinkError> {
+    if repository
+        .filter
+        .excludes_tree(&target.link_path, true, FilterMode::View)
+    {
+        return Ok(());
+    }
+    let pin = ResolvedLinkPin::resolve(link_context, target).await?;
+    let diff = link_pin_diff(link_context, &pin).await?;
+    verify_link_pin_diff(
+        operation,
+        link_context.clone(),
+        pin.new_signature,
+        diff,
+        false,
+    )
+    .await
+    .map(drop)
 }
 
 /// The link node at `link_path` where it links `link_repository`, or `None` where the state has
@@ -3571,14 +3608,10 @@ pub async fn verify_resolved_link_pin(
 ) -> Result<(), LinkError> {
     let link_path_rel = RelativePath::from_str(link_path)
         .internal_with(|| format!("Invalid link path {link_path}"))?;
-    if repository
-        .filter
-        .excludes_tree(&link_path_rel, true, FilterMode::View)
-    {
-        return Ok(());
-    }
     let resolved = resolve_link_at_path(state_staged, repository.clone(), link_path).await?;
-    let pin = ResolvedLinkPin::resolve(
+    verify_link_pin_change(
+        operation,
+        repository,
         &resolved.link_context,
         LinkPinRealizeTarget {
             link_path: link_path_rel,
@@ -3588,17 +3621,7 @@ pub async fn verify_resolved_link_pin(
             mount_source: LinkMountSource::Node(chosen_mount),
         },
     )
-    .await?;
-    let diff = link_pin_diff(&resolved.link_context, &pin).await?;
-    verify_link_pin_diff(
-        operation,
-        resolved.link_context,
-        pin.new_signature,
-        diff,
-        false,
-    )
-    .await?;
-    Ok(())
+    .await
 }
 
 /// Move the row at `link_path` to `chosen`, mounting `chosen_mount`, a node of the revision
