@@ -243,6 +243,42 @@ changing it on an existing StatefulSet.
 
 See [examples/multi-server-aws.values.yaml](examples/multi-server-aws.values.yaml).
 
+## Edge servers
+
+With `backend.type: edge`, the servers are caches in front of a Lore deployment elsewhere, the
+upstream, with no storage of their own. `/data` holds the cached content; misses are fetched from
+the upstream's replication endpoint, and branch and repository state comes from the upstream.
+
+```yaml
+topology:
+  mode: single
+backend:
+  type: edge
+  edge:
+    upstreamInternalAddress: lore-internal.example.com:41340
+    upstreamURL: lores://lore.example.com:41337
+    identity:
+      secretName: lore-edge-identity
+replication:
+  tls:
+    secretName: lore-edge-replication-tls
+```
+
+The edge presents the replication cert to the upstream as a client cert, so the upstream's
+replication CA must have issued it. With `replication.enabled` and `provider: statefulset` the
+edges also peer with each other, as [multiple servers](#multiple-servers-aws-backend) do.
+
+The identity is the login the edge uses at the upstream; it needs access to every repository the
+edge serves. The server renews that login and writes it back, so the Secret only seeds
+`/data/auth` on a pod's first start. Make it from a file-based token store:
+
+```sh
+LORE_AUTH_PATH=./edge-auth LORE_AUTH_STORE=fallback lore login lores://lore.example.com:41337
+kubectl create secret generic lore-edge-identity --from-file=./edge-auth
+```
+
+See [examples/edge.values.yaml](examples/edge.values.yaml).
+
 ## Cross-cluster replication
 
 `replication.enabled=true` turns on the server's two internal replication endpoints on

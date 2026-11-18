@@ -21,7 +21,7 @@
       "type": "object",
       "description": "Where the authoritative store lives.",
       "properties": {
-        "type": { "type": "string", "enum": ["local", "aws"], "description": "local (default): the data pod's /data volume. aws: shared S3 + DynamoDB with /data as a local fragment cache; needs topology.mode=single and allows data.replicas > 1." },
+        "type": { "type": "string", "enum": ["local", "aws", "edge"], "description": "local (default): the data pod's /data volume. aws: shared S3 + DynamoDB with /data as a local fragment cache; needs topology.mode=single and allows data.replicas > 1. edge: a cache in front of another Lore deployment (backend.edge), with no storage of its own; needs topology.mode=single and replication.tls, and allows data.replicas > 1." },
         "aws": {
           "type": "object",
           "description": "S3 bucket and DynamoDB tables for backend.type=aws, with the key schemas in contrib/aws/storage.tf.",
@@ -36,6 +36,33 @@
             "cacheFlushDelaySeconds": { "type": "integer", "minimum": 0, "description": "How long the local cache batches its index writes." },
             "forceWrite": { "type": "boolean", "description": "Write to the immutable and mutable stores without first checking whether the entry exists." }
           }
+        },
+        "edge": {
+          "type": "object",
+          "description": "The upstream an edge caches, for backend.type=edge.",
+          "properties": {
+            "upstreamInternalAddress": { "type": "string", "description": "host:port of the upstream's replication endpoint, without a scheme. Content misses go there over QUIC and forwarded requests over gRPC, with mutual TLS from replication.tls." },
+            "upstreamURL": { "type": "string", "description": "The upstream's public URL as a client names it, e.g. lores://lore.example.com:41337. The mutable store reaches it as a client, logged in as identity." },
+            "expectedRttMs": { "type": "integer", "minimum": 0, "description": "Round trip to the upstream, which sizes the QUIC connection to it. 0 = the server's default." },
+            "periodicClientRefreshSeconds": { "type": "integer", "minimum": 1, "description": "How often the connections to the upstream's replication endpoint are replaced." },
+            "regenerateRetry": {
+              "type": "object",
+              "description": "Backoff when a connection to the upstream's replication endpoint has to be re-established.",
+              "properties": {
+                "initialBackoffMs": { "type": "integer", "minimum": 0 },
+                "maxBackoffMs": { "type": "integer", "minimum": 0 },
+                "maxAttempts": { "type": "integer", "minimum": 1 }
+              }
+            },
+            "cacheFlushDelaySeconds": { "type": "integer", "minimum": 0, "description": "How long the local cache batches its index writes." },
+            "forwardedRpcs": { "type": "array", "items": { "type": "string" }, "description": "Public RPCs answered by forwarding them to the upstream." },
+            "identity": {
+              "type": "object",
+              "properties": {
+                "secretName": { "type": "string", "description": "Secret holding a file-based token store logged in as the edge's identity at the upstream. It seeds /data/auth on a pod's first start. Empty for an upstream without auth." }
+              }
+            }
+          }
         }
       }
     },
@@ -44,7 +71,7 @@
       "description": "The authoritative durable store (Pod C).",
       "required": ["persistence"],
       "properties": {
-        "replicas": { "type": "integer", "minimum": 1, "description": "Number of data pods. Above 1 needs backend.type=aws." },
+        "replicas": { "type": "integer", "minimum": 1, "description": "Number of data pods. Above 1 needs backend.type=aws or edge." },
         "podManagementPolicy": { "type": "string", "enum": ["OrderedReady", "Parallel"], "description": "StatefulSet pod management policy. Kubernetes does not allow changing it on an existing StatefulSet." },
         "spreadAcrossNodes": { "type": "boolean", "description": "With more than one replica and no custom affinity, require each data pod on its own node." },
         "hostNetwork": { "type": "boolean", "description": "Run the data pods in the node's network namespace. At most one data pod then runs per node." },

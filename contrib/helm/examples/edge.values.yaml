@@ -1,0 +1,70 @@
+# Example: edge servers, caches near clients in front of a Lore deployment elsewhere
+# (the upstream). Each edge caches content on its node's NVMe, fetches misses from the
+# upstream's replication endpoint, and gets branch and repository state from the
+# upstream. The edges peer with each other, so content one fetched is cached on the others.
+#
+# PREREQUISITES
+#   1. A Secret with tls.crt, tls.key and ca.crt: a client cert issued by the upstream's
+#      replication CA, also valid for *.lore-edge-headless.<namespace>.svc.cluster.local
+#      so the edges can peer.
+#   2. The upstream's ports 41340 (TCP and UDP) and 41337 reachable from the edges.
+#   3. For an upstream with auth, the identity Secret (see the README).
+#   4. Nodes with NVMe mounted at the hostPath below, labelled for the nodeSelector.
+#
+# Deploy: helm install lore-edge . -f examples/edge.values.yaml
+image:
+  repository: ghcr.io/epicgames/lore/loreserver
+  tag: ""  # empty = the chart's appVersion
+topology:
+  mode: single
+backend:
+  type: edge
+  edge:
+    upstreamInternalAddress: lore-internal.example.com:41340
+    upstreamURL: lores://lore.example.com:41337
+    expectedRttMs: 20
+    identity:
+      secretName: lore-edge-identity   # prerequisite 3; "" for an upstream without auth
+data:
+  replicas: 2
+  podManagementPolicy: Parallel   # set before the first install; immutable afterwards
+  hostNetwork: true               # one edge per node, on the node's own network
+  persistence:
+    # The cache and the identity's token store, on the node's NVMe.
+    type: hostPath
+    hostPath:
+      path: /mnt/nvme/lore-edge
+  store:
+    # Bound the cache below the NVMe capacity.
+    maxSize: 3000Gi
+    compactionDelaySeconds: 900
+nodeSelector:
+  lore.epicgames.com/local-nvme: "true"
+resources:
+  requests: { cpu: "28", memory: 56Gi }
+  limits:   { memory: 56Gi }
+replication:
+  enabled: true
+  tls:
+    secretName: lore-edge-replication-tls   # prerequisite 1: tls.crt, tls.key, ca.crt
+  topology:
+    provider: statefulset
+service:
+  type: LoadBalancer
+  loadBalancerClass: service.k8s.aws/nlb
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    service.beta.kubernetes.io/aws-load-balancer-enable-tcp-udp-listener: "true"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: http
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "41339"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /health_check
+tls:
+  mode: secret
+  existingSecret: lore-edge-tls
+  grpcTls: true                # clients use lores://
+auth:
+  enabled: true                # the edge checks every client's token as the upstream does
+  jwksEndpoint: "https://auth.example.com/.well-known/jwks.json"
+  issuer: "https://auth.example.com/"
+  audience: ["lore"]

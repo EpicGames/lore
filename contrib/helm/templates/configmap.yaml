@@ -197,6 +197,9 @@ data:
     {{- if eq .Values.backend.type "aws" }}
     {{- "\n" }}
     {{- include "lore.awsStoreToml" $ | nindent 4 }}
+    {{- else if eq .Values.backend.type "edge" }}
+    {{- "\n" }}
+    {{- include "lore.edgeStoreToml" $ | nindent 4 }}
     {{- else }}
 
     [immutable_store.local]
