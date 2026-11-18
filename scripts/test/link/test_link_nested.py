@@ -679,11 +679,6 @@ def test_link_branch_archive_include_links_reaches_nested_link(new_lore_repo):
 
 
 @pytest.mark.smoke
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="a merge leaves a nested link at its pre-merge pin, dropping the edit inside it",
-)
 def test_merge_lands_an_edit_inside_a_nested_link(new_lore_repo):
     """A branch editing a file inside a nested link and one inside its outer
     link merges both edits."""

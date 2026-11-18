@@ -776,7 +776,8 @@ async fn commit_staged_with_layers(
         .forward_with::<CommitError, _>(|| {
             format!("Failed to deserialize revision state {current_revision}")
         })?;
-    reject_unresolved_link_merge_conflicts(&repository, &state_staged).await?;
+    reject_unresolved_link_merge_conflicts(&repository, &state_staged, &link::Mount::root())
+        .await?;
 
     let metadata = build_commit_metadata(
         repository.clone(),
@@ -1346,6 +1347,22 @@ async fn commit_link_only(
         )
         .await);
     }
+    let source = link::link_source_path(
+        link_repository.clone(),
+        &link_state_staged,
+        resolved_staged.link_node.child,
+    )
+    .await
+    .forward::<CommitError>("Failed resolving the path the link exposes")?;
+    reject_unresolved_link_merge_conflicts(
+        &link_repository,
+        &link_state_staged,
+        &link::Mount {
+            path: link_mount_path.clone(),
+            source,
+        },
+    )
+    .await?;
 
     // If a prior --link commit advanced the branch, the staged state's parent
     // still points to the parent's committed pin (stale). Update it to the
@@ -2801,18 +2818,31 @@ fn reject_unresolved_conflict(node: &Node, path: &str) -> Result<(), CommitError
     Ok(())
 }
 
-/// Refuses the commit of `state` where a link it merges holds a conflict not resolved anywhere in
-/// the linked tree. The walks refuse each conflict they meet as well, but only once the links
-/// committed beside it, and the files met before it, are written.
+/// Refuses the commit of `state`, which the working tree materializes at `mount`, where a link it
+/// merges, or a link nested in one that the merge merged too, holds a conflict not resolved
+/// anywhere in the linked tree, or a link row still awaiting the user's choice. The walks refuse each conflict they meet as well, but only once
+/// the links committed beside it, and the files met before it, are written.
 async fn reject_unresolved_link_merge_conflicts(
     repository: &Arc<RepositoryContext>,
     state: &State,
+    mount: &link::Mount,
 ) -> Result<(), CommitError> {
     let merged = state
         .deserialize_link_merge_state(repository.clone())
         .await
         .forward::<CommitError>("Failed reading link merge state")?;
     for entry in merged {
+        if entry.is_conflict() {
+            if entry.is_unresolved() {
+                let path = path_for_message(repository, state, entry.local_node).await;
+                let Ok(path) = RelativePath::from_str(&path);
+                return Err(Conflict {
+                    path: mount.spell(&path).unwrap_or(path).to_string(),
+                }
+                .into());
+            }
+            continue;
+        }
         let link_node = {
             let block = state
                 .block(repository.clone(), NodeBlock::index(entry.local_node))
@@ -2828,17 +2858,30 @@ async fn reject_unresolved_link_merge_conflicts(
             .open(repository)
             .await
             .forward::<CommitError>("Failed to deserialize link state")?;
+        let path = path_for_message(repository, state, entry.local_node).await;
+        let Ok(path) = RelativePath::from_str(&path);
+        let link_mount = mount.spell(&path).unwrap_or(path);
         if let Some(conflict) = unresolved_link_conflict(&link_repository, &link_state).await? {
-            let mount = path_for_message(repository, state, entry.local_node).await;
-            let Ok(mount) = RelativePath::from_str(&mount);
             return Err(link_conflict(
                 &link_repository,
                 &link_state,
-                (&mount, link.node),
+                (&link_mount, link.node),
                 conflict,
             )
             .await);
         }
+        let source = link::link_source_path(link_repository.clone(), &link_state, link.node)
+            .await
+            .forward::<CommitError>("Failed resolving the path the link exposes")?;
+        Box::pin(reject_unresolved_link_merge_conflicts(
+            &link_repository,
+            &link_state,
+            &link::Mount {
+                path: link_mount,
+                source,
+            },
+        ))
+        .await?;
     }
     Ok(())
 }

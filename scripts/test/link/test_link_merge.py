@@ -60,10 +60,14 @@ pytestmark = pytest.mark.own_vfs(
 
 
 def _link_added_on_feature_branch(
-    new_lore_repo, link_path: str, **link_add_options
+    new_lore_repo, link_path: str, outer: str = "", **link_add_options
 ) -> tuple[Lore, Lore]:
-    """Parent repo on `main`, link added and committed on `feature-branch` only."""
-    repo = make_repo(new_lore_repo, {"main-file.txt": "initial content\n"})
+    """Parent repo on `main`, link added and committed on `feature-branch` only. `outer` links a
+    repository there first, which `link_path` is in."""
+    if outer:
+        repo, _ = make_parent_with_link(new_lore_repo, outer)
+    else:
+        repo = make_repo(new_lore_repo, {"main-file.txt": "initial content\n"})
     source_repo = make_repo(new_lore_repo, {"link-file.txt": "link source content\n"})
 
     repo.branch_create("feature-branch")
@@ -224,12 +228,17 @@ def _assert_warns_once(output: str):
 
 
 def _link_added_on_branch_and_main_moved(
-    new_lore_repo, link_path: str, feature_edit: str | None, linked_main_files: dict
+    new_lore_repo,
+    link_path: str,
+    feature_edit: str | None,
+    linked_main_files: dict,
+    outer: str = "",
 ) -> tuple[Lore, Lore]:
     """`feature-branch` adds a following link and, given `feature_edit`, commits it to
     `link-file.txt` through the mount. `linked_main_files` are committed to the linked
-    repository's `main` and a change to the parent's, which is left checked out."""
-    repo, source_repo = _link_added_on_feature_branch(new_lore_repo, link_path)
+    repository's `main` and a change to the parent's, which is left checked out. `outer` adds
+    the link in a link mounted there, which main changes."""
+    repo, source_repo = _link_added_on_feature_branch(new_lore_repo, link_path, outer)
     if feature_edit:
         repo.write_commit_push(
             "Edit inside the link", {f"{link_path}/link-file.txt": feature_edit}
@@ -237,7 +246,7 @@ def _link_added_on_branch_and_main_moved(
     if linked_main_files:
         source_repo.write_commit_push("Linked main moves on", linked_main_files)
     repo.branch_switch("main")
-    repo.write_commit_push("Change on main", {"root.txt": "root\n"})
+    repo.write_commit_push("Change on main", {f"{outer}/root.txt".lstrip("/"): "root\n"})
     return repo, source_repo
 
 
@@ -264,22 +273,28 @@ def _assert_pinned_at_linked_main(repo: Lore, source_repo: Lore):
 
 @pytest.mark.smoke
 @pytest.mark.parametrize(
-    "merge_into, feature_edit, linked_main_files",
+    "merge_into, feature_edit, linked_main_files, outer",
     [
-        (False, "edited on feature\n", {}),
-        (False, None, {"main-only.txt": "main\n"}),
-        (True, "edited on feature\n", {"main-only.txt": "main\n"}),
+        (False, "edited on feature\n", {}, ""),
+        (False, None, {"main-only.txt": "main\n"}, ""),
+        (True, "edited on feature\n", {"main-only.txt": "main\n"}, ""),
+        (False, "edited on feature\n", {"main-only.txt": "main\n"}, "outer"),
     ],
-    ids=["edited", "linked main moved", "merge into"],
+    ids=["edited", "linked main moved", "merge into", "nested"],
 )
 def test_link_added_on_branch_merges_its_repository(
-    new_lore_repo, merge_into, feature_edit, linked_main_files
+    new_lore_repo, merge_into, feature_edit, linked_main_files, outer
 ):
     """A following link a merged branch adds is merged in its repository's own branch, which the
-    link lands pinned at, so a commit inside the link afterwards pushes."""
-    link_path = "linked/repo"
+    link lands pinned at, so a commit inside the link afterwards pushes. `outer` adds the link in
+    a link mounted there."""
+    link_path = f"{outer}/linked/repo".lstrip("/")
     repo, source_repo = _link_added_on_branch_and_main_moved(
-        new_lore_repo, link_path, feature_edit, {} if merge_into else linked_main_files
+        new_lore_repo,
+        link_path,
+        feature_edit,
+        {} if merge_into else linked_main_files,
+        outer,
     )
 
     if merge_into:
@@ -2580,9 +2595,6 @@ def test_link_merge_start_refuses_local_work_inside_the_link(
 
     repo.reset(edited, purge=True)
     repo.branch_merge_start("main", no_commit=True)
-    if nested:
-        # A merge in a nested link doesn't realize its files yet.
-        return
     for path, content in incoming.items():
         with repo.open_file(f"{mount}/{path}") as f:
             assert f.read() == content, f"{mount}/{path} should hold the merge"

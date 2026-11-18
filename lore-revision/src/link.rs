@@ -2313,6 +2313,28 @@ pub struct DescribedLink {
     pub source_path: String,
 }
 
+/// Where the working tree materializes the subtree at `source` of a repository.
+pub(crate) struct Mount {
+    pub path: RelativePath,
+    pub source: RelativePath,
+}
+
+impl Mount {
+    /// The main repository's, materialized whole at the root of the working tree.
+    pub(crate) fn root() -> Self {
+        Self {
+            path: RelativePath::new(),
+            source: RelativePath::new(),
+        }
+    }
+
+    /// Where the working tree holds `path`, a path of the repository, or `None` outside the
+    /// subtree.
+    pub(crate) fn spell(&self, path: &RelativePath) -> Option<RelativePath> {
+        path.below(&self.source).map(|below| self.path.join(below))
+    }
+}
+
 /// The path a link exposes from the repository it points at, as stored, so a
 /// root mount is the empty path.
 pub async fn link_source_path(
@@ -3580,13 +3602,14 @@ pub async fn verify_resolved_link_pin(
 }
 
 /// Move the row at `link_path` to `chosen`, mounting `chosen_mount`, a node of the revision
-/// `chosen` pins, and realizing the content change at the mount.
+/// `chosen` pins, and realizing the content change at the mount as `realize` says.
 pub async fn apply_resolved_link_pin(
     repository: Arc<RepositoryContext>,
     state_staged: &Arc<State>,
     link_path: &str,
     chosen: LinkReference,
     chosen_mount: NodeID,
+    realize: LinkPinRealize,
 ) -> Result<(), LinkError> {
     let resolved = resolve_link_at_path(state_staged, repository.clone(), link_path).await?;
     let current = resolved
@@ -3601,7 +3624,7 @@ pub async fn apply_resolved_link_pin(
         &current,
         &chosen,
         LinkMountSource::Node(chosen_mount),
-        LinkPinRealize::WorkingTree,
+        realize,
     )
     .await
     .map(drop)

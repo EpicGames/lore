@@ -4243,13 +4243,7 @@ pub(crate) fn collect_merge_paths(
         }
         if node.is_link() {
             let mut collected = StagedMergePaths::default();
-            // A link nested in a linked repository is not merged with it, so it holds no merge.
-            if refusal
-                .as_ref()
-                .is_none_or(|refusal| refusal.scope == ResolveScope::Parent)
-            {
-                collected.links.push((base_path, node.linked_node()));
-            }
+            collected.links.push((base_path, node.linked_node()));
             return Ok(collected);
         }
 
@@ -5226,6 +5220,12 @@ async fn collect_link_groups(
             lore_debug!("Ignoring invalid link path, does not exist in link staged state: {user}");
             continue;
         }
+        if node_link.repository != group.link_context.id {
+            return Err(NotSupported {
+                operation: format!("resolving {user} to one side inside a nested link"),
+            }
+            .into());
+        }
         let block = group
             .link_state_staged
             .block(group.link_context.clone(), NodeBlock::index(node_link.node))
@@ -5240,7 +5240,7 @@ async fn collect_link_groups(
             }
             vec![(user, below_mount, in_link)]
         } else {
-            collect_merge_paths(
+            let collected = collect_merge_paths(
                 group.link_context.clone(),
                 group.link_state_staged.clone(),
                 node_link.node,
@@ -5251,11 +5251,25 @@ async fn collect_link_groups(
                 },
                 Some(refusal.clone()),
             )
-            .await?
-            .files
-            .into_iter()
-            .filter_map(in_group)
-            .collect()
+            .await?;
+            if !collected.links.is_empty() {
+                let merged = group
+                    .link_state_staged
+                    .deserialize_link_merge_state(group.link_context.clone())
+                    .await
+                    .forward::<StageError>("Failed to read the link's link merge state")?;
+                if let Some((nested, _)) = collected.links.iter().find(|(_, node_link)| {
+                    merged
+                        .iter()
+                        .any(|entry| entry.base.repository == node_link.repository)
+                }) {
+                    return Err(NotSupported {
+                        operation: format!("resolving {nested} to one side inside a nested link"),
+                    }
+                    .into());
+                }
+            }
+            collected.files.into_iter().filter_map(in_group).collect()
         };
         for (user, below_mount, in_link) in files {
             let target = match group

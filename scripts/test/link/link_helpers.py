@@ -626,12 +626,23 @@ def diverged_link_branches(new_lore_repo):
     return urc, link_repos
 
 
+def repo_holding_links(new_lore_repo, outer: str) -> tuple[Lore, str]:
+    """Returns (urc, prefix): a repository holding `main-file.txt`, where the links a test adds
+    below `prefix` go. Where `outer` is set, it holds `main-file.txt` in a repository it links
+    there, so the links the test adds are nested in that link."""
+    if not outer:
+        return make_repo(new_lore_repo, {"main-file.txt": "main base\n"}), ""
+    urc, _ = make_parent_with_link(new_lore_repo, outer, {"main-file.txt": "main base\n"})
+    return urc, f"{outer}/"
+
+
 def merge_a_branch_removing_a_link(
     new_lore_repo,
     added: bool,
     pinned: bool,
     conflict: str | None = None,
     link_messages: dict[str, str] | None = None,
+    outer: str = "",
 ) -> tuple[Lore, Lore]:
     """Returns (urc, link_repo) once main merges `feature-branch`, which removes the link at
     `libs/old` while each branch changes the linked repository through it, and links the
@@ -639,30 +650,33 @@ def merge_a_branch_removing_a_link(
 
     `pinned` links the first revision of the linked repository at both paths rather than its
     latest. `conflict` names the file both branches change apart from that: `main-file.txt`, or
-    `shared.txt` inside the link. `link_messages` passes per-link messages to the merge.
+    `shared.txt` inside the link. `link_messages` passes per-link messages to the merge. `outer`
+    nests every path in a link mounted there, as `repo_holding_links` describes.
     """
-    urc = make_repo(new_lore_repo, {"main-file.txt": "main base\n"})
+    urc, p = repo_holding_links(new_lore_repo, outer)
     link_repo = make_repo(
         new_lore_repo, {"linked.txt": "linked base\n", "shared.txt": "shared base\n"}
     )
     first = link_repo.branch_info().local_latest
-    urc.link_add("libs/old", link_repo.get_id(), "/", pin=first if pinned else None)
+    urc.link_add(f"{p}libs/old", link_repo.get_id(), "/", pin=first if pinned else None)
     urc.commit("Add link")
     urc.push()
 
     def changes(branch: str) -> dict[str, str]:
-        files = {f"libs/old/{branch}.txt": f"{branch}\n"}
+        files = {f"{p}libs/old/{branch}.txt": f"{branch}\n"}
         if conflict == "main-file.txt":
-            files["main-file.txt"] = f"{branch}\n"
+            files[f"{p}main-file.txt"] = f"{branch}\n"
         elif conflict == "shared.txt":
-            files["libs/old/shared.txt"] = f"{branch}\n"
+            files[f"{p}libs/old/shared.txt"] = f"{branch}\n"
         return files
 
     urc.branch_create("feature-branch")
     urc.write_commit_push("Feature changes the link", changes("feature"))
-    urc.link_remove("libs/old")
+    urc.link_remove(f"{p}libs/old")
     if added:
-        urc.link_add("libs/new", link_repo.get_id(), "/", pin=first if pinned else None)
+        urc.link_add(
+            f"{p}libs/new", link_repo.get_id(), "/", pin=first if pinned else None
+        )
     urc.commit("Feature removes the link")
     urc.push()
 
@@ -676,31 +690,37 @@ def merge_a_branch_removing_a_link(
 
 
 def merge_a_branch_moving_a_link(
-    new_lore_repo, pinned: bool, moved: tuple[str, str], conflict: bool = False
+    new_lore_repo,
+    pinned: bool,
+    moved: tuple[str, str],
+    conflict: bool = False,
+    outer: str = "",
 ) -> tuple[Lore, Lore]:
     """Returns (urc, link_repo) once main merges `feature-branch`, which moves `moved[0]`, the
     link `libs/old` or the directory `libs` holding it, to `moved[1]`, while each branch adds a
     file to the linked repository through the link. `pinned` links the first revision of the
     linked repository rather than its latest, and `conflict` changes `main-file.txt` on both
-    branches."""
-    urc = make_repo(new_lore_repo, {"main-file.txt": "main base\n"})
+    branches. `outer` nests every path in a link mounted there, as `repo_holding_links`
+    describes."""
+    urc, p = repo_holding_links(new_lore_repo, outer)
     link_repo = make_repo(new_lore_repo, {"linked.txt": "linked base\n"})
     first = link_repo.branch_info().local_latest
-    urc.link_add("libs/old", link_repo.get_id(), "/", pin=first if pinned else None)
+    urc.link_add(f"{p}libs/old", link_repo.get_id(), "/", pin=first if pinned else None)
     urc.commit("Add link")
     urc.push()
 
     def changes(branch: str) -> dict[str, str]:
-        files = {f"libs/old/{branch}.txt": f"{branch}\n"}
+        files = {f"{p}libs/old/{branch}.txt": f"{branch}\n"}
         if conflict:
-            files["main-file.txt"] = f"{branch}\n"
+            files[f"{p}main-file.txt"] = f"{branch}\n"
         return files
 
     urc.branch_create("feature-branch")
     urc.write_commit_push("Feature changes the link", changes("feature"))
-    urc.move(*moved)
-    if moved[0] == "libs/old":
-        # `lore stage move` refuses a link, and a scan stages its rename in case.
+    urc.move(f"{p}{moved[0]}", f"{p}{moved[1]}")
+    if moved[0] == "libs/old" or p:
+        # `lore stage move` refuses a link and a path inside one, and a scan stages a rename in
+        # case.
         urc.stage(scan=True, case="rename")
     else:
         urc.stage_move(*moved)

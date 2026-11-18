@@ -15,6 +15,7 @@ from link_helpers import (
     SUBTREE_LINK,
     assert_link_holds,
     assert_linked_main_merged_settings,
+    build_nested_link_repos_at,
     diverged_link_branches,
     link_pin,
     make_parent_with_link,
@@ -149,20 +150,39 @@ def test_link_merge_all_refuses_a_conflict_outside_a_subtree_link(new_lore_repo)
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize("link", [None, SUBTREE_LINK], ids=["all", "link"])
-def test_link_merge_all_refuses_deleting_the_subtree_a_link_mounts(new_lore_repo, link):
+@pytest.mark.parametrize(
+    "link, outer",
+    [(None, ""), (SUBTREE_LINK, ""), (None, "outer")],
+    ids=["all", "link", "nested"],
+)
+def test_link_merge_all_refuses_deleting_the_subtree_a_link_mounts(
+    new_lore_repo, link, outer
+):
     """A merge, of every link or of the link alone, whose linked branch deletes the directory
     holding the subtree a link mounts is refused before it stages anything, leaving the working
-    tree and the pin as they were."""
-    parent, linked = make_parent_with_link(
-        new_lore_repo,
-        SUBTREE_LINK,
-        {"content/assets/a.txt": "a base\n", "config/settings.txt": "settings base\n"},
-        {"root.txt": "root\n"},
-        source_path="content/assets",
-    )
+    tree and the pin as they were. `outer` nests the link in a link mounted there."""
+    linked_files = {
+        "content/assets/a.txt": "a base\n",
+        "config/settings.txt": "settings base\n",
+    }
+    if outer:
+        parent, _ = make_parent_with_link(new_lore_repo, outer, {"root.txt": "root\n"})
+        linked = make_repo(new_lore_repo, linked_files)
+        p = f"{outer}/"
+        parent.link_add(f"{p}{SUBTREE_LINK}", linked.get_id(), "content/assets")
+        parent.commit("Add a nested link")
+        parent.push()
+    else:
+        parent, linked = make_parent_with_link(
+            new_lore_repo,
+            SUBTREE_LINK,
+            linked_files,
+            {"root.txt": "root\n"},
+            source_path="content/assets",
+        )
+        p = ""
     parent.branch_create("feature")
-    parent.write_commit_push("Feature change", {"root.txt": "root on feature\n"})
+    parent.write_commit_push("Feature change", {f"{p}root.txt": "root on feature\n"})
     linked.branch_switch("feature")
     linked.rmtree("content")
     linked.stage(scan=True)
@@ -176,9 +196,9 @@ def test_link_merge_all_refuses_deleting_the_subtree_a_link_mounts(new_lore_repo
 
     assert parse_status_json(parent.status(json=True)) == []
     assert link_pin(parent, linked.get_id()) == pin_before
-    with parent.open_file(f"{SUBTREE_LINK}/a.txt") as f:
+    with parent.open_file(f"{p}{SUBTREE_LINK}/a.txt") as f:
         assert f.read() == "a base\n"
-    with parent.open_file("root.txt") as f:
+    with parent.open_file(f"{p}root.txt") as f:
         assert f.read() == "root\n"
 
 
@@ -2082,3 +2102,160 @@ def test_link_merge_abort_of_a_branch_moving_a_link(new_lore_repo, pinned, how):
     assert parse_status_json(urc.status(json=True)) == [], (
         "the abort should leave nothing staged"
     )
+
+
+def assert_files_hold(repo, files: dict[str, str]):
+    assert files.items() <= repo.read_files().items()
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("link", [None, "vendor/b"], ids=["all", "link"])
+def test_link_merge_all_merges_a_nested_link(new_lore_repo, link):
+    """A merge, of every link or of the outer link alone, merges the repository of a link nested
+    inside another link as well, so each branch's changes inside both linked repositories
+    arrive, and the merge pushes."""
+    urc, _, _, outer, nested = build_nested_link_repos_at(
+        new_lore_repo, "vendor/b", "deps/c"
+    )
+    urc.branch_create("feature")
+    urc.write_commit_push(
+        "Feature changes both links",
+        {f"{nested}/c-data/inner.txt": "feature\n", f"{outer}/b-root.txt": "feature\n"},
+    )
+    urc.branch_switch("main")
+    urc.write_commit_push(
+        "Main changes both links",
+        {f"{nested}/main.txt": "main\n", f"{outer}/main.txt": "main\n"},
+    )
+
+    urc.branch_merge_start("feature", message="Merge feature", link=link)
+    urc.push()
+
+    for repo in [urc, urc.clone()]:
+        assert_files_hold(
+            repo,
+            {
+                f"{nested}/c-data/inner.txt": "feature\n",
+                f"{nested}/main.txt": "main\n",
+                f"{outer}/b-root.txt": "feature\n",
+                f"{outer}/main.txt": "main\n",
+            },
+        )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "finish, link",
+    [("resolve", None), ("abort", None), ("resolve", "vendor/b")],
+    ids=["resolve", "abort", "link"],
+)
+def test_link_merge_all_conflict_in_a_nested_link(new_lore_repo, finish, link):
+    """A merge, of every link or of the outer link alone, marks a conflict inside a link nested
+    inside another link at its mount, and the conflict refuses a commit and a resolve to one side.
+    Resolved with no path named, the merge commits and pushes, and an abort after resolving it
+    restores the nested link."""
+    urc, _, _, _, nested = build_nested_link_repos_at(new_lore_repo, "vendor/b", "deps/c")
+    beside = make_repo(new_lore_repo, {"beside.txt": "base\n"})
+    urc.link_add("vendor/a", beside.get_id(), "/")
+    urc.commit("Link a repository beside")
+    urc.push()
+    conflicted = f"{nested}/c-data/inner.txt"
+    urc.branch_create("feature")
+    urc.write_commit_push(
+        "Feature changes the links",
+        {conflicted: "feature\n", "vendor/a/feature.txt": "feature\n"},
+    )
+    urc.branch_switch("main")
+    urc.write_commit_push(
+        "Main changes the links", {conflicted: "main\n", "vendor/a/main.txt": "main\n"}
+    )
+    latest = urc.branch_info().local_latest
+
+    urc.branch_merge_start("feature", message="Merge feature", link=link)
+    assert urc.unresolved_paths() == {conflicted}
+    with urc.open_file(conflicted) as f:
+        assert "<<<<<<<" in f.read()
+    if finish == "abort":
+        urc.write_files({conflicted: "resolved\n"})
+        urc.branch_merge_resolve(conflicted)
+        urc.branch_merge_abort()
+        assert urc.branch_info().local_latest == latest
+        assert parse_status_json(urc.status(json=True)) == []
+        assert_files_hold(urc, {conflicted: "main\n"})
+        return
+    with pytest.raises(UnresolvedConflictError):
+        urc.commit("Merge feature")
+    with pytest.raises(NotSupportedError):
+        urc.branch_merge_resolve_mine(conflicted)
+    urc.write_files({conflicted: "resolved\n"})
+    urc.branch_merge_resolve()
+    urc.commit("Merge feature")
+    urc.push()
+
+    merged_beside = {} if link else {"vendor/a/feature.txt": "feature\n"}
+    for repo in [urc, urc.clone()]:
+        assert_files_hold(
+            repo,
+            {conflicted: "resolved\n", "vendor/a/main.txt": "main\n", **merged_beside},
+        )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("how", ["removed", "link-in-case", "directory-in-case"])
+def test_link_merge_all_of_a_branch_removing_or_moving_a_nested_link(new_lore_repo, how):
+    """A link nested in a link, which the merged branch removes, renames in case, or carries
+    along with a directory it renames in case, is removed or merged where it moves to, as a link
+    of the main repository is."""
+    if how == "removed":
+        urc, _ = merge_a_branch_removing_a_link(
+            new_lore_repo, added=False, pinned=False, outer="outer"
+        )
+        urc.push()
+        assert not urc.path_exists("outer/libs/old")
+        return
+    moved, destination, exposed = LINK_MOVES[how]
+    urc, _ = merge_a_branch_moving_a_link(
+        new_lore_repo, pinned=False, moved=moved, outer="outer"
+    )
+    urc.push()
+    for repo in [urc, urc.clone()]:
+        assert sorted(os.listdir(os.path.join(repo.path, f"outer/{destination}"))) == exposed
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("side", ["mine", "theirs"])
+def test_link_merge_all_pin_conflict_in_a_nested_link(new_lore_repo, side):
+    """A pin both branches moved, of a fixed link nested in a link, is listed as a link conflict
+    and refuses a commit. Resolved to either side, the merge commits and pushes that side's pin."""
+    urc, _ = make_parent_with_link(new_lore_repo, "outer", {"b.txt": "b\n"})
+    fixed = make_repo(new_lore_repo, {"f.txt": "one\n"})
+    nested = "outer/linked/fixed"
+    urc.link_add(nested, fixed.get_id(), "/", disable_branching=True)
+    urc.commit("Add a fixed link inside the link")
+    urc.push()
+    pins = {}
+    for content in ("two", "three"):
+        fixed.write_commit_push(content, {"f.txt": f"{content}\n"})
+        pins[content] = fixed.branch_info().local_latest
+    urc.branch_create("feature")
+    urc.link_update(nested, pin=pins["three"])
+    urc.commit("Pin the nested link to three")
+    urc.push()
+    urc.branch_switch("main")
+    urc.link_update(nested, pin=pins["two"])
+    urc.commit("Pin the nested link to two")
+    urc.push()
+
+    output = urc.branch_merge_start("feature", message="Merge feature")
+    assert f"Link conflict: {nested}" in output
+    assert f"Link conflict: {nested}" in urc.branch_merge_conflicts_list()
+    with pytest.raises(UnresolvedConflictError):
+        urc.commit("Merge feature")
+
+    getattr(urc, f"branch_merge_resolve_{side}")(nested)
+    urc.commit("Merge feature")
+    urc.push()
+
+    expected = {"mine": "two\n", "theirs": "three\n"}[side]
+    for repo in [urc, urc.clone()]:
+        assert_files_hold(repo, {f"{nested}/f.txt": expected})

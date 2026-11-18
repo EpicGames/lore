@@ -2649,7 +2649,10 @@ merged branch removes is removed, and its repository is not merged. The reposito
 auto-following link the merged branch adds is merged into the linked branch the link lands
 on, and the link pins the result: the pin it was given names a revision of the merged
 branch's counterpart, which the target's need not hold. A link with an explicit branch keeps
-the pin it was given. A link the merged branch moves is merged where it moves to.
+the pin it was given. A link the merged branch moves is merged where it moves to. The merge of a
+linked repository treats the links that repository holds by the same rules, so a merge reaches
+nested links up to the link depth limit of 8, and the link holding them pins the result. A link
+back to a repository the merge is already inside is left out.
 
 A link's row, its pin, the branch it follows, its flags and the folder it mounts, is merged
 three ways against the common ancestor. A row only the merged branch changed lands whole. A
@@ -2658,7 +2661,8 @@ side's whole row with `branch merge resolve mine|theirs`, or to this branch's ro
 `branch merge resolve`, and the commit is refused until then. Where both sides follow their own
 parent's branch, only the pin differs: it is left to the link's own merge, and otherwise stays.
 A row's branch is read under its own parent's branch, so a row following its parent names the
-same branch on either side. Which side was chosen is bookkeeping for the merge in progress and
+same branch on either side. A row of a nested link is held open and settled the same way, in the
+merge of the link holding it. Which side was chosen is bookkeeping for the merge in progress and
 never reaches a committed revision.
 
 #### 22.4 Link-scoped committing and single-link merging
@@ -2673,9 +2677,10 @@ repositories that have changes. Two operations are scoped to a single link:
   resolving conflicts in one linked repository, or when making incremental progress
   on a link before committing at the parent level.
 - *Single-link merging.* `branch merge start <branch> --link <path>` runs a merge
-  operation through one link's mounted repository, leaving the parent and other links
-  untouched. Conflicts are resolved at the link's mount path; the parent's link pin
-  updates to the resulting merged revision when the merge operation completes.
+  operation through one link's mounted repository and the links nested in it, leaving
+  the parent and its other links untouched. Conflicts are resolved at the link's mount
+  path; the parent's link pin updates to the resulting merged revision when the merge
+  operation completes.
 
 Both operations exist because the cascading default isn't always what the user wants.
 Working on a single linked repository at a time, with the parent quiet, matches the
