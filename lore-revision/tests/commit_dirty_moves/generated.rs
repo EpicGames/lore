@@ -117,8 +117,9 @@ struct Model {
     moved_from: BTreeSet<String>,
     /// The paths of the directories removed and marked dirty that hold a node staged for deletion
     /// below them, or that the commit takes staged for what lies below them alone
-    /// ([`Self::settle_bare`]), which the staged tree holds and does not mark deleted, and which the
-    /// commit deletes with everything below them, as the working tree no longer holds them.
+    /// ([`Self::settle_bare`]), which the staged tree holds and does not mark deleted, and which
+    /// the commit deletes, as the working tree no longer holds them, but where one holds a
+    /// committed node not staged ([`gone_directories`]).
     unmarked: BTreeSet<String>,
     /// Each committed file a removal marked dirty took from the working tree while another node held
     /// its committed path, with its path in the staged tree and its committed path: it keeps its
@@ -237,11 +238,11 @@ impl Model {
 
     /// Takes each directory removed and marked dirty at or above a directory a staged change took a
     /// committed node out of ([`Self::left_directories`]) as gone: the commit stages it for its
-    /// rehash, if only for one below it, and deletes it with everything below it, as for one
-    /// holding a node staged for deletion ([`Self::unmarked`]). Asserts that the directories the
-    /// commit stages so for what lies below them alone are those: each `before`, the staged tree
-    /// the commit takes, holds staged that way, and each the commit stages, holding in `base` a
-    /// staged node marked dirty that `before` holds elsewhere.
+    /// rehash, if only for one below it, and takes it as one holding a node staged for deletion
+    /// ([`Self::unmarked`]). Asserts that the directories the commit stages so for what lies below
+    /// them alone are those: each `before`, the staged tree the commit takes, holds staged that
+    /// way, and each the commit stages, holding in `base` a staged node marked dirty that `before`
+    /// holds elsewhere.
     fn settle_bare(
         &mut self,
         ops: &[Op],
@@ -942,11 +943,7 @@ async fn run(instance: &TestRepository, ops: &[Op], order: Order) -> Run {
     assert!(warnings <= 1, "{ops:?} {order:?}: {warnings} warnings");
 
     if matches!(order, Order::Unaided) {
-        let gone: BTreeSet<NodeID> = before
-            .iter()
-            .filter(|(_, at)| model.unmarked.contains(&at.path))
-            .map(|(id, _)| *id)
-            .collect();
+        let gone = gone_directories(&model, &base, &before);
         let kept = Kept {
             base: &base,
             before: &before,
@@ -1051,8 +1048,8 @@ async fn test_revision(instance: &TestRepository) -> std::sync::Arc<State> {
 }
 
 /// The trees a commit is checked by: the base revision, the staged tree it took, the revision it
-/// stored, and the directories of the staged tree the working tree no longer holds, which the
-/// commit deletes with everything below them.
+/// stored, and the directories of the staged tree the working tree no longer holds that the commit
+/// deletes with everything below them ([`gone_directories`]).
 struct Kept<'a> {
     base: &'a BTreeMap<NodeID, Placed>,
     before: &'a BTreeMap<NodeID, Placed>,
@@ -1182,6 +1179,74 @@ fn taken_in_place(
     true
 }
 
+/// The flags of a change a directory is staged with in its own right: an action, or a merge flag
+/// but the merge bit, which a merge stages the directories above what it brings in with.
+const OWN_CHANGE: u16 =
+    NodeFlags::ActionBits.bits() | (NodeFlags::MergeBits.bits() & !NodeFlags::StagedMerge.bits());
+
+/// The directories of `before`, the staged tree the commit takes, that the commit deletes with
+/// everything below them as the working tree no longer holds them: each staged for what lies
+/// below it alone at or below one of `model`'s [`Model::unmarked`], but for one holding a committed
+/// node not staged, there or going back there with a move the commit leaves out, and each above
+/// such a one, which the commit keeps, as it deletes nothing that was not staged. Where the
+/// directory above those is one the working tree no longer holds staged with a change of its own
+/// ([`gone_with_a_change`]), they go with it instead.
+fn gone_directories(
+    model: &Model,
+    base: &BTreeMap<NodeID, Placed>,
+    before: &BTreeMap<NodeID, Placed>,
+) -> BTreeSet<NodeID> {
+    let unmarked: BTreeSet<NodeID> = before
+        .iter()
+        .filter(|(_, at)| model.unmarked.contains(&at.path))
+        .map(|(id, _)| *id)
+        .collect();
+    let removed: BTreeSet<NodeID> = before
+        .iter()
+        .filter(|(id, at)| {
+            at.node.is_directory()
+                && at.node.is_staged()
+                && at.node.flags & OWN_CHANGE == 0
+                && within(before, **id, &unmarked)
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    let mut kept = BTreeSet::new();
+    let mut chain = Vec::new();
+    for (id, at) in before {
+        let Some(committed) = base.get(id) else {
+            continue;
+        };
+        if at.node.is_staged() || (at.parent != committed.parent && !at.node.is_dirty_move()) {
+            continue;
+        }
+        let mut above = committed.parent;
+        while removed.contains(&above) && !kept.contains(&above) {
+            chain.push(above);
+            above = before[&above].parent;
+        }
+        if !gone_with_a_change(model, before, above) {
+            kept.extend(chain.iter().copied());
+        }
+        chain.clear();
+    }
+    removed.difference(&kept).copied().collect()
+}
+
+/// Whether `before` holds `id` as a directory staged with a change of its own ([`OWN_CHANGE`]) that
+/// the working tree of `model` no longer holds.
+fn gone_with_a_change(model: &Model, before: &BTreeMap<NodeID, Placed>, id: NodeID) -> bool {
+    before.get(&id).is_some_and(|placed| {
+        placed.node.is_directory()
+            && placed.node.is_staged()
+            && placed.node.flags & OWN_CHANGE != 0
+            && !model
+                .paths
+                .keys()
+                .any(|held| held.eq_ignore_ascii_case(&placed.path))
+    })
+}
+
 /// Whether `before` holds `id` at or below one of `nodes`.
 fn within(before: &BTreeMap<NodeID, Placed>, id: NodeID, nodes: &BTreeSet<NodeID>) -> bool {
     let mut at = id;
@@ -1243,7 +1308,7 @@ fn assert_marked(
         base,
         before,
         after,
-        gone: _,
+        gone,
     } = *kept;
     let aspc: Vec<&str> = displaced
         .iter()
@@ -1264,6 +1329,10 @@ fn assert_marked(
         .filter(|at| !at.node.is_dirty_delete() && !excused(&at.path))
         .map(|at| (at.path.as_str(), at.node.is_directory()))
         .collect();
+    let gone_with = |path: &str| {
+        gone.iter()
+            .any(|gone| below_or_at(path, &before[gone].path))
+    };
     let (kept, home) = model.homeward_after();
     let expected: BTreeMap<&str, bool> = model
         .paths
@@ -1271,10 +1340,16 @@ fn assert_marked(
         .filter(|(path, _)| !excused(path))
         .map(|(path, entry)| (path.as_str(), entry.directory))
         .chain(kept.iter().map(|path| (*path, false)))
+        .chain(
+            model
+                .unmarked
+                .iter()
+                .filter(|path| !gone_with(path))
+                .map(|path| (path.as_str(), true)),
+        )
         .collect();
     assert_eq!(held, expected, "{ops:?}: the staged tree's paths");
     let at_path = |path: &str| marked.values().find(|at| at.path == path);
-    let gone_with = |path: &str| model.unmarked.iter().any(|gone| below_or_at(path, gone));
     let left_with = |path: &str| {
         before
             .iter()
@@ -1401,8 +1476,8 @@ async fn generated_sequences_past_a_dropped_add_and_a_displaced_removal() {
 }
 
 /// The sequence of a seed past the ones the tests above draw that removes a directory a staged
-/// move took a file out of, which the commit deletes with everything below it, as the directory is
-/// staged for its rehash and gone.
+/// move took a file out of, which is staged for its rehash and gone, and which the commit keeps
+/// for the committed nodes below it that are not staged.
 #[tokio::test]
 async fn generated_sequences_removing_a_directory_a_staged_move_left() {
     sequence_of(8543).await;

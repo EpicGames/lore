@@ -119,3 +119,30 @@ def registered_links(repo: "Lore") -> dict[str, str]:
         entry["linkPath"]: entry["link"]
         for entry in parse_jsonl(repo.link_list(json=True), "linkEntry")
     }
+
+
+def commit_unstaged_below_a_staged_deletion(repo: "Lore", r: str) -> None:
+    """Removes the committed directory `r`, holding `a/y`, `a/z` and `keep`, stages its
+    deletion, unstages `r/a` below it and commits. Asserts that status shows `r/keep` staged
+    for deletion and `r/a` as a deletion not staged before the commit, and that a scan after
+    it finds the rest of `r` deleted against the revision but `r/keep`, which the commit
+    deleted."""
+    repo.rmtree(r)
+    repo.stage(r, scan=True)
+    repo.unstage(posix_join(r, "a"))
+
+    entries = parse_status_json(repo.status(json=True))
+    assert sorted(
+        (to_posix(e["path"]), e["action"], e["flagStaged"]) for e in entries
+    ) == [
+        (posix_join(r, "a"), "delete", False),
+        (posix_join(r, "keep"), "delete", True),
+    ]
+    repo.commit("Delete all but a")
+    scanned = parse_status_json(repo.status(json=True, scan=True))
+    assert sorted(to_posix(e["path"]) for e in scanned if e["action"] == "delete") == [
+        r,
+        posix_join(r, "a"),
+        posix_join(r, "a", "y"),
+        posix_join(r, "a", "z"),
+    ]

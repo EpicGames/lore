@@ -1836,7 +1836,7 @@ in the next revision." Second, it does *not* freeze the content. Between staging
 committing, the user can keep editing the file, and committing picks up whatever the
 file looks like at that moment - not whatever it looked like when it was staged.
 
-The commit takes what the working tree holds at a staged path: a staged node the working tree no longer holds, or holds a node of the other kind at, is committed as deleted, a directory with everything below it, and one staged as added is left out. A directory holding what the view excludes or a link's mount stays, as their absence from the working tree is no deletion. A node staged as moved that the working tree holds at its committed path again stays there as committed instead, a directory whatever it holds, and what was added in such a directory stays marked as added. A directory whose move or add is marked dirty takes it staged once something below it is staged. In a staged directory, an unstaged child marked dirty as deleted that shares its name with a staged child is committed as deleted with what it holds, as a revision holds one node of a name.
+The commit takes what the working tree holds at staged paths, and deletes only what was staged: a staged path the working tree no longer holds is committed as deleted, and one staged as added is left out.
 
 This matches how iteration actually works. A developer stages a file, keeps editing,
 runs tests, fixes, and commits. Committing captures the latest state of the staged

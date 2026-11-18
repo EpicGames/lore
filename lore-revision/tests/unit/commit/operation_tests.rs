@@ -693,7 +693,7 @@ async fn a_commit_refuses_a_staged_link_inside_a_moved_directory_that_went_back(
 }
 
 /// A commit of a staged directory move whose directory the working tree no longer holds deletes
-/// each file the move took, and the directory with them.
+/// the directory with each file the move took, though only the directory's move was staged.
 #[tokio::test]
 async fn a_commit_deletes_a_staged_directory_move_gone_from_the_working_tree() {
     with_instance(|instance| async move {
@@ -797,9 +797,9 @@ async fn a_commit_deletes_a_directory_removed_after_edits_in_it_were_staged() {
 }
 
 /// A commit of a staged edit in a committed directory the working tree no longer holds deletes
-/// the committed file beside it that was not staged, with the directory.
+/// the staged file and keeps the directory with the committed file beside it that was not staged.
 #[tokio::test]
-async fn a_commit_deletes_a_removed_directory_with_a_file_in_it_not_staged() {
+async fn a_commit_keeps_a_removed_directory_with_a_file_in_it_not_staged() {
     with_instance(|instance| async move {
         let first = committed(&instance, &["a/x.txt", "a/y.txt", "other.txt"]).await;
         let held = tree_paths(&instance, &first).await;
@@ -808,21 +808,20 @@ async fn a_commit_deletes_a_removed_directory_with_a_file_in_it_not_staged() {
 
         let revision = committed_state(&instance, "Removed").await;
         let kept = tree_paths(&instance, &revision).await;
-        assert_eq!(kept.keys().collect::<Vec<_>>(), ["other.txt"]);
-        assert_deletes(
-            &instance,
-            &revision,
-            &[held["a"], held["a/x.txt"], held["a/y.txt"]],
-        )
-        .await;
+        assert_eq!(
+            kept.keys().collect::<Vec<_>>(),
+            ["a", "a/y.txt", "other.txt"]
+        );
+        assert_eq!(kept["a/y.txt"], held["a/y.txt"]);
+        assert_deletes(&instance, &revision, &[held["a/x.txt"]]).await;
     })
     .await;
 }
 
 /// A commit of a staged deletion in a committed directory the working tree no longer holds deletes
-/// the directory with everything below it, the staged deletion recorded once.
+/// the staged file and keeps the directory with the committed file beside it that was not staged.
 #[tokio::test]
-async fn a_commit_deletes_a_removed_directory_that_held_only_a_staged_deletion() {
+async fn a_commit_keeps_a_removed_directory_that_held_only_a_staged_deletion() {
     with_instance(|instance| async move {
         let first = committed(&instance, &["a/x.txt", "a/y.txt", "other.txt"]).await;
         let held = tree_paths(&instance, &first).await;
@@ -832,13 +831,12 @@ async fn a_commit_deletes_a_removed_directory_that_held_only_a_staged_deletion()
 
         let revision = committed_state(&instance, "Removed").await;
         let kept = tree_paths(&instance, &revision).await;
-        assert_eq!(kept.keys().collect::<Vec<_>>(), ["other.txt"]);
-        assert_deletes(
-            &instance,
-            &revision,
-            &[held["a"], held["a/x.txt"], held["a/y.txt"]],
-        )
-        .await;
+        assert_eq!(
+            kept.keys().collect::<Vec<_>>(),
+            ["a", "a/y.txt", "other.txt"]
+        );
+        assert_eq!(kept["a/y.txt"], held["a/y.txt"]);
+        assert_deletes(&instance, &revision, &[held["a/x.txt"]]).await;
     })
     .await;
 }

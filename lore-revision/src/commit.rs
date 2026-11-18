@@ -3364,20 +3364,21 @@ impl Gone {
     }
 }
 
-/// Commits a staged node the working tree no longer holds as deleted, as `gone` finds them,
-/// reading the working tree through `operation`. A gone file the working tree holds under another
-/// case refuses the commit as not found ([`refuse_case_variants`]). A file staged as moved goes
-/// back to its committed path where the working tree holds a file there, the move left out
+/// Commits a staged node the working tree no longer holds as deleted, as `gone` finds them, reading
+/// the working tree through `operation`. A gone file the working tree holds under another case
+/// refuses the commit as not found ([`refuse_case_variants`]). A file staged as moved goes back to
+/// its committed path where the working tree holds a file there, the move left out
 /// ([`return_moved_files`]), and so does a directory staged as moved where the working tree holds a
 /// directory there ([`return_moved_directories`]), with what moved with it, which stays as
-/// committed. A staged directory the working tree no longer holds leaves with everything below
-/// it, the topmost one above each gone file and each directory the walk leaves to the climb
-/// ([`Gone::directories`], [`gone_directories`]), and the delta drops what the walk recorded of
-/// what leaves with it or goes back. What leaves goes to `discard` and `subnodes_to_discard`,
-/// staged for deletion, in place of what they listed below such a directory, for
-/// [`commit_discard`] to record and free. `walk_root` is the node the walk starts at, which never
-/// leaves, and its working-tree path. Answers the sorted nodes the revision holds nothing at the
-/// walk's path of: those that leave and the directories that go back.
+/// committed. A staged directory the working tree no longer holds leaves with everything below it,
+/// the topmost one above each gone file and each directory the walk leaves to the climb, but for
+/// one staged only for what lies below it that holds a child not staged, which stays, with each
+/// gone directory above it staged so too ([`Gone::directories`], [`gone_directories`]), and the
+/// delta drops what the walk recorded of what leaves with it or goes back. What leaves goes to
+/// `discard` and `subnodes_to_discard`, staged for deletion, in place of what they listed below
+/// such a directory, for [`commit_discard`] to record and free. `walk_root` is the node the walk
+/// starts at, which never leaves, and its working-tree path. Answers the sorted nodes the revision
+/// holds nothing at the walk's path of: those that leave and the directories that go back.
 #[allow(clippy::too_many_arguments)]
 async fn commit_gone(
     operation: &InstanceOperationImpl,
@@ -3822,9 +3823,9 @@ fn count_totals(stats: &CommitStats, flags: impl Iterator<Item = u16>) {
     }
 }
 
-/// `flags`, of a node the working tree no longer holds, staged for deletion. The deletion of a node
-/// staged as added is recorded as [`recorded_deletions`] answers: as nothing where the revision
-/// the tree was built on lacks it.
+/// `flags`, of a node the commit removes from the revision, staged for deletion, whatever change
+/// it carried. The deletion of a node staged as added is recorded as [`recorded_deletions`]
+/// answers: as nothing where the revision the tree was built on lacks it.
 fn deleted_flags(flags: u16) -> u16 {
     (flags & !NodeFlags::ActionBits.bits()) | NodeFlags::StagedDelete.bits()
 }
@@ -4109,7 +4110,10 @@ struct Holder {
 /// ([`crate::filter::Filter::view_covers_subtree`]), and it holds no link's mount
 /// ([`linked_directories`]): a working tree lacks what the view excludes without its having been
 /// deleted, and a link leaves only by its removal. Elsewhere it counts as held, but for one staged
-/// as moved, which may go back ([`OnDisk::Kept`]). A file at its path counts as gone.
+/// as moved, which may go back ([`OnDisk::Kept`]). One staged only for what lies below it
+/// ([`state::staged_for_below`]) that holds a child not staged counts as held, with each gone
+/// directory above it, where each of those is staged only for what lies below it too
+/// ([`hold_unstaged`]): the commit deletes only what was staged. A file at its path counts as gone.
 async fn gone_directories(
     operation: &InstanceOperationImpl,
     repository: &Arc<RepositoryContext>,
@@ -4140,26 +4144,39 @@ async fn gone_directories(
         return Ok(HashMap::new());
     }
     let mut up = HashMap::new();
+    let mut holding = Vec::new();
     let mut linked = None;
     let filter = &repository.filter;
     while !frontier.is_empty() {
         let mut parents = Vec::new();
         for (directory, path) in frontier {
-            let node = state
-                .node(repository.clone(), directory)
-                .await
-                .forward::<CommitError>("Failed reading a directory gone from the working tree")?;
-            let staged = node.is_directory() && node.is_staged();
+            let (parent, staged, bare, kept) = {
+                let node = state
+                    .node(repository.clone(), directory)
+                    .await
+                    .forward::<CommitError>(
+                        "Failed reading a directory gone from the working tree",
+                    )?;
+                let staged = node.is_directory() && node.is_staged();
+                let kept = staged && node.is_staged_move() && !node.is_staged_add();
+                (node.parent, staged, state::staged_for_below(&node), kept)
+            };
             let leaves = staged
                 && filter.view_covers_subtree(filter.exclusion_states(&path), &path)
                 && !holds_link(repository, state, &mut linked, directory).await?;
             if !leaves {
-                let kept = staged && node.is_staged_move() && !node.is_staged_add();
                 on_disk.insert(directory, if kept { OnDisk::Kept } else { OnDisk::Held });
                 continue;
             }
-            up.insert(directory, node.parent);
-            let parent = node.parent;
+            if bare
+                && state
+                    .node_has_unstaged_children(repository.clone(), directory)
+                    .await
+                    .forward::<CommitError>("Failed reading a directory's children")?
+            {
+                holding.push(directory);
+            }
+            up.insert(directory, (parent, bare));
             if parent != walk_root && parent != ROOT_NODE && !on_disk.contains_key(&parent) {
                 parents.push((parent, path.parent_path()));
             }
@@ -4168,6 +4185,7 @@ async fn gone_directories(
         parents.dedup_by_key(|(node, _)| *node);
         frontier = read_held(operation, parents, &mut on_disk).await?;
     }
+    hold_unstaged(&holding, &mut up, &mut on_disk);
     let mut chain = Vec::new();
     let gone: Vec<NodeID> = up.keys().copied().collect();
     for directory in gone {
@@ -4178,7 +4196,7 @@ async fn gone_directories(
         let mut at = directory;
         let top = loop {
             chain.push(at);
-            let Some(&parent) = up.get(&at) else {
+            let Some(&(parent, _)) = up.get(&at) else {
                 break at;
             };
             match on_disk.get(&parent) {
@@ -4192,6 +4210,39 @@ async fn gone_directories(
         }
     }
     Ok(on_disk)
+}
+
+/// Holds each gone directory of `holding`, staged only for what lies below it and holding a child
+/// not staged, with each gone directory above it up to the first held one, where every one of those
+/// is staged only for what lies below it too: `up` maps each gone directory to its parent and
+/// whether it is staged so ([`state::staged_for_below`]). One below a gone directory with a staged
+/// change of its own leaves or goes back with that directory instead, as its change says, and each
+/// gone directory its climb passed is then marked as not staged so, for a later climb to stop at.
+/// Reads nothing, and passes each gone directory at most twice.
+fn hold_unstaged(
+    holding: &[NodeID],
+    up: &mut HashMap<NodeID, (NodeID, bool)>,
+    on_disk: &mut HashMap<NodeID, OnDisk>,
+) {
+    for &directory in holding {
+        let mut at = directory;
+        while let Some(&(parent, true)) = up.get(&at) {
+            at = parent;
+        }
+        let held = !up.contains_key(&at);
+        let mut at = directory;
+        if held {
+            while let Some((parent, _)) = up.remove(&at) {
+                on_disk.insert(at, OnDisk::Held);
+                at = parent;
+            }
+        } else {
+            while let Some(entry) = up.get_mut(&at).filter(|entry| entry.1) {
+                entry.1 = false;
+                at = entry.0;
+            }
+        }
+    }
 }
 
 /// Reads whether the working tree holds each directory of `directories` ([`directories_held`]),
@@ -4734,7 +4785,8 @@ fn hand_directories(
 
 /// Frees the nodes staged for deletion, `discard`, and the nodes below them a walk collected,
 /// `subnodes_to_discard`, each with its flags, recording each deletion in the delta as `base` says
-/// ([`recorded_deletions`]) under the flags it is listed with: each root is detached before
+/// ([`recorded_deletions`]): a root under the flags it is listed with, and a node below one as a
+/// deletion whatever change it is listed with ([`deleted_flags`]). Each root is detached before
 /// anything below it is freed (H6).
 ///
 /// Refuses an unresolved conflict among the nodes below them, which no walk visits, named by its
@@ -4781,7 +4833,7 @@ async fn commit_discard(
             delta.reserve(collected.len() * size_of::<NodeDelta>());
             for &(node, flags) in &collected {
                 match recorded_as(&recorded, records, node) {
-                    Some(recorded) => delta_push(&mut delta, recorded, flags),
+                    Some(recorded) => delta_push(&mut delta, recorded, deleted_flags(flags)),
                     None => dropped.count(flags),
                 }
             }
@@ -6791,13 +6843,13 @@ async fn apply_merge_carry(
     Ok(())
 }
 
-/// Discard dirty-only-add subtrees, return dirty-only moves to the place `base` holds them at,
-/// and clear dirty flags on every other dirty-only node before the commit pipeline builds the
-/// new revision, so it holds `base` with the staged changes and nothing else. A dirty-only move a
-/// staged change displaces leaves the tree, as it cannot go back. `base` is the revision the
-/// staged tree shares its node IDs with, the one it was built on or loaded from. Answers each
-/// dirty-only move, gone back or left out, with the path the staged tree held its node at, in the
-/// order the walk left them: each before the moves of the directories above it.
+/// Discard dirty-only-add and dirty-only-copy subtrees, return dirty-only moves to the place `base`
+/// holds them at, and clear dirty flags on every other dirty-only node before the commit pipeline
+/// builds the new revision, so it holds `base` with the staged changes and nothing else. A
+/// dirty-only move a staged change displaces leaves the tree, as it cannot go back. `base` is the
+/// revision the staged tree shares its node IDs with, the one it was built on or loaded from.
+/// Answers each dirty-only move, gone back or left out, with the path the staged tree held its node
+/// at, in the order the walk left them: each before the moves of the directories above it.
 ///
 /// A dirty-only directory that holds a staged node is staged with it, as staging the node there
 /// would have staged it, so the revision takes the directory where the staged tree holds it, a
@@ -6817,7 +6869,7 @@ async fn apply_merge_carry(
 /// them. After pruning, the staged tracking is rebuilt against the new
 /// committed revision by marking the returned moves again, marking each other
 /// node with the dirty marks it carried, and re-running `file::dirty::dirty()`
-/// on the paths of the adds and deletions captured beforehand ([`DirtyOnly::carried`]).
+/// on the paths of the adds, copies and deletions captured beforehand ([`DirtyOnly::carried`]).
 ///
 /// The walk is post-order, so empty intermediate directories can collapse
 /// upward after their dirty-add children have already been removed, and a move
@@ -6917,11 +6969,11 @@ pub(crate) async fn prune_dirty_for_commit(
 /// them.
 #[derive(Default)]
 struct DirtyOnly {
-    /// The path of each node marked dirty as added or deleted, which the commit marks again as the
-    /// working tree holds it, or found through a link.
+    /// The path of each node marked dirty as added, copied or deleted, which the commit marks again
+    /// as the working tree holds it, or found through a link.
     paths: Vec<RelativePath>,
-    /// Each node of [`Self::paths`] marked dirty as added or deleted, and each new directory only
-    /// marked dirty whose children carry it, which the commit marks again by their paths
+    /// Each node of [`Self::paths`] marked dirty as added, copied or deleted, and each new directory
+    /// only marked dirty whose children carry it, which the commit marks again by their paths
     /// ([`state::DirtyPathSink::carried_by_children`]), not found through a link.
     named: Vec<NamedPath>,
     /// Each other node of the tree, with its flags, which the revision holds where the tree does or
@@ -6929,8 +6981,9 @@ struct DirtyOnly {
     marks: Vec<(NodeID, NodeFlags)>,
 }
 
-/// A node [`DirtyOnly`] holds the path of, marked dirty as added or deleted: its directory and name
-/// hash, which a node of its name shares, its kind, and its path's index in [`DirtyOnly::paths`].
+/// A node [`DirtyOnly`] holds the path of, marked dirty as added, copied or deleted: its directory
+/// and name hash, which a node of its name shares, its kind, and its path's index in
+/// [`DirtyOnly::paths`].
 /// A directory its children carry has no path there: it shares one with the node marked deleted
 /// that it pairs with, as both hold one name in one directory.
 struct NamedPath {
@@ -6956,7 +7009,7 @@ impl state::DirtyPathSink for DirtyOnly {
     const THROUGH_MOVES: bool = true;
 
     fn record(&mut self, path: &RelativePathBuf, id: NodeID, node: &Node, linked: bool) {
-        if linked || node.is_dirty_add() || node.is_dirty_delete() {
+        if linked || node.is_dirty_add() || node.is_dirty_copy() || node.is_dirty_delete() {
             if !linked {
                 self.named.push(NamedPath {
                     node: id,
@@ -7189,8 +7242,8 @@ struct PruneContext {
 /// dirty as deleted that a staged child of their name replaces ([`take_replaced_deletions`]),
 /// returns it to the place the base revision holds it at where it is an unstaged dirty move
 /// ([`State::node_return_unstaged_move`]), recording it in `context`, clears its dirty flags unless
-/// it is an unstaged dirty add to be discarded, and answers what its parent does with it, one only
-/// marked dirty as deleted named to its parent for that check. A node that was not staged
+/// it is an unstaged dirty add or copy to be discarded, and answers what its parent does with it,
+/// one only marked dirty as deleted named to its parent for that check. A node that was not staged
 /// and holds staged content, or a dirty add that holds a staged node, is staged first, its
 /// ancestors with it, as staging that node would have staged it ([`stage_holder`]), its dirty move
 /// or add with it. One that holds only staged directories that no staged content lies below, as a
@@ -7273,7 +7326,10 @@ async fn prune_dirty_leave(
         Box::pin(stage_holder(state, repository, node_id)).await?;
     }
 
-    if !is_staged && flags.contains(NodeFlags::DirtyAdd) && !is_root {
+    if !is_staged
+        && (flags.contains(NodeFlags::DirtyAdd) || flags.contains(NodeFlags::DirtyCopy))
+        && !is_root
+    {
         return Ok(Leave::Discard);
     }
 

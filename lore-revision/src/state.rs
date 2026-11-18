@@ -5033,6 +5033,16 @@ impl State {
         self.holds_child(repository, parent_node, Node::is_staged)
     }
 
+    /// Whether a child of the directory `parent_node` carries no Staged flag, as
+    /// [`Self::holds_child`] reads it.
+    pub(crate) fn node_has_unstaged_children(
+        &self,
+        repository: Arc<RepositoryContext>,
+        parent_node: NodeID,
+    ) -> impl Future<Output = Result<bool, StateError>> + Send + '_ {
+        self.holds_child(repository, parent_node, |child| !child.is_staged())
+    }
+
     /// Whether the directory `directory` holds a node staged in its own right below it, through
     /// directories staged only for what lies below them ([`is_staged_for_descendants_only`]): a
     /// bare staged bit that a node since gone carried up holds no staged content. Each directory is
@@ -9442,6 +9452,15 @@ pub(crate) fn is_staged_for_descendants_only(node: &Node) -> bool {
     node.is_staged()
         && !node.is_link()
         && node.flags & (NodeFlags::ActionBits.bits() | NodeFlags::MergeBits.bits()) == 0
+}
+
+/// Whether `node` is staged only for what lies below it ([`is_staged_for_descendants_only`]), or as
+/// a merge stages the directories above an add or a move it takes in: with no staged action of its
+/// own and no merge flag but the merge bit.
+pub(crate) fn staged_for_below(node: &Node) -> bool {
+    let own = NodeFlags::ActionBits.bits()
+        | (NodeFlags::MergeBits.bits() & !NodeFlags::StagedMerge.bits());
+    node.is_staged() && !node.is_link() && node.flags & own == 0
 }
 
 /// Clear the `Dirty` and `Staged` bits that marking a node carried up to `ancestor` and the nodes

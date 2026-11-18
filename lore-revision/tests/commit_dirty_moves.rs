@@ -173,6 +173,23 @@ async fn assert_staged(
     }
 }
 
+/// Asserts that the delta of `revision` records each node of `expected`, which `held` names at its
+/// path, with its action, `None` for a node it records nothing of.
+async fn assert_recorded(
+    instance: &TestRepository,
+    revision: &State,
+    held: &BTreeMap<String, NodeID>,
+    expected: &[(&str, Option<FileAction>)],
+) {
+    for (path, action) in expected {
+        assert_eq!(
+            delta_action(instance, revision, held[*path]).await,
+            action.map(|action| action as u16),
+            "the action recorded of {path}"
+        );
+    }
+}
+
 /// Asserts that the instance holds no dirty mark: no staged tree, or one with no dirty node.
 async fn assert_nothing_dirty(instance: &TestRepository) {
     let (_, staged, _) = State::deserialize_current_and_staged(instance.repository.clone())
@@ -312,13 +329,14 @@ fn failing_context(instance: &TestRepository, failing: &[&str]) -> Arc<Repositor
 
 /// A file `lore dirty move` moved out of a committed directory whose deletion is then staged goes
 /// back into it, and leaves the revision with it: the revision holds the committed tree with the
-/// staged changes alone. The commit warns that the move is not kept, and the working tree's file
-/// at the moved path is marked dirty as added.
+/// staged changes alone, and its delta records the file deleted with the directory. The commit
+/// warns that the move is not kept, and the working tree's file at the moved path is marked dirty
+/// as added.
 #[tokio::test]
 async fn a_commit_deletes_a_dirty_moved_file_with_its_committed_directory() {
     with_instance(|instance| async move {
         let first = committed(&instance, &["d/f.txt", "other.txt"]).await;
-        let other = node_id_at(&instance, &first, "other.txt").await;
+        let held = tree_paths(&instance, &first).await;
         dirty_moved(&instance, "d/f.txt", "f.txt").await;
         removed_directory(&instance, "d");
         let state = stage_path(&instance, "d").await;
@@ -326,7 +344,15 @@ async fn a_commit_deletes_a_dirty_moved_file_with_its_committed_directory() {
         assert!(d.is_staged_delete(), "flags {:#x}", d.flags);
 
         let (revision, warnings) = committed_warning(&instance, "Deleted").await;
-        assert_revision(&instance, &revision, &[("other.txt", other)]).await;
+        assert_revision(&instance, &revision, &[("other.txt", held["other.txt"])]).await;
+        let deleted = Some(FileAction::Delete);
+        assert_recorded(
+            &instance,
+            &revision,
+            &held,
+            &[("d", deleted), ("d/f.txt", deleted)],
+        )
+        .await;
         assert_eq!(warnings, 1);
 
         let staged = staged_tree(&instance).await;
@@ -1349,10 +1375,10 @@ async fn assert_below_a_directory(instance: &TestRepository, state: &State, path
 }
 
 /// A directory removed on disk and marked dirty, below which the deletion of a directory is
-/// staged, is not staged for deletion by the mark, and is deleted by the commit with everything
-/// below it, as the working tree no longer holds it: nothing of it stays marked.
+/// staged, is staged for what lies below it alone, and the commit deletes the staged directory
+/// alone: the directory and its file never staged stay, the file marked deleted and not staged.
 #[tokio::test]
-async fn a_commit_deletes_a_directory_marked_deleted_above_a_staged_deletion() {
+async fn a_commit_keeps_a_directory_marked_deleted_above_a_staged_deletion() {
     with_instance(|instance| async move {
         let first = committed(&instance, &["a/f1", "a/s/g1", "other.txt"]).await;
         let held = tree_paths(&instance, &first).await;
@@ -1364,8 +1390,20 @@ async fn a_commit_deletes_a_directory_marked_deleted_above_a_staged_deletion() {
         assert!(!a.is_staged_delete(), "a: flags {:#x}", a.flags);
 
         let (revision, _) = committed_warning(&instance, "Deleted").await;
-        assert_revision_holds(&instance, &revision, &without(&held, "a")).await;
-        assert_nothing_dirty(&instance).await;
+        assert_revision_holds(&instance, &revision, &without(&held, "a/s")).await;
+        assert_recorded(
+            &instance,
+            &revision,
+            &held,
+            &[
+                ("a", Some(FileAction::Keep)),
+                ("a/f1", None),
+                ("a/s", Some(FileAction::Delete)),
+                ("a/s/g1", Some(FileAction::Delete)),
+            ],
+        )
+        .await;
+        assert_deletions_not_staged(&instance, &["a/f1"]).await;
     })
     .await;
 }
@@ -1838,81 +1876,100 @@ async fn an_unstage_of_the_tree_reaches_a_staged_file_dirty_moved_into_a_committ
 }
 
 /// A commit of a directory the working tree no longer holds, after edits in it were staged,
-/// counts what it does as a commit of the directory's staged deletion does: each file and
-/// directory once in the totals and once as done, and as deleted.
+/// deletes the staged files and keeps the directory with the file never staged; with the
+/// directory's deletion staged, it deletes the directory with every file in it. Either way it
+/// counts each file and directory once in the totals and once as done, and as deleted where it
+/// deletes it.
 #[tokio::test]
-async fn a_commit_of_a_removed_directory_counts_it_as_its_staged_deletion() {
-    let mut counts = Vec::new();
+async fn a_commit_of_a_removed_directory_counts_what_it_deletes() {
     for staged in [false, true] {
-        let (sender, receiver) = std::sync::mpsc::channel();
         with_instance(|instance| async move {
-            committed(&instance, &["a/x.txt", "a/y.txt", "a/z.txt", "other.txt"]).await;
+            let files = &["a/x.txt", "a/y.txt", "a/z.txt", "other.txt"];
+            let first = committed(&instance, files).await;
+            let held = tree_paths(&instance, &first).await;
             restaged(&instance, "a/x.txt").await;
             restaged(&instance, "a/y.txt").await;
             removed_directory(&instance, "a");
             if staged {
                 stage_path(&instance, "a").await;
             }
-            let _ = sender.send(counted_commit(&instance).await);
+
+            let (counts, revision) = counted_commit(&instance).await;
+            let [
+                directories,
+                directory_total,
+                files,
+                file_total,
+                directories_deleted,
+                files_deleted,
+            ] = counts;
+            assert_eq!(directories, directory_total, "staged {staged}");
+            let (deleted, kept) = if staged {
+                ((3, 3, 3, 1), without(&held, "a"))
+            } else {
+                let kept = without(&without(&held, "a/x.txt"), "a/y.txt");
+                ((2, 2, 2, 0), kept)
+            };
+            assert_eq!(
+                (files, file_total, files_deleted, directories_deleted),
+                deleted,
+                "staged {staged}"
+            );
+            assert_revision_holds(&instance, &revision, &kept).await;
         })
         .await;
-        counts.push(receiver.recv().expect("the counts"));
     }
-    assert_eq!(counts[0], counts[1], "gone, then staged for deletion");
-    let [
-        directories,
-        directory_total,
-        files,
-        file_total,
-        directories_deleted,
-        files_deleted,
-    ] = counts[0];
-    assert_eq!((files, file_total, files_deleted), (3, 3, 3));
-    assert_eq!(directories, directory_total);
-    assert_eq!(directories_deleted, 1);
 }
 
 /// A commit of a directory the working tree no longer holds, after edits in the directories below
-/// it were staged, counts each of those directories once in the totals and once as done, as a
-/// commit of the directory's staged deletion does, though the walk entered them first.
+/// it were staged, deletes those directories with their staged files and keeps the directory with
+/// the file never staged; with the directory's deletion staged, it deletes the directory with
+/// everything in it. Either way it counts each directory once in the totals and once as done, and
+/// as deleted where it deletes it, though the walk entered them first.
 #[tokio::test]
 async fn a_commit_of_a_removed_directory_counts_the_directories_the_walk_entered_once() {
-    let mut counts = Vec::new();
     for staged in [false, true] {
-        let (sender, receiver) = std::sync::mpsc::channel();
         with_instance(|instance| async move {
-            committed(
-                &instance,
-                &["a/b/x.txt", "a/c/y.txt", "a/z.txt", "other.txt"],
-            )
-            .await;
+            let files = &["a/b/x.txt", "a/c/y.txt", "a/z.txt", "other.txt"];
+            let first = committed(&instance, files).await;
+            let held = tree_paths(&instance, &first).await;
             restaged(&instance, "a/b/x.txt").await;
             restaged(&instance, "a/c/y.txt").await;
             removed_directory(&instance, "a");
             if staged {
                 stage_path(&instance, "a").await;
             }
-            let _ = sender.send(counted_commit(&instance).await);
+
+            let (counts, revision) = counted_commit(&instance).await;
+            let [
+                directories,
+                directory_total,
+                _,
+                _,
+                directories_deleted,
+                files_deleted,
+            ] = counts;
+            assert_eq!(directories, directory_total, "staged {staged}");
+            let (deleted, kept) = if staged {
+                ((3, 3), without(&held, "a"))
+            } else {
+                ((2, 2), without(&without(&held, "a/b"), "a/c"))
+            };
+            assert_eq!(
+                (directories_deleted, files_deleted),
+                deleted,
+                "staged {staged}"
+            );
+            assert_revision_holds(&instance, &revision, &kept).await;
         })
         .await;
-        counts.push(receiver.recv().expect("the counts"));
     }
-    assert_eq!(counts[0], counts[1], "gone, then staged for deletion");
-    let [
-        directories,
-        directory_total,
-        _,
-        _,
-        directories_deleted,
-        files_deleted,
-    ] = counts[0];
-    assert_eq!(directories, directory_total);
-    assert_eq!((directories_deleted, files_deleted), (3, 3));
 }
 
-/// Commits what `instance` holds staged, answering the counts the commit reports at its end:
-/// directories done and in total, files done and in total, and directories and files deleted.
-async fn counted_commit(instance: &TestRepository) -> [u64; 6] {
+/// Commits what `instance` holds staged, answering the counts the commit reports at its end,
+/// directories done and in total, files done and in total, and directories and files deleted, and
+/// the revision it stored.
+async fn counted_commit(instance: &TestRepository) -> ([u64; 6], Arc<State>) {
     let counted = Arc::new(Mutex::new(None));
     let seen = counted.clone();
     let callback: LoreEventCallback = Some(Box::new(move |event| {
@@ -1933,19 +1990,20 @@ async fn counted_commit(instance: &TestRepository) -> [u64; 6] {
         EventDispatcher::new(callback),
         "test-user".to_string(),
     ));
-    LORE_CONTEXT
+    let revision = LORE_CONTEXT
         .scope(execution.clone(), test_commit(instance, "Counted"))
         .await;
     execution.dispatcher.drain().await;
-    counted.lock().take().expect("the commit's end")
+    let counts = counted.lock().take().expect("the commit's end");
+    (counts, revision)
 }
 
 /// A committed file `lore dirty move` moved out of a committed directory that holds a staged edit,
-/// which is then removed on disk and not marked, goes back into the directory for the commit,
-/// which deletes the directory with it as the working tree no longer holds it: the commit warns
-/// that it does not keep the move, and the file at the moved path is marked dirty as added.
+/// which is then removed on disk and not marked, stays in the directory: the commit deletes the
+/// file whose edit was staged, as the working tree no longer holds it, and keeps the directory
+/// with the file never staged, which stays marked as moved.
 #[tokio::test]
-async fn a_commit_deletes_a_file_dirty_moved_out_of_a_removed_directory_with_it() {
+async fn a_commit_keeps_a_file_dirty_moved_out_of_a_removed_directory_in_it() {
     with_instance(|instance| async move {
         let first = committed(&instance, &["a/x.txt", "a/y.txt", "other.txt"]).await;
         let held = tree_paths(&instance, &first).await;
@@ -1954,12 +2012,23 @@ async fn a_commit_deletes_a_file_dirty_moved_out_of_a_removed_directory_with_it(
         removed_directory(&instance, "a");
 
         let (revision, warnings) = committed_warning(&instance, "Removed").await;
-        assert_revision_holds(&instance, &revision, &without(&held, "a")).await;
-        assert_eq!(warnings, 1);
+        assert_revision_holds(&instance, &revision, &without(&held, "a/y.txt")).await;
+        assert_recorded(
+            &instance,
+            &revision,
+            &held,
+            &[
+                ("a", Some(FileAction::Keep)),
+                ("a/x.txt", None),
+                ("a/y.txt", Some(FileAction::Delete)),
+            ],
+        )
+        .await;
+        assert_eq!(warnings, 0);
         let staged = staged_tree(&instance).await;
         let x = node_at(&instance, &staged, "x.txt").await;
         assert!(
-            x.is_dirty_add() && !x.is_staged(),
+            x.is_dirty_move() && !x.is_staged(),
             "x.txt: flags {:#x}",
             x.flags
         );
@@ -2474,10 +2543,10 @@ enum LeavesBy {
 }
 
 /// A commit of a directory a staged move took a staged file out of, which the directory is staged
-/// for, as its address changes, deletes the directory with everything in it where the working tree
-/// no longer holds it, the files never staged included, and keeps it as committed where it does.
+/// for, as its address changes, keeps it with the files never staged, whether or not the working
+/// tree still holds it: where it does not, they stay marked deleted.
 #[tokio::test]
-async fn a_commit_deletes_a_removed_directory_a_staged_move_left() {
+async fn a_commit_keeps_a_removed_directory_a_staged_move_left_with_what_was_never_staged() {
     for (by, removed) in [
         (LeavesBy::DirtyMove, true),
         (LeavesBy::StagedMove, true),
@@ -2503,20 +2572,24 @@ async fn a_commit_deletes_a_removed_directory_a_staged_move_left() {
 
             let (revision, _) = committed_warning(&instance, "Moved").await;
             let kept = tree_paths(&instance, &revision).await;
-            let mut expected = vec![("f2", "a/f2"), ("other.txt", "other.txt")];
-            if !removed {
-                expected.extend([
-                    ("a", "a"),
-                    ("a/f1", "a/f1"),
-                    ("a/s", "a/s"),
-                    ("a/s/g1", "a/s/g1"),
-                ]);
-            }
-            let expected: BTreeMap<String, NodeID> = expected
-                .into_iter()
-                .map(|(path, committed)| (path.to_string(), held[committed]))
-                .collect();
+            let expected: BTreeMap<String, NodeID> = [
+                ("f2", "a/f2"),
+                ("other.txt", "other.txt"),
+                ("a", "a"),
+                ("a/f1", "a/f1"),
+                ("a/s", "a/s"),
+                ("a/s/g1", "a/s/g1"),
+            ]
+            .into_iter()
+            .map(|(path, committed)| (path.to_string(), held[committed]))
+            .collect();
             assert_eq!(kept, expected, "{by:?}, removed {removed}");
+            let marked: &[&str] = if removed {
+                &["a/f1", "a/s", "a/s/g1"]
+            } else {
+                &[]
+            };
+            assert_deletions_not_staged(&instance, marked).await;
         })
         .await;
     }
@@ -3677,6 +3750,508 @@ async fn a_dirty_move_onto_a_committed_file_marks_it_deleted_beside_the_moved_on
         .await;
     }
     assert_eq!(orders.lock().len(), 2, "both chain orders");
+}
+
+/// Asserts that the instance's staged tree, where it holds one, stages nothing and marks exactly
+/// the paths of `deleted` dirty as deleted: what status reports as deletions not staged.
+async fn assert_deletions_not_staged(instance: &TestRepository, deleted: &[&str]) {
+    let (_, staged, _) = State::deserialize_current_and_staged(instance.repository.clone())
+        .await
+        .expect("the states");
+    let mut marked = Vec::new();
+    if let Some(staged) = staged {
+        for (path, node) in tree_paths(instance, &staged).await {
+            let node = node_of(instance, &staged, node).await;
+            assert!(
+                !node.is_staged(),
+                "{path} is staged, flags {:#x}",
+                node.flags
+            );
+            if node.is_dirty_delete() {
+                marked.push(path);
+            }
+        }
+    }
+    assert_eq!(marked, deleted, "the paths marked deleted");
+}
+
+/// Commits `files`, removes `r` on disk and stages its deletion, then unstages `path` below it:
+/// answers the paths the commit held, each with its node.
+async fn unstaged_below_deleted_r(
+    instance: &TestRepository,
+    files: &[&str],
+    path: &str,
+) -> BTreeMap<String, NodeID> {
+    let first = committed(instance, files).await;
+    let held = tree_paths(instance, &first).await;
+    removed_directory(instance, "r");
+    stage_path(instance, "r").await;
+    unstaged(instance, path).await;
+    held
+}
+
+/// A directory unstaged below a directory staged for deletion stays, with the directory above it:
+/// the commit deletes the rest of the staged deletion, recording each node it deletes as deleted,
+/// and keeps the unstaged directory as committed, its deletion marked and not staged.
+#[tokio::test]
+async fn a_commit_keeps_a_directory_unstaged_below_a_staged_deletion() {
+    with_instance(|instance| async move {
+        let files = &["r/a/y", "r/a/z", "r/keep", "other.txt"];
+        let held = unstaged_below_deleted_r(&instance, files, "r/a").await;
+
+        let (revision, _) = committed_warning(&instance, "Deleted").await;
+        assert_revision_holds(&instance, &revision, &without(&held, "r/keep")).await;
+        assert_recorded(
+            &instance,
+            &revision,
+            &held,
+            &[
+                ("r", Some(FileAction::Keep)),
+                ("r/a", None),
+                ("r/a/y", None),
+                ("r/a/z", None),
+                ("r/keep", Some(FileAction::Delete)),
+            ],
+        )
+        .await;
+        assert_deletions_not_staged(&instance, &["r/a", "r/a/y", "r/a/z"]).await;
+    })
+    .await;
+}
+
+/// A directory unstaged below a directory staged for deletion, a file of which the working tree
+/// holds again, stays with that file, and the commit deletes the rest of the staged deletion.
+#[tokio::test]
+async fn a_commit_keeps_a_file_written_again_in_a_directory_unstaged_below_a_staged_deletion() {
+    with_instance(|instance| async move {
+        let files = &["r/a/y", "r/a/z", "r/keep", "other.txt"];
+        let held = unstaged_below_deleted_r(&instance, files, "r/a").await;
+        written(&instance, &["r/a/y"]);
+
+        let (revision, _) = committed_warning(&instance, "Deleted").await;
+        assert_revision_holds(&instance, &revision, &without(&held, "r/keep")).await;
+        assert_recorded(
+            &instance,
+            &revision,
+            &held,
+            &[
+                ("r", Some(FileAction::Keep)),
+                ("r/a", None),
+                ("r/a/y", None),
+                ("r/a/z", None),
+                ("r/keep", Some(FileAction::Delete)),
+            ],
+        )
+        .await;
+        assert_deletions_not_staged(&instance, &["r/a/z"]).await;
+    })
+    .await;
+}
+
+/// A file unstaged below a directory staged for deletion stays, with each directory above it: the
+/// commit deletes the rest of the staged deletion, its sibling with it.
+#[tokio::test]
+async fn a_commit_keeps_a_file_unstaged_below_a_staged_deletion() {
+    with_instance(|instance| async move {
+        let files = &["r/a/y", "r/a/z", "r/keep", "other.txt"];
+        let held = unstaged_below_deleted_r(&instance, files, "r/a/y").await;
+
+        let (revision, _) = committed_warning(&instance, "Deleted").await;
+        let kept = without(&without(&held, "r/a/z"), "r/keep");
+        assert_revision_holds(&instance, &revision, &kept).await;
+        assert_recorded(
+            &instance,
+            &revision,
+            &held,
+            &[
+                ("r", Some(FileAction::Keep)),
+                ("r/a", Some(FileAction::Keep)),
+                ("r/a/y", None),
+                ("r/a/z", Some(FileAction::Delete)),
+                ("r/keep", Some(FileAction::Delete)),
+            ],
+        )
+        .await;
+        assert_deletions_not_staged(&instance, &["r/a/y"]).await;
+    })
+    .await;
+}
+
+/// A file unstaged three directories below a directory staged for deletion stays, with each
+/// directory between them, whether or not the directory between them holds a deletion of its own:
+/// the commit deletes the rest of the staged deletion at every level.
+#[tokio::test]
+async fn a_commit_keeps_a_file_unstaged_deep_below_a_staged_deletion() {
+    for beside in [true, false] {
+        with_instance(|instance| async move {
+            let mut files = vec!["r/a/b/x", "r/a/b/w", "r/keep", "other.txt"];
+            if beside {
+                files.push("r/a/y");
+            }
+            let held = unstaged_below_deleted_r(&instance, &files, "r/a/b/x").await;
+
+            let (revision, _) = committed_warning(&instance, "Deleted").await;
+            let mut kept = without(&without(&held, "r/a/b/w"), "r/keep");
+            let mut recorded = vec![
+                ("r", Some(FileAction::Keep)),
+                ("r/a", Some(FileAction::Keep)),
+                ("r/a/b", Some(FileAction::Keep)),
+                ("r/a/b/x", None),
+                ("r/a/b/w", Some(FileAction::Delete)),
+                ("r/keep", Some(FileAction::Delete)),
+            ];
+            if beside {
+                kept.remove("r/a/y");
+                recorded.push(("r/a/y", Some(FileAction::Delete)));
+            }
+            assert_revision_holds(&instance, &revision, &kept).await;
+            assert_recorded(&instance, &revision, &held, &recorded).await;
+            assert_deletions_not_staged(&instance, &["r/a/b/x"]).await;
+        })
+        .await;
+    }
+}
+
+/// A directory unstaged below a directory staged for deletion, out of which a file's move is
+/// staged to a path the working tree no longer holds, stays: the file goes back into it, kept
+/// where the working tree holds it there and deleted where it does not.
+#[tokio::test]
+async fn a_commit_keeps_a_directory_unstaged_below_a_staged_deletion_a_staged_move_left() {
+    for written_again in [false, true] {
+        with_instance(|instance| async move {
+            let first = committed(&instance, &["r/a/x", "r/a/y", "r/keep", "other.txt"]).await;
+            let held = tree_paths(&instance, &first).await;
+            staged_moved(&instance, "r/a/x", "e").await;
+            removed_directory(&instance, "r");
+            stage_path(&instance, "r").await;
+            unstaged(&instance, "r/a").await;
+            std::fs::remove_file(instance.path.join("e")).expect("the delete on disk");
+            if written_again {
+                written(&instance, &["r/a/x"]);
+            }
+
+            let (revision, _) = committed_warning(&instance, "Deleted").await;
+            let mut kept = without(&held, "r/keep");
+            let (moved, marked) = if written_again {
+                (None, &["r/a/y"][..])
+            } else {
+                kept.remove("r/a/x");
+                (Some(FileAction::Delete), &["r/a", "r/a/y"][..])
+            };
+            assert_revision_holds(&instance, &revision, &kept).await;
+            assert_recorded(
+                &instance,
+                &revision,
+                &held,
+                &[
+                    ("r", Some(FileAction::Keep)),
+                    ("r/a/x", moved),
+                    ("r/a/y", None),
+                    ("r/keep", Some(FileAction::Delete)),
+                ],
+            )
+            .await;
+            assert_deletions_not_staged(&instance, marked).await;
+        })
+        .await;
+    }
+}
+
+/// Unstages `path`, below `instance`'s working tree, under a view that leaves out `excluded`.
+async fn unstaged_in_view(instance: &TestRepository, path: &str, excluded: &str) {
+    let viewed = Arc::new(
+        instance
+            .repository
+            .to_filter_context(Arc::new(crate::helper::test_filter(&[], &[excluded]))),
+    );
+    lore_revision::file::unstage::unstage(
+        viewed,
+        &instance.write_token,
+        lore_revision::interface::LoreArray::from_vec(vec![
+            lore_revision::interface::LoreString::from(&instance.path.join(path)),
+        ]),
+        lore_revision::file::unstage::UnstageOptions::default(),
+    )
+    .await
+    .expect("the unstage");
+}
+
+/// An unstage of a directory below a directory staged for deletion that leaves it staged, as one
+/// holding a path the view no longer takes in does, leaves each directory above it staged for
+/// deletion too.
+#[tokio::test]
+async fn an_unstage_leaving_a_directory_staged_below_a_staged_deletion_leaves_the_deletion_whole() {
+    with_instance(|instance| async move {
+        let files = &["r/a/y", "r/a/z", "r/keep", "other.txt"];
+        let first = committed(&instance, files).await;
+        let held = tree_paths(&instance, &first).await;
+        removed_directory(&instance, "r");
+        stage_path(&instance, "r").await;
+        unstaged_in_view(&instance, "r/a", "r/a/y").await;
+
+        let staged = staged_tree(&instance).await;
+        for path in ["r", "r/a", "r/a/y"] {
+            let node = node_of(&instance, &staged, held[path]).await;
+            assert!(
+                node.is_staged_delete(),
+                "{path} is staged for deletion, flags {:#x}",
+                node.flags
+            );
+        }
+    })
+    .await;
+}
+
+/// An unstage below a directory staged only for what lies below it, between it and directories
+/// staged for deletion above, keeps its path: each of those directories is staged only for what
+/// lies below it too. A deletion staged below a directory an unstage left unstaged, inside one the
+/// unstage left staged for deletion, marks such a directory between them.
+#[tokio::test]
+async fn an_unstage_below_a_directory_between_staged_deletions_keeps_its_path() {
+    with_instance(|instance| async move {
+        let files = &["r/a/y", "r/a/s/w", "r/a/s/v", "r/keep", "other.txt"];
+        let first = committed(&instance, files).await;
+        let held = tree_paths(&instance, &first).await;
+        removed_directory(&instance, "r");
+        stage_path(&instance, "r").await;
+        unstaged_in_view(&instance, "r/a", "r/a/y").await;
+        stage_path(&instance, "r/a/s/w").await;
+        let staged = staged_tree(&instance).await;
+        for (path, deleted) in [
+            ("r", true),
+            ("r/a", true),
+            ("r/a/s", false),
+            ("r/a/s/w", true),
+        ] {
+            let node = node_of(&instance, &staged, held[path]).await;
+            assert_eq!(
+                node.is_staged_delete(),
+                deleted,
+                "{path} staged for deletion, flags {:#x}",
+                node.flags
+            );
+        }
+        unstaged(&instance, "r/a/s/w").await;
+        restaged(&instance, "other.txt").await;
+
+        let (revision, _) = committed_warning(&instance, "Deleted").await;
+        let kept = without(&without(&held, "r/a/y"), "r/keep");
+        assert_revision_holds(&instance, &revision, &kept).await;
+    })
+    .await;
+}
+
+/// Commits `d/s/x.txt`, `d/s/y.txt`, `d/k.txt` and `other.txt`, stages the move of `d` to `e`,
+/// removes `e/s` on disk and stages its deletion, then unstages `e/s/y.txt` below it: answers the
+/// paths the commit held, each with its node.
+async fn unstaged_below_deleted_in_moved_d(instance: &TestRepository) -> BTreeMap<String, NodeID> {
+    let first = committed(
+        instance,
+        &["d/s/x.txt", "d/s/y.txt", "d/k.txt", "other.txt"],
+    )
+    .await;
+    let held = tree_paths(instance, &first).await;
+    staged_moved(instance, "d", "e").await;
+    removed_directory(instance, "e/s");
+    stage_path(instance, "e/s").await;
+    unstaged(instance, "e/s/y.txt").await;
+    held
+}
+
+/// A file unstaged below a staged deletion, inside a directory whose move is staged, leaves with
+/// the moved directory where the working tree no longer holds it: the commit deletes it and all
+/// below it.
+#[tokio::test]
+async fn a_commit_deletes_a_moved_directory_gone_with_a_file_unstaged_below_a_deletion_in_it() {
+    with_instance(|instance| async move {
+        let held = unstaged_below_deleted_in_moved_d(&instance).await;
+        removed_directory(&instance, "e");
+
+        let (revision, _) = committed_warning(&instance, "Gone").await;
+        assert_revision_holds(&instance, &revision, &without(&held, "d")).await;
+        assert_recorded(
+            &instance,
+            &revision,
+            &held,
+            &[
+                ("d", Some(FileAction::Delete)),
+                ("d/k.txt", Some(FileAction::Delete)),
+                ("d/s", Some(FileAction::Delete)),
+                ("d/s/x.txt", Some(FileAction::Delete)),
+                ("d/s/y.txt", Some(FileAction::Delete)),
+                ("other.txt", None),
+            ],
+        )
+        .await;
+        assert_deletions_not_staged(&instance, &[]).await;
+    })
+    .await;
+}
+
+/// A file unstaged below a staged deletion, inside a directory whose move is staged, goes back with
+/// the moved directory where the working tree holds it at its source again: the commit keeps it and
+/// the directory above it there, and deletes only what was staged for deletion.
+#[tokio::test]
+async fn a_commit_returns_a_moved_directory_with_a_file_unstaged_below_a_deletion_in_it() {
+    with_instance(|instance| async move {
+        let held = unstaged_below_deleted_in_moved_d(&instance).await;
+        rename(&instance, "e", "d");
+
+        let (revision, _) = committed_warning(&instance, "Back").await;
+        assert_revision_holds(&instance, &revision, &without(&held, "d/s/x.txt")).await;
+        assert_recorded(
+            &instance,
+            &revision,
+            &held,
+            &[
+                ("d", Some(FileAction::Keep)),
+                ("d/k.txt", None),
+                ("d/s", Some(FileAction::Keep)),
+                ("d/s/x.txt", Some(FileAction::Delete)),
+                ("d/s/y.txt", None),
+                ("other.txt", None),
+            ],
+        )
+        .await;
+    })
+    .await;
+}
+
+/// Commits `a/x.txt` and `other.txt`, stages an edit of `a/x.txt`, then copies `other.txt` to
+/// `a/c.txt` and marks the copy dirty, as `lore dirty copy` does: answers the paths the commit
+/// held, each with its node, and the copy's node.
+async fn dirty_copied_beside_a_staged_edit(
+    instance: &TestRepository,
+) -> (BTreeMap<String, NodeID>, NodeID) {
+    let first = committed(instance, &["a/x.txt", "other.txt"]).await;
+    let held = tree_paths(instance, &first).await;
+    restaged(instance, "a/x.txt").await;
+    std::fs::copy(
+        instance.path.join("other.txt"),
+        instance.path.join("a/c.txt"),
+    )
+    .expect("the copy on disk");
+    let signature = lore_revision::file::dirty::dirty_copy(
+        instance.repository.clone(),
+        instance
+            .path
+            .join("other.txt")
+            .to_string_lossy()
+            .into_owned(),
+        instance.path.join("a/c.txt").to_string_lossy().into_owned(),
+    )
+    .await
+    .expect("the dirty copy");
+    let state = crate::dirty_move_fixture::staged(instance, signature).await;
+    let copy = node_id_at(instance, &state, "a/c.txt").await;
+    (held, copy)
+}
+
+/// A copy marked dirty and not staged stays out of the commit, as a file marked dirty as added
+/// does, and stays marked dirty past it.
+#[tokio::test]
+async fn a_commit_leaves_out_a_dirty_copy_not_staged() {
+    with_instance(|instance| async move {
+        let (held, copy) = dirty_copied_beside_a_staged_edit(&instance).await;
+
+        let (revision, _) = committed_warning(&instance, "Edited").await;
+        assert_revision_holds(&instance, &revision, &held).await;
+        assert_eq!(
+            delta_action(&instance, &revision, copy).await,
+            None,
+            "the copy's delta"
+        );
+        let marked = node_at(&instance, &*staged_tree(&instance).await, "a/c.txt").await;
+        assert!(
+            marked.is_dirty() && !marked.is_staged(),
+            "a/c.txt is marked dirty, flags {:#x}",
+            marked.flags
+        );
+    })
+    .await;
+}
+
+/// A copy marked dirty and not staged, in a directory the working tree no longer holds where only
+/// an edit is staged, keeps nothing there: the commit deletes the directory with what it holds.
+#[tokio::test]
+async fn a_commit_deletes_a_gone_directory_holding_a_staged_edit_and_a_dirty_copy() {
+    with_instance(|instance| async move {
+        let (held, copy) = dirty_copied_beside_a_staged_edit(&instance).await;
+        removed_directory(&instance, "a");
+
+        let (revision, _) = committed_warning(&instance, "Gone").await;
+        assert_revision_holds(&instance, &revision, &without(&held, "a")).await;
+        assert_recorded(
+            &instance,
+            &revision,
+            &held,
+            &[
+                ("a", Some(FileAction::Delete)),
+                ("a/x.txt", Some(FileAction::Delete)),
+                ("other.txt", None),
+            ],
+        )
+        .await;
+        assert_eq!(
+            delta_action(&instance, &revision, copy).await,
+            None,
+            "the copy's delta"
+        );
+        assert_deletions_not_staged(&instance, &[]).await;
+    })
+    .await;
+}
+
+/// Marks the nodes at `paths` in the staged tree with the merge bit, as a merge marks a node it
+/// takes in and the directories above it, and stores the staged tree.
+async fn merge_marked(instance: &TestRepository, paths: &[&str]) {
+    let state = staged_tree(instance).await;
+    for path in paths {
+        let node = node_id_at(instance, &state, path).await;
+        state
+            .node_mark(
+                &instance.repository,
+                node,
+                Mark::staged(NodeFlags::StagedMerge, false),
+            )
+            .await
+            .expect("the merge's mark");
+    }
+    let signature = state
+        .serialize(instance.repository.clone(), &instance.write_token)
+        .await
+        .expect("the staged state serializes");
+    lore_revision::instance::store_staged_anchor(&instance.repository, signature)
+        .await
+        .expect("the staged anchor");
+}
+
+/// A directory the working tree no longer holds, marked by a merge only as above an add it takes
+/// in, keeps the committed file not staged in it: the merge's mark is no staged change of the
+/// directory's own, and the commit leaves the add out.
+#[tokio::test]
+async fn a_commit_keeps_a_gone_directory_a_merge_marked_above_its_add() {
+    with_instance(|instance| async move {
+        let first = committed(&instance, &["d/y.txt", "other.txt"]).await;
+        let held = tree_paths(&instance, &first).await;
+        written(&instance, &["d/new.txt"]);
+        stage_path(&instance, "d/new.txt").await;
+        merge_marked(&instance, &["d/new.txt", "d"]).await;
+        let directory = node_at(&instance, &*staged_tree(&instance).await, "d").await;
+        assert_eq!(
+            directory.flags & NodeFlags::StagedBits.bits(),
+            NodeFlags::StagedMerge.bits(),
+            "d carries the merge's mark alone, flags {:#x}",
+            directory.flags
+        );
+        removed_directory(&instance, "d");
+        restaged(&instance, "other.txt").await;
+
+        let (revision, _) = committed_warning(&instance, "Merged").await;
+        assert_revision_holds(&instance, &revision, &held).await;
+        assert_recorded(&instance, &revision, &held, &[("d/y.txt", None)]).await;
+    })
+    .await;
 }
 
 /// Runs `body` in an execution context of its own, answering what it answers and the stage events

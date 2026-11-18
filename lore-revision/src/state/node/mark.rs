@@ -204,7 +204,8 @@ fn staged_with_content(node: u16) -> u16 {
 /// action stands, and under a bare `Staged` bit, which a staged change below carries, as does the
 /// rehash of a directory a child's staged move left, the dirty action is not recorded. A caller
 /// that stages it with that change marks it staged; a commit that finds such a directory gone
-/// deletes it with what it holds.
+/// deletes it with what it holds, but keeps it where it holds a child not staged and no gone
+/// directory above it carries a staged change of its own.
 #[inline]
 fn dirty_marked(node: u16, flags: u16) -> u16 {
     let dirty = NodeFlags::Dirty.bits();

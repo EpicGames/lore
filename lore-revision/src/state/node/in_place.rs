@@ -322,6 +322,11 @@ pub enum OwnFlags {
     /// node as a directory staged for what lies below it alone
     /// ([`crate::state::is_staged_for_descendants_only`]).
     ChangeToBare,
+    /// Its action, which its staged and dirty halves share, and its merge flags, but the bare staged
+    /// bit, its dirty bit and extension flags staying: a directory staged as deleted turns into one
+    /// staged for what lies below it alone ([`crate::state::is_staged_for_descendants_only`]), its
+    /// dirty deletion going with the staged one.
+    StagedToBare,
 }
 
 impl State {
@@ -406,6 +411,10 @@ impl State {
                 OwnFlags::ChangeToBare => {
                     node.clear_all_change_flags();
                     node.flags |= NodeFlags::Staged.bits();
+                }
+                OwnFlags::StagedToBare => {
+                    node.flags =
+                        (node.flags & !NodeFlags::StagedBits.bits()) | NodeFlags::Staged.bits();
                 }
             }
             if (node.flags, node.ext_flags) == was {

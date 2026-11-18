@@ -37,6 +37,7 @@ use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::node::NodeFlags;
 use crate::node::NodeID;
+use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
 use crate::path::resolve_user_paths;
@@ -638,16 +639,18 @@ async fn unstage_path(
         return Ok(());
     };
 
-    let replacement =
+    let (flags, replaced) =
         staged_type_change(&target.repository, &target.state_staged, target.node_id).await?;
+    let unstaged = replaced.unwrap_or(target.node_id);
+    let deleted = replaced.is_some() || flags.contains(NodeFlags::StagedDelete);
     let at = NodeMapping {
-        repository: target.repository,
-        state: target.state_staged,
+        repository: target.repository.clone(),
+        state: target.state_staged.clone(),
         path: relative_path,
         node: target.node_id,
     };
-    match replacement {
-        Some((_, replaced)) => {
+    match replaced {
+        Some(replaced) => {
             unstage_replacement(
                 operation,
                 at,
@@ -656,10 +659,10 @@ async fn unstage_path(
                 discard,
                 options,
                 stats,
-                link_tracker,
+                link_tracker.clone(),
                 parent_states,
             )
-            .await
+            .await?;
         }
         None => {
             unstage_node_recurse(
@@ -669,28 +672,69 @@ async fn unstage_path(
                 discard,
                 options,
                 stats,
-                link_tracker,
+                link_tracker.clone(),
                 parent_states,
             )
-            .await
+            .await?;
         }
     }
+    if deleted {
+        keep_directories_above(&target.repository, &target.state_staged, unstaged).await?;
+    }
+    Ok(())
 }
 
-/// The node a staged type change adds at `newest`, the newest node of its name, and the node of
-/// another kind it replaces, which is staged for delete. Nodes are prepended, so the replaced one
-/// follows the added one.
+/// Where the unstage of `node_id`, staged for deletion, left it unstaged, turns each directory
+/// above it staged for deletion into a directory staged for what lies below it alone, the topmost
+/// one included: the commit then deletes the rest below them, and keeps them and the unstaged node,
+/// but where a directory above them that the working tree no longer holds carries a staged change
+/// of its own, which they go with. Reads each directory up to the root, as one staged otherwise can
+/// stand between two staged for deletion, and lists none.
+async fn keep_directories_above(
+    repository: &Arc<RepositoryContext>,
+    state_staged: &State,
+    node_id: NodeID,
+) -> Result<(), UnstageError> {
+    let node = state_staged
+        .node(repository.clone(), node_id)
+        .await
+        .forward::<UnstageError>("Failed deserializing state node block")?;
+    if node.is_staged() {
+        return Ok(());
+    }
+    let mut at = node.parent;
+    while at.is_valid_node_id() {
+        let block = state_staged
+            .block(repository.clone(), NodeBlock::index(at))
+            .await
+            .forward::<UnstageError>("Failed deserializing state node block")?;
+        let (deleted, parent) = {
+            let directory = block.node(Node::index(at));
+            (directory.is_staged_delete(), directory.parent)
+        };
+        if deleted {
+            state_staged.node_clear_own(&block, at, OwnFlags::StagedToBare);
+        }
+        at = parent;
+    }
+    Ok(())
+}
+
+/// The flags of `newest`, the newest node of its name, and the node of another kind that a staged
+/// type change adding `newest` replaces, which is staged for delete. Nodes are prepended, so the
+/// replaced one follows the added one.
 async fn staged_type_change(
     repository: &Arc<RepositoryContext>,
     state: &State,
     newest: NodeID,
-) -> Result<Option<(NodeID, NodeID)>, UnstageError> {
+) -> Result<(NodeFlags, Option<NodeID>), UnstageError> {
     let added = state
         .node(repository.clone(), newest)
         .await
         .forward::<UnstageError>("Failed deserializing state node block")?;
+    let flags = NodeFlags::from_bits_retain(added.flags);
     if !added.is_staged_add() && !added.is_dirty_add() {
-        return Ok(None);
+        return Ok((flags, None));
     }
     let mut cycle = SiblingCycleGuard::new(added.parent);
     let mut next = added.sibling();
@@ -702,14 +746,12 @@ async fn staged_type_change(
         node.walk_step(id, added.parent, &mut cycle)
             .forward::<UnstageError>("Invalid node hierarchy")?;
         if node.name_hash == added.name_hash {
-            return Ok(
-                (node.is_staged_delete() && node.node_type() != added.node_type())
-                    .then_some((newest, id)),
-            );
+            let replaced = node.is_staged_delete() && node.node_type() != added.node_type();
+            return Ok((flags, replaced.then_some(id)));
         }
         next = node.sibling();
     }
-    Ok(None)
+    Ok((flags, None))
 }
 
 /// Whether the current revision's registry holds the link `link_id` at `node_id`.
@@ -885,7 +927,9 @@ async fn unstage_directory(
                 ),
             };
             if staged_deletes.contains(&child_node.name_hash) {
-                staged_type_change(&repository, &state_staged, child_node_id).await?
+                staged_type_change(&repository, &state_staged, child_node_id)
+                    .await?
+                    .1
             } else {
                 None
             }
@@ -906,7 +950,7 @@ async fn unstage_directory(
             path: child_node_path,
             node: child_node_id,
         };
-        if let Some((_, replaced)) = replacement {
+        if let Some(replaced) = replacement {
             unstaged_replaced.push(replaced);
             unstage_replacement(
                 operation.clone(),

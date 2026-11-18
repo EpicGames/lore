@@ -16,6 +16,7 @@ from link_helpers import (
 )
 from lore_parsers import parse_status_json
 from test_utils import (
+    commit_unstaged_below_a_staged_deletion,
     has_staged_anchor,
     status_by_path,
     unstaged_entries,
@@ -1040,3 +1041,16 @@ def test_link_add_in_a_dirty_moved_directory_stages_its_whole_move(new_lore_repo
     assert not any(entry.get("flagStaged") for entry in left.values()), (
         f"the commit takes every staged move: {left}"
     )
+
+
+@pytest.mark.smoke
+def test_link_unstage_below_a_staged_deletion_keeps_the_path(new_lore_repo):
+    """Unstaging a path below a directory of a link's repository staged for deletion
+    keeps the path and each directory above it in the linked revision, as in the
+    parent's own tree."""
+    parent_repo, _ = make_parent_with_link(
+        new_lore_repo,
+        link_files={"r/a/y": b"y\n", "r/a/z": b"z\n", "r/keep": b"keep\n"},
+    )
+
+    commit_unstaged_below_a_staged_deletion(parent_repo, f"{DEFAULT_LINK_MOUNT}/r")

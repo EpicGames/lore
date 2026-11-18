@@ -20,7 +20,11 @@ from lore_parsers import (
     parse_status_summary_json,
 )
 from service_util import LORE_SERVICE_ENVIRONMENT, SERVICE_UNAVAILABLE
-from test_utils import revision_metadata_keys, status_by_path
+from test_utils import (
+    commit_unstaged_below_a_staged_deletion,
+    revision_metadata_keys,
+    status_by_path,
+)
 
 pytestmark = pytest.mark.own_vfs(
     "layers repositories, which a virtual clone does not hold"
@@ -3492,3 +3496,20 @@ def test_layer_commit_deletes_a_staged_file_gone_from_its_mount_and_keeps_the_mo
     repo.file_reset("thr")
     assert repo.file_exists(os.path.join("thr", "o.txt"))
     assert not repo.file_exists(os.path.join("thr", "a.txt"))
+
+
+@pytest.mark.smoke
+def test_layer_unstage_below_a_staged_deletion_keeps_the_path(new_lore_repo):
+    """Unstaging a path below a directory of a layer staged for deletion keeps the
+    path and each directory above it in the layer's revision, as in the repository's
+    own tree."""
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+    repo.write_commit_push(None, {MAIN_FILE: b"main content"})
+    layer_repo.write_commit_push(
+        None,
+        {"lay/r/a/y": b"y\n", "lay/r/a/z": b"z\n", "lay/r/keep": b"keep\n"},
+    )
+    repo.layer_add("lay", layer_repo, "lay/")
+
+    commit_unstaged_below_a_staged_deletion(repo, "lay/r")

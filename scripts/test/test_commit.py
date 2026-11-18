@@ -831,8 +831,8 @@ def test_commit_of_a_merge_takes_the_working_tree_at_merged_paths_removed_since(
 ):
     """A merge's commit takes what the working tree holds at the paths the merge staged: a file
     the merge changed, or whose conflict was resolved, that the working tree no longer holds is
-    deleted, and a directory holding a deletion the merge staged, which the working tree no
-    longer holds, is deleted with what else it holds."""
+    deleted, and so is the deletion the merge staged in a directory the working tree no longer
+    holds, which stays with the file in it that nothing staged."""
     repo: Lore = new_lore_repo()
     repo.write_commit_push(
         "Base",
@@ -865,4 +865,44 @@ def test_commit_of_a_merge_takes_the_working_tree_at_merged_paths_removed_since(
         repo.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
     )
     deleted = sorted(delta["path"] for delta in deltas if delta["action"] == "delete")
-    assert deleted == ["c.txt", "d", "d/x.txt", "d/y.txt", "f.txt"], deltas
+    assert deleted == ["c.txt", "d/x.txt", "f.txt"], deltas
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("brought", ["add", "move"])
+def test_commit_of_a_merge_keeps_a_removed_directory_it_brought_a_file_into(
+    new_lore_repo, brought
+):
+    """A merge that adds a file to a directory, or moves one into it, stages the directory only for
+    what it brings: where the working tree no longer holds the directory, the merge's commit
+    leaves out the add, deletes the moved file, and keeps the directory with the committed file in
+    it that nothing staged."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"d/y.txt": "y\n", "m.txt": "m\n", "o.txt": "o\n"})
+    repo.branch_create("feature")
+    if brought == "add":
+        repo.write_files({"d/new.txt": "new\n"})
+        repo.stage(["d/new.txt"])
+    else:
+        os.rename(repo._fix_path("m.txt"), repo._fix_path("d/m.txt"))
+        repo.stage_move("m.txt", "d/m.txt")
+    repo.commit("Bring a file into d")
+    repo.push()
+    repo.branch_switch("main")
+    repo.write_commit_push("Change on main", {"o.txt": "main\n"})
+
+    repo.branch_merge_start("feature", no_commit=True)
+    repo.rmtree("d")
+    repo.commit("Merge", offline=True)
+
+    deltas = sorted(
+        (delta["path"], delta["action"])
+        for delta in parse_jsonl(
+            repo.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
+        )
+    )
+    moved = [("m.txt", "delete")] if brought == "move" else []
+    assert deltas == [("d", "keep"), *moved], deltas
+    repo.push()
+    kept = ["d/y.txt", "o.txt"] if brought == "move" else ["d/y.txt", "m.txt", "o.txt"]
+    assert sorted(repo.clone().read_files()) == kept

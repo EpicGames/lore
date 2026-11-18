@@ -689,6 +689,86 @@ mod tests {
             .expect("Task failed");
     }
 
+    /// The delta of a revision committed in memory records each node below a deleted directory as
+    /// deleted, though only the directory carries the deletion's mark: the commit records each
+    /// node it discards as deleted, whatever its own marks. A deletion marking only the directory
+    /// comes from the state-level deletion; staging, a merge and the C API mark each node below.
+    #[tokio::test]
+    async fn commit_in_memory_revision_records_each_node_below_a_deleted_directory_as_deleted() {
+        let (_immutable, mutable, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(mutable).await;
+                let branch = branch_id();
+                let state = State::new();
+                let going = add(
+                    &state,
+                    repository.clone(),
+                    ROOT_NODE,
+                    directory("going"),
+                    "going",
+                )
+                .await;
+                let inner = add(&state, repository.clone(), going, directory("in"), "in").await;
+                let below = add(&state, repository.clone(), inner, file("b.bin"), "b.bin").await;
+                add(
+                    &state,
+                    repository.clone(),
+                    ROOT_NODE,
+                    file("k.bin"),
+                    "k.bin",
+                )
+                .await;
+                let first = commit_in_memory_revision(
+                    repository.clone(),
+                    &token(),
+                    state.clone(),
+                    metadata_on(branch),
+                    Hash::default(),
+                    branch,
+                )
+                .await
+                .expect("the first revision must commit");
+
+                state
+                    .node_delete(repository.clone(), going)
+                    .await
+                    .expect("staging the deletion must succeed");
+                let second = commit_in_memory_revision(
+                    repository.clone(),
+                    &token(),
+                    state,
+                    metadata_on(branch),
+                    first,
+                    branch,
+                )
+                .await
+                .expect("the deletion must commit");
+
+                let published = State::deserialize(repository.clone(), second)
+                    .await
+                    .expect("the committed revision must deserialize");
+                let delta = published
+                    .delta_block(repository)
+                    .await
+                    .expect("the delta must read back")
+                    .to_aligned::<NodeDelta>();
+                let mut recorded: Vec<(NodeID, u16)> = delta
+                    .as_type_slice::<NodeDelta>()
+                    .iter()
+                    .map(|entry| (entry.node, entry.action))
+                    .collect();
+                recorded.sort_unstable();
+                let delete = FileAction::Delete as u16;
+                let mut expected = vec![(going, delete), (inner, delete), (below, delete)];
+                expected.sort_unstable();
+                assert_eq!(recorded, expected, "each removed node is recorded deleted");
+            }))
+            .await
+            .expect("Task failed");
+    }
+
     #[tokio::test]
     async fn commit_in_memory_revision_chains_the_parent_and_numbers_the_revision() {
         let (_immutable, mutable, execution) =
@@ -1472,6 +1552,88 @@ mod tests {
                         .await
                         .is_err_and(|error| error.is_node_not_found()),
                     "the revision must not hold the move"
+                );
+            }))
+            .await
+            .expect("Task failed");
+    }
+
+    /// A node the handle holds marked dirty as copied only, as `lore dirty copy` marks one, beside
+    /// a staged add, stays out of the revision, as one marked dirty as added does.
+    #[tokio::test]
+    async fn commit_in_memory_revision_leaves_out_a_copy_marked_dirty_only() {
+        let (_immutable, mutable, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(mutable).await;
+                let branch = branch_id();
+                let state = State::new();
+                let a = add(&state, repository.clone(), ROOT_NODE, directory("a"), "a").await;
+                add(&state, repository.clone(), a, file("x.bin"), "x.bin").await;
+                let first = commit_in_memory_revision(
+                    repository.clone(),
+                    &token(),
+                    state,
+                    metadata_on(branch),
+                    Hash::default(),
+                    branch,
+                )
+                .await
+                .expect("committing the first revision must succeed");
+
+                let handle = State::deserialize(repository.clone(), first)
+                    .await
+                    .expect("the first revision must deserialize");
+                let copy = Node {
+                    flags: (NodeFlags::File | NodeFlags::DirtyCopy).bits(),
+                    ..file("c.bin")
+                };
+                handle
+                    .node_add(repository.clone(), a, copy, "c.bin")
+                    .await
+                    .expect("adding the copy must succeed");
+                handle
+                    .node_mark(
+                        &repository,
+                        a,
+                        Mark::dirty(NodeFlags::Dirty, Ext::Keep, false),
+                    )
+                    .await
+                    .expect("marking the copy's directory must succeed");
+                add(
+                    &handle,
+                    repository.clone(),
+                    ROOT_NODE,
+                    file("new.bin"),
+                    "new.bin",
+                )
+                .await;
+
+                let second = commit_in_memory_revision(
+                    repository.clone(),
+                    &token(),
+                    handle,
+                    metadata_on(branch),
+                    first,
+                    branch,
+                )
+                .await
+                .expect("committing the second revision must succeed");
+
+                let published = State::deserialize(repository.clone(), second)
+                    .await
+                    .expect("the second revision must deserialize");
+                published
+                    .find_node_link(repository.clone(), "new.bin")
+                    .await
+                    .expect("the revision must hold the staged add");
+                assert!(
+                    published
+                        .find_node_link(repository.clone(), "a/c.bin")
+                        .await
+                        .is_err_and(|error| error.is_node_not_found()),
+                    "the revision must not hold the copy"
                 );
             }))
             .await
