@@ -483,6 +483,19 @@ pub trait FilesystemProvider: Send + Sync + 'static {
         false
     }
 
+    /// Whether the provider supports a sync restricted to a dependency set, which leaves what lies
+    /// outside the set as the working tree held it.
+    ///
+    /// # Implementation notes
+    ///
+    /// - **SWFS**: false. The mount serves the new revision whole, so what lies outside the set
+    ///   would have to be kept by the operation, and a scan afterwards reports it differently than
+    ///   a plain instance does.
+    /// - **FUSE**: refused through [`Self::holds_state`] instead.
+    fn supports_dependency_sync(&self) -> bool {
+        true
+    }
+
     /// The content of the file at `path` in the working tree, read without going through the
     /// file system the provider serves it on, by a provider that holds its state
     /// ([`Self::holds_state`]): the service never reads through its own mount. `None` where no
@@ -630,6 +643,9 @@ where
         .await
         .forward_any::<E>("Failed to start filesystem operation")?;
     let result = work(operation.clone()).await;
+    if result.is_err() {
+        operation.fail();
+    }
     let finalized = operation
         .finalize()
         .await
@@ -1123,7 +1139,7 @@ pub trait InstanceOperation: Send + Sync {
 /// while still not knowing which type is in use at compile time.
 pub enum StaticDispatchInstanceOperation {
     Os(OsOperation),
-    Swfs(SwfsOperation),
+    Swfs(Box<SwfsOperation>),
     #[cfg(target_os = "linux")]
     Fuse(FuseOperation),
     #[cfg(feature = "test-util")]
@@ -1168,6 +1184,9 @@ pub struct InstanceOperationImpl {
     dry_run: bool,
     finalized: AtomicBool,
     changed: AtomicBool,
+    /// Whether the work the operation was opened for failed, which a provider that holds what it was
+    /// told a commit stored until the work is known to have succeeded drops.
+    failed: AtomicBool,
     modified_times: RecordedModifiedTimes,
     /// The filesystem clock, read once, the first time [`Self::clock_floor`] is asked.
     clock_floor: tokio::sync::OnceCell<u64>,
@@ -1182,8 +1201,9 @@ pub struct InstanceOperationImpl {
 
 impl InstanceOperationImpl {
     pub fn new(dispatch: StaticDispatchInstanceOperation, holds_state: bool) -> Self {
+        let lists_through_operation = matches!(dispatch, StaticDispatchInstanceOperation::Swfs(_));
         Self {
-            lists_through_operation: AtomicBool::new(false),
+            lists_through_operation: AtomicBool::new(lists_through_operation),
             #[cfg(feature = "test-util")]
             directory_reads: std::sync::atomic::AtomicUsize::new(0),
             dispatch,
@@ -1192,6 +1212,7 @@ impl InstanceOperationImpl {
                 .is_some_and(|context| context.globals().dry_run()),
             finalized: AtomicBool::new(false),
             changed: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
             modified_times: RecordedModifiedTimes::default(),
             clock_floor: tokio::sync::OnceCell::new(),
         }
@@ -1269,6 +1290,49 @@ impl InstanceOperationImpl {
         self.changed.store(true, Ordering::Release);
     }
 
+    /// Notes that a commit stored `path`, or removed it, so the provider thaws it as committed: SWFS
+    /// holds a change to a path until a thaw names it, and a later thaw naming a path it still
+    /// holds as deleted is taken as the commit of that deletion. Counted as a change, outside a dry
+    /// run.
+    pub fn committed_path(&self, path: &RelativePath) {
+        if self.dry_run {
+            return;
+        }
+        if let StaticDispatchInstanceOperation::Swfs(this) = &self.dispatch {
+            this.committed_path(path);
+            self.record_change();
+        }
+    }
+
+    /// Notes that the operation may leave changes of the revision it moves the instance to
+    /// unwritten, as a sync or clone restricted to a dependency set leaves what lies outside it.
+    /// A provider serving the revision whole, as SWFS does, then keeps what the working tree
+    /// showed where the operation wrote nothing (ADR-00034); one whose working tree holds what was
+    /// written has nothing to keep.
+    pub fn leaves_changes_unwritten(&self) {
+        if let StaticDispatchInstanceOperation::Swfs(this) = &self.dispatch {
+            this.leaves_changes_unwritten();
+        }
+    }
+
+    /// Notes that the link or layer mounted at `path` now stands at a state the operation could not
+    /// see while it ran, as one realized before the state holding the change was stored, so the
+    /// operation describes the mount again on finalizing. A plain filesystem has nothing to describe.
+    pub fn mount_changed(&self, path: &RelativePath) {
+        if self.dry_run {
+            return;
+        }
+        if let StaticDispatchInstanceOperation::Swfs(this) = &self.dispatch {
+            this.mount_changed(path);
+            self.record_change();
+        }
+    }
+
+    /// Notes that the work this operation was opened for failed, ahead of its finalize.
+    pub fn fail(&self) {
+        self.failed.store(true, Ordering::Release);
+    }
+
     /// Finishes the operation, reporting to the provider behind it whether the work wrote.
     ///
     /// # Implementation notes
@@ -1287,7 +1351,10 @@ impl InstanceOperationImpl {
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.finalize(changes_made),
             StaticDispatchInstanceOperation::Os(_this) => Ok(()),
-            StaticDispatchInstanceOperation::Swfs(this) => this.finalize(changes_made).await,
+            StaticDispatchInstanceOperation::Swfs(this) => {
+                this.finalize(changes_made, !self.failed.load(Ordering::Acquire))
+                    .await
+            }
             #[cfg(target_os = "linux")]
             StaticDispatchInstanceOperation::Fuse(this) => {
                 this.finalize().await;

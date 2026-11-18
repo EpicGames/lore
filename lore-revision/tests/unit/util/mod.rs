@@ -6,7 +6,7 @@ mod config;
 mod decimal;
 mod encoding;
 mod fan_out;
-mod fs;
+pub(crate) mod fs;
 mod path;
 mod request_tracker;
 

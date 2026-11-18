@@ -5,14 +5,20 @@
 //! Chunking and comparison both read content the same way — a window at an offset — and neither
 //! needs to know where it is held. [`ContentSource`] names where; [`ContentHandle`] reads it.
 
+use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use bytes::BytesMut;
 use lore_base::types::Address;
+use lore_base::types::Partition;
+use lore_transport::StorageSession;
 
 use crate::error::StorageError;
 use crate::errors::InvalidArguments;
+use crate::immutable_store::ImmutableStore;
+use crate::options::ReadOptions;
 
 /// The window a read fills, owned by the operation for its whole flight and handed back
 /// with it. A single segment: the read lands in `buffer[start..start + want]`, leaving
@@ -63,15 +69,149 @@ pub enum ContentSource<'a> {
     Virtual(VirtualContent),
 }
 
-/// Content a virtualizing library holds.
-///
-/// Nothing in this crate reads it: a virtual source answers its declared size, a comparison
-/// settles it by the address it names ([`crate::write::file_matches`]), and opening or reading one
-/// is refused.
-#[derive(Clone, Debug)]
+/// Content that has no file on the host to name.
+#[derive(Clone)]
 pub enum VirtualContent {
+    /// Content an immutable store holds under an address, read through the store.
+    Stored(StoredContent),
+    /// Content held in memory whole, such as what a virtualizing library handed over to read.
+    Memory(Bytes),
+    /// Content a reader serves a range at a time, so no read holds more of it than one window.
+    Ranged(RangedContent),
     /// Content addressed in the immutable store, named by its content hash and declared size.
+    ///
+    /// Unlike [`VirtualContent::Stored`], nothing in this crate reads it: it answers its declared
+    /// size, a comparison settles it by the address it names ([`crate::write::file_matches`]), and
+    /// opening or reading one is refused.
     Immutable { address: Address, size: u64 },
+}
+
+/// Reads content a range at a time, for content held where no host file names it, such as what
+/// a virtualizing library holds of its own.
+pub trait RangedRead: Send + Sync {
+    /// Fills `into` whole with the content from `offset`, or fails.
+    fn read_range<'a>(
+        &'a self,
+        offset: u64,
+        into: &'a mut [u8],
+    ) -> futures::future::BoxFuture<'a, std::io::Result<()>>;
+}
+
+/// Content of `size` bytes that `reader` serves a range at a time.
+#[derive(Clone)]
+pub struct RangedContent {
+    reader: Arc<dyn RangedRead>,
+    size: u64,
+}
+
+/// Where in an immutable store content is held, and how to read it.
+#[derive(Clone)]
+pub struct StoredContent {
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    size: u64,
+    options: ReadOptions,
+    session: Option<Arc<StorageSession>>,
+}
+
+impl StoredContent {
+    async fn read_range(&self, range: Range<usize>, into: &mut [u8]) -> Result<(), StorageError> {
+        crate::read::read_into(
+            self.store.clone(),
+            self.partition,
+            self.address,
+            Some(range),
+            into,
+            self.options,
+            self.session.clone(),
+        )
+        .await
+    }
+}
+
+impl VirtualContent {
+    fn size(&self) -> u64 {
+        match self {
+            VirtualContent::Stored(stored) => stored.size,
+            VirtualContent::Memory(bytes) => bytes.len() as u64,
+            VirtualContent::Ranged(ranged) => ranged.size,
+            VirtualContent::Immutable { size, .. } => *size,
+        }
+    }
+
+    async fn read_all(&self) -> Result<Bytes, StorageError> {
+        match self {
+            VirtualContent::Stored(stored) => crate::read::read(
+                stored.store.clone(),
+                stored.partition,
+                stored.address,
+                None,
+                stored.options,
+                stored.session.clone(),
+            )
+            .await
+            .map(|(_fragment, bytes)| bytes),
+            VirtualContent::Memory(bytes) => Ok(bytes.clone()),
+            VirtualContent::Ranged(ranged) => {
+                let size = usize::try_from(ranged.size).map_err(|err| {
+                    StorageError::from(InvalidArguments {
+                        reason: format!("read: ranged content of {} bytes: {err}", ranged.size),
+                    })
+                })?;
+                let mut buffer = vec![0; size];
+                ranged
+                    .reader
+                    .read_range(0, &mut buffer)
+                    .await
+                    .map_err(|err| {
+                        StorageError::internal_with_context(err, "read ranged content")
+                    })?;
+                Ok(Bytes::from(buffer))
+            }
+            VirtualContent::Immutable { address, .. } => {
+                Err(StorageError::from(InvalidArguments {
+                    reason: format!("read: immutable:{address}: virtual content is not read here"),
+                }))
+            }
+        }
+    }
+
+    /// The same exact read a file gives: the window is filled whole or the read fails.
+    async fn read_window(&self, window: WindowRead, offset: u64) -> std::io::Result<BytesMut> {
+        if let VirtualContent::Immutable { .. } = self {
+            return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        }
+        let WindowRead {
+            mut buffer,
+            start,
+            want,
+        } = window;
+        let end = offset
+            .checked_add(want as u64)
+            .filter(|end| *end <= self.size());
+        let Some(end) = end else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "a window reaching past the end of the content",
+            ));
+        };
+        let into = &mut buffer[start..start + want];
+        match self {
+            VirtualContent::Stored(stored) => {
+                stored
+                    .read_range(offset as usize..end as usize, into)
+                    .await
+                    .map_err(std::io::Error::other)?;
+            }
+            VirtualContent::Memory(bytes) => {
+                into.copy_from_slice(&bytes[offset as usize..end as usize]);
+            }
+            VirtualContent::Ranged(ranged) => ranged.reader.read_range(offset, into).await?,
+            VirtualContent::Immutable { .. } => unreachable!("refused before the window is read"),
+        }
+        Ok(buffer)
+    }
 }
 
 impl<'a> ContentSource<'a> {
@@ -85,7 +225,39 @@ impl<'a> ContentSource<'a> {
         ContentSource::File(std::borrow::Cow::Owned(path))
     }
 
-    /// Content addressed in the immutable store, not backed by any host path.
+    /// The `size` bytes `store` holds under `address` in `partition`, which are read through the
+    /// store, and from `session`'s remote where the store has them no longer.
+    pub fn stored(
+        store: Arc<dyn ImmutableStore>,
+        partition: Partition,
+        address: Address,
+        size: u64,
+        options: ReadOptions,
+        session: Option<Arc<StorageSession>>,
+    ) -> ContentSource<'static> {
+        ContentSource::Virtual(VirtualContent::Stored(StoredContent {
+            store,
+            partition,
+            address,
+            size,
+            options,
+            session,
+        }))
+    }
+
+    /// Content held in memory whole.
+    pub fn memory(bytes: Bytes) -> ContentSource<'static> {
+        ContentSource::Virtual(VirtualContent::Memory(bytes))
+    }
+
+    /// Content of `size` bytes that `reader` serves a range at a time, read a window at a time
+    /// as a file is.
+    pub fn ranged(reader: Arc<dyn RangedRead>, size: u64) -> ContentSource<'static> {
+        ContentSource::Virtual(VirtualContent::Ranged(RangedContent { reader, size }))
+    }
+
+    /// Content addressed in the immutable store, not backed by any host path, which this crate
+    /// does not read.
     pub fn virtual_immutable(address: Address, size: u64) -> ContentSource<'static> {
         ContentSource::Virtual(VirtualContent::Immutable { address, size })
     }
@@ -94,8 +266,8 @@ impl<'a> ContentSource<'a> {
     /// immutable content answers its declared size.
     #[lore_macro::test_pub]
     pub(crate) async fn size(&self) -> Result<u64, StorageError> {
-        if let ContentSource::Virtual(VirtualContent::Immutable { size, .. }) = self {
-            return Ok(*size);
+        if let ContentSource::Virtual(content) = self {
+            return Ok(content.size());
         }
         let path = self.host_path();
         lore_io::IoDriver::global()
@@ -114,13 +286,11 @@ impl<'a> ContentSource<'a> {
     /// dispatch. A caller already holding a handle reads through [`ContentHandle::read_all`]
     /// instead of naming the content twice.
     ///
-    /// The caller budgets for holding the content resident. Virtual content is
+    /// The caller budgets for holding the content resident. Virtual immutable content is
     /// `InvalidArguments`: this crate does not read it.
     pub async fn read_all(&self) -> Result<Bytes, StorageError> {
-        if matches!(self, ContentSource::Virtual(_)) {
-            return Err(StorageError::from(InvalidArguments {
-                reason: format!("read: {self}: virtual content is not read here"),
-            }));
+        if let ContentSource::Virtual(content) = self {
+            return content.read_all().await;
         }
         let path = self.host_path();
         lore_io::IoDriver::global()
@@ -137,7 +307,7 @@ impl<'a> ContentSource<'a> {
     /// Content that does not exist, or that does not name a regular file, will not open on any
     /// attempt, so spending the back-off on it costs the caller ten seconds and reports an
     /// internal fault for what is an argument error. Both are `InvalidArguments` on the first
-    /// attempt, as is virtual content, which this crate does not open. Everything else keeps the
+    /// attempt, as is virtual immutable content, which this crate does not open. Everything else keeps the
     /// back-off, which is there for a reader holding the file open on Windows.
     #[lore_macro::test_pub]
     pub(crate) async fn open(&self) -> Result<(ContentHandle, u64), StorageError> {
@@ -175,8 +345,14 @@ impl<'a> ContentSource<'a> {
     /// A scan reporting content it cannot read as clean spends nothing on a back-off it will
     /// discard the outcome of, and one running per path in a walk would spend it per path.
     pub async fn open_once(&self) -> std::io::Result<(ContentHandle, u64)> {
-        if matches!(self, ContentSource::Virtual(_)) {
-            return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        match self {
+            ContentSource::Virtual(VirtualContent::Immutable { .. }) => {
+                return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+            }
+            ContentSource::Virtual(content) => {
+                return Ok((ContentHandle::Virtual(content.clone()), content.size()));
+            }
+            ContentSource::File(_) => {}
         }
         let (file, size) = open_read(self.host_path()).await?;
         Ok((ContentHandle::File(file), size))
@@ -190,12 +366,12 @@ impl<'a> ContentSource<'a> {
         }
     }
 
-    /// The host path a file's content is read from. Virtual content has none; every reader
-    /// refuses it before asking.
+    /// The host path a file's content is read from. Callers hold virtual content apart before
+    /// asking, since it names none.
     fn host_path(&self) -> &Path {
         match self {
             ContentSource::File(path) => path,
-            ContentSource::Virtual(_) => Path::new(""),
+            ContentSource::Virtual(_) => unreachable!("virtual content names no host path"),
         }
     }
 }
@@ -204,6 +380,19 @@ impl std::fmt::Display for ContentSource<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ContentSource::File(path) => write!(formatter, "{}", path.display()),
+            ContentSource::Virtual(VirtualContent::Stored(stored)) => {
+                write!(
+                    formatter,
+                    "stored {} ({} bytes)",
+                    stored.address, stored.size
+                )
+            }
+            ContentSource::Virtual(VirtualContent::Memory(bytes)) => {
+                write!(formatter, "memory ({} bytes)", bytes.len())
+            }
+            ContentSource::Virtual(VirtualContent::Ranged(ranged)) => {
+                write!(formatter, "ranged ({} bytes)", ranged.size)
+            }
             ContentSource::Virtual(VirtualContent::Immutable { address, .. }) => {
                 write!(formatter, "immutable:{address}")
             }
@@ -223,8 +412,8 @@ impl std::fmt::Display for ContentSource<'_> {
 pub enum ContentHandle {
     /// A file on the host, read through the IO driver.
     File(lore_io::IoFile),
-    /// Content a virtualizing library holds, open. Never produced: no virtual content opens here.
-    #[allow(dead_code)]
+    /// Content with no host file, open. Never virtual immutable content, which does not open
+    /// here.
     Virtual(VirtualContent),
 }
 
@@ -252,7 +441,7 @@ impl ContentHandle {
             ContentHandle::File(file) => {
                 Ok(file.read_exact_vectored_at(window, offset).await?.buffer)
             }
-            ContentHandle::Virtual(_) => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
+            ContentHandle::Virtual(content) => content.read_window(window, offset).await,
         }
     }
 

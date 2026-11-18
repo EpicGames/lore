@@ -1,9 +1,13 @@
 use std::alloc::Layout;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use lore_error_set::WrapInternal;
+use lore_storage::ContentSource;
+use lore_storage::content::RangedRead;
 
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::swfs::api_interface::SwfsInterface;
@@ -22,9 +26,15 @@ use crate::util::path::RelativePath;
 /// this size.
 pub const FROZEN_READ_ALIGNMENT: usize = 1 << 16;
 
-/// The largest block-multiple length, which reads a frozen file from offset 0 to its end: SWFS
-/// clamps the range it reads to the file. The `SWFS_READ_WHOLE_FILE` of `swfs.h`.
-pub const FROZEN_READ_WHOLE_FILE: usize = !(FROZEN_READ_ALIGNMENT - 1);
+/// The range SWFS reads to cover `length` bytes from `offset`, as its start and length:
+/// `swfsReadFrozenFile` takes an offset and a length that are whole blocks, so the range is
+/// widened to the blocks it touches.
+pub fn frozen_read_range(offset: u64, length: usize) -> (u64, usize) {
+    let block = FROZEN_READ_ALIGNMENT as u64;
+    let start = offset - offset % block;
+    let end = (offset + length as u64).next_multiple_of(block);
+    (start, (end - start) as usize)
+}
 
 /// A file in the frozen set, copied out of the buffer SWFS filled so it outlives the call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,12 +139,25 @@ impl FrozenListCollector {
     }
 }
 
+/// The most a [`FrozenReadBuffer`] keeps allocated between reads: the windows the frozen
+/// snapshot is read in, the chunker's and `copy_file`'s, `2 * FRAGMENT_SIZE_THRESHOLD`, and a
+/// block at either end. A larger read, as of a whole file, is released once copied out.
+pub const FROZEN_READ_RETAINED: usize =
+    2 * lore_base::types::FRAGMENT_SIZE_THRESHOLD + 2 * FROZEN_READ_ALIGNMENT;
+
 /// Receives the content of `swfsReadFrozenFile` through the same two-call protocol: the first
-/// call asks for a buffer for the file's size, which must be aligned and a whole number of blocks,
+/// call asks for a buffer for the range read, which must be aligned and a whole number of blocks,
 /// and the second carries it back filled.
+///
+/// One buffer serves read after read: the allocation is kept while it covers what a read asks
+/// for, and grown, zeroed, only where it does not. Only the first `read` bytes SWFS reports it
+/// filled, of this read's request, are ever copied out, so what an earlier read left in the
+/// allocation is never exposed.
 pub struct FrozenReadBuffer {
     buffer: *mut u8,
     capacity: usize,
+    /// What the current read asked for, rounded up to whole blocks.
+    requested: usize,
     filled: bool,
 }
 
@@ -143,11 +166,7 @@ unsafe impl Send for FrozenReadBuffer {}
 
 impl Default for FrozenReadBuffer {
     fn default() -> Self {
-        Self {
-            buffer: std::ptr::null_mut(),
-            capacity: 0,
-            filled: false,
-        }
+        Self::new()
     }
 }
 
@@ -158,6 +177,44 @@ impl Drop for FrozenReadBuffer {
 }
 
 impl FrozenReadBuffer {
+    /// A buffer that holds no allocation yet.
+    pub const fn new() -> Self {
+        Self {
+            buffer: std::ptr::null_mut(),
+            capacity: 0,
+            requested: 0,
+            filled: false,
+        }
+    }
+
+    /// Runs one frozen read: `read` makes it, given this buffer to publish to SWFS's callback, and
+    /// answers the bytes SWFS reports it read; then fills `into` with the bytes from `skip`, as
+    /// [`Self::copy_into`] answers, and releases a buffer larger than [`FROZEN_READ_RETAINED`].
+    /// Nothing of an earlier read counts as filled, so a read SWFS answers without filling the
+    /// buffer, as for a file with no bytes of its own, has no content.
+    pub fn read(
+        &mut self,
+        read: impl FnOnce(*mut FrozenReadBuffer) -> usize,
+        skip: usize,
+        into: &mut [u8],
+    ) -> Option<bool> {
+        self.filled = false;
+        self.requested = 0;
+        let count = read(std::ptr::from_mut(self));
+        let copied = self.copy_into(count, skip, into);
+        self.retain_at_most(FROZEN_READ_RETAINED);
+        copied
+    }
+
+    /// Releases the allocation where it is larger than `retained`, so the buffer kept between
+    /// reads stays bounded.
+    #[lore_macro::test_pub]
+    fn retain_at_most(&mut self, retained: usize) {
+        if self.capacity > retained {
+            self.release();
+        }
+    }
+
     fn layout(capacity: usize) -> Layout {
         Layout::from_size_align(capacity, FROZEN_READ_ALIGNMENT)
             .expect("a block-multiple capacity with a power-of-two alignment")
@@ -182,13 +239,17 @@ impl FrozenReadBuffer {
         out_num_buff_bytes: *mut usize,
     ) -> *mut swfs_ubyte {
         if start_buff.is_null() {
-            self.release();
+            self.filled = false;
             // A file of no bytes still gets a block, so that null can mean no buffer.
-            let capacity = num_bytes.max(1).next_multiple_of(FROZEN_READ_ALIGNMENT);
-            self.buffer = unsafe { std::alloc::alloc_zeroed(Self::layout(capacity)) };
-            self.capacity = if self.buffer.is_null() { 0 } else { capacity };
+            let requested = num_bytes.max(1).next_multiple_of(FROZEN_READ_ALIGNMENT);
+            if self.buffer.is_null() || self.capacity < requested {
+                self.release();
+                self.buffer = unsafe { std::alloc::alloc_zeroed(Self::layout(requested)) };
+                self.capacity = if self.buffer.is_null() { 0 } else { requested };
+            }
+            self.requested = if self.buffer.is_null() { 0 } else { requested };
             if !out_num_buff_bytes.is_null() {
-                unsafe { *out_num_buff_bytes = self.capacity };
+                unsafe { *out_num_buff_bytes = self.requested };
             }
             return self.buffer;
         }
@@ -199,13 +260,20 @@ impl FrozenReadBuffer {
         std::ptr::null_mut()
     }
 
-    /// The first `read` bytes SWFS put in the buffer, or `None` if it never filled one.
-    pub fn into_content(self, read: usize) -> Option<Vec<u8>> {
+    /// Fills `into` with the bytes from `skip` of the first `read` SWFS put in the buffer: `None`
+    /// if it never filled one, and `Some(false)` if it read too few to fill `into`.
+    #[lore_macro::test_pub]
+    fn copy_into(&self, read: usize, skip: usize, into: &mut [u8]) -> Option<bool> {
         if !self.filled || self.buffer.is_null() {
             return None;
         }
-        let length = read.min(self.capacity);
-        Some(unsafe { std::slice::from_raw_parts(self.buffer, length) }.to_vec())
+        let available = read.min(self.requested);
+        let Some(end) = skip.checked_add(into.len()).filter(|end| *end <= available) else {
+            return Some(false);
+        };
+        let filled = unsafe { std::slice::from_raw_parts(self.buffer, available) };
+        into.copy_from_slice(&filled[skip..end]);
+        Some(true)
     }
 }
 
@@ -214,9 +282,14 @@ pub trait FrozenReader: Send + Sync {
     /// The files frozen with the mount.
     fn files(&self) -> Result<Vec<FrozenFile>, SwfsInterfaceError>;
 
-    /// The content of the frozen file at the SWFS-side `path`, or `None` where SWFS has none to
-    /// give.
-    fn read(&self, path: &str) -> Result<Option<Vec<u8>>, SwfsInterfaceError>;
+    /// Fills `into` with the content of the frozen file at the SWFS-side `path` from `offset`,
+    /// answering `false` where SWFS has none to give. Content shorter than `into` is an error.
+    fn read_range(
+        &self,
+        path: &str,
+        offset: u64,
+        into: &mut [u8],
+    ) -> Result<bool, SwfsInterfaceError>;
 
     /// The files SWFS holds modified, deletions included, which name where a move came from. None
     /// where the reader cannot list them.
@@ -233,8 +306,13 @@ impl FrozenReader for SwfsFrozenReader {
         self.0.frozen_files()
     }
 
-    fn read(&self, path: &str) -> Result<Option<Vec<u8>>, SwfsInterfaceError> {
-        self.0.read_frozen_file(path)
+    fn read_range(
+        &self,
+        path: &str,
+        offset: u64,
+        into: &mut [u8],
+    ) -> Result<bool, SwfsInterfaceError> {
+        self.0.read_frozen_range(path, offset, into)
     }
 
     fn modified(&self) -> Result<Vec<FrozenFile>, SwfsInterfaceError> {
@@ -249,8 +327,13 @@ impl FrozenReader for NoFrozenFiles {
         Ok(Vec::new())
     }
 
-    fn read(&self, _path: &str) -> Result<Option<Vec<u8>>, SwfsInterfaceError> {
-        Ok(None)
+    fn read_range(
+        &self,
+        _path: &str,
+        _offset: u64,
+        _into: &mut [u8],
+    ) -> Result<bool, SwfsInterfaceError> {
+        Ok(false)
     }
 }
 
@@ -266,6 +349,9 @@ pub struct FrozenSnapshot {
     /// Where each moved file came from, by the lowercase node path it moved to, as the modified
     /// list pairs them ([`moves_in`]).
     origins: HashMap<String, String>,
+    /// The lowercase node paths the modified list names as renamed (`UpdateName`), deletions left
+    /// out. The frozen list carries no such flag.
+    renamed: HashSet<String>,
     reader: Arc<dyn FrozenReader>,
     /// Whether SWFS listed the frozen files, so that a path the snapshot lacks is one SWFS holds
     /// no change to.
@@ -293,7 +379,25 @@ impl FrozenSnapshot {
                 .push(key.clone());
             files.insert(key, file);
         }
-        let origins = moves_in(&reader.modified()?)
+        let modified = reader.modified()?;
+        let renamed = modified
+            .iter()
+            .filter(|file| {
+                file.mod_flags & SWFSNodeModFlag_UpdateName != 0
+                    && file.mod_flags & SWFSNodeModFlag_Deleted == 0
+            })
+            .filter_map(|file| {
+                Some(
+                    SwfsPath(&file.path)
+                        .node_path()
+                        .ok()?
+                        .0
+                        .as_lowercase_str()
+                        .to_owned(),
+                )
+            })
+            .collect();
+        let origins = moves_in(&modified)
             .into_iter()
             .map(|(from, to)| (to.to_lowercase(), from))
             .collect();
@@ -302,18 +406,20 @@ impl FrozenSnapshot {
             children,
             reader,
             origins,
+            renamed,
             captured: true,
         })
     }
 
-    /// A snapshot of nothing, for an operation SWFS could not list the frozen files for: every
-    /// path then has no frozen answer.
+    /// A snapshot of nothing, for an operation begun without a freeze, as in a test: every path
+    /// then has no frozen answer.
     pub fn empty() -> Self {
         Self {
             files: HashMap::new(),
             children: HashMap::new(),
             reader: Arc::new(NoFrozenFiles),
             origins: HashMap::new(),
+            renamed: HashSet::new(),
             captured: false,
         }
     }
@@ -330,6 +436,23 @@ impl FrozenSnapshot {
         self.origins
             .get(path.as_lowercase_str())
             .map(String::as_str)
+    }
+
+    /// Whether the modified list names the node at `path`, a node path in any spelling, as renamed.
+    pub fn lists_renamed(&self, path: &str) -> bool {
+        self.renamed.contains(&path.to_lowercase())
+    }
+
+    /// Whether the modified list names `path`, or a directory above it, as renamed.
+    pub fn renamed_at_or_above(&self, path: &RelativePath) -> bool {
+        let mut at = path.clone();
+        while !at.is_empty() {
+            if self.renamed.contains(at.as_lowercase_str()) {
+                return true;
+            }
+            at = at.parent_path();
+        }
+        false
     }
 
     /// The files, directories left out, SWFS froze at and below `path`.
@@ -394,9 +517,15 @@ impl FrozenSnapshot {
             .filter_map(|key| self.files.get(key))
     }
 
-    /// The content of the frozen file at `path`, or `None` where it is not listed, is a directory,
-    /// or SWFS has none to give.
-    pub fn read(&self, path: &RelativePath) -> Result<Option<Vec<u8>>, SwfsInterfaceError> {
+    /// The content of the frozen file at `path`, read from SWFS a range at a time as it is read,
+    /// or `None` where it is not listed, is a directory, or SWFS has none to give.
+    ///
+    /// SWFS is read for no more of the file than each read asks for, so a file of any size costs
+    /// no more memory than the window it is read in.
+    pub fn content(
+        &self,
+        path: &RelativePath,
+    ) -> Result<Option<ContentSource<'static>>, SwfsInterfaceError> {
         let Some(file) = self.get(path) else {
             return Ok(None);
         };
@@ -405,9 +534,18 @@ impl FrozenSnapshot {
         }
         // A file of no bytes has nothing to read and SWFS gives it no buffer.
         if file.size == 0 {
-            return Ok(Some(Vec::new()));
+            return Ok(Some(ContentSource::memory(Bytes::new())));
         }
-        self.reader.read(&file.path)
+        // A file changed only in name or attributes has no bytes of its own for SWFS to give, which
+        // a read of its first byte tells.
+        if !self.reader.read_range(&file.path, 0, &mut [0])? {
+            return Ok(None);
+        }
+        let range = FrozenRange {
+            reader: self.reader.clone(),
+            path: file.path.clone(),
+        };
+        Ok(Some(ContentSource::ranged(Arc::new(range), file.size)))
     }
 }
 
@@ -434,4 +572,42 @@ pub fn moves_in(listed: &[FrozenFile]) -> Vec<(String, String)> {
         }
     }
     moves
+}
+
+/// The content of one frozen file, which SWFS is read for a range at a time.
+struct FrozenRange {
+    reader: Arc<dyn FrozenReader>,
+    /// The SWFS-side path.
+    path: String,
+}
+
+impl RangedRead for FrozenRange {
+    fn read_range<'a>(
+        &'a self,
+        offset: u64,
+        into: &'a mut [u8],
+    ) -> futures::future::BoxFuture<'a, std::io::Result<()>> {
+        Box::pin(async move {
+            match self.reader.read_range(&self.path, offset, into) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("SWFS holds no frozen content for {}", self.path),
+                )),
+                Err(error) => Err(std::io::Error::other(error.to_string())),
+            }
+        })
+    }
+}
+
+#[cfg(feature = "test-util")]
+pub mod test_util {
+    use super::FrozenReadBuffer;
+
+    impl FrozenReadBuffer {
+        /// How much the buffer holds allocated.
+        pub fn capacity(&self) -> usize {
+            self.capacity
+        }
+    }
 }

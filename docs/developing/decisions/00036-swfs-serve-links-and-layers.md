@@ -17,7 +17,7 @@ How should an SWFS instance serve its links and layers?
 
 - The working tree an SWFS instance shows must be the one a plain instance would hold after the same operations, links and layers included.
 - Linked and layered files must stay virtual, as the parent's do, and not become local changes in SWFS's write cache.
-- SWFS is a fixed dependency: what it does not support is worked around in Lore or asked of the SWFS team, not assumed.
+- SWFS changes on the SWFS team's schedule: what it does not support is asked of that team, and worked around in Lore until it lands, not assumed.
 - SWFS takes a write through the mount as the user's own change and keeps it over what a later thaw describes. So the SWFS paths describe what a revision holds to the thaw, and write through the mount only scratch files and an edit Lore makes on the user's behalf whose result differs from the current revision ([LEP](../../proposals/2026-10-29-swfs-through-the-filesystem-provider.md#swfs-plumbing-shared-by-every-stage), "Never write the revision's own changes through the OS").
 
 ## Considered Options

@@ -1998,6 +1998,61 @@ async fn diff_filesystem_directory_walk(
     Ok(())
 }
 
+/// Reports one entry `ctx.from`'s directory holds no node for, walking below it where it is a
+/// directory, as the walk of the directory would report it among its new entries.
+///
+/// `ctx` stands at the directory holding the entry, which has to be a node of `ctx.from`.
+pub(crate) async fn diff_filesystem_new_entry(
+    ctx: &FilesystemDiffContext,
+    item: FileListItem,
+    changes: &ChangeSender,
+) -> Result<FilesystemDiffStats, StateError> {
+    let staging = ctx.intent.stage().is_some();
+    let mut stats = FilesystemDiffStats::default();
+    if is_reserved_node_name(item.name.as_str())
+        || (staging && staging_ignores_name(item.name.as_str()))
+    {
+        return Ok(stats);
+    }
+
+    let child_path = ctx
+        .filesystem_path
+        .push_into_buf(item.name.as_str())
+        .freeze();
+    let (child_states, excluded) = ctx.from.repository.filter.child_emit_excludes(
+        ctx.states,
+        &child_path,
+        item.info.is_dir(),
+        ctx.filter_mode,
+    );
+    if excluded {
+        return Ok(stats);
+    }
+    let mut current_node_list = collect_node_list(&ctx.current, false).await?;
+    named_node_sort(&mut current_node_list.children);
+
+    let repository_root = ctx.from.repository.require_path()?;
+    let mut nested_probe = None;
+    let mut tasks = JoinSet::new();
+    let mut new_file_list = [(item, child_states)];
+    let work_result = diff_filesystem_new_entries(
+        ctx,
+        &mut new_file_list,
+        &current_node_list,
+        &mut nested_probe,
+        repository_root,
+        staging,
+        &mut tasks,
+        changes,
+        &mut stats,
+    )
+    .await;
+    let drain_result = lore_drain_tasks!(tasks, StateError::internal("Task failure"));
+    work_result?;
+    drain_result?;
+    Ok(stats)
+}
+
 /// Walks a directory the tree holds as a link, against the linked state, for
 /// [`diff_filesystem_directory_walk`].
 #[allow(clippy::too_many_arguments)]
@@ -3628,4 +3683,40 @@ pub(crate) fn diff_os_filesystem(
         }
         Ok(stats)
     }
+}
+
+/// Reports the directory `ctx` stands at as added where `ctx.from` holds it and the revision it
+/// compares against does not, as the walk of the directory above reports such an entry.
+///
+/// A walk that starts at a directory reports what is in it and not the directory, so a caller
+/// walking the directory on its own, rather than as an entry of the one above, reports it here.
+pub(crate) async fn report_uncommitted_directory(
+    ctx: &FilesystemDiffContext,
+    changes: &ChangeSender,
+) -> Result<(), StateError> {
+    if ctx.filesystem_path.is_empty()
+        || !ctx.from.node.is_valid_node_id()
+        || ctx.current.node.is_valid_node_id()
+    {
+        return Ok(());
+    }
+    let block = ctx
+        .from
+        .state
+        .block(ctx.from.repository.clone(), NodeBlock::index(ctx.from.node))
+        .await?;
+    let node = block.node(Node::index(ctx.from.node));
+    if !node.is_directory() {
+        return Ok(());
+    }
+    emit_dirty_add_node_single(
+        ctx.from.repository.clone(),
+        ctx.from.state.clone(),
+        ctx.from.node,
+        &ctx.filesystem_path,
+        changes,
+        &FilesystemDiffStats::default(),
+        ctx.intent,
+    )
+    .await
 }

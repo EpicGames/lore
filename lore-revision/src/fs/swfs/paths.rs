@@ -47,6 +47,19 @@ pub fn rest_below<'a>(path: &'a str, ancestor: &str) -> Option<&'a str> {
     }
 }
 
+/// What `path` holds below `ancestor`, spelled exactly as `ancestor` is: empty where the two are
+/// the same path, and `None` where `path` lies neither at nor below `ancestor`, compared byte for
+/// byte. The root is above every path.
+pub fn rest_below_exactly<'a>(path: &'a str, ancestor: &str) -> Option<&'a str> {
+    if ancestor.is_empty() {
+        return Some(path);
+    }
+    match path.strip_prefix(ancestor)? {
+        "" => Some(""),
+        rest => rest.strip_prefix('/'),
+    }
+}
+
 /// Whether `path` is `ancestor` or lies below it, in any spelling.
 pub fn at_or_below(path: &RelativePath, ancestor: &RelativePath) -> bool {
     rest_below(path.as_str(), ancestor.as_str()).is_some()

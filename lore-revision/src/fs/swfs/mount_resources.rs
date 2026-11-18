@@ -5,6 +5,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use bytes::Bytes;
+use dashmap::DashSet;
 use lore_base::error::*;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::runtime;
@@ -20,15 +22,19 @@ use parking_lot::RwLock;
 use crate::filter;
 use crate::filter::Filter;
 use crate::filter::FilterInstance;
+use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::invalid_filesystem_provider::InvalidFilesystemProvider;
+use crate::fs::swfs::absent_paths::AbsentPaths;
 use crate::fs::swfs::api_interface::swfs_api::SWFSFile;
 use crate::fs::swfs::callback_counters::CallbackCounters;
 use crate::fs::swfs::file::SwfsFile;
 use crate::fs::swfs::file::SwfsFileArray;
 use crate::fs::swfs::modified_tree::ModifiedTree;
 use crate::fs::swfs::paths::MountPath;
+use crate::fs::swfs::paths::RelativePathKey;
 use crate::fs::swfs::paths::SwfsPath;
+use crate::fs::swfs::renamed_at_risk::RenamedAtRisk;
 use crate::fs::swfs::served_tree::Served;
 use crate::fs::swfs::served_tree::ServedTree;
 use crate::immutable;
@@ -143,16 +149,48 @@ pub struct MountResources {
     /// Names the remote a failed connect is retried against.
     config: RepositoryConfig,
     internal_state: RwLock<InternalState>,
+    /// What the mount last described to SWFS: the tree loaded when it was mounted, then the one
+    /// each thaw that applied changes described. Links and layers that differ from it are
+    /// described by their mount paths (ADR-00037), whatever moved them in between, such as a
+    /// commit inside a link, which moves its pin without a thaw.
+    described: RwLock<Option<Arc<ServedTree>>>,
     /// The files SWFS has reported as modified. Fed by the `notify_*` callbacks.
     modified: Arc<ModifiedTree>,
     /// How often SWFS has called back for content and for directories.
     callbacks: CallbackCounters,
+    /// The moves SWFS has reported, and the renamed files to give bytes of their own: a
+    /// workaround until SWFS names a renamed file's origin ([`RenamedAtRisk`]).
+    renamed: Arc<RenamedAtRisk>,
+    /// The ignore rules and the instance's view, of which the view decides what is served: a path
+    /// it excludes is left out of listings and reads, as a plain instance never writes it
+    /// (ADR-00034).
+    served_filter: RwLock<Arc<Filter>>,
+    /// The content of the user's own `.loreignore`, where SWFS holds it changed, which the
+    /// instance's ignore rules are read from in place of the revision's: empty where the user
+    /// deleted it. Set as each operation begins ([`Self::use_users_ignore_rules`]).
+    users_ignore: RwLock<Option<Bytes>>,
+    /// The ignore rules in effect: rules that change leave the modified-file record untrusted.
+    ignore_rules: parking_lot::Mutex<RulesInEffect>,
+    /// Lowercase paths the current revision holds that the working tree does not, left out of
+    /// what is served: what an operation that moved the instance to the revision did not write
+    /// (ADR-00034).
+    absent: Arc<AbsentPaths>,
+    /// The directories SWFS has listed through `fill_dir_begin` since the mount, as lowercase
+    /// paths, the root as the empty one. See [`Self::list_directories_described_again`].
+    listed: DashSet<String>,
+    /// The directories a thaw described something in while SWFS had not listed them, as lowercase
+    /// paths, until SWFS lists them. See [`Self::list_directories_described_again`].
+    described_unlisted: DashSet<String>,
+    /// Paths below a changed link or layer mount that an operation removed, which the next thaw
+    /// describes as holding nothing although the state it loads still serves them: the operation
+    /// realizes the change before the state that holds it is stored.
+    removed_below_mounts: DashSet<String>,
     _instance_id: InstanceId,
     _name: String,
     pub name_nul_terminated: CString,
     _write_path: PathBuf,
     pub write_path_nul_terminated: CString,
-    _mount_path: MountPath,
+    mount_path: MountPath,
     pub mount_path_nul_terminated: CString,
 }
 
@@ -295,9 +333,18 @@ impl MountResources {
             context,
             modified: Arc::new(ModifiedTree::new(repository.clone())),
             callbacks: CallbackCounters::default(),
+            renamed: Arc::default(),
+            served_filter: RwLock::new(Arc::default()),
+            users_ignore: RwLock::default(),
+            ignore_rules: parking_lot::Mutex::default(),
+            absent: AbsentPaths::load(repository.clone()).await,
+            listed: DashSet::new(),
+            described_unlisted: DashSet::new(),
+            removed_below_mounts: DashSet::new(),
             repository,
             config: config.clone(),
             internal_state: RwLock::default(),
+            described: RwLock::default(),
             _instance_id: instance_id,
             name_nul_terminated: CString::new(name.as_str())
                 .internal("Nul terminating mount name")?,
@@ -308,7 +355,7 @@ impl MountResources {
             mount_path_nul_terminated: mount_path
                 .nul_terminated_swfs_form()
                 .internal("Nul terminating mount path")?,
-            _mount_path: mount_path,
+            mount_path,
         };
         resources
             .update_state(SwfsExecutionToken::new())
@@ -345,6 +392,16 @@ impl MountResources {
             .and_then(|served| served.current().cloned())
     }
 
+    /// What the mount last described to SWFS, `None` before the first load.
+    pub fn described_tree(&self) -> Option<Arc<ServedTree>> {
+        self.described.read().clone()
+    }
+
+    /// Notes that a thaw described `tree` to SWFS.
+    pub fn set_described(&self, tree: Arc<ServedTree>) {
+        *self.described.write() = Some(tree);
+    }
+
     /// What the mount serves at each path of the working tree (ADR-00036).
     pub fn served_tree(&self) -> Arc<ServedTree> {
         self.internal_state
@@ -354,8 +411,23 @@ impl MountResources {
             .unwrap_or_else(|| Arc::new(ServedTree::new(self.repository.clone(), None, Vec::new())))
     }
 
+    /// Where the mount is, which SWFS serves from the stores this instance holds.
+    pub fn mount_path(&self) -> &std::path::Path {
+        self.mount_path.as_ref()
+    }
+
+    /// The ignore rules and the view the mount serves under.
+    pub fn served_filter(&self) -> Arc<Filter> {
+        self.served_filter.read().clone()
+    }
+
     pub fn modified(&self) -> &Arc<ModifiedTree> {
         &self.modified
+    }
+
+    /// The moves SWFS has reported, and the renamed files to give bytes of their own.
+    pub fn renamed(&self) -> &Arc<RenamedAtRisk> {
+        &self.renamed
     }
 
     pub fn callbacks(&self) -> &CallbackCounters {
@@ -410,7 +482,10 @@ impl MountResources {
                 .await
                 .forward::<SwfsWorkError>("Loading what the mount serves")?,
         );
-        self.internal_state.write().served = Some(served);
+        self.internal_state.write().served = Some(served.clone());
+        self.modified.set_served(served.clone());
+        // The first load, at the mount, is what SWFS is serving from then on.
+        self.described.write().get_or_insert(served);
         self.update_ignore_filter(token).await;
         Ok(())
     }
@@ -423,8 +498,17 @@ impl MountResources {
         }
     }
 
-    /// Points the modified-file record at the ignore rules the current revision tracks. The
-    /// mount path is virtual, so they are read from the immutable store rather than from disk.
+    /// Takes `users` as the content of the user's own `.loreignore`, where SWFS holds it changed,
+    /// or `None` where it holds the revision's, and points the record at the rules that makes.
+    pub async fn use_users_ignore_rules(&self, token: SwfsExecutionToken, users: Option<Bytes>) {
+        *self.users_ignore.write() = users;
+        self.update_ignore_filter(token).await;
+    }
+
+    /// Points the modified-file record at the instance's ignore rules: the user's own
+    /// `.loreignore` where SWFS holds it changed, and otherwise the one the current revision
+    /// tracks, read from the immutable store, since the mount path is virtual. Rules that differ
+    /// from those in effect leave the record untrusted, for what it skipped was decided by them.
     ///
     /// Rules that cannot be read leave only the exclusions every repository carries, so the
     /// record takes in more than it should rather than less.
@@ -439,11 +523,134 @@ impl MountResources {
                     .unwrap_or_default()
             }
         };
-        self.modified.set_ignore(Arc::new(filter));
+        let filter = Arc::new(filter);
+        *self.served_filter.write() = filter.clone();
+        self.modified.set_ignore(filter);
+    }
+
+    /// Whether the working tree leaves out `path`, which the current revision holds: the view
+    /// excludes it and everything below it, or it is absent (ADR-00034).
+    pub fn hides(&self, path: &RelativePath, is_directory: bool) -> bool {
+        self.view_hides(path, is_directory) || self.is_absent(path)
+    }
+
+    /// Whether the view excludes `path` and everything below it.
+    pub fn view_hides(&self, path: &RelativePath, is_directory: bool) -> bool {
+        !path.is_empty()
+            && self
+                .served_filter
+                .read()
+                .excludes_tree(path, is_directory, FilterMode::View)
+    }
+
+    /// Whether the working tree lacks `path`, which the current revision holds (ADR-00034).
+    pub fn is_absent(&self, path: &RelativePath) -> bool {
+        !path.is_empty() && self.absent.contains(path)
+    }
+
+    /// Records `paths` as absent from the working tree, and `present` as no longer so, then
+    /// persists the set. Called by an operation's finalize (ADR-00034).
+    pub fn update_absent(&self, absent: &[RelativePath], present: &[RelativePath]) {
+        self.absent.update(absent, present);
+    }
+
+    /// Lists through the mount each directory holding one of `written` that an earlier thaw
+    /// described something in while SWFS had not listed it, shallowest first. Called while the
+    /// mount is frozen, before the thaw that describes `written`, with the state it describes
+    /// from loaded, which is what the listing answers from.
+    ///
+    /// A thaw naming a file in a directory SWFS has not listed makes SWFS an entry for it at the
+    /// size described, and a later thaw naming it at another size leaves that size in place, even
+    /// if the directory is listed after that thaw: a file shrunk by the later thaw reads as its new
+    /// content padded with NUL bytes to the old size. Listing the directory before the later thaw
+    /// keeps it in effect (the relist probe's `shrink` scenario). Only such a directory is listed,
+    /// so a clone, whose thaw describes the whole tree, lists none of it through the mount. A
+    /// directory that cannot be listed, such as one an earlier thaw described as removed, is left
+    /// alone.
+    pub async fn list_directories_described_again(&self, written: &DashSet<RelativePathKey>) {
+        for directory in self.unlisted_directories(written) {
+            if !self
+                .described_unlisted
+                .contains(&directory.to_ascii_lowercase())
+            {
+                continue;
+            }
+            let path = self.mount_path.as_ref().join(&directory);
+            // Listed with a permit from the bound on syscalls on a mount (ADR-00035).
+            let _permit = crate::fs::swfs::mount_io::MountIo::global().permit().await;
+            match lore_io::IoDriver::global().read_dir(&path).await {
+                Ok(mut entries) => while entries.next().await.is_some() {},
+                Err(error) => {
+                    crate::lore_debug!("SWFS: listing {} before a thaw: {error}", path.display());
+                }
+            }
+        }
+    }
+
+    /// Notes each directory holding one of `written` that SWFS has not listed, which a later thaw
+    /// describing something in it again lists first ([`Self::list_directories_described_again`]).
+    /// Called after a thaw that described `written`.
+    /// Notes that the thaw ending the operation describes `path` as holding nothing.
+    pub fn note_removed_below_mount(&self, path: RelativePath) {
+        self.removed_below_mounts.insert(path.as_str().to_owned());
+    }
+
+    /// The paths [`Self::note_removed_below_mount`] noted, which the thaw takes.
+    pub fn take_removed_below_mounts(&self) -> DashSet<RelativePathKey> {
+        let taken = DashSet::new();
+        for path in self.removed_below_mounts.iter() {
+            if let Ok(path) = RelativePath::new_from_initial_path(path.as_str()) {
+                taken.insert(RelativePathKey(path));
+            }
+        }
+        self.removed_below_mounts.clear();
+        taken
+    }
+
+    pub fn note_described_unlisted(&self, written: &DashSet<RelativePathKey>) {
+        for directory in self.unlisted_directories(written) {
+            self.described_unlisted
+                .insert(directory.to_ascii_lowercase());
+        }
+    }
+
+    /// The directories holding one of `written` that SWFS has not listed since the mount,
+    /// shallowest first, the root as the empty path.
+    fn unlisted_directories(&self, written: &DashSet<RelativePathKey>) -> Vec<String> {
+        let mut directories = std::collections::BTreeSet::new();
+        for path in written.iter() {
+            let mut directory = path.0.parent_path();
+            loop {
+                let text = directory.as_str();
+                if !self.listed.contains(&text.to_ascii_lowercase()) {
+                    let depth = if text.is_empty() {
+                        0
+                    } else {
+                        text.matches('/').count() + 1
+                    };
+                    directories.insert((depth, text.to_owned()));
+                }
+                if directory.is_empty() {
+                    break;
+                }
+                directory = directory.parent_path();
+            }
+        }
+        directories
+            .into_iter()
+            .map(|(_, directory)| directory)
+            .collect()
     }
 
     async fn load_ignore_filter(&self, token: SwfsExecutionToken) -> Result<Filter, SwfsWorkError> {
-        let ignore = match self.read_ignore_rules(token).await? {
+        let rules = self.read_ignore_rules(token).await?;
+        let read = RulesInEffect::Read(rules.clone());
+        let previous = std::mem::replace(&mut *self.ignore_rules.lock(), read.clone());
+        let changed = previous != RulesInEffect::Unread && previous != read;
+        if changed {
+            self.modified.distrust();
+        }
+        let ignore = match rules {
             Some(bytes) => filter::parse_filter(&bytes, Path::new(DOT_LOREIGNORE))
                 .forward::<SwfsWorkError>("Parsing the ignore rules")?,
             None => FilterInstance::default(),
@@ -460,6 +667,9 @@ impl MountResources {
         &self,
         token: SwfsExecutionToken,
     ) -> Result<Option<Vec<u8>>, SwfsWorkError> {
+        if let Some(users) = self.users_ignore.read().clone() {
+            return Ok(Some(users.to_vec()));
+        }
         let Some(state) = self.current_read_state() else {
             return Ok(None);
         };
@@ -478,7 +688,8 @@ impl MountResources {
         Ok(Some(bytes))
     }
 
-    /// What the mount serves at `path`: what the served tree resolves it to.
+    /// What the mount serves at `path`: what the served tree resolves it to, unless the view
+    /// excludes it or the working tree leaves it absent (ADR-00034).
     async fn served(&self, path: &RelativePath) -> Result<Served, SwfsWorkError> {
         let served = self
             .served_tree()
@@ -486,6 +697,9 @@ impl MountResources {
             .await
             .forward::<SwfsWorkError>("Resolving a served path")?
             .ok_or_else(|| SwfsWorkError::internal(format!("{path} is not served")))?;
+        if self.hides(path, served.is_directory()) {
+            return Err(SwfsWorkError::internal("Node is not in the working tree"));
+        }
         Ok(served)
     }
 
@@ -568,7 +782,9 @@ impl MountResources {
         let served = self.served_tree();
         // With no revision the mount serves nothing of its own, and what an operation wrote, such
         // as a clone's first files, is in SWFS's write cache: every directory, the root included,
-        // lists as holding nothing more.
+        // lists as holding nothing more. None is recorded as listed, so the listing after the
+        // thaw that first serves a revision is made: a directory never listed is how a later
+        // thaw that shrinks a file in it pads the file with NUL bytes.
         if served.current().is_none() {
             return Ok(SwfsFileArray::empty());
         }
@@ -588,6 +804,9 @@ impl MountResources {
         let mut files = Vec::new();
         for child in children {
             let child_path = node_path.0.join(&child.name);
+            if self.hides(&child_path, child.served.is_directory()) {
+                continue;
+            }
             let file_info = child.served.file_info(&child_path).await;
             files.push(
                 SwfsFile::new(
@@ -598,6 +817,10 @@ impl MountResources {
                 .forward::<SwfsWorkError>("Constructing file info")?,
             );
         }
+        let listed = node_path.0.as_str().to_ascii_lowercase();
+        self.described_unlisted.remove(&listed);
+        self.listed.insert(listed);
+
         Ok(SwfsFileArray::new(files))
     }
 }
@@ -620,6 +843,16 @@ impl SwfsExecutionToken {
     }
 }
 
+/// The ignore rules in effect for a mount, as read: none where neither the user nor the revision
+/// holds a `.loreignore`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum RulesInEffect {
+    /// Not read yet, as before the mount first loads its state.
+    #[default]
+    Unread,
+    Read(Option<Vec<u8>>),
+}
+
 #[cfg(feature = "test-util")]
 pub mod test_util {
     use super::*;
@@ -627,7 +860,7 @@ pub mod test_util {
     impl MountResources {
         /// Mount resources serving `state` of `repository` at `mount_path`, with nothing mounted:
         /// what the callbacks answer, without SWFS or an instance directory.
-        pub fn for_test(
+        pub async fn for_test(
             repository: Arc<RepositoryContext>,
             state: Option<Arc<State>>,
             mount_path: MountPath,
@@ -639,16 +872,25 @@ pub mod test_util {
                 )),
                 modified: Arc::new(ModifiedTree::new(repository.clone())),
                 callbacks: CallbackCounters::default(),
+                renamed: Arc::default(),
+                served_filter: RwLock::new(Arc::default()),
+                users_ignore: RwLock::default(),
+                ignore_rules: parking_lot::Mutex::default(),
+                absent: AbsentPaths::load(repository.clone()).await,
+                listed: DashSet::new(),
+                described_unlisted: DashSet::new(),
+                removed_below_mounts: DashSet::new(),
                 repository,
                 config: RepositoryConfig::default(),
                 internal_state: RwLock::default(),
+                described: RwLock::default(),
                 _instance_id: InstanceId::default(),
                 name_nul_terminated: CString::default(),
                 _name: String::new(),
                 write_path_nul_terminated: CString::default(),
                 _write_path: PathBuf::new(),
                 mount_path_nul_terminated: CString::default(),
-                _mount_path: mount_path,
+                mount_path,
             };
             resources.internal_state.write().served = Some(Arc::new(ServedTree::new(
                 resources.repository.clone(),
@@ -660,6 +902,17 @@ pub mod test_util {
     }
 
     impl MountResources {
+        /// Whether SWFS has listed the directory at `path` since the mount, as far as
+        /// [`Self::list_directories_described_again`] knows.
+        pub fn listed_for_test(&self, path: &str) -> bool {
+            self.listed.contains(&path.to_ascii_lowercase())
+        }
+
+        /// Whether a later thaw describing something in the directory at `path` lists it first.
+        pub fn described_unlisted_for_test(&self, path: &str) -> bool {
+            self.described_unlisted.contains(&path.to_ascii_lowercase())
+        }
+
         /// Serves `served` in place of what the instance has stored.
         pub fn serve_for_test(&self, served: ServedTree) {
             self.internal_state.write().served = Some(Arc::new(served));

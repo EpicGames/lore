@@ -145,7 +145,7 @@ impl SwfsMountManager {
             .map_err(|refused| MountManagerError::internal(refused.to_string()))?;
         let dot_lore = record.external_dir.join(DOT_LORE);
         let interface = SwfsInterface::mount(
-            MountResources::premount_instance_with_config(
+            MountResources::premount_new_instance(
                 repository_id,
                 instance_id,
                 mount_path.clone(),

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use lore_revision::fs::swfs::paths::at_or_below;
 use lore_revision::fs::swfs::paths::rest_below;
+use lore_revision::fs::swfs::paths::rest_below_exactly;
 use lore_revision::fs::swfs::paths::strictly_below;
 use lore_revision::util::path::RelativePath;
 
@@ -49,4 +50,13 @@ fn a_name_of_several_bytes_per_character_is_compared_without_splitting_one() {
     // `de` would end inside the path's `é`, which the byte comparison turns down rather than
     // slicing the path there.
     assert_eq!(rest_below("d\u{e9}/a.txt", "de"), None);
+}
+
+#[test]
+fn the_rest_below_an_ancestor_spelled_exactly_is_found_in_that_spelling_alone() {
+    assert_eq!(rest_below_exactly("a/b/c", "a/b"), Some("c"));
+    assert_eq!(rest_below_exactly("a/b", "a/b"), Some(""));
+    assert_eq!(rest_below_exactly("a/b", ""), Some("a/b"));
+    assert_eq!(rest_below_exactly("A/b/c", "a/b"), None);
+    assert_eq!(rest_below_exactly("a/bc", "a/b"), None);
 }

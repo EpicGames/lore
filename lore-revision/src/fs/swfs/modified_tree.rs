@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use lore_base::types::Hash;
@@ -21,6 +22,7 @@ use crate::node::NodeID;
 use crate::node::ROOT_NODE;
 use crate::repository::DOT_LOREIGNORE;
 use crate::repository::RepositoryContext;
+use crate::state::Clear;
 use crate::state::Ext;
 use crate::state::Mark;
 use crate::state::State;
@@ -53,6 +55,13 @@ pub struct ModifiedTree {
     /// Held while the record is changed. SWFS calls its callbacks from threads of its own, and a
     /// directory two of them find missing would be added twice.
     updating: tokio::sync::Mutex<()>,
+    /// The lowercase paths a callback recorded since the mount was last frozen, until the thaw
+    /// ending that freeze is applied: SWFS keeps the user's version of a name touched while
+    /// frozen, so the thaw naming it does not take it off SWFS's list.
+    touched_while_frozen: parking_lot::Mutex<Option<HashSet<String>>>,
+    /// Whether a thaw is being described, which moves the record to the revision it describes
+    /// from rather than emptying it ([`observe_revision`](Self::observe_revision)).
+    thawing: std::sync::atomic::AtomicBool,
 }
 
 /// Whether the record is known to hold every modification, and how often it has been found not
@@ -103,6 +112,17 @@ pub enum Change {
 }
 
 impl Change {
+    /// The paths the change names.
+    fn paths(&self) -> impl Iterator<Item = &str> {
+        let (first, second) = match self {
+            Change::Written(path) | Change::Created { path, .. } | Change::Deleted { path, .. } => {
+                (path.as_str(), None)
+            }
+            Change::Moved { from, to, .. } => (from.as_str(), Some(to.as_str())),
+        };
+        std::iter::once(first).chain(second)
+    }
+
     fn touches(&self, name: &str) -> bool {
         match self {
             Change::Written(path) | Change::Created { path, .. } | Change::Deleted { path, .. } => {
@@ -123,6 +143,8 @@ impl ModifiedTree {
             revision: RwLock::new(None),
             served: RwLock::new(None),
             updating: tokio::sync::Mutex::new(()),
+            touched_while_frozen: parking_lot::Mutex::new(None),
+            thawing: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -147,7 +169,7 @@ impl ModifiedTree {
         self.trust.lock().trusted = trusted;
     }
 
-    /// Leaves the record untrusted because it may lack a change, and counts it, so a seed
+    /// Leaves the record untrusted because it may lack a change, and counts it, so a rebuild
     /// already running does not trust the record again when it finishes.
     pub fn distrust(&self) {
         let mut trust = self.trust.lock();
@@ -156,13 +178,13 @@ impl ModifiedTree {
     }
 
     /// What [`trust_unless_distrusted_since`](Self::trust_unless_distrusted_since) compares
-    /// against, taken before the walk that seeds the record begins.
+    /// against, taken before a rebuild begins.
     pub fn distrust_mark(&self) -> u64 {
         self.trust.lock().distrusted
     }
 
-    /// Trusts the record once a seed has filled it, unless it was distrusted while the seed ran:
-    /// that change may be one the seed's walk had already passed.
+    /// Trusts the record once a rebuild has filled it, unless it was distrusted while the rebuild
+    /// ran: that change may be one the rebuild's listing had already passed.
     pub fn trust_unless_distrusted_since(&self, mark: u64) {
         let mut trust = self.trust.lock();
         if trust.distrusted == mark {
@@ -177,10 +199,15 @@ impl ModifiedTree {
     /// Records `change`, unless the path it names is ignored. A change that cannot be recorded
     /// leaves the record untrusted, since a callback has no caller to report the failure to.
     pub async fn record(&self, change: Change) {
-        // The ignore rules were read from the revision, so a change to them leaves the record
-        // unsure what to skip until it is rebuilt.
+        // The ignore rules are what `.loreignore` holds, so a change to it leaves the record unsure
+        // what to skip until it is rebuilt under the rules it makes.
         if change.touches(DOT_LOREIGNORE) {
             self.distrust();
+        }
+        if let Some(touched) = self.touched_while_frozen.lock().as_mut() {
+            for path in change.paths() {
+                touched.insert(path.to_lowercase());
+            }
         }
         if let Err(error) = self.try_record(&change).await {
             lore_warn!(
@@ -264,16 +291,78 @@ impl ModifiedTree {
         *self.served.write() = Some(served);
     }
 
-    /// Notes the revision the instance now stands at. A different one than the record was built
-    /// against empties it and leaves it untrusted, so the next diff rebuilds it: the record holds
-    /// differences from a revision, and what Lore itself writes to the tree is not reported.
+    /// Notes the revision the instance now stands at. While a thaw is described
+    /// ([`begin_thaw`](Self::begin_thaw)), the record moves to it, for the thaw takes what it
+    /// names off SWFS's list and [`end_thaw`](Self::end_thaw) off the record. Otherwise a
+    /// different one than the record was built against empties it and leaves it untrusted, so the
+    /// next diff rebuilds it: the revision moved without a thaw of this process naming what
+    /// changed.
     pub async fn observe_revision(&self, revision: Hash) {
         let _updating = self.updating.lock().await;
         let previous = self.revision.write().replace(revision);
-        if previous.is_some_and(|previous| previous != revision) {
+        if previous.is_some_and(|previous| previous != revision)
+            && !self.thawing.load(std::sync::atomic::Ordering::Acquire)
+        {
             self.clear();
             self.distrust();
         }
+    }
+
+    /// Notes that the mount has frozen, from when the paths the callbacks record are kept by the
+    /// thaw that ends the freeze.
+    pub fn begin_freeze(&self) {
+        *self.touched_while_frozen.lock() = Some(HashSet::new());
+    }
+
+    /// Notes that a thaw is being described, so the revision it describes from moves the record
+    /// rather than empties it.
+    pub fn begin_thaw(&self) {
+        self.thawing
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Applies the thaw [`begin_thaw`](Self::begin_thaw) began: `named` are the paths it named
+    /// other than as directories, each of which takes the source's state and comes off SWFS's
+    /// list, and so off the record, unless a callback recorded it since the freeze. `None` is a
+    /// thaw that did not finish, or whose files were not all named, which leaves the record
+    /// untrusted and empty, as a revision moved without a thaw does.
+    pub async fn end_thaw(&self, named: Option<&[RelativePath]>) {
+        let _updating = self.updating.lock().await;
+        self.thawing
+            .store(false, std::sync::atomic::Ordering::Release);
+        let touched = self.touched_while_frozen.lock().take().unwrap_or_default();
+        let Some(named) = named else {
+            self.clear();
+            self.distrust();
+            return;
+        };
+        let state = self.state();
+        for path in named {
+            if touched.contains(&path.as_str().to_lowercase()) {
+                continue;
+            }
+            if let Err(error) = self.forget(&state, path).await {
+                lore_warn!(
+                    "SWFS: unable to drop {path} from the modified-file record, which is no longer \
+                     trusted: {error}"
+                );
+                self.distrust();
+            }
+        }
+    }
+
+    /// Takes the record's own mark off `path`, and off each directory above it that nothing else
+    /// it holds keeps marked. What lies below a directory stays.
+    async fn forget(&self, state: &State, path: &RelativePath) -> Result<(), StateError> {
+        let node = match state
+            .find_node_link(self.repository.clone(), path.as_str())
+            .await
+        {
+            Ok(found) => found.node,
+            Err(error) if error.is_node_not_found() => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        state.node_clear(&self.repository, node, Clear::Dirty).await
     }
 
     /// Rebuilds the record from SWFS's own list of the files it holds modified
@@ -290,9 +379,10 @@ impl ModifiedTree {
     ///
     /// SWFS lists a renamed file by its destination, and its origin as a deletion with the same
     /// `file_index`, which names the move ([`moves_in`]). The origin is not listed while another
-    /// node holds its path, and a rename without it is recorded as an add and leaves the record
-    /// untrusted, as a record that cannot say the origin is gone. Returns whether the record is
-    /// trusted.
+    /// node holds its path, which SWFS lists for itself, so a rename without it is recorded as an
+    /// add: the record then holds what is at both paths, though not that one came from the other.
+    /// Returns whether the record is trusted, which it is unless a callback distrusted it while it
+    /// was rebuilt.
     pub async fn rebuild(
         &self,
         listed: &[FrozenFile],
@@ -304,7 +394,6 @@ impl ModifiedTree {
             .into_iter()
             .map(|(from, to)| (to.to_lowercase(), from))
             .collect();
-        let mut resolved = true;
         for file in listed {
             let path = SwfsPath(&file.path)
                 .node_path()
@@ -331,7 +420,6 @@ impl ModifiedTree {
                         directory,
                     }
                 } else {
-                    resolved = false;
                     Change::Created { path, directory }
                 }
             } else if created && !self.revision_holds(revision, &path).await? {
@@ -343,10 +431,8 @@ impl ModifiedTree {
             };
             self.try_record(&change).await?;
         }
-        if resolved {
-            self.trust_unless_distrusted_since(mark);
-        }
-        Ok(resolved && self.is_trusted())
+        self.trust_unless_distrusted_since(mark);
+        Ok(self.is_trusted())
     }
 
     /// Whether `revision` serves `path`: below a link or layer, whether the repository mounted

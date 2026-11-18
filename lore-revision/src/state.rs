@@ -8879,6 +8879,22 @@ pub(crate) async fn node_change_state(
     }
 }
 
+/// The changes between the subtree `from` names and the subtree `to` names, spelled from `path`,
+/// as [`diff_collect_subtree`] finds them but with a move left as the delete and the add it is
+/// made of, for a caller that settles each path on its own.
+pub(crate) async fn diff_subtree_paths(
+    from: NodeChangeState,
+    to: NodeChangeState,
+    path: RelativePath,
+    filter_mode: FilterMode,
+) -> Result<Vec<NodeChange>, StateError> {
+    ChangeStream::spawn(async move |changes| {
+        diff::diff_subtree(from, to, path, None, &changes, filter_mode).await
+    })
+    .collect()
+    .await
+}
+
 /// The changes between the subtree `from` names and the subtree `to` names, spelled from `path`.
 ///
 /// A subtree a working copy materializes somewhere other than where the repository holding it
@@ -9743,6 +9759,229 @@ pub(crate) async fn holds_untracked_kind(
             Some(_) => {}
         }
     }
+}
+
+/// Diffs the filesystem at `paths` alone against `from`, through `operation`, rather than walking
+/// the whole tree: for a filesystem that already knows which paths changed.
+///
+/// A path stands for what is under it, so a path with a listed ancestor is covered by that
+/// ancestor's walk and not walked again. A path nothing holds is a path that was deleted.
+///
+/// A path the filesystem lists that has not changed reports nothing, so a list may name more
+/// than changed but must not name less.
+#[allow(clippy::too_many_arguments)]
+pub async fn diff_filesystem_listed(
+    operation: &Arc<InstanceOperationImpl>,
+    from: FilesystemDiffTree,
+    current: FilesystemDiffTree,
+    paths: Vec<RelativePath>,
+    filter_mode: FilterMode,
+    intent: FilesystemDiffIntent,
+    layer_mounts: Arc<Vec<LayerMountInfo>>,
+) -> Result<ChangeStream<FilesystemDiffStats>, StateError> {
+    let link_mounts = Arc::new(
+        collect_link_mounts(
+            &[
+                (&from.state, &from.repository, ROOT_NODE),
+                (&current.state, &current.repository, ROOT_NODE),
+            ],
+            &RelativePath::new(),
+        )
+        .await?,
+    );
+    Ok(diff_paths(
+        FilesystemDiffContext {
+            operation: operation.clone(),
+            from: NodeMapping::root(from.repository, from.state),
+            current: NodeMapping::root(current.repository, current.state),
+            filesystem_path: RelativePath::new(),
+            states: FilterStates::ROOT,
+            from_states: FilterStates::ROOT,
+            named_path: None,
+            filter_mode: walk_filter_mode(filter_mode, intent),
+            intent,
+            layer_mounts,
+            link_mounts,
+            discards: None,
+        },
+        paths,
+    ))
+}
+
+/// [`diff_filesystem_listed`] for a whole-tree `diff` already built, walking each of `paths`
+/// through the filesystem the way a walk of the whole tree would reach it.
+pub(crate) fn diff_paths(
+    diff: FilesystemDiffContext,
+    paths: Vec<RelativePath>,
+) -> ChangeStream<FilesystemDiffStats> {
+    ChangeStream::spawn(move |changes| async move {
+        // A marking walk holds what it finds stale until every walk over the tree has drained,
+        // which is all of these.
+        let owned = (diff.discards.is_none() && diff.intent.marks_dirty())
+            .then(|| Arc::new(WalkDiscards::default()));
+        let discards = diff.discards.clone().or_else(|| owned.clone());
+
+        let mut stats = FilesystemDiffStats::default();
+        for path in outermost_paths(paths) {
+            let Some(context) = diff_context_at(&diff, path, discards.clone()).await? else {
+                continue;
+            };
+            let walked = if let Some((parent, item)) =
+                new_directory_entry(&diff, &context, discards.clone()).await?
+            {
+                os_diff::diff_filesystem_new_entry(&parent, item, &changes).await?
+            } else {
+                // A directory an earlier scan marked added, which `from` therefore holds, is
+                // reported here: the walk below starts inside it.
+                os_diff::report_uncommitted_directory(&context, &changes).await?;
+                os_diff::diff_os_filesystem(context, &changes).await?
+            };
+            stats.append(walked);
+        }
+        if let Some(owned) = owned.filter(|discards| !discards.is_empty()) {
+            Box::pin(owned.apply()).await?;
+        }
+        Ok(stats)
+    })
+}
+
+/// The directory holding `context`'s path and the entry it names, where the path is a directory
+/// the filesystem holds that `context.from` has no node for.
+///
+/// Such a directory is reported by the walk of the directory above it, which is where its add is
+/// emitted and where layers, links and nested repositories are told from an ordinary directory.
+/// A walk that starts at the directory itself reports what is in it and not the directory.
+async fn new_directory_entry(
+    base: &FilesystemDiffContext,
+    context: &FilesystemDiffContext,
+    discards: Option<Arc<WalkDiscards>>,
+) -> Result<Option<(FilesystemDiffContext, crate::fs::os::FileListItem)>, StateError> {
+    if context.from.node.is_valid_or_root_node_id() {
+        return Ok(None);
+    }
+    let name = context.filesystem_path.name();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let parent_path = context.filesystem_path.parent_path();
+    // Asked of the operation, as the walk asks it: an SWFS mount answers without being read.
+    let Ok(info) = context.operation.file_info(&context.filesystem_path).await else {
+        return Ok(None);
+    };
+    if !info.is_dir() {
+        return Ok(None);
+    }
+    let Some(parent) = diff_context_at(base, parent_path, discards).await? else {
+        return Ok(None);
+    };
+    if !parent.from.node.is_valid_or_root_node_id() {
+        return Ok(None);
+    }
+    let name = name.to_owned();
+    let name_hash = crate::hash::hash_string(&name);
+    Ok(Some((
+        parent,
+        crate::fs::os::FileListItem {
+            name,
+            info,
+            name_hash,
+        },
+    )))
+}
+
+/// `paths` without any that has an ancestor in it, in path order.
+fn outermost_paths(mut paths: Vec<RelativePath>) -> Vec<RelativePath> {
+    paths.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    paths.dedup_by(|a, b| a.as_str() == b.as_str());
+    let mut outermost: Vec<RelativePath> = Vec::with_capacity(paths.len());
+    for path in paths {
+        let covered = outermost.last().is_some_and(|ancestor| {
+            path.as_str()
+                .strip_prefix(ancestor.as_str())
+                .is_some_and(|rest| ancestor.is_empty() || rest.starts_with('/'))
+        });
+        if !covered {
+            outermost.push(path);
+        }
+    }
+    outermost
+}
+
+/// The context to diff `path` on its own, given the whole-tree context `base`. `None` where the
+/// filter leaves the path out.
+async fn diff_context_at(
+    base: &FilesystemDiffContext,
+    path: RelativePath,
+    discards: Option<Arc<WalkDiscards>>,
+) -> Result<Option<FilesystemDiffContext>, StateError> {
+    let (from, current, states) = if path.is_empty() {
+        (base.from.clone(), base.current.clone(), FilterStates::ROOT)
+    } else {
+        let filter = &base.from.repository.filter;
+        let parent_states = filter.parent_exclusion_states(&path);
+        let from = mapping_at(&base.from, &path).await?;
+        // A path the tree tracks is past the ignore slot, as in a walk, whatever the rules match.
+        let (is_directory, tracked) = if from.node.is_valid_or_root_node_id() {
+            let node = from.state.node(from.repository.clone(), from.node).await?;
+            let is_directory = node.is_directory();
+            let tracked = from
+                .state
+                .tracks_as(
+                    &from.repository,
+                    from.node,
+                    NodeFlags::from_bits_retain(node.flags),
+                    is_directory,
+                )
+                .await?;
+            (is_directory, tracked)
+        } else {
+            (true, false)
+        };
+        let mode = (base.filter_mode | FilterMode::KeepTracked).at(tracked);
+        let (states, excluded) =
+            filter.child_emit_excludes(parent_states, &path, is_directory, mode);
+        if excluded {
+            return Ok(None);
+        }
+        (from, mapping_at(&base.current, &path).await?, states)
+    };
+    Ok(Some(FilesystemDiffContext {
+        operation: base.operation.clone(),
+        from,
+        current,
+        filesystem_path: path,
+        states,
+        from_states: states,
+        named_path: None,
+        filter_mode: base.filter_mode,
+        intent: base.intent,
+        layer_mounts: base.layer_mounts.clone(),
+        link_mounts: base.link_mounts.clone(),
+        discards,
+    }))
+}
+
+/// What the tree `side` names holds at `path`, through any link on the way: an invalid node where
+/// it holds nothing there.
+async fn mapping_at(side: &NodeMapping, path: &RelativePath) -> Result<NodeMapping, StateError> {
+    let node_link = side
+        .state
+        .find_node_link(side.repository.clone(), path.as_str())
+        .await
+        .unwrap_or(NodeLink {
+            node: INVALID_NODE,
+            repository: side.repository.id,
+            revision: side.state.revision(),
+        });
+    let (repository, state) = node_link
+        .resolve(side.repository.clone(), side.state.clone())
+        .await?;
+    Ok(NodeMapping {
+        repository,
+        state,
+        path: path.clone(),
+        node: node_link.node,
+    })
 }
 
 /// Hands one diff to `operation`, which answers with the walk behind a stream.

@@ -967,12 +967,19 @@ async fn an_unlink_removes_a_read_only_junction_and_leaves_its_target_read_only(
 }
 
 /// Creates a junction at `link` to the directory `target`, which Windows does without a privilege.
+/// `mklink` takes neither a verbatim path nor a forward separator, so it is given neither.
 #[cfg(windows)]
-fn junction(link: &Path, target: &Path) {
+pub(crate) fn junction(link: &Path, target: &Path) {
+    let plain = |path: &Path| {
+        let text = path.to_string_lossy();
+        text.strip_prefix(r"\\?\")
+            .unwrap_or(&text)
+            .replace('/', "\\")
+    };
     let created = std::process::Command::new("cmd")
         .args(["/C", "mklink", "/J"])
-        .arg(link)
-        .arg(target)
+        .arg(plain(link))
+        .arg(plain(target))
         .output()
         .expect("run mklink");
     assert!(created.status.success(), "mklink /J failed: {created:?}");

@@ -1492,6 +1492,10 @@ async fn clone_into(
         lore_warn!("Failed to flush the cloned repository's stores: {err}");
     }
 
+    // The current anchor is stored whether or not the tree was written whole.
+    if materialize_result.is_err() {
+        operation.fail();
+    }
     let operation_result = operation
         .finalize()
         .await
@@ -1778,7 +1782,8 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
             ));
         }
     } else {
-        // Dependency discovery mode
+        // Dependency discovery mode, which leaves what lies outside the set absent.
+        ctx.operation.leaves_changes_unwritten();
         let tags: Arc<[String]> = options.dependency_tags.clone().into();
         let dep_ctx = Arc::new(DependencyDiscoverContext {
             tags,

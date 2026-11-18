@@ -449,6 +449,14 @@ pub(crate) async fn sync(
     if repository.file_system().holds_state() && !options.root_files.is_empty() {
         return Err(hold::refused("restrict a sync to a dependency set").into());
     }
+    if !options.root_files.is_empty() && !repository.file_system().supports_dependency_sync() {
+        return Err(InvalidArguments {
+            reason: "A sync restricted to a dependency set (--root-file) is not supported on an \
+                     SWFS-backed instance"
+                .into(),
+        }
+        .into());
+    }
     let repository_current = repository.clone();
     let (repository, view_file) = match sync_load_view(&options).await? {
         Some((view, view_file)) => (

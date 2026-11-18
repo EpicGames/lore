@@ -11069,9 +11069,7 @@ async fn located_after_a_settle_reads_the_new_address() {
                 ContentSource::Virtual(VirtualContent::Immutable { address, size }) => {
                     assert_eq!((address, size), (committed.address, 6));
                 }
-                other @ ContentSource::File(_) => {
-                    panic!("expected the committed address, got {other}")
-                }
+                other => panic!("expected the committed address, got {other}"),
             }
         })
         .await;

@@ -1,15 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::path::Path;
 use std::sync::Arc;
 
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Hash;
-use lore_revision::filter;
-use lore_revision::filter::Filter;
-use lore_revision::filter::FilterInstance;
-use lore_revision::filter::parse_filter;
 use lore_revision::fs::swfs::frozen_files::FrozenFile;
 use lore_revision::fs::swfs::frozen_files::moves_in;
 use lore_revision::fs::swfs::modified_tree::Change;
@@ -21,7 +16,9 @@ use lore_revision::node::NodeFlags;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
+use lore_revision::util::path::RelativePath;
 
+use super::listing_fixture::ignoring;
 use crate::fs::filesystem_provider::test_store_create;
 use crate::helper::default_repository_creation_args;
 
@@ -156,11 +153,6 @@ async fn the_record_starts_untrusted_and_trust_is_set_explicitly() {
         assert!(!tree.is_trusted());
     })
     .await;
-}
-
-fn ignoring(rules: &str) -> Arc<Filter> {
-    let ignore = parse_filter(rules.as_bytes(), Path::new(".loreignore")).expect("parsing rules");
-    Arc::new(filter::from_instances(ignore, FilterInstance::default()).expect("building filter"))
 }
 
 #[tokio::test]
@@ -340,6 +332,112 @@ async fn a_new_revision_empties_the_record_and_leaves_it_untrusted() {
         assert!(!tree.is_trusted());
         assert!(!tree.is_modified("a.txt").await.unwrap());
         assert!(sorted_paths(&tree).await.is_empty());
+    })
+    .await;
+}
+
+fn paths(names: &[&str]) -> Vec<RelativePath> {
+    names
+        .iter()
+        .map(|name| RelativePath::new_from_initial_path(name).expect("a relative path"))
+        .collect()
+}
+
+/// A thaw described from a new revision moves the record there rather than emptying it: what the
+/// thaw names it brings up to date, and nothing else of SWFS's list changes.
+#[tokio::test]
+async fn a_revision_a_thaw_describes_from_moves_the_record_rather_than_emptying_it() {
+    with_tree(async |tree| {
+        let first = Hash::from_u64(1);
+        let second = Hash::from_u64(2);
+        tree.observe_revision(first).await;
+        tree.set_trusted(true);
+        tree.record(Change::Written("a.txt".into())).await;
+
+        tree.begin_thaw();
+        tree.observe_revision(second).await;
+        tree.end_thaw(Some(&[])).await;
+
+        assert!(tree.is_trusted());
+        assert_eq!(tree.revision(), Some(second));
+        assert_eq!(sorted_paths(&tree).await, vec!["a.txt"]);
+    })
+    .await;
+}
+
+/// A file a thaw names takes the source's state and comes off SWFS's list, and so off the record.
+/// What it does not name stays.
+#[tokio::test]
+async fn a_thaw_drops_the_files_it_named_and_keeps_the_rest() {
+    with_tree(async |tree| {
+        tree.set_trusted(true);
+        tree.begin_freeze();
+        tree.record(Change::Written("dir/named.txt".into())).await;
+        tree.record(Change::Written("dir/kept.txt".into())).await;
+        // Recorded before the freeze, as a change the user made between operations is.
+        tree.end_thaw(Some(&[])).await;
+
+        tree.begin_freeze();
+        tree.begin_thaw();
+        tree.end_thaw(Some(&paths(&["dir/named.txt"]))).await;
+
+        assert!(tree.is_trusted());
+        assert_eq!(sorted_paths(&tree).await, vec!["dir/kept.txt"]);
+        assert!(!tree.is_modified("dir/named.txt").await.unwrap());
+    })
+    .await;
+}
+
+/// SWFS keeps the user's version of a name touched while frozen, so the thaw naming it leaves it
+/// on SWFS's list, and on the record.
+#[tokio::test]
+async fn a_path_recorded_while_frozen_is_kept_by_the_thaw_naming_it() {
+    with_tree(async |tree| {
+        tree.set_trusted(true);
+        tree.begin_freeze();
+        tree.record(Change::Written("touched.txt".into())).await;
+
+        tree.begin_thaw();
+        tree.end_thaw(Some(&paths(&["touched.txt"]))).await;
+
+        assert_eq!(sorted_paths(&tree).await, vec!["touched.txt"]);
+    })
+    .await;
+}
+
+/// A thaw that did not finish, or did not name all the operation wrote, leaves what SWFS lists
+/// unknown, so the record is emptied and left to be rebuilt.
+#[tokio::test]
+async fn a_thaw_not_applied_empties_the_record_and_leaves_it_untrusted() {
+    with_tree(async |tree| {
+        tree.set_trusted(true);
+        tree.record(Change::Written("a.txt".into())).await;
+
+        tree.begin_freeze();
+        tree.begin_thaw();
+        tree.end_thaw(None).await;
+
+        assert!(!tree.is_trusted());
+        assert!(sorted_paths(&tree).await.is_empty());
+    })
+    .await;
+}
+
+/// A thaw naming a path the record holds nothing of, such as a file the revision changed and the
+/// user did not, changes nothing of it.
+#[tokio::test]
+async fn a_thaw_naming_a_path_the_record_lacks_leaves_it_as_it_was() {
+    with_tree(async |tree| {
+        tree.set_trusted(true);
+        tree.record(Change::Written("a.txt".into())).await;
+
+        tree.begin_freeze();
+        tree.begin_thaw();
+        tree.end_thaw(Some(&paths(&["other.txt", "dir/deep.txt"])))
+            .await;
+
+        assert!(tree.is_trusted());
+        assert_eq!(sorted_paths(&tree).await, vec!["a.txt"]);
     })
     .await;
 }
@@ -726,7 +824,7 @@ fn moves_in_pairs_a_destination_with_the_deletion_that_shares_its_file_index() {
 }
 
 #[tokio::test]
-async fn a_rebuild_leaves_the_record_untrusted_for_a_rename_whose_origin_is_unknown() {
+async fn a_rebuild_records_a_rename_whose_origin_is_unknown_as_an_add_and_is_trusted() {
     with_tree(async |tree| {
         let trusted = tree
             .rebuild(
@@ -739,9 +837,10 @@ async fn a_rebuild_leaves_the_record_untrusted_for_a_rename_whose_origin_is_unkn
             .await
             .unwrap();
 
-        assert!(!trusted);
-        assert!(!tree.is_trusted());
-        // The destination is still recorded, so a diff that walks the tree finds it.
+        // SWFS leaves the origin out only while another node holds its path, which it lists for
+        // itself, so the record holds what is at both paths.
+        assert!(trusted);
+        assert!(tree.is_trusted());
         assert_eq!(
             tree.coverage("renamed2.txt").await.unwrap(),
             Coverage::Changed
@@ -765,13 +864,14 @@ async fn a_rename_a_rebuild_no_longer_finds_listed_is_forgotten() {
         .await;
         // A thaw named the destination, so SWFS lists nothing.
         assert!(tree.rebuild(&[], None).await.unwrap());
-        // Listed again later, as from a rename the record never heard of, it has no origin.
+        // Listed again later, as from a rename the record never heard of, it has no origin, and
+        // is recorded as an add.
         assert!(
-            !tree
-                .rebuild(&[listed(r"\b.txt", RENAMED, false)], None)
+            tree.rebuild(&[listed(r"\b.txt", RENAMED, false)], None)
                 .await
                 .unwrap()
         );
+        assert_eq!(tree.coverage("b.txt").await.unwrap(), Coverage::Changed);
     })
     .await;
 }

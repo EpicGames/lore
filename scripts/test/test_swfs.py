@@ -6,6 +6,7 @@ import typing
 import pytest
 from error_types import (
     ImproperArgumentsError,
+    LoreException,
     NotSupportedError,
     RepositoryAlreadyExistsError,
     SwfsOutsideServiceError,
@@ -17,9 +18,6 @@ from test_repository_info import get_instance_id
 from lore import Lore, external_root, per_url_store_path
 
 pytestmark = pytest.mark.own_vfs("makes its SWFS clones from ordinary repositories")
-
-# The most SWFS instances a service mounts, `MountManager::MOUNT_LIMIT`.
-SWFS_MOUNT_LIMIT = 8
 
 
 @pytest.mark.smoke
@@ -117,6 +115,93 @@ def _get_stores_size(stores_path: str) -> int:
 @pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
 @pytest.mark.swfs
 @pytest.mark.smoke
+def test_swfs_refuses_a_repository_nested_in_its_mount(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"a.txt": "a"})
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.make_dirs("nested")
+
+    # A repository with its own state inside the mount, unlike a link or a layer, which is the
+    # parent's own content.
+    with pytest.raises(ImproperArgumentsError):
+        swfs_repo.run(
+            ["repository", "create", "nested"],
+            path=os.path.join(swfs_repo.path, "nested"),
+            offline=True,
+        )
+    assert not swfs_repo.path_exists(os.path.join("nested", ".lore"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_instance_is_refused_inside_another_repository(
+    new_lore_repo, background_lore_service
+):
+    # A plain repository, named so even under --all-swfs: the parent's own SWFS mount would be
+    # refused for the other reason.
+    parent = new_lore_repo(
+        create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
+    )
+    parent.repository_create(vfs="none")
+    parent.write_commit_push("first", {"a.txt": "a"})
+    parent.shared_store_create(parent.remote)
+
+    with pytest.raises(ImproperArgumentsError):
+        parent.clone(
+            os.path.join(parent.path, "inner"), vfs="swfs", use_shared_store=True
+        )
+
+
+# The most SWFS instances a service mounts, `MountManager::MOUNT_LIMIT`.
+SWFS_MOUNT_LIMIT = 8
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_refuses_an_instance_past_the_mount_limit(
+    new_lore_repo, background_lore_service, global_dir_name
+):
+    """SWFS attaches about eight mounts and parks the process that asks for one more, so the
+    service refuses another SWFS instance, cloned or created, once it mounts that many, before
+    any of the instance is made."""
+    # A plain repository, named so even under --all-swfs, so that only the clones count.
+    source = new_lore_repo(
+        create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
+    )
+    source.repository_create(vfs="none")
+    source.write_commit_push("first", {"a.txt": "a"})
+    source.shared_store_create(source.remote)
+
+    instances = [
+        source.clone(vfs="swfs", use_shared_store=True) for _ in range(SWFS_MOUNT_LIMIT)
+    ]
+    external = external_root(global_dir_name)
+    assert len(os.listdir(external)) == SWFS_MOUNT_LIMIT
+
+    with pytest.raises(NotSupportedError):
+        source.clone(vfs="swfs", use_shared_store=True)
+    creator = new_lore_repo(
+        create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
+    )
+    with pytest.raises(NotSupportedError):
+        creator.repository_create(vfs="swfs", use_shared_store=True)
+    assert len(os.listdir(external)) == SWFS_MOUNT_LIMIT, (
+        "a refused instance must leave nothing behind"
+    )
+
+    # The mounted instances still work, and a plain clone is not limited.
+    for repo in (instances[-1], source.clone(vfs="none")):
+        with repo.open_file("a.txt") as f:
+            assert f.read() == "a"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
 def test_caches_file_contents(new_lore_repo, background_lore_service, scratch_dir):
     # Create a repo to clone
     original_repo: Lore = new_lore_repo(
@@ -135,7 +220,9 @@ def test_caches_file_contents(new_lore_repo, background_lore_service, scratch_di
     # Create both SWFS and non-SWFS cloned repos and ensure the shared store is larger than the non-SWFS repo's store.
     # This validates that it correctly cached file contents locally.
     swfs_repo = original_repo.clone(vfs="swfs", use_shared_store=True)
-    regular_repo = original_repo.clone()
+    # Named, so a run that mounts every repository through SWFS still compares against one it
+    # does not.
+    regular_repo = original_repo.clone(vfs="none")
 
     swfs_size = _get_stores_size(shared_store_path)
     regular_size = _get_stores_size(os.path.join(regular_repo.path, ".lore"))
@@ -336,6 +423,61 @@ def test_swfs_sync(new_lore_repo, background_lore_service):
     assert not swfs_repo.file_exists(nested_deleted_file)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_sync_shrinks_a_file_never_listed(new_lore_repo, background_lore_service):
+    """A sync that shrinks a file the SWFS instance has never listed or read gives it the new
+    content alone. The clone's thaw made SWFS an entry for the file at its long size, and SWFS
+    kept that size through the sync's thaw unless its directory was listed between them, so the
+    file read as the new content padded with NUL bytes."""
+    # A plain repository, named so even under --all-swfs.
+    source = new_lore_repo(
+        create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
+    )
+    source.repository_create(vfs="none")
+    long_contents = b"a source file that is longer than what replaces it\n"
+    source.write_commit_push(
+        "first", {"src/main.rs": long_contents, "top.txt": long_contents}
+    )
+    clone = _swfs_clone(source)
+
+    shrunk = {"src/main.rs": b"main v2\n", "top.txt": b"top v2\n"}
+    source.write_commit_push("shrink", shrunk)
+    clone.sync()
+
+    for name, contents in shrunk.items():
+        with clone.open_file(name, "rb") as f:
+            assert f.read() == contents, f"{name} read with the old size"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_forced_switch_after_a_commit_keeps_the_working_tree(
+    new_lore_repo, background_lore_service
+):
+    """A forced switch with reset, after a commit, leaves the working tree where it is. The
+    commit left the modified-file record to be rebuilt from SWFS's list, and the frozen files SWFS
+    lists include the root: kept as a child of itself, it read as a file at the root's path, which
+    the reset then removed, leaving the mount with no root."""
+    repo: Lore = new_lore_repo(
+        create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
+    )
+    repo.shared_store_create(repo.remote)
+    repo.repository_create(vfs="swfs", use_shared_store=True)
+    repo.write_commit_push("main file", {"f.txt": b"main\n"})
+    repo.branch_create("other")
+    repo.write_commit_push("other file", {"f.txt": b"other\n"})
+
+    repo.branch_switch("main", force=True, reset=True)
+
+    with repo.open_file("f.txt", "rb") as f:
+        assert f.read() == b"main\n"
+    repo.write_files({"after.txt": b"written after the switch\n"})
+    assert sorted(os.listdir(repo.path)) == ["after.txt", "f.txt"]
+
+
 def _swfs_create(new_lore_repo) -> Lore:
     """An SWFS instance made by `lore repository create` over a shared store, in the service."""
     repo: Lore = new_lore_repo(
@@ -432,7 +574,7 @@ def test_swfs_sync_force_clears_local_writes(new_lore_repo, background_lore_serv
         "unchanged.txt": "locally written unchanged, longer than the original",
         "nested/unchanged.txt": "local",
     }
-    swfs_repo.write_files(local_contents, flush_writes=True)
+    swfs_repo.write_files(local_contents)
     for file_name in local_contents:
         assert not original_repo.compare_file(
             swfs_repo, file_name, only_file_contents=True
@@ -491,84 +633,896 @@ def test_swfs_sync_force_removes_locally_written_file(
 @pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
 @pytest.mark.swfs
 @pytest.mark.smoke
-def test_swfs_refuses_a_repository_nested_in_its_mount(
+def test_swfs_scan_reports_changes_found_through_the_modified_record(
     new_lore_repo, background_lore_service
 ):
     original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
-    original_repo.write_commit_push("first", {"a.txt": "a"})
+    original_repo.write_commit_push(
+        "first",
+        {f"f{i}.txt": f"contents {i}" for i in range(4)}
+        | {f"nested/n{i}.txt": f"nested {i}" for i in range(4)},
+    )
     swfs_repo = _swfs_clone(original_repo)
-    swfs_repo.make_dirs("nested")
 
-    # A repository with its own state inside the mount, unlike a link or a layer, which is the
-    # parent's own content.
-    with pytest.raises(ImproperArgumentsError):
-        swfs_repo.run(
-            ["repository", "create", "nested"],
-            path=os.path.join(swfs_repo.path, "nested"),
-            offline=True,
-        )
-    assert not swfs_repo.path_exists(os.path.join("nested", ".lore"))
+    # The first scan walks the whole tree to learn what the record holds, and finds it clean.
+    assert "A " not in swfs_repo.status(scan=True)
+
+    swfs_repo.write_files(
+        {
+            "f0.txt": "edited",
+            "added.txt": "new",
+            "newdir/inside.txt": "new in a new directory",
+        }
+    )
+    swfs_repo.remove_file("nested/n1.txt")
+    changes = swfs_repo.status(scan=True)
+
+    assert "M f0.txt" in changes
+    assert "D nested/n1.txt" in changes
+    assert "A added.txt" in changes
+    assert "A newdir/inside.txt" in changes
+    assert "f1.txt" not in changes
+    assert "nested/n0.txt" not in changes
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
 @pytest.mark.swfs
 @pytest.mark.smoke
-def test_swfs_instance_is_refused_inside_another_repository(
+def test_swfs_a_later_scan_keeps_the_changes_an_earlier_scan_found(
     new_lore_repo, background_lore_service
 ):
-    # A plain repository, named so even under --all-swfs: the parent's own SWFS mount would be
-    # refused for the other reason.
-    parent = new_lore_repo(
-        create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first", {f"f{i}.txt": f"contents {i}" for i in range(4)}
     )
-    parent.repository_create(vfs="none")
-    parent.write_commit_push("first", {"a.txt": "a"})
-    parent.shared_store_create(parent.remote)
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.status(scan=True)
+    swfs_repo.write_files({"f0.txt": "edited"})
+    assert "M f0.txt" in swfs_repo.status(scan=True)
 
-    with pytest.raises(ImproperArgumentsError):
-        parent.clone(
-            os.path.join(parent.path, "inner"), vfs="swfs", use_shared_store=True
-        )
+    # A later change joins what the record already holds.
+    swfs_repo.write_files({"f2.txt": "edited later"})
+    changes = swfs_repo.status(scan=True)
+
+    assert "M f2.txt" in changes
+    assert "M f0.txt" in changes
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
 @pytest.mark.swfs
 @pytest.mark.smoke
-def test_swfs_refuses_an_instance_past_the_mount_limit(
-    new_lore_repo, background_lore_service, global_dir_name
+def test_swfs_scan_after_a_service_restart_still_reports_earlier_changes(
+    new_lore_repo, lore_service_runner
 ):
-    """SWFS attaches about eight mounts and parks the process that asks for one more, so the
-    service refuses another SWFS instance, cloned or created, once it mounts that many, before
-    any of the instance is made."""
-    # A plain repository, named so even under --all-swfs, so that only the clones count.
-    source = new_lore_repo(
-        create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
+    lore_service_runner.start()
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first", {f"f{i}.txt": f"contents {i}" for i in range(4)}
     )
-    source.repository_create(vfs="none")
-    source.write_commit_push("first", {"a.txt": "a"})
-    source.shared_store_create(source.remote)
+    swfs_repo = _swfs_clone(original_repo)
 
-    instances = [
-        source.clone(vfs="swfs", use_shared_store=True) for _ in range(SWFS_MOUNT_LIMIT)
-    ]
-    external = external_root(global_dir_name)
-    assert len(os.listdir(external)) == SWFS_MOUNT_LIMIT
+    swfs_repo.status(scan=True)
+    swfs_repo.write_files({"f0.txt": "edited", "added.txt": "new"})
+    swfs_repo.remove_file("f1.txt")
+    before = swfs_repo.status(scan=True)
+    assert "M f0.txt" in before
 
-    with pytest.raises(NotSupportedError):
-        source.clone(vfs="swfs", use_shared_store=True)
-    creator = new_lore_repo(
-        create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
+    # SWFS keeps the changes across a restart, and its list of them, which the first operation
+    # rebuilds the record from.
+    lore_service_runner.terminate()
+    lore_service_runner.start()
+    after = swfs_repo.status(scan=True)
+
+    assert "M f0.txt" in after
+    assert "D f1.txt" in after
+    assert "A added.txt" in after
+    assert "f2.txt" not in after
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_scan_skips_paths_the_ignore_rules_exclude(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first", {".loreignore": "build/\n*.tmp\n", "f0.txt": "contents"}
     )
-    with pytest.raises(NotSupportedError):
-        creator.repository_create(vfs="swfs", use_shared_store=True)
-    assert len(os.listdir(external)) == SWFS_MOUNT_LIMIT, (
-        "a refused instance must leave nothing behind"
-    )
+    swfs_repo = _swfs_clone(original_repo)
 
-    # The mounted instances still work, and a plain clone is not limited.
-    for repo in (instances[-1], source.clone(vfs="none")):
-        with repo.open_file("a.txt") as f:
-            assert f.read() == "a"
+    swfs_repo.status(scan=True)
+    swfs_repo.write_files(
+        {
+            "build/out.bin": "ignored",
+            "scratch.tmp": "ignored",
+            "kept.txt": "reported",
+        },
+    )
+    changes = swfs_repo.status(scan=True)
+
+    assert "A kept.txt" in changes
+    assert "build" not in changes
+    assert "scratch.tmp" not in changes
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_scan_after_a_sync_reports_the_changes_the_sync_did_not_replace(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    files = {f"f{i}.txt": f"contents {i}" for i in range(4)}
+    original_repo.write_commit_push("first", files)
+    original_repo.write_commit_push("second", {"f1.txt": "second contents"})
+    swfs_repo = _swfs_clone(original_repo)
+
+    swfs_repo.status(scan=True)
+    # No scan between this edit and the sync: a sync of an SWFS instance whose staged state holds
+    # dirty paths fails to freeze a second time, which is not what this test is about.
+    swfs_repo.write_files({"f0.txt": "edited before the sync"})
+
+    swfs_repo.sync("main@1", force=True)
+    after_sync = swfs_repo.status(scan=True)
+    # The sync rewrites only the file the two revisions differ in, so the local edit to another
+    # stays a change, and the rewritten file is a change from nothing.
+    assert "M f0.txt" in after_sync
+    assert "f1.txt" not in after_sync
+
+    swfs_repo.write_files({"f2.txt": "edited after the sync"})
+    after_edit = swfs_repo.status(scan=True)
+    assert "M f2.txt" in after_edit
+    assert "M f0.txt" in after_edit
+    assert "f1.txt" not in after_edit
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_stage_after_a_scan_stages_what_the_scan_found(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first",
+        {
+            "f0.txt": "contents 0",
+            "f1.txt": "contents 1",
+            "gone/inside.txt": "inside",
+            "kept.txt": "kept",
+        },
+    )
+    swfs_repo = _swfs_clone(original_repo)
+
+    swfs_repo.write_files(
+        {
+            "f0.txt": "edited",
+            "added.txt": "new",
+            "newdir/inside.txt": "new in a new directory",
+        }
+    )
+    swfs_repo.remove_file("f1.txt")
+    swfs_repo.remove_file("gone/inside.txt")
+    swfs_repo.remove_dir("gone")
+    swfs_repo.status(scan=True)
+
+    # Without --scan, stage takes the paths the scan marked, and asks the provider about each.
+    swfs_repo.stage(".")
+    staged = swfs_repo.status()
+
+    assert "M f0.txt" in staged
+    assert "D f1.txt" in staged
+    assert "A added.txt" in staged
+    assert "A newdir/inside.txt" in staged
+    assert "D gone/" in staged
+    assert "kept.txt" not in staged
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_stage_with_a_scan_stages_what_it_finds(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first",
+        {"f0.txt": "contents 0", "f1.txt": "contents 1", "kept.txt": "kept"},
+    )
+    swfs_repo = _swfs_clone(original_repo)
+
+    swfs_repo.write_files({"f0.txt": "edited", "added.txt": "new"})
+    swfs_repo.remove_file("f1.txt")
+    swfs_repo.stage(".", scan=True)
+    staged = swfs_repo.status()
+
+    assert "M f0.txt" in staged
+    assert "D f1.txt" in staged
+    assert "A added.txt" in staged
+    assert "kept.txt" not in staged
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_staging_a_file_it_cannot_describe_never_stages_its_deletion(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first", {"f0.txt": "contents 0", "f1.txt": "contents 1"}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.status(scan=True)
+    swfs_repo.write_files({"f0.txt": "edited"})
+    swfs_repo.status(scan=True)
+
+    # SWFS froze f0.txt for the scan above and not for this operation, so it cannot be described.
+    # That may fail the stage; it must not stage the file as deleted.
+    try:
+        swfs_repo.stage(".")
+    except Exception:  # noqa: BLE001 - the failure is the expected outcome
+        pass
+    staged = swfs_repo.status()
+
+    assert "D f0.txt" not in staged, staged
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_commands_never_report_a_path_they_cannot_describe_as_absent(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"f0.txt": "contents 0"})
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.status(scan=True)
+    swfs_repo.write_files({"new.txt": "added"})
+    swfs_repo.status(scan=True)
+
+    # new.txt was added before the last thaw, so SWFS froze nothing to describe it from. A command
+    # may fail for that; one that succeeds must not have dropped the path or called it deleted.
+    for command in (
+        lambda: swfs_repo.status(path="new.txt", scan=True),
+        lambda: swfs_repo.file_info("new.txt"),
+    ):
+        try:
+            output = str(command())
+        except Exception:  # noqa: BLE001 - the failure is an acceptable outcome
+            continue
+        assert "new.txt" in output, output
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_sync_after_a_scan_carries_the_dirty_paths_forward(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    files = {f"f{i}.txt": f"contents {i}" for i in range(4)}
+    original_repo.write_commit_push("first", files)
+    original_repo.write_commit_push("second", {"f1.txt": "second contents"})
+    swfs_repo = _swfs_clone(original_repo)
+
+    swfs_repo.write_files({"f0.txt": "edited before the sync", "added.txt": "new"})
+    # The scan leaves dirty paths in the staged state, which the sync then rebases onto the
+    # revision it moves to, from inside its own filesystem operation.
+    assert "M f0.txt" in swfs_repo.status(scan=True)
+
+    swfs_repo.sync("main@1", force=True)
+    after_sync = swfs_repo.status(scan=True)
+
+    assert "M f0.txt" in after_sync
+    assert "A added.txt" in after_sync
+    assert "f1.txt" not in after_sync
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_sync_keeping_a_local_deletion_leaves_the_file_deleted(
+    new_lore_repo, background_lore_service
+):
+    """A sync that keeps a file the user deleted leaves it deleted. Moving to the revision empties
+    the modified-file record, which then rebuilds from SWFS's list before the operation keeps what
+    it left unwritten: SWFS freezes no deleted file, so an empty record took the deletion for no
+    change and wrote the old content back."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"a.txt": "a1", "b.txt": "b1"})
+    original_repo.write_commit_push("second", {"a.txt": "a2", "b.txt": "b2"})
+    swfs_repo = _swfs_clone(original_repo)
+
+    swfs_repo.remove_file("b.txt")
+    assert "D b.txt" in swfs_repo.status(scan=True)
+
+    swfs_repo.sync("main@1", forward_changes=True)
+
+    assert not swfs_repo.file_exists("b.txt")
+    after_sync = swfs_repo.status(scan=True)
+    assert "D b.txt" in after_sync
+    assert "M b.txt" not in after_sync
+    with swfs_repo.open_file("a.txt", "r") as file:
+        assert file.read() == "a1"
+
+
+# An operation logs how many times SWFS called back into Lore, at debug level when it finishes.
+_CALLBACKS = re.compile(r"read_file callbacks \+(\d+), directory evaluations \+(\d+)")
+
+
+def _callbacks(output) -> tuple[int, int]:
+    """The `read_file` and directory-evaluation callbacks SWFS made during a command, summed over
+    the operations it ran, as the command's debug output reports them."""
+    reads = evaluations = 0
+    for match in _CALLBACKS.finditer(str(output)):
+        reads += int(match.group(1))
+        evaluations += int(match.group(2))
+    return reads, evaluations
+
+
+# And how many files SWFS held changed when it began, as it froze them.
+_FROZEN = re.compile(r"(\d+) files frozen")
+
+
+def _frozen_files(output) -> list[int]:
+    """How many files SWFS held changed as each operation of a command began, in the order the
+    operations ran, as the command's debug output reports them."""
+    return [int(match.group(1)) for match in _FROZEN.finditer(str(output))]
+
+
+# And how many paths its thaw described to SWFS.
+_DESCRIBED = re.compile(r"(\d+) paths described")
+
+
+def _described(output) -> list[int]:
+    """How many paths each operation of a command described to SWFS when it thawed, in the order
+    the operations ran, as the command's debug output reports them."""
+    return [int(match.group(1)) for match in _DESCRIBED.finditer(str(output))]
+
+
+# How many files a scan read to compare, as its summary reports.
+_HASH_CHECKS = re.compile(r"(\d+) hash checks")
+
+
+def _hash_checks(output) -> int:
+    """How many files the scans of a command read to compare, as its debug output reports."""
+    return sum(int(match.group(1)) for match in _HASH_CHECKS.finditer(str(output)))
+
+
+# What an operation logs where it rebuilds the modified-file record from SWFS's list.
+_REBUILT = "SWFS rebuilds the modified-file record"
+
+# A build without test-util has no fallback, and reports none.
+_ANSWERED = re.compile(
+    r"(\d+) reads answered without the mount(?:, (\d+) fell back to the mount)?"
+)
+
+
+def _answered(output) -> tuple[int, int]:
+    """The reads a command's operations answered without the mount, and the reads that fell back
+    to it, summed over the operations it ran."""
+    answered = fell_back = 0
+    for match in _ANSWERED.finditer(str(output)):
+        answered += int(match.group(1))
+        fell_back += int(match.group(2) or 0)
+    return answered, fell_back
+
+
+def _hash_of(output) -> str:
+    return re.search(r"[0-9a-f]{16,}", str(output)).group(0)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_hashing_an_unmodified_file_reads_it_from_the_store_not_the_mount(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first", {f"f{i}.txt": f"contents of file {i}" for i in range(4)}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.status(scan=True)
+
+    hashed = swfs_repo.file_hash("f1.txt", level="debug")
+
+    reads, _ = _callbacks(hashed)
+    assert reads == 0, f"SWFS fetched content {reads} times: {hashed}"
+    assert _hash_of(hashed) == _hash_of(original_repo.file_hash("f1.txt"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_scan_stage_and_commit_make_swfs_fetch_nothing_for_unchanged_files(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first", {f"f{i}.txt": f"contents of file {i}" for i in range(6)}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.status(scan=True)
+
+    swfs_repo.write_files({"f0.txt": "edited"})
+    scanned = swfs_repo.status(scan=True, level="debug")
+    swfs_repo.stage(".")
+    committed = swfs_repo.commit(message="edit one file", level="debug")
+
+    for command, output in (("status --scan", scanned), ("commit", committed)):
+        reads, _ = _callbacks(output)
+        assert reads == 0, f"{command} made SWFS fetch {reads} files: {output}"
+    assert "M f0.txt" in scanned
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_commit_brings_the_record_up_to_date_rather_than_rebuilding_it(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first", {f"f{i}.txt": f"contents of file {i}" for i in range(4)}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.status(scan=True)
+
+    swfs_repo.write_files({"f0.txt": "committed edit", "f1.txt": "edit left alone"})
+    swfs_repo.stage("f0.txt")
+    swfs_repo.commit(message="commit one edit")
+    scanned = swfs_repo.status(scan=True, level="debug")
+
+    # The commit's thaw took f0.txt off SWFS's list, and the record with it, so the scan after it
+    # answers from the record as it stands.
+    assert _REBUILT not in str(scanned), scanned
+    assert "M f1.txt" in scanned, scanned
+    assert "M f0.txt" not in scanned, scanned
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_the_users_own_ignore_rules_decide_what_a_scan_reports(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first", {".loreignore": "*.tmp\n", "f0.txt": "contents"}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.status(scan=True)
+
+    # As a plain instance's scan reads the rules from disk, the user's edit decides: `*.tmp` is
+    # no longer ignored, and `*.log` is.
+    swfs_repo.write_files(
+        {".loreignore": "*.log\n", "notes.tmp": "kept", "trace.log": "ignored"}
+    )
+    scanned = swfs_repo.status(scan=True)
+
+    assert "notes.tmp" in scanned, scanned
+    assert "trace.log" not in scanned, scanned
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_sync_keeps_the_users_file_where_the_revision_adds_a_directory(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"other.txt": "other\n"})
+    swfs_repo = _swfs_clone(original_repo)
+    original_repo.write_commit_push("x becomes a directory", {"x/inner.txt": "inner\n"})
+
+    # As on a plain instance, where no directory is made over a file, the sync fails rather than
+    # replace the user's file.
+    swfs_repo.write_files({"x": "user file\n"})
+    with pytest.raises(LoreException):
+        swfs_repo.sync()
+
+    with open(os.path.join(swfs_repo.path, "x")) as held:
+        assert held.read() == "user file\n"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_stage_with_a_scan_and_commit_make_swfs_fetch_nothing_for_unchanged_files(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first", {f"f{i}.txt": f"contents of file {i}" for i in range(6)}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.status(scan=True)
+
+    swfs_repo.write_files({"f0.txt": "edited"})
+    staged = swfs_repo.stage(".", scan=True, level="debug")
+    committed = swfs_repo.commit(message="edit one file", level="debug")
+
+    for command, output in (("stage --scan", staged), ("commit", committed)):
+        reads, _ = _callbacks(output)
+        assert reads == 0, f"{command} made SWFS fetch {reads} files: {output}"
+    # The commit holds the edit, not the removal of the file.
+    changes = swfs_repo.revision_diff("main@1", target="main@2")
+    assert "M f0.txt" in changes, changes
+    assert "D f0.txt" not in changes, changes
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_hashing_a_file_changed_since_the_last_thaw_reads_the_frozen_snapshot(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"f0.txt": "original", "f1.txt": "other"})
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.status(scan=True)
+
+    # Written after the last thaw, so SWFS freezes it with the next operation.
+    swfs_repo.write_files({"f0.txt": "changed since the last thaw"})
+    hashed = swfs_repo.file_hash("f0.txt", level="debug")
+
+    answered, fell_back = _answered(hashed)
+    assert fell_back == 0 and answered > 0, hashed
+    expected = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    expected.write_commit_push(
+        "same content", {"f0.txt": "changed since the last thaw"}
+    )
+    assert _hash_of(hashed) == _hash_of(expected.file_hash("f0.txt"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_hashing_a_large_changed_file_reads_it_a_window_at_a_time_from_the_frozen_snapshot(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"big.bin": b"original"})
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.status(scan=True)
+
+    # SWFS is read for a frozen file a range at a time, so however large the file is, Lore holds
+    # no more of it at once than the window it hashes.
+    large = bytes(i % 251 for i in range(48 * 1024 * 1024))
+    swfs_repo.write_files({"big.bin": large})
+    hashed = swfs_repo.file_hash("big.bin", level="debug")
+
+    answered, fell_back = _answered(hashed)
+    assert fell_back == 0 and answered > 0, hashed
+    expected = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    expected.write_commit_push("same content", {"big.bin": large})
+    assert _hash_of(hashed) == _hash_of(expected.file_hash("big.bin"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_hashing_an_ignored_file_reads_it_from_the_frozen_snapshot(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first", {".loreignore": "*.tmp\n", "f0.txt": "contents"}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.status(scan=True)
+
+    # The record drops ignored paths and the revision does not hold the file, but SWFS froze it.
+    swfs_repo.write_files({"scratch.tmp": "ignored contents"})
+    hashed = swfs_repo.file_hash("scratch.tmp", level="debug")
+
+    _, fell_back = _answered(hashed)
+    assert fell_back == 0, hashed
+    expected = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    expected.write_commit_push("same content", {"scratch.tmp": "ignored contents"})
+    assert _hash_of(hashed) == _hash_of(expected.file_hash("scratch.tmp"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_conflicting_merge_leaves_its_copies_and_reads_nothing_through_the_mount(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    base = ["One line\n", "Another line\n", "Third line\n"]
+    original_repo.write_commit_push("base", {"text.txt": base})
+    original_repo.branch_create("theirs")
+    original_repo.write_commit_push("theirs", {"text.txt": base + ["Fourth line\n"]})
+    original_repo.branch_switch("main")
+    original_repo.write_commit_push(
+        "mine", {"text.txt": base + ["Fourth conflicting line\n"]}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+
+    merged = swfs_repo.branch_merge("theirs", level="debug")
+
+    for suffix in ("~mine", "~theirs", "~base"):
+        assert swfs_repo.file_exists("text.txt" + suffix), suffix
+    # The base and theirs copies are written from the store and read straight back, which the
+    # operation answers itself rather than from the mount, where they do not exist yet.
+    assert "Failed to read a side of the merge" not in merged, merged
+    _, fell_back = _answered(merged)
+    assert fell_back == 0, merged
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_conflicting_merge_writes_conflict_markers_to_the_file(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    base = ["One line\n", "Another line\n", "Third line\n"]
+    original_repo.write_commit_push("base", {"text.txt": base})
+    original_repo.branch_create("theirs")
+    original_repo.write_commit_push("theirs", {"text.txt": base + ["Fourth line\n"]})
+    original_repo.branch_switch("main")
+    original_repo.write_commit_push(
+        "mine", {"text.txt": base + ["Fourth conflicting line\n"]}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+
+    swfs_repo.branch_merge("theirs")
+
+    with swfs_repo.open_file("text.txt") as merged_file:
+        assert "<<<<<<<" in merged_file.read()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_revert_result_is_read_by_the_later_operations_that_commit_it(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"text.txt": "first version\n"})
+    original_repo.write_commit_push("second", {"text.txt": "second version\n"})
+    reverted = original_repo.revision_history(1)[0].signature
+    swfs_repo = _swfs_clone(original_repo)
+
+    # The revert writes its result to the mount as its operation finalizes; the scan and the
+    # commit each read it in a later operation, after the thaws between.
+    swfs_repo.revision_revert(reverted, no_commit=True)
+    assert swfs_repo.read_files()["text.txt"] == "first version\n"
+    swfs_repo.status(scan=True)
+    swfs_repo.commit("Revert the second version")
+    swfs_repo.push()
+
+    original_repo.sync()
+    assert original_repo.read_files()["text.txt"] == "first version\n"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_clean_text_merge_keeps_the_changes_of_both_sides(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    base = ["One line\n", "Another line\n", "Third line\n"]
+    original_repo.write_commit_push("base", {"text.txt": base})
+    original_repo.branch_create("theirs")
+    original_repo.write_commit_push(
+        "theirs", {"text.txt": ["First line\n", "Another line\n", "Third line\n"]}
+    )
+    original_repo.branch_switch("main")
+    original_repo.write_commit_push("mine", {"text.txt": base + ["Fourth line\n"]})
+    swfs_repo = _swfs_clone(original_repo)
+
+    merged = swfs_repo.branch_merge("theirs")
+
+    assert "Merge as text failed" not in merged, merged
+    with swfs_repo.open_file("text.txt") as merged_file:
+        assert merged_file.read() == (
+            "First line\nAnother line\nThird line\nFourth line\n"
+        )
+    for suffix in ("~mine", "~theirs", "~base"):
+        assert not swfs_repo.file_exists("text.txt" + suffix), suffix
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_files_a_merge_writes_and_removes_in_one_operation_leave_nothing(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    base = ["One line\n", "Another line\n", "Third line\n"]
+    original_repo.write_commit_push("base", {"text.txt": base})
+    original_repo.branch_create("theirs")
+    original_repo.write_commit_push(
+        "theirs", {"text.txt": ["First line\n", "Another line\n", "Third line\n"]}
+    )
+    original_repo.branch_switch("main")
+    original_repo.write_commit_push("mine", {"text.txt": base + ["Fourth line\n"]})
+    swfs_repo = _swfs_clone(original_repo)
+
+    # A clean text merge writes the base, theirs and mine copies, reads them to merge, and removes
+    # them again, all in the one operation. Thaw is told only of what the revision holds, so it
+    # describes none of them: SWFS makes an empty file of a path it is told holds nothing.
+    swfs_repo.branch_merge("theirs")
+    suffixes = ("~mine", "~theirs", "~base")
+    assert not [s for s in suffixes if swfs_repo.file_exists("text.txt" + s)]
+
+    # A later operation does not bring them back, or report them.
+    after = swfs_repo.status(scan=True)
+    assert not [s for s in suffixes if swfs_repo.file_exists("text.txt" + s)]
+    assert not [s for s in suffixes if s in after], after
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_merge_with_no_base_leaves_an_empty_base_copy(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("base", {"keep.txt": "kept\n"})
+    original_repo.branch_create("theirs")
+    original_repo.write_commit_push("theirs", {"new.txt": "from theirs\n"})
+    original_repo.branch_switch("main")
+    original_repo.write_commit_push("mine", {"new.txt": "from mine\n"})
+    swfs_repo = _swfs_clone(original_repo)
+
+    swfs_repo.branch_merge("theirs")
+
+    # Both sides added the file, so the revision holds no base for it: the base copy is empty.
+    assert swfs_repo.file_exists("new.txt~base")
+    with swfs_repo.open_file("new.txt~base") as base_file:
+        assert base_file.read() == ""
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_stage_lists_directories_from_the_revision_and_the_changes(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first",
+        {
+            "d0/a.txt": "a",
+            "d0/c.txt": "c",
+            "d1/b.txt": "b",
+            "d2/keep.txt": "keep",
+            "d2/deep/inner.txt": "inner",
+        },
+    )
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.status(scan=True)
+
+    swfs_repo.write_files(
+        {"d0/a.txt": "a, edited", "d2/new.txt": "new", "d3/x.txt": "in a new directory"}
+    )
+    swfs_repo.remove_file("d1/b.txt")
+    swfs_repo.move("d0/c.txt", "d0/renamed.txt")
+
+    staged = swfs_repo.stage(".", scan=True, level="debug")
+    answered, _ = _answered(staged)
+    status = swfs_repo.status()
+
+    assert answered > 0, staged
+    assert "M d0/a.txt" in status
+    assert "D d1/b.txt" in status
+    assert "A d2/new.txt" in status
+    assert "A d3/x.txt" in status
+    assert "d0/renamed.txt" in status
+    assert "d0/c.txt" in status
+    assert "keep.txt" not in status
+    assert "inner.txt" not in status
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_new_instance_is_scanned_through_the_view_without_a_walk(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first",
+        {f"d{d}/f{i}.txt": f"contents {d} {i}" for d in range(3) for i in range(3)},
+    )
+    swfs_repo = _swfs_clone(original_repo)
+
+    # Nothing has written to an instance just created, so its record holds every change there is
+    # and the first scan has no walk to make.
+    first = swfs_repo.status(scan=True, level="debug")
+    _, fell_back = _answered(first)
+    assert fell_back == 0, first
+    assert _callbacks(first) == (0, 0), first
+
+    swfs_repo.write_files({"d1/f1.txt": "edited"})
+    scanned = swfs_repo.status(scan=True, level="debug")
+
+    answered, fell_back = _answered(scanned)
+    assert "M d1/f1.txt" in scanned, scanned
+    assert fell_back == 0 and answered > 0, scanned
+    assert _callbacks(scanned) == (0, 0), scanned
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_the_first_scan_after_a_restart_answers_from_swfs_own_list(
+    new_lore_repo, lore_service_runner
+):
+    lore_service_runner.start()
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first", {f"d{d}/f0.txt": f"contents {d}" for d in range(3)}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+    # A deleted file is the one change a scan reads no content for, so SWFS's lack of a frozen
+    # file for an earlier change does not reach it.
+    swfs_repo.remove_file("d1/f0.txt")
+    swfs_repo.status(scan=True)
+
+    lore_service_runner.terminate()
+    lore_service_runner.start()
+    first = swfs_repo.status(scan=True, level="debug")
+
+    # SWFS keeps its list of what it holds modified across a restart, so the first operation
+    # rebuilds the record from it rather than walking the tree to learn what differs.
+    _, fell_back = _answered(first)
+    assert fell_back == 0, first
+    assert _callbacks(first) == (0, 0), first
+    assert "D d1/f0.txt" in first, first
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_rename_from_before_a_restart_is_still_found(
+    new_lore_repo, lore_service_runner
+):
+    """SWFS lists a renamed file by its new name and its origin as a deletion with the same
+    `file_index`, so after a restart the record pairs them and finds both sides of the rename
+    without walking the tree."""
+    lore_service_runner.start()
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"f0.txt": "contents", "f1.txt": "other"})
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.move("f0.txt", "renamed.txt")
+    swfs_repo.status(scan=True)
+
+    lore_service_runner.terminate()
+    lore_service_runner.start()
+    after = swfs_repo.status(scan=True)
+
+    assert (
+        "D f0.txt" in after or "R f0.txt" in after or "f0.txt -> renamed.txt" in after
+    ), after
+    assert "renamed.txt" in after, after
+    assert "f1.txt" not in after, after
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_file_changed_in_an_earlier_operation_is_still_read_from_the_snapshot(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"f0.txt": "original", "f1.txt": "other"})
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.write_files({"f0.txt": "changed before an earlier operation"})
+    swfs_repo.status(scan=True)
+
+    hashed = swfs_repo.file_hash("f0.txt", level="debug")
+
+    answered, fell_back = _answered(hashed)
+    assert fell_back == 0 and answered > 0, hashed
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
@@ -594,6 +1548,199 @@ def test_swfs_commands_in_succession_each_freeze_and_thaw(
 @pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
 @pytest.mark.swfs
 @pytest.mark.smoke
+def test_swfs_a_file_written_back_to_what_the_revision_holds_leaves_swfs_list(
+    new_lore_repo, background_lore_service
+):
+    """SWFS keeps a file the user wrote back to what the revision holds listed as modified, so the
+    scan that finds it unchanged names it in its thaw, and the scans after it compare it no more."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"f0.txt": "original", "f1.txt": "other"})
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.write_files({"f0.txt": "edited"}, flush_writes=True)
+    assert "M f0.txt" in swfs_repo.status(scan=True)
+
+    swfs_repo.write_files({"f0.txt": "original"}, flush_writes=True)
+    written_back = swfs_repo.status(scan=True, level="debug")
+    after = swfs_repo.status(scan=True, level="debug")
+
+    assert "M f0.txt" not in written_back, written_back
+    assert _hash_checks(written_back) == 1, written_back
+    assert _frozen_files(after) and all(count == 0 for count in _frozen_files(after)), after
+    assert _hash_checks(after) == 0, after
+    assert "M f0.txt" not in after, after
+    _repositories_match_files(original_repo, swfs_repo, ["f0.txt", "f1.txt"])
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_renamed_file_keeps_its_content_when_a_new_file_at_its_origin_is_committed(
+    new_lore_repo, background_lore_service
+):
+    """SWFS reads a renamed file it holds no bytes of from the source at the path it came from,
+    and stops listing that origin once a new file is made there. Committing the new file changes
+    what the source holds at that path, so the renamed file must hold bytes of its own by then.
+    Nothing is read before the commit: SWFS's driver keeps what a read fetched for a while, which
+    would hide the source changing."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"a.txt": "the original contents of a"})
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.move("a.txt", "b.txt")
+    swfs_repo.write_files({"a.txt": "new"}, flush_writes=True)
+
+    swfs_repo.stage("a.txt")
+    swfs_repo.commit(message="add the new a.txt")
+
+    with swfs_repo.open_file("b.txt", "r") as renamed:
+        assert renamed.read() == "the original contents of a"
+    with swfs_repo.open_file("a.txt", "r") as new:
+        assert new.read() == "new"
+
+
+# What an operation logs for each renamed file it gives bytes of its own (`renamed_at_risk`).
+_REWRITTEN = "bytes of its own"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_an_atomic_save_rewrites_nothing_through_the_mount(
+    new_lore_repo, background_lore_service
+):
+    """An editor saves by writing a temporary file and renaming it over the file it saves. The
+    saved file holds bytes of its own, so the next temporary file made where the first one was
+    puts nothing at risk, and no operation rewrites it."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"f0.txt": "original", "f1.txt": "other"})
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.status(scan=True)
+
+    swfs_repo.write_files({"f0.txt.tmp": "first save"}, flush_writes=True)
+    os.replace(os.path.join(swfs_repo.path, "f0.txt.tmp"), os.path.join(swfs_repo.path, "f0.txt"))
+    swfs_repo.write_files({"f0.txt.tmp": "second save"}, flush_writes=True)
+    scanned = swfs_repo.status(scan=True, level="debug")
+    after = swfs_repo.status(scan=True, level="debug")
+
+    assert _REWRITTEN not in str(scanned) and _REWRITTEN not in str(after), (scanned, after)
+    with swfs_repo.open_file("f0.txt", "r") as saved:
+        assert saved.read() == "first save"
+
+
+def _dependency_synced(new_lore_repo) -> tuple[Lore, Lore]:
+    """A plain clone and an SWFS clone of a repository in which `src/main.rs` depends on
+    `src/lib.rs`, behind a revision that changes all four files of the first, removes `src/old.rs`
+    and adds `src/new.rs`."""
+    source = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    source.write_commit_push(
+        "first",
+        {
+            "src/main.rs": "main v1\n",
+            "src/lib.rs": "lib v1\n",
+            "src/util.rs": "util v1\n",
+            "src/old.rs": "old v1\n",
+        },
+    )
+    source.file_dependency_add("src/main.rs", ["src/lib.rs"], offline=True)
+    source.write_commit_push("dependencies", {".deps_marker": "deps\n"})
+    plain = source.clone()
+    swfs = _swfs_clone(source)
+
+    source.remove_file("src/old.rs")
+    source.stage(".", scan=True)
+    source.write_commit_push(
+        "second",
+        {
+            "src/main.rs": "main v2\n",
+            "src/lib.rs": "lib v2\n",
+            "src/util.rs": "util v2\n",
+            "src/new.rs": "new v2\n",
+        },
+    )
+    return plain, swfs
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_dependency_sync_is_refused_and_leaves_the_working_tree_as_it_was(
+    new_lore_repo, background_lore_service
+):
+    """A sync restricted to a dependency set leaves what lies outside the set as the working tree
+    held it, which an SWFS mount, serving the new revision whole, does not support: the sync is
+    refused, where a plain instance's goes through."""
+    plain, swfs = _dependency_synced(new_lore_repo)
+    before = swfs.read_files()
+
+    plain.sync(root_files=["src/main.rs"])
+    with pytest.raises(ImproperArgumentsError, match="not supported on an SWFS-backed instance"):
+        swfs.sync(root_files=["src/main.rs"])
+
+    assert plain.read_files()["src/main.rs"] == "main v2\n"
+    assert swfs.read_files() == before
+    # A sync of the whole revision still goes through.
+    swfs.sync()
+    assert swfs.read_files()["src/util.rs"] == "util v2\n"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_merge_writing_many_conflicted_files_to_the_mount_completes(
+    new_lore_repo, background_lore_service
+):
+    """A merge writes each conflicted file's markers and copies to the mount and reads them back
+    in the same operation. Each of those syscalls can wait on an SWFS callback that reads the
+    store through the syscall pool they hold threads of, so they are bounded below its size, and
+    many of them at once complete."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    base = ["One line\n", "Another line\n", "Third line\n"]
+    names = [f"text{index}.txt" for index in range(64)]
+    original_repo.write_commit_push("base", {name: base for name in names})
+    original_repo.branch_create("theirs")
+    original_repo.write_commit_push(
+        "theirs", {name: base + ["Fourth line\n"] for name in names}
+    )
+    original_repo.branch_switch("main")
+    original_repo.write_commit_push(
+        "mine", {name: base + ["Fourth conflicting line\n"] for name in names}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+
+    swfs_repo.branch_merge("theirs")
+
+    files = swfs_repo.read_files()
+    for name in names:
+        assert "<<<<<<<" in files[name], name
+        for suffix in ("~mine", "~theirs", "~base"):
+            assert name + suffix in files, name + suffix
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_dependency_clone_holds_what_a_plain_one_does(
+    new_lore_repo, background_lore_service
+):
+    """A clone restricted to a dependency set writes the set alone, and a plain instance's disk
+    holds nothing else. SWFS serves the revision whole, so the clone records the rest as absent."""
+    source = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    source.write_commit_push(
+        "first",
+        {"src/main.rs": "main\n", "src/lib.rs": "lib\n", "src/util.rs": "util\n"},
+    )
+    source.file_dependency_add("src/main.rs", ["src/lib.rs"], offline=True)
+    source.write_commit_push("dependencies", {".deps_marker": "deps\n"})
+    plain = source.clone(root_files=["src/main.rs"])
+    source.shared_store_create(source.remote)
+    swfs = source.clone(vfs="swfs", use_shared_store=True, root_files=["src/main.rs"])
+
+    assert "src/util.rs" not in plain.read_files()
+    assert swfs.read_files() == plain.read_files()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
 def test_swfs_mount_fetches_what_its_store_evicted(new_lore_repo, lore_service_runner):
     """A mount the service restores, whose store has evicted what it serves, fetches it
     from the instance's remote, where it used to serve the files as zeros."""
@@ -612,3 +1759,53 @@ def test_swfs_mount_fetches_what_its_store_evicted(new_lore_repo, lore_service_r
 
     _repositories_match_files(original_repo, swfs_repo, list(file_contents))
     swfs_repo.status()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_resetting_a_directory_move_puts_the_directory_back(
+    new_lore_repo, background_lore_service
+):
+    """Resetting both ends of a directory the user moved on the mount and marked moved puts the
+    directory back with what it held, at any depth, and leaves the destination gone."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    files = {
+        "dir/a.txt": "a content\n",
+        "dir/b.txt": "b content\n",
+        "dir/sub/c.txt": "c content\n",
+    }
+    original_repo.write_commit_push("first", files)
+    swfs_repo = _swfs_clone(original_repo)
+    os.rename(swfs_repo._fix_path("dir"), swfs_repo._fix_path("moved"))
+    swfs_repo.dirty_move("dir", "moved")
+
+    swfs_repo.reset(["dir", "moved"])
+
+    for path, content in files.items():
+        with swfs_repo.open_file(path, "r") as f:
+            assert f.read() == content, path
+    assert not swfs_repo.file_exists("moved")
+    status = swfs_repo.status(scan=True)
+    assert "moved" not in status and "dir" not in status, status
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_resetting_a_file_move_puts_the_file_back(new_lore_repo, background_lore_service):
+    """Resetting both ends of a file the user moved on the mount and marked moved puts the file
+    back with its content, and leaves the destination gone."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"old.txt": "old content\n"})
+    swfs_repo = _swfs_clone(original_repo)
+    os.rename(swfs_repo._fix_path("old.txt"), swfs_repo._fix_path("new.txt"))
+    swfs_repo.dirty_move("old.txt", "new.txt")
+
+    swfs_repo.reset(["old.txt", "new.txt"])
+
+    with swfs_repo.open_file("old.txt", "r") as f:
+        assert f.read() == "old content\n"
+    assert not swfs_repo.file_exists("new.txt")
+    status = swfs_repo.status(scan=True)
+    assert "old.txt" not in status and "new.txt" not in status, status
