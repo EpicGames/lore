@@ -31,6 +31,7 @@ use crate::quic::client_monitor::default_quic_client_monitor_interval_secs;
 use crate::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
 use crate::quic::initial_cwnd::InitialCwndBytes;
 use crate::quic::initial_cwnd::default_peer_initial_cwnd_bytes;
+use crate::quic::replication_store_service::client::CommandPermitWait;
 use crate::quic::replication_store_service::client_container;
 use crate::quic::replication_store_service::client_container::ClientContainerConfig;
 use crate::store::grpc_replica::GrpcReplica;
@@ -42,6 +43,22 @@ use crate::tls::CertificateSettings;
 /// peers in other regions. This value covers the most distant region. The windows only limit how
 /// much data may be in flight, so connections to nearer regions can leave some capacity unused.
 const OTHER_REGION_EXPECTED_RTT_MS: u64 = 220;
+
+/// How long a read peer client waits for a free command permit before it refuses a request.
+#[lore_macro::test_pub]
+const READ_PEER_COMMAND_PERMIT_WAIT: Duration = Duration::from_millis(10);
+
+/// The command permit wait of a peer client of `replica_type`. A read waits, since a burst of
+/// reads can take every permit for a few milliseconds and a refused read goes to another read
+/// replica or the durable store. A write refuses at once, since write replication runs as detached
+/// tasks that hold their payloads while they wait.
+#[lore_macro::test_pub]
+fn peer_command_permit_wait(replica_type: ReplicaType) -> CommandPermitWait {
+    match replica_type {
+        ReplicaType::Read => CommandPermitWait::UpTo(READ_PEER_COMMAND_PERMIT_WAIT),
+        ReplicaType::Write => CommandPermitWait::Refuse,
+    }
+}
 
 pub static METRICS_PEER_ID_LABEL: &str = "peer_id";
 pub static METRICS_PEER_LOCALITY_LABEL: &str = "peer_locality";
@@ -182,7 +199,7 @@ impl ReplicationStoreTargetFactory {
         let mut factory =
             client_container::QuicClientFactory::new(remote_url, self.quic_certs.clone());
         factory.command_behavior.message_limit = self.client_message_buffer;
-        factory.command_behavior.should_await_command_permit = false;
+        factory.command_behavior.permit_wait = peer_command_permit_wait(replica_type);
         factory.quic_max_reconnects = Some(5);
         factory.sni_override = sni_override;
         factory.transport_config.expected_rtt_ms = rtt_ms;

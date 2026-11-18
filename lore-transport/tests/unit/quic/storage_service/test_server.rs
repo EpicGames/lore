@@ -44,7 +44,7 @@ pub(crate) const PAYLOAD_SIZE: usize = 1024;
 
 /// How far a client may write ahead of what the server has read on one stream: small, so that a
 /// large request whose payload the server is not reading holds the client's write.
-const STREAM_WINDOW: u32 = 16 * 1024;
+pub(crate) const STREAM_WINDOW: u32 = 16 * 1024;
 
 /// The partition test sessions are started for.
 pub(crate) fn test_partition() -> Partition {

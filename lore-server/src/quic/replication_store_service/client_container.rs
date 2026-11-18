@@ -25,6 +25,7 @@ use tracing::error;
 
 use crate::quic::replication_store_service::DEFAULT_CLIENT_MESSAGE_LIMIT;
 use crate::quic::replication_store_service::client::CommandBehavior;
+use crate::quic::replication_store_service::client::CommandPermitWait;
 use crate::quic::replication_store_service::client::DEFAULT_MAX_BYTES_BANDWIDTH_PER_SEC;
 use crate::quic::replication_store_service::client::ReplicationStoreClient;
 use crate::quic::replication_store_service::client::ServiceRequestMeta;
@@ -67,7 +68,7 @@ impl QuicClientFactory {
             },
             command_behavior: CommandBehavior {
                 message_limit: DEFAULT_CLIENT_MESSAGE_LIMIT,
-                should_await_command_permit: true,
+                permit_wait: CommandPermitWait::Unbounded,
             },
             quic_max_reconnects: None,
             sni_override: None,

@@ -41,6 +41,7 @@ use opentelemetry::KeyValue;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
+use tokio::sync::TryAcquireError;
 use tracing::trace;
 use tracing::warn;
 
@@ -178,10 +179,21 @@ pub trait StoreClient: Send + Sync + Sized + 'static {
     async fn copy(&self, request: ImmutableCopy) -> Result<(), ReplicationStoreClientError>;
 }
 
+/// How long a command waits for a free command permit before the client refuses it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandPermitWait {
+    /// Refuses the command at once.
+    Refuse,
+    /// Waits until a permit is free.
+    Unbounded,
+    /// Waits up to the duration, then refuses the command. A free permit is taken without a timer.
+    UpTo(Duration),
+}
+
 #[derive(Clone)]
 pub struct CommandBehavior {
     pub message_limit: usize,
-    pub should_await_command_permit: bool,
+    pub permit_wait: CommandPermitWait,
 }
 
 pub struct ReplicationStoreClient {
@@ -191,7 +203,7 @@ pub struct ReplicationStoreClient {
     transport_config: TransportConfig,
     quic: Arc<QuicConnection>,
     command_limit: Semaphore,
-    should_await_command_permit: bool,
+    permit_wait: CommandPermitWait,
 }
 
 impl Drop for ReplicationStoreClient {
@@ -245,7 +257,7 @@ impl ReplicationStoreClient {
             auth,
             quic: Arc::new(quic),
             command_limit: Semaphore::new(command_behavior.message_limit),
-            should_await_command_permit: command_behavior.should_await_command_permit,
+            permit_wait: command_behavior.permit_wait,
             transport_config,
         };
 
@@ -405,10 +417,18 @@ impl ServiceClient for ReplicationStoreClient {
     const DEFAULT_PORT: u16 = 41340;
 
     async fn acquire_command_permit(&self) -> Option<SemaphorePermit<'_>> {
-        if self.should_await_command_permit {
-            self.command_limit.acquire().await.ok()
-        } else {
-            self.command_limit.try_acquire().ok()
+        match self.permit_wait {
+            CommandPermitWait::Refuse => self.command_limit.try_acquire().ok(),
+            CommandPermitWait::Unbounded => self.command_limit.acquire().await.ok(),
+            CommandPermitWait::UpTo(wait) => match self.command_limit.try_acquire() {
+                Err(TryAcquireError::NoPermits) => {
+                    tokio::time::timeout(wait, self.command_limit.acquire())
+                        .await
+                        .ok()?
+                        .ok()
+                }
+                permit => permit.ok(),
+            },
         }
     }
 

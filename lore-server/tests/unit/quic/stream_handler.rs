@@ -29,6 +29,7 @@ use lore_server::quic::quinn::service_store::ServiceStore;
 use lore_server::quic::quinn::service_store::StreamDataHandlerBuilder;
 use lore_server::quic::replication_store_service::ReplicationServiceErrorCode;
 use lore_server::quic::replication_store_service::client::CommandBehavior;
+use lore_server::quic::replication_store_service::client::CommandPermitWait;
 use lore_server::quic::replication_store_service::client::ReplicationStoreClient;
 use lore_server::quic::replication_store_service::client::ReplicationStoreClientError;
 use lore_server::quic::replication_store_service::client::StoreClient;
@@ -545,7 +546,7 @@ async fn server_with_mtls_accepts_clients_with_certs() {
             },
             CommandBehavior {
                 message_limit: 10,
-                should_await_command_permit: false,
+                permit_wait: CommandPermitWait::Refuse,
             },
             None,
             None,
@@ -628,7 +629,7 @@ async fn server_with_mtls_rejects_clients_with_invalid_certs() {
             },
             CommandBehavior {
                 message_limit: 10,
-                should_await_command_permit: false,
+                permit_wait: CommandPermitWait::Refuse,
             },
             None,
             None,
@@ -710,7 +711,7 @@ async fn server_without_mtls_accepts_clients_without_certs() {
             },
             CommandBehavior {
                 message_limit: 10,
-                should_await_command_permit: false,
+                permit_wait: CommandPermitWait::Refuse,
             },
             None,
             None,

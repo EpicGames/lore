@@ -531,6 +531,137 @@ async fn a_command_after_a_reset_frame_is_answered_over_a_new_connection() {
     assert_eq!(server.accepted_connections(), 2);
 }
 
+/// A command dropped while it waits for its stream's writer has written nothing, so no answer will
+/// come for it, and it leaves no command waiting on the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_command_dropped_before_its_write_leaves_nothing_pending() {
+    use bytes::Bytes;
+    use lore_transport::quic::storage_service::Command;
+
+    let (_server, _client, quic) = served_connection().await;
+    let writers = quic.lock_writers().await.expect("open every stream");
+    let mut small = [Bytes::new(), Bytes::from_static(b"dropped")];
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(100),
+        send_normal(
+            quic.clone(),
+            Command::Put as u8,
+            BoundSession::any(0),
+            true,
+            &mut small,
+        ),
+    )
+    .await;
+    assert!(dropped.is_err(), "the command was not held: {dropped:?}");
+    drop(writers);
+    assert_eq!(quic.pending_commands().await, 0);
+}
+
+/// A command too big to send is refused before anything is written, so no answer will come for it,
+/// and it leaves no command waiting on the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_command_too_big_to_send_leaves_nothing_pending() {
+    use bytes::Bytes;
+    use lore_transport::quic::QuicClientError;
+    use lore_transport::quic::storage_service::Command;
+    use lore_transport::quic::storage_service::MAX_CHUNK_SIZE;
+
+    let (_server, _client, quic) = served_connection().await;
+    let mut too_big = [Bytes::new(), Bytes::from(vec![0u8; MAX_CHUNK_SIZE + 1])];
+    let refused = send_normal(
+        quic.clone(),
+        Command::Put as u8,
+        BoundSession::any(0),
+        true,
+        &mut too_big,
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(QuicClientError::ClientMessageTooBig)),
+        "{refused:?}"
+    );
+    assert_eq!(quic.pending_commands().await, 0);
+}
+
+/// A command dropped while it holds its stream's writer, but before the stream takes any of its
+/// frame, has written nothing either, and leaves no command waiting on the stream. A frame that
+/// fills the stream's window, which the server does not read meanwhile, leaves it no room.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_command_dropped_before_the_stream_takes_any_of_its_frame_leaves_nothing_pending() {
+    use bytes::Bytes;
+    use lore_transport::quic::command_header::COMMAND_HEADER_SIZE_V4;
+    use lore_transport::quic::storage_service::Command;
+
+    use crate::quic::storage_service::test_server::STREAM_WINDOW;
+
+    let (server, _client, quic) = served_connection().await;
+    // On a stream nothing has used, so that its whole window is free.
+    quic.open_streams().await.expect("open every stream");
+    server.pause_reading();
+    let mut filling = [
+        Bytes::new(),
+        Bytes::from(vec![0u8; STREAM_WINDOW as usize - COMMAND_HEADER_SIZE_V4]),
+    ];
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        send_without_response(quic.clone(), Command::Put as u8, 0, true, &mut filling),
+    )
+    .await
+    .expect("the frame filling the window was not written whole")
+    .expect("the frame filling the window");
+    assert_eq!(quic.pending_commands().await, 1);
+
+    let mut small = [Bytes::new(), Bytes::from_static(b"dropped")];
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(100),
+        send_normal(
+            quic.clone(),
+            Command::Put as u8,
+            BoundSession::any(0),
+            true,
+            &mut small,
+        ),
+    )
+    .await;
+    assert!(dropped.is_err(), "the command was not held: {dropped:?}");
+    assert_eq!(quic.pending_commands().await, 1);
+}
+
+/// A command dropped once its frame is written still waits on its stream, so the reader takes its
+/// answer when it comes rather than ending the stream on an answer it does not expect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_command_dropped_after_its_write_is_answered_and_its_stream_kept() {
+    use bytes::Bytes;
+    use lore_transport::quic::storage_service::Command;
+
+    let (server, _client, quic) = served_connection().await;
+    server.pause_reading();
+    let mut small = [Bytes::new(), Bytes::from_static(b"dropped")];
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(100),
+        send_normal(
+            quic.clone(),
+            Command::Put as u8,
+            BoundSession::any(0),
+            true,
+            &mut small,
+        ),
+    )
+    .await;
+    assert!(dropped.is_err(), "the command was answered: {dropped:?}");
+    assert_eq!(quic.pending_commands().await, 1);
+
+    server.resume_reading();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while quic.pending_commands().await != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the dropped command's answer never came");
+    assert_eq!(quic.streams_ended(), 0);
+}
+
 mod controller_factory {
     use std::time::Instant;
 
