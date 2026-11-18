@@ -3917,6 +3917,146 @@ async fn a_node_link_crosses_a_link_where_its_repository_or_revision_differs() {
     .await;
 }
 
+/// A merge an earlier build started wrote rollback rows only, and has to stay finishable or
+/// abortable after an upgrade.
+#[test]
+fn link_merge_state_written_by_an_earlier_build_reads_as_rollback_rows() {
+    use lore_revision::state::LinkMergeEntryV0;
+    use lore_revision::state::LinkMergeState;
+    use lore_revision::state::LinkReference;
+    use lore_revision::state::parse_link_merge_state;
+    use zerocopy::IntoBytes;
+
+    let base = LinkReference {
+        signature: Hash::from([7u8; 32]),
+        local_node: 3,
+        ..Default::default()
+    };
+    let mut raw = LinkMergeState {
+        count: 1,
+        version: 0,
+    }
+    .as_bytes()
+    .to_vec();
+    raw.extend_from_slice(
+        LinkMergeEntryV0 {
+            local_node: 3,
+            reserved: 0,
+            base,
+        }
+        .as_bytes(),
+    );
+
+    let entries = parse_link_merge_state(&raw).expect("an earlier layout should be readable");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].local_node, 3);
+    assert_eq!(entries[0].base.signature(), Hash::from([7u8; 32]));
+    assert!(
+        !entries[0].is_conflict(),
+        "an earlier layout holds rollback rows only"
+    );
+}
+
+/// Builds before link merge state was written refuse any format above `LowerCaseHash`, so a
+/// staged state holding it has to be written above that, and a committed one must not be.
+#[test]
+fn only_a_state_holding_link_merge_state_is_written_in_a_format_earlier_builds_refuse() {
+    use lore_revision::state::StateData;
+    use lore_revision::state::StateFormat;
+
+    let committed = StateData::default();
+    assert_eq!(
+        committed.format_to_write(),
+        StateFormat::LowerCaseHash as u32
+    );
+
+    let staged = StateData::default().with_link_merge_hash(Hash::from([1u8; 32]));
+    assert_eq!(staged.format_to_write(), StateFormat::LinkMergeState as u32);
+}
+
+/// A row is compared and carried by the branch it resolves to, read under its own parent's branch:
+/// an auto-following row on its parent's branch names that branch whether it stores it or zero,
+/// and a fixed row names its branch on any parent.
+#[test]
+fn link_rows_compare_and_carry_under_their_own_parent_branch() {
+    use lore_revision::state::LinkReference;
+
+    let main = BranchId::from([1; 16]);
+    let feature = BranchId::from([2; 16]);
+    let other = BranchId::from([3; 16]);
+    let row = |branch, flags: LinkFlags| LinkReference {
+        branch,
+        signature: Hash::from([9u8; 32]),
+        flags: flags.into(),
+        ..Default::default()
+    };
+
+    let tracking = row(BranchId::default(), LinkFlags::NoFlags);
+    assert!(row(main, LinkFlags::NoFlags).same_row(main, &tracking, feature));
+    assert!(row(feature, LinkFlags::NoFlags).same_row(
+        feature,
+        &row(main, LinkFlags::NoFlags),
+        main
+    ));
+    assert!(!row(other, LinkFlags::NoFlags).same_row(feature, &tracking, main));
+
+    let fixed = row(main, LinkFlags::DisableAutoFollow);
+    assert!(fixed.same_row(main, &fixed, feature));
+    assert!(!fixed.same_row(main, &row(main, LinkFlags::NoFlags), main));
+
+    assert_eq!(
+        row(feature, LinkFlags::NoFlags)
+            .carried(feature, main)
+            .branch(),
+        BranchId::default()
+    );
+    assert_eq!(
+        row(other, LinkFlags::NoFlags)
+            .carried(feature, main)
+            .branch(),
+        other
+    );
+    assert_eq!(fixed.carried(main, feature).branch(), main);
+}
+
+/// A link merge state that is short of the rows its header counts, or of a layout or a resolution
+/// this build doesn't know, is refused rather than read as fewer rows, which would let a commit through.
+#[test]
+fn link_merge_state_short_of_its_rows_or_of_an_unknown_layout_is_refused() {
+    use lore_revision::state::LinkMergeEntry;
+    use lore_revision::state::LinkMergeState;
+    use lore_revision::state::parse_link_merge_state;
+    use zerocopy::IntoBytes;
+
+    let header = |count, version| LinkMergeState { count, version }.as_bytes().to_vec();
+    let mut one_row = header(2, 1);
+    one_row.extend_from_slice(LinkMergeEntry::default().as_bytes());
+    assert!(parse_link_merge_state(&one_row).is_err());
+
+    assert!(parse_link_merge_state(&header(0, 2)).is_err());
+    assert!(parse_link_merge_state(&[0u8; 4]).is_err());
+
+    let mut unknown_resolution = header(1, 1);
+    unknown_resolution.extend_from_slice(
+        LinkMergeEntry {
+            resolution: 4,
+            ..Default::default()
+        }
+        .as_bytes(),
+    );
+    assert!(parse_link_merge_state(&unknown_resolution).is_err());
+
+    let mut two_rows = header(2, 1);
+    two_rows.extend_from_slice(LinkMergeEntry::default().as_bytes());
+    two_rows.extend_from_slice(LinkMergeEntry::default().as_bytes());
+    assert_eq!(
+        parse_link_merge_state(&two_rows)
+            .map(|rows| rows.len())
+            .ok(),
+        Some(2)
+    );
+}
+
 /// A recovery that asks the remote whether it holds an address as a list writes the fragment the
 /// remote describes to the local store as an entry without its payload, marked durable, so a later
 /// write of the list uploads nothing.

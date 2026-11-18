@@ -4184,11 +4184,22 @@ pub(crate) struct StagedMergePaths {
 /// Which nodes [`collect_merge_paths`] collects.
 #[derive(Clone, Copy)]
 pub(crate) struct MergeWalk {
-    /// Collect conflicts not yet resolved rather than every staged merge.
-    pub(crate) unresolved_only: bool,
+    /// Which merged nodes to collect.
+    pub(crate) nodes: MergeNodes,
     /// Collect a directory carrying a conflict no node below it carries: the conflict is with a
     /// file the other side put in its place.
     pub(crate) whole_directories: bool,
+}
+
+/// The merged nodes a [`MergeWalk`] collects.
+#[derive(Clone, Copy)]
+pub(crate) enum MergeNodes {
+    /// Every node the merge staged.
+    Merged,
+    /// Conflicts, resolved or not.
+    Conflicts,
+    /// Conflicts not yet resolved.
+    Unresolved,
 }
 
 /// Collects the paths of the merged nodes at and below `node_id`, and the links met, with what
@@ -4208,12 +4219,10 @@ pub(crate) fn collect_merge_paths(
             .forward::<StageError>("Failed deserializing state node block")?;
         let node = block.node(Node::index(node_id));
 
-        let collects = |node: &Node| {
-            if walk.unresolved_only {
-                node.is_staged_merge_conflict() && node.is_staged_merge_unresolved()
-            } else {
-                node.is_staged_merge()
-            }
+        let collects = |node: &Node| match walk.nodes {
+            MergeNodes::Merged => node.is_staged_merge(),
+            MergeNodes::Conflicts => node.is_staged_merge_conflict(),
+            MergeNodes::Unresolved => node.is_staged_merge_unresolved(),
         };
 
         if node.is_file() {
@@ -4695,7 +4704,7 @@ async fn stage_from_parent_revision_in_operation(
                 node_link.node,
                 relative_path,
                 MergeWalk {
-                    unresolved_only: false,
+                    nodes: MergeNodes::Merged,
                     whole_directories: true,
                 },
                 Some(refusal.clone()),
@@ -5237,7 +5246,7 @@ async fn collect_link_groups(
                 node_link.node,
                 user,
                 MergeWalk {
-                    unresolved_only: false,
+                    nodes: MergeNodes::Merged,
                     whole_directories: false,
                 },
                 Some(refusal.clone()),

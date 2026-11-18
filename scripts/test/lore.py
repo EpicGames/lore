@@ -965,6 +965,9 @@ class Lore:
             **kwargs,
         )
 
+    def branch_merge_conflicts_list(self, **kwargs: Unpack[GlobalOptions]):
+        return self.run(["branch", "merge", "conflicts", "list"], **kwargs)
+
     def branch_diff(
         self,
         target: str | None = None,

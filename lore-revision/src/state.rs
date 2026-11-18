@@ -1386,6 +1386,9 @@ pub enum StateFormat {
     Initial = 1,
     /// Node name hash is lower case
     LowerCaseHash = 2,
+    /// Holds link merge state in a layout earlier builds would misread, so they refuse it.
+    /// Written only while a merge is in progress, so committed revisions stay readable.
+    LinkMergeState = 3,
 }
 
 #[repr(C)]
@@ -1433,6 +1436,15 @@ impl StateData {
     /// format version.
     pub(crate) fn has_state_magic(&self) -> bool {
         self.magic == STATE_MAGIC
+    }
+
+    #[lore_macro::test_pub]
+    fn format_to_write(&self) -> u32 {
+        if self.hash_link_merge.is_zero() {
+            StateFormat::LowerCaseHash as u32
+        } else {
+            StateFormat::LinkMergeState as u32
+        }
     }
 }
 
@@ -1510,18 +1522,192 @@ impl LinkReference {
     pub fn flags(&self) -> u32 {
         self.flags
     }
+
+    /// The same row pinned at `signature`, which the tree node carries
+    /// alongside the registry and is the copy a comparison reads.
+    pub(crate) fn with_signature(mut self, signature: Hash) -> Self {
+        self.signature = signature;
+        self
+    }
+
+    /// The linked branch this row follows under a parent on `parent_branch`, or `None` where an
+    /// auto-following row follows that same branch, so rows following their own parents compare
+    /// equal across parent branches.
+    #[lore_macro::test_pub]
+    pub(crate) fn foreign_branch(&self, parent_branch: BranchId) -> Option<BranchId> {
+        let branch = self.resolve_branch(parent_branch);
+        (branch != parent_branch || self.flags & LinkFlags::DisableAutoFollow != 0)
+            .then_some(branch)
+    }
+
+    /// Whether both carry the same pin, flags and branch, each row read under its own parent's
+    /// branch, which is all a merge carries of a row.
+    #[lore_macro::test_pub]
+    pub(crate) fn same_row(
+        &self,
+        parent_branch: BranchId,
+        other: &Self,
+        other_parent_branch: BranchId,
+    ) -> bool {
+        self.signature == other.signature
+            && self.flags == other.flags
+            && self.foreign_branch(parent_branch) == other.foreign_branch(other_parent_branch)
+    }
+
+    /// Whether both store the same pin, branch and flags, as rows of one parent do.
+    pub(crate) fn stores_same(&self, other: &Self) -> bool {
+        self.signature == other.signature
+            && self.branch == other.branch
+            && self.flags == other.flags
+    }
+
+    /// This row as a parent on `parent_branch` stores it, carried from one on `from_branch`.
+    #[lore_macro::test_pub]
+    pub(crate) fn carried(&self, from_branch: BranchId, parent_branch: BranchId) -> Self {
+        let branch = self.foreign_branch(from_branch).unwrap_or(parent_branch);
+        Self {
+            branch: self.branch_to_store(branch, parent_branch),
+            ..*self
+        }
+    }
 }
 
-/// Tracks a single link's merge state for rollback.
+/// What a [`LinkMergeEntry`] records, and for a conflict which side was chosen.
+#[repr(u32)]
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub enum LinkMergeResolution {
+    /// A pre-merge row kept only so abort can roll it back.
+    Rollback = 0,
+    /// A divergent row waiting on the user's choice.
+    Unresolved = 1,
+    /// Resolved to the row this branch held.
+    Mine = 2,
+    /// Resolved to the row the merged branch held.
+    Theirs = 3,
+}
+
+impl LinkMergeResolution {
+    fn from_raw(raw: u32) -> Self {
+        match raw {
+            1 => Self::Unresolved,
+            2 => Self::Mine,
+            3 => Self::Theirs,
+            _ => Self::Rollback,
+        }
+    }
+}
+
+/// Tracks a single link's merge state for rollback and conflict resolution.
 #[repr(C)]
 #[derive(Copy, Clone, Default, IntoBytes, FromBytes, Immutable)]
 pub struct LinkMergeEntry {
     /// Link path node ID (correlates with `LinkReference.local_node`)
     pub local_node: u32,
-    /// Reserved for future use
-    pub reserved: u32,
+    /// See [`LinkMergeResolution`].
+    pub resolution: u32,
     /// Pre-merge (base) link reference snapshot for rollback
     pub base: LinkReference,
+    /// The merged branch's row, for a divergent link
+    pub source: LinkReference,
+    /// This branch's row, for a divergent link
+    pub target: LinkReference,
+    /// The node of `source`'s pin the merged branch mounts, for a divergent link
+    pub source_mount: NodeID,
+    /// The node of `target`'s pin this branch mounts, for a divergent link
+    pub target_mount: NodeID,
+}
+
+impl LinkMergeEntry {
+    /// The pre-merge row of a link the merge changed, for abort to restore.
+    pub fn rollback(base: LinkReference) -> Self {
+        Self {
+            local_node: base.local_node,
+            resolution: LinkMergeResolution::Rollback as u32,
+            base,
+            ..Default::default()
+        }
+    }
+
+    /// `base` stays the row this branch held, so abort rolls a conflicted link
+    /// back the same way it rolls back a merged one.
+    pub fn conflict(
+        source: LinkReference,
+        source_mount: NodeID,
+        target: LinkReference,
+        target_mount: NodeID,
+    ) -> Self {
+        Self {
+            local_node: target.local_node,
+            resolution: LinkMergeResolution::Unresolved as u32,
+            base: target,
+            source,
+            target,
+            source_mount,
+            target_mount,
+        }
+    }
+
+    /// What the entry records, and for a conflict the side chosen.
+    pub fn resolution(&self) -> LinkMergeResolution {
+        LinkMergeResolution::from_raw(self.resolution)
+    }
+
+    /// Records the side a resolve chose.
+    pub fn set_resolution(&mut self, resolution: LinkMergeResolution) {
+        self.resolution = resolution as u32;
+    }
+
+    /// A divergent row no resolve has settled yet, which refuses a commit.
+    pub fn is_unresolved(&self) -> bool {
+        self.resolution() == LinkMergeResolution::Unresolved
+    }
+
+    /// A divergent row, settled or not. A settled one still matches a resolve,
+    /// so a user can change the side they picked.
+    pub fn is_conflict(&self) -> bool {
+        self.resolution() != LinkMergeResolution::Rollback
+    }
+
+    /// Moves each auto-following row of a repository in `followed` onto the zero branch, as a
+    /// branch create moves the rows it cascades to, and answers whether any row moved.
+    pub(crate) fn follow_parent_branch(&mut self, followed: &[RepositoryId]) -> bool {
+        let mut moved = false;
+        for row in [&mut self.base, &mut self.source, &mut self.target] {
+            if followed.contains(&row.repository)
+                && row.flags & LinkFlags::DisableAutoFollow == 0
+                && !row.branch.is_zero()
+            {
+                row.branch = BranchId::default();
+                moved = true;
+            }
+        }
+        moved
+    }
+
+    /// The row the chosen side names and the node of its pin it mounts, or `None` while the
+    /// entry is unresolved.
+    pub fn resolved_reference(&self) -> Option<(LinkReference, NodeID)> {
+        match self.resolution() {
+            LinkMergeResolution::Mine => Some((self.target, self.target_mount)),
+            LinkMergeResolution::Theirs => Some((self.source, self.source_mount)),
+            _ => None,
+        }
+    }
+}
+
+/// Abort reads `base` out of this blob to undo a merge, so another layout is
+/// refused rather than parsed into rollback data for the wrong revisions.
+const LINK_MERGE_STATE_VERSION: u32 = 1;
+
+/// The layout a merge started by an earlier build wrote, holding rollback rows
+/// only. Still read so that merge can be finished or aborted after an upgrade.
+#[lore_macro::test_pub]
+#[repr(C)]
+#[derive(Copy, Clone, IntoBytes, FromBytes, Immutable)]
+struct LinkMergeEntryV0 {
+    local_node: u32,
+    reserved: u32,
+    base: LinkReference,
 }
 
 /// Header for the serialized link merge state blob.
@@ -1530,9 +1716,52 @@ pub struct LinkMergeEntry {
 pub struct LinkMergeState {
     /// Number of `LinkMergeEntry` items following this header
     pub count: u32,
-    /// Flags (reserved for future use)
-    pub flags: u32,
+    /// See [`LINK_MERGE_STATE_VERSION`]
+    pub version: u32,
 }
+#[lore_macro::test_pub]
+fn parse_link_merge_state(raw: &[u8]) -> Result<Vec<LinkMergeEntry>, StateError> {
+    let Ok((header, entry_bytes)) = LinkMergeState::read_from_prefix(raw) else {
+        return Err(StateError::internal("Link merge state is truncated"));
+    };
+
+    match header.version {
+        0 => Ok(read_records::<LinkMergeEntryV0>(entry_bytes, header.count)?
+            .into_iter()
+            .map(|entry| LinkMergeEntry::rollback(entry.base))
+            .collect()),
+        LINK_MERGE_STATE_VERSION => {
+            let entries: Vec<LinkMergeEntry> = read_records(entry_bytes, header.count)?;
+            if entries
+                .iter()
+                .any(|entry| entry.resolution > LinkMergeResolution::Theirs as u32)
+            {
+                return Err(StateError::internal(
+                    "Link merge state holds a row this build cannot read",
+                ));
+            }
+            Ok(entries)
+        }
+        version => Err(StateError::internal(format!(
+            "Link merge state version {version} cannot be read by this build (expected \
+             {LINK_MERGE_STATE_VERSION}). Complete or abort the merge with the build that started \
+             it"
+        ))),
+    }
+}
+
+/// `count` records laid end to end. Fewer is an error rather than a shorter list, since a missing
+/// conflict row would let a commit through.
+fn read_records<T: FromBytes>(bytes: &[u8], count: u32) -> Result<Vec<T>, StateError> {
+    let truncated = || StateError::internal("Link merge state is truncated");
+    bytes
+        .get(..count as usize * size_of::<T>())
+        .ok_or_else(truncated)?
+        .chunks_exact(size_of::<T>())
+        .map(|record| T::read_from_bytes(record).ok().ok_or_else(truncated))
+        .collect()
+}
+
 const MAX_BLOCK_CACHE: usize = 5000;
 /// How many file metadata blocks a state keeps from checking recycled slots, at 65,568 bytes
 /// each. Adds land in the few blocks with free slots, so a handful is the usual working set.
@@ -2139,8 +2368,8 @@ impl State {
 
         if !data.has_state_magic() {
             Err(StateError::internal("Corrupt header"))
-        } else if data.format == 0 || data.format > StateFormat::LowerCaseHash as u32 {
-            if data.format > StateFormat::LowerCaseHash as u32 && data.format < 0xFFF {
+        } else if data.format == 0 || data.format > StateFormat::LinkMergeState as u32 {
+            if data.format > StateFormat::LinkMergeState as u32 && data.format < 0xFFF {
                 Err(StateError::internal(format!(
                     "Upgrade format: {}",
                     data.format
@@ -2340,7 +2569,7 @@ impl State {
             let buffer = {
                 let mut data = self.data_write();
                 data.flags &= !StateFlags::Dirty;
-                data.format = StateFormat::LowerCaseHash as u32;
+                data.format = data.format_to_write();
                 data.magic = STATE_MAGIC;
 
                 Bytes::copy_from_slice(data.as_bytes())
@@ -6315,6 +6544,32 @@ impl State {
         Ok(RevisionMetadata::from_metadata(metadata))
     }
 
+    /// Serialize a state that is becoming a committed revision.
+    ///
+    /// A merge's flags and its link rows are bookkeeping for the operation in progress and must
+    /// not reach a committed revision, so every commit drops both here.
+    pub fn serialize_committed<'a>(
+        self: &'a Arc<Self>,
+        repository: Arc<RepositoryContext>,
+        token: &'a RepositoryWriteToken,
+    ) -> impl Future<Output = Result<Hash, StateError>> + Send + 'a {
+        self.serialize_committed_keeping(repository, token, drop::<SerializedBlocks>)
+    }
+
+    /// [`Self::serialize_committed`], handing `keep` the blocks it wrote, as
+    /// [`Self::serialize_keeping`] does.
+    pub fn serialize_committed_keeping<'a>(
+        self: &'a Arc<Self>,
+        repository: Arc<RepositoryContext>,
+        token: &'a RepositoryWriteToken,
+        keep: impl FnOnce(SerializedBlocks) + Send + 'a,
+    ) -> impl Future<Output = Result<Hash, StateError>> + Send + 'a {
+        self.reset_merge_conflict_flags();
+        self.clear_link_merge_state();
+
+        self.serialize_keeping(repository, token, keep)
+    }
+
     pub fn link_merge_hash(&self) -> Hash {
         self.data_read().hash_link_merge
     }
@@ -6347,7 +6602,7 @@ impl State {
     ) -> Result<Hash, StateError> {
         let header = LinkMergeState {
             count: entries.len() as u32,
-            flags: 0,
+            version: LINK_MERGE_STATE_VERSION,
         };
 
         let mut bytes =
@@ -6357,11 +6612,13 @@ impl State {
             bytes.extend_from_slice(entry.as_bytes());
         }
 
+        // No committed revision references this blob, so uploading it would only leave garbage.
         let address = immutable::write(
             repository.clone(),
             Context::default(),
             Bytes::from(bytes),
             immutable::write_options_from_repository(repository)
+                .no_remote_write()
                 .with_local_cache_priority()
                 .with_max_size_chunk(),
         )
@@ -6370,6 +6627,17 @@ impl State {
 
         self.set_link_merge_hash(address.hash);
         Ok(address.hash)
+    }
+
+    /// The mount path of the link a [`LinkMergeEntry`] tracks.
+    pub async fn link_merge_entry_path(
+        &self,
+        repository: Arc<RepositoryContext>,
+        entry: &LinkMergeEntry,
+    ) -> Result<String, StateError> {
+        self.node_path(repository, entry.local_node)
+            .await
+            .forward::<StateError>("Failed resolving link node path")
     }
 
     pub async fn deserialize_link_merge_state(
@@ -6391,31 +6659,7 @@ impl State {
         .await
         .forward::<StateError>("Failed to read link merge state")?;
 
-        let raw = data.as_ref();
-        let header_size = std::mem::size_of::<LinkMergeState>();
-        if raw.len() < header_size {
-            return Ok(vec![]);
-        }
-
-        let Ok(header) = LinkMergeState::read_from_bytes(&raw[..header_size]) else {
-            return Ok(vec![]);
-        };
-
-        let mut entries = Vec::with_capacity(header.count as usize);
-        let entry_bytes = &raw[header_size..];
-        for chunk in entry_bytes
-            .as_chunks::<{ size_of::<LinkMergeEntry>() }>()
-            .0
-            .iter()
-            .take(header.count as usize)
-        {
-            let Ok(entry) = LinkMergeEntry::read_from_bytes(chunk) else {
-                break;
-            };
-            entries.push(entry);
-        }
-
-        Ok(entries)
+        parse_link_merge_state(data.as_ref())
     }
 
     /// The link registry as the state was last serialized with, ignoring the runtime copy.
@@ -12993,6 +13237,14 @@ fn delete_hierarchy_side(from: NodeChangeState, to: &NodeChangeState) -> Option<
 #[cfg(feature = "test-util")]
 pub mod test_util {
     use super::*;
+
+    impl StateData {
+        /// The same data holding link merge state at `hash`. For tests.
+        pub fn with_link_merge_hash(mut self, hash: Hash) -> Self {
+            self.hash_link_merge = hash;
+            self
+        }
+    }
 
     impl State {
         /// The hash of the link list the State was serialized with. For tests.

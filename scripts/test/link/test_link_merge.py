@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
+import json
 import os
 import re
 import stat
@@ -8,8 +9,7 @@ from collections.abc import Callable
 
 import pytest
 from error_types import (
-    LinkMountDivergedError,
-    LinkPinDivergedError,
+    ImproperArgumentsError,
     LocalChanges,
     NotSupportedError,
     UnresolvedConflictError,
@@ -28,6 +28,7 @@ from link_helpers import (
     delete_the_folder,
     fail_unless_holds,
     folder_replaced_by_a_link,
+    link_field,
     link_pin,
     link_pins,
     link_replaced_by_its_folder,
@@ -589,12 +590,10 @@ def test_link_add_on_branch_merge_start_preserves_link_flags(new_lore_repo):
     repo.branch_merge_start("feature-branch", message="Merge feature-branch")
     repo.push()
 
+    assert link_field(repo, source_repo.get_id(), "Flags") == "DisableAutoFollow", (
+        "Merged link should keep the DisableAutoFollow flag"
+    )
     link_output = repo.link_list()
-    assert re.search(
-        rf"Link\s+{source_repo.get_id()}.*?Flags:\s+DisableAutoFollow \(0x1\)",
-        link_output,
-        re.DOTALL,
-    ), f"Merged link should keep the DisableAutoFollow flag.\nGot: {link_output}"
     assert re.search(
         rf"Link\s+{source_repo.get_id()}.*?Branch:\s+main", link_output, re.DOTALL
     ), f"Merged fixed link should keep tracking 'main'.\nGot: {link_output}"
@@ -853,31 +852,579 @@ def _diverge_link_pins(new_lore_repo, link_path: str) -> tuple[Lore, Lore, str, 
     return repo, source_repo, revision_two, revision_three
 
 
-@pytest.mark.smoke
-def test_link_pin_update_divergent_does_not_silently_pick_a_side(new_lore_repo):
-    """Both branches moving a link pin stops the merge instead of resolving it.
+_REVISION_TWO_CONTENT = "link source revision two\n"
+_REVISION_THREE_CONTENT = "link source revision three\n"
 
-    Divergent rows are a parent-level conflict. Until they can be resolved in
-    place the merge refuses, so neither side's row is adopted silently.
+
+def _mounted_link_file(repo: Lore, link_path: str) -> str:
+    with repo.open_file(f"{link_path}/link-file.txt", "r") as f:
+        return f.read()
+
+
+@pytest.mark.smoke
+def test_link_pin_conflict_resolve_theirs_takes_merged_branch_pin(new_lore_repo):
+    """A divergent link pin holds the merge open until `theirs` settles it.
+
+    The merge names the row, on a dry run too, the commit before the resolve is
+    refused, and the one after it carries the merged branch's pin and nothing more,
+    which a clone reads and realizes.
+    """
+    link_path = "linked/repo"
+    repo, source_repo, _revision_two, revision_three = _diverge_link_pins(
+        new_lore_repo, link_path
+    )
+
+    output = repo.branch_merge_start(
+        "feature-branch", message="Merge divergent link pins", dry_run=True
+    )
+    assert f"Link conflict: {link_path}" in output, (
+        f"A dry run should name the divergent row - Got:\n{output}"
+    )
+
+    output = repo.branch_merge_start(
+        "feature-branch", message="Merge divergent link pins"
+    )
+    assert f"Link conflict: {link_path}" in output, (
+        f"The merge should name the divergent row - Got:\n{output}"
+    )
+
+    with pytest.raises(UnresolvedConflictError):
+        repo.commit("Commit with the link pin still in conflict")
+
+    output = repo.branch_merge_resolve_theirs(link_path)
+    assert f"{link_path} (theirs)" in output, (
+        f"The resolve should report the side it settled the row to - Got:\n{output}"
+    )
+    assert _mounted_link_file(repo, link_path) == _REVISION_THREE_CONTENT, (
+        "Resolving theirs should realize the merged branch's revision at the mount"
+    )
+
+    output = repo.commit("Merge divergent link pins")
+    assert "Commit succeeded" in output, f"Commit did not succeed - Got:\n{output}"
+    assert link_pin(repo, source_repo.get_id()) == revision_three, (
+        "The committed pin should be the revision the merged branch held"
+    )
+    repo.push()
+
+    clone = repo.clone()
+    assert link_pin(clone, source_repo.get_id()) == revision_three, (
+        "A clone should read the resolved pin from the pushed revision"
+    )
+    assert _mounted_link_file(clone, link_path) == _REVISION_THREE_CONTENT, (
+        "A clone should realize the resolved revision at the mount"
+    )
+    assert "No conflicts" in clone.branch_merge_conflicts_list(), (
+        "A clone should find no merge state in the revision"
+    )
+
+
+@pytest.mark.smoke
+def test_link_pin_conflict_is_not_read_as_an_already_merged_link(new_lore_repo):
+    """A recorded pin conflict is outstanding work, not a link a prior pass merged.
+
+    `--ignore-links` records the divergent row and leaves the merge open. A
+    following `merge start` has to report that merge rather than read the row as
+    a link it already merged and skip it.
     """
     link_path = "linked/repo"
     repo, source_repo, revision_two, _revision_three = _diverge_link_pins(
         new_lore_repo, link_path
     )
 
-    with pytest.raises(LinkPinDivergedError):
-        repo.branch_merge_start("feature-branch", message="Merge divergent link pins")
+    repo.branch_merge_start(
+        "feature-branch", message="Merge divergent link pins", ignore_links=True
+    )
 
+    output = repo.branch_merge_start(
+        "feature-branch", message="Merge again", check=False
+    )
+    assert "already in progress" in output, (
+        f"A second merge start should report the open merge - Got:\n{output}"
+    )
+
+    repo.branch_merge_resolve_mine(link_path)
+    output = repo.commit("Merge divergent link pins")
+    assert "Commit succeeded" in output, f"Commit did not succeed - Got:\n{output}"
     assert link_pin(repo, source_repo.get_id()) == revision_two, (
-        "A refused merge should leave main's pin alone"
+        "The committed pin should be the row this branch held"
     )
 
 
 @pytest.mark.smoke
-def test_link_pin_update_divergent_creates_no_branch_for_a_merged_in_link(
+def test_merge_conflicts_list_names_a_branch_change(new_lore_repo):
+    """Sides tracking different branches of the linked repository read as that."""
+    link_path = "linked/repo"
+    repo, source_repo, _pin_base = _fixed_link_pinned_on_main(new_lore_repo, link_path)
+    revision_two = source_repo.branch_info().local_latest
+
+    source_repo.branch_create("other")
+    with source_repo.open_file("link-file.txt", "w+") as f:
+        f.writelines(["link source on another branch\n"])
+    source_repo.stage(scan=True)
+    source_repo.commit("Source revision on another branch")
+    source_repo.push()
+
+    repo.branch_create("feature-branch")
+    repo.link_update(link_path, pin="other@LATEST")
+    repo.commit("Track the other source branch on feature branch")
+    repo.push()
+
+    repo.branch_switch("main")
+    repo.link_update(link_path, pin=f"{revision_two}")
+    repo.commit("Pin link to the second revision on main")
+    repo.push()
+
+    repo.branch_merge_start("feature-branch", message="Merge divergent link rows")
+    output = repo.branch_merge_conflicts_list()
+
+    assert "branch change" in output, (
+        f"The kind should name the branch change - Got:\n{output}"
+    )
+    assert "Branch: other" in output, (
+        f"The branch the merged side tracks should be listed - Got:\n{output}"
+    )
+    assert "Branch: main" in output, (
+        f"The branch this side tracks should be listed - Got:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_merge_conflicts_list_follows_file_and_link_conflicts_until_settled(
     new_lore_repo,
 ):
-    """A merge refused for a divergent pin leaves the linked repositories it brings in alone."""
+    """`merge conflicts list` describes each conflict until a resolve settles it.
+
+    The file conflict stays listed while the link row is settled through the
+    folder holding its mount, so the row leaving the list is that resolve landing
+    rather than a walk that found nothing. Plain `merge resolve` keeps the side a
+    row was settled to, and a row can be settled again the other way.
+    """
+    link_path = "linked/repo"
+    repo, source_repo, revision_two, revision_three = _diverge_link_pins(
+        new_lore_repo, link_path
+    )
+
+    repo.branch_switch("feature-branch")
+    with repo.open_file("shared.txt", "w+") as f:
+        f.writelines(["feature\n"])
+    repo.stage(scan=True)
+    repo.commit("Feature edits shared.txt")
+    repo.push()
+
+    repo.branch_switch("main")
+    with repo.open_file("shared.txt", "w+") as f:
+        f.writelines(["main\n"])
+    repo.stage(scan=True)
+    repo.commit("Main edits shared.txt")
+    repo.push()
+
+    repo.branch_merge_start(
+        "feature-branch", message="Merge divergent link pins", no_commit=True
+    )
+
+    output = repo.branch_merge_conflicts_list()
+    assert "shared.txt" in output, (
+        f"The conflicted file should be listed - Got:\n{output}"
+    )
+    assert f"Link conflict: {link_path} (revision divergence)" in output, (
+        f"The link row should be listed with its kind - Got:\n{output}"
+    )
+    assert revision_two in output and revision_three in output, (
+        f"Both sides' revisions should be listed - Got:\n{output}"
+    )
+    assert "Second source revision" in output and "Third source revision" in output, (
+        f"The message of the revision each side pins should be listed - Got:\n{output}"
+    )
+
+    events = [
+        json.loads(line)
+        for line in repo.branch_merge_conflicts_list(json=True).strip().splitlines()
+    ]
+    assert [
+        event["data"]["linkPath"]
+        for event in events
+        if event["tagName"] == "branchMergeLinkPinConflict"
+    ] == [link_path], f"JSON output should carry the link row alone - Got:\n{events}"
+
+    output = repo.branch_merge_resolve_theirs("linked")
+    assert f"{link_path} (theirs)" in output, (
+        f"A folder holding the mount should settle its row - Got:\n{output}"
+    )
+
+    output = repo.branch_merge_conflicts_list()
+    assert "shared.txt" in output, (
+        f"The file still needing a side should stay listed - Got:\n{output}"
+    )
+    assert link_path not in output, (
+        f"The settled link row should have left the list - Got:\n{output}"
+    )
+
+    with repo.open_file("shared.txt", "w+") as f:
+        f.writelines(["resolved by hand\n"])
+    repo.branch_merge_resolve(["shared.txt", link_path])
+    assert _mounted_link_file(repo, link_path) == _REVISION_THREE_CONTENT, (
+        "A plain resolve should keep the side the row was settled to"
+    )
+
+    output = repo.branch_merge_resolve_mine(link_path)
+    assert f"{link_path} (mine)" in output, (
+        f"The resolve should report the side it settled the row to - Got:\n{output}"
+    )
+    assert _mounted_link_file(repo, link_path) == _REVISION_TWO_CONTENT, (
+        "Settling again should realize this branch's revision at the mount"
+    )
+
+    output = repo.commit("Merge divergent link pins")
+    assert "Commit succeeded" in output, f"Commit did not succeed - Got:\n{output}"
+    assert link_pin(repo, source_repo.get_id()) == revision_two, (
+        "The committed pin should be the one the last resolve chose"
+    )
+    with repo.open_file("shared.txt", "r") as f:
+        assert f.read() == "resolved by hand\n", (
+            "The file should keep the content the resolve settled on"
+        )
+
+
+def _link_readded_fixed_on_feature(
+    new_lore_repo, link_path: str, fixed: bool = True
+) -> tuple[Lore, Lore, str]:
+    """A link on main, re-added at a newer revision on a branch, fixed there where `fixed`
+    and following there otherwise."""
+    repo = make_repo(new_lore_repo, {"main-file.txt": "initial content\n"})
+    source_repo = make_repo(new_lore_repo, {"link-file.txt": "link source content\n"})
+    repo.link_add(link_path, source_repo.get_id(), "/", disable_branching=not fixed)
+    repo.commit("Add the link", non_interactive=True)
+    repo.push()
+
+    source_repo.write_commit_push("Second source revision", {"link-file.txt": "two\n"})
+    revision_two = source_repo.branch_info().local_latest
+    repo.branch_create("feature-branch")
+    repo.link_remove(link_path)
+    repo.commit("Remove the link", non_interactive=True)
+    repo.push()
+    repo.link_add(link_path, source_repo.get_id(), "/", disable_branching=fixed)
+    repo.commit("Re-add the link", non_interactive=True)
+    repo.push()
+
+    repo.branch_switch("main")
+    return repo, source_repo, revision_two
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("fixed", "flags"),
+    [(True, "DisableAutoFollow"), (False, "None")],
+    ids=["fixed", "unfixed"],
+)
+def test_link_row_flags_travel_with_a_one_sided_merge(new_lore_repo, fixed, flags):
+    """A row only the merged branch changed lands with its flags, not just its pin,
+    whether the merged branch made the link fixed or following."""
+    link_path = "linked/repo"
+    repo, source_repo, revision_two = _link_readded_fixed_on_feature(
+        new_lore_repo, link_path, fixed
+    )
+
+    repo.branch_merge_start(
+        "feature-branch", message="Merge the re-added link", non_interactive=True
+    )
+
+    assert link_pin(repo, source_repo.get_id()) == revision_two, (
+        "The merge should carry the merged branch's pin"
+    )
+    assert link_field(repo, source_repo.get_id(), "Flags") == flags, (
+        "The merge should carry the merged branch's flags with its pin"
+    )
+
+
+@pytest.mark.smoke
+def test_link_conflict_abort_of_one_link_keeps_the_others(new_lore_repo):
+    """Aborting one link of a merge restores that link and leaves the other rows to settle."""
+    repo = make_repo(new_lore_repo, {"main-file.txt": "main\n"})
+    sources = {
+        path: make_repo(new_lore_repo, {"file.txt": "one\n"})
+        for path in ("linked/first", "linked/second")
+    }
+    for path, source in sources.items():
+        repo.link_add(path, source.get_id(), "/", disable_branching=True)
+    repo.commit("Add the links")
+    repo.push()
+    pins = {}
+    for path, source in sources.items():
+        source.write_commit_push("Second revision", {"file.txt": "two\n"})
+        two = source.branch_info().local_latest
+        source.write_commit_push("Third revision", {"file.txt": "three\n"})
+        pins[path] = (two, source.branch_info().local_latest)
+
+    repo.branch_create("feature-branch")
+    for path, (_two, three) in pins.items():
+        repo.link_update(path, pin=three)
+    repo.commit("Pin the links to their third revisions")
+    repo.push()
+    repo.branch_switch("main")
+    for path, (two, _three) in pins.items():
+        repo.link_update(path, pin=two)
+    repo.commit("Pin the links to their second revisions")
+    repo.push()
+    repo.branch_merge_start("feature-branch", message="Merge feature-branch")
+
+    repo.branch_merge_abort(link="linked/first")
+
+    assert (
+        link_pin(repo, sources["linked/first"].get_id()) == pins["linked/first"][0]
+    ), "Aborting the first link should restore the row this branch held"
+    listed = repo.branch_merge_conflicts_list()
+    assert "Link conflict: linked/second" in listed, (
+        f"The other link's row should stay listed - Got:\n{listed}"
+    )
+    with pytest.raises(UnresolvedConflictError):
+        repo.commit("Merge feature-branch")
+
+    repo.branch_merge_resolve_theirs("linked/second")
+    output = repo.commit("Merge feature-branch")
+    assert "Commit succeeded" in output, f"Commit did not succeed - Got:\n{output}"
+    assert (
+        link_pin(repo, sources["linked/second"].get_id()) == pins["linked/second"][1]
+    ), "The committed row should be the one the merged branch held"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("same_file", [False, True], ids=["apart", "same-file"])
+def test_link_fixed_on_the_merged_branch_conflicts_with_its_own_merge(
+    new_lore_repo, same_file
+):
+    """A link both branches changed inside, which the merged branch also made fixed, holds its
+    own merge's result against the merged branch's fixed row, and abort restores the pre-merge
+    row and the files inside the link, a conflict there resolved included.
+
+    The link's own merge produces a revision on the linked branch this branch follows, so the
+    merged branch's flags cannot land on it.
+    """
+    link_path = "linked/repo"
+    repo = make_repo(new_lore_repo, {"main-file.txt": "main\n"})
+    source_repo = make_repo(
+        new_lore_repo, {"link-file.txt": "one\n", "other.txt": "other\n"}
+    )
+    repo.link_add(link_path, source_repo.get_id(), "/")
+    repo.commit("Add a following link", non_interactive=True)
+    repo.push()
+
+    def commit_inside_the_link(path, content, message):
+        with repo.open_file(f"{link_path}/{path}", "w+") as f:
+            f.write(content)
+        repo.stage(scan=True)
+        repo.commit(message, non_interactive=True)
+        repo.push()
+
+    repo.branch_create("feature-branch")
+    commit_inside_the_link(
+        "link-file.txt", "feature\n", "Feature edits inside the link"
+    )
+    feature_pin = link_pin(repo, source_repo.get_id())
+    repo.branch_switch("main")
+    commit_inside_the_link(
+        "link-file.txt" if same_file else "other.txt",
+        "main\n",
+        "Main edits inside the link",
+    )
+    repo.link_remove(link_path)
+    repo.commit("Remove the link", non_interactive=True)
+    repo.push()
+    repo.link_add(link_path, source_repo.get_id(), "/", disable_branching=True)
+    repo.commit("Add the link back fixed", non_interactive=True)
+    repo.push()
+    main_pin = link_pin(repo, source_repo.get_id())
+
+    repo.branch_switch("feature-branch")
+    if same_file:
+        repo.branch_merge_start("main", message="Merge main", non_interactive=True)
+        repo.write_files({f"{link_path}/link-file.txt": "main\n"})
+        repo.branch_merge_resolve(f"{link_path}/link-file.txt")
+    output = repo.branch_merge_start("main", message="Merge main", non_interactive=True)
+    assert f"Link conflict: {link_path}" in output, (
+        f"The merge should hold the row open - Got:\n{output}"
+    )
+
+    repo.branch_merge_resolve_theirs(link_path)
+    assert link_field(repo, source_repo.get_id(), "Flags") == "DisableAutoFollow"
+    assert link_pin(repo, source_repo.get_id()) == main_pin, (
+        "Theirs should be the merged branch's row with its own pin"
+    )
+
+    repo.branch_merge_abort()
+    assert link_field(repo, source_repo.get_id(), "Flags") == "None"
+    assert link_pin(repo, source_repo.get_id()) == feature_pin, (
+        "Abort should restore the row this branch held before the link's own merge"
+    )
+    assert mounted_files(repo, link_path) == {
+        "link-file.txt": "feature\n",
+        "other.txt": "other\n",
+    }
+
+
+@pytest.mark.smoke
+def test_link_pin_conflict_resolve_keeps_work_staged_in_the_link(new_lore_repo):
+    """Work staged inside a divergent link during the merge is this branch's side: settling to
+    mine keeps it, and taking theirs is refused rather than discard it."""
+    link_path = "linked/repo"
+    repo, _source_repo, _revision_two, _revision_three = _diverge_link_pins(
+        new_lore_repo, link_path
+    )
+    repo.branch_merge_start("feature-branch", message="Merge divergent link pins")
+
+    with repo.open_file(f"{link_path}/link-file.txt", "w+") as f:
+        f.write("staged during the merge\n")
+    repo.stage(f"{link_path}/link-file.txt")
+
+    repo.branch_merge_resolve()
+    assert _mounted_link_file(repo, link_path) == "staged during the merge\n", (
+        "Settling to mine should keep the work staged inside the link"
+    )
+    with pytest.raises(ImproperArgumentsError):
+        repo.branch_merge_resolve_theirs(link_path)
+    assert _mounted_link_file(repo, link_path) == "staged during the merge\n", (
+        "A refused resolve should leave the work staged inside the link"
+    )
+
+
+@pytest.mark.smoke
+def test_link_remount_kept_where_the_merged_pin_lacks_it_is_a_conflict(new_lore_repo):
+    """This branch remounting a link the merged branch repinned to a revision without that folder
+    holds the merge open, and theirs takes the merged branch's row whole."""
+    link_path = "linked/repo"
+    source_repo = make_repo(new_lore_repo, {"first/a.txt": "a\n", "top.txt": "top\n"})
+    pin_with_folder = source_repo.branch_info().local_latest
+    source_repo.rmtree("first")
+    source_repo.stage("first", scan=True)
+    source_repo.commit("Remove first/")
+    source_repo.push()
+    pin_without_folder = source_repo.branch_info().local_latest
+
+    repo = make_repo(new_lore_repo, {"main-file.txt": "main\n"})
+    repo.link_add(
+        link_path,
+        source_repo.get_id(),
+        "/",
+        disable_branching=True,
+        pin=pin_with_folder,
+    )
+    repo.commit("Add the link")
+    repo.push()
+
+    repo.branch_create("feature-branch")
+    repo.link_update(link_path, pin=pin_without_folder)
+    repo.commit("Repin to the revision without first/")
+    repo.push()
+
+    repo.branch_switch("main")
+    repo.link_remove(link_path)
+    repo.commit("Remove the link")
+    repo.link_add(
+        link_path,
+        source_repo.get_id(),
+        "first",
+        disable_branching=True,
+        pin=pin_with_folder,
+    )
+    repo.commit("Mount first/")
+    repo.push()
+
+    output = repo.branch_merge_start("feature-branch", message="Merge feature-branch")
+    assert f"Link conflict: {link_path} (mount change)" in output, (
+        f"The merge should hold the row open - Got:\n{output}"
+    )
+
+    repo.branch_merge_resolve_theirs(link_path)
+    assert link_pin(repo, source_repo.get_id()) == pin_without_folder
+    assert_mount_exposes(repo, link_path, "/", ["top.txt"])
+
+
+@pytest.mark.smoke
+def test_link_pin_conflict_stays_unsettled_when_the_resolve_is_refused(new_lore_repo):
+    """A resolve naming a divergent row and a conflict it cannot settle settles neither."""
+    repo = make_repo(
+        new_lore_repo, {"main-file.txt": "main\n", "shared/a.txt": "a original\n"}
+    )
+    source_repo = make_repo(new_lore_repo, {"link-file.txt": "one\n"})
+    folder_repo = make_repo(new_lore_repo, {"a.txt": "a original\n"})
+    repo.link_add("linked/repo", source_repo.get_id(), "/", disable_branching=True)
+    repo.commit("Add a fixed link")
+    repo.push()
+    source_repo.write_commit_push("Second source revision", {"link-file.txt": "two\n"})
+    revision_two = source_repo.branch_info().local_latest
+    source_repo.write_commit_push("Third source revision", {"link-file.txt": "three\n"})
+    revision_three = source_repo.branch_info().local_latest
+
+    repo.branch_create("feature-branch")
+    repo.link_update("linked/repo", pin=revision_three)
+    repo.rmtree("shared")
+    repo.stage("shared", scan=True)
+    repo.link_add("shared", folder_repo.get_id(), "/")
+    repo.commit("Repin the link and replace shared/ with a link")
+    repo.push()
+
+    repo.branch_switch("main")
+    repo.link_update("linked/repo", pin=revision_two)
+    repo.write_commit_push("Repin the link and change shared/", {"shared/a.txt": "a\n"})
+    repo.branch_merge_start("feature-branch", message="Merge feature-branch")
+
+    with pytest.raises(NotSupportedError):
+        repo.branch_merge_resolve_theirs(["linked/repo", "shared"])
+
+    listed = repo.branch_merge_conflicts_list()
+    assert "Link conflict: linked/repo" in listed, (
+        f"The row a refused resolve named should stay listed - Got:\n{listed}"
+    )
+    assert link_pin(repo, source_repo.get_id()) == revision_two, (
+        "A refused resolve should leave the row this branch holds"
+    )
+
+
+@pytest.mark.smoke
+def test_link_pin_conflict_follows_a_branch_created_while_the_merge_is_open(
+    new_lore_repo,
+):
+    """A branch created during the merge moves its divergent rows onto it, as it moves the
+    links themselves, so the row a resolve writes back follows the new branch."""
+    link_path = "linked/repo"
+    repo = make_repo(new_lore_repo, {"main-file.txt": "initial content\n"})
+    source_repo = make_repo(new_lore_repo, {"link-file.txt": "one\n"})
+    repo.link_add(link_path, source_repo.get_id(), "/")
+    repo.commit("Add a following link", non_interactive=True)
+    repo.push()
+    source_repo.branch_create("other")
+    source_repo.write_commit_push("Second source revision", {"link-file.txt": "two\n"})
+    revision_two = source_repo.branch_info().local_latest
+    source_repo.write_commit_push("Third source revision", {"link-file.txt": "three\n"})
+
+    repo.branch_create("feature-branch")
+    repo.link_update(link_path, pin=source_repo.branch_info().local_latest)
+    repo.commit("Pin the link to the other branch's latest", non_interactive=True)
+    repo.push()
+    repo.branch_switch("main")
+    repo.link_update(link_path, pin=revision_two)
+    repo.commit("Pin the link to an earlier revision", non_interactive=True)
+    repo.push()
+    repo.branch_merge_start(
+        "feature-branch", message="Merge divergent link pins", non_interactive=True
+    )
+
+    repo.branch_create("followed")
+    repo.branch_merge_resolve_mine(link_path)
+    output = repo.commit("Merge divergent link pins", non_interactive=True)
+    assert "Commit succeeded" in output, f"Commit did not succeed - Got:\n{output}"
+
+    assert link_field(repo, source_repo.get_id(), "Branch") == "followed", (
+        "The settled row should follow the branch created during the merge"
+    )
+    assert link_pin(repo, source_repo.get_id()) == revision_two, (
+        "The settled row should keep the pin this branch held"
+    )
+
+
+@pytest.mark.smoke
+def test_link_pin_conflict_creates_the_branch_for_a_merged_in_link(new_lore_repo):
+    """A merge held open by a divergent pin still brings in the links the merged branch adds,
+    with the branch they follow created in their own repository."""
     repo, _source_repo, _revision_two, _revision_three = _diverge_link_pins(
         new_lore_repo, "linked/repo"
     )
@@ -887,37 +1434,97 @@ def test_link_pin_update_divergent_creates_no_branch_for_a_merged_in_link(
     repo.push()
 
     repo.branch_switch("feature-branch")
-    with pytest.raises(LinkPinDivergedError):
-        repo.branch_merge_start("main", message="Merge divergent link pins")
+    repo.branch_merge_start("main", message="Merge divergent link pins")
 
+    listed = repo.branch_merge_conflicts_list()
+    assert "Link conflict: linked/repo" in listed, (
+        f"The divergent row should be listed - Got:\n{listed}"
+    )
     branches = sorted(entry["name"] for entry in remote_branch_entries(other_repo))
-    assert branches == ["main"], (
-        f"The merged-in linked repository should still hold only 'main'.\nGot: {branches}"
+    assert branches == ["feature-branch", "main"], (
+        f"The merged-in link should follow a branch of its own.\nGot: {branches}"
     )
 
 
 @pytest.mark.smoke
-def test_link_pin_update_divergent_detected_with_ignore_links(new_lore_repo):
-    """`--ignore-links` skips link content work but not the row comparison.
-
-    The parent's link list is parent state, so a row both branches moved is a
-    parent merge conflict that the flag does not suppress.
+def test_link_pin_conflict_resolve_writes_the_chosen_rows_flags(new_lore_repo):
+    """Rows pinning the same revision but carrying different flags are a conflict,
+    and settling it writes the flags of the side chosen.
     """
     link_path = "linked/repo"
-    repo, source_repo, revision_two, _revision_three = _diverge_link_pins(
+    repo, source_repo, revision_two = _link_readded_fixed_on_feature(
         new_lore_repo, link_path
     )
+    repo.link_update(link_path, pin=revision_two)
+    repo.commit("Pin the link to the same revision", non_interactive=True)
+    repo.push()
 
-    with pytest.raises(LinkPinDivergedError):
-        repo.branch_merge_start(
-            "feature-branch", message="Merge divergent link pins", ignore_links=True
-        )
-
-    assert link_pin(repo, source_repo.get_id()) == revision_two, (
-        "A refused merge should leave main's pin alone"
+    output = repo.branch_merge_start(
+        "feature-branch", message="Merge divergent link rows", non_interactive=True
+    )
+    assert f"Link conflict: {link_path} (flag change)" in output, (
+        f"The merge should name the flag change - Got:\n{output}"
     )
 
-    repo.branch_merge_abort()
+    repo.branch_merge_resolve_mine(link_path)
+    assert link_field(repo, source_repo.get_id(), "Flags") == "None", (
+        "Resolving mine should keep this branch's flags"
+    )
+
+    repo.branch_merge_resolve_theirs(link_path)
+    assert link_field(repo, source_repo.get_id(), "Flags") == "DisableAutoFollow", (
+        "Resolving theirs should write the merged branch's flags"
+    )
+
+    output = repo.commit("Merge divergent link rows", non_interactive=True)
+    assert "Commit succeeded" in output, f"Commit did not succeed - Got:\n{output}"
+    repo.push()
+    assert (
+        link_field(repo.clone(), source_repo.get_id(), "Flags") == "DisableAutoFollow"
+    ), "The committed row should carry the flags of the side chosen"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("abort_options", "kept"),
+    [
+        ({}, "mine"),
+        ({"link": "linked/repo"}, "mine"),
+        ({"ignore_links": True}, "theirs"),
+    ],
+    ids=["abort", "abort-link", "abort-ignore-links"],
+)
+def test_link_pin_conflict_abort_restores_the_whole_row(
+    new_lore_repo, abort_options, kept
+):
+    """Abort after a resolve realized the other side puts this branch's row back whole:
+    its pin, its flags and the content at the mount.
+
+    `--ignore-links` keeps the link rows the merge produced, so it keeps the side chosen.
+    """
+    link_path = "linked/repo"
+    repo, source_repo, revision_two = _link_readded_fixed_on_feature(
+        new_lore_repo, link_path
+    )
+    source_repo.write_commit_push("Third source revision", {"link-file.txt": "three\n"})
+    revision_three = source_repo.branch_info().local_latest
+    repo.link_update(link_path, pin=revision_three)
+    repo.commit("Pin the link to a newer revision", non_interactive=True)
+    repo.push()
+
+    repo.branch_merge_start(
+        "feature-branch", message="Merge divergent link rows", non_interactive=True
+    )
+    repo.branch_merge_resolve_theirs(link_path)
+    repo.branch_merge_abort(**abort_options)
+
+    flags, pin, content = {
+        "mine": ("None", revision_three, "three\n"),
+        "theirs": ("DisableAutoFollow", revision_two, "two\n"),
+    }[kept]
+    assert link_field(repo, source_repo.get_id(), "Flags") == flags
+    assert link_pin(repo, source_repo.get_id()) == pin
+    assert _mounted_link_file(repo, link_path) == content
 
 
 @pytest.mark.smoke
@@ -984,8 +1591,9 @@ def test_link_remount_on_the_target_survives_a_merged_pin_move(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_link_remount_divergent_does_not_silently_pick_a_side(new_lore_repo):
-    """Both branches remounting a link stops the merge instead of resolving it.
+def test_link_remount_divergent_is_a_conflict_either_side_settles(new_lore_repo):
+    """Both branches remounting a link holds the merge open on the mount each side chose,
+    and settling it mounts the chosen side's folder.
 
     The mount is the one part of a link its pin cannot express, so a side that moved it is
     invisible to the pin comparison and has to be judged on its own.
@@ -1002,10 +1610,24 @@ def test_link_remount_divergent_does_not_silently_pick_a_side(new_lore_repo):
     repo.branch_switch("main")
     remount(repo, link_path, source_repo.get_id(), "first")
 
-    with pytest.raises(LinkMountDivergedError):
-        repo.branch_merge_start("feature-branch", message="Merge divergent remounts")
-
+    output = repo.branch_merge_start(
+        "feature-branch", message="Merge divergent remounts"
+    )
+    assert f"Link conflict: {link_path} (mount change)" in output, (
+        f"The merge should name the mount change - Got:\n{output}"
+    )
+    assert "Source path: first" in output and "Source path: second" in output, (
+        f"Both sides' mounts should be listed - Got:\n{output}"
+    )
     assert_mount_exposes(repo, link_path, "first", ["a.txt"])
+
+    repo.branch_merge_resolve_theirs(link_path)
+    assert_mount_exposes(repo, link_path, "second", ["b.txt"])
+
+    output = repo.commit("Merge divergent remounts")
+    assert "Commit succeeded" in output, f"Commit did not succeed - Got:\n{output}"
+    repo.push()
+    assert_mount_source(repo.clone(), link_path, "second")
 
 
 # ---------------------------------------------------------------------------
@@ -1062,6 +1684,10 @@ def _assert_mount_conflict(
     )
     assert _conflicted_paths(parent) == ["shared"], (
         f"the conflict must be reported at the mount, got {_conflicted_paths(parent)}"
+    )
+    listed = parent.branch_merge_conflicts_list()
+    assert "shared" in listed.splitlines(), (
+        f"`merge conflicts list` must list the mount, got:\n{listed}"
     )
     assert parent.branch_info().local_latest == head_before, (
         "the merge must leave the branch on its pre-merge revision"
@@ -1522,12 +2148,13 @@ def test_abort_restores_a_link_holding_a_nested_link(new_lore_repo):
 
 @pytest.mark.smoke
 @pytest.mark.parametrize("link_only", [False, True], ids=["merge", "link"])
+@pytest.mark.parametrize("resolve", [None, "theirs", "marked"])
 def test_abort_restores_a_conflict_inside_a_link_mounted_from_a_folder(
-    new_lore_repo, link_only
+    new_lore_repo, link_only, resolve
 ):
     """Aborting a merge, or only its link's merge, that conflicts inside a link mounted from a
     folder restores the conflicted file from the folder and the link's pin, and leaves no copy
-    of either side."""
+    of either side, whether or not the conflict was resolved first."""
     link_path = "linked/repo"
     parent, source = make_parent_with_link(
         new_lore_repo,
@@ -1547,6 +2174,11 @@ def test_abort_restores_a_conflict_inside_a_link_mounted_from_a_folder(
     assert parent.unresolved_paths() == {conflicted}, (
         "the merge must conflict on the file both branches changed inside the link"
     )
+    if resolve == "theirs":
+        parent.branch_merge_resolve_theirs(conflicted)
+    elif resolve == "marked":
+        parent.write_files({conflicted: "merged\n"})
+        parent.branch_merge_resolve(conflicted)
 
     parent.branch_merge_abort(link=link_path if link_only else None)
 

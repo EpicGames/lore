@@ -145,6 +145,14 @@ def link_entry(repo: Lore, link_path: str) -> dict:
     return next(e for e in entries if e["linkPath"] == link_path)
 
 
+def link_field(repo: Lore, source_id: str, field: str) -> str:
+    """The first word of `field` in the `link list` entry for `source_id`."""
+    output = repo.link_list()
+    match = re.search(rf"Link\s+{source_id}.*?{field}:\s*(\w+)", output, re.DOTALL)
+    assert match, f"No {field} for {source_id} in link list:\n{output}"
+    return match.group(1)
+
+
 def link_pins(repo: Lore, source_id: str) -> list[str]:
     """The revisions the links to `source_id` pin, read from `link list`."""
     entries = parse_jsonl(repo.link_list(json=True), "linkEntry")

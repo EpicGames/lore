@@ -186,6 +186,7 @@ async fn restorable_link(
         linked_repository.clone(),
         source_path,
         at.node,
+        None,
     )
     .await
     .forward::<LinkError>("Failed checking link source paths")?;

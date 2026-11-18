@@ -167,12 +167,6 @@ class NotALinkError(LoreException): ...
 class LinkNotFoundError(LoreException): ...
 
 
-class LinkPinDivergedError(LoreException): ...
-
-
-class LinkMountDivergedError(LoreException): ...
-
-
 class LinkDivergedError(LoreException):
     """Raised when a push stops at a link whose branch has newer revisions on
     the remote than the local history holds."""
@@ -285,8 +279,6 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Nothing staged for commit", NothingStagedError),
     ("Path is not a link", NotALinkError),
     ("Link not found", LinkNotFoundError),
-    ("Link pin conflict at", LinkPinDivergedError),
-    ("Link mount conflict at", LinkMountDivergedError),
     ("Can't push the link at", LinkDivergedError),
     ("overlaps the link already mounted at", OverlappingLinkError),
     ("Path is not a layer", NotALayerError),

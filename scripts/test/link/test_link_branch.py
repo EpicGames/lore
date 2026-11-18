@@ -15,6 +15,7 @@ from link_helpers import (
     build_nested_link_repos_at,
     folder_replaced_by_a_link,
     link_entry,
+    link_field,
     link_pin_at,
     link_replaced_by_its_folder,
     make_parent_with_link,
@@ -130,9 +131,7 @@ def test_link_branching_and_pinning(new_lore_repo):
         "Case A: link list should show feature-test as the branch"
     )
 
-    # Verify no DisableAutoFollow flag
-    pattern_a_flags = rf"Link\s+{link_repo_a.get_id()}.*?Flags:\s+None"
-    assert re.search(pattern_a_flags, link_output, re.DOTALL), (
+    assert link_field(parent_repo, link_repo_a.get_id(), "Flags") == "None", (
         "Case A: link should have no flags set"
     )
 
@@ -169,9 +168,7 @@ def test_link_branching_and_pinning(new_lore_repo):
         "Case B: link should be pinned to the specified revision"
     )
 
-    # Verify no DisableAutoFollow flag
-    pattern_b_flags = rf"Link\s+{link_repo_b.get_id()}.*?Flags:\s+None"
-    assert re.search(pattern_b_flags, link_output, re.DOTALL), (
+    assert link_field(parent_repo, link_repo_b.get_id(), "Flags") == "None", (
         "Case B: link should have no flags set"
     )
 
@@ -199,13 +196,9 @@ def test_link_branching_and_pinning(new_lore_repo):
         "Case C: link list should show main as the branch (default branch fallback)"
     )
 
-    # Verify DisableAutoFollow flag is set
-    pattern_c_flags = (
-        rf"Link\s+{link_repo_c.get_id()}.*?Flags:\s+DisableAutoFollow \(0x1\)"
-    )
-    assert re.search(pattern_c_flags, link_output, re.DOTALL), (
-        "Case C: link should have DisableAutoFollow flag"
-    )
+    assert (
+        link_field(parent_repo, link_repo_c.get_id(), "Flags") == "DisableAutoFollow"
+    ), "Case C: link should have DisableAutoFollow flag"
 
     parent_repo.commit("Add link C")
     parent_repo.push()
@@ -248,13 +241,9 @@ def test_link_branching_and_pinning(new_lore_repo):
         "Case D: link should be pinned to the pinned-branch revision"
     )
 
-    # Verify DisableAutoFollow flag is set
-    pattern_d_flags = (
-        rf"Link\s+{link_repo_d.get_id()}.*?Flags:\s+DisableAutoFollow \(0x1\)"
-    )
-    assert re.search(pattern_d_flags, link_output, re.DOTALL), (
-        "Case D: link should have DisableAutoFollow flag"
-    )
+    assert (
+        link_field(parent_repo, link_repo_d.get_id(), "Flags") == "DisableAutoFollow"
+    ), "Case D: link should have DisableAutoFollow flag"
 
     parent_repo.commit("Add link D")
     parent_repo.push()

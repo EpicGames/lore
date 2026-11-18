@@ -66,6 +66,8 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * [`lore branch merge resolve mine`↴](#lore-branch-merge-resolve-mine)
 * [`lore branch merge resolve theirs`↴](#lore-branch-merge-resolve-theirs)
 * [`lore branch merge abort`↴](#lore-branch-merge-abort)
+* [`lore branch merge conflicts`↴](#lore-branch-merge-conflicts)
+* [`lore branch merge conflicts list`↴](#lore-branch-merge-conflicts-list)
 * [`lore branch diff`↴](#lore-branch-diff)
 * [`lore branch archive`↴](#lore-branch-archive)
 * [`lore branch reset`↴](#lore-branch-reset)
@@ -796,6 +798,7 @@ Merge two branches
 * `restart` — Restart the merge, resetting the current merge state
 * `resolve` — Resolves the merge
 * `abort` — Abort a merge process
+* `conflicts` — Conflicts held by the merge in progress
 
 ###### **Arguments:**
 
@@ -936,6 +939,22 @@ Abort a merge process
 
 * `--link <LINK>` — Abort only a specific linked repository merge at the given mount path
 * `--ignore-links` — Abort only the main repository merge, keeping link pin updates
+
+## `lore branch merge conflicts`
+
+Conflicts held by the merge in progress
+
+**Usage:** `lore branch merge conflicts <COMMAND>`
+
+###### **Subcommands:**
+
+* `list` — List every conflict the merge still holds
+
+## `lore branch merge conflicts list`
+
+List every conflict the merge still holds
+
+**Usage:** `lore branch merge conflicts list`
 
 ## `lore branch diff`
 

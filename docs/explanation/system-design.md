@@ -2651,6 +2651,16 @@ on, and the link pins the result: the pin it was given names a revision of the m
 branch's counterpart, which the target's need not hold. A link with an explicit branch keeps
 the pin it was given. A link the merged branch moves is merged where it moves to.
 
+A link's row, its pin, the branch it follows, its flags and the folder it mounts, is merged
+three ways against the common ancestor. A row only the merged branch changed lands whole. A
+row both branches changed is a conflict the merge holds open: the user settles it to either
+side's whole row with `branch merge resolve mine|theirs`, or to this branch's row with a plain
+`branch merge resolve`, and the commit is refused until then. Where both sides follow their own
+parent's branch, only the pin differs: it is left to the link's own merge, and otherwise stays.
+A row's branch is read under its own parent's branch, so a row following its parent names the
+same branch on either side. Which side was chosen is bookkeeping for the merge in progress and
+never reaches a committed revision.
+
 #### 22.4 Link-scoped committing and single-link merging
 
 By default, committing and merging in Lore cascade through the parent and any linked

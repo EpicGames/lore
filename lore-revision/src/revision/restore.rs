@@ -481,7 +481,7 @@ pub(crate) async fn restore(
     .forward::<RestoreError>("weaving history")?;
 
     let signature = new_state
-        .serialize(repository.clone(), token)
+        .serialize_committed(repository.clone(), token)
         .await
         .forward::<RestoreError>("serializing new state")?;
 

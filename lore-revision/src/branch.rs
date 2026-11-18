@@ -3479,6 +3479,12 @@ async fn create_linked_branches(
             )
         });
     }
+    if let Some(state_staged) = state_staged
+        && let Err(err) = follow_merge_entries(repository, state_staged, &groups).await
+    {
+        delete_linked_branches(created, cascade.branch).await;
+        return Err(err);
+    }
 
     let index: HashMap<RepositoryId, usize> = repositories
         .iter()
@@ -3507,6 +3513,31 @@ async fn create_linked_branches(
             Err(err)
         }
     }
+}
+
+/// An open merge writes its rows back on a resolve or an abort, so they follow the new branch as
+/// the staged rows do.
+async fn follow_merge_entries(
+    repository: &Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    groups: &[(RepositoryId, Vec<CascadeMount>)],
+) -> Result<(), BranchError> {
+    let followed: Vec<RepositoryId> = groups.iter().map(|(link_id, _)| *link_id).collect();
+    let mut entries = state_staged
+        .deserialize_link_merge_state(repository.clone())
+        .await
+        .forward::<BranchError>("Failed to deserialize link merge state")?;
+    let mut moved = false;
+    for entry in &mut entries {
+        moved |= entry.follow_parent_branch(&followed);
+    }
+    if moved {
+        state_staged
+            .serialize_link_merge_state(repository.clone(), &entries)
+            .await
+            .forward::<BranchError>("Failed to serialize link merge state")?;
+    }
+    Ok(())
 }
 
 /// `reached` with the link whose pin its branch starts at: the newest of the pins of the links
@@ -3905,7 +3936,7 @@ async fn store_repin_revision(
     .forward::<BranchError>("Failed to weave history")?;
 
     state
-        .serialize(repository.clone(), cascade.token)
+        .serialize_committed(repository.clone(), cascade.token)
         .await
         .forward::<BranchError>("Failed to serialize revision state")
 }

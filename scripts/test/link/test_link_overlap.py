@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
 import pytest
-from error_types import OverlappingLinkError
+from error_types import ImproperArgumentsError, OverlappingLinkError
 from link_helpers import parse_revision_diff
 from test_utils import unstaged_entries, working_tree_files
 
@@ -135,6 +135,34 @@ def test_link_add_allows_non_nesting_source_paths(new_lore_repo):
         assert f.read() == _OVERLAP_LINK_FILES["sub/other/sibling.txt"]
     with parent.open_file("vendor/second/test/inner.txt") as f:
         assert f.read() == _OVERLAP_LINK_FILES["sub/test/inner.txt"]
+
+
+@pytest.mark.smoke
+def test_link_mounts_of_one_folder_must_agree_on_branch_and_flags(new_lore_repo):
+    """Mounts exposing one folder have to track the same branch with the same flags.
+
+    Mounts of separate folders expose separate subtrees, so they are free to differ.
+    """
+    parent, link_repo = _parent_and_link_for_overlap(new_lore_repo)
+    parent.link_add("vendor/test", link_repo.get_id(), "sub/test")
+
+    with pytest.raises(ImproperArgumentsError):
+        parent.link_add(
+            "vendor/again", link_repo.get_id(), "sub/test", disable_branching=True
+        )
+
+    parent.link_add("vendor/again", link_repo.get_id(), "sub/test")
+    parent.link_add(
+        "vendor/other", link_repo.get_id(), "sub/other", disable_branching=True
+    )
+    parent.commit("Add links")
+    parent.push()
+
+    for mount in ("vendor/test", "vendor/again"):
+        with parent.open_file(f"{mount}/inner.txt") as f:
+            assert f.read() == _OVERLAP_LINK_FILES["sub/test/inner.txt"]
+    with parent.open_file("vendor/other/sibling.txt") as f:
+        assert f.read() == _OVERLAP_LINK_FILES["sub/other/sibling.txt"]
 
 
 @pytest.mark.smoke

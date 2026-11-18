@@ -36,6 +36,7 @@ use crate::repository::clone::LoreRepositoryCloneEndEventData;
 use crate::stage;
 use crate::stage::KnownChild;
 use crate::stage::StageOptions;
+use crate::state::LinkReference;
 use crate::state::NodeMapping;
 use crate::state::State;
 use crate::state::StateNodeChildrenIterator;
@@ -277,12 +278,27 @@ pub async fn add(
             .await
             .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
 
+    let (link_flags, stored_branch) = if disable_branching {
+        lore_debug!("Disabled auto-follow for link {}", link.id);
+        (LinkFlags::DisableAutoFollow, link_branch)
+    } else {
+        (LinkFlags::NoFlags, BranchId::default())
+    };
+
     link::check_source_path_overlap(
         &inner_state,
         inner_repository.clone(),
         link.clone(),
         resolved_source_path,
         crate::node::INVALID_NODE,
+        Some((
+            LinkReference {
+                branch: stored_branch,
+                flags: link_flags.into(),
+                ..Default::default()
+            },
+            current_branch,
+        )),
     )
     .await
     .forward::<LinkError>("Failed checking link source paths")?;
@@ -359,13 +375,6 @@ pub async fn add(
     )
     .await
     .forward::<LinkError>("Failed staging the link node")?;
-
-    let (link_flags, stored_branch) = if disable_branching {
-        lore_debug!("Disabled auto-follow for link {}", link.id);
-        (LinkFlags::DisableAutoFollow, link_branch)
-    } else {
-        (LinkFlags::NoFlags, BranchId::default())
-    };
 
     inner_state
         .link_add(

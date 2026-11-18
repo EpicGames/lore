@@ -261,6 +261,14 @@ typedef enum lore_repository_instance_clone_phase_t {
   LORE_REPOSITORY_INSTANCE_CLONE_PHASE_REGISTERING = 3,
 } lore_repository_instance_clone_phase_t;
 
+// Which side a divergent link row was settled to.
+typedef enum lore_link_pin_resolution_t {
+  // The row this branch held.
+  LORE_LINK_PIN_RESOLUTION_MINE = 0,
+  // The row the merged branch held.
+  LORE_LINK_PIN_RESOLUTION_THEIRS = 1,
+} lore_link_pin_resolution_t;
+
 // Which authentication path a client takes if a server advertises both its
 // gRPC auth service and an OIDC issuer. A path the server does not
 // advertise cannot be taken.
@@ -3717,6 +3725,40 @@ typedef struct lore_revision_graph_branch_synced_event_data_t {
   struct lore_hash_t local_latest;
 } lore_revision_graph_branch_synced_event_data_t;
 
+// One side of a link row the two branches disagree on.
+typedef struct lore_link_pin_side_data_t {
+  // The branch the row resolves to.
+  lore_branch_id_t branch;
+  // The revision the row pins.
+  struct lore_hash_t revision;
+  // The row's flags: `1` where the link does not follow the parent's branches.
+  uint32_t flags;
+  // The path in the linked repository the row mounts, empty when it cannot be read.
+  struct lore_string_t source_path;
+  // Message of the revision the row pins, empty when it cannot be read.
+  struct lore_string_t message;
+} lore_link_pin_side_data_t;
+
+// Data for the event sent when a link row diverges across a merge.
+typedef struct lore_branch_merge_link_pin_conflict_event_data_t {
+  // The mount path of the divergent link.
+  struct lore_string_t link_path;
+  // The repository both sides point at.
+  lore_repository_id_t repository;
+  // The row this branch holds.
+  struct lore_link_pin_side_data_t mine;
+  // The row the merged branch holds.
+  struct lore_link_pin_side_data_t theirs;
+} lore_branch_merge_link_pin_conflict_event_data_t;
+
+// Data for the event sent when a divergent link row is settled.
+typedef struct lore_branch_merge_link_pin_resolved_event_data_t {
+  // The mount path of the settled link.
+  struct lore_string_t link_path;
+  // The side the row was settled to.
+  enum lore_link_pin_resolution_t resolution;
+} lore_branch_merge_link_pin_resolved_event_data_t;
+
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
 enum lore_event_id_t {
@@ -4226,6 +4268,10 @@ enum lore_event_id_t {
   LORE_EVENT_REVISION_GRAPH_BRANCH_METADATA,
   // A branch sync's outcome.
   LORE_EVENT_REVISION_GRAPH_BRANCH_SYNCED,
+  // A link row both branches changed, which the merge holds open.
+  LORE_EVENT_BRANCH_MERGE_LINK_PIN_CONFLICT,
+  // A divergent link row was settled to one side.
+  LORE_EVENT_BRANCH_MERGE_LINK_PIN_RESOLVED,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -4484,6 +4530,8 @@ typedef struct lore_event_t {
     struct lore_revision_graph_location_complete_event_data_t revision_graph_location_complete;
     struct lore_revision_graph_branch_metadata_event_data_t revision_graph_branch_metadata;
     struct lore_revision_graph_branch_synced_event_data_t revision_graph_branch_synced;
+    struct lore_branch_merge_link_pin_conflict_event_data_t branch_merge_link_pin_conflict;
+    struct lore_branch_merge_link_pin_resolved_event_data_t branch_merge_link_pin_resolved;
   };
 } lore_event_t;
 
@@ -4761,6 +4809,11 @@ typedef struct lore_branch_merge_abort_args_t {
   // Abort only the main repository merge, keeping link pin updates
   uint8_t ignore_links;
 } lore_branch_merge_abort_args_t;
+
+// Arguments for listing the conflicts an open merge holds.
+typedef struct lore_branch_merge_conflicts_list_args_t {
+  int _unused;
+} lore_branch_merge_conflicts_list_args_t;
 
 // Arguments for marking resolved merge paths as unresolved again.
 typedef struct lore_branch_merge_unresolve_args_t {
@@ -7738,6 +7791,60 @@ void lore_branch_merge_abort_async(const struct lore_global_args_t *globals,
                                    const struct lore_branch_merge_abort_args_t *args,
                                    struct lore_event_callback_config_t callback);
 
+// List every conflict the open merge still holds, files and link rows alike.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Branch Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_BRANCH_MERGE_CONFLICT_FILE` | `lore_branch_merge_conflict_file_event_data_t` | Emitted for each file still in conflict |
+// | `LORE_EVENT_BRANCH_MERGE_LINK_PIN_CONFLICT` | `lore_branch_merge_link_pin_conflict_event_data_t` | Emitted for each link row still awaiting a side |
+int32_t lore_branch_merge_conflicts_list(const struct lore_global_args_t *globals,
+                                         const struct lore_branch_merge_conflicts_list_args_t *args,
+                                         struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_branch_merge_conflicts_list`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Branch Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_BRANCH_MERGE_CONFLICT_FILE` | `lore_branch_merge_conflict_file_event_data_t` | Emitted for each file still in conflict |
+// | `LORE_EVENT_BRANCH_MERGE_LINK_PIN_CONFLICT` | `lore_branch_merge_link_pin_conflict_event_data_t` | Emitted for each link row still awaiting a side |
+void lore_branch_merge_conflicts_list_async(const struct lore_global_args_t *globals,
+                                            const struct lore_branch_merge_conflicts_list_args_t *args,
+                                            struct lore_event_callback_config_t callback);
+
 // Mark conflicting files in a merge as unresolved.
 //
 // # Events
@@ -7896,6 +8003,7 @@ void lore_branch_merge_into_async(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_BRANCH_MERGE_RESOLVE_FILE` | `lore_branch_merge_resolve_file_event_data_t` | Emitted for each file that was marked as resolved |
+// | `LORE_EVENT_BRANCH_MERGE_LINK_PIN_RESOLVED` | `lore_branch_merge_link_pin_resolved_event_data_t` | Emitted for each link row settled, naming the side it was settled to |
 // | `LORE_EVENT_BRANCH_MERGE_RESOLVE_REVISION` | `lore_branch_merge_resolve_revision_event_data_t` | Emitted with the updated staged revision after resolve completes |
 int32_t lore_branch_merge_resolve(const struct lore_global_args_t *globals,
                                   const struct lore_branch_merge_resolve_args_t *args,
@@ -7923,6 +8031,7 @@ int32_t lore_branch_merge_resolve(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_BRANCH_MERGE_RESOLVE_FILE` | `lore_branch_merge_resolve_file_event_data_t` | Emitted for each file that was marked as resolved |
+// | `LORE_EVENT_BRANCH_MERGE_LINK_PIN_RESOLVED` | `lore_branch_merge_link_pin_resolved_event_data_t` | Emitted for each link row settled, naming the side it was settled to |
 // | `LORE_EVENT_BRANCH_MERGE_RESOLVE_REVISION` | `lore_branch_merge_resolve_revision_event_data_t` | Emitted with the updated staged revision after resolve completes |
 void lore_branch_merge_resolve_async(const struct lore_global_args_t *globals,
                                      const struct lore_branch_merge_resolve_args_t *args,
@@ -7950,6 +8059,7 @@ void lore_branch_merge_resolve_async(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_BRANCH_MERGE_RESOLVE_FILE` | `lore_branch_merge_resolve_file_event_data_t` | Emitted for each file resolved by keeping "mine" |
+// | `LORE_EVENT_BRANCH_MERGE_LINK_PIN_RESOLVED` | `lore_branch_merge_link_pin_resolved_event_data_t` | Emitted for each link row settled, naming the side it was settled to |
 // | `LORE_EVENT_BRANCH_MERGE_RESOLVE_REVISION` | `lore_branch_merge_resolve_revision_event_data_t` | Emitted with the updated staged revision |
 int32_t lore_branch_merge_resolve_mine(const struct lore_global_args_t *globals,
                                        const struct lore_branch_merge_resolve_mine_args_t *args,
@@ -7977,6 +8087,7 @@ int32_t lore_branch_merge_resolve_mine(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_BRANCH_MERGE_RESOLVE_FILE` | `lore_branch_merge_resolve_file_event_data_t` | Emitted for each file resolved by keeping "mine" |
+// | `LORE_EVENT_BRANCH_MERGE_LINK_PIN_RESOLVED` | `lore_branch_merge_link_pin_resolved_event_data_t` | Emitted for each link row settled, naming the side it was settled to |
 // | `LORE_EVENT_BRANCH_MERGE_RESOLVE_REVISION` | `lore_branch_merge_resolve_revision_event_data_t` | Emitted with the updated staged revision |
 void lore_branch_merge_resolve_mine_async(const struct lore_global_args_t *globals,
                                           const struct lore_branch_merge_resolve_mine_args_t *args,
@@ -8004,6 +8115,7 @@ void lore_branch_merge_resolve_mine_async(const struct lore_global_args_t *globa
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_BRANCH_MERGE_RESOLVE_FILE` | `lore_branch_merge_resolve_file_event_data_t` | Emitted for each file resolved by keeping "theirs" |
+// | `LORE_EVENT_BRANCH_MERGE_LINK_PIN_RESOLVED` | `lore_branch_merge_link_pin_resolved_event_data_t` | Emitted for each link row settled, naming the side it was settled to |
 // | `LORE_EVENT_BRANCH_MERGE_RESOLVE_REVISION` | `lore_branch_merge_resolve_revision_event_data_t` | Emitted with the updated staged revision |
 int32_t lore_branch_merge_resolve_theirs(const struct lore_global_args_t *globals,
                                          const struct lore_branch_merge_resolve_theirs_args_t *args,
@@ -8031,6 +8143,7 @@ int32_t lore_branch_merge_resolve_theirs(const struct lore_global_args_t *global
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_BRANCH_MERGE_RESOLVE_FILE` | `lore_branch_merge_resolve_file_event_data_t` | Emitted for each file resolved by keeping "theirs" |
+// | `LORE_EVENT_BRANCH_MERGE_LINK_PIN_RESOLVED` | `lore_branch_merge_link_pin_resolved_event_data_t` | Emitted for each link row settled, naming the side it was settled to |
 // | `LORE_EVENT_BRANCH_MERGE_RESOLVE_REVISION` | `lore_branch_merge_resolve_revision_event_data_t` | Emitted with the updated staged revision |
 void lore_branch_merge_resolve_theirs_async(const struct lore_global_args_t *globals,
                                             const struct lore_branch_merge_resolve_theirs_args_t *args,
@@ -8116,6 +8229,7 @@ void lore_branch_merge_restart_async(const struct lore_global_args_t *globals,
 // | `LORE_EVENT_BRANCH_MERGE_START_BEGIN` | `lore_branch_merge_start_begin_event_data_t` | Emitted when merge begins, includes source branch and revision info |
 // | `LORE_EVENT_BRANCH_MERGE_START_END` | `lore_branch_merge_start_end_event_data_t` | Emitted when merge operation completes, includes sync stats and conflict flag |
 // | `LORE_EVENT_BRANCH_MERGE_CONFLICT_FILE` | `lore_branch_merge_conflict_file_event_data_t` | Emitted for each file with an unresolved merge conflict |
+// | `LORE_EVENT_BRANCH_MERGE_LINK_PIN_CONFLICT` | `lore_branch_merge_link_pin_conflict_event_data_t` | Emitted for each link row both branches changed, which the merge holds open |
 // | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted during the apply_diff phase of the merge |
 // | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file modified during merge realization |
 // | `LORE_EVENT_FILE_STAGE_FILE` | `lore_file_stage_file_event_data_t` | Emitted for each file staged for deletion during merge realization |
@@ -8153,6 +8267,7 @@ int32_t lore_branch_merge_start(const struct lore_global_args_t *globals,
 // | `LORE_EVENT_BRANCH_MERGE_START_BEGIN` | `lore_branch_merge_start_begin_event_data_t` | Emitted when merge begins, includes source branch and revision info |
 // | `LORE_EVENT_BRANCH_MERGE_START_END` | `lore_branch_merge_start_end_event_data_t` | Emitted when merge operation completes, includes sync stats and conflict flag |
 // | `LORE_EVENT_BRANCH_MERGE_CONFLICT_FILE` | `lore_branch_merge_conflict_file_event_data_t` | Emitted for each file with an unresolved merge conflict |
+// | `LORE_EVENT_BRANCH_MERGE_LINK_PIN_CONFLICT` | `lore_branch_merge_link_pin_conflict_event_data_t` | Emitted for each link row both branches changed, which the merge holds open |
 // | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted during the apply_diff phase of the merge |
 // | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file modified during merge realization |
 // | `LORE_EVENT_FILE_STAGE_FILE` | `lore_file_stage_file_event_data_t` | Emitted for each file staged for deletion during merge realization |

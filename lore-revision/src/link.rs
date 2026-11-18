@@ -1824,7 +1824,7 @@ pub(crate) async fn links_and_merged(
         .map(|link| {
             let merged = entries
                 .iter()
-                .any(|entry| entry.local_node == link.local_node);
+                .any(|entry| !entry.is_conflict() && entry.local_node == link.local_node);
             (link, merged)
         })
         .collect())
@@ -2435,6 +2435,7 @@ pub async fn check_incoming_mount_overlaps(
             link_context,
             source_path.clone(),
             change.from.mapping.node,
+            None,
         )
         .await?;
 
@@ -2470,13 +2471,16 @@ pub fn source_paths_nest(left: &RelativePath, right: &RelativePath) -> bool {
 /// `source_path` must be the path as stored in the linked repository, so that it
 /// compares directly against what the existing mounts resolve to.
 /// `exclude_node` is the mount being written, which must not be compared against
-/// itself.
+/// itself. With `row`, the row the mount is to hold under a parent on the given
+/// branch, a mount of the same folder also has to resolve to the same branch with
+/// the same flags, since both expose one subtree.
 pub async fn check_source_path_overlap(
     state: &State,
     repository: Arc<RepositoryContext>,
     link_context: Arc<RepositoryContext>,
     source_path: RelativePath,
     exclude_node: NodeID,
+    row: Option<(LinkReference, BranchId)>,
 ) -> Result<(), StateError> {
     let link_list = state
         .link_list(repository.clone())
@@ -2499,7 +2503,13 @@ pub async fn check_source_path_overlap(
 
         let mounted_source = pinned_source_path(link_context.clone(), &link_node).await?;
 
-        if !source_paths_nest(&source_path, &mounted_source) {
+        let disagrees = source_path.as_lowercase_str() == mounted_source.as_lowercase_str()
+            && row.is_some_and(|(row, parent_branch)| {
+                row.flags != link_reference.flags
+                    || row.resolve_branch(parent_branch)
+                        != link_reference.resolve_branch(parent_branch)
+            });
+        if !disagrees && !source_paths_nest(&source_path, &mounted_source) {
             continue;
         }
 
@@ -2507,6 +2517,18 @@ pub async fn check_source_path_overlap(
             .node_path(repository.clone(), link_reference.local_node)
             .await
             .forward::<StateError>("Failed resolving link node")?;
+
+        if disagrees {
+            return Err(InvalidArguments {
+                reason: format!(
+                    "source path {} is already mounted at {} on another branch or with other \
+                     flags; mounts of the same folder have to agree on both",
+                    display_path(source_path.as_str()),
+                    display_path(&link_path),
+                ),
+            }
+            .into());
+        }
 
         return Err(InvalidArguments {
             reason: format!(
@@ -2810,7 +2832,7 @@ pub async fn stage_link_pin(
 /// Which side decides a link pin that the two sides of a merge disagree on.
 pub enum LinkPinResolution {
     /// Adopt the incoming pin only when the target left it at the base revision.
-    /// Both sides having moved it is a conflict.
+    /// Both sides having changed it is a conflict for the user to settle.
     ThreeWay(Arc<State>),
     /// Adopt the incoming pin whatever the target holds. For an operation whose
     /// target branch is required to already be merged into the incoming branch.
@@ -2828,9 +2850,8 @@ pub struct CarriedLinkPin {
 pub struct PlannedLinkPin {
     pub link_path: String,
     link_node: Node,
-    target_pin: Hash,
-    incoming_pin: Hash,
-    branch: BranchId,
+    target: LinkReference,
+    incoming: LinkReference,
     /// The path the merged branch mounts and its node at the pin the link lands on, for a remount.
     remount: Option<(RelativePath, NodeID)>,
 }
@@ -2843,6 +2864,30 @@ impl PlannedLinkPin {
             None => LinkMountSource::SamePath,
         }
     }
+}
+
+/// A link row no single side of a merge owns: both changed its pin, branch, flags or mount away
+/// from their common ancestor, or neither had an ancestor to change it from. Each side's mount is
+/// a node of the revision that side pins.
+pub struct LinkPinConflict {
+    pub link_path: String,
+    pub source: LinkReference,
+    pub source_mount: NodeID,
+    pub target: LinkReference,
+    pub target_mount: NodeID,
+}
+
+/// What comparing the parent's link rows across a merge found.
+#[derive(Default)]
+pub struct LinkPinClassification {
+    pub planned: Vec<PlannedLinkPin>,
+    pub conflicts: Vec<LinkPinConflict>,
+}
+
+/// What comparing one link row across a merge found.
+enum LinkPinClass {
+    Planned(PlannedLinkPin),
+    Conflict(LinkPinConflict),
 }
 
 /// Check the working tree against what [`apply_link_pins`] realizes for `planned`, refusing where a
@@ -2869,8 +2914,8 @@ pub async fn verify_link_pins(
             &link_context,
             LinkPinRealizeTarget {
                 link_path,
-                old_signature: planned_pin.target_pin,
-                new_signature: planned_pin.incoming_pin,
+                old_signature: planned_pin.target.signature(),
+                new_signature: planned_pin.incoming.signature(),
                 current_node: planned_pin.link_node.child,
                 mount_source: planned_pin.mount_source(),
             },
@@ -3026,24 +3071,69 @@ pub(crate) async fn merged_link_path(
     Ok(Some(path))
 }
 
-/// Compare the parent's link rows across a merge and return the ones the
-/// incoming state moved on its own. A row both sides moved is an error.
+/// The row `rows` hold for the link at `node_id`, pinned at the revision its tree node carries, or
+/// `fallback`'s branch and flags where the registry has no row for it.
+fn link_row(
+    rows: &LinkRows,
+    node_id: NodeID,
+    node: &Node,
+    fallback: &LinkReference,
+) -> LinkReference {
+    let link_id: RepositoryId = node.address.context.into();
+    rows.row(node_id, link_id)
+        .unwrap_or(LinkReference {
+            repository: link_id,
+            local_node: node_id,
+            ..*fallback
+        })
+        .with_signature(node.address.hash)
+}
+
+/// The branch `state`'s revision was committed on, which its auto-following rows resolve to.
+async fn parent_branch(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+) -> Result<BranchId, LinkError> {
+    if state.metadata_hash().is_zero() {
+        return Ok(BranchId::default());
+    }
+    Ok(state
+        .revision_metadata(repository.clone())
+        .await
+        .forward::<LinkError>("Failed reading the branch a revision is on")?
+        .branch)
+}
+
+/// The states a merge's link rows are compared between, with the branch each was committed on, and
+/// the rows of the two the comparison looks rows up in.
+struct LinkPinSides<'a> {
+    staged: &'a Arc<State>,
+    staged_branch: BranchId,
+    incoming: LinkRows,
+    incoming_branch: BranchId,
+    base: Option<(LinkRows, BranchId)>,
+}
+
+/// Compare the parent's link rows across a merge, separating the ones the
+/// incoming state changed on its own from the ones both sides changed.
 ///
 /// The parent-level diff never carries a pin change, so the rows are compared
-/// here instead. Only explicitly pinned links are considered: an auto-following
-/// link's pin only means something on the parent branch whose mirror produced
-/// it, so it moves by its own branch merge. Links whose node is in `skip_nodes`
-/// keep the pin they have.
+/// here instead. Where both sides follow their own parent's branch, the pin only
+/// means something on the parent branch whose mirror produced it, so it moves by
+/// the link's own branch merge. Links whose node is in `skip_nodes` keep the pin
+/// that merge gave them.
 pub fn classify_link_pins<'a>(
     repository: Arc<RepositoryContext>,
     state_staged: &'a Arc<State>,
+    staged_branch: BranchId,
     state_incoming: &'a Arc<State>,
     resolution: LinkPinResolution,
     skip_nodes: &'a [NodeID],
-) -> impl Future<Output = Result<Vec<PlannedLinkPin>, LinkError>> + 'a {
+) -> impl Future<Output = Result<LinkPinClassification, LinkError>> + 'a {
     classify_link_pins_except(
         repository,
         state_staged,
+        staged_branch,
         state_incoming,
         resolution,
         skip_nodes,
@@ -3059,13 +3149,15 @@ pub fn classify_link_pins<'a>(
 pub fn classify_link_pins_before_merge<'a>(
     repository: Arc<RepositoryContext>,
     state_current: &'a Arc<State>,
+    current_branch: BranchId,
     state_incoming: &'a Arc<State>,
     resolution: LinkPinResolution,
     left_out: &'a [NodeID],
-) -> impl Future<Output = Result<Vec<PlannedLinkPin>, LinkError>> + 'a {
+) -> impl Future<Output = Result<LinkPinClassification, LinkError>> + 'a {
     classify_link_pins_except(
         repository,
         state_current,
+        current_branch,
         state_incoming,
         resolution,
         &[],
@@ -3077,62 +3169,92 @@ pub fn classify_link_pins_before_merge<'a>(
 async fn classify_link_pins_except(
     repository: Arc<RepositoryContext>,
     state_staged: &Arc<State>,
+    staged_branch: BranchId,
     state_incoming: &Arc<State>,
     resolution: LinkPinResolution,
     skip_nodes: &[NodeID],
     left_out: &[NodeID],
-) -> Result<Vec<PlannedLinkPin>, LinkError> {
+) -> Result<LinkPinClassification, LinkError> {
     let mut link_list = state_staged
         .link_list(repository.clone())
         .await
         .forward::<LinkError>("Failed to list links")?;
     link_list.retain(|link_reference| !left_out.contains(&link_reference.local_node));
+    if link_list.is_empty() {
+        return Ok(LinkPinClassification::default());
+    }
 
-    // Classify every link before changing any of them, so a divergent pin stops
-    // the operation with nothing carried.
-    let planned = try_join_links(
+    let state_base = match &resolution {
+        LinkPinResolution::ThreeWay(state_base) => Some(state_base),
+        LinkPinResolution::Incoming => None,
+    };
+    let (incoming_branch, incoming, base) = tokio::try_join!(
+        parent_branch(state_incoming, &repository),
+        LinkRows::read(state_incoming, repository.clone()),
+        async {
+            match state_base {
+                Some(state_base) => Ok(Some((
+                    LinkRows::read(state_base, repository.clone()).await?,
+                    parent_branch(state_base, &repository).await?,
+                ))),
+                None => Ok(None),
+            }
+        },
+    )?;
+    let sides = LinkPinSides {
+        staged: state_staged,
+        staged_branch,
+        incoming,
+        incoming_branch,
+        base,
+    };
+
+    // Classify every link before changing any of them, so a divergent row is
+    // recorded with nothing carried.
+    let classes = try_join_links(
         link_list
             .iter()
             .map(|link_reference| {
-                classify_link_pin(
-                    &repository,
-                    state_staged,
-                    state_incoming,
-                    &resolution,
-                    skip_nodes,
-                    link_reference,
-                )
+                classify_link_pin(&repository, &sides, skip_nodes, link_reference)
             })
             .collect(),
     )
     .await?;
 
-    Ok(planned.into_iter().flatten().collect())
+    let mut classification = LinkPinClassification::default();
+    for class in classes.into_iter().flatten() {
+        match class {
+            LinkPinClass::Planned(planned) => classification.planned.push(planned),
+            LinkPinClass::Conflict(conflict) => classification.conflicts.push(conflict),
+        }
+    }
+    Ok(classification)
 }
 
 /// [`classify_link_pins`] for one link.
 async fn classify_link_pin(
     repository: &Arc<RepositoryContext>,
-    state_staged: &Arc<State>,
-    state_incoming: &Arc<State>,
-    resolution: &LinkPinResolution,
+    sides: &LinkPinSides<'_>,
     skip_nodes: &[NodeID],
     link_reference: &LinkReference,
-) -> Result<Option<PlannedLinkPin>, LinkError> {
-    let link_path = state_staged
+) -> Result<Option<LinkPinClass>, LinkError> {
+    let link_path = sides
+        .staged
         .node_path(repository.clone(), link_reference.local_node)
         .await
         .forward::<LinkError>("Failed resolving link node path")?;
 
-    let link_node = state_staged
+    let link_node = sides
+        .staged
         .node(repository.clone(), link_reference.local_node)
         .await
         .forward::<LinkError>("Failed deserializing state")?;
     let target_pin = link_node.address.hash;
+    let target = link_reference.with_signature(target_pin);
 
     // An added or removed link has no row on one side; the tree carries it.
     let Some((incoming_node_id, incoming_node)) =
-        link_node_at_path(state_incoming, repository.clone(), &link_path).await?
+        link_node_at_path(&sides.incoming.state, repository.clone(), &link_path).await?
     else {
         return Ok(None);
     };
@@ -3142,25 +3264,57 @@ async fn classify_link_pin(
     }
 
     let incoming_pin = incoming_node.address.hash;
-    if incoming_pin == target_pin && link_node.mounts_same_source(&incoming_node) {
+    // A link merged in its own right already holds the pin that merge produced, so its row is
+    // compared on what else it carries.
+    let pin_merged_already = skip_nodes.contains(&link_reference.local_node);
+    let merged_pin = |row: LinkReference| {
+        if pin_merged_already {
+            row.with_signature(target_pin)
+        } else {
+            row
+        }
+    };
+    let incoming_row = link_row(
+        &sides.incoming,
+        incoming_node_id,
+        &incoming_node,
+        link_reference,
+    );
+    let incoming = merged_pin(incoming_row);
+    let row_unchanged = incoming.same_row(sides.incoming_branch, &target, sides.staged_branch);
+    if row_unchanged && incoming_pin == target_pin && link_node.mounts_same_source(&incoming_node) {
         return Ok(None);
     }
 
-    // The row both sides moved from, which the mount and the pin are each judged against.
-    let base_node = match resolution {
-        LinkPinResolution::ThreeWay(state_base) => {
-            link_node_at_path(state_base, repository.clone(), &link_path)
+    // The row both sides changed from, which the mount and the row are each judged against.
+    let base = match &sides.base {
+        Some((base_rows, base_branch)) => {
+            link_node_at_path(&base_rows.state, repository.clone(), &link_path)
                 .await?
-                .map(|(_, node)| node)
+                .map(|(base_node_id, base_node)| {
+                    let base_row = merged_pin(link_row(
+                        base_rows,
+                        base_node_id,
+                        &base_node,
+                        link_reference,
+                    ));
+                    (base_node, base_row, *base_branch)
+                })
         }
-        LinkPinResolution::Incoming => None,
+        None => None,
     };
-    if base_node.as_ref().is_some_and(|base_node| {
-        base_node.address == incoming_node.address && base_node.child == incoming_node.child
-    }) {
+    if base
+        .as_ref()
+        .is_some_and(|(base_node, base_row, base_branch)| {
+            base_node.address == incoming_node.address
+                && base_node.child == incoming_node.child
+                && base_row.same_row(*base_branch, &incoming, sides.incoming_branch)
+        })
+    {
         return Ok(None);
     }
-    let three_way = matches!(resolution, LinkPinResolution::ThreeWay(_));
+    let three_way = sides.base.is_some();
+    let mut conflicted = false;
 
     let link_id: RepositoryId = link_node.address.context.into();
     let link_context = repository.to_link_context(link_id).await;
@@ -3194,43 +3348,39 @@ async fn classify_link_pin(
         .forward::<LinkError>("Failed resolving the subtree a link exposes")?;
         (current_mount.as_lowercase_str() != incoming_mount.as_lowercase_str()).then_some((
             state_target_pin,
+            state_incoming_pin,
             current_mount,
             incoming_mount,
         ))
     };
 
-    if three_way && let Some((_, current_mount, incoming_mount)) = remount.as_ref() {
-        // The pin comparison below cannot see a side that moved only the mount, so the mount is
+    // This branch's remount, where the merged branch left the mount alone, with the revision the
+    // merged branch pins, which a pin the merge carries has to hold it.
+    let mut kept_mount = None;
+    if three_way && let Some((_, state_incoming_pin, current_mount, incoming_mount)) = &remount {
+        // The row comparison below cannot see a side that moved only the mount, so the mount is
         // judged against the base on its own.
-        let base_mount = match base_node.as_ref() {
-            Some(base_node) if base_node.address.context == link_node.address.context => Some(
-                pinned_source_path(link_context.clone(), base_node)
-                    .await
-                    .forward::<LinkError>("Failed resolving the subtree a link exposes")?,
-            ),
+        let base_mount = match base.as_ref() {
+            Some((base_node, _, _)) if base_node.address.context == link_node.address.context => {
+                Some(
+                    pinned_source_path(link_context.clone(), base_node)
+                        .await
+                        .forward::<LinkError>("Failed resolving the subtree a link exposes")?,
+                )
+            }
             _ => None,
         };
         match base_mount.as_ref().map(RelativePath::as_lowercase_str) {
             Some(base) if base == current_mount.as_lowercase_str() => {}
-            Some(base) if base == incoming_mount.as_lowercase_str() => remount = None,
-            _ => {
-                let current = display_path(current_mount.as_str());
-                let incoming = display_path(incoming_mount.as_str());
-                return Err(LinkError::internal(format!(
-                    "Link mount conflict at {link_path}: this branch mounts {current}, the \
-                     merged branch mounts {incoming}. Resolving a link mount conflict in place is \
-                     not supported yet. Set the mount you want with `lore link remove \
-                     {link_path}` and `lore link add {link_path} <repository> <source path>`, \
-                     commit, and merge again"
-                )));
+            Some(base) if base == incoming_mount.as_lowercase_str() => {
+                kept_mount = Some((state_incoming_pin.clone(), current_mount.clone()));
+                remount = None;
             }
+            _ => conflicted = true,
         }
     }
 
-    // A link merged in its own right already holds the pin that merge produced, so only a remount
-    // is still outstanding here.
-    let pin_merged_already = skip_nodes.contains(&link_reference.local_node);
-    if pin_merged_already && remount.is_none() {
+    if pin_merged_already && remount.is_none() && row_unchanged {
         lore_debug!(
             "Link node {} pin is owned by its own merge, leaving it",
             link_reference.local_node
@@ -3238,89 +3388,97 @@ async fn classify_link_pin(
         return Ok(None);
     }
 
-    let branch = state_incoming
-        .link_find(
-            repository.clone(),
-            link_node.address.context.into(),
-            incoming_node_id,
-        )
-        .await
-        .map_or(link_reference.branch, |reference| reference.branch);
+    let mut adopt_row = !row_unchanged;
 
-    let mut adopt_pin = !pin_merged_already && incoming_pin != target_pin;
-
-    // An auto-following row resolves against whichever branch the state ends
-    // up on, so its pin cannot travel between parent branches.
-    if adopt_pin && branch.is_zero() {
+    // Rows following their own parent's branch on both sides differ in the pin alone, which
+    // resolves against whichever branch the state ends up on, so it moves by the link's own merge.
+    if adopt_row
+        && incoming.foreign_branch(sides.incoming_branch).is_none()
+        && target.foreign_branch(sides.staged_branch).is_none()
+    {
         lore_debug!("Link {link_path} follows the parent branch, leaving its pin to its own merge");
-        adopt_pin = false;
+        adopt_row = false;
     }
 
-    if adopt_pin && three_way {
-        let base_pin = base_node.as_ref().map(|node| node.address.hash);
-        match base_pin {
-            Some(base_pin) if base_pin == target_pin => {}
-            Some(base_pin) if base_pin == incoming_pin => adopt_pin = false,
-            // A link carrying an explicit branch cannot merge its signature
-            // automatically, so both sides moving it is a flag change; no
-            // base row at all is an add on both sides.
-            _ => {
-                let subtype = if base_pin.is_some() {
-                    "flag change"
-                } else {
-                    "add/add, no common base"
-                };
-                return Err(LinkError::internal(format!(
-                    "Link pin conflict at {link_path} ({subtype}): this branch pins \
-                     {target_pin}, the merged branch pins {incoming_pin}. Resolving a link \
-                     pin conflict in place is not supported yet. Set the row you want with \
-                     `lore link update {link_path} --pin <revision>`, commit, and merge again"
-                )));
-            }
+    if adopt_row && let Some((_, base_row, base_branch)) = base.as_ref() {
+        if base_row.same_row(*base_branch, &incoming, sides.incoming_branch) {
+            adopt_row = false;
+        } else if !base_row.same_row(*base_branch, &target, sides.staged_branch) {
+            conflicted = true;
         }
+    } else if adopt_row && three_way {
+        conflicted = true;
+    }
+    // The pin a link's own merge produced is on the linked branch this branch follows, so a row the
+    // merged branch changed otherwise cannot land on it: the user chooses between the two.
+    if adopt_row && pin_merged_already {
+        conflicted = true;
+    }
+    if adopt_row
+        && !conflicted
+        && incoming_pin != target_pin
+        && let Some((state_incoming_pin, current_mount)) = &kept_mount
+    {
+        conflicted = !state_incoming_pin
+            .find_node_link(link_context.clone(), current_mount.as_str())
+            .await
+            .is_ok_and(|node_link| node_link.is_valid_or_root());
     }
 
-    if !adopt_pin && remount.is_none() {
-        return Ok(None);
-    }
+    let carried = incoming_row.carried(sides.incoming_branch, sides.staged_branch);
+    let readable = repository.can_read_link(link_id);
+    let conflict = |source: LinkReference, source_mount: NodeID| {
+        if !readable {
+            return Err(LinkError::internal(format!(
+                "Link conflict at {link_path}: both branches changed a link to a repository this \
+                 user cannot read, so its row cannot be settled here. Merge as a user who can \
+                 read it"
+            )));
+        }
+        Ok(Some(LinkPinClass::Conflict(LinkPinConflict {
+            link_path: link_path.clone(),
+            source,
+            source_mount,
+            target,
+            target_mount: link_node.child,
+        })))
+    };
 
     let remount = match remount {
         None => None,
-        Some((_, _, incoming_mount)) if adopt_pin || incoming_pin == target_pin => {
+        Some(_) if conflicted => return conflict(carried, incoming_node.child),
+        Some((_, _, _, incoming_mount)) if adopt_row || incoming_pin == target_pin => {
             Some((incoming_mount, incoming_node.child))
         }
-        Some((state_target_pin, _, incoming_mount)) => {
-            // A remount the pin does not travel with lands at the pin this branch keeps.
+        Some((state_target_pin, _, _, incoming_mount)) => {
+            // A remount the pin does not travel with lands at the pin this branch keeps, and one
+            // that pin does not hold leaves the two sides' rows for the user to choose between.
             let node_link = state_target_pin
                 .find_node_link(link_context, incoming_mount.as_str())
                 .await
                 .ok()
                 .filter(|node_link| node_link.is_valid_or_root());
-            let Some(node_link) = node_link else {
-                let incoming = display_path(incoming_mount.as_str());
-                return Err(LinkError::internal(format!(
-                    "Link mount conflict at {link_path}: the merged branch mounts {incoming}, which \
-                 the revision this branch pins does not hold. Pin the link where it does with \
-                 `lore link update {link_path} --pin <revision>`, commit, and merge again"
-                )));
-            };
-            Some((incoming_mount, node_link.node))
+            match node_link {
+                Some(node_link) => Some((incoming_mount, node_link.node)),
+                None => return conflict(carried, incoming_node.child),
+            }
         }
     };
+    if conflicted {
+        return conflict(carried, incoming_node.child);
+    }
 
-    let (incoming_pin, branch) = if adopt_pin {
-        (incoming_pin, branch)
-    } else {
-        (target_pin, link_reference.branch)
-    };
-    Ok(Some(PlannedLinkPin {
+    if !adopt_row && remount.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(LinkPinClass::Planned(PlannedLinkPin {
         link_path,
         link_node,
-        target_pin,
-        incoming_pin,
-        branch,
+        target,
+        incoming: if adopt_row { carried } else { target },
         remount,
-    }))
+    })))
 }
 
 /// Write the rows [`classify_link_pins`] selected into the staged state.
@@ -3332,42 +3490,38 @@ pub async fn apply_link_pins(
 ) -> Result<Vec<CarriedLinkPin>, LinkError> {
     let mut carried = Vec::new();
     for planned_pin in planned {
+        let mount_source = planned_pin.mount_source();
         let PlannedLinkPin {
             link_path,
             link_node,
-            target_pin,
-            incoming_pin,
-            branch,
+            target,
+            incoming,
             remount,
         } = planned_pin;
-
-        let link_path_rel = RelativePath::from_str(&link_path)
-            .internal_with(|| format!("Invalid link path {link_path}"))?;
 
         let link_context = repository
             .to_link_context(link_node.address.context.into())
             .await;
 
-        if target_pin != incoming_pin {
-            lore_info!("Link {link_path} pin {target_pin} -> {incoming_pin} from merged branch");
+        if target.signature() != incoming.signature() {
+            lore_info!(
+                "Link {link_path} pin {} -> {} from merged branch",
+                target.signature(),
+                incoming.signature()
+            );
         }
-        let mount_source = match remount {
-            Some((path, node)) => {
-                lore_info!("Link {link_path} exposes {path} from the merged branch");
-                LinkMountSource::Node(node)
-            }
-            None => LinkMountSource::SamePath,
-        };
+        if let Some((path, _)) = &remount {
+            lore_info!("Link {link_path} exposes {path} from the merged branch");
+        }
 
-        stage_link_pin(
+        stage_link_row(
             repository.clone(),
             state_staged,
             &link_context,
-            link_path_rel,
+            &link_path,
             link_node,
-            target_pin,
-            incoming_pin,
-            branch,
+            &target,
+            &incoming,
             mount_source,
             realize,
         )
@@ -3375,33 +3529,170 @@ pub async fn apply_link_pins(
 
         carried.push(CarriedLinkPin {
             link_path,
-            previous: target_pin,
-            adopted: incoming_pin,
+            previous: target.signature(),
+            adopted: incoming.signature(),
         });
     }
 
     Ok(carried)
 }
 
+/// Check the working tree against what [`apply_resolved_link_pin`] realizes for `chosen`, refusing
+/// where a local modification would be overwritten.
+pub async fn verify_resolved_link_pin(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    link_path: &str,
+    chosen: &LinkReference,
+    chosen_mount: NodeID,
+) -> Result<(), LinkError> {
+    let link_path_rel = RelativePath::from_str(link_path)
+        .internal_with(|| format!("Invalid link path {link_path}"))?;
+    if repository
+        .filter
+        .excludes_tree(&link_path_rel, true, FilterMode::View)
+    {
+        return Ok(());
+    }
+    let resolved = resolve_link_at_path(state_staged, repository.clone(), link_path).await?;
+    let pin = ResolvedLinkPin::resolve(
+        &resolved.link_context,
+        LinkPinRealizeTarget {
+            link_path: link_path_rel,
+            old_signature: resolved.link_node.address.hash,
+            new_signature: chosen.signature(),
+            current_node: resolved.link_node.child,
+            mount_source: LinkMountSource::Node(chosen_mount),
+        },
+    )
+    .await?;
+    let diff = link_pin_diff(&resolved.link_context, &pin).await?;
+    verify_link_pin_diff(
+        operation,
+        resolved.link_context,
+        pin.new_signature,
+        diff,
+        false,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Move the row at `link_path` to `chosen`, mounting `chosen_mount`, a node of the revision
+/// `chosen` pins, and realizing the content change at the mount.
+pub async fn apply_resolved_link_pin(
+    repository: Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    link_path: &str,
+    chosen: LinkReference,
+    chosen_mount: NodeID,
+) -> Result<(), LinkError> {
+    let resolved = resolve_link_at_path(state_staged, repository.clone(), link_path).await?;
+    let current = resolved
+        .link_reference
+        .with_signature(resolved.link_node.address.hash);
+    stage_link_row(
+        repository,
+        state_staged,
+        &resolved.link_context,
+        link_path,
+        resolved.link_node,
+        &current,
+        &chosen,
+        LinkMountSource::Node(chosen_mount),
+        LinkPinRealize::WorkingTree,
+    )
+    .await
+    .map(drop)
+}
+
+/// Write `chosen` over the row `current` at `link_path`, pin, branch and flags together, mounting
+/// `mount_source` and realizing the content change at the mount. Returns the staged link node, and
+/// does nothing where the row already is `chosen` at that mount.
+#[allow(clippy::too_many_arguments)]
+pub async fn stage_link_row(
+    repository: Arc<RepositoryContext>,
+    state: &Arc<State>,
+    link_context: &Arc<RepositoryContext>,
+    link_path: &str,
+    link_node: Node,
+    current: &LinkReference,
+    chosen: &LinkReference,
+    mount_source: LinkMountSource,
+    realize: LinkPinRealize,
+) -> Result<NodeID, LinkError> {
+    if current.stores_same(chosen)
+        && matches!(mount_source, LinkMountSource::Node(mount) if mount == link_node.child)
+    {
+        return Ok(current.local_node);
+    }
+    let link_path_rel = RelativePath::from_str(link_path)
+        .internal_with(|| format!("Invalid link path {link_path}"))?;
+
+    let node = stage_link_pin(
+        repository.clone(),
+        state,
+        link_context,
+        link_path_rel,
+        link_node,
+        current.signature(),
+        chosen.signature(),
+        chosen.branch(),
+        mount_source,
+        realize,
+    )
+    .await?;
+
+    if current.flags() != chosen.flags() {
+        state
+            .link_replace(
+                repository,
+                LinkReference {
+                    local_node: node,
+                    ..*chosen
+                },
+            )
+            .await
+            .forward::<LinkError>("Failed to update link flags")?;
+    }
+    Ok(node)
+}
+
 /// [`classify_link_pins`] followed by [`apply_link_pins`].
 pub async fn merge_link_pins(
     repository: Arc<RepositoryContext>,
     state_staged: &Arc<State>,
+    staged_branch: BranchId,
     state_incoming: &Arc<State>,
     resolution: LinkPinResolution,
     realize: LinkPinRealize,
     skip_nodes: &[NodeID],
 ) -> Result<Vec<CarriedLinkPin>, LinkError> {
-    let planned = classify_link_pins(
+    let classification = classify_link_pins(
         repository.clone(),
         state_staged,
+        staged_branch,
         state_incoming,
         resolution,
         skip_nodes,
     )
     .await?;
+    // Only a three-way comparison leaves a row for the user to settle.
+    if let Some(conflict) = classification.conflicts.first() {
+        return Err(LinkError::internal(format!(
+            "Link conflict at {}: the incoming row cannot be carried over this branch's",
+            conflict.link_path
+        )));
+    }
 
-    Box::pin(apply_link_pins(repository, state_staged, planned, realize)).await
+    Box::pin(apply_link_pins(
+        repository,
+        state_staged,
+        classification.planned,
+        realize,
+    ))
+    .await
 }
 
 /// Result of checking whether a link is eligible for a merge operation.

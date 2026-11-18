@@ -193,4 +193,5 @@ pub enum LoreCommand {
         crate::revision_graph::branch_archive::LoreRevisionGraphBranchArchiveArgs,
     ),
     RevisionGraphBranchSync(crate::revision_graph::branch_sync::LoreRevisionGraphBranchSyncArgs),
+    BranchMergeConflictsList(crate::branch::LoreBranchMergeConflictsListArgs),
 }

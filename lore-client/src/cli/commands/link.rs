@@ -515,7 +515,7 @@ fn print_link_access_remediation(status: i32) {
     );
 }
 
-fn format_link_flags(flags: u32) -> String {
+pub(crate) fn format_link_flags(flags: u32) -> String {
     let flags = LinkFlags::from_bits_truncate(flags);
     let name = if flags.is_empty() {
         "None".to_string()

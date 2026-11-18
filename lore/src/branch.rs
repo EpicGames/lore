@@ -472,6 +472,55 @@ fn merge_abort_local(
 
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[handler(merge_conflicts_list_local)]
+/// Arguments for listing the conflicts an open merge holds.
+pub struct LoreBranchMergeConflictsListArgs {}
+
+/// Lists every conflict the open merge still holds, files and link rows alike.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+///
+/// ## Merge Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::BranchMergeConflictFile`](crate::interface::LoreEvent::BranchMergeConflictFile) | Emitted for each file still in conflict |
+/// | [`LoreEvent::BranchMergeLinkPinConflict`](crate::interface::LoreEvent::BranchMergeLinkPinConflict) | Emitted for each link row still awaiting a side |
+pub async fn merge_conflicts_list(
+    globals: LoreGlobalArgs,
+    args: LoreBranchMergeConflictsListArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    dispatch_call(globals, args, callback, merge_conflicts_list_local).await
+}
+
+fn merge_conflicts_list_local(
+    globals: LoreGlobalArgs,
+    args: LoreBranchMergeConflictsListArgs,
+    callback: LoreEventCallback,
+) -> impl Future<Output = i32> {
+    repository_call_read(
+        globals,
+        callback,
+        args,
+        merge_conflicts_list,
+        move |repository, _args| async move { branch::merge::merge_conflicts_list(repository).await },
+    )
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(merge_unresolve_local)]
 /// Arguments for marking resolved merge paths as unresolved again.
 pub struct LoreBranchMergeUnresolveArgs {

@@ -1422,6 +1422,10 @@ pub enum LoreEvent {
     RevisionGraphBranchMetadata(LoreRevisionGraphBranchMetadataEventData),
     /// A branch sync's outcome.
     RevisionGraphBranchSynced(LoreRevisionGraphBranchSyncedEventData),
+    /// A link row both branches changed, which the merge holds open.
+    BranchMergeLinkPinConflict(crate::branch::merge::LoreBranchMergeLinkPinConflictEventData),
+    /// A divergent link row was settled to one side.
+    BranchMergeLinkPinResolved(crate::branch::merge::LoreBranchMergeLinkPinResolvedEventData),
 }
 
 /// Encodes as the event it refers to, so that a sender can encode an event it only borrows.

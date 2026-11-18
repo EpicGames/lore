@@ -1274,6 +1274,14 @@ async fn commit_link_only(
                 })
             })?;
 
+    // The parent is written with its link rows, so only the link committed has to be settled.
+    reject_unresolved_link_pins(
+        &repository,
+        &state_parent_staged,
+        Some(resolved_staged.link_reference.local_node),
+    )
+    .await?;
+
     let resolved_current =
         link::resolve_link_at_path(&state_parent_current, repository.clone(), &link_path)
             .await
@@ -1819,6 +1827,8 @@ async fn commit_staged_revision(
         }
     }
 
+    reject_unresolved_link_pins(&repository, &state_staged, None).await?;
+
     // A merge reconciling divergent history is staged on its second parent, and a state moved onto
     // another revision keeps the node IDs of the one it was staged on.
     let based_on = if reconciles || state_staged.parent_self() != built_on {
@@ -1916,10 +1926,6 @@ async fn commit_staged_revision(
 
         weave_history(repository.clone(), state_staged.clone(), based_on).await?;
 
-        // Reset conflict/merge flags and transient link merge state
-        state_staged.reset_merge_conflict_flags();
-        state_staged.clear_link_merge_state();
-
         // Before the save, with the discards done, as nothing else frees a slot left detached or
         // in flight (C15).
         state_staged
@@ -1929,7 +1935,7 @@ async fn commit_staged_revision(
 
         // Serialize the new current state, its fresh blocks kept for the provider's settle
         let signature = state_staged
-            .serialize_keeping(repository.clone(), &token, |written| {
+            .serialize_committed_keeping(repository.clone(), &token, |written| {
                 operation.keep_serialized_blocks(written);
             })
             .await
@@ -2741,6 +2747,46 @@ pub(crate) async fn rehash_tree_in_operation(
 struct FileToCommit {
     node_id: NodeID,
     relative_path: RelativePath,
+}
+
+/// A commit drops the merge's link rows, so a row still awaiting the user's choice has to be
+/// refused before the record of it is gone. Link rows carry no node flags, so the walk that
+/// rejects an unresolved file cannot see them. With `only`, just the row of that link node counts.
+///
+/// Only an open merge records link rows, so their read is boxed rather than held by every commit.
+async fn reject_unresolved_link_pins(
+    repository: &Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    only: Option<NodeID>,
+) -> Result<(), CommitError> {
+    if state_staged.link_merge_hash().is_zero() {
+        return Ok(());
+    }
+    Box::pin(reject_recorded_link_pins(repository, state_staged, only)).await
+}
+
+async fn reject_recorded_link_pins(
+    repository: &Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    only: Option<NodeID>,
+) -> Result<(), CommitError> {
+    let entries = state_staged
+        .deserialize_link_merge_state(repository.clone())
+        .await
+        .forward::<CommitError>("Failed to deserialize link merge state")?;
+
+    let Some(entry) = entries.iter().find(|entry| {
+        entry.is_unresolved() && only.is_none_or(|local_node| entry.local_node == local_node)
+    }) else {
+        return Ok(());
+    };
+
+    let path = state_staged
+        .link_merge_entry_path(repository.clone(), entry)
+        .await
+        .forward::<CommitError>("Failed resolving link node path")?;
+
+    Err(Conflict { path }.into())
 }
 
 /// A commit walk clears the flags of every node it freezes, so a conflict has to be refused before
@@ -5640,7 +5686,7 @@ async fn link_based_on(
         .await
         .forward::<CommitError>("Failed reading link merge state")?
         .into_iter()
-        .find(|entry| entry.local_node == link_reference.local_node)
+        .find(|entry| !entry.is_conflict() && entry.local_node == link_reference.local_node)
         .map(|entry| entry.base.signature);
     Ok(if pinned == Some(link_state.parent_other()) {
         BasedOn::Other
@@ -5799,11 +5845,8 @@ async fn commit_link(
 
             weave_history(repository.clone(), state.clone(), based_on).await?;
 
-            state.reset_merge_conflict_flags();
-            state.clear_link_merge_state();
-
             let signature = state
-                .serialize(repository.clone(), &token)
+                .serialize_committed(repository.clone(), &token)
                 .await
                 .forward::<CommitError>("Failed to serialize revision state")?;
 
@@ -7880,6 +7923,10 @@ pub async fn commit_in_memory_revision(
         .forward::<CommitError>("Revision state is not valid to commit")
         .map_err(InMemoryCommitFailure::rejected)?;
 
+    reject_unresolved_link_pins(&repository, &state_staged, None)
+        .await
+        .map_err(InMemoryCommitFailure::rejected)?;
+
     let mut metadata = metadata;
     stamp_commit_metadata(repository.clone(), &mut metadata, branch)
         .await
@@ -7940,11 +7987,8 @@ pub async fn commit_in_memory_revision(
         )
         .await?;
 
-        state_staged.reset_merge_conflict_flags();
-        state_staged.clear_link_merge_state();
-
         state_staged
-            .serialize(work_repository, token)
+            .serialize_committed(work_repository, token)
             .await
             .forward::<CommitError>("Failed to serialize revision state")
     }

@@ -18,6 +18,7 @@ from link_helpers import (
     DEFAULT_LINK_MOUNT,
     DEFAULT_PARENT_FILE,
     assert_mount_exposes,
+    link_field,
     link_pin,
     make_parent_with_link,
     make_parent_with_remount,
@@ -374,13 +375,9 @@ def test_link(new_lore_repo):
     assert not sync_repo.file_exists(link_deleted_file)
     assert sync_repo.compare_file(clone, some_file)
 
-    # Verify that new link is fixed
-    output = clone.link_list()
-
-    pattern = rf"Link\s+{restricted_repo.get_id()}.*?Flags:\s+DisableAutoFollow \(0x1\)"
-    match = re.search(pattern, output, re.DOTALL)
-
-    assert match, f"Restricted link {restricted_repo.get_id()} is not fixed"
+    assert (
+        link_field(clone, restricted_repo.get_id(), "Flags") == "DisableAutoFollow"
+    ), f"Restricted link {restricted_repo.get_id()} is not fixed"
 
     # Remove link
     output = clone.link_remove(link_relative_path)
