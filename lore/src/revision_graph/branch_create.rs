@@ -46,6 +46,7 @@ use crate::revision_graph::RevisionGraphError;
 use crate::revision_graph::call::revision_graph_call;
 use crate::revision_graph::locations::LocationMiss;
 use crate::revision_graph::locations::PreCheck;
+use crate::revision_graph::locations::branch_record_at;
 use crate::revision_graph::locations::default_branch_at;
 use crate::revision_graph::locations::ended_at;
 use crate::revision_graph::locations::local_write_context;
@@ -167,6 +168,9 @@ pub(crate) fn parent_at<'a>(
     }
 }
 
+/// The trace context of a failed query of the parent branch at the remote.
+const PARENT_QUERY: &str = "querying the remote for the parent branch";
+
 /// The parent of a branch created from the revision `form` names at the remote, through `ctx`,
 /// the remote's read context, and `service`, its revision service. The parent's record is read
 /// with one branch query, beside the remote's revision list for a revision number.
@@ -183,12 +187,13 @@ async fn remote_parent(
             let record = if parent.is_zero() {
                 None
             } else {
-                parent_record(service.as_ref(), parent).await?
+                branch_record_at(service.as_ref(), parent, PARENT_QUERY).await?
             };
             (parent, hash, record)
         }
         RevisionForm::Latest(branch) => {
-            let Some(record) = parent_record(service.as_ref(), branch).await? else {
+            let Some(record) = branch_record_at(service.as_ref(), branch, PARENT_QUERY).await?
+            else {
                 return Ok(Err(LocationMiss::BranchNotFound));
             };
             (branch, record.latest, Some(record))
@@ -196,7 +201,7 @@ async fn remote_parent(
         RevisionForm::Number(branch, number) => {
             let (numbered, record) = tokio::join!(
                 numbered_at(ctx, Some(service), branch, number),
-                parent_record(service.as_ref(), branch),
+                branch_record_at(service.as_ref(), branch, PARENT_QUERY),
             );
             let revision = match numbered? {
                 Ok((revision, _)) => revision,
@@ -216,21 +221,6 @@ async fn remote_parent(
             default_unchecked: false,
         },
     }))
-}
-
-/// The remote's record of `parent`, read with a branch query through `service`. `None` where the
-/// remote doesn't hold the branch.
-async fn parent_record(
-    service: &dyn Revision,
-    parent: BranchId,
-) -> Result<Option<BranchRecord>, RevisionGraphError> {
-    match service.branch_query(Some(parent), None).await {
-        Ok(record) => Ok(Some(record)),
-        Err(err) if err.is_not_found() => Ok(None),
-        Err(err) => {
-            Err(err).forward_any::<RevisionGraphError>("querying the remote for the parent branch")
-        }
-    }
 }
 
 /// The parent of a branch created from the revision `form` names in the local store, through
@@ -301,7 +291,7 @@ async fn parent_metadata(
 /// at the remote, given its revision service `service`, zero where no live branch holds the name,
 /// and otherwise in the local store, read through `ctx`, the value of the name's mapping, zero
 /// where the name has none or only the id derived from it names a branch
-/// ([`branch::lookup_name_local_unwritten`]).
+/// ([`branch::local_claim_expected`]).
 ///
 /// In the local store, the name is claimed where the branch it names has no metadata key, as a
 /// stale mapping or a derived id with only a latest revision leaves it. A branch with a metadata
@@ -337,20 +327,11 @@ pub(crate) fn name_free_at<'a>(
                 }
             };
         }
-        let Some(named) = branch::lookup_name_local_unwritten(ctx.clone(), name)
-            .await
-            .forward_any::<RevisionGraphError>("looking up the branch name")?
-        else {
-            return Ok(Ok(Context::default()));
-        };
-        if branch::mutable_value(ctx.clone(), branch::METADATA, named.branch())
-            .await
-            .forward_any::<RevisionGraphError>("loading the named branch's metadata key")?
-            .is_some()
-        {
-            return Ok(Err(taken()));
+        match branch::local_claim_expected(ctx.clone(), name, BranchId::default()).await {
+            Ok(expected) => Ok(Ok(expected)),
+            Err(err) if err.is_branch_already_exists() => Ok(Err(taken())),
+            Err(err) => Err(err).forward_any::<RevisionGraphError>("looking up the branch name"),
         }
-        Ok(Ok(named.mapping()))
     }
 }
 

@@ -195,6 +195,14 @@ Compare to: partition.
 
 Also see: address.
 
+### Convergent
+
+The status of a branch whose local latest is known to be on the remote's history line for the branch: the remote latest, or a revision the remote latest reaches by following each revision's first parent.
+
+Compare to: divergent.
+
+Also see: latest, sync.
+
 ### CR
 
 See change request.
@@ -248,6 +256,14 @@ To mark a file or directory as changed â€” modified, moved, copied, or deleted â
 Compare to: stage.
 
 Also see: scan.
+
+### Divergent
+
+The status of a branch whose local latest isn't known to be on the remote's history line for the branch, as after a commit the remote doesn't have yet. The remote's history line for a branch is the remote latest and the revisions it reaches by following each revision's first parent.
+
+Compare to: convergent.
+
+Also see: latest, push, sync.
 
 ## E
 

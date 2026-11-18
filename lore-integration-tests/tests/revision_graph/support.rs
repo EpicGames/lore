@@ -10,8 +10,8 @@
 //! storage handles over the fixture's local stores. They have a mutable store take another
 //! writer's metadata once it answers a load, the server's included. They give a revision graph
 //! call its global arguments, its arguments and its revision identifier, make the calls of the
-//! read verbs and the branch metadata verbs, and pick a call's records, its location complete
-//! events and their order out of its events.
+//! read verbs, the branch metadata verbs and the branch sync, and pick a call's records, its
+//! location complete events and their order, and its synced events, out of its events.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -35,6 +35,9 @@ use lore::revision_graph::branch_metadata_set::LoreRevisionGraphBranchMetadataSe
 use lore::revision_graph::branch_metadata_set::branch_metadata_set;
 use lore::revision_graph::branch_resolve::LoreRevisionGraphBranchResolveArgs;
 use lore::revision_graph::branch_resolve::branch_resolve;
+use lore::revision_graph::branch_sync::LoreRevisionGraphBranchSyncArgs;
+use lore::revision_graph::branch_sync::LoreRevisionGraphBranchSyncOptions;
+use lore::revision_graph::branch_sync::branch_sync;
 use lore::revision_graph::locations::local_write_context;
 use lore::revision_graph::locations::remote_read_context;
 use lore::revision_graph::revision_resolve::LoreRevisionGraphRevisionResolveArgs;
@@ -114,6 +117,7 @@ use lore_storage::test_util::Answered;
 use lore_storage::test_util::HookedStore;
 use lore_storage::test_util::StoreCall;
 use lore_storage::test_util::answered;
+use lore_transport::BranchRecord;
 use lore_transport::Connection;
 use tonic::Status;
 
@@ -637,6 +641,28 @@ pub(crate) async fn create_branch(
     status_and_events_of(|callback| branch_create(globals, args, callback)).await
 }
 
+/// The status and events of a `branch_sync` call of `branch` in `f`'s repository to the revision
+/// `target` names, with `options`, on `store` under `globals`, as [`status_and_events_of`] reports
+/// them.
+pub(crate) async fn sync_branch(
+    f: &Fixture,
+    store: LoreStore,
+    globals: LoreGlobalArgs,
+    branch: BranchId,
+    target: LoreRevisionIdentifier,
+    options: LoreRevisionGraphBranchSyncOptions,
+) -> (i32, Vec<LoreEvent>) {
+    let args = LoreRevisionGraphBranchSyncArgs {
+        id: 1,
+        store,
+        repository: f.repository,
+        branch,
+        target,
+        options,
+    };
+    status_and_events_of(|callback| branch_sync(globals, args, callback)).await
+}
+
 /// The status and events of a `branch_metadata_get` call of the metadata of `branch` in `f`'s
 /// repository, on `store` under `globals`, as [`status_and_events_of`] reports them: of the entry
 /// `key` names, or of every entry where it is empty.
@@ -737,6 +763,46 @@ async fn commit_file_on(
     branch: BranchId,
     parent: Hash,
 ) -> (Hash, Address) {
+    let (handle, address) = tree_with_new_file(store, repository, branch, parent).await;
+    let (status, committed) = commit_tree(handle).await;
+    assert_eq!(status, 0, "committing must succeed");
+    let revision = committed_revision(&committed).expect("the commit reports its revision");
+    close_tree(handle).await;
+    (revision, address)
+}
+
+/// The status of a commit on `branch` through the revision tree API on `store`, of the revision
+/// [`commit_on`] commits, which fails where the branch's local latest is no longer `parent` when
+/// the commit swaps it, and the revision it committed, zero where it failed.
+pub(crate) async fn try_commit_on(
+    store: LoreStore,
+    repository: Partition,
+    branch: BranchId,
+    parent: Hash,
+) -> (i32, Hash) {
+    let (handle, _) = tree_with_new_file(store, repository, branch, parent).await;
+    let (status, committed) = commit_tree(handle).await;
+    close_tree(handle).await;
+    (status, committed_revision(&committed).unwrap_or_default())
+}
+
+/// The revision the commit events `committed` report.
+fn committed_revision(committed: &[LoreEvent]) -> Option<Hash> {
+    committed.iter().find_map(|event| match event {
+        LoreEvent::RevisionTreeCommitComplete(data) => Some(data.revision_hash),
+        _ => None,
+    })
+}
+
+/// A tree loaded on `store` at `parent`, with one new file under the root, whose content is stored
+/// in `store` and no other file shares, and the `branch` metadata key naming `branch`, and the
+/// address of the file's content.
+async fn tree_with_new_file(
+    store: LoreStore,
+    repository: Partition,
+    branch: BranchId,
+    parent: Hash,
+) -> (LoreRevisionTree, Address) {
     let file_id = uuid::Uuid::now_v7();
     let content = file_id.as_bytes();
     let address = put_content(store, repository, Context::from(file_id), content, 1, 0).await;
@@ -794,7 +860,13 @@ async fn commit_file_on(
         )
     })
     .await;
-    let committed = events_of("committing", |callback| {
+    (handle, address)
+}
+
+/// The status and events of a commit of `handle`, which writes the revision to the remote of the
+/// tree's storage handle, if it has one.
+async fn commit_tree(handle: LoreRevisionTree) -> (i32, Vec<LoreEvent>) {
+    status_and_events_of(|callback| {
         commit(
             LoreGlobalArgs::default(),
             LoreRevisionTreeCommitArgs {
@@ -805,15 +877,11 @@ async fn commit_file_on(
             callback,
         )
     })
-    .await;
-    let revision = committed
-        .iter()
-        .find_map(|event| match event {
-            LoreEvent::RevisionTreeCommitComplete(data) => Some(data.revision_hash),
-            _ => None,
-        })
-        .expect("the commit reports its revision");
+    .await
+}
 
+/// Closes `handle`.
+async fn close_tree(handle: LoreRevisionTree) {
     events_of("closing the tree", |callback| {
         close(
             LoreGlobalArgs::default(),
@@ -826,7 +894,6 @@ async fn commit_file_on(
         )
     })
     .await;
-    (revision, address)
 }
 
 /// A file of `size` bytes under the root, with the content `address` names. It is named for
@@ -927,7 +994,7 @@ pub(crate) async fn create_remote_branch(
 }
 
 /// Creates `branch` in `category` as [`create_remote_branch`] creates a branch.
-async fn create_remote_branch_as(
+pub(crate) async fn create_remote_branch_as(
     f: &Fixture,
     branch: BranchId,
     name: &str,
@@ -985,10 +1052,11 @@ pub(crate) async fn publish(f: &Fixture, branch: BranchId, revision: Hash) {
 }
 
 /// Commits a revision on `branch` from `parent` with [`commit_on`] through a storage handle of its
-/// own, whose remote is the server, closes that handle, publishes the revision, and returns its
-/// hash. The local store of `f`'s handle holds none of it, where committing through that handle
-/// would leave the revision and the branch's latest there.
-pub(crate) async fn publish_from_another_handle(
+/// own, whose remote is the server, closes that handle, and returns the revision's hash. The
+/// server holds the revision, and its latest of `branch` stays. The local store of `f`'s handle
+/// holds none of it, where committing through that handle would leave the revision and the
+/// branch's latest there.
+pub(crate) async fn commit_from_another_handle(
     f: &Fixture,
     branch: BranchId,
     parent: Hash,
@@ -996,6 +1064,16 @@ pub(crate) async fn publish_from_another_handle(
     let other = open_handle(Some(&f.url)).await;
     let revision = commit_on(other, f.repository, branch, parent).await;
     close_handle(other).await;
+    revision
+}
+
+/// Commits a revision with [`commit_from_another_handle`], publishes it, and returns its hash.
+pub(crate) async fn publish_from_another_handle(
+    f: &Fixture,
+    branch: BranchId,
+    parent: Hash,
+) -> Hash {
+    let revision = commit_from_another_handle(f, branch, parent).await;
     publish(f, branch, revision).await;
     revision
 }
@@ -1019,6 +1097,12 @@ pub(crate) async fn archive_locally(f: &Fixture, branch: BranchId) {
 /// The latest of `branch` the server answers a branch query with. Panics unless the server holds
 /// the branch.
 pub(crate) async fn server_latest(f: &Fixture, branch: BranchId) -> Hash {
+    server_record(f, branch).await.latest
+}
+
+/// The record of `branch` the server answers a branch query with. Panics unless the server holds
+/// the branch.
+pub(crate) async fn server_record(f: &Fixture, branch: BranchId) -> BranchRecord {
     in_client(async {
         connection_for(&f.url, f.repository)
             .await
@@ -1030,7 +1114,6 @@ pub(crate) async fn server_latest(f: &Fixture, branch: BranchId) -> Hash {
     })
     .await
     .expect("the server holds the branch")
-    .latest
 }
 
 /// The metadata of `branch` the server holds, read on its stores with `branch::local_metadata`.
@@ -1085,6 +1168,14 @@ pub(crate) async fn local_latest(
     branch: BranchId,
 ) -> Hash {
     latest_by_key(store, LoreGlobalArgs::default(), repository, branch).await
+}
+
+/// The `function` value of `branch`, such as [`branch::LATEST_STATUS`], in the local store of `f`'s
+/// storage handle, read with `branch::mutable_value`: `None` where the store holds none.
+pub(crate) async fn local_value(f: &Fixture, function: &str, branch: BranchId) -> Option<Hash> {
+    in_client(branch::mutable_value(local_writer(f), function, branch))
+        .await
+        .expect("loads the value in the local store")
 }
 
 /// The latest of `branch` of `repository` that a [`mutable_load`] of its latest key reads, through
@@ -1309,6 +1400,21 @@ pub(crate) fn event_order(events: &[LoreEvent]) -> Vec<(LoreBranchLocation, bool
                     matches!(event, LoreEvent::RevisionGraphLocationComplete(_)),
                 )
             })
+        })
+        .collect()
+}
+
+/// The synced events among `events` as (previous local latest, local latest), each echoing the
+/// call's `id`, 1.
+pub(crate) fn synced(events: &[LoreEvent]) -> Vec<(Hash, Hash)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            LoreEvent::RevisionGraphBranchSynced(data) => {
+                assert_eq!(data.id, 1, "a synced event echoes the call's id");
+                Some((data.previous_local_latest, data.local_latest))
+            }
+            _ => None,
         })
         .collect()
 }

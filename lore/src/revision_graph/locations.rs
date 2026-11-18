@@ -5,8 +5,7 @@
 //! Each builder makes a context over the storage handle's stores, which the call drops when it
 //! returns: [`local_read_context`] and [`local_write_context`] for the local store,
 //! [`remote_read_context`] for the remote, with its revision service in
-//! [`remote_revision_service`], and `full_context` for both, which is built only with the
-//! `test-util` feature.
+//! [`remote_revision_service`], and [`full_context`] for both.
 //! The local store's context is offline, so work through it never reaches the remote. The remote's
 //! context reads immutable data from the remote alone and stores none of it in the local store, in
 //! each read that takes its options from the context
@@ -22,14 +21,12 @@
 //! ([`LocationAnswer`]) through [`CallOutcome`].
 //!
 //! A write verb's pre-checks answer a [`PreCheck`] at each location, and [`ended_at`] ends a
-//! location's work where it failed.
+//! location's work where it failed. [`branch_record_at`] reads a branch's record at the remote.
 
-#[cfg(feature = "test-util")]
 use std::future;
 use std::sync::Arc;
 
 use futures::FutureExt;
-#[cfg(feature = "test-util")]
 use futures::future::Either;
 use lore_base::error::BranchNotFound;
 use lore_base::error::NoRemote;
@@ -41,6 +38,7 @@ use lore_revision::interface::LoreBranchLocation;
 use lore_revision::protocol::RemoteEndpoint;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_transport::BranchRecord;
 use lore_transport::ProtocolError;
 use lore_transport::Revision;
 
@@ -239,6 +237,24 @@ pub(crate) async fn default_branch_at(
     }
 }
 
+/// The remote's record of `branch`, read with a branch query through `service`, the remote's
+/// revision service. `None` where the remote doesn't hold the branch.
+///
+/// # Errors
+///
+/// A failed request, forwarded under `context`.
+pub(crate) async fn branch_record_at(
+    service: &dyn Revision,
+    branch: BranchId,
+    context: &'static str,
+) -> Result<Option<BranchRecord>, RevisionGraphError> {
+    match service.branch_query(Some(branch), None).await {
+        Ok(record) => Ok(Some(record)),
+        Err(err) if err.is_not_found() => Ok(None),
+        Err(err) => Err(err).forward_any::<RevisionGraphError>(context),
+    }
+}
+
 /// A context over the local store: offline, without a write token, and telling a failed read from
 /// a block the store doesn't hold ([`RepositoryContext::strict_local_reads`]).
 pub fn local_read_context(store: &StoreInternal, repository: Partition) -> Arc<RepositoryContext> {
@@ -308,7 +324,6 @@ pub fn remote_revision_service<'a>(
 /// # Errors
 ///
 /// The connect's error.
-#[cfg(feature = "test-util")]
 pub fn full_context<'a>(
     store: &'a StoreInternal,
     repository: Partition,

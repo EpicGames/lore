@@ -59,7 +59,9 @@ pub struct BranchRecordOut {
     pub protect: bool,
     /// Whether the branch is archived at the location.
     pub archived: bool,
-    /// Whether the local latest may hold revisions the remote lacks. False on a remote record.
+    /// Whether the local latest isn't known to be on the remote's history line for the branch, the
+    /// remote latest or a revision it reaches along first parents, as after a commit the remote
+    /// doesn't have yet. False on a remote record.
     pub divergent: bool,
 }
 
@@ -117,7 +119,7 @@ pub(crate) fn live_branch_record(
 }
 
 /// The record of `branch` in the local store from `metadata`, the blob its metadata key names: the
-/// blob's fields, and the latest and the latest status, read through `ctx` together. A branch
+/// blob's fields, and the latest and the latest status ([`local_latest`]). A branch
 /// without a latest has a zero one, and a blob without a category or a creator, as older clients
 /// wrote, an empty one.
 ///
@@ -136,13 +138,7 @@ pub(crate) fn branch_record_from_metadata(
     metadata: Metadata,
 ) -> impl Future<Output = Result<BranchRecordOut, RevisionGraphError>> {
     async move {
-        let (latest, status) = tokio::join!(
-            branch::mutable_value(ctx.clone(), branch::LATEST, branch),
-            branch::mutable_value(ctx, branch::LATEST_STATUS, branch),
-        );
-        let latest = latest
-            .forward_any::<RevisionGraphError>("loading the latest revision")?
-            .unwrap_or_default();
+        let LocalLatest { latest, divergent } = local_latest(ctx, branch).await?;
         Ok(BranchRecordOut {
             branch,
             name: LoreString::from(
@@ -156,11 +152,50 @@ pub(crate) fn branch_record_from_metadata(
             created: branch::created(&metadata),
             protect: branch::protected(&metadata),
             archived: false,
+            divergent,
+        })
+    }
+}
+
+/// The latest of a branch in the local store, zero for none, and whether its latest status is
+/// divergent.
+#[derive(Clone, Copy)]
+pub(crate) struct LocalLatest {
+    /// The local latest.
+    pub latest: Hash,
+    /// Whether the local latest isn't known to be on the remote's history line for the branch, the
+    /// remote latest or a revision it reaches along first parents, as after a commit the remote
+    /// doesn't have yet.
+    pub divergent: bool,
+}
+
+/// The local latest of `branch` and its latest status, read through `ctx` together.
+///
+/// Returns the two reads' joined future with the answer mapped onto its output, without a future
+/// of its own.
+///
+/// # Errors
+///
+/// A failed read, the latest's first.
+#[inline]
+pub(crate) fn local_latest(
+    ctx: Arc<RepositoryContext>,
+    branch: BranchId,
+) -> impl Future<Output = Result<LocalLatest, RevisionGraphError>> {
+    futures::future::join(
+        branch::mutable_value(ctx.clone(), branch::LATEST, branch),
+        branch::mutable_value(ctx, branch::LATEST_STATUS, branch),
+    )
+    .map(|(latest, status)| {
+        Ok(LocalLatest {
+            latest: latest
+                .forward_any::<RevisionGraphError>("loading the latest revision")?
+                .unwrap_or_default(),
             divergent: status
                 .forward_any::<RevisionGraphError>("loading the latest status")?
                 .is_some(),
         })
-    }
+    })
 }
 
 /// The record of the branch the remote's `record` describes: [`remote_record_out`], with `protect`

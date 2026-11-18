@@ -14,4 +14,5 @@ mod read_costs;
 mod resolve;
 mod session_reuse;
 mod support;
+mod sync;
 mod write_costs;

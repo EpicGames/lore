@@ -339,8 +339,10 @@ async fn sync_store_view(
     Ok(())
 }
 
-/// Records `revision` as `branch`'s latest, convergent with the remote that answered
-/// for it, and as the revision last synced to.
+/// Records `revision` as `branch`'s latest, convergent, and as the revision last synced to. The
+/// caller passes only a revision known to be on the remote's history line for the branch: the
+/// remote latest, or a revision [`revision_advances_branch_latest`] finds the remote holds at its
+/// number.
 async fn sync_store_branch_latest(
     repository: Arc<RepositoryContext>,
     branch: BranchId,

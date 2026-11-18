@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 //! Event data for the `lore_revision_graph_*` verbs: record events, each reporting one object as
-//! one location holds it, and the location complete event, which reports a call's outcome at one
-//! location.
+//! one location holds it, the location complete event, which reports a call's outcome at one
+//! location, and the synced event, which reports a branch sync's outcome.
 
 use lore_base::types::BranchId;
 use lore_base::types::Hash;
@@ -46,7 +46,9 @@ pub struct LoreRevisionGraphBranchEventData {
     /// Set when the branch is archived.
     #[serde(with = "u8_as_bool")]
     pub archived: u8,
-    /// Set when the local latest may hold revisions the remote lacks. Zero on a remote record.
+    /// Set when the local latest isn't known to be on the remote's history line for the branch, the
+    /// remote latest or a revision it reaches along first parents, as after a commit the remote
+    /// doesn't have yet. Zero on a remote record.
     #[serde(with = "u8_as_bool")]
     pub divergent: u8,
 }
@@ -122,4 +124,20 @@ pub struct LoreRevisionGraphLocationCompleteEventData {
     /// The location's outcome. Code 0 on success, including when the location doesn't hold the
     /// object.
     pub error: LoreErrorDetail,
+}
+
+/// A branch sync's outcome: the local latest before the call and after it.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreRevisionGraphBranchSyncedEventData {
+    /// The `id` from the call's arguments.
+    pub id: u64,
+    /// The branch the call syncs.
+    pub branch: BranchId,
+    /// The local latest the call read. Where the call failed, the local latest it last observed.
+    pub previous_local_latest: Hash,
+    /// The local latest when the call finished. Where the call failed, the local latest it last
+    /// observed, as `previous_local_latest` holds it.
+    pub local_latest: Hash,
 }

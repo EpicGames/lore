@@ -3637,7 +3637,9 @@ typedef struct lore_revision_graph_branch_event_data_t {
   uint8_t protect;
   // Set when the branch is archived.
   uint8_t archived;
-  // Set when the local latest may hold revisions the remote lacks. Zero on a remote record.
+  // Set when the local latest isn't known to be on the remote's history line for the branch, the
+  // remote latest or a revision it reaches along first parents, as after a commit the remote
+  // doesn't have yet. Zero on a remote record.
   uint8_t divergent;
 } lore_revision_graph_branch_event_data_t;
 
@@ -3701,6 +3703,19 @@ typedef struct lore_revision_graph_branch_metadata_event_data_t {
   // The entry's value, with the type it's stored with.
   struct lore_metadata_t value;
 } lore_revision_graph_branch_metadata_event_data_t;
+
+// A branch sync's outcome: the local latest before the call and after it.
+typedef struct lore_revision_graph_branch_synced_event_data_t {
+  // The `id` from the call's arguments.
+  uint64_t id;
+  // The branch the call syncs.
+  lore_branch_id_t branch;
+  // The local latest the call read. Where the call failed, the local latest it last observed.
+  struct lore_hash_t previous_local_latest;
+  // The local latest when the call finished. Where the call failed, the local latest it last
+  // observed, as `previous_local_latest` holds it.
+  struct lore_hash_t local_latest;
+} lore_revision_graph_branch_synced_event_data_t;
 
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
@@ -4209,6 +4224,8 @@ enum lore_event_id_t {
   LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE,
   // One metadata entry of a branch, as one location holds it.
   LORE_EVENT_REVISION_GRAPH_BRANCH_METADATA,
+  // A branch sync's outcome.
+  LORE_EVENT_REVISION_GRAPH_BRANCH_SYNCED,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -4466,6 +4483,7 @@ typedef struct lore_event_t {
     struct lore_revision_graph_revision_event_data_t revision_graph_revision;
     struct lore_revision_graph_location_complete_event_data_t revision_graph_location_complete;
     struct lore_revision_graph_branch_metadata_event_data_t revision_graph_branch_metadata;
+    struct lore_revision_graph_branch_synced_event_data_t revision_graph_branch_synced;
   };
 } lore_event_t;
 
@@ -6972,6 +6990,34 @@ typedef struct lore_revision_graph_branch_archive_args_t {
   // Branch to archive. Not zero.
   lore_branch_id_t branch;
 } lore_revision_graph_branch_archive_args_t;
+
+// Options of `lore_revision_graph_branch_sync`.
+typedef struct lore_revision_graph_branch_sync_options_t {
+  // Non-zero: move the local latest to the target even where the target isn't a first-parent
+  // descendant of it
+  uint8_t force;
+  // Non-zero: sync only while the local latest is this revision. Zero sets no expectation.
+  struct lore_hash_t expected_local_latest;
+} lore_revision_graph_branch_sync_options_t;
+
+// Arguments for `lore_revision_graph_branch_sync`.
+typedef struct lore_revision_graph_branch_sync_args_t {
+  // Caller-chosen id echoed back in every event this surface defines for the call. Separate
+  // from `globals.correlation_id`.
+  uint64_t id;
+  // Open storage handle the call reaches the repository through
+  struct lore_store_t store;
+  // Repository the branch is synced in
+  struct lore_partition_t repository;
+  // Branch whose local latest the call syncs. Not zero.
+  lore_branch_id_t branch;
+  // The revision to sync the local latest to: a revision on the branch, the branch point the
+  // branch starts from, or a revision number on the branch or its latest. All zero names the
+  // branch's latest.
+  struct lore_revision_identifier_t target;
+  // How the call syncs
+  struct lore_revision_graph_branch_sync_options_t options;
+} lore_revision_graph_branch_sync_args_t;
 
 // Return the tag identifying the type of an event.
 uint32_t lore_event_type(const struct lore_event_t *event);
@@ -14532,6 +14578,100 @@ int32_t lore_revision_graph_branch_archive(const struct lore_global_args_t *glob
 void lore_revision_graph_branch_archive_async(const struct lore_global_args_t *globals,
                                               const struct lore_revision_graph_branch_archive_args_t *args,
                                               struct lore_event_callback_config_t callback);
+
+// Sync the local latest of `args->branch` to the revision `args->target` names.
+//
+// With no location flag or with `remote`, the call looks the target up at the remote, if
+// `args->store` has one; with `local` or `offline`, or on a storage handle without a remote, it
+// looks it up in the local store. Whatever the flags, the call writes the local store alone: the
+// branch's local latest with its latest status and latest history, and the last synchronized
+// revision where it records the branch in sync with the remote. An all-zero `args->target` names
+// the branch's latest. A hash target must be a revision whose own branch is `args->branch`, or the
+// branch point the branch starts from, and a branch-form target must name `args->branch`.
+//
+// The local store holds the branch where it holds the branch's metadata; a local latest alone, as
+// a tree commit leaves it, doesn't count. Where the call consults the remote and the local store
+// lacks the branch's metadata, or the branch's name doesn't map to it there, the call first brings
+// the branch in: it copies the remote's metadata into the local store under the same id, settling
+// a restore that stopped part way, and claims the name. A branch the remote has archived gets its
+// metadata and no name.
+//
+// The call moves the local latest to the target where the local latest is zero, or where the
+// target descends from it along first parents, which an ancestry walk checks. The walk reads
+// history from the remote and keeps what it fetches in the local store where the call looks the
+// target up at the remote, and reads the local store alone otherwise. `args->options.force` moves
+// the local latest to any target, and a non-zero `args->options.expected_local_latest` lets the
+// call proceed only while the local latest is that revision. The local latest moves with a
+// compare-and-swap from the value the call read, so a commit on the branch that lands first fails
+// the call, and one that lands after reports a tip collision. Where the target is the remote
+// latest, the call records the branch in sync with the remote, also where the local latest is the
+// target already. Otherwise it records the new local latest as divergent, unless the remote shows
+// that its history for the branch holds the target: a revision number on the branch, the branch
+// point, or a hash whose revision number on the branch the remote's revision list answers with
+// that hash, which takes one more request. A local sync with an all-zero target writes nothing,
+// and sends a `LORE_EVENT_REVISION_GRAPH_INSTANCE` for each repository instance registered in the
+// local store whose current branch is `args->branch`. The call ignores `globals.force` and
+// `globals.dry_run`, and `lore_storage_close` waits for it.
+//
+// `LORE_EVENT_REVISION_GRAPH_BRANCH_SYNCED` fires before `LORE_EVENT_COMPLETE` once the call has
+// read the local latest, on success and on failure alike. On success its `local_latest` is the new
+// local latest. After a later failure, both its latests hold the local latest the call last read,
+// so a caller can retry with `args->options.expected_local_latest` set to it. A call that fails
+// before that read, such as on invalid arguments, a refused connection, or a branch the local store
+// doesn't hold that the remote can't supply, sends only `LORE_EVENT_COMPLETE`. The call sends no
+// `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE`.
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_REVISION_GRAPH_INSTANCE` | `lore_revision_graph_instance_event_data_t` | A repository instance on the branch, from a local sync with no target |
+// | `LORE_EVENT_REVISION_GRAPH_BRANCH_SYNCED` | `lore_revision_graph_branch_synced_event_data_t` | The local latest the call read and the one it left |
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | A log line |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` on success or the error code, with its detail in `error` |
+//
+// Fails with:
+// - error code 3 (invalid arguments) for a zero `args->branch`, a malformed `args->target`, a
+//   target outside the branch, an unknown or closed `args->store`, and location flags that
+//   contradict each other or those `args->store` was opened with;
+// - error code 111 (no remote) where `remote` is set in `globals` and `args->store` has no remote;
+// - error code 41 (branch advanced) where the local latest isn't
+//   `args->options.expected_local_latest`, or changed during the call;
+// - error code 42 (divergent) where, without `args->options.force`, the target doesn't descend
+//   from the local latest along first parents, including a target that reaches it only through
+//   the second parent of a merge;
+// - error code 57 (branch already exists) where bringing the branch in finds another local branch
+//   holding its name, or another writer changing the branch's local metadata meanwhile;
+// - error code 87 (branch not found) where the location the call looks the target up in doesn't
+//   hold the branch;
+// - error code 88 (revision not found) where that location lacks the revision `args->target`
+//   names, and where the ancestry walk stops at a revision the local store lacks with no remote to
+//   read it from;
+// - error code 80 (address not found) where the remote lacks a blob it names, such as the branch's
+//   metadata;
+// - error code 118 (oversized) where a location holds a metadata blob larger than 1 MiB;
+// - error code 16 (not authenticated) where the call has no login or tokens the remote accepts.
+//   The call starts no login: the caller logs in, with `lore_auth_login_interactive` or
+//   `lore_auth_login_with_token`, and calls again, and a storage handle's open connection picks
+//   up the new login within a minute. A caller that passes its own tokens in `globals` opens a
+//   new storage handle with fresh ones, since an open connection keeps the tokens it connected
+//   with;
+// - error codes 17 (not authorized), 28 (disconnected), 29 (not connected), 30 (maintenance) and
+//   31 (slow down) where the remote refuses the call or can't be reached;
+// - error code -1 (internal) for any other failure, such as a corrupt block.
+//
+// An event's strings, arrays and error detail are valid only during the callback invocation that
+// delivers it. This call and `lore_revision_graph_branch_sync_async` copy `args` before they
+// return, so an `_async` caller can free `args` once the call returns. A caller that passes the
+// same `globals.correlation_id` on every call over one storage handle reuses one storage session
+// per connection, as with the `lore_storage_*` calls. `args->id`, which every
+// `LORE_EVENT_REVISION_GRAPH_*` event echoes, is separate from it.
+int32_t lore_revision_graph_branch_sync(const struct lore_global_args_t *globals,
+                                        const struct lore_revision_graph_branch_sync_args_t *args,
+                                        struct lore_event_callback_config_t callback);
+
+// Sync a branch's local latest to a target revision (async variant).
+void lore_revision_graph_branch_sync_async(const struct lore_global_args_t *globals,
+                                           const struct lore_revision_graph_branch_sync_args_t *args,
+                                           struct lore_event_callback_config_t callback);
 
 // Select how payloads are compressed before they are stored, over
 // `lore_storage::COMPRESSION_MODE`.

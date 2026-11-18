@@ -84,6 +84,7 @@ use crate::dependency::LoreFileDependencyRemoveEndEventData;
 use crate::dependency::LoreFileDependencyRemoveEntryEventData;
 use crate::event::revision_graph::LoreRevisionGraphBranchEventData;
 use crate::event::revision_graph::LoreRevisionGraphBranchMetadataEventData;
+use crate::event::revision_graph::LoreRevisionGraphBranchSyncedEventData;
 use crate::event::revision_graph::LoreRevisionGraphInstanceEventData;
 use crate::event::revision_graph::LoreRevisionGraphLocationCompleteEventData;
 use crate::event::revision_graph::LoreRevisionGraphRevisionEventData;
@@ -1419,6 +1420,8 @@ pub enum LoreEvent {
     RevisionGraphLocationComplete(LoreRevisionGraphLocationCompleteEventData),
     /// One metadata entry of a branch, as one location holds it.
     RevisionGraphBranchMetadata(LoreRevisionGraphBranchMetadataEventData),
+    /// A branch sync's outcome.
+    RevisionGraphBranchSynced(LoreRevisionGraphBranchSyncedEventData),
 }
 
 /// Encodes as the event it refers to, so that a sender can encode an event it only borrows.

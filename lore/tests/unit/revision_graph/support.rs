@@ -509,10 +509,12 @@ pub(crate) fn counting_reads(
 }
 
 /// How [`NamingRevision`] answers a branch query.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) enum QueryAnswer {
     /// The record of a live branch with this id, named `feature`, without a latest revision.
     Record(BranchId),
+    /// This record.
+    Answer(BranchQueryResponse),
     /// No live branch holds the name or the id.
     NotFound,
     /// The remote is overloaded.
@@ -648,13 +650,14 @@ impl Revision for NamingRevision {
             .lock()
             .unwrap()
             .push((branch, name.map(str::to_owned)));
-        match self.query {
+        match &self.query {
             QueryAnswer::Record(id) => Ok(BranchQueryResponse {
-                id,
+                id: *id,
                 name: "feature".to_owned(),
                 metadata: hash(7),
                 ..Default::default()
             }),
+            QueryAnswer::Answer(record) => Ok(record.clone()),
             QueryAnswer::NotFound => Err(ProtocolError::from(NotFound)),
             QueryAnswer::SlowDown => Err(ProtocolError::from(SlowDown)),
         }

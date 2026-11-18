@@ -6,6 +6,7 @@ mod branch_list;
 mod branch_metadata_get;
 mod branch_metadata_set;
 mod branch_resolve;
+mod branch_sync;
 mod call;
 mod identifier;
 mod locations;

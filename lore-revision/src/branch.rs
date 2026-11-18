@@ -1067,6 +1067,40 @@ pub async fn lookup_name_local_unwritten(
         .map(NamedBranch::Derived))
 }
 
+/// The value a claim of `name` for `claimant` swaps from, as the name's mapping holds it in the
+/// local store alone, zero for none ([`lookup_name_local_unwritten`]). The name is held where its
+/// mapping, or for a name without one the id derived from it, names a branch other than
+/// `claimant` that has a metadata key, whatever its metadata says, and is stale where that branch
+/// has none. `claimant` is zero for a branch with a new id.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+///
+/// # Errors
+///
+/// [`BranchAlreadyExists`] naming `name` where another branch holds it, and a failed read.
+#[allow(clippy::manual_async_fn)]
+pub fn local_claim_expected(
+    repository: Arc<RepositoryContext>,
+    name: &str,
+    claimant: BranchId,
+) -> impl Future<Output = Result<Context, BranchError>> {
+    async move {
+        let Some(named) = lookup_name_local_unwritten(repository.clone(), name).await? else {
+            return Ok(Context::default());
+        };
+        if named.branch() != claimant
+            && mutable_value(repository, METADATA, named.branch())
+                .await?
+                .is_some()
+        {
+            return Err(BranchError::from(BranchAlreadyExists {
+                branch: name.to_string(),
+            }));
+        }
+        Ok(named.mapping())
+    }
+}
+
 /// The value the mapping of `name` holds in the local store, zero for none. A read that fails other
 /// than as not found fails.
 ///
@@ -1244,13 +1278,14 @@ pub async fn load_latest_preferring_remote(
         .unwrap_or_default())
 }
 
+/// Whether a branch's local latest is known to be on the remote's history line for the branch: the
+/// remote latest, or a revision the remote latest reaches along first parents.
 #[derive(PartialEq)]
 pub enum BranchLatestStatus {
-    /// The latest revision is not guaranteed to be in sync with remote branch history.
-    /// When syncing to a new revision a divergence check has to be performed.
+    /// The local latest isn't known to be on the remote's history line for the branch, as after a
+    /// commit the remote doesn't have yet.
     Divergent,
-    /// The latest revision is guaranteed to be in sync with remote branch history.
-    /// When syncing to a new revision it is safe to avoid doing a divergence check.
+    /// The local latest is known to be on the remote's history line for the branch.
     Convergent,
 }
 
@@ -1261,6 +1296,11 @@ pub enum BranchLatestStatus {
 /// [`BranchError::BranchAdvanced`] is returned having written nothing. Creating
 /// a branch passes `Hash::default()`. A caller deliberately overwriting a tip it
 /// has not tracked reads it with [`load_latest`] and passes that.
+///
+/// On a client, the latest status is then stored: `latest` where `status` is
+/// divergent, and where it is convergent the status is cleared with a
+/// compare-and-swap from `previous`, so a status another writer stores for its
+/// own latest after the pointer write stays.
 pub async fn store_latest(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
@@ -1281,17 +1321,20 @@ pub async fn store_latest(
         return Ok(());
     }
 
-    let _ = mutable_store(
-        repository.clone(),
-        LATEST_STATUS,
-        branch,
-        if status == BranchLatestStatus::Divergent {
-            latest
-        } else {
-            Hash::default()
-        },
-    )
-    .await;
+    let _ = match status {
+        BranchLatestStatus::Divergent => {
+            mutable_store(repository.clone(), LATEST_STATUS, branch, latest).await
+        }
+        BranchLatestStatus::Convergent => mutable_try_store(
+            repository.clone(),
+            LATEST_STATUS,
+            branch,
+            previous,
+            Hash::default(),
+        )
+        .await
+        .map(drop),
+    };
     store_latest_history(repository, branch, latest).await
 }
 
@@ -2757,7 +2800,7 @@ fn finish_restore(
             stamp_time(&mut metadata, RESTORED)?;
             let finished = serialize_metadata(repository.clone(), &metadata).await?;
             match swap_metadata_key(repository.clone(), branch, recorded, finished).await {
-                Ok(()) => return Ok(()),
+                Ok(_) => return Ok(()),
                 Err(err) if err.is_branch_already_exists() => {
                     let Some((current, current_metadata)) =
                         restore_record(repository.clone(), branch, name, archived).await?
@@ -2848,7 +2891,8 @@ async fn settle_pending_restore(
     Ok(Some((settled, released)))
 }
 
-/// Caches `remote`, the remote's metadata hash of `branch`, in the local metadata key.
+/// Caches `remote`, the remote's metadata hash of `branch`, in the local metadata key, and answers
+/// the value the cache replaced there, zero for none.
 ///
 /// Where the local store holds metadata, the cache first settles a restore it records
 /// ([`RESTORING`]), or releases the name it marks [`RELEASED`], as a restore or an archive does.
@@ -2863,13 +2907,52 @@ pub(crate) async fn cache_remote_metadata(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
     remote: Hash,
-) -> Result<(), BranchError> {
+) -> Result<Hash, BranchError> {
     let local = match mutable_load(repository.clone(), METADATA, branch).await {
         Ok(read) => Box::pin(settle_local_restore(repository.clone(), branch, read)).await?,
         Err(err) if err.is_branch_not_found() => Hash::default(),
         Err(err) => return Err(err),
     };
     swap_metadata_key(repository, branch, local, remote).await
+}
+
+/// Writes the local record of `branch` that a sync brings in from the remote: `metadata`, the
+/// remote's metadata hash, whose blob the local store holds, cached in the local metadata key as
+/// [`cache_remote_metadata`] caches it, then, with `claim`, the mapping of `name` to `branch`,
+/// claimed from the value [`local_claim_expected`] reads after the cache, whose settle may release
+/// the name. Sends no event and writes no latest revision.
+///
+/// A claim that fails sets the metadata key back from `metadata` to the value the cache replaced,
+/// zero where there was none, which removes the key, as a create that loses its claim does.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+///
+/// # Errors
+///
+/// [`BranchAlreadyExists`] naming `branch` where another writer changed the metadata key after the
+/// cache read it, and naming `name` where another branch holds it; a failed read or write.
+#[allow(clippy::manual_async_fn)]
+pub fn bring_in_record(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    name: &str,
+    metadata: Hash,
+    claim: bool,
+) -> impl Future<Output = Result<(), BranchError>> {
+    async move {
+        let replaced = cache_remote_metadata(repository.clone(), branch, metadata).await?;
+        if !claim {
+            return Ok(());
+        }
+        let claimed = match local_claim_expected(repository.clone(), name, branch).await {
+            Ok(expected) => claim_name(repository.clone(), name, expected, branch).await,
+            Err(err) => Err(err),
+        };
+        if claimed.is_err() {
+            revert_metadata(repository, branch, metadata, replaced).await;
+        }
+        claimed
+    }
 }
 
 /// Settles a restore the local metadata of `branch`, which the local key holds as `read`, records,
@@ -3082,14 +3165,15 @@ async fn serialize_metadata(
         .forward::<BranchError>("Failed to serialize branch metadata")
 }
 
-/// Swaps the metadata key of `branch` from `expected` to `hash`. A key that holds another value is
-/// left as it is, and the swap fails with [`BranchAlreadyExists`] naming the branch.
+/// Swaps the metadata key of `branch` from `expected` to `hash`, answering `expected`, the value
+/// it replaced. A key that holds another value is left as it is, and the swap fails with
+/// [`BranchAlreadyExists`] naming the branch.
 async fn swap_metadata_key(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
     expected: Hash,
     hash: Hash,
-) -> Result<(), BranchError> {
+) -> Result<Hash, BranchError> {
     let held = mutable_try_store(repository, METADATA, branch, expected, hash).await?;
     if held != expected {
         lore_debug!("Branch {branch} has metadata {held}, not {expected}, so it isn't rewritten");
@@ -3097,7 +3181,7 @@ async fn swap_metadata_key(
             branch: branch.to_string(),
         }));
     }
-    Ok(())
+    Ok(held)
 }
 
 /// Writes the record of a new branch: its metadata, swapped into the metadata key of `branch` from

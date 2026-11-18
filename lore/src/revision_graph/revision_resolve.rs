@@ -357,25 +357,38 @@ pub(crate) fn numbered_at<'a>(
                 NumberWalk::Absent | NumberWalk::Missing(_) => Err(LocationMiss::RevisionNotFound),
             });
         };
-        match remote_service
-            .revision_list(RevisionListIdentifier { branch, number }.into())
-            .await
-        {
-            Ok(page) => {
-                return Ok(
-                    listed_revision(&page.items, number)?.ok_or(LocationMiss::RevisionNotFound)
-                );
-            }
-            Err(err) if !err.is_not_found() => {
-                return Err(err)
-                    .forward_any::<RevisionGraphError>("listing the remote's revisions");
-            }
-            Err(_not_found) => {}
+        if let Some(listed) = listed_at(remote_service, branch, number).await? {
+            return Ok(listed.ok_or(LocationMiss::RevisionNotFound));
         }
         Ok(Err(match latest_at(ctx, service, branch).await? {
             Err(LocationMiss::BranchNotFound) => LocationMiss::BranchNotFound,
             _ => LocationMiss::RevisionNotFound,
         }))
+    }
+}
+
+/// The revision the remote's revision list for `branch` numbers `number`, and the hash of its
+/// metadata, through the remote's revision service `service`, as [`listed_revision`] reads the page
+/// that holds it: `Some` of the page's answer, `None` within it for a page that lists no revision
+/// with that number. `None` where the list answers `NotFound`, which Lore Server answers both for
+/// a branch it doesn't hold and for a number it can't resolve.
+///
+/// # Errors
+///
+/// A failed request, and a list item labelled the number without a state of its own with that
+/// number.
+pub(crate) async fn listed_at(
+    service: &Arc<dyn Revision>,
+    branch: BranchId,
+    number: u64,
+) -> Result<Option<Option<(Hash, Hash)>>, RevisionGraphError> {
+    match service
+        .revision_list(RevisionListIdentifier { branch, number }.into())
+        .await
+    {
+        Ok(page) => listed_revision(&page.items, number).map(Some),
+        Err(err) if err.is_not_found() => Ok(None),
+        Err(err) => Err(err).forward_any::<RevisionGraphError>("listing the remote's revisions"),
     }
 }
 

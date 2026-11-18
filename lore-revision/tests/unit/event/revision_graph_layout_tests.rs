@@ -10,6 +10,7 @@ use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_graph::LoreRevisionGraphBranchEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphBranchMetadataEventData;
+use lore_revision::event::revision_graph::LoreRevisionGraphBranchSyncedEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphInstanceEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphLocationCompleteEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphRevisionEventData;
@@ -38,12 +39,13 @@ fn lore_event_is_sized_by_an_existing_payload() {
         event <= tagged,
         "LoreEvent holds {event} bytes, the largest existing payload with its tag {tagged}; the \
          graph event data's (size, alignment): branch {:?}, instance {:?}, revision {:?}, \
-         location complete {:?}, branch metadata {:?}",
+         location complete {:?}, branch metadata {:?}, branch synced {:?}",
         layout::<LoreRevisionGraphBranchEventData>(),
         layout::<LoreRevisionGraphInstanceEventData>(),
         layout::<LoreRevisionGraphRevisionEventData>(),
         layout::<LoreRevisionGraphLocationCompleteEventData>(),
         layout::<LoreRevisionGraphBranchMetadataEventData>(),
+        layout::<LoreRevisionGraphBranchSyncedEventData>(),
     );
 }
 
@@ -71,8 +73,12 @@ fn graph_variants_are_appended_after_the_last_existing_variant() {
         LoreEvent::RevisionGraphRevision(revision()).discriminant(),
         LoreEvent::RevisionGraphLocationComplete(location_complete()).discriminant(),
         LoreEvent::RevisionGraphBranchMetadata(branch_metadata()).discriminant(),
+        LoreEvent::RevisionGraphBranchSynced(branch_synced()).discriminant(),
     ];
-    assert_eq!(graph, [last + 1, last + 2, last + 3, last + 4, last + 5]);
+    assert_eq!(
+        graph,
+        [last + 1, last + 2, last + 3, last + 4, last + 5, last + 6]
+    );
 }
 
 fn branch() -> LoreRevisionGraphBranchEventData {
@@ -130,5 +136,14 @@ fn branch_metadata() -> LoreRevisionGraphBranchMetadataEventData {
         branch: BranchId::default(),
         key: LoreString::default(),
         value: LoreMetadata::Boolean(0),
+    }
+}
+
+fn branch_synced() -> LoreRevisionGraphBranchSyncedEventData {
+    LoreRevisionGraphBranchSyncedEventData {
+        id: 0,
+        branch: BranchId::default(),
+        previous_local_latest: Hash::default(),
+        local_latest: Hash::default(),
     }
 }

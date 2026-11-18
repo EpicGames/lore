@@ -1,13 +1,19 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! What `branch_create` reads and writes in the local store in one call with no location flag,
-//! counted on a handle over the fixture handle's local stores: its pre-checks' loads and reads,
-//! then exactly the record it creates.
+//! What `branch_create` and `branch_sync` read and write in the local store in one call with no
+//! location flag, counted on a handle over the fixture handle's local stores: the create's
+//! pre-checks' loads and reads, then exactly the record it creates, and the keys a sync writes; and
+//! that a malformed revision identifier touches no store.
 
 use std::sync::atomic::Ordering;
 
+use lore::revision_graph::LoreRevisionIdentifier;
+use lore::revision_graph::branch_sync::LoreRevisionGraphBranchSyncOptions;
 use lore_base::error::InvalidArguments;
+use lore_base::test_util::TempDir;
+use lore_base::types::Hash;
 use lore_revision::branch;
+use lore_revision::repository::SALT_LORE;
 
 use super::counting::ByKeyType;
 use super::counting::LocalCalls;
@@ -19,9 +25,9 @@ use crate::common::net_common::close_handle;
 /// A create from a branch the local store holds with metadata, at both locations, loads the
 /// name's mapping, the latest of the id the name derives, the parent's metadata key and latest, and
 /// reads the parent's metadata blob. It then writes exactly its record: its metadata blob, swapped
-/// into the metadata key from zero, the name's mapping and the latest, each with a compare-and-swap,
-/// and the latest's status and history: a load of the history key, and a stored history blob the
-/// key then names. Each blob write queries the store before it puts. The parent's latest is a
+/// into the metadata key from zero, the name's mapping, the latest and the latest's status, cleared
+/// as convergent, each with a compare-and-swap, and the latest's history: a load of the history
+/// key, and a stored history blob the key then names. Each blob write queries the store before it puts. The parent's latest is a
 /// revision committed on it, so no history blob of another branch holds the new branch's entry.
 #[tokio::test]
 async fn branch_create_local_writes_exactly_its_record() {
@@ -58,12 +64,13 @@ async fn branch_create_local_writes_exactly_its_record() {
                 branch_id: 1,
                 branch_metadata: 1,
                 branch_latest_pointer: 1,
+                untyped: 1,
                 ..Default::default()
             },
             gets: 1,
             queries: 2,
             puts: 2,
-            others: 2,
+            others: 1,
             ..Default::default()
         }
     );
@@ -86,5 +93,95 @@ async fn branch_create_with_an_invalid_name_touches_no_store() {
     assert_eq!((mutable.total(), immutable.total()), (0, 0));
     assert_eq!(f.server_gets.load(Ordering::SeqCst), server_gets);
     assert!(location_outcomes(&events).is_empty());
+    f.close().await;
+}
+
+/// A sync that fast-forwards a branch the local store holds, with an instance registered on it,
+/// writes exactly the branch's latest, with a compare-and-swap, then its latest status, its latest
+/// history and its last synchronized revision, and no instance key.
+#[tokio::test]
+async fn branch_sync_writes_only_the_branchs_keys() {
+    let f = fixture().await;
+    let seeded = seed_main(&f).await;
+    let feature = create_branch_at_both_locations(
+        &f,
+        "feature",
+        branch::default_category(),
+        f.default_branch,
+        CREATOR,
+    )
+    .await;
+    let dir = TempDir::new("graph-sync-writes-");
+    register_instance_at(&f, feature, seeded, &dir).await;
+    let published = publish_from_another_handle(&f, feature, seeded).await;
+    let (store, mutable, _) = open_counted_handle(&f, None, None);
+
+    let (status, _) = sync_branch(
+        &f,
+        store,
+        graph_globals(),
+        feature,
+        LoreRevisionIdentifier::default(),
+        LoreRevisionGraphBranchSyncOptions::default(),
+    )
+    .await;
+    close_handle(store).await;
+
+    assert_eq!(status, 0);
+    assert_eq!(
+        local_value(&f, branch::LATEST, feature).await,
+        Some(published)
+    );
+    let key = |function| branch::mutable_key(SALT_LORE, function, f.repository, feature);
+    assert_eq!(
+        mutable.written(),
+        [
+            key(branch::LATEST),
+            key(branch::LATEST_STATUS),
+            key(branch::LATEST_HISTORY),
+            key(branch::LAST_SYNC),
+        ]
+    );
+    f.close().await;
+}
+
+/// A create whose `from` names both a hash and a branch, and a sync whose target names both a hash
+/// and a revision number, fail with `InvalidArguments` before any store access, the connect to the
+/// remote included.
+#[tokio::test]
+async fn malformed_identifiers_touch_no_store_for_create_and_sync() {
+    let f = fixture().await;
+    let (store, mutable, immutable) = open_counted_handle(&f, Some(closed_port_remote(&f)), None);
+    let malformed_from = LoreRevisionIdentifier {
+        hash: Hash::from([3; 32]),
+        branch: f.default_branch,
+        revision_number: 0,
+    };
+    let malformed_target = LoreRevisionIdentifier {
+        hash: Hash::from([3; 32]),
+        branch: Default::default(),
+        revision_number: 2,
+    };
+
+    let (created, create_events) =
+        create_branch(&f, store, graph_globals(), "feature", malformed_from).await;
+    let (sync_status, sync_events) = sync_branch(
+        &f,
+        store,
+        graph_globals(),
+        f.default_branch,
+        malformed_target,
+        LoreRevisionGraphBranchSyncOptions::default(),
+    )
+    .await;
+    close_handle(store).await;
+
+    assert_eq!(
+        (created, sync_status),
+        (InvalidArguments::FFI_CODE, InvalidArguments::FFI_CODE)
+    );
+    assert_eq!((mutable.total(), immutable.total()), (0, 0));
+    assert!(location_outcomes(&create_events).is_empty());
+    assert!(synced(&sync_events).is_empty());
     f.close().await;
 }

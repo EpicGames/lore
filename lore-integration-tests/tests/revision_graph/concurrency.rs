@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Concurrent `branch_create` calls of one name, at the remote and on one local store, and a
-//! create the remote's `branch_create` refuses after the pre-checks passed. The concurrent creates
+//! Concurrent `branch_create` calls of one name, at the remote and on one local store, a create
+//! the remote's `branch_create` refuses after the pre-checks passed, and a `branch_sync` racing a
+//! tree commit on its branch. The concurrent creates
 //! reach the race window only by chance; the claim's deterministic guards are the create core's
 //! rollback test and `classify_create_refusal_maps_each_row`.
 
@@ -9,9 +10,12 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use lore::revision_graph::LoreRevisionIdentifier;
+use lore::revision_graph::branch_sync::LoreRevisionGraphBranchSyncOptions;
 use lore::storage::handle;
 use lore::storage::store::StoreInternal;
 use lore::storage::store::disk_backed_for_tests;
+use lore_base::error::BranchAdvanced;
 use lore_base::error::BranchAlreadyExists;
 use lore_base::error::BranchNotFound;
 use lore_base::error::NotAuthorized;
@@ -23,8 +27,10 @@ use lore_base::types::KeyType;
 use lore_revision::branch;
 use lore_revision::branch::BranchLatestStatus;
 use lore_revision::interface::LoreBranchLocation;
+use lore_revision::repository::SALT_LORE;
 use lore_storage::local::store_lock::StoreHold;
 
+use super::counting::open_counted_handle;
 use super::support::*;
 use crate::common::net_common::close_handle;
 use crate::common::net_common::open_handle;
@@ -173,5 +179,115 @@ async fn a_create_refused_by_the_remote_rpc_emits_its_error_and_no_local_event()
     )
     .await;
     assert_eq!(status, BranchNotFound::FFI_CODE);
+    f.close().await;
+}
+
+/// The options of a forced sync that proceeds only while the local latest is `expected`.
+fn forced_from(expected: Hash) -> LoreRevisionGraphBranchSyncOptions {
+    LoreRevisionGraphBranchSyncOptions {
+        force: 1,
+        expected_local_latest: expected,
+    }
+}
+
+/// A forced sync expecting the local latest a tree commit on the branch also starts from, run
+/// together with that commit, leaves exactly one of them failed: a commit that lands first fails
+/// the sync with `BranchAdvanced`, and a sync that lands first fails the commit with a tip
+/// collision. The local latest is the winner's revision.
+#[tokio::test]
+async fn a_sync_racing_a_tree_commit_leaves_one_failed() {
+    let f = fixture().await;
+    let seeded = seed_main(&f).await;
+    let published = publish_from_another_handle(&f, f.default_branch, seeded).await;
+
+    let ((committed, revision), (synced_status, _)) = tokio::join!(
+        try_commit_on(f.store, f.repository, f.default_branch, seeded),
+        sync_branch(
+            &f,
+            f.store,
+            graph_globals(),
+            f.default_branch,
+            LoreRevisionIdentifier::default(),
+            forced_from(seeded),
+        ),
+    );
+
+    let failed = [committed != 0, synced_status != 0];
+    assert_eq!(
+        failed.iter().filter(|failed| **failed).count(),
+        1,
+        "exactly one fails: commit {committed}, sync {synced_status}"
+    );
+    let winner = if synced_status == 0 {
+        published
+    } else {
+        assert_eq!(synced_status, BranchAdvanced::FFI_CODE);
+        revision
+    };
+    assert_eq!(
+        local_latest(f.store, f.repository, f.default_branch).await,
+        winner
+    );
+    f.close().await;
+}
+
+/// A forced sync whose expected local latest a commit has moved past fails with `BranchAdvanced`,
+/// and the commit stays the local latest.
+#[tokio::test]
+async fn expected_local_latest_keeps_a_forced_sync_off_a_moved_latest() {
+    let f = fixture().await;
+    let seeded = seed_main(&f).await;
+    let committed = commit_on(f.store, f.repository, f.default_branch, seeded).await;
+
+    let (status, _) = sync_branch(
+        &f,
+        f.store,
+        graph_globals(),
+        f.default_branch,
+        LoreRevisionIdentifier::default(),
+        forced_from(seeded),
+    )
+    .await;
+
+    assert_eq!(status, BranchAdvanced::FFI_CODE);
+    assert_eq!(
+        local_latest(f.store, f.repository, f.default_branch).await,
+        committed
+    );
+    f.close().await;
+}
+
+/// A sync whose compare-and-swap of the local latest finds another writer's value, stored after
+/// the sync read the local latest, fails with `BranchAdvanced`, and its synced event reports the
+/// value that won as both latests.
+#[tokio::test]
+async fn a_sync_that_loses_its_swap_reports_the_latest_that_won() {
+    let f = fixture().await;
+    let seeded = seed_main(&f).await;
+    publish_from_another_handle(&f, f.default_branch, seeded).await;
+    let won = Hash::from([5; 32]);
+    let latest_key =
+        branch::mutable_key(SALT_LORE, branch::LATEST, f.repository, f.default_branch).0;
+    let overtake = Overtake::default();
+    *overtake.lock().unwrap() = Some((latest_key, won));
+    let (store, _, _) = open_counted_handle(&f, None, overtaking_load(overtake));
+
+    let (status, events) = sync_branch(
+        &f,
+        store,
+        graph_globals(),
+        f.default_branch,
+        LoreRevisionIdentifier::default(),
+        LoreRevisionGraphBranchSyncOptions::default(),
+    )
+    .await;
+    close_handle(store).await;
+
+    assert_eq!(status, BranchAdvanced::FFI_CODE);
+    assert_eq!(synced(&events), [(won, won)]);
+    assert_eq!(
+        local_latest(f.store, f.repository, f.default_branch).await,
+        won
+    );
     f.close().await;
 }

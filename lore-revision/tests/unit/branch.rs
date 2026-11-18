@@ -5954,3 +5954,236 @@ async fn archives_locally_answers_false_for_an_archived_derived_branch() {
     }))
     .await;
 }
+
+/// A latest stored convergent clears the latest status with a compare-and-swap from the latest it
+/// replaces, so a status another writer stores between the latest's swap and that clear, as a
+/// commit landing right after the swap stores it for its own revision, stays.
+#[tokio::test]
+async fn store_latest_keeps_a_status_stored_after_its_swap() {
+    with_execution(async {
+        let branch = branch_id(3);
+        let (previous, latest, committed) = (revision(4), revision(5), revision(6));
+        let armed = Arc::new(Mutex::new(None::<(Hash, Hash, KeyType)>));
+        let stores = crate::paged_remote::answering_client_stores(
+            |_call, _key, _key_type| Ok(()),
+            answered({
+                let armed = armed.clone();
+                move |inner, partition, call, key, _key_type| {
+                    let write = match (call, *armed.lock().expect("the arming lock")) {
+                        (
+                            StoreCall::CompareAndSwap,
+                            Some((latest_key, status_key, status_type)),
+                        ) if latest_key == key => Some((status_key, status_type)),
+                        _ => None,
+                    };
+                    if write.is_some() {
+                        *armed.lock().expect("the arming lock") = None;
+                    }
+                    async move {
+                        if let Some((status_key, status_type)) = write {
+                            inner
+                                .store(partition, status_key, committed, status_type)
+                                .await?;
+                        }
+                        Ok(())
+                    }
+                }
+            }),
+        )
+        .await;
+        let writer = stores.writer.clone();
+        store_latest(
+            writer.clone(),
+            branch,
+            Hash::default(),
+            previous,
+            BranchLatestStatus::Divergent,
+        )
+        .await
+        .expect("stores the previous latest");
+        let (latest_key, _) = mutable_key(writer.salt(), LATEST, writer.id, branch);
+        let (status_key, status_type) =
+            mutable_key(writer.salt(), LATEST_STATUS, writer.id, branch);
+        *armed.lock().expect("the arming lock") = Some((latest_key, status_key, status_type));
+
+        store_latest(
+            writer.clone(),
+            branch,
+            previous,
+            latest,
+            BranchLatestStatus::Convergent,
+        )
+        .await
+        .expect("stores the latest");
+
+        assert_eq!(
+            mutable_value(writer, LATEST_STATUS, branch)
+                .await
+                .expect("loads the status"),
+            Some(committed)
+        );
+    })
+    .await;
+}
+
+/// Writes, through `writer`, branch metadata of `id` named `name` that `entries` extends, each a
+/// key and its String value, and returns its hash.
+async fn write_branch_metadata(
+    writer: &Arc<RepositoryContext>,
+    id: BranchId,
+    name: &str,
+    entries: &[(&str, &str)],
+) -> Hash {
+    let mut metadata = lore_revision::metadata::Metadata::new();
+    metadata_populate(
+        &mut metadata,
+        id,
+        name,
+        default_category(),
+        "creator",
+        1,
+        vec![branch_point(1, 1)],
+    )
+    .expect("populating the branch's metadata");
+    for (key, value) in entries {
+        metadata.set_string(key, value).expect("setting an entry");
+    }
+    metadata
+        .serialize(writer.clone())
+        .await
+        .expect("storing the branch's metadata")
+}
+
+/// Bringing in a branch whose local metadata records a stopped restore settles it: the name the
+/// restore claimed maps to nothing, the metadata key holds the remote's hash, and the branch's own
+/// name maps to it.
+#[tokio::test]
+async fn bring_in_record_settles_a_stopped_local_restore() {
+    with_execution(async {
+        let stores = client_stores().await;
+        let id = branch_id(7);
+        let stopped =
+            write_branch_metadata(&stores.writer, id, CLAIMED_NAME, &[(RESTORING, "bee")]).await;
+        mutable_store_metadata(stores.writer.clone(), id, stopped)
+            .await
+            .expect("storing the branch's local metadata hash");
+        claim_name(stores.writer.clone(), "bee", BranchId::default(), id)
+            .await
+            .expect("the stopped restore claimed its name");
+        let remote = write_branch_metadata(&stores.writer, id, CLAIMED_NAME, &[]).await;
+
+        bring_in_record(stores.writer.clone(), id, CLAIMED_NAME, remote, true)
+            .await
+            .expect("brings the branch in");
+
+        assert_eq!(mapped(&stores.writer, "bee").await, None);
+        assert_eq!(mapped(&stores.writer, CLAIMED_NAME).await, Some(id));
+        assert_eq!(
+            mutable_value(stores.writer.clone(), METADATA, id)
+                .await
+                .expect("loads the metadata key"),
+            Some(remote)
+        );
+    })
+    .await;
+}
+
+/// Bringing in a branch whose name another branch with metadata holds fails with
+/// `BranchAlreadyExists`, and sets the metadata key back to the value it held.
+#[tokio::test]
+async fn bring_in_record_sets_its_metadata_back_after_a_lost_claim() {
+    with_execution(async {
+        let stores = client_stores().await;
+        let (id, holder) = (branch_id(7), branch_id(8));
+        create_record(
+            stores.writer.clone(),
+            holder,
+            CLAIMED_NAME,
+            default_category(),
+            "creator",
+            1,
+            Vec::new(),
+            revision(1),
+            BranchLatestStatus::Divergent,
+            BranchId::default(),
+        )
+        .await
+        .expect("another branch holds the name");
+        let before = write_branch_metadata(&stores.writer, id, "elsewhere", &[]).await;
+        mutable_store_metadata(stores.writer.clone(), id, before)
+            .await
+            .expect("storing the branch's local metadata hash");
+        let remote = write_branch_metadata(&stores.writer, id, CLAIMED_NAME, &[]).await;
+
+        let brought = bring_in_record(stores.writer.clone(), id, CLAIMED_NAME, remote, true).await;
+
+        assert!(brought.is_err_and(|err| err.is_branch_already_exists()));
+        assert_eq!(mapped(&stores.writer, CLAIMED_NAME).await, Some(holder));
+        assert_eq!(
+            mutable_value(stores.writer.clone(), METADATA, id)
+                .await
+                .expect("loads the metadata key"),
+            Some(before)
+        );
+    })
+    .await;
+}
+
+/// Bringing in a branch without a claim, as of a branch the remote has archived, caches its
+/// metadata and maps no name to it.
+#[tokio::test]
+async fn bring_in_record_without_a_claim_writes_no_name() {
+    with_execution(async {
+        let stores = client_stores().await;
+        let id = branch_id(7);
+        let remote = write_branch_metadata(&stores.writer, id, CLAIMED_NAME, &[]).await;
+
+        bring_in_record(stores.writer.clone(), id, CLAIMED_NAME, remote, false)
+            .await
+            .expect("brings the branch in");
+
+        assert_eq!(mapped(&stores.writer, CLAIMED_NAME).await, None);
+        assert_eq!(
+            mutable_value(stores.writer.clone(), METADATA, id)
+                .await
+                .expect("loads the metadata key"),
+            Some(remote)
+        );
+    })
+    .await;
+}
+
+/// Bringing in a branch whose local metadata key another writer changes after the cache read it
+/// fails with `BranchAlreadyExists`, leaves that writer's value, and claims no name.
+#[tokio::test]
+async fn bring_in_record_keeps_metadata_another_writer_stored_after_its_read() {
+    Box::pin(with_execution(async {
+        let armed = ArmedWrite::default();
+        let stores = crate::paged_remote::answering_client_stores(
+            |_call, _key, _key_type| Ok(()),
+            writing_after_its_load(armed.clone()),
+        )
+        .await;
+        let id = branch_id(7);
+        let before = write_branch_metadata(&stores.writer, id, "elsewhere", &[]).await;
+        mutable_store_metadata(stores.writer.clone(), id, before)
+            .await
+            .expect("storing the branch's local metadata hash");
+        let other = write_branch_metadata(&stores.writer, id, "other", &[]).await;
+        let remote = write_branch_metadata(&stores.writer, id, CLAIMED_NAME, &[]).await;
+        let (key, _key_type) = mutable_key(stores.writer.salt(), METADATA, stores.writer.id, id);
+        *armed.lock().expect("the arming lock") = Some((key, other));
+
+        let brought = bring_in_record(stores.writer.clone(), id, CLAIMED_NAME, remote, true).await;
+
+        assert!(brought.is_err_and(|err| err.is_branch_already_exists()));
+        assert_eq!(
+            mutable_value(stores.writer.clone(), METADATA, id)
+                .await
+                .expect("loads the metadata key"),
+            Some(other)
+        );
+        assert_eq!(mapped(&stores.writer, CLAIMED_NAME).await, None);
+    }))
+    .await;
+}

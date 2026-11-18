@@ -25,6 +25,7 @@ use lore_revision::event::LoreEvent;
 use lore_revision::event::LoreLogEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphBranchEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphBranchMetadataEventData;
+use lore_revision::event::revision_graph::LoreRevisionGraphBranchSyncedEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphInstanceEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphLocationCompleteEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphRevisionEventData;
@@ -61,6 +62,7 @@ fn kinds(events: &Mutex<Vec<LoreEvent>>) -> Vec<&'static str> {
             LoreEvent::RevisionGraphInstance(_) => Some("instance"),
             LoreEvent::RevisionGraphRevision(_) => Some("revision"),
             LoreEvent::RevisionGraphBranchMetadata(_) => Some("branch metadata"),
+            LoreEvent::RevisionGraphBranchSynced(_) => Some("branch synced"),
             LoreEvent::RevisionGraphLocationComplete(_) => Some("location complete"),
             LoreEvent::Complete(_) => Some("complete"),
             LoreEvent::End(_) => Some("end"),
@@ -71,7 +73,7 @@ fn kinds(events: &Mutex<Vec<LoreEvent>>) -> Vec<&'static str> {
 
 /// One event of each kind a revision graph call passes, after the events it drops: one a core
 /// sends and those of an interactive login.
-fn events_a_verb_sends() -> [LoreEvent; 9] {
+fn events_a_verb_sends() -> [LoreEvent; 10] {
     [
         LoreEvent::BranchCreate(LoreBranchCreateEventData {
             name: LoreString::from("core"),
@@ -134,6 +136,12 @@ fn events_a_verb_sends() -> [LoreEvent; 9] {
             records: 0,
             error: LoreErrorDetail::default(),
         }),
+        LoreEvent::RevisionGraphBranchSynced(LoreRevisionGraphBranchSyncedEventData {
+            id: 0,
+            branch: BranchId::default(),
+            previous_local_latest: Hash::default(),
+            local_latest: Hash::default(),
+        }),
     ]
 }
 
@@ -170,6 +178,7 @@ async fn call_drops_core_events_and_passes_log_and_complete() {
             "revision",
             "branch metadata",
             "location complete",
+            "branch synced",
             "complete",
             "end",
         ]

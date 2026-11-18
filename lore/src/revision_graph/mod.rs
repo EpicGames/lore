@@ -13,6 +13,7 @@ pub mod branch_list;
 pub mod branch_metadata_get;
 pub mod branch_metadata_set;
 pub mod branch_resolve;
+pub mod branch_sync;
 #[cfg(not(feature = "test-util"))]
 pub(crate) mod call;
 #[cfg(feature = "test-util")]
