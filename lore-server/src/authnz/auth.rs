@@ -46,19 +46,27 @@ fn auth_endpoint(auth_url: &str) -> Result<tonic::transport::Endpoint, Status> {
     Ok(endpoint)
 }
 
-async fn connect(url: &str, service: &str) -> Result<Channel, Status> {
+/// Dials `url`. A dial that fails answers `dial_failure` with its message.
+async fn connect(
+    url: &str,
+    service: &str,
+    dial_failure: fn(String) -> Status,
+) -> Result<Channel, Status> {
     let endpoint = auth_endpoint(url)?;
     // Connect from net so the hyper/h2 driver tasks this spawns bind there
     // rather than to the core runtime the caller runs on.
     lore_spawn_net!(async move { endpoint.connect().await })
         .await
         .warn_map_err(|_| Status::internal(format!("{service} connection task failed")))?
-        .warn_map_err(|_| Status::internal(format!("Failed to connect to {service}")))
+        .warn_map_err(|_| dial_failure(format!("Failed to connect to {service}")))
 }
 
 impl LoreAuthClientHelper {
-    async fn new(auth_url: String) -> Result<LoreAuthClientHelper, Status> {
-        let channel = connect(&auth_url, "lore auth service").await?;
+    async fn new(
+        auth_url: String,
+        dial_failure: fn(String) -> Status,
+    ) -> Result<LoreAuthClientHelper, Status> {
+        let channel = connect(&auth_url, "lore auth service", dial_failure).await?;
         let client = UrcAuthApiClient::with_interceptor(channel, CorrelationInterceptor);
         Ok(LoreAuthClientHelper { client })
     }
@@ -89,7 +97,13 @@ impl LoreAuthClientHelper {
 }
 
 pub async fn grpc_get_auth_client(auth_url: String) -> Result<LoreAuthClientHelper, Status> {
-    LoreAuthClientHelper::new(auth_url).await
+    LoreAuthClientHelper::new(auth_url, Status::internal).await
+}
+
+/// [`grpc_get_auth_client`] for permission checks: a dial that fails is
+/// `UNAVAILABLE`, which the check reads as a failure that can clear.
+pub async fn grpc_get_permission_client(auth_url: String) -> Result<LoreAuthClientHelper, Status> {
+    LoreAuthClientHelper::new(auth_url, Status::unavailable).await
 }
 
 /// A `lore.user.v1.RepositoryRegistryService` client for `user_url`, dialed
@@ -100,7 +114,7 @@ pub async fn grpc_get_repository_registry_client(
     RepositoryRegistryServiceClient<InterceptedService<Channel, CorrelationInterceptor>>,
     Status,
 > {
-    let channel = connect(user_url, "repository registry").await?;
+    let channel = connect(user_url, "repository registry", Status::internal).await?;
     Ok(RepositoryRegistryServiceClient::with_interceptor(
         channel,
         CorrelationInterceptor,

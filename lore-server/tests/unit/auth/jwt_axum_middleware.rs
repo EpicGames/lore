@@ -169,6 +169,57 @@ async fn the_shared_authorizer_decides_the_repository_path() {
         .await;
 }
 
+/// A check that failed is not a denial: the middleware answers 503 for a
+/// retryable failure and 500 for any other, and 403 only for a denial.
+#[tokio::test]
+async fn a_failed_check_is_not_forbidden() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let repository = random::<Context>();
+            let (_fragment, address, _payload) = fragment::generate_random();
+            for (refusal, expected) in [
+                (
+                    tonic::Status::permission_denied("denied"),
+                    HttpStatusCode::FORBIDDEN,
+                ),
+                (
+                    tonic::Status::resource_exhausted("rate limited"),
+                    HttpStatusCode::SERVICE_UNAVAILABLE,
+                ),
+                (
+                    tonic::Status::internal("failed"),
+                    HttpStatusCode::INTERNAL_SERVER_ERROR,
+                ),
+            ] {
+                let state = ServerState {
+                    immutable_store: immutable_store.clone(),
+                    mutable_store: mutable_store.clone(),
+                    token_verification: TokenVerification::Verify(verifier()),
+                    repository_authorizer: Arc::new(
+                        crate::authnz::repository_authorizer::RefusingAuthorizer(refusal),
+                    ),
+                    max_file_size: 100,
+                    presign_config: None,
+                };
+                let health = ServerHealth::new_without_availability(state.immutable_store.clone());
+                let server = TestServer::new(create_router(
+                    state,
+                    health,
+                    &LoreHttpServerSettings::test_default(),
+                ))
+                .unwrap();
+                let response = server
+                    .get(&format!("/v1/repository/{repository}/content/{address}"))
+                    .add_header(HeaderName::from_static("authorization"), bearer(None))
+                    .await;
+                assert_eq!(response.status_code(), expected);
+            }
+        })
+        .await;
+}
+
 /// Any grant on the repository reads its content; `PUT` also needs `write`.
 /// The legacy tier answers from the token's `resources` claim, so the
 /// authorizer's URL is never reached.

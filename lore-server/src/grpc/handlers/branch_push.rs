@@ -862,10 +862,10 @@ impl PushAccess {
         let access = Self {
             write: authorizer
                 .permits(extensions, repository, Action::Write)
-                .await,
+                .await?,
             push_protected: authorizer
                 .permits(extensions, repository, Action::PushProtected)
-                .await,
+                .await?,
         };
         if access.write || access.push_protected {
             Ok(access)

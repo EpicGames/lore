@@ -1783,11 +1783,14 @@ mod push_protected_action {
             let mut request = tier.with_token(request, repository_id, actions);
             if service_account {
                 // Replaces the claims with a token whose only privilege is the removed claim.
+                // The empty `resources` claim keeps it an access token, which every tier
+                // answers in place.
                 request
                     .extensions_mut()
                     .insert(lore_server::auth::jwt::AuthorizationToken {
                         user_id: "service-bot".into(),
                         is_service_account: Some(true),
+                        resources: Some(vec![]),
                         ..Default::default()
                     });
             }

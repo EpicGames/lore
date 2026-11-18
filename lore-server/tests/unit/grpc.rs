@@ -321,7 +321,8 @@ mod may_administer {
                     "alice",
                     "mallory",
                 )
-                .await,
+                .await
+                .unwrap(),
                 permitted,
                 "{actions:?}"
             );
@@ -343,6 +344,7 @@ mod may_administer {
                 "mallory",
             )
             .await
+            .unwrap()
         );
         assert_eq!(
             *recording.asked.lock().unwrap(),
@@ -364,7 +366,8 @@ mod may_administer {
                     "alice",
                     "alice",
                 )
-                .await,
+                .await
+                .unwrap(),
                 permitted,
                 "{actions:?}"
             );
@@ -388,7 +391,8 @@ mod may_administer {
                     "alice",
                     user,
                 )
-                .await,
+                .await
+                .unwrap(),
                 permitted,
                 "{user}"
             );
@@ -425,6 +429,7 @@ mod may_administer {
                 "mallory",
             )
             .await
+            .unwrap()
         );
         assert_eq!(*recording.enumerated.lock().unwrap(), 0);
         assert!(recording.asked.lock().unwrap().is_empty());
@@ -473,10 +478,36 @@ mod may_administer {
                     "alice",
                     "<unknown>",
                 )
-                .await,
+                .await
+                .unwrap(),
                 permitted,
                 "{actions:?}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_is_an_error_and_a_denial_is_not() {
+        for (refusal, outcome) in [
+            (Status::permission_denied("denied"), Ok(false)),
+            (
+                Status::resource_exhausted("rate limited"),
+                Err(Code::ResourceExhausted),
+            ),
+        ] {
+            let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(
+                crate::authnz::repository_authorizer::RefusingAuthorizer(refusal),
+            );
+            let result = may_administer_repository(
+                &authorizer,
+                &extensions_with_token(),
+                RepositoryId::default(),
+                "alice",
+                "mallory",
+            )
+            .await
+            .map_err(|status| status.code());
+            assert_eq!(result, outcome);
         }
     }
 }

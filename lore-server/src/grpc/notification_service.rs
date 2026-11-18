@@ -22,10 +22,10 @@ use tracing::instrument;
 
 use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::flatten_denial;
 use crate::grpc::authorization_timeout_status;
 use crate::grpc::get_user_id;
 use crate::grpc::get_verified_token;
-use crate::grpc::no_repository_access_status;
 
 #[derive(Clone)]
 pub struct NotificationService {
@@ -78,24 +78,18 @@ impl lore_notification::NotificationService for NotificationService {
         // Checked against the partition in the request *body*. The
         // default authorization middleware validates access using the
         // request metadata fields. The services passing a repository
-        // in the body need custom verification logic. A denial is folded
-        // into the boolean inside the bound, so elapsing is the only other
-        // thing the check reports.
-        let permitted = tokio::time::timeout(self.authorization_timeout, async {
-            self.authorizer
-                .check_repository_access(
-                    get_verified_token(&extensions).as_ref(),
-                    repository,
-                    Action::Read,
-                )
-                .await
-                .is_ok()
-        })
+        // in the body need custom verification logic.
+        tokio::time::timeout(
+            self.authorization_timeout,
+            self.authorizer.check_repository_access(
+                get_verified_token(&extensions).as_ref(),
+                repository,
+                Action::Read,
+            ),
+        )
         .await
-        .map_err(|_elapsed| authorization_timeout_status())?;
-        if !permitted {
-            return Err(no_repository_access_status());
-        }
+        .map_err(|_elapsed| authorization_timeout_status())?
+        .map_err(flatten_denial)?;
 
         let rx = self.sender.register(repository);
 

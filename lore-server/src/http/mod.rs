@@ -15,11 +15,25 @@ use axum::http::StatusCode;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 pub use server::LoreHttpServer;
 
+use crate::authnz::repository_authorizer::AuthorizationOutcome;
+
 pub(crate) fn log_http_error(error: &impl std::fmt::Debug, status: StatusCode) {
     if status.is_server_error() {
         warn!(?error, "http server error");
     } else {
         debug!(?error, "http user error");
+    }
+}
+
+/// The HTTP status for a repository authorization check that failed with
+/// `status`, which is never a denial: `503` for `RESOURCE_EXHAUSTED`, a
+/// failure the client should retry, and `500` for any other.
+pub(crate) fn failed_authorization_status(status: &tonic::Status) -> StatusCode {
+    match AuthorizationOutcome::of(status) {
+        AuthorizationOutcome::Retryable => StatusCode::SERVICE_UNAVAILABLE,
+        AuthorizationOutcome::Denied | AuthorizationOutcome::Failed => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     }
 }
 

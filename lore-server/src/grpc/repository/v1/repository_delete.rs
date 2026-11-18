@@ -67,7 +67,7 @@ pub async fn handler(
 
             let user_id = execution_context().user_id().await;
             if !may_administer_repository(authorizer, &extensions, id, &metadata.creator, &user_id)
-                .await
+                .await?
             {
                 info!(
                     "Repository delete refused for user {user_id}, creator {}",

@@ -21,12 +21,12 @@ use tonic::Status;
 
 use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::flatten_denial;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::get_verified_token;
 use crate::grpc::get_write_token;
-use crate::grpc::no_repository_access_status;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -124,7 +124,7 @@ pub async fn handler(
                     Action::Write,
                 )
                 .await
-                .map_err(|_err| no_repository_access_status())?;
+                .map_err(flatten_denial)?;
 
             // Deserialize current and proposed blobs for validation
             let current_metadata = if !expected_hash.is_zero() {

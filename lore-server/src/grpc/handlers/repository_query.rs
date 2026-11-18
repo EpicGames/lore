@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use lore_base::error::RepositoryNotFound;
+use lore_base::error::SlowDown;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Context;
 use lore_error_set::prelude::*;
@@ -17,15 +19,18 @@ use lore_transport::RepositoryData;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
+use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::AuthorizationOutcome;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::get_verified_token;
+use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
 #[tracing::instrument(name = "RepositoryQuery::handle", skip_all)]
@@ -66,8 +71,10 @@ pub async fn handler(
                     .await
                     .filter_slow_down()?
                     .map_err(|err| {
-                        warn!("Repository ID {id} not known: {err}",);
-                        Status::not_found(err.to_string())
+                        lookup_error_status(&err, || {
+                            warn!("Repository ID {id} not known: {err}");
+                            Status::not_found(err.to_string())
+                        })
                     })?
                 }
                 lore_proto::repository_query_request::Query::Name(name) => repository_query_name(
@@ -79,8 +86,10 @@ pub async fn handler(
                 .await
                 .filter_slow_down()?
                 .map_err(|err| {
-                    warn!("Repository name {name} not known: {err}");
-                    Status::not_found(err.to_string())
+                    lookup_error_status(&err, || {
+                        warn!("Repository name {name} not known: {err}");
+                        Status::not_found(err.to_string())
+                    })
                 })?,
             };
             Ok(Response::new(RepositoryQueryResponse {
@@ -94,7 +103,6 @@ pub async fn handler(
         .await
 }
 
-#[allow(clippy::map_err_ignore)]
 pub async fn repository_query_id(
     repository: Arc<RepositoryContext>,
     id: RepositoryId,
@@ -102,14 +110,7 @@ pub async fn repository_query_id(
     token: Option<&VerifiedToken<'_>>,
 ) -> Result<RepositoryData, RepositoryError> {
     if let Some(authorizer) = authorizer {
-        check_repository_query_authorization(authorizer, token, id)
-            .await
-            .map_err(|status| {
-                warn!("User authorization failed: {status}");
-                RepositoryError::from(RepositoryNotFound {
-                    repository: id.to_string(),
-                })
-            })?;
+        check_repository_query_authorization(authorizer, token, id, id).await?;
     }
 
     let repository = Arc::new(repository.to_server_context(id));
@@ -156,7 +157,6 @@ pub async fn repository_query_id(
     })
 }
 
-#[allow(clippy::map_err_ignore)]
 pub async fn repository_query_name(
     repository: Arc<RepositoryContext>,
     name: &str,
@@ -172,14 +172,7 @@ pub async fn repository_query_name(
     let id = repository::id_from_name(name_repository, name).await?;
 
     if let Some(authorizer) = authorizer {
-        check_repository_query_authorization(authorizer, token, id)
-            .await
-            .map_err(|status| {
-                warn!("User authorization failed: {status}");
-                RepositoryError::from(RepositoryNotFound {
-                    repository: name.to_string(),
-                })
-            })?;
+        check_repository_query_authorization(authorizer, token, id, name).await?;
     }
 
     let repository = Arc::new(repository.to_server_context(id));
@@ -214,18 +207,55 @@ pub async fn repository_query_name(
     })
 }
 
-/// The repository-query lookup check, on the configured authorizer.
+/// The repository-query lookup check, on the configured authorizer, for the
+/// partition the caller named as `repository`.
 ///
-/// Callers map a denial to `RepositoryNotFound` rather than
-/// `permission_denied`, deliberately: answering the two cases apart would
-/// let an unauthorized caller distinguish a partition that exists from one
-/// that does not.
+/// A denial is `RepositoryNotFound` rather than `permission_denied`,
+/// deliberately: answering the two cases apart would let an unauthorized
+/// caller distinguish a partition that exists from one that does not. A check
+/// that failed with `RESOURCE_EXHAUSTED` is `SlowDown`, which `filter_slow_down`
+/// answers so the client retries. Any other failed check is `Internal`, which
+/// [`lookup_error_status`] answers as `INTERNAL`. A lookup by name reaches this
+/// check only for a name that exists, so while checks fail, a caller can tell
+/// an existing name from a missing one.
 pub(crate) async fn check_repository_query_authorization(
     authorizer: &dyn RepositoryAuthorizer,
     token: Option<&VerifiedToken<'_>>,
     repository_id: RepositoryId,
-) -> Result<(), Status> {
-    authorizer
+    repository: impl Display,
+) -> Result<(), RepositoryError> {
+    let Err(status) = authorizer
         .check_repository_lookup(token, repository_id)
         .await
+    else {
+        return Ok(());
+    };
+    match AuthorizationOutcome::of(&status) {
+        AuthorizationOutcome::Denied => {
+            debug!(%repository_id, "User authorization failed: {status}");
+            Err(RepositoryNotFound {
+                repository: repository.to_string(),
+            }
+            .into())
+        }
+        AuthorizationOutcome::Retryable => Err(SlowDown.into()),
+        AuthorizationOutcome::Failed => Err(RepositoryError::internal_with_context(
+            status,
+            "checking repository authorization",
+        )),
+    }
+}
+
+/// The status a repository lookup that failed with `err` answers: `INTERNAL`
+/// for an internal failure, such as an authorization check that could not be
+/// made or a store fault, and `not_found` for every other failure.
+pub(crate) fn lookup_error_status(
+    err: &RepositoryError,
+    not_found: impl FnOnce() -> Status,
+) -> Status {
+    if err.is_internal() {
+        warn_error_to_status(err, |_| Status::internal("Repository lookup failed"))
+    } else {
+        not_found()
+    }
 }

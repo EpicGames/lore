@@ -79,6 +79,7 @@ use crate::authnz::repository_authorizer::RawToken;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::authnz::repository_authorizer::VerifiedTokenOwned;
+use crate::authnz::repository_authorizer::is_denial;
 use crate::authnz::repository_authorizer::permits_with;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -492,12 +493,12 @@ impl RepositoryAdministration {
 
 /// Answered from the grants the partition-access layer enumerated for
 /// `repository` when the request carries them, else from one enumeration,
-/// else per action.
+/// else per action. `Err` when a check failed rather than denied.
 pub async fn repository_administration(
     authorizer: &Arc<dyn RepositoryAuthorizer>,
     extensions: &Extensions,
     repository: RepositoryId,
-) -> RepositoryAdministration {
+) -> Result<RepositoryAdministration, Status> {
     let token = get_verified_token(extensions);
     let enumerated;
     let grants = if let Some(grants) = extensions
@@ -506,38 +507,44 @@ pub async fn repository_administration(
     {
         Some(&grants.grants)
     } else {
-        let Ok(grants) = authorizer.granted_actions(token.as_ref(), repository).await else {
-            return RepositoryAdministration::Denied;
-        };
-        enumerated = grants;
+        match authorizer.granted_actions(token.as_ref(), repository).await {
+            Ok(grants) => enumerated = grants,
+            Err(status) if is_denial(&status) => return Ok(RepositoryAdministration::Denied),
+            Err(status) => return Err(status),
+        }
         enumerated.as_ref()
     };
     let permits = async |action| {
         permits_with(&**authorizer, grants, token.as_ref(), repository, action).await
     };
-    if permits(Action::Owner).await || permits(Action::Admin).await {
-        RepositoryAdministration::Permitted
-    } else if !permits(Action::Write).await {
-        RepositoryAdministration::Denied
-    } else if token.is_none() {
-        RepositoryAdministration::Permitted
-    } else {
-        RepositoryAdministration::CreatorOnly
-    }
+    Ok(
+        if permits(Action::Owner).await? || permits(Action::Admin).await? {
+            RepositoryAdministration::Permitted
+        } else if !permits(Action::Write).await? {
+            RepositoryAdministration::Denied
+        } else if token.is_none() {
+            RepositoryAdministration::Permitted
+        } else {
+            RepositoryAdministration::CreatorOnly
+        },
+    )
 }
 
 /// Whether `user_id` may administer `repository`, recorded as created by
-/// `creator`, per [`RepositoryAdministration`].
+/// `creator`, per [`RepositoryAdministration`]. `Err` when a check failed
+/// rather than denied.
 pub async fn may_administer_repository(
     authorizer: &Arc<dyn RepositoryAuthorizer>,
     extensions: &Extensions,
     repository: RepositoryId,
     creator: &str,
     user_id: &str,
-) -> bool {
-    repository_administration(authorizer, extensions, repository)
-        .await
-        .permits(creator, user_id)
+) -> Result<bool, Status> {
+    Ok(
+        repository_administration(authorizer, extensions, repository)
+            .await?
+            .permits(creator, user_id),
+    )
 }
 
 /// The creator recorded in `repository`'s metadata. Reads only, so it does
@@ -574,11 +581,11 @@ pub async fn require_branch_protection_administration(
 ) -> Result<(), Status> {
     if authorizer
         .permits(extensions, repository.id, Action::SetProtected)
-        .await
+        .await?
     {
         return Ok(());
     }
-    let permitted = match repository_administration(authorizer, extensions, repository.id).await {
+    let permitted = match repository_administration(authorizer, extensions, repository.id).await? {
         RepositoryAdministration::Permitted => true,
         RepositoryAdministration::CreatorOnly => repository_creator(repository).await? == user_id,
         RepositoryAdministration::Denied => false,
@@ -604,7 +611,7 @@ pub async fn require_action<T>(
     let repository = get_repository(request.metadata())?;
     if authorizer
         .permits(request.extensions(), repository, action)
-        .await
+        .await?
     {
         Ok(())
     } else {

@@ -78,7 +78,7 @@ pub async fn handler(
         .scope(execution, async move {
             if !authorizer
                 .permits(&extensions, repository, Action::Obliterate)
-                .await
+                .await?
             {
                 warn!("Attempt to obliterate {address} in repository, but user does not have the correct permissions");
                 return Err(Status::permission_denied("Permission denied"));

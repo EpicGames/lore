@@ -14,11 +14,11 @@ use tonic::Status;
 
 use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::flatten_denial;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::get_verified_token;
-use crate::grpc::no_repository_access_status;
 use crate::util::setup_execution;
 
 /// `lore.repository.v1.RepositoryService.RepositoryMetadataGet` handler.
@@ -58,7 +58,7 @@ pub async fn handler(
                     Action::Read,
                 )
                 .await
-                .map_err(|_err| no_repository_access_status())?;
+                .map_err(flatten_denial)?;
 
             let metadata_hash = repository::metadata_hash(repository)
                 .await

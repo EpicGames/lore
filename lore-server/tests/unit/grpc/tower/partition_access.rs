@@ -442,9 +442,10 @@ async fn an_enumerated_denial_never_reaches_the_service() {
 /// own short bound.
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A failing enumeration denies, flattened like every other denial.
+/// A failing enumeration is not a denial: the request answers with the
+/// authorizer's status, so the client sees a server fault.
 #[tokio::test]
-async fn a_failing_enumeration_denies() {
+async fn a_failing_enumeration_answers_its_status() {
     struct FailingAuthorizer;
 
     #[async_trait]
@@ -463,7 +464,7 @@ async fn a_failing_enumeration_denies() {
             _token: Option<&VerifiedToken<'_>>,
             _repository_id: RepositoryId,
         ) -> Result<Option<Grants>, Status> {
-            Err(Status::internal("auth service unreachable"))
+            Err(Status::unavailable("auth service unreachable"))
         }
     }
 
@@ -476,7 +477,7 @@ async fn a_failing_enumeration_denies() {
         .await
         .unwrap();
 
-    assert_eq!(status_of(&response).code(), Code::PermissionDenied);
+    assert_eq!(status_of(&response).code(), Code::Unavailable);
     assert!(inner.0.lock().unwrap().is_empty());
 }
 

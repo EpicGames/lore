@@ -7,6 +7,7 @@ mod copy;
 mod correlate;
 mod get;
 mod get_resolved;
+mod messages;
 mod mutable_cas;
 mod mutable_load;
 mod mutable_store_handler;

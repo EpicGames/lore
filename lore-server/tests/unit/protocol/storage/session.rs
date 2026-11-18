@@ -71,22 +71,34 @@ mod entry_permits {
             Some(Grants::Actions(HashSet::from(["migrate".to_string()]))),
             Some(owned_token()),
         );
-        assert!(entry.permits(&PolicyOnly("other"), Action::Migrate).await);
+        assert!(
+            entry
+                .permits(&PolicyOnly("other"), Action::Migrate)
+                .await
+                .unwrap()
+        );
         assert!(
             !entry
                 .permits(&AllowAllRepositoryAuthorizer, Action::Obliterate)
                 .await
+                .unwrap()
         );
     }
 
     #[tokio::test]
     async fn non_enumerated_sessions_ask_the_authorizer_per_action() {
         let entry = entry(None, Some(owned_token()));
-        assert!(entry.permits(&PolicyOnly("migrate"), Action::Migrate).await);
+        assert!(
+            entry
+                .permits(&PolicyOnly("migrate"), Action::Migrate)
+                .await
+                .unwrap()
+        );
         assert!(
             !entry
                 .permits(&PolicyOnly("migrate"), Action::Obliterate)
                 .await
+                .unwrap()
         );
     }
 
@@ -100,13 +112,20 @@ mod entry_permits {
             entry
                 .permits(&AllowAllRepositoryAuthorizer, Action::Write)
                 .await
+                .unwrap()
         );
         assert!(
             !entry
                 .permits(&AllowAllRepositoryAuthorizer, Action::Migrate)
                 .await
+                .unwrap()
         );
-        assert!(!entry.permits(&PolicyOnly("migrate"), Action::Migrate).await);
+        assert!(
+            !entry
+                .permits(&PolicyOnly("migrate"), Action::Migrate)
+                .await
+                .unwrap()
+        );
     }
 }
 

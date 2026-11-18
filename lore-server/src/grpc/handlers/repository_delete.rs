@@ -101,7 +101,7 @@ async fn repository_delete(
         &metadata.creator,
         &user_id,
     )
-    .await
+    .await?
     {
         info!(
             "Repository delete refused for user {user_id}, creator {}",

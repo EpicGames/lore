@@ -326,11 +326,13 @@ mod authorized_session {
             session
                 .permits(&*service.repository_authorizer, Action::Migrate)
                 .await
+                .unwrap()
         );
         assert!(
             !session
                 .permits(&*service.repository_authorizer, Action::Obliterate)
                 .await
+                .unwrap()
         );
     }
 
@@ -550,6 +552,50 @@ mod authorized_session {
             .await
             .expect_err("a token granting another partition must be refused");
         assert!(matches!(err, MessageHandleError::AuthorizationFailure(_)));
+    }
+
+    /// A session start whose check failed is not refused as unauthorized: a
+    /// retryable failure answers `SlowDown`, which the client retries, and any
+    /// other `InternalError`.
+    #[tokio::test]
+    async fn failed_session_start_check_is_not_a_refusal() {
+        use crate::authnz::repository_authorizer::RefusingAuthorizer;
+
+        let repository = random::<lore_revision::lore::RepositoryId>();
+        let token = signed_token(&[&format!("urc-{repository}")], &["read"]);
+        for (refusal, expected) in [
+            (
+                tonic::Status::permission_denied("denied"),
+                "AuthorizationFailure",
+            ),
+            (
+                tonic::Status::resource_exhausted("rate limited"),
+                "SlowDown",
+            ),
+            (tonic::Status::internal("failed"), "InternalError"),
+        ] {
+            let (immutable_store, mutable_store, _execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let service = StorageServiceV4::new(
+                Arc::new(TokenVerification::Verify(verifier())),
+                Arc::new(RefusingAuthorizer(refusal)),
+                immutable_store.clone(),
+                immutable_store,
+                mutable_store,
+                Arc::new(UserAgentFilter::default()),
+                SessionMap::default(),
+            );
+            let err = start_session(&service, repository, &token)
+                .await
+                .expect_err("a refused check must not start a session");
+            let matched = match err {
+                MessageHandleError::AuthorizationFailure(_) => "AuthorizationFailure",
+                MessageHandleError::SlowDown => "SlowDown",
+                MessageHandleError::InternalError => "InternalError",
+                _ => "other",
+            };
+            assert_eq!(matched, expected);
+        }
     }
 }
 

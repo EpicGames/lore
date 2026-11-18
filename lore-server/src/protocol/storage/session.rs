@@ -9,6 +9,7 @@ use dashmap::DashSet;
 use dashmap::mapref::entry::Entry;
 use lore_revision::lore::RepositoryId;
 use lore_storage::CorrelationHold;
+use tonic::Status;
 
 use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::Grants;
@@ -48,7 +49,12 @@ impl SessionEntry {
     /// command. Same contract as `RepositoryAuthorizer::permits`: answered
     /// from the grants enumerated at session start, asked of the authorizer
     /// when they were not enumerable, with or without a verified token.
-    pub async fn permits(&self, authorizer: &dyn RepositoryAuthorizer, action: Action) -> bool {
+    /// `Err` when the check failed rather than denied.
+    pub async fn permits(
+        &self,
+        authorizer: &dyn RepositoryAuthorizer,
+        action: Action,
+    ) -> Result<bool, Status> {
         let token = self.token.as_deref().map(VerifiedTokenOwned::as_token);
         permits_with(
             authorizer,

@@ -11,9 +11,6 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
-use lore_server::authnz::repository_authorizer::Action;
-use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
-use lore_server::authnz::repository_authorizer::VerifiedToken;
 use lore_server::grpc::forwarded_requests::ForwardedRequests;
 use tonic::Request;
 use tonic::Response;
@@ -34,6 +31,7 @@ mod forwarded_request {
     use rand::random;
 
     use super::*;
+    use crate::authnz::repository_authorizer::RefusingAuthorizer;
     use crate::store::test_support::test_store_create;
 
     /// Single-use client that returns a pre-configured result on its one call.
@@ -284,25 +282,9 @@ mod forwarded_request {
         .await;
     }
 
-    /// Denial answers `RepositoryNotFound`, not `permission_denied`: a
-    /// distinct status would let an unauthorized caller distinguish a
-    /// partition that exists from one that does not.
-    #[tokio::test]
-    async fn denied_get_answers_not_found_for_an_existing_repository() {
-        struct DenyAllRepositoryAuthorizer;
-
-        #[async_trait]
-        impl RepositoryAuthorizer for DenyAllRepositoryAuthorizer {
-            async fn check_repository_access(
-                &self,
-                _token: Option<&VerifiedToken<'_>>,
-                _repository_id: lore_base::types::RepositoryId,
-                _action: Action,
-            ) -> Result<(), Status> {
-                Err(Status::permission_denied("denied"))
-            }
-        }
-
+    /// The status a local get of an existing repository answers when every
+    /// authorization check ends in `refusal`.
+    async fn get_existing_refused_with(refusal: Status) -> Status {
         let id = random::<RepositoryId>();
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
@@ -316,18 +298,51 @@ mod forwarded_request {
             )
             .await;
 
-            let err = handler(
+            handler(
                 make_request("my-repo"),
-                Arc::new(DenyAllRepositoryAuthorizer),
+                Arc::new(RefusingAuthorizer(refusal)),
                 immutable_store,
                 mutable_store,
                 &None,
             )
             .await
-            .expect_err("denied get must fail");
-
-            assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+            .expect_err("a refused get must fail")
         }))
-        .await;
+        .await
+    }
+
+    /// Denial answers `RepositoryNotFound`, not `permission_denied`: a
+    /// distinct status would let an unauthorized caller distinguish a
+    /// partition that exists from one that does not.
+    #[tokio::test]
+    async fn denied_get_answers_not_found_for_an_existing_repository() {
+        for denial in [
+            Status::permission_denied("denied"),
+            Status::unauthenticated("token refused"),
+        ] {
+            let err = get_existing_refused_with(denial).await;
+            assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+        }
+    }
+
+    /// A check that could not be made answers its failure rather than telling
+    /// the client the repository does not exist: `RESOURCE_EXHAUSTED`, which
+    /// the client retries, for an auth service that is down or rate limiting,
+    /// and `INTERNAL` otherwise.
+    #[tokio::test]
+    async fn failed_authorization_check_answers_its_failure() {
+        for (failure, code) in [
+            (
+                Status::resource_exhausted("auth service rate limited"),
+                tonic::Code::ResourceExhausted,
+            ),
+            (
+                Status::internal("auth service failed"),
+                tonic::Code::Internal,
+            ),
+        ] {
+            let err = get_existing_refused_with(failure).await;
+            assert_eq!(err.code(), code, "{err:?}");
+        }
     }
 }

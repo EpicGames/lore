@@ -13,9 +13,11 @@ use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_storage::StoreError;
 use thiserror::Error;
+use tonic::Status;
 use tracing::warn;
 
 use crate::auth::jwt::TokenVerification;
+use crate::authnz::repository_authorizer::AuthorizationOutcome;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::responses;
@@ -101,6 +103,22 @@ impl From<StoreError> for MessageHandleError {
             StoreError::SlowDown(_) => MessageHandleError::SlowDown,
             StoreError::Oversized(_) => MessageHandleError::Oversized,
             _ => MessageHandleError::StoreFailure,
+        }
+    }
+}
+
+impl MessageHandleError {
+    /// An error from a [`RepositoryAuthorizer`]: a denial as
+    /// `AuthorizationFailure`, a check that failed with `RESOURCE_EXHAUSTED` as
+    /// `SlowDown`, which clients retry, and any other failed check as
+    /// `InternalError`.
+    pub fn from_authorization(status: Status) -> Self {
+        match AuthorizationOutcome::of(&status) {
+            AuthorizationOutcome::Denied => {
+                MessageHandleError::AuthorizationFailure(status.message().to_string())
+            }
+            AuthorizationOutcome::Retryable => MessageHandleError::SlowDown,
+            AuthorizationOutcome::Failed => MessageHandleError::InternalError,
         }
     }
 }

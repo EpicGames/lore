@@ -227,14 +227,19 @@ impl LoreLockService {
     }
 
     /// `owner` or `admin` on `repository` waives the lock-ownership check.
-    async fn is_elevated(&self, extensions: &tonic::Extensions, repository: RepositoryId) -> bool {
-        self.authorizer
+    async fn is_elevated(
+        &self,
+        extensions: &tonic::Extensions,
+        repository: RepositoryId,
+    ) -> Result<bool, Status> {
+        Ok(self
+            .authorizer
             .permits(extensions, repository, Action::Owner)
-            .await
+            .await?
             || self
                 .authorizer
                 .permits(extensions, repository, Action::Admin)
-                .await
+                .await?)
     }
 }
 
@@ -348,12 +353,12 @@ impl LoreLockService {
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
         let repository = get_repository(request.metadata())?;
-        let elevated = self.is_elevated(request.extensions(), repository).await;
+        let elevated = self.is_elevated(request.extensions(), repository).await?;
         if !elevated
             && !self
                 .authorizer
                 .permits(request.extensions(), repository, Action::Write)
-                .await
+                .await?
         {
             return Err(no_repository_access_status());
         }
@@ -408,7 +413,7 @@ impl LoreLockService {
         if !self
             .authorizer
             .permits(request.extensions(), repository, Action::Migrate)
-            .await
+            .await?
         {
             warn!("Attempt to apply admin locks, but user does not have the correct permissions");
             return Err(Status::permission_denied("Permission denied"));

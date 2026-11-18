@@ -435,6 +435,7 @@ mod permits_helper {
             !authorizer
                 .permits(&extensions, repository(), Action::Migrate)
                 .await
+                .unwrap()
         );
     }
 
@@ -457,6 +458,7 @@ mod permits_helper {
             authorizer
                 .permits(&extensions, repository(), Action::Write)
                 .await
+                .unwrap()
         );
     }
 
@@ -470,16 +472,19 @@ mod permits_helper {
             allow_all
                 .permits(&extensions, repository(), Action::Write)
                 .await
+                .unwrap()
         );
         assert!(
             !allow_all
                 .permits(&extensions, repository(), Action::Owner)
                 .await
+                .unwrap()
         );
         assert!(
             !allow_all
                 .permits(&extensions, repository(), Action::Migrate)
                 .await
+                .unwrap()
         );
 
         let tier_1: Arc<dyn RepositoryAuthorizer> = Arc::new(
@@ -492,6 +497,7 @@ mod permits_helper {
             !tier_1
                 .permits(&extensions, repository(), Action::Read)
                 .await
+                .unwrap()
         );
     }
 }
@@ -767,4 +773,144 @@ fn selection_display_names_the_implementation() {
         AuthorizerSelection::ResourceGrants.to_string(),
         "ResourceGrantsAuthorizer"
     );
+}
+
+/// Answers every check with the error it was built with, and enumerates
+/// nothing.
+pub struct RefusingAuthorizer(pub Status);
+
+#[async_trait]
+impl RepositoryAuthorizer for RefusingAuthorizer {
+    async fn check_repository_access(
+        &self,
+        _token: Option<&VerifiedToken<'_>>,
+        _repository_id: RepositoryId,
+        _action: Action,
+    ) -> Result<(), Status> {
+        Err(self.0.clone())
+    }
+}
+
+mod failed_checks {
+    use super::*;
+
+    fn denials() -> [Status; 2] {
+        [
+            Status::permission_denied("denied"),
+            Status::unauthenticated("token refused"),
+        ]
+    }
+
+    fn failures() -> [Status; 3] {
+        [
+            Status::unavailable("rate limited"),
+            Status::internal("failed"),
+            Status::cancelled("timed out"),
+        ]
+    }
+
+    #[test]
+    fn only_permission_denied_and_unauthenticated_are_denials() {
+        for denial in denials() {
+            assert!(is_denial(&denial), "{denial:?}");
+        }
+        for failure in failures() {
+            assert!(!is_denial(&failure), "{failure:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn permits_with_answers_a_denial_and_returns_a_failure() {
+        let repository: RepositoryId = Context::default().into();
+        for denial in denials() {
+            let permitted = permits_with(
+                &RefusingAuthorizer(denial),
+                None,
+                None,
+                repository,
+                Action::Write,
+            )
+            .await
+            .unwrap();
+            assert!(!permitted);
+        }
+        for failure in failures() {
+            let code = failure.code();
+            let err = permits_with(
+                &RefusingAuthorizer(failure),
+                None,
+                None,
+                repository,
+                Action::Write,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), code);
+        }
+    }
+
+    /// A denial is flattened so the caller learns nothing from its reason; a
+    /// failed check keeps its status, so the caller sees the server fault.
+    #[tokio::test]
+    async fn granted_access_flattens_denials_and_keeps_failures() {
+        let repository: RepositoryId = Context::default().into();
+        for denial in denials() {
+            let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(RefusingAuthorizer(denial));
+            let err = authorizer
+                .granted_access(None, repository)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), Code::PermissionDenied);
+        }
+        for failure in failures() {
+            let code = failure.code();
+            let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(RefusingAuthorizer(failure));
+            let err = authorizer
+                .granted_access(None, repository)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), code);
+        }
+    }
+
+    /// An auth service that cannot be reached is a failed check the client
+    /// retries, not a denial.
+    #[tokio::test]
+    async fn an_unreachable_auth_service_is_retryable() {
+        let claims = AuthorizationToken::default();
+        let token = VerifiedToken {
+            raw: "identity.jwt",
+            claims: &claims,
+        };
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let auth_url = format!("http://{}", unused.local_addr().unwrap());
+        drop(unused);
+        let err = AuthClientAuthorizer::new(auth_url)
+            .check_repository_access(Some(&token), Context::default().into(), Action::Read)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::ResourceExhausted, "{err:?}");
+    }
+
+    /// The auth service's denials stay denials, including `NOT_FOUND`.
+    /// Failures that can clear are retryable, and the rest are internal.
+    #[test]
+    fn auth_service_failures_map_by_whether_they_can_clear() {
+        for (from, to) in [
+            (Code::PermissionDenied, Code::PermissionDenied),
+            (Code::Unauthenticated, Code::Unauthenticated),
+            (Code::Unavailable, Code::ResourceExhausted),
+            (Code::ResourceExhausted, Code::ResourceExhausted),
+            (Code::DeadlineExceeded, Code::ResourceExhausted),
+            (Code::Aborted, Code::ResourceExhausted),
+            (Code::Internal, Code::Internal),
+            (Code::InvalidArgument, Code::Internal),
+            (Code::NotFound, Code::PermissionDenied),
+            (Code::FailedPrecondition, Code::Internal),
+        ] {
+            let mapped = auth_service_failure(&Status::new(from, "upstream detail"));
+            assert_eq!(mapped.code(), to, "{from:?}");
+            assert!(!mapped.message().contains("upstream detail"), "{from:?}");
+        }
+    }
 }

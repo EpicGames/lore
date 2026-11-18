@@ -29,6 +29,7 @@ use tracing::warn;
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt_axum_middleware::http_permits;
 use crate::authnz::repository_authorizer::Action;
+use crate::http::failed_authorization_status;
 use crate::http::log_http_error;
 use crate::http::presign_token::CURRENT_TOKEN_VERSION;
 use crate::http::presign_token::PresignTokenPayload;
@@ -47,6 +48,8 @@ pub enum PresignError {
     NotConfigured,
     #[error("Presign not permitted on this repository")]
     NotPermitted,
+    #[error("Authorization check failed")]
+    AuthorizationFailed(tonic::Status),
     #[error("content_type is not allowed: {0}")]
     DisallowedContentType(String),
     #[error("header value is not valid: {0}")]
@@ -74,6 +77,10 @@ impl IntoResponse for PresignError {
                 StatusCode::FORBIDDEN,
                 "presign not permitted on this repository".to_string(),
             ),
+            PresignError::AuthorizationFailed(status) => (
+                failed_authorization_status(status),
+                "authorization check failed".to_string(),
+            ),
             PresignError::StoreError | PresignError::SystemTime(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong. See server log for more info.".to_string(),
@@ -81,7 +88,10 @@ impl IntoResponse for PresignError {
             PresignError::NotFound => (StatusCode::NOT_FOUND, "address not found".to_string()),
         };
 
-        log_http_error(&self, status);
+        // The authorizer logs a failed check where it happens.
+        if !matches!(self, PresignError::AuthorizationFailed(_)) {
+            log_http_error(&self, status);
+        }
 
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "text/plain".parse().unwrap());
@@ -127,6 +137,7 @@ pub async fn handler(
         Action::Presign,
     )
     .await
+    .map_err(PresignError::AuthorizationFailed)?
     {
         return Err(PresignError::NotPermitted);
     }

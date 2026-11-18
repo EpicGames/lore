@@ -12,14 +12,15 @@ use lore_proto::auth::CheckUserPermissionResponse;
 use tonic::Code;
 use tonic::Status;
 use tracing::info;
+use tracing::warn;
 
-use super::auth::grpc_get_auth_client;
+use super::auth::grpc_get_permission_client;
 use super::common::create_request_with_authorization;
 use super::global_grants_authorizer::GlobalGrantsAuthorizer;
 use super::resource_grants_authorizer::ResourceGrantsAuthorizer;
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::ResourceMatcher;
-use crate::grpc::ServerResultExt;
+use crate::grpc::rpc_code_to_str;
 use crate::settings::AuthSettings;
 
 /// An action a caller may be asked to hold on a partition. Grants name
@@ -141,6 +142,13 @@ pub struct PartitionGrants {
     pub grants: Grants,
 }
 
+/// Answers whether a caller may act on a partition.
+///
+/// An implementation denies with `PERMISSION_DENIED`, or `UNAUTHENTICATED`
+/// for a token it refuses. Any other status means the check could not be
+/// made, and callers return it as an error: `RESOURCE_EXHAUSTED` for a
+/// failure the client should retry. See [`AuthorizationOutcome`]. An
+/// implementation logs a check it fails to make.
 #[async_trait]
 pub trait RepositoryAuthorizer: Send + Sync {
     /// Whether `token` may perform `action` on `repository_id`: [`Action::Read`],
@@ -210,7 +218,8 @@ impl dyn RepositoryAuthorizer {
     /// answered by asking [`Action::Read`] of an authorizer that cannot enumerate;
     /// later action checks then ask it too. Denials are flattened to
     /// [`no_repository_access_status`] so an unauthorized caller learns
-    /// nothing from the reason.
+    /// nothing from the reason. A check that failed, rather than denied,
+    /// keeps its own status.
     ///
     /// The one call every partition-scoped entry point makes — the gRPC
     /// partition-access layer, the QUIC session start / connect, and the
@@ -224,12 +233,13 @@ impl dyn RepositoryAuthorizer {
     ) -> Result<Option<Grants>, Status> {
         match self.granted_actions(token, repository_id).await {
             Ok(Some(grants)) if grants.reachable() => Ok(Some(grants)),
+            Ok(Some(_unreachable)) => Err(crate::grpc::no_repository_access_status()),
             Ok(None) => self
                 .check_repository_access(token, repository_id, Action::Read)
                 .await
                 .map(|()| None)
-                .map_err(|_denied| crate::grpc::no_repository_access_status()),
-            _ => Err(crate::grpc::no_repository_access_status()),
+                .map_err(flatten_denial),
+            Err(status) => Err(flatten_denial(status)),
         }
     }
 
@@ -242,12 +252,13 @@ impl dyn RepositoryAuthorizer {
     /// that can only answer per-action policy questions (and for call sites
     /// that are not behind the Tower middleware). A request with no verified
     /// token is asked too: the authorizer decides what such a caller holds.
+    /// `Err` when the check failed rather than denied.
     pub async fn permits(
         &self,
         extensions: &tonic::Extensions,
         repository_id: RepositoryId,
         action: Action,
-    ) -> bool {
+    ) -> Result<bool, Status> {
         let grants = extensions
             .get::<PartitionGrants>()
             .filter(|grants| grants.repository_id == repository_id);
@@ -266,20 +277,72 @@ impl dyn RepositoryAuthorizer {
 /// Whether `action` on `repository_id` is permitted. `grants`, the caller's
 /// enumerated grants on it, answer when present; otherwise `authorizer` is
 /// asked with `token`, which is `None` when no verifier is configured.
+/// `Err` when the check failed rather than denied.
 pub async fn permits_with(
     authorizer: &dyn RepositoryAuthorizer,
     grants: Option<&Grants>,
     token: Option<&VerifiedToken<'_>>,
     repository_id: RepositoryId,
     action: Action,
-) -> bool {
+) -> Result<bool, Status> {
     if let Some(grants) = grants {
-        return grants.permits(action);
+        return Ok(grants.permits(action));
     }
-    authorizer
+    match authorizer
         .check_repository_access(token, repository_id, action)
         .await
-        .is_ok()
+    {
+        Ok(()) => Ok(true),
+        Err(status) if is_denial(&status) => Ok(false),
+        Err(status) => Err(status),
+    }
+}
+
+/// Whether `status`, an error from a [`RepositoryAuthorizer`], is its answer
+/// that the caller may not act, rather than a failure to answer. Authorizers
+/// deny with `PERMISSION_DENIED`, or with `UNAUTHENTICATED` for a token they
+/// refuse. Any other code means the check could not be made.
+pub fn is_denial(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        Code::PermissionDenied | Code::Unauthenticated
+    )
+}
+
+/// What an error from a [`RepositoryAuthorizer`] means for its caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthorizationOutcome {
+    /// The caller may not act: see [`is_denial`].
+    Denied,
+    /// The check could not be made, and the client should retry:
+    /// `RESOURCE_EXHAUSTED`.
+    Retryable,
+    /// The check could not be made, and a retry would not help.
+    Failed,
+}
+
+impl AuthorizationOutcome {
+    pub fn of(status: &Status) -> Self {
+        if is_denial(status) {
+            Self::Denied
+        } else if status.code() == Code::ResourceExhausted {
+            Self::Retryable
+        } else {
+            Self::Failed
+        }
+    }
+}
+
+/// `status` from a [`RepositoryAuthorizer`], with a denial flattened to
+/// [`no_repository_access_status`](crate::grpc::no_repository_access_status)
+/// so an unauthorized caller learns nothing from the reason. A failed check
+/// keeps its own status.
+pub fn flatten_denial(status: Status) -> Status {
+    if is_denial(&status) {
+        crate::grpc::no_repository_access_status()
+    } else {
+        status
+    }
 }
 
 /// Selected when no `[server.auth]` is configured: nothing verifies tokens,
@@ -356,22 +419,45 @@ impl AuthClientAuthorizer {
         authorization: Option<String>,
         resource_id: &str,
     ) -> Result<CheckUserPermissionResponse, Status> {
-        let mut client = grpc_get_auth_client(self.auth_url.clone()).await?;
+        let mut client = grpc_get_permission_client(self.auth_url.clone())
+            .await
+            .map_err(|err| auth_service_failure(&err))?;
         let request = check_user_permission_request(resource_id.to_string(), authorization)?;
 
-        let permissions = client
-            .check_user_permission(request)
-            .await
-            .warn_map_err(|err| {
-                if err.code() == Code::PermissionDenied {
-                    return Status::permission_denied("Query resource denied");
-                } else if err.code() == Code::Unauthenticated {
-                    return Status::unauthenticated("Query resource failed - unauthenticated");
-                }
-                Status::internal(format!("Failed to call auth check_user_permission: {err}"))
-            })?;
+        let permissions = client.check_user_permission(request).await.map_err(|err| {
+            let status = auth_service_failure(&err);
+            if !is_denial(&status) {
+                warn!(
+                    ?err,
+                    response = ?status,
+                    rpc_status_code = rpc_code_to_str(&status.code()),
+                    "CheckUserPermission failed"
+                );
+            }
+            status
+        })?;
 
         Ok(permissions.into_inner())
+    }
+}
+
+/// The status a `CheckUserPermission` call that ended in `err` answers. The
+/// auth service's denials stay denials. `NOT_FOUND` is one: auth API can
+/// answer it for a caller or repo missing from its store. A failure that can clear, such as an
+/// unreachable or rate-limiting auth service, is `RESOURCE_EXHAUSTED`, which
+/// clients retry with backoff. Any other failure is `INTERNAL`. The auth
+/// service's own message is not passed on.
+#[lore_macro::test_pub]
+fn auth_service_failure(err: &Status) -> Status {
+    match err.code() {
+        Code::PermissionDenied | Code::NotFound => {
+            Status::permission_denied("Query resource denied")
+        }
+        Code::Unauthenticated => Status::unauthenticated("Query resource failed - unauthenticated"),
+        Code::Unavailable | Code::ResourceExhausted | Code::DeadlineExceeded | Code::Aborted => {
+            Status::resource_exhausted("The auth service could not answer the permission check")
+        }
+        _ => Status::internal("The auth service failed the permission check"),
     }
 }
 

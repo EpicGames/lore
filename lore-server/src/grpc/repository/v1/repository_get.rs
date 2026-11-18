@@ -36,6 +36,7 @@ use crate::grpc::get_is_service_account;
 use crate::grpc::get_user_id;
 use crate::grpc::get_verified_token;
 use crate::grpc::handlers::repository_query::check_repository_query_authorization;
+use crate::grpc::handlers::repository_query::lookup_error_status;
 use crate::util::setup_execution;
 
 /// `lore.repository.v1.RepositoryService.RepositoryGet` handler.
@@ -143,7 +144,11 @@ pub async fn repository_get_implementation(
                     )
                     .await
                     .filter_slow_down()?
-                    .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
+                    .map_err(|err| {
+                        lookup_error_status(&err, || {
+                            Status::not_found(format!("Repository {id} not found"))
+                        })
+                    })?;
                     (id, metadata, metadata_hash)
                 }
                 Query::Name(name) => {
@@ -156,7 +161,11 @@ pub async fn repository_get_implementation(
                     )
                     .await
                     .filter_slow_down()?
-                    .map_err(|_err| Status::not_found(format!("Repository {name} not found")))?;
+                    .map_err(|err| {
+                        lookup_error_status(&err, || {
+                            Status::not_found(format!("Repository {name} not found"))
+                        })
+                    })?;
                     (id, metadata, metadata_hash)
                 }
             };
@@ -172,7 +181,6 @@ pub async fn repository_get_implementation(
 /// metadata pointer hash. Performs the same authz check + name-mapping
 /// repair the legacy v0 handler does. `authorizer: None` skips the access
 /// check for internal lookups.
-#[allow(clippy::map_err_ignore)]
 pub(super) async fn repository_load_id(
     repository: Arc<RepositoryContext>,
     id: RepositoryId,
@@ -180,14 +188,7 @@ pub(super) async fn repository_load_id(
     token: Option<&VerifiedToken<'_>>,
 ) -> Result<(RepositoryMetadata, Hash), RepositoryError> {
     if let Some(authorizer) = authorizer {
-        check_repository_query_authorization(authorizer, token, id)
-            .await
-            .map_err(|status| {
-                debug!(%id, "User authorization failed: {status}");
-                RepositoryError::from(RepositoryNotFound {
-                    repository: id.to_string(),
-                })
-            })?;
+        check_repository_query_authorization(authorizer, token, id, id).await?;
     }
 
     let repository = Arc::new(repository.to_server_context(id));
@@ -232,7 +233,6 @@ pub(super) async fn repository_load_id(
 /// caller passed a parseable `RepositoryId` as the name. Self-heals a
 /// stale name → id mapping by deleting it when the metadata's name
 /// disagrees.
-#[allow(clippy::map_err_ignore)]
 pub(super) async fn repository_load_name(
     repository: Arc<RepositoryContext>,
     name: &str,
@@ -249,14 +249,7 @@ pub(super) async fn repository_load_name(
     let id = repository::id_from_name(name_repository, name).await?;
 
     if let Some(authorizer) = authorizer {
-        check_repository_query_authorization(authorizer, token, id)
-            .await
-            .map_err(|status| {
-                debug!(%id, "User authorization failed: {status}");
-                RepositoryError::from(RepositoryNotFound {
-                    repository: name.to_string(),
-                })
-            })?;
+        check_repository_query_authorization(authorizer, token, id, name).await?;
     }
 
     let repository = Arc::new(repository.to_server_context(id));
