@@ -45,7 +45,6 @@ use crate::node::NodeID;
 use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::revision::sync::LoreRevisionSyncFileEventData;
-use crate::revision::sync::LoreRevisionSyncProgressEventData;
 use crate::revision::sync::SyncRealizeStats;
 use crate::state;
 use crate::state::AttachCheck;
@@ -742,7 +741,7 @@ pub async fn report(changes: &[NodeChange]) -> Result<(), StateError> {
         carried.push((size, file));
     }
     stats.discovery.complete.store(true, Ordering::Relaxed);
-    event::LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(&stats)).send();
+    stats.send_progress();
     for (change, &(size, file)) in changes.iter().zip(&carried) {
         if change.action == FileAction::Delete {
             stats.complete.file_delete.fetch_add(1, Ordering::Relaxed);
@@ -756,7 +755,7 @@ pub async fn report(changes: &[NodeChange]) -> Result<(), StateError> {
         event::LoreEvent::RevisionSyncFile(LoreRevisionSyncFileEventData::new(change, size, file))
             .send();
     }
-    event::LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(&stats)).send();
+    stats.send_progress();
     Ok(())
 }
 

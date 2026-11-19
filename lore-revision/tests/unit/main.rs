@@ -42,6 +42,7 @@ mod metadata;
 mod node;
 mod notification;
 mod paged_remote;
+mod progress;
 mod protocol;
 mod records;
 mod refusal;

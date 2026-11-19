@@ -1380,6 +1380,28 @@ pub struct SyncRealizeStats {
     pub kept_renames: KeptRenames,
 }
 
+impl SyncRealizeStats {
+    /// Sends a progress event with the counts as they stand, in order with the other progress
+    /// events of the sync ([`DiscoveryStats::send_progress`]).
+    pub fn send_progress(&self) {
+        self.discovery.send_progress(|| {
+            self.send_progress_event();
+        });
+    }
+
+    /// Sends a progress event with the counts as they stand, without the order lock
+    /// ([`DiscoveryStats::send_progress`] holds it).
+    pub(crate) fn send_progress_event(&self) {
+        LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(self)).send();
+    }
+}
+
+impl AsRef<DiscoveryStats> for SyncRealizeStats {
+    fn as_ref(&self) -> &DiscoveryStats {
+        &self.discovery
+    }
+}
+
 /// Renames left undone, which leave their source where it stands: ones the file system refused,
 /// and ones that would carry a layer's mount away from where the layer is mounted. Counted, with
 /// the first, for one warning.
@@ -1397,7 +1419,8 @@ pub struct KeptRename {
 }
 
 impl LoreRevisionSyncProgressEventData {
-    pub fn new(stats: &Arc<SyncRealizeStats>) -> Self {
+    /// The counts of `stats` as they stand.
+    pub fn new(stats: &SyncRealizeStats) -> Self {
         // Read update totals from discovery stats directly since they are
         // incrementally updated by the producer. This ensures file_update_total
         // and bytes_update_total always reflect the current discovered total,

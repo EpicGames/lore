@@ -15,7 +15,6 @@ use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tokio_util::task::AbortOnDropHandle;
 use zerocopy::FromZeros;
 
 use crate::MAX_CONCURRENT_TREE_TASKS;
@@ -56,6 +55,7 @@ use crate::node::NodeID;
 use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::progress::DEFAULT_WORK_CHANNEL_CAPACITY;
+use crate::progress::ProgressTicker;
 use crate::repository::BASE_SUFFIX;
 use crate::repository::MERGE_ARTIFACT_SUFFIXES;
 use crate::repository::MINE_SUFFIX;
@@ -66,7 +66,6 @@ use crate::repository::clone::CloneContext;
 use crate::revision::sync::KeptRename;
 use crate::revision::sync::KeptRenames;
 use crate::revision::sync::LoreRevisionSyncFileEventData;
-use crate::revision::sync::LoreRevisionSyncProgressEventData;
 use crate::revision::sync::SyncError;
 use crate::revision::sync::SyncOptions;
 use crate::revision::sync::SyncRealizeStats;
@@ -2770,7 +2769,7 @@ pub fn realize_changes<'a>(
     stats: Arc<SyncRealizeStats>,
 ) -> impl Future<Output = Result<(), SyncError>> + 'a {
     async move {
-        let _ticker = progress_ticker(stats.clone());
+        let ticker = progress_ticker(stats.clone());
         let is_merge = merge_current.is_some();
 
         lore_debug!("Realize {} changes", changes.len());
@@ -2817,10 +2816,7 @@ pub fn realize_changes<'a>(
                 .store(true, Ordering::Relaxed);
             // Send a progress event immediately when discovery finishes,
             // ensuring at least one progress event has discoveryComplete=true
-            event::LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(
-                &discover_stats,
-            ))
-            .send();
+            discover_stats.send_progress();
             result
         });
 
@@ -2843,8 +2839,8 @@ pub fn realize_changes<'a>(
         lore_debug!("Modified/added paths realized");
         report_kept_renames(&stats.kept_renames);
 
-        event::LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(&stats))
-            .send();
+        drop(ticker);
+        stats.send_progress();
 
         let drained = match staging.as_deref() {
             Some(state) if state.holds_promoted_moves() => Box::pin(
@@ -2929,7 +2925,7 @@ pub async fn realize_conflicts(
     stats: Arc<SyncRealizeStats>,
     merge_type: MergeType,
 ) -> Result<(), SyncError> {
-    let _ticker = progress_ticker(stats.clone());
+    let ticker = progress_ticker(stats.clone());
 
     if let Some(state_stage) = state_stage.as_ref() {
         // Collect all the paths we're realizing files into and ensure they exist
@@ -2992,7 +2988,8 @@ pub async fn realize_conflicts(
     .await?;
     lore_debug!("Merged paths realized");
 
-    event::LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(&stats)).send();
+    drop(ticker);
+    stats.send_progress();
 
     Ok(())
 }
@@ -3160,15 +3157,10 @@ async fn write_node_to_path(
     Ok(info)
 }
 
-fn progress_ticker(stats: Arc<SyncRealizeStats>) -> AbortOnDropHandle<()> {
-    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
-    AbortOnDropHandle::new(lore_spawn!(async move {
-        loop {
-            ticker.tick().await;
-            event::LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(&stats))
-                .send();
-        }
-    }))
+fn progress_ticker(stats: Arc<SyncRealizeStats>) -> ProgressTicker<SyncRealizeStats> {
+    ProgressTicker::start(stats, std::time::Duration::from_millis(100), |stats| {
+        stats.send_progress_event();
+    })
 }
 
 /// Realizes the deletes `changes` holds, deepest first, and answers the directory deletes that
@@ -3418,8 +3410,7 @@ pub(crate) async fn remove_emptied_excluded_directories(
         }
     }
     if removed {
-        event::LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(stats))
-            .send();
+        stats.send_progress();
     }
 }
 

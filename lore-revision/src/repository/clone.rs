@@ -65,6 +65,7 @@ use crate::metadata;
 use crate::node::*;
 use crate::progress::DEFAULT_WORK_CHANNEL_CAPACITY;
 use crate::progress::DiscoveryStats;
+use crate::progress::ProgressTicker;
 use crate::protocol;
 use crate::repository;
 use crate::repository::FileConfig;
@@ -297,6 +298,31 @@ impl Default for CloneStats {
             directory_inflight: AtomicU64::new(0),
             created_parents: DashSet::new(),
         }
+    }
+}
+
+impl CloneStats {
+    /// Sends a progress event with the counts as they stand, in order with the other progress
+    /// events of the clone ([`DiscoveryStats::send_progress`]).
+    fn send_progress(self: &Arc<Self>) {
+        self.discovery.send_progress(|| {
+            self.send_progress_event();
+        });
+    }
+
+    /// Sends a progress event with the counts as they stand, without the order lock
+    /// ([`DiscoveryStats::send_progress`] holds it).
+    fn send_progress_event(self: &Arc<Self>) {
+        event::LoreEvent::RepositoryCloneProgress(LoreRepositoryCloneProgressEventData {
+            count: LoreRepositoryCloneCountData::new(self),
+        })
+        .send();
+    }
+}
+
+impl AsRef<DiscoveryStats> for CloneStats {
+    fn as_ref(&self) -> &DiscoveryStats {
+        &self.discovery
     }
 }
 
@@ -1695,21 +1721,11 @@ async fn clone_materialize(
             .await
             .forward::<CloneError>("Failed to load repository state from remote")?;
 
-        let ticker_stats = stats.clone();
-        let _ticker = AbortOnDropHandle::new(lore_spawn!({
-            async move {
-                let mut ticker = time::interval(time::Duration::from_millis(100));
-                loop {
-                    ticker.tick().await;
-                    event::LoreEvent::RepositoryCloneProgress(
-                        LoreRepositoryCloneProgressEventData {
-                            count: LoreRepositoryCloneCountData::new(&ticker_stats),
-                        },
-                    )
-                    .send();
-                }
-            }
-        }));
+        let _ticker = ProgressTicker::start(
+            stats.clone(),
+            time::Duration::from_millis(100),
+            CloneStats::send_progress_event,
+        );
 
         cache_task = Some(spawn_fragment_cache(
             &repository,
@@ -1720,10 +1736,7 @@ async fn clone_materialize(
         clone_result = clone_in_path(ctx).await;
     }
 
-    event::LoreEvent::RepositoryCloneProgress(LoreRepositoryCloneProgressEventData {
-        count: LoreRepositoryCloneCountData::new(&stats),
-    })
-    .send();
+    stats.send_progress();
 
     if let Some(task) = cache_task {
         let cached = task.await;
@@ -1837,10 +1850,7 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
             .store(true, Ordering::Relaxed);
         // Send a progress event immediately when discovery finishes,
         // ensuring at least one progress event has discoveryComplete=true
-        event::LoreEvent::RepositoryCloneProgress(LoreRepositoryCloneProgressEventData {
-            count: LoreRepositoryCloneCountData::new(&discover_stats),
-        })
-        .send();
+        discover_stats.send_progress();
         drop(dispatcher);
         result
     });

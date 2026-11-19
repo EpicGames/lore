@@ -4392,7 +4392,7 @@ async fn apply_prepared_diff(
     })
     .await?;
 
-    event::LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(&stats)).send();
+    stats.send_progress();
 
     // Serialize as staged state with merged parents, staged states have revision 0
     state_staged.set_revision_number(0);

@@ -20,7 +20,6 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
-use tokio_util::task::AbortOnDropHandle;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
@@ -81,6 +80,7 @@ use crate::node::ROOT_NODE;
 use crate::progress::DEFAULT_WORK_CHANNEL_CAPACITY;
 use crate::progress::DiscoveryStats;
 use crate::progress::MAX_CONCURRENT_DIRECTORY_TASKS;
+use crate::progress::ProgressTicker;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::repository::verify::verify_state_for_commit;
@@ -373,6 +373,12 @@ pub(crate) struct CommitStats {
     statistics: bool,
 }
 
+impl AsRef<DiscoveryStats> for CommitStats {
+    fn as_ref(&self) -> &DiscoveryStats {
+        &self.discovery
+    }
+}
+
 impl CommitStats {
     /// Counters for one commit, keeping what the call's statistics level reports.
     #[lore_macro::test_pub]
@@ -384,6 +390,23 @@ impl CommitStats {
             statistics: crate::runtime::try_execution_context()
                 .is_some_and(|context| context.globals().stats()),
         })
+    }
+
+    /// Sends a progress event with the counts as they stand, in order with the other progress
+    /// events of the commit ([`DiscoveryStats::send_progress`]).
+    fn send_progress(self: &Arc<Self>) {
+        self.discovery.send_progress(|| {
+            self.send_progress_event();
+        });
+    }
+
+    /// Sends a progress event with the counts as they stand, without the order lock
+    /// ([`DiscoveryStats::send_progress`] holds it).
+    fn send_progress_event(self: &Arc<Self>) {
+        event::LoreEvent::RevisionCommitProgress(LoreRevisionCommitProgressEventData {
+            count: LoreRevisionCommitCountData::new(self.clone()),
+        })
+        .send();
     }
 
     /// Counts one directory in the total and as done, the total first, as
@@ -2478,17 +2501,11 @@ pub(crate) async fn commit_files_and_rehash(
     event::LoreEvent::RevisionCommitBegin(LoreRevisionCommitBeginEventData::default()).send();
 
     // Print progress at regular intervals
-    let ticker_stats = stats.clone();
-    let ticker = AbortOnDropHandle::new(lore_spawn!(async move {
-        let mut ticker = tokio::time::interval(progress_interval);
-        loop {
-            ticker.tick().await;
-            event::LoreEvent::RevisionCommitProgress(LoreRevisionCommitProgressEventData {
-                count: LoreRevisionCommitCountData::new(ticker_stats.clone()),
-            })
-            .send();
-        }
-    }));
+    let ticker = ProgressTicker::start(
+        stats.clone(),
+        progress_interval,
+        CommitStats::send_progress_event,
+    );
 
     let (walk, file_rx) = CommitWalk::new(
         operation.holds_state(),
@@ -2614,10 +2631,7 @@ async fn commit_walks(
                 stats.discovery.complete.store(true, Ordering::Relaxed);
                 // Send a progress event immediately when discovery finishes,
                 // ensuring at least one progress event has discoveryComplete=true
-                event::LoreEvent::RevisionCommitProgress(LoreRevisionCommitProgressEventData {
-                    count: LoreRevisionCommitCountData::new(stats),
-                })
-                .send();
+                stats.send_progress();
             }
             result
         }))
@@ -8257,10 +8271,7 @@ async fn freeze_tree(
     .await?;
 
     stats.discovery.complete.store(true, Ordering::Relaxed);
-    event::LoreEvent::RevisionCommitProgress(LoreRevisionCommitProgressEventData {
-        count: LoreRevisionCommitCountData::new(stats.clone()),
-    })
-    .send();
+    stats.send_progress();
 
     commit_discard(
         repository.clone(),
