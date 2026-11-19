@@ -1752,8 +1752,8 @@ pub async fn drain_link_tracker(
 /// Force-realizes specific file paths from a linked repository state at the
 /// mount path, regardless of any state-to-state diff.
 ///
-/// Restore on-disk content for `paths` (mount-relative) from `link_state`
-/// and unlink any `~mine`/`~theirs`/`~base` sidecars at the same paths.
+/// Restore on-disk content from `link_state` for those of `paths` (mount-relative) the view
+/// keeps, and unlink any `~mine`/`~theirs`/`~base` sidecars at the same paths.
 ///
 /// Used during merge abort to clean up filesystem-only artifacts: marker
 /// bytes inside conflicted file contents and sidecar files. The
@@ -1779,6 +1779,12 @@ pub async fn restore_link_paths_from_state(
         for link_relative in paths {
             let mount_path = link_path.join(link_relative.as_str());
             sync::unlink_merge_artifacts(&operation, &mount_path).await;
+            if repository
+                .filter
+                .excludes(&mount_path, false, FilterMode::View)
+            {
+                continue;
+            }
 
             let node_link = link_state
                 .find_relative_node_link(link_context.clone(), mounted, link_relative.as_str())

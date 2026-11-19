@@ -24,7 +24,7 @@ from link_helpers import (
     remount,
 )
 from lore_parsers import parse_jsonl, parse_status_json
-from test_utils import view_file
+from test_utils import view_file, working_tree_files
 
 from lore import Lore
 
@@ -1651,6 +1651,31 @@ def test_syncing_off_a_link_while_widening_the_view_restores_the_folder(
 
 
 @pytest.mark.smoke
+def test_syncing_to_a_link_the_view_reincludes_into_realizes_what_it_keeps(
+    new_lore_repo, scratch_dir
+):
+    """A sync that adds a link under a view excluding the mount and re-including
+    one of its files realizes that file alone."""
+    parent = make_repo(new_lore_repo, {"main-file.txt": "main\n"})
+    unlinked = parent.branch_info("main").local_latest
+    source = make_repo(
+        new_lore_repo, {"kept.txt": "kept\n", "dropped.txt": "dropped\n"}
+    )
+    parent.link_add("linked/repo", source.get_id(), "/")
+    parent.commit("Add the link")
+    parent.push()
+    view = view_file(scratch_dir, "narrow", ["/linked/repo/", "!/linked/repo/kept.txt"])
+    parent.sync(unlinked, view=view)
+
+    parent.sync()
+
+    assert working_tree_files(parent, "linked", directories=True) == [
+        "linked/repo",
+        "linked/repo/kept.txt",
+    ], "the sync must realize only the file the view re-includes"
+
+
+@pytest.mark.smoke
 @pytest.mark.parametrize("discard", [None, "reset", "force"])
 def test_switching_off_a_link_over_a_local_edit_the_folder_would_overwrite(
     new_lore_repo, discard
@@ -1942,9 +1967,7 @@ def test_syncing_a_link_moved_to_another_repository_checks_the_mount(new_lore_re
     parent.write_files({"vendor/linked.txt": "edited locally\n"})
     with pytest.raises(LocalChanges) as refused:
         parent.sync()
-    assert "vendor/linked.txt" in str(refused.value), (
-        "the refusal must name the file"
-    )
+    assert "vendor/linked.txt" in str(refused.value), "the refusal must name the file"
 
     with parent.open_file(parent.ignore_file(), "w+") as rules_file:
         rules_file.write("*.key\n")

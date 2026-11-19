@@ -4464,9 +4464,15 @@ fn realize_change_modify_add<'a>(
 
         // Only on-disk work honours the view. This gates directory creation, link
         // cloning and the file write. A directory the view excludes is created by
-        // the first write below it. The move rename below is not gated, because
-        // it repositions a path an earlier in-view realize may have written.
-        let write_to_disk = !view_filter.excludes(path, node.is_directory(), FilterMode::View);
+        // the first write below it. A link's content is written only here, so a link
+        // is kept wherever the view could re-include something below it. The move
+        // rename below is not gated, because it repositions a path an earlier
+        // in-view realize may have written.
+        let write_to_disk = !if node.is_link() {
+            view_filter.excludes_tree(path, true, FilterMode::View)
+        } else {
+            view_filter.excludes(path, node.is_directory(), FilterMode::View)
+        };
 
         lore_trace!(
             "{}{} {}",
