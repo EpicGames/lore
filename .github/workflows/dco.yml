@@ -27,6 +27,7 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_OPENER: ${{ github.event.pull_request.user.login }}
           DCO_DOC: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.event.pull_request.base.ref }}/CONTRIBUTING.md#dco-sign-off
         run: |
           set -euo pipefail
@@ -40,7 +41,6 @@ jobs:
           fi
 
           pass=0
-          skip=0
           fail=0
           failures=""
 
@@ -48,16 +48,14 @@ jobs:
             IFS=$'\x1f' read -r -d '' short author_name author_email subject body \
               < <(git show -s --format='%h%x1f%an%x1f%ae%x1f%s%x1f%B' "$sha") || true
 
-            # Bots (dependabot[bot], github-actions[bot], ...) don't sign off.
-            case "$author_name|$author_email" in
-              *'[bot]|'* | *'[bot]@users.noreply.github.com')
-                skip=$((skip + 1))
-                echo "skip (bot): $short $subject"
-                continue
-                ;;
-            esac
-
             expected="${author_name} <${author_email}>"
+            # Dependabot signs off with a different email from the one it authors with.
+            # Commit author fields are set by whoever commits, so only accept that
+            # sign-off on pull requests GitHub says Dependabot opened.
+            if [ "$PR_OPENER" = 'dependabot[bot]' ] &&
+              [ "$expected" = 'dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>' ]; then
+              expected='dependabot[bot] <support@github.com>'
+            fi
             matched=0
             present=0
             while IFS= read -r line; do
@@ -89,9 +87,10 @@ jobs:
             echo ""
             echo "Verifies every commit in this PR carries a \`Signed-off-by\` line"
             echo "matching its author, certifying the [Developer Certificate of Origin]($DCO_DOC)."
-            echo "Merge commits and bot authors are exempt."
+            echo "Merge commits are exempt. On pull requests opened by Dependabot, its commits"
+            echo "must carry its \`dependabot[bot] <support@github.com>\` sign-off."
             echo ""
-            echo "Passed: $pass · Skipped (bots): $skip · Failed: $fail"
+            echo "Passed: $pass · Failed: $fail"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$fail" -gt 0 ]; then
