@@ -1610,3 +1610,17 @@ impl AsRef<str> for RelativePathBuf {
         self.path.as_str()
     }
 }
+
+/// Whether a path `path_of` reads from an item of `sorted`, sorted by that path, is below
+/// `directory`.
+pub(crate) fn sorted_holds_below<T>(
+    sorted: &[T],
+    path_of: impl Fn(&T) -> &str,
+    directory: &RelativePath,
+) -> bool {
+    let prefix = format!("{directory}/");
+    let first = sorted.partition_point(|item| path_of(item) < prefix.as_str());
+    sorted
+        .get(first)
+        .is_some_and(|item| path_of(item).starts_with(&prefix))
+}

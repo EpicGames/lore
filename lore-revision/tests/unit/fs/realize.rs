@@ -1285,6 +1285,7 @@ async fn realize_verified(
         operation,
         Arc::new(realized),
         &[],
+        None, /* No subtrees */
         None,
         false,
         None,
@@ -1922,6 +1923,46 @@ async fn an_add_below_a_deleted_link_refuses_a_file_the_view_excluded() {
     .await;
 }
 
+/// The check of a directory deleted as a whole looks through the mount of a link below it: a file
+/// the link tracks that holds what the link holds passes, and one holding other content refuses
+/// the sync.
+#[tokio::test]
+async fn a_deleted_directory_refuses_a_modified_file_in_the_mount_of_a_link_below_it() {
+    Box::pin(with_execution(async {
+        let linked = pseudo_random_bytes(20 * 1024, 0);
+        let modified = pseudo_random_bytes(20 * 1024, 1);
+        for (content, refused) in [(&linked, false), (&modified, true)] {
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+            let repository = working_tree_repository(dir.path()).await;
+            write_working_files(&repository, &[(TRACKED, content)]).await;
+            let (current, _) =
+                linked_plugin_tree(&repository, SOURCE, &[(TRACKED_NAME, &linked)]).await;
+            let parent = SOURCE.rsplit_once('/').unwrap().0;
+            let mut whole = delete_change(&repository, &current, parent).await;
+            whole.flags = change::Flags::Subtree;
+
+            let result = verify_set(&repository, &current, vec![whole]).await;
+            if refused {
+                assert!(
+                    result
+                        .as_ref()
+                        .is_err_and(SyncError::is_local_modifications),
+                    "A modified file the link tracks refuses the sync: {:?}",
+                    result.map(|verified| verified.changes)
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "A file holding what the link holds is no local work: {:?}",
+                    result.map(|verified| verified.changes)
+                );
+            }
+            assert_eq!(working_file(&repository, TRACKED).await, content.as_slice());
+        }
+    }))
+    .await;
+}
+
 /// The delete of a link keeps a file below its mount that already holds what replaces it, without
 /// writing it again, and removes what the link alone held there.
 #[tokio::test]
@@ -1963,6 +2004,7 @@ async fn a_deleted_link_keeps_a_file_already_holding_what_replaces_it() {
             operation,
             changes,
             &kept,
+            None, /* No subtrees */
             None,
             false,
             None,
@@ -2010,6 +2052,7 @@ async fn a_deleted_link_removes_a_wide_mount_around_the_files_it_keeps() {
             operation,
             Arc::new(vec![delete]),
             &[relative(TRACKED), relative(nested)],
+            None, /* No subtrees */
             None,
             false,
             None,
@@ -2058,6 +2101,7 @@ async fn a_deleted_link_removes_a_deep_mount_around_the_file_it_keeps() {
             operation,
             Arc::new(vec![delete]),
             &[relative(&kept)],
+            None, /* No subtrees */
             None,
             false,
             None,
@@ -2129,6 +2173,7 @@ async fn a_deleted_link_keeps_a_forwarded_local_edit() {
             operation,
             changes,
             &kept,
+            None, /* No subtrees */
             None,
             false,
             None,
@@ -2415,6 +2460,7 @@ async fn a_merge_moves_the_other_spelling_of_a_source_edited_since_the_base() {
             operation,
             Arc::new(vec![moved]),
             &[],
+            None, /* No subtrees */
             None,
             false,
             Some(MergeCurrent::new(current)),
@@ -2555,6 +2601,7 @@ async fn a_merge_deleting_a_directory_keeps_an_edited_case_variant_of_an_ignored
                 operation,
                 Arc::new(changes),
                 &[],
+                None, /* No subtrees */
                 None,
                 false,
                 Some(MergeCurrent::new(state.clone())),
@@ -2653,8 +2700,9 @@ async fn sync_continues_after_a_materialization_error() {
         let result = realize_changes(
             repository.clone(),
             operation.clone(),
-            Arc::new(changes),
+            Arc::new(changes.clone()),
             &[],
+            None, /* No subtrees */
             None,
             false,
             None,
@@ -2671,6 +2719,290 @@ async fn sync_continues_after_a_materialization_error() {
             assert!(info.exists(), "available file {name} was not materialized");
             assert_eq!(info.size(), 0);
         }
+    }))
+    .await;
+}
+
+/// A directory deleted as a whole, handed over without the subtrees that expand it or beside a state
+/// to stage it in, fails before anything is removed rather than deleting nothing below it.
+#[tokio::test]
+async fn a_subtree_change_without_its_subtrees_is_refused() {
+    Box::pin(with_execution(async {
+        let temp = lore_base::test_util::TempDir::new("lore-subtree-without-subtrees-");
+        let repository = working_tree_repository(temp.path()).await;
+        let path = RelativePath::new_from_initial_path("gone").unwrap();
+        let inner = RelativePath::new_from_initial_path("gone/inner.txt").unwrap();
+        std::fs::create_dir(temp.path().join("gone")).expect("create the directory");
+        write_working_file(&repository, &inner, b"inner").await;
+        let current = state_holding(&repository, &path, Node::new_zeroed(), 1).await;
+        let changes = vec![NodeChange {
+            action: FileAction::Delete,
+            flags: change::Flags::Subtree,
+            from: side(&repository, &current, path.clone()),
+            to: side(&repository, &current, path.clone()),
+        }];
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        let result = realize_changes(
+            repository.clone(),
+            operation.clone(),
+            Arc::new(changes.clone()),
+            &[],
+            None, /* No subtrees */
+            None,
+            false,
+            None, /* Not a merge */
+            Arc::default(),
+        )
+        .await;
+        assert!(
+            result.is_err_and(|err| err.is_internal()),
+            "A subtree change needs its subtrees"
+        );
+        let (_, subtrees) = state::diff_collect_subtrees(
+            repository.clone(),
+            current.state.clone(),
+            repository.clone(),
+            current.state.clone(),
+            FilterMode::Full,
+        )
+        .await
+        .expect("the subtrees of an empty diff");
+        let staged = realize_changes(
+            repository.clone(),
+            operation.clone(),
+            Arc::new(changes.clone()),
+            &[],
+            Some(subtrees),
+            Some(State::new()),
+            false,
+            None, /* Not a merge */
+            Arc::default(),
+        )
+        .await;
+        assert!(
+            staged.is_err_and(|err| err.is_internal()),
+            "A subtree change is never staged"
+        );
+        assert!(
+            operation.file_info(&inner).await.unwrap().exists(),
+            "Nothing below the directory may be removed"
+        );
+    }))
+    .await;
+}
+
+/// The check of a deleted directory's working tree stops once another change has refused the
+/// sync, rather than going on through a directory that holds no local work.
+#[tokio::test]
+async fn a_deleted_directory_check_stops_once_the_sync_is_refused() {
+    Box::pin(with_execution(async {
+        let temp = lore_base::test_util::TempDir::new("lore-refused-stops-check-");
+        let repository = working_tree_repository(temp.path()).await;
+        let path = RelativePath::new_from_initial_path("gone").unwrap();
+        let clean = RelativePath::new_from_initial_path("gone/clean.txt").unwrap();
+        std::fs::create_dir(temp.path().join("gone")).expect("create the directory");
+        write_working_file(&repository, &clean, b"clean").await;
+        // An untracked file is a difference the check walks to, and keeps rather than refuses.
+        let untracked = RelativePath::new_from_initial_path("gone/untracked.txt").unwrap();
+        write_working_file(&repository, &untracked, b"untracked").await;
+        let current = state_holding(&repository, &path, Node::new_zeroed(), 1).await;
+        lore_revision::stage::stage_single_node(
+            repository.clone(),
+            current.state.clone(),
+            clean.clone(),
+            file_node(b"clean"),
+            Arc::default(),
+            None,
+            FilterMode::Full,
+        )
+        .await
+        .expect("stage the file");
+        let root = NodeMapping::root(repository.clone(), current.state.clone());
+        let directory = root.node_at(&path).await;
+        let check = async |refused: bool| {
+            let mut change = NodeChange {
+                action: FileAction::Delete,
+                flags: change::Flags::None,
+                from: NodeChangeState {
+                    mapping: NodeMapping {
+                        repository: repository.clone(),
+                        state: current.state.clone(),
+                        path: path.clone(),
+                        node: directory.node,
+                    },
+                    observed: None,
+                    flags: NodeFlags::NoFlags,
+                    address: Default::default(),
+                    mode: 0,
+                },
+                to: side(&repository, &current, path.clone()),
+            };
+            let stats = Arc::new(lore_revision::revision::sync::SyncVerifyStats::default());
+            stats
+                .refused
+                .store(refused, std::sync::atomic::Ordering::Relaxed);
+            let operation = repository.file_system().begin_operation().await.unwrap();
+            Box::pin(verify_filesystem(
+                &mut change,
+                repository.clone(),
+                operation,
+                root.clone(),
+                false,
+                false,
+                false,
+                stats,
+                FilterMode::Full,
+                &IncomingChanges::new(Arc::default()),
+            ))
+            .await
+        };
+
+        assert_eq!(
+            check(false)
+                .await
+                .expect("A clean directory may be deleted"),
+            Verdict::Realize,
+            "The directory holds no local work"
+        );
+        assert!(
+            check(true)
+                .await
+                .is_err_and(|err| err.is_local_modifications()),
+            "A refused sync stops the check"
+        );
+    }))
+    .await;
+}
+
+/// A directory log reads back every path pushed to it, last first, across chunk boundaries and
+/// where consecutive paths share a prefix that ends inside a character.
+#[test]
+fn a_directory_log_reads_back_every_path_last_first() {
+    let mut log = DirectoryLog::default();
+    let mut pushed = Vec::new();
+    for index in 0..(2 * 4096 + 17) {
+        // `é` and `è` share their first byte, so each path keeps part of a character of the last.
+        let accent = if index % 2 == 0 { "é" } else { "è" };
+        let path = RelativePath::new_from_initial_path(format!("top/{accent}{index}/below"))
+            .expect("a valid path");
+        log.push(&path, index as NodeID);
+        pushed.push((path.as_str().to_string(), index as NodeID));
+    }
+
+    let mut reader = log.into_rev_reader();
+    let mut read = Vec::new();
+    while let Some((path, node)) = reader.next() {
+        read.push((path.as_str().to_string(), node));
+    }
+    pushed.reverse();
+    assert_eq!(read, pushed);
+}
+
+/// A verification refused for local modifications marks the sync refused, which stops the check
+/// of a deleted directory still running, and any other failure doesn't; the first failure is the
+/// one answered either way.
+#[test]
+fn only_a_refusal_for_local_modifications_marks_the_verification_refused() {
+    use std::sync::atomic::Ordering;
+
+    use lore_base::error::LocalModifications;
+    use lore_revision::revision::sync::SyncVerifyStats;
+
+    let stats = SyncVerifyStats::default();
+    let mut failure = None;
+    record_verify_failure(&stats, &mut failure, SyncError::internal("unreadable node"));
+    assert!(
+        !stats.refused.load(Ordering::Relaxed),
+        "An internal failure refuses nothing"
+    );
+    record_verify_failure(&stats, &mut failure, LocalModifications.into());
+    assert!(
+        stats.refused.load(Ordering::Relaxed),
+        "Local modifications refuse the sync"
+    );
+    assert!(
+        failure.is_some_and(|err| err.is_internal()),
+        "The first failure is the one answered"
+    );
+}
+
+/// The delete of a directory deleted as a whole is boxed, so the delete of listed changes, which
+/// every realize awaits, doesn't hold its walk.
+#[tokio::test]
+async fn the_deletes_of_a_realize_hold_no_whole_directory_delete() {
+    Box::pin(with_execution(async {
+        let temp = lore_base::test_util::TempDir::new("lore-subtree-delete-size-");
+        let repository = working_tree_repository(temp.path()).await;
+        let path = RelativePath::new_from_initial_path("gone").unwrap();
+        let current = state_holding(&repository, &path, Node::new_zeroed(), 1).await;
+        let (_, subtrees) = state::diff_collect_subtrees(
+            repository.clone(),
+            current.state.clone(),
+            repository.clone(),
+            current.state.clone(),
+            FilterMode::Full,
+        )
+        .await
+        .expect("the subtrees of an empty diff");
+        let change = NodeChange {
+            action: FileAction::Delete,
+            flags: change::Flags::Subtree,
+            from: side(&repository, &current, path.clone()),
+            to: side(&repository, &current, path.clone()),
+        };
+        let context = Arc::new(DeleteContext {
+            repository: repository.clone(),
+            operation: repository.file_system().begin_operation().await.unwrap(),
+            state_stage: None,
+            dry_run: true,
+            merge_current: None,
+            stats: Arc::default(),
+        });
+        let changes = [change];
+        let listed = realize_changes_delete(&context, &changes, &[], Some(&subtrees));
+        let whole = realize_subtree_delete(&context, &changes[0], &subtrees, &[], &[]);
+        assert!(
+            size_of_val(&listed) < size_of_val(&whole),
+            "the deletes hold {} bytes beside the {} of a whole-directory delete",
+            size_of_val(&listed),
+            size_of_val(&whole)
+        );
+    }))
+    .await;
+}
+
+/// The task deleting a file below a directory deleted as a whole holds its change once, beside the
+/// removal it awaits.
+#[tokio::test]
+async fn a_file_delete_task_holds_its_change_once() {
+    Box::pin(with_execution(async {
+        let temp = lore_base::test_util::TempDir::new("lore-delete-below-size-");
+        let repository = working_tree_repository(temp.path()).await;
+        let path = RelativePath::new_from_initial_path("file.txt").unwrap();
+        let current = state_holding(&repository, &path, Node::new_zeroed(), 1).await;
+        let change = NodeChange {
+            action: FileAction::Delete,
+            flags: change::Flags::None,
+            from: side(&repository, &current, path.clone()),
+            to: side(&repository, &current, path.clone()),
+        };
+        let context = Arc::new(DeleteContext {
+            repository: repository.clone(),
+            operation: repository.file_system().begin_operation().await.unwrap(),
+            state_stage: None,
+            dry_run: true,
+            merge_current: None,
+            stats: Arc::default(),
+        });
+        let removal = size_of_val(&remove_file(&context, &change, &[]));
+        let task = delete_below(context.clone(), change.clone());
+        assert!(
+            size_of_val(&task) < removal + 2 * size_of::<NodeChange>(),
+            "the task holds {} bytes beside a removal of {} and a change of {}",
+            size_of_val(&task),
+            removal,
+            size_of::<NodeChange>()
+        );
     }))
     .await;
 }
@@ -2728,6 +3060,7 @@ async fn a_refused_move_removes_its_destination_unless_it_is_the_source() {
                 operation,
                 Arc::new(vec![change]),
                 &[],
+                None, /* No subtrees */
                 None,
                 false,
                 None,

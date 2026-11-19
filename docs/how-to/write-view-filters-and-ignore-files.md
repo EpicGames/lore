@@ -137,9 +137,8 @@ lore sync --view config.view
 `lore sync --view` is a full sync: it also moves the instance to the branch's latest revision. It refuses while anything is staged, and when the sync would merge a diverged branch. Lore writes the files entering the view, deletes those leaving it, and keeps untracked files. If that would delete a file you've modified, it refuses and changes nothing. From an instance with no view filter, with `Engine/Source/Runtime/core.cpp` modified, and `config.view` holding the view from [Exclude everything, then re-include](#exclude-everything-then-re-include):
 
 ```text
-[Error] Deleted file is currently modified in file system: Engine/Source/Runtime/core.cpp
-[Error] Deleted directory has modified files in file system: Engine/Source/Runtime
 [Error] Deleted directory has modified files in file system: Engine/Source
+[Error] Deleted file is currently modified in file system: Engine/Source/Runtime/core.cpp, size 45 mtime <mtime>, revision mode 0 size 39 hash <hash>
 [Error] Local modifications prevent synchronization
 ```
 

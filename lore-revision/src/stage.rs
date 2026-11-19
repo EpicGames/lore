@@ -5684,6 +5684,7 @@ pub(crate) async fn stage_from_parent_state(
         operation.clone(),
         changes.clone(),
         &[],
+        None, /* No subtrees */
         None,
         false, /* No dry run */
         None,  /* Not a merge */

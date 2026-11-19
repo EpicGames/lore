@@ -4142,6 +4142,7 @@ async fn restart_reset_conflicts(
         operation.clone(),
         Arc::new(changes),
         &[],
+        None, /* No subtrees */
         None,
         dry_run,
         None, /* Not a merge */
@@ -4182,6 +4183,7 @@ async fn realize_diff_over_filesystem(args: RealizeDiff<'_>) -> Result<(), Merge
         args.operation.clone(),
         args.changes.clone(),
         &[],
+        None, /* No subtrees */
         Some(args.state_staged.clone()),
         args.skip_filesystem,
         // The merge applies to the target.
@@ -5251,6 +5253,7 @@ pub async fn merge_abort(
             operation.clone(),
             changes.clone(),
             &[],
+            None, /* No subtrees */
             None,
             dry_run,
             None, /* Not a merge */

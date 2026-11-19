@@ -95,6 +95,7 @@ mod tests {
         files_deleted: AtomicUsize,
         delete_total: AtomicUsize,
         reported: Mutex<Vec<String>>,
+        excluded: Mutex<Vec<String>>,
     }
 
     impl Recorded {
@@ -113,6 +114,14 @@ mod tests {
                 self.files_deleted.load(Ordering::Relaxed),
                 self.delete_total.load(Ordering::Relaxed),
             )
+        }
+
+        /// Every path a filter exclusion event named, in order.
+        fn excluded(&self) -> Vec<String> {
+            self.excluded
+                .lock()
+                .expect("Recorded exclusions poisoned")
+                .clone()
         }
 
         /// Every path a per-file event named, with the action it carried, in order.
@@ -154,6 +163,11 @@ mod tests {
                     .lock()
                     .expect("Recorded paths poisoned")
                     .push(format!("{:?} {}", file.action, file.path)),
+                LoreEvent::FilterExclude(excluded) => recorded
+                    .excluded
+                    .lock()
+                    .expect("Recorded exclusions poisoned")
+                    .push(excluded.path.to_string()),
                 _ => {}
             }))),
             "test-user".to_string(),
@@ -446,15 +460,371 @@ mod tests {
                     },
                     "a narrowing writes nothing and removes the two files and their directory"
                 );
+                let mut reported = recorded.reported();
+                let directory = reported.pop();
+                reported.sort();
                 assert_eq!(
-                    recorded.reported(),
-                    vec![
-                        "Delete drop/dropped.txt".to_string(),
-                        "Delete drop/also-dropped.txt".to_string(),
-                        "Delete drop".to_string(),
-                    ],
+                    (reported, directory),
+                    (
+                        vec![
+                            "Delete drop/also-dropped.txt".to_string(),
+                            "Delete drop/dropped.txt".to_string(),
+                        ],
+                        Some("Delete drop".to_string()),
+                    ),
                     "each path leaving the view is reported once, the files before the directory \
                      that held them"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Commits [`NESTED`] below [`DROPPED_DIRECTORY`], then a revision without the directory,
+    /// answering the two, with the working tree standing on the first.
+    async fn nested_then_gone(fixture: &Fixture) -> (String, String) {
+        std::fs::create_dir_all(fixture.working(NESTED_DIRECTORY))
+            .expect("Create directory failed");
+        test_file_write(fixture.working(NESTED).as_path(), b"nested");
+        let nested = test_commit_tree(&fixture.instance, "Nested")
+            .await
+            .revision();
+        std::fs::remove_dir_all(fixture.working(DROPPED_DIRECTORY)).expect("Delete failed");
+        let gone = test_commit_tree(&fixture.instance, "Gone").await.revision();
+        let (result, _recorded) = fixture
+            .sync(
+                fixture.instance.repository.clone(),
+                SyncOptions {
+                    revision: Some(nested.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        result.expect("Failed to sync back to the nested revision");
+        (nested.to_string(), gone.to_string())
+    }
+
+    const NESTED_DIRECTORY: &str = "drop/sub";
+    const NESTED: &str = "drop/sub/deep.txt";
+
+    /// A sync deleting a directory whole keeps a directory below it that holds a local file, and the
+    /// directories above that one, while every tracked file goes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deleted_directory_keeps_a_nested_directory_holding_a_local_file() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                let (_, gone) = nested_then_gone(&fixture).await;
+                let local = format!(
+                    "{NESTED_DIRECTORY}/local{}",
+                    lore_revision::repository::TEMP_FILE_EXTENSION
+                );
+                test_file_write(fixture.working(&local).as_path(), b"local work");
+
+                let (result, _recorded) = fixture
+                    .sync(
+                        fixture.instance.repository.clone(),
+                        SyncOptions {
+                            revision: Some(gone),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+
+                result.expect("Failed to sync to the revision without the directory");
+                assert_eq!(
+                    (
+                        fixture.working_file(DROPPED),
+                        fixture.working_file(ALSO_DROPPED),
+                        fixture.working_file(NESTED),
+                        fixture.working_file(&local).as_deref(),
+                    ),
+                    (None, None, None, Some(b"local work".as_slice())),
+                    "the tracked files go and the local file stays"
+                );
+                assert!(
+                    fixture.working(NESTED_DIRECTORY).is_dir(),
+                    "the directory holding the local file is kept, and so is the one above it"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A path the view excludes below a directory a sync deletes whole is reported as often as when
+    /// the sync lists every file, once by the check of the working tree and once by the walk that
+    /// deletes it, though the sync also looks below the directory for a move to the file it adds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_path_excluded_below_a_deleted_directory_is_reported_by_no_extra_walk() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                let first = fixture.anchor().await;
+                std::fs::remove_dir_all(fixture.working(DROPPED_DIRECTORY)).expect("Delete failed");
+                test_file_write(fixture.working(ADDED).as_path(), ADDED_CONTENT);
+                let gone = test_commit_tree(&fixture.instance, "Gone").await.revision();
+                let view = fixture.view_file(NARROW_VIEW, &[&format!("/{ALSO_DROPPED}")]);
+                let (result, _recorded) = fixture
+                    .sync(
+                        fixture.instance.repository.clone(),
+                        SyncOptions {
+                            revision: Some(first.to_string()),
+                            view: Some(view),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                result.expect("Failed to sync back under the view");
+
+                let (result, recorded) = fixture
+                    .sync(
+                        fixture.reopened(),
+                        SyncOptions {
+                            revision: Some(gone.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+
+                result.expect("Failed to sync to the revision without the directory");
+                assert!(
+                    !fixture.working(DROPPED_DIRECTORY).exists(),
+                    "the directory is deleted"
+                );
+                let excluded: Vec<_> = recorded
+                    .excluded()
+                    .into_iter()
+                    .filter(|path| path == ALSO_DROPPED)
+                    .collect();
+                assert_eq!(excluded.len(), 2, "reported twice: {excluded:?}");
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A sync that can't delete a file below a directory it deletes whole fails with that failure,
+    /// leaving the file.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_answers_a_file_below_a_deleted_directory_it_cannot_delete() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Safety: `geteuid` takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root deletes from a directory it cannot write to");
+            return;
+        }
+
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                let (_, gone) = nested_then_gone(&fixture).await;
+                let nested = fixture.working(NESTED_DIRECTORY);
+                std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o555))
+                    .expect("Failed to make the directory read-only");
+
+                let (result, _recorded) = fixture
+                    .sync(
+                        fixture.instance.repository.clone(),
+                        SyncOptions {
+                            revision: Some(gone),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+
+                std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755))
+                    .expect("Failed to make the directory writable again");
+                assert!(
+                    result.as_ref().is_err_and(|err| err.is_internal()),
+                    "the sync answers the failed delete: {result:?}"
+                );
+                assert!(
+                    fixture.working_file(NESTED).is_some(),
+                    "the file it couldn't delete stays"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A sync deleting a directory whole that the working tree no longer holds reports each file the
+    /// revision holds below it, and clears the time it recorded for each.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_deleting_a_directory_already_gone_from_disk_clears_what_it_recorded_below_it() {
+        use lore_revision::util::path::RelativePath;
+
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                let (_, gone) = nested_then_gone(&fixture).await;
+                let nested = RelativePath::new_from_initial_path(NESTED).expect("a valid path");
+                let recorded_time = async || {
+                    lore_revision::state::file_modified_time(
+                        fixture.instance.repository.clone(),
+                        &nested,
+                    )
+                    .await
+                };
+                assert_ne!(recorded_time().await, 0, "the sync records the file's time");
+                std::fs::remove_dir_all(fixture.working(DROPPED_DIRECTORY))
+                    .expect("Failed to remove the directory by hand");
+
+                let (result, recorded) = fixture
+                    .sync(
+                        fixture.instance.repository.clone(),
+                        SyncOptions {
+                            revision: Some(gone),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+
+                result.expect("Failed to sync to the revision deleting the directory");
+                assert!(!fixture.working(DROPPED_DIRECTORY).exists());
+                assert!(
+                    recorded.reported().contains(&format!("Delete {NESTED}")),
+                    "the file below the directory is reported: {:?}",
+                    recorded.reported()
+                );
+                assert_eq!(
+                    recorded_time().await,
+                    0,
+                    "the file's recorded time is cleared"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A sync deleting a directory whole that holds more files than it deletes at once deletes
+    /// every file and the directory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_deletes_every_file_of_a_directory_larger_than_its_delete_bound() {
+        use lore_revision::MAX_CONCURRENT_TREE_TASKS;
+
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                let files = MAX_CONCURRENT_TREE_TASKS + 500;
+                let many = fixture.working("many");
+                std::fs::create_dir_all(&many).expect("Create directory failed");
+                for index in 0..files {
+                    test_file_write(many.join(format!("{index}.txt")).as_path(), b"many");
+                }
+                let held = test_commit_tree(&fixture.instance, "Many").await.revision();
+                std::fs::remove_dir_all(&many).expect("Delete failed");
+                let gone = test_commit_tree(&fixture.instance, "Gone").await.revision();
+                let (result, _recorded) = fixture
+                    .sync(
+                        fixture.instance.repository.clone(),
+                        SyncOptions {
+                            revision: Some(held.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                result.expect("Failed to sync back to the revision holding the files");
+
+                let (result, recorded) = fixture
+                    .sync(
+                        fixture.instance.repository.clone(),
+                        SyncOptions {
+                            revision: Some(gone.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+
+                result.expect("Failed to sync to the revision deleting the directory");
+                assert!(!many.exists(), "the directory and its files are gone");
+                let (deleted, total) = recorded.deletes();
+                assert_eq!(deleted, total, "every file counted is deleted");
+                assert!(total > files, "every file and the directory are counted");
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A sync deleting a directory whole that holds more files than it deletes at once stops
+    /// walking the directory at the first file it fails to delete, rather than walking on to start a
+    /// delete of every other file.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_stops_walking_a_deleted_directory_at_its_first_failed_delete() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use lore_revision::MAX_CONCURRENT_TREE_TASKS;
+
+        // Safety: `geteuid` takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root deletes from a directory it cannot write to");
+            return;
+        }
+
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                let files = MAX_CONCURRENT_TREE_TASKS + 500;
+                let many = fixture.working("many");
+                std::fs::create_dir_all(&many).expect("Create directory failed");
+                for index in 0..files {
+                    test_file_write(many.join(format!("{index}.txt")).as_path(), b"many");
+                }
+                let held = test_commit_tree(&fixture.instance, "Many").await.revision();
+                std::fs::remove_dir_all(&many).expect("Delete failed");
+                let gone = test_commit_tree(&fixture.instance, "Gone").await.revision();
+                let (result, _recorded) = fixture
+                    .sync(
+                        fixture.instance.repository.clone(),
+                        SyncOptions {
+                            revision: Some(held.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                result.expect("Failed to sync back to the revision holding the files");
+                std::fs::set_permissions(&many, std::fs::Permissions::from_mode(0o555))
+                    .expect("Failed to make the directory read-only");
+
+                let (result, recorded) = fixture
+                    .sync(
+                        fixture.instance.repository.clone(),
+                        SyncOptions {
+                            revision: Some(gone.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+
+                std::fs::set_permissions(&many, std::fs::Permissions::from_mode(0o755))
+                    .expect("Failed to make the directory writable again");
+                assert!(
+                    result.as_ref().is_err_and(|err| err.is_internal()),
+                    "the sync answers the failed delete: {result:?}"
+                );
+                let (_, total) = recorded.deletes();
+                assert!(
+                    total <= MAX_CONCURRENT_TREE_TASKS + 1,
+                    "the walk stopped once the deletes in flight failed, at {total} of {files}"
                 );
             }))
             .await

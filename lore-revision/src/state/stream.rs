@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
@@ -9,14 +10,62 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::change::NodeChange;
+use crate::lore::Context;
 use crate::state::StateError;
 
 /// Where a diff walk emits the changes it finds.
 ///
 /// Cloned into each subtree a walk spawns, so a subtree emits to the caller directly rather than
-/// collecting for a parent to fold in. Carries changes alone: what a walk could not answer is
-/// its own failure, reported where it ends rather than in place of a change.
-pub type ChangeSender = mpsc::Sender<NodeChange>;
+/// collecting for a parent to fold in. Carries changes alone, and how the walk emits a directory
+/// deleted as a whole and the paths the filter excludes: what a walk could not answer is its own
+/// failure, reported where it ends rather than in place of a change.
+#[derive(Clone)]
+pub struct ChangeSender {
+    sender: mpsc::Sender<NodeChange>,
+    deletes: Deletes,
+    exclusions: Exclusions,
+    /// The file identities, sorted, of the files the walk leaves out, as listed on their own.
+    listed: Option<Arc<Vec<Context>>>,
+}
+
+/// What a walk emits for a directory deleted as a whole.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Deletes {
+    /// A change for the directory and one for every node below it.
+    Each,
+    /// One change carrying [`Flags::Subtree`](crate::change::Flags::Subtree), and nothing below.
+    Whole,
+}
+
+/// Whether a walk reports each path the filter excludes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Exclusions {
+    Reported,
+    Quiet,
+}
+
+impl ChangeSender {
+    /// Whether a directory deleted as a whole is emitted as one change carrying
+    /// [`Flags::Subtree`](crate::change::Flags::Subtree) rather than a change for every node
+    /// below it. See [`ChangeStream::spawn_subtrees`].
+    pub(crate) fn subtrees(&self) -> bool {
+        self.deletes == Deletes::Whole
+    }
+
+    /// Whether the walk reports each path the filter excludes, as a
+    /// [`LoreEvent::FilterExclude`](crate::event::LoreEvent::FilterExclude).
+    pub(crate) fn announces(&self) -> bool {
+        self.exclusions == Exclusions::Reported
+    }
+
+    /// Whether the walk leaves out the file whose file identity is `identity`, which is listed
+    /// on its own. See [`ChangeStream::spawn_below`].
+    pub(crate) fn lists(&self, identity: &Context) -> bool {
+        self.listed
+            .as_ref()
+            .is_some_and(|listed| !identity.is_zero() && listed.binary_search(identity).is_ok())
+    }
+}
 
 /// Emits the change `build` makes to the caller reading them, once the channel has room for it.
 ///
@@ -30,6 +79,7 @@ pub(crate) async fn emit(
     build: impl FnOnce() -> NodeChange,
 ) -> Result<(), StateError> {
     let permit = changes
+        .sender
         .reserve()
         .await
         .map_err(|_closed| StateError::internal("Diff receiver dropped"))?;
@@ -95,7 +145,75 @@ impl<Summary: Default + Send + 'static> ChangeStream<Summary> {
         Walk: FnOnce(ChangeSender) -> Walking,
         Walking: Future<Output = Result<Summary, StateError>> + Send + 'static,
     {
+        Self::spawn_walk(lookahead, Deletes::Each, Exclusions::Reported, None, walk)
+    }
+
+    /// [`spawn`](Self::spawn) for a caller that expands a directory deleted as a whole itself, as
+    /// it gets to it: such a directory is one change carrying
+    /// [`Flags::Subtree`](crate::change::Flags::Subtree), and nothing below it is emitted.
+    pub(crate) fn spawn_subtrees<Walk, Walking>(walk: Walk) -> Self
+    where
+        Walk: FnOnce(ChangeSender) -> Walking,
+        Walking: Future<Output = Result<Summary, StateError>> + Send + 'static,
+    {
+        Self::spawn_walk(
+            CHANGE_LOOKAHEAD,
+            Deletes::Whole,
+            Exclusions::Reported,
+            None,
+            walk,
+        )
+    }
+
+    /// [`spawn`](Self::spawn) for a walk over a hierarchy another walk reports: it reports no path
+    /// the filter excludes, and emits a deleted directory as `deletes` says.
+    pub(crate) fn spawn_quiet<Walk, Walking>(deletes: Deletes, walk: Walk) -> Self
+    where
+        Walk: FnOnce(ChangeSender) -> Walking,
+        Walking: Future<Output = Result<Summary, StateError>> + Send + 'static,
+    {
+        Self::spawn_walk(CHANGE_LOOKAHEAD, deletes, Exclusions::Quiet, None, walk)
+    }
+
+    /// [`spawn`](Self::spawn) for a walk below a directory deleted as a whole: it leaves out each
+    /// file whose file identity `listed`, sorted, holds, as listed on its own, emits a deleted
+    /// directory as `deletes` says, and reports each path the filter excludes where `announce`.
+    pub(crate) fn spawn_below<Walk, Walking>(
+        deletes: Deletes,
+        announce: bool,
+        listed: Arc<Vec<Context>>,
+        walk: Walk,
+    ) -> Self
+    where
+        Walk: FnOnce(ChangeSender) -> Walking,
+        Walking: Future<Output = Result<Summary, StateError>> + Send + 'static,
+    {
+        let exclusions = if announce {
+            Exclusions::Reported
+        } else {
+            Exclusions::Quiet
+        };
+        Self::spawn_walk(CHANGE_LOOKAHEAD, deletes, exclusions, Some(listed), walk)
+    }
+
+    fn spawn_walk<Walk, Walking>(
+        lookahead: NonZeroUsize,
+        deletes: Deletes,
+        exclusions: Exclusions,
+        listed: Option<Arc<Vec<Context>>>,
+        walk: Walk,
+    ) -> Self
+    where
+        Walk: FnOnce(ChangeSender) -> Walking,
+        Walking: Future<Output = Result<Summary, StateError>> + Send + 'static,
+    {
         let (sender, changes) = mpsc::channel(lookahead.get());
+        let sender = ChangeSender {
+            sender,
+            deletes,
+            exclusions,
+            listed,
+        };
         ChangeStream {
             changes,
             walk: Some(lore_spawn!(crate::subtask!(walk(sender)))),
@@ -126,33 +244,15 @@ impl<Summary: Default + Send + 'static> ChangeStream<Summary> {
     /// collecting. A caller that wants what the walk reported reads the changes with
     /// [`next`](Self::next) and then asks [`finish`](Self::finish).
     ///
-    /// The changes are gathered in chunks of [`COLLECT_CHUNK`] and moved into one list of exactly
-    /// their number once the walk ends. A list grown by doubling holds up to twice the changes'
-    /// size, and three times it while it moves to its last allocation; a tree of millions of
-    /// files makes that gigabytes.
+    /// The changes are gathered as [`ChunkedChanges`] gathers them.
     pub async fn collect(self) -> Result<Vec<NodeChange>, StateError> {
         let ChangeStream { mut changes, walk } = self;
-        let mut full_chunks: Vec<Vec<NodeChange>> = Vec::new();
-        let mut chunk = Vec::new();
+        let mut collected = ChunkedChanges::default();
         while let Some(change) = changes.recv().await {
-            if chunk.len() == COLLECT_CHUNK {
-                full_chunks.push(std::mem::replace(
-                    &mut chunk,
-                    Vec::with_capacity(COLLECT_CHUNK),
-                ));
-            }
-            chunk.push(change);
+            collected.push(change);
         }
         joined(walk).await?;
-        if full_chunks.is_empty() {
-            return Ok(chunk);
-        }
-        let mut collected = Vec::with_capacity(full_chunks.len() * COLLECT_CHUNK + chunk.len());
-        for full_chunk in full_chunks {
-            collected.extend(full_chunk);
-        }
-        collected.extend(chunk);
-        Ok(collected)
+        Ok(collected.append_to(Vec::new()))
     }
 
     /// Whether the walk finds a change `wanted` accepts, answered at the first one that does.
@@ -210,5 +310,75 @@ async fn joined<Summary: Default>(
             .internal("Diff task failed")
             .map_err(StateError::from)?,
         None => Ok(Summary::default()),
+    }
+}
+
+/// Changes gathered in chunks of [`COLLECT_CHUNK`] and moved into one list of exactly their number
+/// once all are in. A list grown by doubling holds up to twice the changes' size, and three times
+/// it while it moves to its last allocation; a tree of millions of files makes that gigabytes.
+#[derive(Default)]
+pub(crate) struct ChunkedChanges {
+    full: Vec<Vec<NodeChange>>,
+    chunk: Vec<NodeChange>,
+}
+
+impl ChunkedChanges {
+    /// Adds `change` after the ones gathered so far.
+    pub(crate) fn push(&mut self, change: NodeChange) {
+        if self.chunk.len() == COLLECT_CHUNK {
+            self.full.push(std::mem::replace(
+                &mut self.chunk,
+                Vec::with_capacity(COLLECT_CHUNK),
+            ));
+        }
+        self.chunk.push(change);
+    }
+
+    /// `before` followed by the changes gathered, in one list grown once to hold them all. A list of
+    /// one chunk or less, with nothing before it, is answered as it is. `before` grows in place,
+    /// so its allocation is the one the list ends in rather than a second copy beside it.
+    pub(crate) fn append_to(self, before: Vec<NodeChange>) -> Vec<NodeChange> {
+        let ChunkedChanges { full, chunk } = self;
+        if before.is_empty() && full.is_empty() {
+            return chunk;
+        }
+        if full.is_empty() && chunk.is_empty() {
+            return before;
+        }
+        let mut all = before;
+        all.reserve_exact(full.len() * COLLECT_CHUNK + chunk.len());
+        for full_chunk in full {
+            all.extend(full_chunk);
+        }
+        all.extend(chunk);
+        all
+    }
+}
+
+#[cfg(feature = "test-util")]
+pub mod test_util {
+    use tokio::sync::mpsc;
+
+    use super::ChangeSender;
+    use super::Deletes;
+    use super::Exclusions;
+    use crate::change::NodeChange;
+
+    impl ChangeSender {
+        /// A walk emitting every change to `sender`, a deleted directory followed by everything
+        /// below it.
+        pub fn from_sender(sender: mpsc::Sender<NodeChange>) -> Self {
+            Self {
+                sender,
+                deletes: Deletes::Each,
+                exclusions: Exclusions::Reported,
+                listed: None,
+            }
+        }
+
+        /// Waits until the caller reading the changes has stopped listening.
+        pub async fn closed(&self) {
+            self.sender.closed().await;
+        }
     }
 }

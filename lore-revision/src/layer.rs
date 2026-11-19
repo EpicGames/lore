@@ -1077,6 +1077,7 @@ pub(crate) async fn sync_in_operation(
         operation.clone(),
         changes.clone(),
         &kept,
+        None, /* No subtrees */
         None,
         dry_run,
         None, /* Not a merge */

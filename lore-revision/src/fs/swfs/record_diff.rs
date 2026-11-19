@@ -11,6 +11,7 @@ use crate::state::FilesystemDiffStats;
 use crate::state::StateError;
 use crate::state::collect_dirty_paths;
 use crate::state::diff_paths;
+use crate::state::emit;
 use crate::state::os_diff::diff_os_filesystem;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
@@ -86,11 +87,11 @@ async fn diff_from_record(
         })
         .collect();
     let mut listed = diff_paths(diff, candidates);
-    while let Some(change) = listed.next().await {
-        changes
-            .send(change)
-            .await
-            .map_err(|_closed| StateError::internal("Diff receiver dropped"))?;
+    loop {
+        let Some(change) = listed.next().await else {
+            break;
+        };
+        emit(&changes, || change).await?;
     }
     listed.finish().await
 }

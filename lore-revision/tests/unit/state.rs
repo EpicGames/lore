@@ -3119,6 +3119,355 @@ async fn a_hierarchy_is_emitted_parents_first() {
     }
 }
 
+/// Adds the file `name` under `parent`, carrying the file identity `identity`.
+async fn add_identified_file(
+    state: &State,
+    repository: Arc<RepositoryContext>,
+    parent: NodeID,
+    name: &str,
+    identity: u8,
+) -> NodeID {
+    let mut node = dirty_node(name, NodeFlags::File);
+    node.address = Address {
+        hash: Hash::hash_buffer(name.as_bytes()),
+        context: [identity; 16].into(),
+    };
+    state
+        .node_add(repository, parent, node, name)
+        .await
+        .expect("adding a file to the walked tree")
+}
+
+/// A change as its action, its path and the path a move came from.
+fn change_key(change: &lore_revision::change::NodeChange) -> (u16, String, String) {
+    (
+        change.action as u16,
+        change.path().as_str().to_string(),
+        change
+            .move_source()
+            .map_or_else(String::new, |source| source.as_str().to_string()),
+    )
+}
+
+/// A sync lists a directory deleted as a whole once, and what the listed changes and its
+/// expansion name together is what the full diff names. A file moved out of a deleted directory
+/// into an added one is listed as the move, and the expansion doesn't repeat it.
+#[tokio::test]
+async fn a_whole_directory_is_listed_once_and_expands_to_the_full_diff() {
+    let repository = null_repository().await;
+    let from = State::new();
+    let to = State::new();
+    let directory = NodeFlags::NoFlags;
+
+    for state in [&from, &to] {
+        let kept = add_dirty_node(state, repository.clone(), ROOT_NODE, "kept", directory).await;
+        add_identified_file(state, repository.clone(), kept, "same.txt", 9).await;
+    }
+    let gone = add_dirty_node(&from, repository.clone(), ROOT_NODE, "gone", directory).await;
+    add_identified_file(&from, repository.clone(), gone, "a.txt", 1).await;
+    let sub = add_dirty_node(&from, repository.clone(), gone, "sub", directory).await;
+    add_identified_file(&from, repository.clone(), sub, "b.txt", 2).await;
+    add_identified_file(&from, repository.clone(), gone, "moved.txt", 3).await;
+
+    let new = add_dirty_node(&to, repository.clone(), ROOT_NODE, "new", directory).await;
+    add_identified_file(&to, repository.clone(), new, "c.txt", 4).await;
+    let deep = add_dirty_node(&to, repository.clone(), new, "deep", directory).await;
+    add_identified_file(&to, repository.clone(), deep, "d.txt", 5).await;
+    add_identified_file(&to, repository.clone(), new, "arrived.txt", 3).await;
+
+    let walk = async move {
+        let full = diff_collect(
+            repository.clone(),
+            from.clone(),
+            repository.clone(),
+            to.clone(),
+            None,
+            FilterMode::Full,
+        )
+        .await
+        .expect("the full diff");
+        let (listed, subtrees) = diff_collect_subtrees(
+            repository.clone(),
+            from,
+            repository.clone(),
+            to,
+            FilterMode::Full,
+        )
+        .await
+        .expect("the diff listing subtrees");
+        let mut expanded = Vec::new();
+        for change in listed.iter().filter(|change| change.flags.is_subtree()) {
+            let mut expansion = subtrees.expand(change);
+            while let Some(below) = expansion.next().await {
+                expanded.push(below);
+            }
+            expansion.finish().await.expect("expanding a subtree");
+        }
+        (full, listed, expanded)
+    };
+    let (full, listed, expanded) = LORE_CONTEXT.scope(setup_test_execution(), walk).await;
+
+    let mut subtrees: Vec<_> = listed
+        .iter()
+        .filter(|change| change.flags.is_subtree())
+        .map(change_key)
+        .collect();
+    subtrees.sort();
+    assert_eq!(
+        subtrees,
+        vec![(FileAction::Delete as u16, "gone".to_string(), String::new())],
+        "a directory deleted as a whole is one subtree change, and one added isn't"
+    );
+    assert!(
+        listed.iter().any(|change| change_key(change)
+            == (
+                FileAction::Move as u16,
+                "new/arrived.txt".to_string(),
+                "gone/moved.txt".to_string()
+            )),
+        "the move between the two subtrees is listed: {listed:?}"
+    );
+    assert_eq!(
+        listed.len(),
+        6,
+        "the added directory is listed file by file, and nothing else is: {listed:?}"
+    );
+
+    let mut together: Vec<_> = listed.iter().chain(&expanded).map(change_key).collect();
+    together.sort();
+    let mut wanted: Vec<_> = full.iter().map(change_key).collect();
+    wanted.sort();
+    assert_eq!(
+        together, wanted,
+        "the listed changes and their expansions are the full diff"
+    );
+}
+
+/// Two files below a deleted directory sharing a file identity with an add are both listed, one
+/// as the move and the other as a delete of its own, and the expansion repeats neither.
+#[tokio::test]
+async fn files_of_a_deleted_directory_sharing_an_identity_with_an_add_are_listed_once() {
+    let repository = null_repository().await;
+    let from = State::new();
+    let to = State::new();
+    let directory = NodeFlags::NoFlags;
+
+    let twin = async |state: &State, parent: NodeID, name: &str| {
+        let mut node = crate::repository::test_helpers::file_node(b"twin");
+        node.name_hash = lore_storage::hash::hash_string(name);
+        node.address.context = [7; 16].into();
+        state
+            .node_add(repository.clone(), parent, node, name)
+            .await
+            .expect("adding a twin");
+    };
+    let new = add_dirty_node(&to, repository.clone(), ROOT_NODE, "new", directory).await;
+    twin(&to, new, "arrived.txt").await;
+    let gone = add_dirty_node(&from, repository.clone(), ROOT_NODE, "gone", directory).await;
+    twin(&from, gone, "one.txt").await;
+    twin(&from, gone, "two.txt").await;
+    add_identified_file(&from, repository.clone(), gone, "other.txt", 8).await;
+
+    let walk = async move {
+        let full = diff_collect(
+            repository.clone(),
+            from.clone(),
+            repository.clone(),
+            to.clone(),
+            None,
+            FilterMode::Full,
+        )
+        .await
+        .expect("the full diff");
+        let (listed, subtrees) = diff_collect_subtrees(
+            repository.clone(),
+            from,
+            repository.clone(),
+            to,
+            FilterMode::Full,
+        )
+        .await
+        .expect("the diff listing subtrees");
+        let mut expanded = Vec::new();
+        for change in listed.iter().filter(|change| change.flags.is_subtree()) {
+            let mut expansion = subtrees.expand(change);
+            while let Some(below) = expansion.next().await {
+                expanded.push(below);
+            }
+            expansion.finish().await.expect("expanding a subtree");
+        }
+        (full, listed, expanded)
+    };
+    let (full, listed, expanded) = LORE_CONTEXT.scope(setup_test_execution(), walk).await;
+
+    let expanded_paths: Vec<_> = expanded
+        .iter()
+        .map(|change| change.path().as_str().to_string())
+        .collect();
+    assert_eq!(
+        expanded_paths,
+        vec!["gone/other.txt".to_string()],
+        "the expansion holds only the file no add shares an identity with"
+    );
+    let mut together: Vec<_> = listed.iter().chain(&expanded).map(change_key).collect();
+    together.sort();
+    let mut wanted: Vec<_> = full.iter().map(change_key).collect();
+    wanted.sort();
+    assert_eq!(
+        together, wanted,
+        "the listed changes and the expansion are the full diff"
+    );
+}
+
+/// A directory moved to another parent is a deleted directory whose every file is listed as the
+/// move to its new place, and the expansion holds only the directories the moves leave behind.
+#[tokio::test]
+async fn a_directory_moved_to_another_parent_lists_each_file_as_a_move_once() {
+    let repository = null_repository().await;
+    let from = State::new();
+    let to = State::new();
+    let directory = NodeFlags::NoFlags;
+
+    let gone = add_dirty_node(&from, repository.clone(), ROOT_NODE, "gone", directory).await;
+    let gone_inner = add_dirty_node(&from, repository.clone(), gone, "inner", directory).await;
+    let new = add_dirty_node(&to, repository.clone(), ROOT_NODE, "new", directory).await;
+    let moved = add_dirty_node(&to, repository.clone(), new, "moved", directory).await;
+    let moved_inner = add_dirty_node(&to, repository.clone(), moved, "inner", directory).await;
+    let mut files = 0;
+    for identity in 10..50u8 {
+        let name = format!("{identity}.txt");
+        add_identified_file(&from, repository.clone(), gone, &name, identity).await;
+        add_identified_file(&to, repository.clone(), moved, &name, identity).await;
+        files += 1;
+    }
+    for identity in 100..110u8 {
+        let name = format!("{identity}.txt");
+        add_identified_file(&from, repository.clone(), gone_inner, &name, identity).await;
+        add_identified_file(&to, repository.clone(), moved_inner, &name, identity).await;
+        files += 1;
+    }
+
+    let walk = async move {
+        let full = diff_collect(
+            repository.clone(),
+            from.clone(),
+            repository.clone(),
+            to.clone(),
+            None,
+            FilterMode::Full,
+        )
+        .await
+        .expect("the full diff");
+        let (listed, subtrees) = diff_collect_subtrees(
+            repository.clone(),
+            from,
+            repository.clone(),
+            to,
+            FilterMode::Full,
+        )
+        .await
+        .expect("the diff listing subtrees");
+        let mut expanded = Vec::new();
+        for change in listed.iter().filter(|change| change.flags.is_subtree()) {
+            let mut expansion = subtrees.expand(change);
+            while let Some(below) = expansion.next().await {
+                expanded.push(below);
+            }
+            expansion.finish().await.expect("expanding a subtree");
+        }
+        (full, listed, expanded)
+    };
+    let (full, listed, expanded) = LORE_CONTEXT.scope(setup_test_execution(), walk).await;
+
+    let subtree_paths: Vec<_> = listed
+        .iter()
+        .filter(|change| change.flags.is_subtree())
+        .map(|change| change.path().as_str().to_string())
+        .collect();
+    assert_eq!(subtree_paths, vec!["gone".to_string()]);
+    let moves: Vec<_> = listed
+        .iter()
+        .filter(|change| change.action == FileAction::Move)
+        .map(change_key)
+        .collect();
+    assert_eq!(moves.len(), files, "each file is one move: {listed:?}");
+    assert!(
+        moves.iter().all(|(_, path, source)| {
+            source.starts_with("gone/")
+                && path.strip_prefix("new/moved/") == source.strip_prefix("gone/")
+        }),
+        "each move carries a file to the same place in the moved directory: {moves:?}"
+    );
+    let mut expanded_paths: Vec<_> = expanded
+        .iter()
+        .map(|change| change.path().as_str().to_string())
+        .collect();
+    expanded_paths.sort();
+    assert_eq!(
+        expanded_paths,
+        vec!["gone/inner".to_string()],
+        "the expansion repeats no file the moves list"
+    );
+    let mut together: Vec<_> = listed.iter().chain(&expanded).map(change_key).collect();
+    together.sort();
+    let mut wanted: Vec<_> = full.iter().map(change_key).collect();
+    wanted.sort();
+    assert_eq!(
+        together, wanted,
+        "the listed changes and the expansion are the full diff"
+    );
+}
+
+/// Expanding a level of a deleted directory yields the nodes directly below it, a directory among
+/// them as a subtree change of its own, and nothing below that.
+#[tokio::test]
+async fn a_level_of_a_deleted_directory_holds_its_children_alone() {
+    let repository = null_repository().await;
+    let from = State::new();
+    let to = State::new();
+    let directory = NodeFlags::NoFlags;
+
+    let gone = add_dirty_node(&from, repository.clone(), ROOT_NODE, "gone", directory).await;
+    add_identified_file(&from, repository.clone(), gone, "a.txt", 1).await;
+    let sub = add_dirty_node(&from, repository.clone(), gone, "sub", directory).await;
+    add_identified_file(&from, repository.clone(), sub, "b.txt", 2).await;
+
+    let walk = async move {
+        let (listed, subtrees) = diff_collect_subtrees(
+            repository.clone(),
+            from,
+            repository.clone(),
+            to,
+            FilterMode::Full,
+        )
+        .await
+        .expect("the diff listing subtrees");
+        let gone = listed
+            .iter()
+            .find(|change| change.flags.is_subtree())
+            .expect("the deleted directory is a subtree change");
+        let mut level = subtrees.expand_level(gone);
+        let mut below = Vec::new();
+        while let Some(change) = level.next().await {
+            below.push((
+                change.path().as_str().to_string(),
+                change.flags.is_subtree(),
+            ));
+        }
+        level.finish().await.expect("expanding a level");
+        below
+    };
+    let mut below = LORE_CONTEXT.scope(setup_test_execution(), walk).await;
+    below.sort();
+    assert_eq!(
+        below,
+        vec![
+            ("gone/a.txt".to_string(), false),
+            ("gone/sub".to_string(), true),
+        ]
+    );
+}
+
 /// A child whose stored name the read path refuses, written before a rule refused it, is left
 /// out of a directory added or deleted as a whole, as a listing leaves it out, and its siblings
 /// are emitted.
@@ -3893,6 +4242,259 @@ async fn walk_children_restarts_past_a_child_moved_away() {
         .expect("the walk must restart, not fail");
     assert_eq!(visited, vec![a]);
     assert!(walked.may_repeat, "a restarted walk may repeat");
+}
+
+/// Realizes the sync from `from` to `to` over the working tree `repository` reads, listing a
+/// directory deleted as a whole as one change, without verifying it first.
+async fn realize_with_subtrees(
+    repository: Arc<RepositoryContext>,
+    from: Arc<State>,
+    to: Arc<State>,
+) -> Result<(), lore_revision::revision::sync::SyncError> {
+    let (changes, subtrees) = diff_collect_subtrees(
+        repository.clone(),
+        from,
+        repository.clone(),
+        to,
+        FilterMode::Full,
+    )
+    .await
+    .expect("the diff listing subtrees");
+    let operation = repository
+        .file_system()
+        .begin_operation()
+        .await
+        .expect("an operation over the working tree");
+    lore_revision::fs::realize::realize_changes(
+        repository,
+        operation,
+        Arc::new(changes),
+        &[],
+        Some(subtrees),
+        None,
+        false,
+        None, /* Not a merge */
+        Arc::default(),
+    )
+    .await
+}
+
+/// Of two files below a deleted directory sharing a file identity with an add, the delete phase
+/// removes the one no move pairs with the add, though the expansion skips it as listed on its own,
+/// and leaves the move's source and the directory holding it for the move.
+#[tokio::test]
+#[allow(clippy::disallowed_methods)] // Test fixture writes; not subject to repository write-token discipline.
+async fn a_listed_file_below_a_deleted_directory_that_no_move_pairs_is_deleted() {
+    let temp = lore_base::test_util::TempDir::new("lore-unpaired-claimed-delete-");
+    let repository = crate::repository::test_helpers::working_tree_repository(temp.path()).await;
+    let from = State::new();
+    let to = State::new();
+    let directory = NodeFlags::NoFlags;
+    let new = add_dirty_node(&to, repository.clone(), ROOT_NODE, "new", directory).await;
+    add_identified_file(&to, repository.clone(), new, "arrived.txt", 7).await;
+    let gone = add_dirty_node(&from, repository.clone(), ROOT_NODE, "gone", directory).await;
+    add_identified_file(&from, repository.clone(), gone, "one.txt", 7).await;
+    add_identified_file(&from, repository.clone(), gone, "two.txt", 7).await;
+    std::fs::create_dir_all(temp.child("gone")).expect("create the directory");
+    for name in ["one.txt", "two.txt"] {
+        std::fs::write(temp.child("gone").join(name), b"twin").expect("write a twin");
+    }
+
+    let deletes = async {
+        let (changes, subtrees) = diff_collect_subtrees(
+            repository.clone(),
+            from,
+            repository.clone(),
+            to,
+            FilterMode::Full,
+        )
+        .await
+        .expect("the diff listing subtrees");
+        let source = changes
+            .iter()
+            .find_map(|change| {
+                change
+                    .move_source()
+                    .map(|source| source.as_str().to_string())
+            })
+            .expect("one twin is the move");
+        let context = Arc::new(lore_revision::fs::realize::DeleteContext {
+            repository: repository.clone(),
+            operation: repository
+                .file_system()
+                .begin_operation()
+                .await
+                .expect("an operation over the working tree"),
+            state_stage: None,
+            dry_run: false,
+            merge_current: None,
+            stats: Arc::default(),
+        });
+        let deleted = lore_revision::fs::realize::realize_changes_delete(
+            &context,
+            &changes,
+            &[],
+            Some(&subtrees),
+        )
+        .await;
+        (source, deleted)
+    };
+    let (source, deleted) = LORE_CONTEXT.scope(setup_test_execution(), deletes).await;
+
+    let kept = deleted.expect("the deletes");
+    let unpaired = if source == "gone/one.txt" {
+        "gone/two.txt"
+    } else {
+        "gone/one.txt"
+    };
+    assert!(
+        !temp.child(unpaired).exists(),
+        "the twin no move pairs is deleted"
+    );
+    assert!(
+        temp.child(&source).exists(),
+        "the move's source stays for the move"
+    );
+    assert_eq!(
+        kept.iter()
+            .map(|change| change.path().as_str().to_string())
+            .collect::<Vec<_>>(),
+        vec!["gone".to_string()],
+        "the directory holding the move's source is kept for the move"
+    );
+}
+
+/// A revision of `repository` tracking `files` and the directories leading to them, stored, which
+/// a link can pin.
+async fn linked_revision(repository: &Arc<RepositoryContext>, files: &[&str]) -> Hash {
+    let linked = State::new();
+    let mut directories: std::collections::HashMap<String, NodeID> =
+        std::collections::HashMap::new();
+    for file in files {
+        let (parents, name) = file.rsplit_once('/').unwrap_or(("", file));
+        let mut parent = ROOT_NODE;
+        let mut walked = String::new();
+        for directory in parents.split('/').filter(|part| !part.is_empty()) {
+            walked.push_str(directory);
+            walked.push('/');
+            if let Some(&node) = directories.get(&walked) {
+                parent = node;
+                continue;
+            }
+            parent = add_dirty_node(
+                &linked,
+                repository.clone(),
+                parent,
+                directory,
+                NodeFlags::NoFlags,
+            )
+            .await;
+            directories.insert(walked.clone(), parent);
+        }
+        add_dirty_node(&linked, repository.clone(), parent, name, NodeFlags::File).await;
+    }
+    linked.set_revision_number(1);
+    let token = repository
+        .try_write_token()
+        .expect("a working tree repository carries a write token");
+    linked
+        .serialize(repository.clone(), token)
+        .await
+        .expect("storing the linked revision")
+}
+
+/// Realizes the delete of `gone/sub/mounted`, a link below the directory `gone` deleted as a
+/// whole, over a working tree holding `files` below the mount. Where `opens`, the link pins a
+/// revision of the repository tracking `files`, mounted at its root; otherwise its revision cannot
+/// be opened.
+#[allow(clippy::disallowed_methods)] // Test fixture writes; not subject to repository write-token discipline.
+async fn realize_link_below_deleted_directory(
+    temp: &lore_base::test_util::TempDir,
+    files: &[&str],
+    opens: bool,
+) {
+    let repository = crate::repository::test_helpers::working_tree_repository(temp.path()).await;
+    let from = State::new();
+    let to = State::new();
+    let gone = add_dirty_node(
+        &from,
+        repository.clone(),
+        ROOT_NODE,
+        "gone",
+        NodeFlags::NoFlags,
+    )
+    .await;
+    let sub = add_dirty_node(&from, repository.clone(), gone, "sub", NodeFlags::NoFlags).await;
+    let mut link = dirty_node("mounted", NodeFlags::Link);
+    if opens {
+        link.address = Address {
+            hash: linked_revision(&repository, files).await,
+            context: repository.id.into(),
+        };
+    }
+    from.node_add(repository.clone(), sub, link, "mounted")
+        .await
+        .expect("adding the link");
+    std::fs::create_dir_all(temp.child("gone/sub/mounted")).expect("create the mount");
+    for file in files {
+        let path = temp.child("gone/sub/mounted").join(file);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("create its directory");
+        std::fs::write(path, b"linked").expect("write a file in the mount");
+    }
+
+    LORE_CONTEXT
+        .scope(
+            setup_test_execution(),
+            realize_with_subtrees(repository, from, to),
+        )
+        .await
+        .expect("the realize");
+}
+
+/// An empty mount of a link below a deleted directory goes, and the directories above it with it.
+#[tokio::test]
+async fn a_link_below_a_deleted_directory_goes_with_its_mount() {
+    let temp = lore_base::test_util::TempDir::new("lore-link-below-deleted-");
+
+    realize_link_below_deleted_directory(&temp, &[], false).await;
+
+    assert!(
+        !temp.child("gone").exists(),
+        "the mount and the directories above it are gone"
+    );
+}
+
+/// The mount of a link below a deleted directory whose revision opens goes with every file and
+/// directory the link tracks there, and the directories above it with it.
+#[tokio::test]
+async fn a_link_below_a_deleted_directory_goes_with_all_its_mount_tracks() {
+    let temp = lore_base::test_util::TempDir::new("lore-link-below-deleted-");
+
+    realize_link_below_deleted_directory(
+        &temp,
+        &["inner/file.txt", "inner/deeper/other.txt"],
+        true,
+    )
+    .await;
+
+    assert!(
+        !temp.child("gone").exists(),
+        "the mount, what it held, and the directories above it are gone"
+    );
+}
+
+/// The mount of a link below a deleted directory whose revision cannot be opened keeps what it
+/// holds, as removing the mount of any such link does, and so do the directories leading to it.
+#[tokio::test]
+async fn a_link_below_a_deleted_directory_keeps_what_an_unopened_mount_holds() {
+    let temp = lore_base::test_util::TempDir::new("lore-link-below-deleted-");
+
+    realize_link_below_deleted_directory(&temp, &["inner/file.txt"], false).await;
+
+    assert!(
+        temp.child("gone/sub/mounted/inner/file.txt").exists(),
+        "the file the mount holds stays"
+    );
 }
 
 #[tokio::test]

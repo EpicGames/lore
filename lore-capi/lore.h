@@ -1000,7 +1000,7 @@ typedef struct lore_revision_sync_progress_event_data_t {
   uintptr_t file_update_total;
   // Number of files deleted so far.
   uintptr_t file_delete;
-  // Total number of files to delete.
+  // Total number of files to delete, which can grow while a sync runs.
   uintptr_t file_delete_total;
   // Number of files merged automatically so far.
   uintptr_t file_automerge;

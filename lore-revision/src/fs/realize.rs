@@ -21,6 +21,7 @@ use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::branch::merge::MergeType;
 use crate::change;
 use crate::change::NodeChange;
+use crate::change::NodeChangeState;
 use crate::dependency;
 use crate::errors::LocalModifications;
 use crate::errors::WriteRequired;
@@ -83,6 +84,7 @@ use crate::state::os_diff::types_agree;
 use crate::util;
 use crate::util::path::RelativePath;
 use crate::util::path::expand_path_ancestors;
+use crate::util::path::sorted_holds_below;
 
 /// Carries the working tree from `state_current` to `state_target`. A provider that holds its
 /// state in a `State` is handed `state_target` alone and carries itself there
@@ -184,22 +186,23 @@ pub async fn realize_state(
     };
 
     let stats: Arc<SyncRealizeStats> = Arc::default();
+    let mut subtrees = None;
     let changes = if !options.reset {
         lore_info!(
             "Calculating deltas {} -> {}",
             state_current.revision_number(),
             state_target.revision_number()
         );
-        state::diff_collect(
+        let (changes, expansion) = diff_for_sync(
             repository_current.clone(),
             state_current.clone(),
             repository_target.clone(),
             state_target.clone(),
-            None, /* No subpath */
-            options.filter_mode,
+            &options,
         )
-        .await
-        .forward::<SyncError>("Failed to calculate delta changes between states")?
+        .await?;
+        subtrees = expansion;
+        changes
     } else {
         lore_info!(
             "Calculating deltas from filesystem -> {}",
@@ -284,7 +287,18 @@ pub async fn realize_state(
     let options = Arc::new(options);
     let changes = Arc::new(changes);
     let VerifiedChanges { changes, kept } = if !changes.is_empty() && !force && !options.reset {
-        lore_info!("Verifying {} changes with local file system", changes.len());
+        let whole = changes
+            .iter()
+            .filter(|change| change.flags.is_subtree())
+            .count();
+        if whole == 0 {
+            lore_info!("Verifying {} changes with local file system", changes.len());
+        } else {
+            lore_info!(
+                "Verifying {} changes with local file system, {whole} of them directories deleted as a whole",
+                changes.len()
+            );
+        }
         // The list is moved in, so verification can filter it in place and the realize step never
         // holds a second list of the same millions of changes.
         verify_filesystem_for_changes(Arc::new(SyncVerifyArgs {
@@ -316,6 +330,7 @@ pub async fn realize_state(
         operation,
         changes,
         &kept,
+        subtrees,
         None,
         dry_run,
         None, /* Not a merge */
@@ -333,6 +348,45 @@ pub async fn realize_state(
     Ok(())
 }
 
+/// The changes a sync from `state_current` to `state_target` realizes, and the
+/// [`Subtrees`](state::Subtrees) that expand those standing for a directory deleted as a whole.
+///
+/// Such a directory is one change, expanded as verification and realization get to it, so a sync
+/// deleting millions of files doesn't hold a change for each. Where the changes are taken one by
+/// one, by a dependency set, by keeping local work file by file or by hashing every file, each is
+/// listed.
+async fn diff_for_sync(
+    repository_current: Arc<RepositoryContext>,
+    state_current: Arc<State>,
+    repository_target: Arc<RepositoryContext>,
+    state_target: Arc<State>,
+    options: &SyncOptions,
+) -> Result<(Vec<NodeChange>, Option<Arc<state::Subtrees>>), SyncError> {
+    if options.root_files.is_empty() && !options.forward_changes && !options.force_hash_check {
+        let (changes, subtrees) = state::diff_collect_subtrees(
+            repository_current,
+            state_current,
+            repository_target,
+            state_target,
+            options.filter_mode,
+        )
+        .await
+        .forward::<SyncError>("Failed to calculate delta changes between states")?;
+        return Ok((changes, Some(subtrees)));
+    }
+    let changes = state::diff_collect(
+        repository_current,
+        state_current,
+        repository_target,
+        state_target,
+        None, /* No subpath */
+        options.filter_mode,
+    )
+    .await
+    .forward::<SyncError>("Failed to calculate delta changes between states")?;
+    Ok((changes, None))
+}
+
 /// The changes a verify leaves to realize, and the files a link delete among them keeps.
 pub struct VerifiedChanges {
     /// The changes still having work to do, sorted by path.
@@ -343,7 +397,7 @@ pub struct VerifiedChanges {
     pub kept: Vec<RelativePath>,
 }
 
-/// Verifies the changes `args` holds against the working copy, each as [`verify_filesystem`]
+/// Verifies the changes `args` holds against the working tree, each as [`verify_filesystem`]
 /// does, and answers those still having work to do.
 ///
 /// Where [`SyncVerifyArgs::carries_modes`] is set, gives each file found holding the incoming
@@ -363,6 +417,7 @@ pub fn verify_filesystem_for_changes(
         let mut tasks = JoinSet::new();
         let mut verdicts = vec![(Verdict::Drop, change::Flags::None); args.changes.len()];
         let stats = Arc::new(SyncVerifyStats::default());
+        let refuse = stats.clone();
         let incoming = Arc::new(IncomingChanges::new(args.changes.clone()));
         let record = |verdicts: &mut Vec<(Verdict, change::Flags)>,
                       failure: &mut Option<SyncError>,
@@ -376,7 +431,7 @@ pub fn verify_filesystem_for_changes(
                 .flatten()
             {
                 Ok((index, verdict, flags)) => verdicts[index] = (verdict, flags),
-                Err(err) => *failure = failure.take().or(Some(err)),
+                Err(err) => record_verify_failure(&refuse, failure, err),
             }
         };
         for (index, change) in args.changes.iter().enumerate() {
@@ -2027,10 +2082,120 @@ async fn remove_directory_of_case_variants<C: Borrow<NodeChange>>(
     directory: &RelativePath,
     changes: &[C],
 ) -> bool {
+    let mut folded = files_directly_in(directory, changes);
+    if folded.is_empty() {
+        return false;
+    }
+    folded.sort_unstable_by_key(|(name_hash, _)| *name_hash);
+    remove_case_variants(operation, directory, &folded).await
+}
+
+/// [`remove_directory_of_case_variants`] for the directory the subtree change `change` deletes,
+/// whose files are the tree's level below it and the files of `listed`, sorted by path, directly in
+/// it.
+///
+/// The level is walked for the hashes of its files' names first, 8 bytes each, and the directory
+/// is listed only where one of those or of `listed` names a file: a directory whose files all move
+/// elsewhere costs no listing. The level is walked again, holding its changes, only where the
+/// listing holds a file one of them folds to.
+async fn remove_subtree_directory_of_case_variants(
+    operation: &InstanceOperationImpl,
+    change: &NodeChange,
+    subtrees: &Arc<state::Subtrees>,
+    listed: &[NodeChange],
+) -> bool {
+    let directory = change.path();
+    let listed = files_directly_in(directory, listed);
+    let mut deleted = Vec::new();
+    if !walk_level_files(subtrees, change, |name_hash, _| deleted.push(name_hash)).await {
+        return false;
+    }
+    deleted.extend(listed.iter().map(|(name_hash, _)| *name_hash));
+    if deleted.is_empty() {
+        return false;
+    }
+    deleted.sort_unstable();
+    let Some(mut on_disk) = list_files(operation, directory, |entry| {
+        deleted
+            .binary_search(&entry.name_hash)
+            .ok()
+            .map(|_| entry.name_hash)
+    })
+    .await
+    else {
+        return false;
+    };
+    if on_disk.is_empty() {
+        return false;
+    }
+    on_disk.sort_unstable();
+    let folds = |name_hash: &u64| on_disk.binary_search(name_hash).is_ok();
+    let mut below = Vec::new();
+    if !walk_level_files(subtrees, change, |name_hash, child| {
+        if folds(&name_hash) {
+            below.push((name_hash, child));
+        }
+    })
+    .await
+    {
+        return false;
+    }
+    let mut folded: Vec<(u64, &NodeChange)> = below
+        .iter()
+        .map(|(name_hash, child)| (*name_hash, child))
+        .chain(listed.into_iter().filter(|(name_hash, _)| folds(name_hash)))
+        .collect();
+    folded.sort_unstable_by_key(|(name_hash, _)| *name_hash);
+    remove_case_variants(operation, directory, &folded).await
+}
+
+/// Hands `found` each file of the tree's level below the subtree change `change`, with the hash of
+/// its name, but for the ones listed on their own, and answers whether the walk completed.
+async fn walk_level_files(
+    subtrees: &Arc<state::Subtrees>,
+    change: &NodeChange,
+    mut found: impl FnMut(u64, NodeChange),
+) -> bool {
+    let mut level = subtrees.expand_level(change);
+    loop {
+        let Some(child) = level.next().await else {
+            break;
+        };
+        if child.from.flags.contains(NodeFlags::File)
+            && let Some(name_hash) = child
+                .from
+                .mapping
+                .path
+                .as_str()
+                .rsplit('/')
+                .next()
+                .map(hash::hash_string)
+        {
+            found(name_hash, child);
+        }
+    }
+    match level.finish().await {
+        Ok(()) => true,
+        Err(err) => {
+            lore_warn!(
+                "Keeping {}: the tree below it could not be walked: {err}",
+                change.path()
+            );
+            false
+        }
+    }
+}
+
+/// The files that the changes of `changes`, sorted by the path each starts from, delete or move
+/// away directly in `directory`, each with the hash of its name.
+fn files_directly_in<'a, C: Borrow<NodeChange>>(
+    directory: &RelativePath,
+    changes: &'a [C],
+) -> Vec<(u64, &'a NodeChange)> {
     let prefix = format!("{directory}/");
     let first = changes
         .partition_point(|change| change.borrow().from.mapping.path.as_str() < prefix.as_str());
-    let mut folded: Vec<(u64, &NodeChange)> = changes[first..]
+    changes[first..]
         .iter()
         .map(Borrow::borrow)
         .map_while(|change| {
@@ -2041,23 +2206,48 @@ async fn remove_directory_of_case_variants<C: Borrow<NodeChange>>(
         })
         .filter(|(change, name)| !name.contains('/') && change.from.flags.contains(NodeFlags::File))
         .map(|(change, name)| (hash::hash_string(name), change))
-        .collect();
-    if folded.is_empty() {
-        return false;
-    }
-    folded.sort_unstable_by_key(|(name_hash, _)| *name_hash);
-    let Ok(mut listing) = operation.read_directory(directory).await else {
-        return false;
-    };
-    let mut variants = Vec::new();
+        .collect()
+}
+
+/// What `take` keeps of each file `directory` holds, drained from its listing, or `None` where it
+/// can't be listed.
+async fn list_files<T>(
+    operation: &InstanceOperationImpl,
+    directory: &RelativePath,
+    mut take: impl FnMut(crate::fs::filesystem_provider::DirectoryEntry) -> Option<T>,
+) -> Option<Vec<T>> {
+    let mut listing = operation.read_directory(directory).await.ok()?;
+    let mut kept = Vec::new();
     while let Some(entry) = listing.next().await {
         if let Ok(entry) = entry
             && entry.info.is_file()
-            && let Ok(found) = folded.binary_search_by_key(&entry.name_hash, |(hash, _)| *hash)
+            && let Some(taken) = take(entry)
         {
-            variants.push((entry.name, entry.info.size(), folded[found].1));
+            kept.push(taken);
         }
     }
+    Some(kept)
+}
+
+/// Removes each file `directory` holds that folds to a change in `folded`, sorted by name hash, and
+/// holds the content the change starts from or the content its move carries, and then `directory`,
+/// answering whether it removed the directory. Of the listing, only the files that fold to a change
+/// are kept.
+async fn remove_case_variants(
+    operation: &InstanceOperationImpl,
+    directory: &RelativePath,
+    folded: &[(u64, &NodeChange)],
+) -> bool {
+    let Some(variants) = list_files(operation, directory, |entry| {
+        let found = folded
+            .binary_search_by_key(&entry.name_hash, |(hash, _)| *hash)
+            .ok()?;
+        Some((entry.name, entry.info.size(), folded[found].1))
+    })
+    .await
+    else {
+        return false;
+    };
     let mut removed = false;
     for (name, size, change) in &variants {
         let path = directory.join(name);
@@ -2255,6 +2445,21 @@ fn rename_paired_spelling<'a>(
     }
 }
 
+/// Holds on to the first failure of a verification in `failure`, and marks `stats` refused where `err`
+/// refuses the sync for local modifications, so a check of a deleted directory still running stops at
+/// the next difference it finds.
+#[lore_macro::test_pub]
+pub(crate) fn record_verify_failure(
+    stats: &SyncVerifyStats,
+    failure: &mut Option<SyncError>,
+    err: SyncError,
+) {
+    if err.is_local_modifications() {
+        stats.refused.store(true, Ordering::Relaxed);
+    }
+    *failure = failure.take().or(Some(err));
+}
+
 /// Whether the file of `size` bytes at `path` holds the content `change`, a move, carries.
 async fn holds_the_carried_content(
     operation: &InstanceOperationImpl,
@@ -2286,12 +2491,12 @@ pub enum Verdict {
     CarryMode,
 }
 
-/// Checks `change` against the working copy, refusing the ones that would overwrite local work
+/// Checks `change` against the working tree, refusing the ones that would overwrite local work
 /// and settling on it what realizing it has to know, and answers what is left to do with it.
 ///
 /// A caller that realizes every change it verified, which a merge does to build the staged state
 /// out of them, takes the change as this leaves it and disregards the answer, and says so in
-/// `realizes_every_change`. One that realizes only what the working copy still needs, which a
+/// `realizes_every_change`. One that realizes only what the working tree still needs, which a
 /// sync does, acts on the answer. This changes no executable bit: [`verify_filesystem_for_changes`]
 /// carries the bits it answers [`Verdict::CarryMode`] for once every change has passed, where its
 /// caller asks for it ([`SyncVerifyArgs::carries_modes`]), and a caller realizing every change
@@ -2640,7 +2845,14 @@ pub async fn verify_filesystem(
                 "Failed to calculate delta changes between file system and target state",
             )?;
             let mut has_modified_file = false;
-            while let Some(subchange) = directory_changes.next().await {
+            loop {
+                let Some(subchange) = directory_changes.next().await else {
+                    break;
+                };
+                if stats.refused.load(Ordering::Relaxed) {
+                    directory_changes.abandon().await;
+                    return Err(LocalModifications.into());
+                }
                 let incoming = (!has_modified_file).then_some(incoming);
                 if !holds_local_work(&operation, &subchange, incoming).await? {
                     lore_trace!(
@@ -2650,7 +2862,6 @@ pub async fn verify_filesystem(
                     continue;
                 }
 
-                let file_info = operation.file_info(subchange.path()).await.ok();
                 if !has_modified_file {
                     lore_error!(
                         "Deleted directory has modified files in file system: {}",
@@ -2658,40 +2869,7 @@ pub async fn verify_filesystem(
                     );
                 }
                 has_modified_file = true;
-
-                let from_node = subchange.from.get_node().await;
-                if let Some(file_info) = file_info {
-                    if file_info.is_dir() {
-                        lore_info!(
-                            "  {} {}/",
-                            subchange.action.as_string_short(),
-                            subchange.path()
-                        );
-                    } else {
-                        lore_info!(
-                            "  {} {} : size {} mtime {}",
-                            subchange.action.as_string_short(),
-                            subchange.path(),
-                            file_info.size(),
-                            file_info.mtime()
-                        );
-                    }
-                } else {
-                    lore_info!("  Failed to get local file info");
-                }
-
-                if subchange.from.mapping.node.is_valid_node_id() {
-                    if let Ok(node) = from_node {
-                        lore_info!(
-                            "  Revision state   : mode {:o} size {} hash {}",
-                            node.mode,
-                            node.size,
-                            node.address.hash,
-                        );
-                    } else {
-                        lore_info!("  Revision state node block deserialize failed");
-                    }
-                }
+                Box::pin(report_local_work(&operation, &subchange)).await;
             }
             directory_changes.finish().await.forward::<SyncError>(
                 "Failed to calculate delta changes between file system and target state",
@@ -2747,7 +2925,8 @@ impl MergeCurrent {
 
 /// Realizes `changes` in the working tree, deletes first, and stages them in `state_stage` where
 /// given. A link delete removes its mount but for the files `kept` names below it
-/// ([`VerifiedChanges::kept`]).
+/// ([`VerifiedChanges::kept`]). `subtrees` expands the subtree changes `changes` holds; a subtree
+/// change without `subtrees`, or beside a `state_stage`, is refused.
 ///
 /// `merge_current` is, for a merge, what the working tree stands on, as a merge's changes start
 /// from its base; it is `None` for changes that start from the revision the working tree stands
@@ -2757,18 +2936,27 @@ impl MergeCurrent {
 /// directory's whole move, as staging inside it does.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
 #[allow(clippy::manual_async_fn, clippy::too_many_arguments)]
-pub fn realize_changes<'a>(
+pub(crate) fn realize_changes<'a>(
     repository: Arc<RepositoryContext>,
     operation: Arc<InstanceOperationImpl>,
     changes: Arc<Vec<NodeChange>>,
     kept: &'a [RelativePath],
+    subtrees: Option<Arc<state::Subtrees>>,
     state_stage: Option<Arc<State>>,
     dry_run: bool,
     merge_current: Option<MergeCurrent>,
     stats: Arc<SyncRealizeStats>,
 ) -> impl Future<Output = Result<(), SyncError>> + 'a {
     async move {
+        if (subtrees.is_none() || state_stage.is_some())
+            && changes.iter().any(|change| change.flags.is_subtree())
+        {
+            return Err(SyncError::internal(
+                "A subtree change to realize without the subtrees expanding it, or with a staged state",
+            ));
+        }
         let ticker = progress_ticker(stats.clone());
         let is_merge = merge_current.is_some();
 
@@ -2785,17 +2973,16 @@ pub fn realize_changes<'a>(
             .store(file_delete_total, Ordering::Relaxed);
 
         // First perform all deletes in case of delete-add for going from/to file & directory
-        let kept_directories = realize_changes_delete(
-            repository.clone(),
-            operation.clone(),
-            changes.clone(),
-            kept,
-            state_stage.clone(),
+        let delete_context = Arc::new(DeleteContext {
+            repository: repository.clone(),
+            operation: operation.clone(),
+            state_stage: state_stage.clone(),
             dry_run,
-            merge_current.as_ref(),
-            stats.clone(),
-        )
-        .await?;
+            merge_current: merge_current.clone(),
+            stats: stats.clone(),
+        });
+        let kept_directories =
+            realize_changes_delete(&delete_context, &changes, kept, subtrees.as_ref()).await?;
         lore_debug!("Deleted paths realized");
 
         if let Some(state_stage) = state_stage.as_ref() {
@@ -2890,19 +3077,17 @@ async fn remove_directories_moved_out_of(
             .cmp(b.from.mapping.path.as_str())
     });
     for change in kept {
-        let prefix = format!("{}/", change.path());
-        let first =
-            moves.partition_point(|moved| moved.from.mapping.path.as_str() < prefix.as_str());
-        if moves
-            .get(first)
-            .is_some_and(|moved| moved.from.mapping.path.as_str().starts_with(&prefix))
-            && (operation.remove(change.path()).await.is_ok()
-                || Box::pin(remove_directory_of_case_variants(
-                    operation,
-                    change.path(),
-                    &moves,
-                ))
-                .await)
+        if sorted_holds_below(
+            &moves,
+            |moved| moved.from.mapping.path.as_str(),
+            change.path(),
+        ) && (operation.remove(change.path()).await.is_ok()
+            || Box::pin(remove_directory_of_case_variants(
+                operation,
+                change.path(),
+                &moves,
+            ))
+            .await)
         {
             event::LoreEvent::RevisionSyncFile(LoreRevisionSyncFileEventData::new(
                 &change, 0, false,
@@ -3163,186 +3348,582 @@ fn progress_ticker(stats: Arc<SyncRealizeStats>) -> ProgressTicker<SyncRealizeSt
     })
 }
 
+/// What realizing a delete needs beside the change.
+#[lore_macro::test_pub]
+struct DeleteContext {
+    repository: Arc<RepositoryContext>,
+    operation: Arc<InstanceOperationImpl>,
+    state_stage: Option<Arc<State>>,
+    dry_run: bool,
+    /// What a merge's realize reads the working tree against ([`realize_changes`]).
+    merge_current: Option<MergeCurrent>,
+    stats: Arc<SyncRealizeStats>,
+}
+
+/// Where a directory delete that finds the directory holding entries looks for the changes its
+/// files may be case variants of; see [`remove_directory_of_case_variants`].
+#[derive(Clone, Copy)]
+enum CaseVariants<'a> {
+    /// The deletes listed, sorted by path.
+    Listed(&'a [NodeChange]),
+    /// The level of the tree below the subtree change deleting the directory.
+    Below {
+        subtrees: &'a Arc<state::Subtrees>,
+        /// The deletes listed, sorted by path, which hold the files below it listed on their own.
+        listed: &'a [NodeChange],
+    },
+}
+
 /// Realizes the deletes `changes` holds, deepest first, and answers the directory deletes that
 /// found their directory holding entries and kept it. A link delete removes its mount but for the
 /// files `kept` names below it.
-#[allow(clippy::too_many_arguments)]
+#[lore_macro::test_pub]
 async fn realize_changes_delete(
-    repository: Arc<RepositoryContext>,
-    operation: Arc<InstanceOperationImpl>,
-    changes: Arc<Vec<NodeChange>>,
+    context: &Arc<DeleteContext>,
+    changes: &[NodeChange],
     kept: &[RelativePath],
-    state_stage: Option<Arc<State>>,
-    dry_run: bool,
-    merge_current: Option<&MergeCurrent>,
-    stats: Arc<SyncRealizeStats>,
+    subtrees: Option<&Arc<state::Subtrees>>,
 ) -> Result<Vec<NodeChange>, SyncError> {
-    let is_merge = merge_current.is_some();
     // Sort the changes by path length and iterate in descending order. This will make sure that
     // directories have files deleted first, before attempting to delete the directory.
     // If a directory still have local files which are view/ignore filtered, these directories
     // should not be deleted in order to prevent any potential data loss. Instead the user
     // should manually clean out these directories (or use purge).
-    // This also requires all deleted to execute in sequence.
-    // TODO(mjansson): Group and let unrelated paths execute in parallel with spawn
     let mut delete_changes: Vec<NodeChange> = changes
         .iter()
         .filter(|change| change.action == change::FileAction::Delete)
         .cloned()
         .collect();
     change::sort_by_path(delete_changes.as_mut_slice());
+    let mut move_sources: Vec<&str> = Vec::new();
+    if subtrees.is_some() {
+        move_sources = changes
+            .iter()
+            .filter(|change| change.move_source().is_some())
+            .map(|change| change.from.mapping.path.as_str())
+            .collect();
+        move_sources.sort_unstable();
+    }
     let kept_lowercase = folded_and_sorted(kept);
     let mut kept = Vec::new();
     for change in delete_changes.iter().rev() {
-        let change = change.clone();
-
-        let (state_from, stats) = (change.from.mapping.state.clone(), stats.clone());
-
-        // TODO(mjansson): File system virtualization
-        /*
-        if (repository->virtualized) {
-            err = repository->virtualization->delete_node(repository, change->path);
-            return err;
-        }
-        */
-
-        let change_path = change.path().clone();
-
-        let is_link = change.from.is_link();
-
-        let is_file = if is_link {
-            false
-        } else if change.from.mapping.node.is_valid_node_id() {
-            let block = state_from
-                .block(
-                    change.from.mapping.repository.clone(),
-                    NodeBlock::index(change.from.mapping.node),
-                )
-                .await
-                .forward::<SyncError>("Failed deserializing state node block")?;
-            let node = block.node(Node::index(change.from.mapping.node));
-
-            node.is_file()
-        } else {
-            // This can happen if a local path needs to be deleted as a
-            // result of a <state> vs <filesystem> diff.
-            operation.file_info(&change_path).await?.is_file()
-        };
-
-        lore_trace!("D {}", change.path());
-        let mut deleted = true;
-        if !dry_run {
-            let shown = if is_link {
-                let (current, staged) = merge_current
-                    .map(|current| current.roots(&repository))
-                    .unzip();
-                mount_shown(&change, current.as_ref(), staged.flatten().as_ref())
-                    .await?
-                    .flatten()
-            } else {
-                None
-            };
-            let mut retry = util::fs::file_unlink_retry();
-            loop {
-                if is_link {
-                    match remove_link_mount(
-                        &operation,
-                        &change.from.mapping.repository.filter,
-                        repository.path(),
-                        &change_path,
-                        shown.clone(),
-                        &kept_lowercase,
-                    )
-                    .await
-                    {
-                        Ok(kept) => {
-                            kept.report(&change_path);
-                            break;
-                        }
-                        Err(err) => {
-                            lore_debug!(
-                                "Unable to unlink linked repository files at {}: {} (attempt {} of {}",
-                                change_path,
-                                err,
-                                retry.counter() + 1,
-                                retry.limit()
-                            );
-                            if !retry.wait().await {
-                                return Err(SyncError::internal(format!(
-                                    "Failed to remove file or directory from local file system {change_path}",
-                                )));
-                            }
-                        }
-                    }
-                } else if let Err(err) = operation.remove(&change_path).await {
-                    // Retry if it is a file, otherwise assume the directory has local files
-                    if is_file {
-                        lore_trace!(
-                            "Unable to unlink local path {}: {} (attempt {} of {})",
-                            change_path,
-                            err,
-                            retry.counter() + 1,
-                            retry.limit()
-                        );
-                        if !retry.wait().await {
-                            return Err(SyncError::internal(format!(
-                                "Failed to remove file or directory from local file system {change_path}",
-                            )));
-                        }
-                    } else {
-                        deleted = Box::pin(remove_directory_of_case_variants(
-                            &operation,
-                            &change_path,
-                            &delete_changes,
-                        ))
-                        .await;
-                        break;
-                    }
-                } else {
-                    // Success.
-                    break;
+        let variants = match subtrees.filter(|_| change.flags.is_subtree()) {
+            Some(subtrees) => {
+                kept.extend(
+                    Box::pin(realize_subtree_delete(
+                        context,
+                        change,
+                        subtrees,
+                        &delete_changes,
+                        &move_sources,
+                    ))
+                    .await?,
+                );
+                CaseVariants::Below {
+                    subtrees,
+                    listed: &delete_changes,
                 }
             }
-
-            state::file_modified_time_clear(repository.clone(), change.path()).await;
-        }
-
-        stats.complete.file_delete.fetch_add(1, Ordering::Relaxed);
-
-        if deleted {
-            event::LoreEvent::RevisionSyncFile(LoreRevisionSyncFileEventData::new(
-                &change, 0, is_file,
-            ))
-            .send();
-        }
-
-        if let Some(state_stage) = &state_stage {
-            stage_realized_delete(
-                &change.from.mapping.repository,
-                state_stage,
-                &change,
-                is_merge,
-            )
-            .await?;
-        }
-
-        if !deleted {
-            kept.push(change);
+            None => CaseVariants::Listed(&delete_changes),
+        };
+        if !realize_delete(context, change, variants, &kept_lowercase).await? {
+            kept.push(change.clone());
         }
     }
 
-    if !dry_run && !repository.is_layer() {
+    if !context.dry_run && !context.repository.is_layer() {
         remove_emptied_excluded_directories(
-            &operation,
-            &repository,
+            &context.operation,
+            &context.repository,
             &delete_changes,
             &RelativePath::new(),
-            &stats,
+            &context.stats,
         )
         .await;
     }
 
     Ok(kept)
+}
+
+/// Deletes what the subtree change `change` stands for below its directory, answering the
+/// directories that stayed because they hold entries and hold one of `move_sources`, the sorted
+/// paths moves start from. `listed` holds the deletes listed, sorted by path.
+///
+/// The files go as the walk finds them, up to [`MAX_CONCURRENT_TREE_TASKS`] at once, since none
+/// waits on another, and are reported as they go, in no fixed order. The first that fails to go
+/// stops the walk at the next file it reaches once its task has ended, and is the answer; the files
+/// already deleted stay deleted, as a delete that fails among listed changes leaves the ones before
+/// it. The directories, named by path and node alone, go once their files have, deepest first.
+/// A directory the working tree no longer holds is walked as well, so the time recorded for each
+/// file below it is cleared and each file is reported.
+///
+/// Its caller boxes it, one allocation per subtree change beside the task and channel its walk
+/// already spawns: inline, it would make every realize as large as its walk, whether or not it
+/// deletes a whole directory.
+#[lore_macro::test_pub]
+#[allow(clippy::while_let_loop)] // Keep the read directory out of the await state.
+async fn realize_subtree_delete(
+    context: &Arc<DeleteContext>,
+    change: &NodeChange,
+    subtrees: &Arc<state::Subtrees>,
+    listed: &[NodeChange],
+    move_sources: &[&str],
+) -> Result<Vec<NodeChange>, SyncError> {
+    let mut expansion = subtrees.expand(change);
+    let mut directories = DirectoryLog::default();
+    let mut tasks = JoinSet::new();
+    let mut failure = None;
+    loop {
+        let Some(below) = expansion.next().await else {
+            break;
+        };
+        let is_file = below
+            .from
+            .flags
+            .intersects(NodeFlags::File | NodeFlags::Link);
+        if is_file {
+            while let Some(result) = tasks.try_join_next() {
+                keep_first_failure(&mut failure, result);
+            }
+            while failure.is_none()
+                && tasks.len() >= MAX_CONCURRENT_TREE_TASKS
+                && let Some(result) = tasks.join_next().await
+            {
+                keep_first_failure(&mut failure, result);
+            }
+            if failure.is_some() {
+                break;
+            }
+        }
+        context
+            .stats
+            .complete
+            .file_delete_total
+            .fetch_add(1, Ordering::Relaxed);
+        if is_file {
+            lore_spawn!(tasks, delete_below(context.clone(), below));
+        } else {
+            directories.push(&below.from.mapping.path, below.from.mapping.node);
+        }
+    }
+    let walked = if failure.is_some() {
+        expansion.abandon().await;
+        Ok(())
+    } else {
+        expansion
+            .finish()
+            .await
+            .forward::<SyncError>("Failed to walk a deleted directory")
+    };
+    while let Some(result) = tasks.join_next().await {
+        keep_first_failure(&mut failure, result);
+    }
+    if let Some(err) = failure {
+        return Err(err);
+    }
+    walked?;
+
+    let mut kept = Vec::new();
+    let mut reader = directories.into_rev_reader();
+    loop {
+        let Some((path, node)) = reader.next() else {
+            break;
+        };
+        let directory = NodeChange {
+            action: change::FileAction::Delete,
+            flags: change::Flags::Subtree,
+            from: NodeChangeState {
+                mapping: NodeMapping {
+                    repository: change.from.mapping.repository.clone(),
+                    state: change.from.mapping.state.clone(),
+                    path: path.clone(),
+                    node,
+                },
+                observed: None,
+                flags: NodeFlags::NoFlags,
+                address: crate::lore::Address::default(),
+                mode: 0,
+            },
+            to: change.to.invalid(path),
+        };
+        if !realize_delete(
+            context,
+            &directory,
+            CaseVariants::Below { subtrees, listed },
+            &[],
+        )
+        .await?
+            && sorted_holds_below(move_sources, |path| path, directory.path())
+        {
+            kept.push(directory);
+        }
+    }
+    Ok(kept)
+}
+
+/// Holds on to the first failure of the tasks `result` comes from in `failure`.
+fn keep_first_failure(
+    failure: &mut Option<SyncError>,
+    result: Result<Result<(), SyncError>, tokio::task::JoinError>,
+) {
+    if let Err(err) = result
+        .internal("Deleting a file below a deleted directory")
+        .map_err(SyncError::from)
+        .flatten()
+    {
+        *failure = failure.take().or(Some(err));
+    }
+}
+
+/// Removes the file or link `change` deletes from the working tree, unless under a dry run, and
+/// counts and reports it. A link's mount goes but for the files `kept` names below it, lowercase
+/// and sorted.
+#[lore_macro::test_pub]
+async fn remove_file(
+    context: &DeleteContext,
+    change: &NodeChange,
+    kept: &[&str],
+) -> Result<(), SyncError> {
+    let path = change.path();
+    let is_link = change.from.is_link();
+    lore_trace!("D {path}");
+    if !context.dry_run {
+        unlink_retrying(context, change, kept).await?;
+        state::file_modified_time_clear(context.repository.clone(), path).await;
+    }
+    context
+        .stats
+        .complete
+        .file_delete
+        .fetch_add(1, Ordering::Relaxed);
+    event::LoreEvent::RevisionSyncFile(LoreRevisionSyncFileEventData::new(change, 0, !is_link))
+        .send();
+    Ok(())
+}
+
+/// [`remove_file`] for a file or link below a directory deleted as a whole, owning what it removes
+/// so that it runs as a task of its own.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
+#[allow(clippy::manual_async_fn)]
+fn delete_below(
+    context: Arc<DeleteContext>,
+    change: NodeChange,
+) -> impl Future<Output = Result<(), SyncError>> + Send {
+    async move { remove_file(&context, &change, &[]).await }
+}
+
+/// Logs, as an error, the local work the entry `change` below a deleted directory holds: what the
+/// working tree holds at its path and what the revision holds there.
+///
+/// Runs only where a sync is refused, a cold path its caller boxes.
+async fn report_local_work(operation: &InstanceOperationImpl, change: &NodeChange) {
+    let path = change.path();
+    let revision = if change.from.mapping.node.is_valid_node_id() {
+        match change.from.get_node().await {
+            Ok(node) => format!(
+                ", revision mode {:o} size {} hash {}",
+                node.mode, node.size, node.address.hash
+            ),
+            Err(_) => ", revision node unreadable".to_string(),
+        }
+    } else {
+        String::new()
+    };
+    match operation.file_info(path).await {
+        Ok(info) if info.is_dir() => {
+            lore_error!("Deleted directory holds local work in file system: {path}/{revision}");
+        }
+        Ok(info) => lore_error!(
+            "Deleted file is currently modified in file system: {path}, size {} mtime {}{revision}",
+            info.size(),
+            info.mtime()
+        ),
+        Err(_) => lore_error!(
+            "Deleted file is currently modified in file system: {path}, not readable{revision}"
+        ),
+    }
+}
+
+/// Removes the file `change` deletes, or the mount of the link it deletes but for what the link
+/// does not track and the files `kept` names below it ([`remove_link_mount`]), trying again as
+/// [`util::fs::file_unlink_retry`] allows.
+async fn unlink_retrying(
+    context: &DeleteContext,
+    change: &NodeChange,
+    kept: &[&str],
+) -> Result<(), SyncError> {
+    let operation = &context.operation;
+    let path = change.path();
+    let is_link = change.from.is_link();
+    let shown = if is_link {
+        let (current, staged) = context
+            .merge_current
+            .as_ref()
+            .map(|current| current.roots(&context.repository))
+            .unzip();
+        Box::pin(mount_shown(
+            change,
+            current.as_ref(),
+            staged.flatten().as_ref(),
+        ))
+        .await?
+        .flatten()
+    } else {
+        None
+    };
+    let mut retry = util::fs::file_unlink_retry();
+    loop {
+        let removed = if is_link {
+            Box::pin(remove_link_mount(
+                operation,
+                &change.from.mapping.repository.filter,
+                context.repository.path(),
+                path,
+                shown.clone(),
+                kept,
+            ))
+            .await
+            .map(|left| left.report(path))
+        } else {
+            operation.remove(path).await.map_err(SyncError::from)
+        };
+        let Err(err) = removed else {
+            return Ok(());
+        };
+        lore_trace!(
+            "Unable to unlink local path {path}: {err} (attempt {} of {})",
+            retry.counter() + 1,
+            retry.limit()
+        );
+        if !retry.wait().await {
+            return Err(err)
+                .forward_with::<SyncError, _>(|| format!("removing {path} from the working tree"));
+        }
+    }
+}
+
+/// The directories below a subtree change, in the order the walk names them, each as its node and
+/// the part of its path that differs from the one before it.
+///
+/// A large tree can hold millions of directories, most holding a file or two, under long shared
+/// prefixes, which this holds once rather than in every path. Every [`Self::CHUNK`]th path is held
+/// whole, so the log reads back one chunk at a time.
+#[lore_macro::test_pub]
+#[derive(Default)]
+struct DirectoryLog {
+    /// Per directory: its node (4 bytes), how many bytes of the previous path it keeps (2), how
+    /// many it adds (4), and those bytes.
+    bytes: Vec<u8>,
+    /// Where each chunk starts in `bytes`.
+    chunks: Vec<usize>,
+    count: usize,
+    previous: Vec<u8>,
+}
+
+impl DirectoryLog {
+    const CHUNK: usize = 4096;
+
+    #[lore_macro::test_pub]
+    fn push(&mut self, path: &RelativePath, node: NodeID) {
+        let path = path.as_str().as_bytes();
+        let kept = if self.count.is_multiple_of(Self::CHUNK) {
+            self.chunks.push(self.bytes.len());
+            0
+        } else {
+            self.previous
+                .iter()
+                .zip(path)
+                .take(usize::from(u16::MAX))
+                .take_while(|(a, b)| a == b)
+                .count()
+        };
+        let added = &path[kept..];
+        self.bytes.extend_from_slice(&node.to_le_bytes());
+        self.bytes.extend_from_slice(&(kept as u16).to_le_bytes());
+        self.bytes
+            .extend_from_slice(&(added.len() as u32).to_le_bytes());
+        self.bytes.extend_from_slice(added);
+        self.previous.clear();
+        self.previous.extend_from_slice(path);
+        self.count += 1;
+    }
+
+    /// Reads every directory back, last named first. A walk names a directory before anything
+    /// below it, so this names every directory after what it holds.
+    #[lore_macro::test_pub]
+    fn into_rev_reader(self) -> DirectoryLogReader {
+        DirectoryLogReader {
+            next_chunk: self.chunks.len(),
+            log: self,
+            paths: Vec::new(),
+            entries: Vec::new(),
+        }
+    }
+}
+
+/// [`DirectoryLog::into_rev_reader`]: decodes a chunk at a time into one buffer of its paths, laid
+/// end to end, and the end and node of each, which every chunk reuses.
+#[lore_macro::test_pub]
+struct DirectoryLogReader {
+    log: DirectoryLog,
+    /// The chunk after the one decoded.
+    next_chunk: usize,
+    paths: Vec<u8>,
+    /// Per directory of the chunk decoded and not yet read: where its path starts and ends in
+    /// `paths`, and its node.
+    entries: Vec<(usize, usize, NodeID)>,
+}
+
+impl DirectoryLogReader {
+    /// The next directory, or `None` once every one has been read.
+    #[lore_macro::test_pub]
+    fn next(&mut self) -> Option<(RelativePath, NodeID)> {
+        if self.entries.is_empty() {
+            self.decode_previous_chunk()?;
+        }
+        let (start, end, node) = self.entries.pop()?;
+        let path = String::from_utf8_lossy(&self.paths[start..end]);
+        Some((RelativePath::new_from_clean_parts(&path, ""), node))
+    }
+
+    /// Decodes the chunk before the one last decoded, or answers `None` where there is none.
+    fn decode_previous_chunk(&mut self) -> Option<()> {
+        let chunk = self.next_chunk.checked_sub(1)?;
+        self.next_chunk = chunk;
+        let bytes = &self.log.bytes;
+        let start = self.log.chunks[chunk];
+        let end = self
+            .log
+            .chunks
+            .get(chunk + 1)
+            .copied()
+            .unwrap_or(bytes.len());
+        let field = |at: usize, width: usize| {
+            bytes[at..at + width]
+                .iter()
+                .rev()
+                .fold(0usize, |value, byte| value << 8 | usize::from(*byte))
+        };
+        self.paths.clear();
+        self.entries.clear();
+        let mut previous = 0..0;
+        let mut at = start;
+        while at < end {
+            let node = field(at, 4) as NodeID;
+            let kept = field(at + 4, 2);
+            let added = field(at + 6, 4);
+            at += 10;
+            let path_start = self.paths.len();
+            self.paths
+                .extend_from_within(previous.start..previous.start + kept);
+            self.paths.extend_from_slice(&bytes[at..at + added]);
+            at += added;
+            previous = path_start..self.paths.len();
+            self.entries.push((previous.start, previous.end, node));
+        }
+        Some(())
+    }
+}
+
+/// Deletes what `change` names from the working tree, and from the staged state where the context
+/// has one, answering whether it is gone: a directory still holding entries stays, unless what it
+/// holds are case variants of files `variants` deletes directly in it. A dry run answers that it
+/// is gone. A subtree change names a directory, so its node isn't read. A link's mount goes but
+/// for the files `kept` names below it, lowercase and sorted.
+async fn realize_delete(
+    context: &DeleteContext,
+    change: &NodeChange,
+    variants: CaseVariants<'_>,
+    kept: &[&str],
+) -> Result<bool, SyncError> {
+    let DeleteContext {
+        repository,
+        operation,
+        state_stage,
+        dry_run,
+        merge_current,
+        stats,
+    } = context;
+    let (dry_run, is_merge) = (*dry_run, merge_current.is_some());
+    let state_from = change.from.mapping.state.clone();
+
+    // TODO(mjansson): File system virtualization
+    /*
+    if (repository->virtualized) {
+        err = repository->virtualization->delete_node(repository, change->path);
+        return err;
+    }
+    */
+
+    let change_path = change.path().clone();
+
+    let is_link = change.from.is_link();
+
+    let is_file = if is_link || change.flags.is_subtree() {
+        false
+    } else if change.from.mapping.node.is_valid_node_id() {
+        let block = state_from
+            .block(
+                change.from.mapping.repository.clone(),
+                NodeBlock::index(change.from.mapping.node),
+            )
+            .await
+            .forward::<SyncError>("Failed deserializing state node block")?;
+        let node = block.node(Node::index(change.from.mapping.node));
+
+        node.is_file()
+    } else {
+        // This can happen if a local path needs to be deleted as a
+        // result of a <state> vs <filesystem> diff.
+        operation.file_info(&change_path).await?.is_file()
+    };
+
+    let mut deleted = true;
+    if is_link || is_file {
+        remove_file(context, change, kept).await?;
+    } else {
+        lore_trace!("D {}", change.path());
+        if !dry_run {
+            if operation.remove(&change_path).await.is_err() {
+                // Type-erased: a caller's `Send` check of the comparisons below overflows the
+                // recursion limit.
+                let variants_removed: crate::BoxFuture<'_, bool> =
+                    match variants {
+                        CaseVariants::Listed(deletes) => Box::pin(
+                            remove_directory_of_case_variants(operation, &change_path, deletes),
+                        ),
+                        CaseVariants::Below { subtrees, listed } => {
+                            Box::pin(remove_subtree_directory_of_case_variants(
+                                operation, change, subtrees, listed,
+                            ))
+                        }
+                    };
+                deleted = variants_removed.await;
+            }
+            state::file_modified_time_clear(repository.clone(), change.path()).await;
+        }
+        stats.complete.file_delete.fetch_add(1, Ordering::Relaxed);
+        if deleted {
+            event::LoreEvent::RevisionSyncFile(LoreRevisionSyncFileEventData::new(
+                change, 0, false,
+            ))
+            .send();
+        }
+    }
+
+    if let Some(state_stage) = state_stage {
+        stage_realized_delete(
+            &change.from.mapping.repository,
+            state_stage,
+            change,
+            is_merge,
+        )
+        .await?;
+    }
+
+    Ok(deleted)
 }
 
 /// Removes each directory the view excludes below `floor` and above a delete in `changes` that the

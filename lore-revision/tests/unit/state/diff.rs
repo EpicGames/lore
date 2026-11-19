@@ -486,6 +486,7 @@ async fn a_walk_holds_each_subtree_once() {
                 graft: None,
             };
             let (changes, _receiver) = tokio::sync::mpsc::channel(1);
+            let changes = lore_revision::state::ChangeSender::from_sender(changes);
             let stats = DiffWalkStats::default();
             let mut work = SubtreeWork {
                 tasks: SubtreeTasks::new(),

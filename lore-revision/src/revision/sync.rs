@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -99,7 +100,7 @@ pub struct LoreRevisionSyncProgressEventData {
     pub file_update_total: usize,
     /// Number of files deleted so far.
     pub file_delete: usize,
-    /// Total number of files to delete.
+    /// Total number of files to delete, which can grow while a sync runs.
     pub file_delete_total: usize,
     /// Number of files merged automatically so far.
     pub file_automerge: usize,
@@ -1361,6 +1362,9 @@ pub struct SyncVerifyStats {
     pub file_conflict: AtomicUsize,
     pub file_retain: AtomicUsize,
     pub file_replace: AtomicUsize,
+    /// Set once a change refuses the sync for local modifications, so a check of a deleted
+    /// directory's working tree still running stops at the next difference it finds.
+    pub refused: AtomicBool,
 }
 
 #[derive(Default)]
@@ -1454,6 +1458,7 @@ pub async fn realize_changes(
             operation,
             changes,
             &[],
+            None, /* No subtrees */
             state_stage,
             dry_run,
             merge_current.map(crate::fs::realize::MergeCurrent::new),

@@ -2270,6 +2270,7 @@ async fn realize_link_pin_diff(
         operation.clone(),
         changes,
         &kept,
+        None, /* No subtrees */
         None,
         false, /* Not dry run */
         None,  /* Not a merge */

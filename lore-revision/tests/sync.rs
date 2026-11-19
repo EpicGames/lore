@@ -768,6 +768,93 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// Syncs a working tree holding `variant` as [`RULES_VARIANT`] in a directory nested in
+    /// [`PLUGIN`], in place of the [`RULES`] the first revision holds there, to a second revision
+    /// deleting [`PLUGIN`]. Answers whether the variant and [`PLUGIN`] remain, and how the sync
+    /// ended.
+    #[cfg(target_os = "linux")]
+    async fn sync_over_a_nested_case_variant(
+        instance: &TestRepository,
+        variant: &[u8],
+    ) -> (bool, bool, Result<(), sync::SyncError>) {
+        let directory = instance.path.join(PLUGIN);
+        let nested = directory.join("Sub");
+        fs::create_dir_all(nested.as_path()).expect("Failed to create the directory");
+        test_file_write(nested.join(RULES).as_path(), b"rules");
+        let first = test_commit_tree(instance, "First").await.revision();
+
+        fs::remove_dir_all(directory.as_path()).expect("Failed to remove the directory");
+        file::stage::stage(
+            instance.repository.clone(),
+            &instance.write_token,
+            LoreArray::from_vec(vec![LoreString::from(&directory)]),
+            StageOptions {
+                scan: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to stage the directory delete");
+        let second = test_commit(instance, "Second").await.revision();
+
+        sync_to(instance, first, false).await;
+        fs::remove_file(nested.join(RULES)).expect("Failed to remove the file");
+        test_file_write(nested.join(RULES_VARIANT).as_path(), variant);
+
+        let result = sync::sync_boxed(
+            instance.repository.clone(),
+            &instance.write_token,
+            SyncOptions {
+                revision: Some(second.to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        (
+            nested.join(RULES_VARIANT).exists(),
+            directory.exists(),
+            result,
+        )
+    }
+
+    /// A case variant of a file in a directory nested in one a revision deletes goes with the
+    /// directories where it holds the file's content, and refuses the sync, keeping both, where it
+    /// holds other content.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deleted_directory_takes_a_nested_case_variant_holding_its_file() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                for (variant, goes) in [(&b"rules"[..], true), (&b"mine!"[..], false)] {
+                    let instance = test_repository_create(
+                        immutable_store.clone(),
+                        mutable_store.clone(),
+                        RepositoryId::from(uuid::Uuid::now_v7()),
+                    )
+                    .await;
+                    let (variant_left, directory_left, result) =
+                        Box::pin(sync_over_a_nested_case_variant(&instance, variant)).await;
+                    let content = String::from_utf8_lossy(variant);
+                    if goes {
+                        result.expect("A variant holding the file's content is no local work");
+                    } else {
+                        assert!(
+                            result.is_err_and(|err| err.is_local_modifications()),
+                            "A variant holding {content} is local work"
+                        );
+                    }
+                    assert_eq!(variant_left, !goes, "The variant holding {content}");
+                    assert_eq!(directory_left, !goes, "The directory over the variant");
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     /// A forced sync keeps a case variant of a file the revision moves out of a directory it
     /// deletes where the variant holds other content of the same size, and the directory with it.
     #[cfg(target_os = "linux")]
@@ -1188,6 +1275,98 @@ mod tests {
                         .await
                         .is_empty(),
                     "its node leaves the staged tree once the file is ignored"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    const MOVED: &str = "moved.txt";
+    const MOVED_CONTENT: &[u8] = b"moved";
+    const ELSEWHERE: &str = "Elsewhere";
+
+    /// A deleted directory goes whole where a file in a directory nested in it is moved elsewhere:
+    /// the nested directory holds the file until the move runs, and goes once it has.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deleted_directory_goes_with_a_nested_directory_a_file_is_moved_out_of() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let instance = test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                let directory = instance.path.join(PLUGIN);
+                let nested = directory.join("Sub");
+                let elsewhere = instance.path.join(ELSEWHERE);
+                fs::create_dir_all(nested.as_path()).expect("Failed to create the directory");
+                test_file_write(nested.join(MOVED).as_path(), MOVED_CONTENT);
+                let first = test_commit_tree(&instance, "First").await.revision();
+
+                fs::create_dir_all(elsewhere.as_path()).expect("Failed to create the destination");
+                fs::rename(nested.join(MOVED), elsewhere.join(MOVED))
+                    .expect("Failed to move the file");
+                file::stage::stage_move(
+                    instance.repository.clone(),
+                    &instance.write_token,
+                    nested.join(MOVED).to_string_lossy().into_owned(),
+                    elsewhere.join(MOVED).to_string_lossy().into_owned(),
+                    StageOptions {
+                        scan: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("Failed to stage the move");
+                fs::remove_dir_all(directory.as_path()).expect("Failed to remove the directory");
+                file::stage::stage(
+                    instance.repository.clone(),
+                    &instance.write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&directory)]),
+                    StageOptions {
+                        scan: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("Failed to stage the directory delete");
+                let second = test_commit(&instance, "Second").await.revision();
+                sync_to(&instance, first, false).await;
+
+                let (changes, _) = lore_revision::state::diff_collect_subtrees(
+                    instance.repository.clone(),
+                    lore_revision::state::State::deserialize(instance.repository.clone(), first)
+                        .await
+                        .expect("The first revision"),
+                    instance.repository.clone(),
+                    lore_revision::state::State::deserialize(instance.repository.clone(), second)
+                        .await
+                        .expect("The second revision"),
+                    lore_revision::filter::FilterMode::Full,
+                )
+                .await
+                .expect("The diff listing subtrees");
+                assert!(
+                    changes
+                        .iter()
+                        .any(|change| change.action == lore_revision::change::FileAction::Move),
+                    "The file moves out of the deleted directory: {changes:?}"
+                );
+
+                sync_to(&instance, second, false).await;
+
+                assert_eq!(
+                    fs::read(elsewhere.join(MOVED)).expect("The moved file"),
+                    MOVED_CONTENT
+                );
+                assert!(
+                    !directory.exists(),
+                    "The directory goes with the one nested in it"
                 );
             }))
             .await

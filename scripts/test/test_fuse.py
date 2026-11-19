@@ -886,16 +886,18 @@ def normalized(output: str, clone: Lore, branch: str, names: dict[str, str]) -> 
     )
     output = re.sub(r"(?m)^(Date\s*:).*$", r"\1 <date>", output)
     # A mount verifies against the State it holds (`hold::check`), an ordinary
-    # clone calculates deltas and verifies against its files (`realize_state`);
-    # the change count must still match.
+    # clone calculates deltas and verifies against its files (`realize_state`).
+    # The counts differ: an ordinary clone counts a directory deleted as a whole
+    # as one change, and a mount counts every change below it.
     output = re.sub(
-        r"(?m)^Verifying (\d+) changes with the held state$",
-        r"<verifying \1 changes>",
+        r"(?m)^Verifying \d+ changes with the held state$",
+        r"<verifying changes>",
         output,
     )
     output = re.sub(
-        r"(?m)^Calculating deltas \d+ -> \d+\nVerifying (\d+) changes with local file system$",
-        r"<verifying \1 changes>",
+        r"(?m)^Calculating deltas \d+ -> \d+\nVerifying \d+ changes with local file system"
+        r"(?:, \d+ of them directories deleted as a whole)?$",
+        r"<verifying changes>",
         output,
     )
     return output

@@ -96,7 +96,9 @@ pub use node::rewrite::Rewrite;
 use serde::Serialize;
 pub use stream::ChangeSender;
 pub use stream::ChangeStream;
-use stream::emit;
+use stream::ChunkedChanges;
+use stream::Deletes;
+pub(crate) use stream::emit;
 use tokio::join;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -8403,7 +8405,8 @@ fn emit_change(
     )
 }
 
-/// [`add_change_where`] walking every child of a directory added or deleted as a whole.
+/// [`add_change_where`] walking every child of a directory added or deleted as a whole, except a
+/// directory deleted as a whole to a `changes` emitting [subtrees](ChangeSender::subtrees).
 #[allow(clippy::too_many_arguments)]
 fn add_change(
     from: NodeChangeState,
@@ -8432,9 +8435,10 @@ fn add_change(
 /// ([`diff::versioned_on_a_working_tree`]), as it does in a filesystem State.
 ///
 /// Only a directory added or deleted as a whole is walked: a caller emitting a
-/// modification walks the directory itself. The walk is boxed, one allocation per
-/// such directory: inline, it would make this future and every future above it
-/// larger.
+/// modification walks the directory itself, and a directory deleted as a whole to a
+/// `changes` emitting [subtrees](ChangeSender::subtrees) is one change, not walked. The
+/// walk is boxed, one allocation per such directory: inline, it would make this future
+/// and every future above it larger.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -8479,9 +8483,14 @@ fn add_change_where(
                 None
             };
             let recursion_node = recursion_node_storage.as_ref().unwrap_or(&node);
+            let subtree =
+                changes.subtrees() && action == FileAction::Delete && recursion_node.is_directory();
 
             // Compute flags and create change record
-            let flags = compute_change_flags(&node) | measured;
+            let mut flags = compute_change_flags(&node) | measured;
+            if subtree {
+                flags |= change::Flags::Subtree;
+            }
 
             emit(changes, || NodeChange {
                 action,
@@ -8491,7 +8500,7 @@ fn add_change_where(
             })
             .await?;
 
-            if !recursion_node.is_directory() {
+            if !recursion_node.is_directory() || subtree {
                 return Ok(());
             }
         }
@@ -9175,7 +9184,33 @@ pub async fn diff_collect(
     path: Option<RelativePath>,
     filter_mode: FilterMode,
 ) -> Result<Vec<NodeChange>, StateError> {
-    let mut changes = ChangeStream::spawn(async move |changes| {
+    let mut changes = collect_diff(
+        repository_from,
+        state_from,
+        repository_to,
+        state_to,
+        path,
+        filter_mode,
+        Deletes::Each,
+    )
+    .await?;
+    detect_and_coalesce_moves(&mut changes);
+    crate::change::sort_by_path(&mut changes);
+    Ok(changes)
+}
+
+/// Every change [`diff`] emits below `path`, in the order it emits them, with a directory deleted as
+/// a whole emitted as `deletes` says.
+async fn collect_diff(
+    repository_from: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    repository_to: Arc<RepositoryContext>,
+    state_to: Arc<State>,
+    path: Option<RelativePath>,
+    filter_mode: FilterMode,
+    deletes: Deletes,
+) -> Result<Vec<NodeChange>, StateError> {
+    let walk = async move |changes: ChangeSender| {
         diff(
             repository_from,
             state_from,
@@ -9187,12 +9222,207 @@ pub async fn diff_collect(
             filter_mode,
         )
         .await
-    })
-    .collect()
+    };
+    let changes = match deletes {
+        Deletes::Each => ChangeStream::spawn(walk),
+        Deletes::Whole => ChangeStream::spawn_subtrees(walk),
+    };
+    changes.collect().await
+}
+
+/// [`diff_collect`] where a directory deleted as a whole is one change carrying
+/// [`Flags::Subtree`](change::Flags::Subtree), which the caller expands as it gets to it through
+/// the [`Subtrees`] answered beside the changes.
+///
+/// A file below such a directory that shares its file identity with a listed add is listed on its
+/// own, where move coalescing may pair it with the add, and [`Subtrees`] claims it so no expansion
+/// repeats it.
+#[lore_macro::test_pub]
+pub(crate) async fn diff_collect_subtrees(
+    repository_from: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    repository_to: Arc<RepositoryContext>,
+    state_to: Arc<State>,
+    filter_mode: FilterMode,
+) -> Result<(Vec<NodeChange>, Arc<Subtrees>), StateError> {
+    let mut changes = collect_diff(
+        repository_from,
+        state_from,
+        repository_to,
+        state_to,
+        None,
+        filter_mode,
+        Deletes::Whole,
+    )
     .await?;
+    let claimed = claim_subtree_moves(&mut changes, filter_mode).await?;
     detect_and_coalesce_moves(&mut changes);
     crate::change::sort_by_path(&mut changes);
-    Ok(changes)
+    Ok((
+        changes,
+        Arc::new(Subtrees {
+            claimed: Arc::new(claimed),
+            filter_mode,
+        }),
+    ))
+}
+
+/// Lists on their own the files below the deleted directories in `changes` that share a file
+/// identity with a listed add, so the move pairs, and answers their identities, sorted.
+///
+/// Runs where `changes` holds a directory deleted as a whole and an add with a file identity, and
+/// costs one walk of each deleted directory's tree in the State before any change is verified: the
+/// walk reads no working tree, takes the deleted directories one after another, each on every
+/// core as [`add_change_hierarchy`] does, and holds
+/// the identities of the listed adds (16 bytes each) and the files it lists. No expansion repeats
+/// them. A directory moved whole lists every file below it, as the full list does, gathered in
+/// chunks so the list is built once at its final length.
+async fn claim_subtree_moves(
+    changes: &mut Vec<NodeChange>,
+    filter_mode: FilterMode,
+) -> Result<Vec<Context>, StateError> {
+    if !changes.iter().any(|change| change.flags.is_subtree()) {
+        return Ok(Vec::new());
+    }
+    let mut adds: Vec<Context> = changes
+        .iter()
+        .filter(|change| change.action == FileAction::Add)
+        .map(NodeChange::move_identity)
+        .filter(|identity| !identity.is_zero())
+        .collect();
+    if adds.is_empty() {
+        return Ok(Vec::new());
+    }
+    adds.sort_unstable();
+    adds.dedup();
+
+    let unclaimed = Arc::new(Subtrees {
+        claimed: Arc::default(),
+        filter_mode,
+    });
+    let mut listed = ChunkedChanges::default();
+    let mut claimed = Vec::new();
+    for change in changes.iter().filter(|change| change.flags.is_subtree()) {
+        let mut walk = unclaimed.walk(change);
+        while let Some(below) = walk.next().await {
+            let identity = below.move_identity();
+            if adds.binary_search(&identity).is_ok() {
+                claimed.push(identity);
+                listed.push(below);
+            }
+        }
+        walk.finish().await?;
+    }
+    claimed.sort_unstable();
+    claimed.dedup();
+    *changes = listed.append_to(std::mem::take(changes));
+    Ok(claimed)
+}
+
+/// Expands the subtree changes [`diff_collect_subtrees`] answers with.
+#[lore_macro::test_pub]
+pub(crate) struct Subtrees {
+    /// The identities of the files below a subtree change that are listed on their own, sorted.
+    claimed: Arc<Vec<Context>>,
+    filter_mode: FilterMode,
+}
+
+impl Subtrees {
+    /// Every change below the subtree change `change`, a directory's before those below it, but
+    /// for the ones listed on their own. Reports each path the filter excludes below it.
+    #[lore_macro::test_pub]
+    pub(crate) fn expand(self: &Arc<Self>, change: &NodeChange) -> SubtreeExpansion {
+        self.expansion(change, ExpansionWalk::Realize)
+    }
+
+    /// [`expand`](Self::expand), reporting no path the filter excludes.
+    fn walk(self: &Arc<Self>, change: &NodeChange) -> SubtreeExpansion {
+        self.expansion(change, ExpansionWalk::Quiet)
+    }
+
+    /// The changes directly below the subtree change `change`, a directory among them being a
+    /// subtree change in turn, but for the ones listed on their own. Reports no path the filter
+    /// excludes.
+    #[lore_macro::test_pub]
+    pub(crate) fn expand_level(self: &Arc<Self>, change: &NodeChange) -> SubtreeExpansion {
+        self.expansion(change, ExpansionWalk::Level)
+    }
+
+    fn expansion(self: &Arc<Self>, change: &NodeChange, kind: ExpansionWalk) -> SubtreeExpansion {
+        debug_assert!(
+            change.flags.is_subtree() && change.action == FileAction::Delete,
+            "{change:?} is not a subtree change"
+        );
+        let (from, to) = (change.from.clone(), change.to.clone());
+        let filter_mode = self.filter_mode;
+        let walk = async move |changes: ChangeSender| {
+            let Some(side) = delete_hierarchy_side(from.clone(), &to) else {
+                return Ok(());
+            };
+            let states = side
+                .mapping
+                .repository
+                .filter
+                .exclusion_states(&side.mapping.path);
+            add_change_hierarchy(
+                from,
+                to,
+                FileAction::Delete,
+                &changes,
+                filter_mode,
+                states,
+                false,
+            )
+            .await
+        };
+        let claimed = self.claimed.clone();
+        SubtreeExpansion {
+            changes: match kind {
+                ExpansionWalk::Realize => {
+                    ChangeStream::spawn_below(Deletes::Each, true, claimed, walk)
+                }
+                ExpansionWalk::Quiet => ChangeStream::spawn_quiet(Deletes::Each, walk),
+                ExpansionWalk::Level => {
+                    ChangeStream::spawn_below(Deletes::Whole, false, claimed, walk)
+                }
+            },
+        }
+    }
+}
+
+/// Which walk [`Subtrees::expansion`] runs.
+enum ExpansionWalk {
+    /// Every change below, reporting each path the filter excludes.
+    Realize,
+    /// Every change below, reporting none.
+    Quiet,
+    /// The changes directly below, reporting none.
+    Level,
+}
+
+/// The changes below one subtree change, as [`Subtrees::expand`] walks them.
+#[lore_macro::test_pub]
+pub(crate) struct SubtreeExpansion {
+    changes: ChangeStream<()>,
+}
+
+impl SubtreeExpansion {
+    /// The next change, or `None` once the walk has no more; see [`ChangeStream::next`].
+    #[lore_macro::test_pub]
+    pub(crate) async fn next(&mut self) -> Option<NodeChange> {
+        self.changes.next().await
+    }
+
+    /// Whether the walk succeeded; see [`ChangeStream::finish`].
+    #[lore_macro::test_pub]
+    pub(crate) async fn finish(self) -> Result<(), StateError> {
+        self.changes.finish().await
+    }
+
+    /// Stops the walk; see [`ChangeStream::abandon`].
+    pub(crate) async fn abandon(self) {
+        self.changes.abandon().await;
+    }
 }
 
 /// A state's node mapped to its path in the repository instance's file system.
@@ -12889,7 +13119,10 @@ impl CollectedChildren {
     }
 }
 
-/// Emits a change for every node under a directory added or deleted as a whole.
+/// Emits a change for every node under a directory added or deleted as a whole, or, for a delete
+/// to a `changes` emitting [subtrees](ChangeSender::subtrees), for every node directly under it, a
+/// directory among them as a subtree change. Each path the filter excludes is reported where
+/// `changes` [announces](ChangeSender::announces) them.
 ///
 /// A delete enumerates the side [`delete_hierarchy_side`] answers with, and emits nothing, with a
 /// warning, where that node cannot be read; an add enumerates `to`, and fails where it cannot be
@@ -13071,10 +13304,16 @@ async fn walk_hierarchy(
                 },
             )
             .await?;
-        let (child_states, excluded) =
-            filter.child_emit_excludes(level.states, &path, child_node.is_directory(), mode);
+        let (child_states, excluded) = if changes.announces() {
+            filter.child_emit_excludes(level.states, &path, child_node.is_directory(), mode)
+        } else {
+            filter.child_excludes_tree(level.states, &path, child_node.is_directory(), mode)
+        };
 
-        if !excluded {
+        let subtree =
+            changes.subtrees() && action == FileAction::Delete && child_node.is_directory();
+        let listed = !child_node.is_link() && changes.lists(&child_node.address.context);
+        if !excluded && !listed {
             let child_path = path.clone().freeze();
             emit(changes, || {
                 let absent = other.invalid(child_path.clone());
@@ -13083,9 +13322,13 @@ async fn walk_hierarchy(
                     FileAction::Delete => (child, absent),
                     _ => (absent, child),
                 };
+                let mut flags = compute_change_flags(&child_node);
+                if subtree {
+                    flags |= change::Flags::Subtree;
+                }
                 NodeChange {
                     action,
-                    flags: compute_change_flags(&child_node),
+                    flags,
                     from,
                     to,
                 }
@@ -13096,7 +13339,7 @@ async fn walk_hierarchy(
         // TODO(UCS-11623): Check if the target link repository has no local changes - if so,
         // do not iterate and show each link file as added. Otherwise, recurse in and compare
         // against file system and/or staged state in link
-        if !excluded && child_node.is_directory() {
+        if !excluded && child_node.is_directory() && !subtree {
             if let Ok(permit) = hierarchy_task_semaphore().clone().try_acquire_owned() {
                 let child = side.from_child(child_id, &child_node, path.clone().freeze());
                 let absent = other.invalid(child.mapping.path.clone());
