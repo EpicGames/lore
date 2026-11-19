@@ -2,12 +2,21 @@
 // SPDX-License-Identifier: MIT
 
 //! `lore branch merge` of a move on one branch against changes to the moved node on the other,
-//! as the working tree and the merge revision hold it.
+//! as the working tree and the merge revision hold it, and `lore branch merge into` and
+//! `lore revision restore` of a move that edits the moved file.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use lore_base::types::Address;
+use lore_base::types::Hash;
 use lore_revision::branch;
+use lore_revision::change;
+use lore_revision::filter::FilterMode;
 use lore_revision::node::ROOT_NODE;
+use lore_revision::revision::sync;
+use lore_revision::state::State;
+use lore_revision::state::diff_collect;
 
 use super::instance::Edit;
 use super::instance::Instance;
@@ -21,6 +30,7 @@ use super::instance::revision_state;
 use super::instance::run;
 use super::instance::switch_to;
 use super::instance::working_tree;
+use crate::helper::test_filter;
 
 /// The files every fixture starts from, each holding its own path.
 const TREE: [&str; 4] = ["Dir/a.txt", "Dir/b.txt", "Dir/Sub/c.txt", "Top.txt"];
@@ -1057,4 +1067,153 @@ async fn a_move_or_delete_below_a_rename_both_branches_make_reaches_the_working_
         )
         .await;
     }
+}
+
+/// A move of a file the view excludes that also edits it merges with the edit: the merge revision
+/// holds the file where the move put it with the content the moving branch gave it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edited_move_out_of_view_takes_the_edit() {
+    run(
+        "an_edited_move_out_of_view_takes_the_edit",
+        &TREE,
+        |mut instance| async move {
+            create_branch(&instance, "feature").await;
+            let feature =
+                commit_edits(&instance, &moving(&MOVES[0], Some("edited")), "Feature").await;
+            switch_to(&instance, branch::DEFAULT_DEFAULT_NAME).await;
+            commit_edits(&instance, &[Edit::Write("Dir/b.txt", "main")], "Main").await;
+            instance.repository = Arc::new(
+                instance
+                    .repository
+                    .to_filter_context(Arc::new(test_filter(&[], &["/Dir"]))),
+            );
+            assert!(
+                merge_branch(&instance, "feature").await,
+                "the merge committed"
+            );
+
+            assert_eq!(
+                address_at(
+                    &instance,
+                    &revision_state(&instance, current(&instance).await).await,
+                    MOVES[0].to
+                )
+                .await,
+                address_at(
+                    &instance,
+                    &revision_state(&instance, feature).await,
+                    MOVES[0].to
+                )
+                .await
+            );
+        },
+    )
+    .await;
+}
+
+/// The address of the node `state` holds at `path`.
+async fn address_at(instance: &Instance, state: &Arc<State>, path: &str) -> Address {
+    let node = state
+        .find_node_link(instance.repository.clone(), path)
+        .await
+        .expect("Failed to find the node")
+        .node;
+    state
+        .node(instance.repository.clone(), node)
+        .await
+        .expect("Failed to read the node")
+        .address
+}
+
+/// The tree of `onto` with the 2-way diff from `onto` to `revision` staged on it as
+/// `lore revision restore` stages it, or as `lore branch merge into` stages it where `merge` says:
+/// the diff realized on the tree alone.
+async fn staged_onto(instance: &Instance, onto: Hash, revision: Hash, merge: bool) -> Arc<State> {
+    let (onto, revision) = (
+        revision_state(instance, onto).await,
+        revision_state(instance, revision).await,
+    );
+    let mut changes = diff_collect(
+        instance.repository.clone(),
+        onto.clone(),
+        instance.repository.clone(),
+        revision,
+        None,
+        FilterMode::View,
+    )
+    .await
+    .expect("Failed to diff the revisions");
+    change::sort_by_path(&mut changes);
+    let staged = revision_state(instance, onto.revision()).await;
+    sync::realize_changes(
+        instance.repository.clone(),
+        Arc::new(changes),
+        Some(staged.clone()),
+        true,
+        merge.then_some(onto),
+        Arc::new(sync::SyncRealizeStats::default()),
+    )
+    .await
+    .expect("Failed to realize the changes on the tree");
+    staged
+}
+
+/// `lore branch merge into` of a branch that moved and edited a file stages the file where the
+/// move put it with the content the moving branch gave it.
+#[tokio::test(flavor = "multi_thread")]
+async fn merging_an_edited_move_into_a_branch_takes_the_edit() {
+    run(
+        "merging_an_edited_move_into_a_branch_takes_the_edit",
+        &TREE,
+        |instance| async move {
+            let base = current(&instance).await;
+            create_branch(&instance, "feature").await;
+            let feature =
+                commit_edits(&instance, &moving(&MOVES[0], Some("edited")), "Feature").await;
+            assert_eq!(
+                address_at(
+                    &instance,
+                    &staged_onto(&instance, base, feature, true).await,
+                    MOVES[0].to
+                )
+                .await,
+                address_at(
+                    &instance,
+                    &revision_state(&instance, feature).await,
+                    MOVES[0].to
+                )
+                .await
+            );
+        },
+    )
+    .await;
+}
+
+/// `lore revision restore` of a revision from before a move that edited the file stages the file
+/// where the revision held it with the content it held.
+#[tokio::test(flavor = "multi_thread")]
+async fn restoring_across_an_edited_move_takes_the_restored_content() {
+    run(
+        "restoring_across_an_edited_move_takes_the_restored_content",
+        &TREE,
+        |instance| async move {
+            let restored = current(&instance).await;
+            let moved = commit_edits(&instance, &moving(&MOVES[0], Some("edited")), "Move").await;
+            assert_eq!(
+                address_at(
+                    &instance,
+                    &staged_onto(&instance, moved, restored, false).await,
+                    MOVES[0].from
+                )
+                .await,
+                address_at(
+                    &instance,
+                    &revision_state(&instance, restored).await,
+                    MOVES[0].from
+                )
+                .await
+            );
+        },
+    )
+    .await;
 }

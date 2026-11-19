@@ -28,7 +28,6 @@ use crate::helper::in_memory;
 use crate::helper::in_memory::add;
 use crate::helper::in_memory::branch_id;
 use crate::helper::in_memory::commit;
-use crate::helper::in_memory::directory;
 use crate::helper::in_memory::file;
 use crate::helper::in_memory::revision_state;
 use crate::helper::test_store_create;
@@ -60,6 +59,14 @@ fn added_at(path: &str, version: u64) -> Node {
         version,
     ));
     node
+}
+
+/// A directory named `name` with mode 0, the mode staging gives a directory.
+fn directory_as_staged(name: &str) -> Node {
+    Node {
+        mode: 0,
+        ..in_memory::directory(name)
+    }
 }
 
 /// What [`file_at`] holds, with `mode`.
@@ -116,14 +123,21 @@ async fn base(repository: &Arc<RepositoryContext>) -> Hash {
         &state,
         repository.clone(),
         ROOT_NODE,
-        directory("Dir"),
+        directory_as_staged("Dir"),
         "Dir",
     )
     .await;
     for name in ["a.txt", "b.txt"] {
         add(&state, repository.clone(), parent, file_at(name, 1), name).await;
     }
-    let sub = add(&state, repository.clone(), parent, directory("Sub"), "Sub").await;
+    let sub = add(
+        &state,
+        repository.clone(),
+        parent,
+        directory_as_staged("Sub"),
+        "Sub",
+    )
+    .await;
     add(
         &state,
         repository.clone(),
@@ -193,7 +207,7 @@ async fn edited(repository: &Arc<RepositoryContext>, base: Hash, edits: &[Edit])
                     &state,
                     repository.clone(),
                     ROOT_NODE,
-                    directory("Bulk"),
+                    directory_as_staged("Bulk"),
                     "Bulk",
                 )
                 .await;
@@ -300,9 +314,14 @@ async fn diff_with(
 /// the stored result.
 async fn apply(repository: &Arc<RepositoryContext>, diff: &DiffResult) -> Hash {
     let merged = revision_state(repository, diff.target).await;
-    merge_tree_changes(repository.clone(), merged.clone(), &diff.changes)
-        .await
-        .expect("applying the changes");
+    merge_tree_changes(
+        repository.clone(),
+        merged.clone(),
+        &revision_state(repository, diff.source).await,
+        &mut diff.changes.clone(),
+    )
+    .await
+    .expect("applying the changes");
     merged
         .serialize(repository.clone(), &in_memory::token())
         .await
@@ -1627,7 +1646,7 @@ async fn a_change_alike_where_a_move_puts_it_stands_only_with_the_alike_changes(
 }
 
 /// The target revision with the move of `Dir/a.txt` to `Dir/z.txt` a fast-forward merge applied
-/// onto an edit of `Other.txt`, which gives the moved file another node.
+/// onto an edit of `Other.txt`, which keeps the moved file's node.
 async fn fast_forward_moved(repository: &Arc<RepositoryContext>, base: Hash) -> Hash {
     let moved = edited(repository, base, &[Edit::Move("Dir/a.txt", "Dir/z.txt")]).await;
     let other = edited(repository, base, &[Edit::Write("Other.txt", 2)]).await;
@@ -1635,7 +1654,7 @@ async fn fast_forward_moved(repository: &Arc<RepositoryContext>, base: Hash) -> 
         .await
         .expect("diffing the revisions");
     let target = apply(repository, &fast_forward).await;
-    assert_ne!(
+    assert_eq!(
         node_at(
             repository,
             &*revision_state(repository, target).await,
@@ -1648,58 +1667,55 @@ async fn fast_forward_moved(repository: &Arc<RepositoryContext>, base: Hash) -> 
             "Dir/a.txt"
         )
         .await,
-        "the fast-forward merge gives the moved file another node"
+        "the fast-forward merge keeps the moved file's node"
     );
     target
 }
 
-/// A move the target received through a fast-forward merge, which gives the moved file another
-/// node, is a delete and an add to the 3-way diff: an edit against it conflicts where the file
-/// stood, the same move with an edit conflicts where the move put the file, and the same move
-/// alone, or a delete, leaves the target's tree.
+/// A move a fast-forward merge applied diffs as a committed move: an edit against it, the same
+/// move with an edit, the same move alone and a delete diff against it as against a target that
+/// commits the move, and merge into the same files.
 #[tokio::test]
-async fn a_move_a_fast_forward_merge_applied_is_a_delete_and_an_add() {
+async fn a_move_a_fast_forward_merge_applied_is_a_move() {
     run(|repository| async move {
         let base = base(&repository).await;
         let target = fast_forward_moved(&repository, base).await;
         let movement = Edit::Move("Dir/a.txt", "Dir/z.txt");
-        let deleted = "Delete Dir/a.txt <- Dir/a.txt";
-        for (source, changes, conflicts) in [
-            (
-                vec![Edit::Write("Dir/a.txt", 3)],
-                vec![],
-                vec![("Dir/a.txt", "Dir/a.txt")],
-            ),
-            (
-                vec![movement, Edit::Write("Dir/z.txt", 3)],
-                vec![deleted],
-                vec![("Dir/z.txt", "Dir/z.txt")],
-            ),
-            (vec![movement], vec![deleted], vec![]),
-            (vec![Edit::Delete("Dir/a.txt")], vec![], vec![]),
+        let committed = edited(&repository, base, &[Edit::Write("Other.txt", 2), movement]).await;
+        for source in [
+            vec![Edit::Write("Dir/a.txt", 3)],
+            vec![movement, Edit::Write("Dir/z.txt", 3)],
+            vec![movement],
+            vec![Edit::Delete("Dir/a.txt")],
         ] {
             let revision = edited(&repository, base, &source).await;
-            let diff = diff3_collect(repository.clone(), base, revision, target, None, false)
-                .await
-                .expect("diffing the revisions");
-            assert_eq!(
-                outcome(&diff),
-                (
-                    changes.iter().map(|change| change.to_string()).collect(),
-                    conflicts
-                        .iter()
-                        .map(|(source, target)| (source.to_string(), target.to_string()))
-                        .collect()
-                ),
-                "{source:?}"
-            );
-            if conflicts.is_empty() {
-                let merged = apply(&repository, &diff).await;
+            let [diff, expected] = [target, committed].map(|target| {
+                let repository = repository.clone();
+                async move {
+                    diff3_collect(repository, base, revision, target, None, false)
+                        .await
+                        .expect("diffing the revisions")
+                }
+            });
+            let (diff, expected) = (diff.await, expected.await);
+            assert_eq!(outcome(&diff), outcome(&expected), "{source:?}");
+            if diff.conflicts.is_empty() {
+                let [merged, expected] = [&diff, &expected].map(|diff| apply(&repository, diff));
                 assert_eq!(
                     files(
-                        &contents(&repository, &*revision_state(&repository, merged).await).await
+                        &contents(
+                            &repository,
+                            &*revision_state(&repository, merged.await).await
+                        )
+                        .await
                     ),
-                    files_after(&repository, &[Edit::Write("Other.txt", 2), movement]).await,
+                    files(
+                        &contents(
+                            &repository,
+                            &*revision_state(&repository, expected.await).await
+                        )
+                        .await
+                    ),
                     "{source:?}"
                 );
             }
@@ -1789,9 +1805,14 @@ async fn a_fast_forward_merge_stores_the_tree_a_commit_stores() {
 /// target's addresses, and each deleted node kept, staged for deletion.
 async fn apply_unfrozen(repository: &Arc<RepositoryContext>, diff: &DiffResult) -> Hash {
     let merged = revision_state(repository, diff.target).await;
-    apply_tree_changes(repository.clone(), merged.clone(), &diff.changes)
-        .await
-        .expect("applying the changes");
+    apply_tree_changes(
+        repository.clone(),
+        merged.clone(),
+        &revision_state(repository, diff.source).await,
+        &mut diff.changes.clone(),
+    )
+    .await
+    .expect("applying the changes");
     merged
         .serialize(repository.clone(), &in_memory::token())
         .await
@@ -2293,7 +2314,14 @@ async fn deep_base(repository: &Arc<RepositoryContext>) -> Hash {
     let base = base(repository).await;
     let state = revision_state(repository, base).await;
     let sub = node_at(repository, &state, "Dir/Sub").await;
-    let deep = add(&state, repository.clone(), sub, directory("Deep"), "Deep").await;
+    let deep = add(
+        &state,
+        repository.clone(),
+        sub,
+        directory_as_staged("Deep"),
+        "Deep",
+    )
+    .await;
     add(
         &state,
         repository.clone(),
@@ -2884,14 +2912,15 @@ async fn linked_revision(linked: &Arc<RepositoryContext>, name: &str) -> Hash {
 /// The revision renaming the link of `base` at `Mount` to `mount` and pinning it to `pin`.
 async fn renamed_and_pinned(repository: &Arc<RepositoryContext>, base: Hash, pin: Hash) -> Hash {
     let state = revision_state(repository, base).await;
-    stage_renamed_and_pinned(repository, &state, LinkPin::Revision(pin)).await;
+    stage_renamed_and_pinned(repository, &state, "mount", LinkPin::Revision(pin)).await;
     commit(repository, &state, base, branch_id()).await
 }
 
-/// Renames the link of `state` at `Mount` to `mount` and gives it `pin`, staged.
+/// Renames the link of `state` at `Mount` to `name` and gives it `pin`, staged.
 async fn stage_renamed_and_pinned(
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
+    name: &str,
     pin: LinkPin,
 ) {
     let link = node_at(repository, state, "Mount").await;
@@ -2900,7 +2929,7 @@ async fn stage_renamed_and_pinned(
             repository.clone(),
             link,
             ROOT_NODE,
-            ("mount", hash_string("mount")),
+            (name, hash_string(name)),
             &state.moves_permit().await.expect("the moves permit"),
             false,
         )
@@ -2921,6 +2950,75 @@ async fn stage_renamed_and_pinned(
         )
         .await
         .expect("staging the pin");
+}
+
+/// A link the source renames, only in case or to another name, and pins to another revision of a
+/// repository the reader may not read takes the pin through a fast-forward merge, which its row in
+/// the link registry names. Renamed only in case, it keeps its node. Renamed to another name, the
+/// 2-way diff pairs no move of it, so the 3-way diff reports a delete and an add.
+#[tokio::test]
+async fn a_link_moved_and_repinned_takes_the_pin() {
+    run(|repository| async move {
+        let (id, linked) = linked_repository(&repository).await;
+        let (base_pin, pin) = (
+            linked_revision(&linked, "base.txt").await,
+            linked_revision(&linked, "x.txt").await,
+        );
+        let repository = Arc::new(
+            repository
+                .to_filter_context(repository.filter.clone())
+                .with_link_read(Arc::new(|_| false)),
+        );
+        let state = State::new();
+        add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            link_to(id, base_pin),
+            "Mount",
+        )
+        .await;
+        add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            file_at("Other.txt", 1),
+            "Other.txt",
+        )
+        .await;
+        let base = commit(&repository, &state, Hash::default(), branch_id()).await;
+        let target = edited(&repository, base, &[Edit::Write("Other.txt", 3)]).await;
+        let held = node_at(
+            &repository,
+            &*revision_state(&repository, target).await,
+            "Mount",
+        )
+        .await;
+        for name in ["mount", "Linked"] {
+            let source_state = revision_state(&repository, base).await;
+            stage_renamed_and_pinned(&repository, &source_state, name, LinkPin::Revision(pin))
+                .await;
+            let source = commit(&repository, &source_state, base, branch_id()).await;
+            let diff = diff3_collect(repository.clone(), base, source, target, None, false)
+                .await
+                .expect("diffing the revisions");
+            assert!(diff.conflicts.is_empty(), "{name}: {:?}", outcome(&diff));
+            let merged = revision_state(&repository, apply(&repository, &diff).await).await;
+            let node = node_at(&repository, &merged, name).await;
+            assert_eq!(node == held, name == "mount", "{name}");
+            let link = merged
+                .node(repository.clone(), node)
+                .await
+                .expect("reading the link");
+            assert_eq!(link.address.hash, pin, "{name}");
+            let row = merged
+                .link_find(repository.clone(), RepositoryId::from(id), node)
+                .await
+                .expect("finding the link's row");
+            assert_eq!(row.signature, pin, "{name}");
+        }
+    })
+    .await;
 }
 
 /// The same rename of a link that only changes case on both sides conflicts where the two pin it to
@@ -3273,7 +3371,7 @@ async fn a_link_renamed_only_in_case_and_repinned_is_one_change_where_the_walk_s
         let renamed = vec!["Move mount <- Mount".to_string()];
         for (reader, pin) in [(unreadable, repinned), (repository.clone(), remounted)] {
             let source_state = revision_state(&reader, base).await;
-            stage_renamed_and_pinned(&reader, &source_state, pin).await;
+            stage_renamed_and_pinned(&reader, &source_state, "mount", pin).await;
             let source = commit(&reader, &source_state, base, branch_id()).await;
             let source_state = revision_state(&reader, source).await;
             let link = source_state
@@ -3310,7 +3408,7 @@ async fn a_link_renamed_only_in_case_and_repinned_is_one_change_where_the_walk_s
             assert_eq!(merged.get("Other.txt"), Some(&content(3, 0o644)));
         }
         let staged = revision_state(&repository, base).await;
-        stage_renamed_and_pinned(&repository, &staged, LinkPin::Revision(pin)).await;
+        stage_renamed_and_pinned(&repository, &staged, "mount", LinkPin::Revision(pin)).await;
         assert_eq!(
             walked(&walk(&repository, revision_state(&repository, base).await, staged).await),
             renamed

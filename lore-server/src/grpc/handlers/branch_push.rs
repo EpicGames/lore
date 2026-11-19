@@ -1383,13 +1383,13 @@ async fn try_fast_forward_merge(
             %original_base, %incoming_revision, %current_head,
             "Computing diff3 for fast-forward merge"
         );
-        let diff_result = lore_revision::revision::diff3_collect(
+        let mut diff_result = lore_revision::revision::diff3_collect(
             repository.clone(),
             original_base,
             incoming_revision,
             current_head,
             None,
-            false,
+            true,
         )
         .await
         .filter_slow_down()?
@@ -1429,7 +1429,8 @@ async fn try_fast_forward_merge(
         lore_revision::commit::merge_tree_changes(
             repository.clone(),
             state_current.clone(),
-            &diff_result.changes,
+            &incoming_state,
+            &mut diff_result.changes,
         )
         .await
         .filter_slow_down()?
@@ -1439,11 +1440,6 @@ async fn try_fast_forward_merge(
             ))
         })?;
 
-        // Set parents: self=current head (target branch), other=incoming merge revision
-        state_current.set_parent_self(current_head);
-        state_current.set_parent_other(incoming_revision);
-
-        // Compute revision number from both parents
         let parent_state = State::deserialize(repository.clone(), current_head)
             .await
             .filter_slow_down()?
@@ -1451,11 +1447,7 @@ async fn try_fast_forward_merge(
                 Status::internal(format!("Failed to load current head state: {err}"))
             })?;
 
-        let revision_number = next_revision_number(
-            parent_state.revision_number(),
-            incoming_state.revision_number(),
-        );
-        state_current.set_revision_number(revision_number);
+        let revision_number = state_current.revision_number();
 
         // Copy metadata from the incoming revision and set merged-by to "server"
         let incoming_metadata_hash = incoming_state.metadata_hash();

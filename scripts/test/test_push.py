@@ -379,7 +379,8 @@ def test_push_fast_forward_merge_case_rename(new_lore_repo):
     """A fast-forward merge of a revision that renames a directory only in case
     keeps the new name and every file below it, an instance that pushed the
     other side renames the directory on disk when it syncs, and a revision
-    committed on top of the merge records no move."""
+    committed on top of the merge records no move. The follow-up stages online,
+    as a sync doesn't cache the file metadata blocks an offline stage reads."""
     repo: Lore = new_lore_repo()
     repo.make_dirs("Docs")
     for path in ["Config.txt", "Docs/Guide.txt", "Docs/notes.txt"]:
@@ -411,7 +412,7 @@ def test_push_fast_forward_merge_case_rename(new_lore_repo):
 
     with repo.open_file("follow.txt", "w+") as f:
         f.write("follow\n")
-    repo.stage(scan=True, offline=True)
+    repo.stage(scan=True)
     repo.commit("Follow-up", offline=True)
     deltas = parse_jsonl(
         repo.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
@@ -758,3 +759,74 @@ def test_push_uploads_a_line_merged_into_a_merged_line(new_lore_repo):
         assert input_file.read() == "side\n", (
             f"revision {side_commit} realized the wrong content"
         )
+
+
+@pytest.mark.smoke
+def test_push_fast_forward_merge_records_the_merge_a_client_records(new_lore_repo):
+    """A fast-forward merge of a revision that moves a file and edits another, onto a
+    latest that edits a third, records what a client merge records: a second instance
+    that syncs holds the merged tree, the moved file's history records the move at the
+    merge revision and the add before it, the pushed edit is recorded at the merge
+    revision and the edit on latest at latest, and the merge revision's delta records
+    the move and the pushed edit and nothing the latest already holds."""
+    repo: Lore = new_lore_repo()
+    repo.make_dirs("Dir")
+    for path in ["Dir/a.txt", "Dir/b.txt", "Top.txt"]:
+        with repo.open_file(path, "w+") as f:
+            f.write(f"{path}\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit("Base", offline=True)
+    repo.push()
+    base = repo.revision_info().signature
+
+    other = repo.clone()
+    with other.open_file("Top.txt", "w+") as f:
+        f.write("latest\n")
+    other.stage(scan=True, offline=True)
+    other.commit("Edit on latest", offline=True)
+    other.push()
+    latest = other.revision_info().signature
+
+    repo.move("Dir/a.txt", "Dir/z.txt")
+    repo.file_stage_move("Dir/a.txt", "Dir/z.txt", offline=True)
+    with repo.open_file("Dir/b.txt", "w+") as f:
+        f.write("pushed\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit("Move and edit", offline=True)
+    pushed = repo.revision_info().signature
+    repo.push(fast_forward_merge=True)
+
+    other.sync()
+    merged = other.revision_info()
+    assert merged.merge.split() == [latest, pushed]
+    assert _collect_repo_files(other) == {"Dir/z.txt", "Dir/b.txt", "Top.txt"}
+    with other.open_file("Dir/b.txt", "r") as f:
+        assert f.read() == "pushed\n"
+    with other.open_file("Top.txt", "r") as f:
+        assert f.read() == "latest\n"
+
+    def history(path: str) -> list[tuple[str, str, str, str]]:
+        entries = parse_jsonl(other.file_history(path, json=True), "fileHistory")
+        return [
+            (entry["revision"], entry["action"], entry["path"], entry["fromPath"])
+            for entry in entries
+        ]
+
+    assert history("Dir/z.txt") == [
+        (merged.signature, "move", "Dir/z.txt", "Dir/a.txt"),
+        (base, "add", "Dir/a.txt", ""),
+    ]
+    assert [entry[0] for entry in history("Dir/b.txt")] == [merged.signature, base]
+    assert [entry[0] for entry in history("Top.txt")] == [latest, base]
+
+    deltas = parse_jsonl(
+        other.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
+    )
+    files = {
+        delta["path"]: (delta["action"], delta["fromPath"])
+        for delta in deltas
+        if delta["path"] in ("Dir/z.txt", "Dir/b.txt", "Top.txt")
+    }
+    assert files["Dir/z.txt"] == ("move", "Dir/a.txt"), deltas
+    assert "Dir/b.txt" in files, deltas
+    assert "Top.txt" not in files, deltas

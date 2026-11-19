@@ -2693,7 +2693,7 @@ async fn rehash_and_record_delta(
         .forward::<CommitError>("Failed to update tree root hash")?;
     lore_debug!("Rehashed merkle tree");
 
-    generate_delta_block(repository, state, delta, tracker).await
+    generate_delta_block(repository, state, delta, Some(tracker)).await
 }
 
 /// Rehashes the whole of `state` under one filesystem operation, answering with the modified
@@ -6233,11 +6233,12 @@ fn delta_retain(delta: &mut BytesMut, keeps: impl Fn(NodeID) -> bool) {
     delta.truncate(kept);
 }
 
+/// Writes `delta` as the node delta of `state`, through `tracker` where given.
 async fn generate_delta_block(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     delta: Arc<parking_lot::RwLock<BytesMut>>,
-    tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+    tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
 ) -> Result<(), CommitError> {
     let delta = {
         let mut lock = delta.write();
@@ -6253,7 +6254,7 @@ async fn generate_delta_block(
             immutable::write_options_from_repository(repository.clone())
                 .with_local_cache_priority()
                 .with_max_size_chunk(),
-            Some(tracker),
+            tracker,
         )
         .await
         .forward::<CommitError>("Failed writing delta block to immutable store")?
@@ -6382,6 +6383,9 @@ pub(crate) async fn weave_history(
             )?
             .to_aligned::<NodeDelta>();
         let delta_slice = delta_buffer.as_type_slice::<NodeDelta>();
+        // The last block read is held into the next entry, so that entries sharing a block of the
+        // parent read it once: nothing else holds the parent's blocks.
+        let mut held = None;
         for (idelta, delta) in delta_slice.iter().enumerate() {
             if delta.flags & change::Flags::Merge != 0 {
                 if delta.action == FileAction::Delete as u16 {
@@ -6413,6 +6417,7 @@ pub(crate) async fn weave_history(
                     .forward::<CommitError>("Failed deserializing file metadata block")?;
 
                 let merge_metadata = *file_metadata_block.read().node(node_index);
+                held = Some(file_metadata_block);
 
                 let metadata_node = node::node_to_file_metadata(node_id);
                 let block_index = NodeFileMetadataBlock::index(metadata_node);
@@ -6448,6 +6453,8 @@ pub(crate) async fn weave_history(
                 }
             }
         }
+
+        drop(held);
 
         // Then weave in the node delta of the revision being merged in (again, other parent)
         let delta_buffer = state_parent
@@ -8173,39 +8180,49 @@ async fn freeze_in_memory_tree(
     stats: Arc<CommitStats>,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
 ) -> Result<(), CommitError> {
-    let delta = freeze_tree(repository.clone(), state.clone(), Some(base), stats).await?;
-    generate_delta_block(repository, state, delta, tracker).await
+    let delta = freeze_tree(repository.clone(), state.clone(), base, stats).await?;
+    generate_delta_block(repository, state, delta, Some(tracker)).await
 }
 
 /// Applies `changes`, the conflict-free changes of a 3-way diff, to `state`, the tree of the
-/// revision they merge onto, and freezes the result into the tree a revision records: nodes staged
-/// for deletion discarded, change flags cleared and every changed directory rehashed. The state
-/// keeps the delta block it was loaded with.
+/// revision they merge onto, and commits the result as `lore branch merge` commits it
+/// ([`state::apply_tree_changes`]): the revision `state` was loaded from its first parent and
+/// `source`, the revision merged in, its second, the tree frozen against the first parent, the node
+/// delta of the merge written as the state's own, the file history of both parent lines woven
+/// from it, and the revision numbered one above the higher of its parents.
 pub async fn merge_tree_changes(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
-    changes: &[change::NodeChange],
+    source: &Arc<State>,
+    changes: &mut [change::NodeChange],
 ) -> Result<(), CommitError> {
-    state::apply_tree_changes(repository.clone(), state.clone(), changes)
+    state.set_parent_self(state.revision());
+    state.set_parent_other(source.revision());
+    state::apply_tree_changes(repository.clone(), state.clone(), source, changes)
         .await
         .forward_any::<CommitError>("applying the merged changes")?;
-    freeze_tree(repository, state, None, CommitStats::new()).await?;
-    Ok(())
+    let delta = freeze_tree(
+        repository.clone(),
+        state.clone(),
+        state.parent_self(),
+        CommitStats::new(),
+    )
+    .await?;
+    generate_delta_block(repository.clone(), state.clone(), delta, None).await?;
+    weave_history(repository, state, BasedOn::FirstParent).await
 }
 
 /// Freeze a staged tree whose every leaf carries its address into the shape a revision records:
 /// dirty tracking pruned against `base`, the revision the tree shares its node IDs with, staged
 /// deletions discarded, staged files and links cleared of their change flags and every affected
-/// directory rehashed. Answers the node delta of the changes, which records no deletion for a
-/// caller that keeps no delta and gives no `base`; such a tree is pruned against the revision it
-/// was loaded from.
+/// directory rehashed. Answers the node delta of the changes.
 ///
 /// Only a tree holding a dirty mark takes the prune, boxed: every dirty mark marks a child of the
 /// root, and no mark the root itself. The tree a merge applies its changes to holds none.
 async fn freeze_tree(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
-    base: Option<Hash>,
+    base: Hash,
     stats: Arc<CommitStats>,
 ) -> Result<Arc<parking_lot::RwLock<BytesMut>>, CommitError> {
     let dirty = state
@@ -8216,7 +8233,7 @@ async fn freeze_tree(
         Box::pin(prune_dirty_for_commit(
             state.clone(),
             repository.clone(),
-            base.unwrap_or_else(|| state.committed_revision()),
+            base,
         ))
         .await?;
     }
@@ -8248,9 +8265,7 @@ async fn freeze_tree(
     commit_discard(
         repository.clone(),
         state.clone(),
-        base.map_or(DeletionBase::Unrecorded, |base| {
-            DeletionBase::of(base, Hash::default(), BasedOn::FirstParent)
-        }),
+        DeletionBase::of(base, Hash::default(), BasedOn::FirstParent),
         (&RelativePath::new(), ROOT_NODE),
         delta.clone(),
         &discard,

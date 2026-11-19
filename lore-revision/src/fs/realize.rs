@@ -54,7 +54,6 @@ use crate::node::NodeFileMode;
 use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeIDExt;
-use crate::node::NodeLink;
 use crate::node::ROOT_NODE;
 use crate::progress::DEFAULT_WORK_CHANNEL_CAPACITY;
 use crate::repository::BASE_SUFFIX;
@@ -2800,56 +2799,8 @@ pub fn realize_changes<'a>(
         .await?;
         lore_debug!("Deleted paths realized");
 
-        // For an incoming change that introduces a destination path whose parent
-        // directory is absent from the staged Merkle state (e.g. the current
-        // branch deleted the parent), pre-stage the missing ancestors as
-        // directory nodes so `stage_single_node` for the change resolves its
-        // parent. Mirrors the ancestor staging done in `realize_conflicts`.
-        // Only Add, Move, and Copy need this: those actions introduce a
-        // destination path that the target snapshot need not contain. A Modify
-        // on a path beneath a target-deleted directory always pairs with the
-        // target's delete as a conflict and is routed through the conflict
-        // realization path instead. `change.path` is the destination for Move
-        // and Copy (the source location is irrelevant for ancestor staging).
         if let Some(state_stage) = state_stage.as_ref() {
-            let mut parent_paths: Vec<RelativePath> = Vec::new();
-            for change in changes.iter() {
-                if !matches!(
-                    change.action,
-                    change::FileAction::Add | change::FileAction::Move | change::FileAction::Copy
-                ) {
-                    continue;
-                }
-                if let Some(parent) = change.path().parent() {
-                    parent_paths.push(
-                        RelativePath::new_from_initial_path(parent)
-                            .expect("parent derived from valid change path"),
-                    );
-                }
-            }
-
-            let stage_flags = if is_merge {
-                NodeFlags::StagedMerge.bits()
-            } else {
-                NodeFlags::NoFlags.bits()
-            };
-            for stage_path in expand_path_ancestors(parent_paths) {
-                let node = Node {
-                    flags: stage_flags,
-                    ..Default::default()
-                };
-                stage::stage_single_node(
-                    repository.clone(),
-                    state_stage.clone(),
-                    stage_path,
-                    node,
-                    Arc::default(),
-                    None,
-                    FilterMode::empty(),
-                )
-                .await
-                .forward::<SyncError>("Failed to stage change")?;
-            }
+            stage_destination_ancestors(&repository, state_stage, &changes, is_merge).await?;
         }
 
         // Channel pipeline for add/modify changes
@@ -3373,47 +3324,14 @@ async fn realize_changes_delete(
             .send();
         }
 
-        if let Some(state_stage) = state_stage.clone() {
-            let node_link = match state_stage
-                .find_node_link(
-                    change.from.mapping.repository.clone(),
-                    change.path().as_str(),
-                )
-                .await
-            {
-                Ok(node_link) => node_link,
-                Err(e) if e.is_node_not_found() => NodeLink::invalid(),
-                Err(err) => Err(err).forward::<SyncError>("Failed to stage change")?,
-            };
-
-            if node_link.is_valid() {
-                stage::stage_delete(
-                    change.from.mapping.repository.clone(),
-                    state_stage.clone(),
-                    change.path().clone(),
-                    node_link.node,
-                    if is_merge {
-                        NodeFlags::StagedMerge
-                    } else {
-                        NodeFlags::NoFlags
-                    },
-                    Arc::new(stage::StageStats::default()),
-                    None, // TODO(vri): UCS-18008 - Investigate link tracking for sync/realize_changes
-                )
-                .await
-                .forward::<SyncError>("Failed to stage change")?;
-
-                if is_link {
-                    state_stage
-                        .link_remove_if_present(
-                            change.from.mapping.repository.clone(),
-                            change.from.address.context.into(),
-                            node_link.node,
-                        )
-                        .await
-                        .forward::<SyncError>("Failed to remove link from the link registry")?;
-                }
-            }
+        if let Some(state_stage) = &state_stage {
+            stage_realized_delete(
+                &change.from.mapping.repository,
+                state_stage,
+                &change,
+                is_merge,
+            )
+            .await?;
         }
 
         if !deleted {
@@ -3939,15 +3857,11 @@ pub(crate) fn report_kept_renames(kept: &KeptRenames) {
 ///
 /// A move whose rename fails takes the entry the working tree holds its source in under another
 /// spelling, where the view holds the source ([`rename_held_spelling`]), against what `moves`
-/// holds for the realize, and otherwise recovers as [`recover_refused_move`] describes. A move is
-/// staged
-/// by moving the node the staged tree holds, which keeps the bit that node held, so a moved file
-/// is given the change's bit ([`carry_staged_mode`]): a commit records the staged bit where it
-/// reads none from the working tree.
+/// holds for the realize, and otherwise recovers as [`recover_refused_move`] describes. The change
+/// is staged as [`stage_realized_change`] describes.
 ///
-/// Cloning an added link and recording a staged link in the registry are boxed. Only a link
-/// reaches them, and inline they would make the future of every change realized as large as
-/// theirs.
+/// Cloning an added link is boxed. Only a link reaches it, and inline it would make the future of
+/// every change realized as large as its own.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -4066,67 +3980,15 @@ fn realize_change_modify_add<'a>(
             }
         }
 
-        if let Some(state_stage) = state_stage.clone() {
-            if change.action == change::FileAction::Move
-                && let Some(from_path) = change.move_source()
-            {
-                let from_node = state_stage
-                    .find_node_link(repository.clone(), from_path.as_str())
-                    .await
-                    .forward::<SyncError>("Failed to stage change")?
-                    .node;
-                relink_moved_node(
-                    &state_stage,
-                    &repository,
-                    from_path,
-                    from_node,
-                    path,
-                    moves.merge_current.is_some(),
-                )
-                .await?;
-                if node.is_file() {
-                    carry_staged_mode(&state_stage, &repository, from_node, node.mode)
-                        .await
-                        .forward::<SyncError>("Failed to stage change")?;
-                }
-            } else {
-                let mut node = node;
-                if moves.merge_current.is_some() {
-                    node.flags |= NodeFlags::StagedMerge;
-                    // A directory the incoming side adds is staged as an add, including one
-                    // that already stands in the staged tree as the parent of an add below it.
-                    if change.action == change::FileAction::Add && node.is_directory() {
-                        node.flags |= NodeFlags::StagedAdd;
-                    }
-                }
-                if change.action == change::FileAction::Move {
-                    node.flags &= !NodeFlags::StagedAdd;
-                    node.flags |= NodeFlags::StagedMove;
-                }
-
-                let staged_node = stage::stage_single_node(
-                    repository.clone(),
-                    state_stage.clone(),
-                    change.path().clone(),
-                    node,
-                    Arc::new(stage::StageStats::default()),
-                    None, // TODO(vri): UCS-18008 - Investigate link tracking for sync/realize_changes
-                    FilterMode::View,
-                )
-                .await
-                .forward::<SyncError>("Failed to stage change")?;
-
-                if node.is_link() && staged_node.node.is_valid_node_id() {
-                    Box::pin(stage_link_registry_entry(
-                        &repository,
-                        &state_stage,
-                        &change,
-                        node,
-                        staged_node.node,
-                    ))
-                    .await?;
-                }
-            }
+        if let Some(state_stage) = &state_stage {
+            stage_realized_change(
+                &repository,
+                state_stage,
+                &change,
+                node,
+                moves.merge_current.is_some(),
+            )
+            .await?;
         }
 
         Ok(())
@@ -4239,6 +4101,190 @@ pub(crate) async fn relink_moved_node(
     }
 
     Ok(new_parent_id)
+}
+
+/// Stages in `state_stage` the directories above the destination of each add, move and copy of
+/// `changes`, as a merge stages them where `is_merge` says, so that the change finds its parent
+/// where the staged tree lacks it, as when the current branch deleted it. A modify below a deleted
+/// directory pairs with the delete as a conflict and needs none.
+pub(crate) async fn stage_destination_ancestors(
+    repository: &Arc<RepositoryContext>,
+    state_stage: &Arc<State>,
+    changes: &[NodeChange],
+    is_merge: bool,
+) -> Result<(), SyncError> {
+    let parent_paths = changes
+        .iter()
+        .filter(|change| {
+            matches!(
+                change.action,
+                change::FileAction::Add | change::FileAction::Move | change::FileAction::Copy
+            ) && change.path().parent().is_some()
+        })
+        .map(|change| change.path().parent_path())
+        .collect();
+    let flags = if is_merge {
+        NodeFlags::StagedMerge.bits()
+    } else {
+        NodeFlags::NoFlags.bits()
+    };
+    for stage_path in expand_path_ancestors(parent_paths) {
+        stage::stage_single_node(
+            repository.clone(),
+            state_stage.clone(),
+            stage_path,
+            Node {
+                flags,
+                ..Default::default()
+            },
+            Arc::default(),
+            None,
+            FilterMode::empty(),
+        )
+        .await
+        .forward::<SyncError>("Failed to stage change")?;
+    }
+    Ok(())
+}
+
+/// Stages in `state_stage` the delete `change` realizes, as a merge stages it where `is_merge`
+/// says: the node at its path, where the staged tree holds one, staged for deletion, and a link
+/// taken out of the link registry.
+pub(crate) async fn stage_realized_delete(
+    repository: &Arc<RepositoryContext>,
+    state_stage: &Arc<State>,
+    change: &NodeChange,
+    is_merge: bool,
+) -> Result<(), SyncError> {
+    let node_link = match state_stage
+        .find_node_link(repository.clone(), change.path().as_str())
+        .await
+    {
+        Ok(node_link) => node_link,
+        Err(e) if e.is_node_not_found() => return Ok(()),
+        Err(err) => return Err(err).forward::<SyncError>("Failed to stage change"),
+    };
+    if !node_link.is_valid() {
+        return Ok(());
+    }
+
+    stage::stage_delete(
+        repository.clone(),
+        state_stage.clone(),
+        change.path().clone(),
+        node_link.node,
+        if is_merge {
+            NodeFlags::StagedMerge
+        } else {
+            NodeFlags::NoFlags
+        },
+        Arc::new(stage::StageStats::default()),
+        None, // TODO(vri): UCS-18008 - Investigate link tracking for sync/realize_changes
+    )
+    .await
+    .forward::<SyncError>("Failed to stage change")?;
+
+    if change.from.is_link() {
+        state_stage
+            .link_remove_if_present(
+                repository.clone(),
+                change.from.address.context.into(),
+                node_link.node,
+            )
+            .await
+            .forward::<SyncError>("Failed to remove link from the link registry")?;
+    }
+    Ok(())
+}
+
+/// Stages in `state_stage` the add, modify or move `change` realizes, `node` being the node its
+/// `to` side names with the mode it states, as a merge stages it where `is_merge` says.
+///
+/// A move relinks the staged node ([`relink_moved_node`]), which keeps its identity and the nodes
+/// below it. A moved file or link the move modifies then takes `node`'s content, and one it does
+/// not keeps the staged node's, a file taking the change's executable bit
+/// ([`carry_staged_mode`]). Any other change stages `node` at the change's path, a merge's with
+/// `StagedMerge` and a directory a merge adds with `StagedAdd`.
+///
+/// Recording a staged link in the registry is boxed: only a link reaches it, and inline it would
+/// make the future of every change staged as large as its own.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub(crate) fn stage_realized_change<'a>(
+    repository: &'a Arc<RepositoryContext>,
+    state_stage: &'a Arc<State>,
+    change: &'a NodeChange,
+    mut node: Node,
+    is_merge: bool,
+) -> impl Future<Output = Result<(), SyncError>> + 'a {
+    async move {
+        let path = change.path();
+        if change.action == change::FileAction::Move
+            && let Some(from_path) = change.move_source()
+        {
+            let from_node = state_stage
+                .find_node_link(repository.clone(), from_path.as_str())
+                .await
+                .forward::<SyncError>("Failed to stage change")?
+                .node;
+            relink_moved_node(
+                state_stage,
+                repository,
+                from_path,
+                from_node,
+                path,
+                is_merge,
+            )
+            .await?;
+            if node.is_directory() {
+                return Ok(());
+            }
+            if !change.flags.contains(change::Flags::Modify) {
+                if node.is_file() {
+                    carry_staged_mode(state_stage, repository, from_node, node.mode)
+                        .await
+                        .forward::<SyncError>("Failed to stage change")?;
+                }
+                return Ok(());
+            }
+        }
+
+        if is_merge {
+            node.flags |= NodeFlags::StagedMerge;
+            if change.action == change::FileAction::Add && node.is_directory() {
+                node.flags |= NodeFlags::StagedAdd;
+            }
+        }
+        if change.action == change::FileAction::Move {
+            node.flags &= !NodeFlags::StagedAdd;
+            node.flags |= NodeFlags::StagedMove;
+        }
+
+        let staged_node = stage::stage_single_node(
+            repository.clone(),
+            state_stage.clone(),
+            path.clone(),
+            node,
+            Arc::new(stage::StageStats::default()),
+            None, // TODO(vri): UCS-18008 - Investigate link tracking for sync/realize_changes
+            FilterMode::View,
+        )
+        .await
+        .forward::<SyncError>("Failed to stage change")?;
+
+        if node.is_link() && staged_node.node.is_valid_node_id() {
+            Box::pin(stage_link_registry_entry(
+                repository,
+                state_stage,
+                change,
+                node,
+                staged_node.node,
+            ))
+            .await?;
+        }
+        Ok(())
+    }
 }
 
 /// Gives the staged file `node_id` the executable bit `mode`, where it holds another.

@@ -9,12 +9,15 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
+use lore_base::types::TypedBytes as _;
 use lore_revision::branch;
 use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
+use lore_revision::change::FileAction;
 use lore_revision::commit::commit_in_memory_revision;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::node::Node;
+use lore_revision::node::NodeDelta;
 use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
@@ -231,9 +234,9 @@ async fn add_staged(
 /// A change a revision [`commit_files`] commits makes.
 #[derive(Clone, Copy)]
 enum Change {
-    /// Adds a file holding its path, at most one directory deep, with its directory. The file's
-    /// identity derives from its path, so two revisions adding a file at one path add the same
-    /// file.
+    /// Adds a file holding its path, at most one directory deep, with its directory, which takes
+    /// mode 0, the mode staging gives a directory. The file's identity derives from its path, so
+    /// two revisions adding a file at one path add the same file.
     Add(&'static str),
     /// Deletes the file at the path.
     Delete(&'static str),
@@ -260,7 +263,6 @@ async fn add_file(repository: &Arc<RepositoryContext>, state: &State, path: &str
             Ok(link) if link.is_valid() => link.node,
             _ => {
                 let node = Node {
-                    mode: 0o755,
                     name_hash: lore_storage::hash::hash_string(directory),
                     ..Default::default()
                 };
@@ -1359,6 +1361,153 @@ mod push {
                 );
             }
             assert_eq!(roots[0], roots[1]);
+        }))
+        .await;
+    }
+
+    /// The path, action and flags of each entry of the delta of `revision`, each failing the test
+    /// where it names a node the revision does not hold at its path. A deleted node is left out.
+    async fn delta_paths(
+        repository: &Arc<RepositoryContext>,
+        revision: Hash,
+    ) -> Vec<(String, u16, u16)> {
+        let state = State::deserialize(repository.clone(), revision)
+            .await
+            .expect("load the revision");
+        let delta = state
+            .delta_block(repository.clone())
+            .await
+            .expect("read the delta")
+            .to_aligned::<NodeDelta>();
+        let mut entries = Vec::new();
+        for entry in delta.as_type_slice::<NodeDelta>() {
+            if entry.action == FileAction::Delete as u16 {
+                continue;
+            }
+            let path = state
+                .node_path(repository.clone(), entry.node)
+                .await
+                .expect("read a delta path");
+            assert_eq!(
+                node_at(repository, &state, path.as_str()).await,
+                entry.node,
+                "the delta names {} at {path}",
+                entry.node
+            );
+            entries.push((path.clone(), entry.action, entry.flags));
+        }
+        entries
+    }
+
+    /// The revisions the first-parent and the second-parent history of the file at `path` name in
+    /// `revision`.
+    async fn history_of(
+        repository: &Arc<RepositoryContext>,
+        revision: Hash,
+        path: &str,
+    ) -> [Hash; 2] {
+        let state = State::deserialize(repository.clone(), revision)
+            .await
+            .expect("load the revision");
+        let metadata_node = node_to_file_metadata(node_at(repository, &state, path).await);
+        let block = state
+            .block_file_metadata(
+                repository.clone(),
+                NodeFileMetadataBlock::index(metadata_node),
+            )
+            .await
+            .expect("read the file metadata");
+        block
+            .read()
+            .node(NodeFileMetadata::index(metadata_node))
+            .revision
+    }
+
+    /// A fast-forward merge commits the merge as `lore branch merge` commits it: the moved file
+    /// keeps its node, the delta is the merge's own, naming the nodes the merge revision holds and
+    /// recording the move, the add and the add both sides make alike as merged, and the file
+    /// history names the latest revision for the file it added and the pushed revision for the file
+    /// the push added.
+    #[tokio::test]
+    async fn a_fast_forward_merge_records_its_own_delta_and_the_history_of_both_lines() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                random::<RepositoryId>(),
+            ));
+            let branch = create_test_branch(&repository).await;
+            let base = commit_files(
+                &repository,
+                branch,
+                Hash::default(),
+                &[Change::Add("dir/a.txt"), Change::Add("other.txt")],
+            )
+            .await;
+            let latest = commit_files(
+                &repository,
+                branch,
+                base,
+                &[Change::Add("dir/l.txt"), Change::Add("same.txt")],
+            )
+            .await;
+            let incoming = commit_unpushed(
+                &repository,
+                branch,
+                base,
+                &[
+                    Change::Move("dir/a.txt", "dir/z.txt"),
+                    Change::Add("dir/p.txt"),
+                    Change::Add("same.txt"),
+                ],
+            )
+            .await;
+
+            let result = push_merging(&repository, branch, incoming).await;
+            assert!(result.fast_forward_merged);
+            let merged = result.revision;
+
+            let latest_state = State::deserialize(repository.clone(), latest)
+                .await
+                .expect("load the latest revision");
+            let merged_state = State::deserialize(repository.clone(), merged)
+                .await
+                .expect("load the merged revision");
+            assert_eq!(
+                node_at(&repository, &merged_state, "dir/z.txt").await,
+                node_at(&repository, &latest_state, "dir/a.txt").await
+            );
+
+            let merge = lore_revision::change::Flags::Merge.bits();
+            let delta = delta_paths(&repository, merged).await;
+            for (path, action) in [
+                ("dir/z.txt", Some(FileAction::Move)),
+                ("dir/p.txt", Some(FileAction::Add)),
+                ("same.txt", None),
+            ] {
+                assert!(
+                    delta.iter().any(|(at, recorded, flags)| at == path
+                        && action.is_none_or(|action| *recorded == action as u16)
+                        && flags & merge != 0),
+                    "{path} in {delta:?}"
+                );
+            }
+            assert!(
+                !delta.iter().any(|(at, _, _)| at == "dir/l.txt"),
+                "{delta:?}"
+            );
+
+            assert_eq!(
+                history_of(&repository, merged, "dir/l.txt").await[0],
+                latest
+            );
+            assert_eq!(
+                history_of(&repository, merged, "dir/p.txt").await[1],
+                incoming
+            );
         }))
         .await;
     }

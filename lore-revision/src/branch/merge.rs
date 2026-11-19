@@ -6,6 +6,7 @@ use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use futures::FutureExt as _;
 use futures::StreamExt;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
@@ -6803,45 +6804,48 @@ pub struct MergeIntoOptions {
     pub inherit_metadata: MetadataInherit,
 }
 
-/// Copies the file metadata `path` has in `state_source` onto `path` in `state_staged`, where
-/// both states hold it.
+/// Copies the file metadata of `source_node` in `state_source`, or of the node `state_source`
+/// holds at `path` where `source_node` is `None`, onto `path` in `state_staged`, where both states
+/// hold it. Answers the block of `state_source` it read the metadata from.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
-fn merge_metadata_task(
+pub(crate) fn merge_metadata_task(
     repository: Arc<RepositoryContext>,
     path: RelativePath,
     state_source: Arc<State>,
+    source_node: Option<NodeID>,
     state_staged: Arc<State>,
-) -> impl Future<Output = Result<(), MergeError>> {
+) -> impl Future<Output = Result<Option<Arc<NodeFileMetadataBlock>>, MergeError>> {
     async move {
-        let metadata_hash;
-
-        if let Ok(node_link) = state_source
-            .find_node_link(repository.clone(), path.as_str())
-            .await
-            && node_link.is_valid()
-        {
-            let metadata_node = node::node_to_file_metadata(node_link.node);
-            let metadata_block_index = NodeFileMetadataBlock::index(metadata_node);
-            let metadata_node_index = NodeFileMetadata::index(metadata_node);
-
-            let metadata_block = state_source
-                .block_file_metadata(repository.clone(), metadata_block_index)
+        let source_node = match source_node {
+            Some(node) => node,
+            None => match state_source
+                .find_node_link(repository.clone(), path.as_str())
                 .await
-                .forward::<MergeError>("deserializing metadata block")?;
-
-            let block_reader = metadata_block.read();
-            let node = block_reader.node(metadata_node_index);
-
-            metadata_hash = node.metadata;
-        } else {
-            lore_debug!(
-                "Merge metadata skipped due to missing 'source' node for {}",
-                path
-            );
-            return Ok(());
-        }
+            {
+                Ok(node_link) if node_link.is_valid() => node_link.node,
+                _ => {
+                    lore_debug!(
+                        "Merge metadata skipped due to missing 'source' node for {}",
+                        path
+                    );
+                    return Ok(None);
+                }
+            },
+        };
+        let metadata_node = node::node_to_file_metadata(source_node);
+        let source_block = state_source
+            .block_file_metadata(
+                repository.clone(),
+                NodeFileMetadataBlock::index(metadata_node),
+            )
+            .await
+            .forward::<MergeError>("deserializing metadata block")?;
+        let metadata_hash = source_block
+            .read()
+            .node(NodeFileMetadata::index(metadata_node))
+            .metadata;
 
         if let Ok(node_link) = state_staged
             .find_node_link(repository.clone(), path.as_str())
@@ -6876,10 +6880,9 @@ fn merge_metadata_task(
                 "Merge metadata skipped due to missing 'staged' node for {}",
                 path
             );
-            return Ok(());
         }
 
-        Ok(())
+        Ok(Some(source_block))
     }
 }
 
@@ -6897,8 +6900,10 @@ async fn merge_file_metadata(
                 repository.clone(),
                 change.path().clone(),
                 state_source.clone(),
+                None,
                 state_staged.clone(),
             )
+            .map(|copied| copied.map(drop))
         );
     }
 

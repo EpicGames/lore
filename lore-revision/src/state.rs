@@ -128,6 +128,9 @@ use crate::fs::filesystem_provider::FilesystemDiffTree;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::ListedEntry;
+use crate::fs::realize::stage_destination_ancestors;
+use crate::fs::realize::stage_realized_change;
+use crate::fs::realize::stage_realized_delete;
 use crate::hash;
 use crate::immutable;
 use crate::immutable::ImmutableError;
@@ -12636,23 +12639,14 @@ fn collect_new_addresses_recurse(
     ))
 }
 
-/// Applies a set of node-level changes to a state tree without touching the filesystem.
-///
-/// This is used for server-side merge operations where there is no working directory.
-/// Changes are applied purely at the state tree level: nodes are added, modified, or
-/// deleted in the target state based on the diff result.
-///
-/// The `target_state` is the state being modified (e.g., the current branch head).
-/// Each `NodeChange` carries source node data in its `to` field, which is copied into
-/// the target state tree with the mode `to` states.
-///
-/// A move deletes the node at its source and stages the moved node at its destination. The
-/// destination of a move that only changes case resolves to the node at its source, so that node
-/// is renamed in place instead, keeping its children. A renamed directory keeps the rest of the
-/// target's node, since its address derives from its children, which the changes below it reach.
-/// A renamed file or link takes the moved node's content only where the move modifies it, and
-/// otherwise keeps the target's: the 3-way diff folds a change the target made at the source into
-/// a move that leaves the content as it was.
+/// Applies the changes of a 3-way diff to `target_state`, the tree of the revision they merge onto,
+/// staging them as `lore branch merge` stages them in a working tree, without touching any
+/// filesystem: the changes sorted by path, the deletes staged first, deepest first
+/// ([`stage_realized_delete`]), the directories above each destination staged
+/// ([`stage_destination_ancestors`]), every other change staged in path order
+/// ([`stage_realized_change`]), and each changed path given the file metadata of the node of
+/// `source`, the revision merged in, that the change takes ([`merged_node`]), or of the node
+/// `source` holds at the path ([`crate::branch::merge::merge_metadata_task`]).
 ///
 /// Preconditions:
 /// - The changes must be conflict-free (no entries with `Flags::Conflict`)
@@ -12661,127 +12655,68 @@ fn collect_new_addresses_recurse(
 pub(crate) async fn apply_tree_changes(
     repository: Arc<RepositoryContext>,
     target_state: Arc<State>,
-    changes: &[NodeChange],
+    source: &Arc<State>,
+    changes: &mut [NodeChange],
 ) -> Result<(), StateError> {
-    let stats = Arc::new(crate::stage::StageStats::default());
+    crate::change::sort_by_path(changes);
 
-    // Process deletes first, in reverse path order (deepest paths first) so that
-    // children are deleted before parent directories
-    let mut delete_changes: Vec<&NodeChange> = changes
+    for change in changes
         .iter()
-        .filter(|c| c.action == FileAction::Delete)
-        .collect();
-    delete_changes.sort_by_key(|b| std::cmp::Reverse(b.path().as_str().len()));
-
-    for change in &delete_changes {
-        let node_link = match target_state
-            .find_node_link(repository.clone(), change.path().as_str())
+        .rev()
+        .filter(|change| change.action == FileAction::Delete)
+    {
+        stage_realized_delete(&repository, &target_state, change, true)
             .await
-        {
-            Ok(node_link) => node_link,
-            Err(e) if e.is_node_not_found() => continue,
-            Err(err) => return Err(err),
-        };
-
-        if node_link.is_valid() {
-            crate::stage::stage_delete(
-                repository.clone(),
-                target_state.clone(),
-                change.path().clone(),
-                node_link.node,
-                NodeFlags::StagedMerge,
-                stats.clone(),
-                None,
-            )
-            .await
-            .forward::<StateError>("Node not found")?;
-        }
+            .forward_any::<StateError>("staging a merged delete")?;
     }
 
-    // Process add/modify/move changes
-    for change in changes {
-        if change.action == FileAction::Delete {
+    stage_destination_ancestors(&repository, &target_state, changes, true)
+        .await
+        .forward_any::<StateError>("staging the parents of the merged changes")?;
+
+    for change in changes
+        .iter()
+        .filter(|change| change.action != FileAction::Delete)
+    {
+        if !change.to.mapping.node.is_valid_node_id() {
             continue;
         }
-
-        if change.action == FileAction::Move
-            && let Some(from_path) = change.move_source()
-        {
-            let node_link = match target_state
-                .find_node_link(repository.clone(), from_path.as_str())
-                .await
-            {
-                Ok(node_link) => node_link,
-                Err(e) if e.is_node_not_found() => NodeLink::invalid(),
-                Err(err) => return Err(err),
-            };
-
-            if node_link.is_valid() {
-                if change.is_case_only_move() {
-                    let renamed_directory = target_state
-                        .node(repository.clone(), node_link.node)
-                        .await?
-                        .is_directory();
-                    target_state
-                        .node_rename(
-                            repository.clone(),
-                            node_link.node,
-                            NameChange::Rename(change.path().name()),
-                        )
-                        .await?;
-                    if renamed_directory || !change.flags.contains(change::Flags::Modify) {
-                        target_state
-                            .node_mark(
-                                &repository,
-                                node_link.node,
-                                Mark::staged(NodeFlags::Staged, true),
-                            )
-                            .await?;
-                        continue;
-                    }
-                } else {
-                    crate::stage::stage_delete(
-                        repository.clone(),
-                        target_state.clone(),
-                        from_path.clone(),
-                        node_link.node,
-                        NodeFlags::StagedMerge,
-                        stats.clone(),
-                        None,
-                    )
-                    .await
-                    .forward::<StateError>("Node not found")?;
-                }
-            }
-        }
-
-        // Get the source node data from the change
-        let source_state = &change.to.mapping.state;
-        let source_node_id = change.to.mapping.node;
-        if !source_node_id.is_valid_node_id() {
-            continue;
-        }
-
-        let mut node = source_state
-            .node(change.to.mapping.repository.clone(), source_node_id)
+        let mut node = change
+            .to
+            .mapping
+            .state
+            .node(change.to.mapping.repository.clone(), change.to.mapping.node)
             .await?;
         node.mode = change.to.mode;
+        stage_realized_change(&repository, &target_state, change, node, true)
+            .await
+            .forward_any::<StateError>("staging a merged change")?;
+    }
 
-        // Stage the node into the target state at the change path
-        crate::stage::stage_single_node(
+    let mut held = None;
+    for change in changes
+        .iter()
+        .filter(|change| change.action != FileAction::Delete)
+    {
+        held = crate::branch::merge::merge_metadata_task(
             repository.clone(),
-            target_state.clone(),
             change.path().clone(),
-            node,
-            stats.clone(),
-            None,
-            crate::filter::FilterMode::Full,
+            source.clone(),
+            merged_node(change, source),
+            target_state.clone(),
         )
         .await
-        .forward::<StateError>("Node not found")?;
+        .forward_any::<StateError>("merging file metadata")?
+        .or(held);
     }
 
     Ok(())
+}
+
+/// The node of `source`, the revision merged in, that `change` takes, where its `to` side names
+/// one of `source`. A change both sides made alike names the node of the revision merged onto.
+fn merged_node(change: &NodeChange, source: &State) -> Option<NodeID> {
+    (change.to.mapping.state.revision() == source.revision()).then_some(change.to.mapping.node)
 }
 
 /// Load a node based on the determined source.
