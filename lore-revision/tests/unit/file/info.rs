@@ -56,7 +56,7 @@ async fn measure(root: &Path, path: RelativePath) -> u64 {
         .begin_operation()
         .await
         .expect("an operation over the working tree");
-    calculate_local_size_recurse(
+    calculate_local_size(
         operation,
         repository,
         path,
@@ -253,7 +253,7 @@ async fn measure_folded_pair(root: &Path, directory_first: bool) -> u64 {
         node: dir,
         path_len: "dir".len(),
     };
-    calculate_local_size_recurse(
+    calculate_local_size(
         operation,
         repository,
         RelativePath::new_from_initial_path("dir").expect("relative path"),

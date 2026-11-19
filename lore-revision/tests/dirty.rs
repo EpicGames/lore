@@ -7427,6 +7427,71 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// A dirty mark of a tracked directory the ignore file names marks the tracked files below it,
+    /// at two depths, and not the untracked file beside them, and a stage of the directory then
+    /// stages those the working tree changed: the directory searched or listed by how many entries
+    /// it holds.
+    #[tokio::test]
+    // Test fixture writes; not subject to repository write-token discipline.
+    #[allow(clippy::disallowed_methods)]
+    async fn a_dirty_mark_and_a_stage_of_a_directory_the_ignore_file_names_take_what_the_tree_tracks()
+     {
+        use lore_revision::file::dirty::SEARCHED_CHILDREN;
+        for siblings in [0, SEARCHED_CHILDREN] {
+            in_execution(async move {
+                let unchanged: Vec<String> = (0..siblings)
+                    .map(|index| format!("bin/{index}.txt"))
+                    .collect();
+                let changed = ["bin/edit.txt", "bin/sub/deep.txt"];
+                let committed: Vec<&str> = changed
+                    .into_iter()
+                    .chain(unchanged.iter().map(String::as_str))
+                    .collect();
+                let (ruled, _, tempdir) = ignoring_repository(&committed, "bin/\n").await;
+                let root = tempdir.to_path_buf();
+                for path in changed {
+                    test_file_write(root.join(path).as_path(), b"edited");
+                }
+                test_file_write(root.join("bin/new.txt").as_path(), b"new");
+                let reported = async || {
+                    let mut reported = status_reported(&ruled, None, false).await;
+                    reported.sort();
+                    reported
+                };
+                file::dirty::dirty(ruled.clone(), path_arguments(&root, &["bin"]))
+                    .await
+                    .expect("Dirty failed");
+                let mut marked: Vec<(String, bool)> = committed
+                    .iter()
+                    .map(|path| (format!("M {path}"), false))
+                    .collect();
+                marked.sort();
+                assert_eq!(
+                    reported().await,
+                    marked,
+                    "the dirty mark of bin, beside {siblings} files, marked other than what the \
+                     tree tracks below it"
+                );
+                stage_paths(&ruled, &root, &["bin"], false, false).await;
+                let staged: Vec<(String, bool)> = reported()
+                    .await
+                    .into_iter()
+                    .filter(|(_, staged)| *staged)
+                    .collect();
+                assert_eq!(
+                    staged,
+                    [
+                        ("M bin/edit.txt".to_string(), true),
+                        ("M bin/sub/deep.txt".to_string(), true)
+                    ],
+                    "the stage of bin, beside {siblings} files, staged other than the tracked \
+                     files the working tree changed"
+                );
+            })
+            .await;
+        }
+    }
+
     /// Status lists a forced add of a file an ignore rule matches, and staged moves into and out
     /// of a directory one names.
     #[tokio::test]

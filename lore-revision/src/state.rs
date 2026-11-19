@@ -117,6 +117,7 @@ use crate::errors::NotFound;
 use crate::errors::Oversized;
 use crate::errors::SlowDown;
 use crate::errors::StateErrors;
+use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterPath;
 use crate::filter::FilterStates;
@@ -5486,12 +5487,12 @@ impl State {
                 // them. --force bypasses the filter. The ignore slot has no say
                 // over a node the tree tracks, only over one it only marks, as
                 // an add or a copy.
-                let mode = if force {
-                    FilterMode::TRACKED
+                let (child_states, reason) = if force {
+                    (FilterStates::ROOT, None)
                 } else {
                     repository
                         .filter
-                        .tracked_mode(
+                        .child_tracked_reason(
                             states,
                             &child_path,
                             !child.is_file(),
@@ -5507,14 +5508,7 @@ impl State {
                         )
                         .await?
                 };
-                let (child_states, excluded) = repository.filter.child_excludes_tree_unless_forced(
-                    force,
-                    states,
-                    &child_path,
-                    !child.is_file(),
-                    mode,
-                );
-                if excluded {
+                if reason.is_some() {
                     continue;
                 }
 
@@ -7612,12 +7606,12 @@ async fn collect_dirty_paths_linked<S: DirtyPathSink>(
         // never materializes them. --force bypasses the filter. The ignore
         // slot has no say over a node the tree tracks, only over one it only
         // marks, as in `State::collect_dirty_paths`.
-        let mode = if options.force {
-            FilterMode::TRACKED
+        let (child_states, reason) = if options.force {
+            (FilterStates::ROOT, None)
         } else {
             repository
                 .filter
-                .tracked_mode(
+                .child_tracked_reason(
                     level_states,
                     &*parent_path,
                     !child.is_file(),
@@ -7634,16 +7628,9 @@ async fn collect_dirty_paths_linked<S: DirtyPathSink>(
                 )
                 .await?
         };
-        let (child_states, excluded) = repository.filter.child_excludes_tree_unless_forced(
-            options.force,
-            level_states,
-            &*parent_path,
-            !child.is_file(),
-            mode,
-        );
 
         let mut descended = false;
-        if !excluded {
+        if reason.is_none() {
             if contributes {
                 paths.record(parent_path, child_id, &child, link_depth > 0);
             } else if marked_directory_carried_by_children(&child) {
@@ -13308,8 +13295,8 @@ async fn walk_hierarchy(
         let appended = !child_name.is_empty();
         path.push(child_name);
         let filter = &side.mapping.repository.filter;
-        let mode = filter
-            .tracked_mode(
+        let (child_states, reason) = filter
+            .child_tracked_reason(
                 level.states,
                 &path,
                 child_node.is_directory(),
@@ -13326,10 +13313,10 @@ async fn walk_hierarchy(
                 },
             )
             .await?;
-        let (child_states, excluded) = if changes.announces() {
-            filter.child_emit_excludes(level.states, &path, child_node.is_directory(), mode)
+        let excluded = if changes.announces() {
+            Filter::emit(&path, reason)
         } else {
-            filter.child_excludes_tree(level.states, &path, child_node.is_directory(), mode)
+            reason.is_some()
         };
 
         let subtree =

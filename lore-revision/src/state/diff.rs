@@ -1139,9 +1139,6 @@ async fn add_change_for_solo_to_node(
     } = context;
     let to_named_node = &to_nodes.children[to_index];
     stats.queried();
-    // A node only a working tree's State holds is one lore's tree lacks, so untracked whatever
-    // that State says of it.
-    let working_tree = context.flags.contains(DiffFlags::FilesystemTo);
     let Some((
         NodeSearchResult {
             node: to_node,
@@ -1153,16 +1150,12 @@ async fn add_change_for_solo_to_node(
         to_named_node.node,
         &paths.to,
         states.to,
-        filter_mode.at_staged(to_named_node.flags().contains(NodeFlags::Staged)),
-        async |flags: NodeFlags| {
-            if working_tree {
-                return Ok(false);
-            }
-            to_nodes
-                .state
-                .holds_tracked_change(&to_nodes.repository, to_named_node.node, flags)
-                .await
-        },
+        to_side_mode(
+            filter_mode.at_staged(to_named_node.flags().contains(NodeFlags::Staged)),
+            context.flags,
+            false,
+        ),
+        |flags| to_tracks(to_nodes, to_named_node.node, flags, context.flags, false),
     )
     .await?
     else {
@@ -1279,9 +1272,13 @@ fn subtree_states(
 /// a link's content sits in a directory even though the node is not one. So the answer is the
 /// subtree's and not the node's, and for a link the two diverge: a directory-only rule naming a mount
 /// reaches what is under it without matching the mount itself.
+///
+/// The node is asked about past the slots `mode` keeps where `tracked` answers that the to side's
+/// tree tracks it, as [`Filter::child_tracked_reason`] asks, and only under two views: elsewhere
+/// only the states are read, which its tracking leaves as they are.
 #[lore_macro::test_pub]
 #[allow(clippy::too_many_arguments)]
-fn to_subtree_verdict(
+async fn to_subtree_verdict<E, F>(
     filter: &Filter,
     parent: FilterStates,
     path: &RelativePath,
@@ -1290,15 +1287,21 @@ fn to_subtree_verdict(
     flags: DiffFlags,
     mode: FilterMode,
     stats: &DiffWalkStats,
-) -> (FilterStates, bool) {
+    tracked: impl FnOnce() -> F,
+) -> Result<(FilterStates, bool), E>
+where
+    F: Future<Output = Result<bool, E>>,
+{
     let two_views = flags.contains(DiffFlags::TwoViews);
     let paired_directory = !was_file && !is_file;
     if !paired_directory && !two_views {
-        return (parent, false);
+        return Ok((parent, false));
     }
     stats.queried();
-    let (states, excluded) = filter.child_excludes_tree(parent, path, !is_file, mode);
-    (states, excluded && two_views)
+    let (states, reason) = filter
+        .child_tracked_reason(parent, path, !is_file, mode.at(two_views), tracked)
+        .await?;
+    Ok((states, reason.is_some() && two_views))
 }
 
 /// Whether the two views can hold different content below the directory the walk paired at
@@ -1356,6 +1359,34 @@ fn presence_change(
         (false, true) => Some(change::FileAction::Delete),
         _ => None,
     }
+}
+
+/// Whether the to side's tree tracks a change at or below its node `node`, carrying `flags`, which
+/// takes the node past the slots the mode keeps. A working tree's State answers nothing of what
+/// Lore tracks, so there the node is tracked where `held_as_kind` says Lore's tree, on the from
+/// side, holds it as the kind it is: an entry of another kind, or one Lore's tree lacks, is new
+/// content the rules answer for (ADR-00027).
+async fn to_tracks(
+    to_nodes: &StateChildrenNodes,
+    node: NodeID,
+    flags: NodeFlags,
+    diff_flags: DiffFlags,
+    held_as_kind: bool,
+) -> Result<bool, StateError> {
+    if diff_flags.contains(DiffFlags::FilesystemTo) {
+        return Ok(held_as_kind);
+    }
+    to_nodes
+        .state
+        .holds_tracked_change(&to_nodes.repository, node, flags)
+        .await
+}
+
+/// `mode` for a to node whose tracking [`to_tracks`] answers with `held_as_kind`: in a working
+/// tree's State, where that answer needs no read, the mode it gives, so a node Lore's tree does not
+/// hold as its kind is not asked about.
+fn to_side_mode(mode: FilterMode, diff_flags: DiffFlags, held_as_kind: bool) -> FilterMode {
+    mode.at(held_as_kind || !diff_flags.contains(DiffFlags::FilesystemTo))
 }
 
 /// Report the change between the two nodes the walk paired by name, and descend where both are
@@ -1499,35 +1530,8 @@ async fn add_change_for_paired_nodes(
         }
         drop(to_name);
 
-        // The to side passes the ignore rules where its tree tracks a change at or below the
-        // node, which is asked only where the rules would leave the node out. A working tree's
-        // State answers nothing of what lore tracks, and its node is paired with one of lore's
-        // tree, which passed the rules on the from side: tracked as the kind that node is, so an
-        // entry of another kind is new content the rules answer for (ADR-00027).
-        let working_tree = flags.contains(DiffFlags::FilesystemTo);
-        let to_filter_mode = to_nodes
-            .repository
-            .filter
-            .tracked_mode(
-                states.to,
-                &subpath,
-                !to_node.is_file(),
-                filter_mode.at_staged(to_node.is_staged()),
-                || async {
-                    if working_tree {
-                        return Ok(same_type);
-                    }
-                    to_nodes
-                        .state
-                        .holds_tracked_change(
-                            &to_nodes.repository,
-                            to_named_node.node,
-                            NodeFlags::from_bits_retain(to_node.flags),
-                        )
-                        .await
-                },
-            )
-            .await?;
+        let to_filter_mode =
+            to_side_mode(filter_mode.at_staged(to_node.is_staged()), flags, same_type);
         let (to_subtree_states, to_excludes_subtree) = to_subtree_verdict(
             &to_nodes.repository.filter,
             states.to,
@@ -1537,7 +1541,17 @@ async fn add_change_for_paired_nodes(
             flags,
             to_filter_mode,
             stats,
-        );
+            || {
+                to_tracks(
+                    to_nodes,
+                    to_named_node.node,
+                    NodeFlags::from_bits_retain(to_node.flags),
+                    flags,
+                    same_type,
+                )
+            },
+        )
+        .await?;
         if to_excludes_subtree {
             lore_trace!("Diff node {subpath} excluded on the to side, delete {from_path}");
             add_change(
@@ -1773,10 +1787,25 @@ async fn add_change_for_paired_nodes(
         } else {
             lore_trace!("Diff node {subpath} changed from {from_type:?} to {to_type:?}");
             stats.queried();
-            let (to_node_states, to_node_excluded) = to_nodes
+            let (to_node_states, to_node_reason) = to_nodes
                 .repository
                 .filter
-                .child_excludes_tree(states.to, &subpath, to_node.is_directory(), to_filter_mode);
+                .child_tracked_reason(
+                    states.to,
+                    &subpath,
+                    to_node.is_directory(),
+                    to_filter_mode,
+                    || {
+                        to_tracks(
+                            to_nodes,
+                            to_named_node.node,
+                            NodeFlags::from_bits_retain(to_node.flags),
+                            flags,
+                            false,
+                        )
+                    },
+                )
+                .await?;
             add_change(
                 from.clone(),
                 to.clone(),
@@ -1787,7 +1816,7 @@ async fn add_change_for_paired_nodes(
                 from_node_states,
             )
             .await?;
-            if !to_node_excluded {
+            if to_node_reason.is_none() {
                 add_change_where(
                     from,
                     to,
@@ -2082,8 +2111,8 @@ where
     let filter = &nodes.repository.filter;
     let is_directory = result.node.is_directory();
     let flags = NodeFlags::from_bits_retain(result.node.flags);
-    let mode = filter
-        .tracked_mode(
+    let (states, reason) = filter
+        .child_tracked_reason(
             parent_states,
             &result.path,
             is_directory,
@@ -2091,9 +2120,7 @@ where
             || tracked(flags),
         )
         .await?;
-    let (states, excluded) =
-        filter.child_emit_excludes(parent_states, &result.path, is_directory, mode);
-    if excluded {
+    if Filter::emit(&result.path, reason) {
         lore_trace!("Path excluded by filter: {}", path);
         return Ok(None);
     }

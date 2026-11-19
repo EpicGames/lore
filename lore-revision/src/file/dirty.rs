@@ -14,6 +14,7 @@ use crate::file::node_outside_links;
 use crate::file::parent_outside_links;
 use crate::file::stage::is_path_under_layer_mask;
 use crate::file::stage::route_layer_paths;
+use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::fs::filesystem_provider::DirectoryEntry;
@@ -992,24 +993,38 @@ async fn dirty_resolved_path(
         } else {
             Node::asked_as_directory(staged.as_ref())
         };
-        let filter = &walk.repository.filter;
-        let tracked = !force
-            && filter
-                .child_excludes_tree(parent, path, is_directory, FilterMode::Full)
-                .1
-            && tracks(walk, nodes, Some(is_directory)).await?;
-        let mode = FilterMode::TRACKED.at(tracked);
-        let (states, excluded) = if info.exists() {
-            filter.child_emit_unless_forced(
-                force,
+        let (states, excluded) = if !force {
+            let (states, mut reason, asks) = walk.repository.filter.child_untracked_reason(
+                parent,
+                path,
+                is_directory,
+                FilterMode::TRACKED,
+            );
+            if asks && tracks(walk, nodes, Some(is_directory)).await? {
+                reason = walk.repository.filter.tracked_reason(
+                    states,
+                    path,
+                    is_directory,
+                    FilterMode::TRACKED,
+                );
+            }
+            (states, Filter::emit(path, reason))
+        } else if info.exists() {
+            walk.repository.filter.child_emit_unless_forced(
+                true,
                 FilterMode::View,
                 parent,
                 path,
                 is_directory,
-                mode,
+                FilterMode::TRACKED,
             )
         } else {
-            filter.child_emit_excludes(parent, path, is_directory, mode.absence(force))
+            walk.repository.filter.child_emit_excludes(
+                parent,
+                path,
+                is_directory,
+                FilterMode::TRACKED.absence(true),
+            )
         };
         let staged_parent = StagedParent::below(base.staged, names.parent());
         if excluded {
@@ -2487,23 +2502,42 @@ fn dirty_directory<'a>(
                 None => nodes.child(walk, entry.name_hash).await,
             };
             let is_directory = entry.info.is_dir();
-            let tracked = !force
-                && walk
+            let mut tracked = None;
+            let (child_states, excluded) = if force {
+                walk.repository.filter.child_emit_unless_forced(
+                    true,
+                    FilterMode::View,
+                    states,
+                    &child_path,
+                    is_directory,
+                    FilterMode::TRACKED,
+                )
+            } else {
+                let (child_states, mut reason, asks) = walk
                     .repository
                     .filter
-                    .child_excludes_tree(states, &child_path, is_directory, FilterMode::Full)
-                    .1
-                && tracks(walk, child_nodes, Some(is_directory)).await?;
-            let (child_states, excluded) = walk.repository.filter.child_emit_unless_forced(
-                force,
-                FilterMode::View,
-                states,
-                &child_path,
-                is_directory,
-                FilterMode::TRACKED.at(tracked),
-            );
+                    .child_untracked_reason(states, &child_path, is_directory, FilterMode::TRACKED);
+                if asks {
+                    let answer = tracks(walk, child_nodes, Some(is_directory)).await?;
+                    tracked = Some(answer);
+                    if answer {
+                        reason = walk.repository.filter.tracked_reason(
+                            child_states,
+                            &child_path,
+                            is_directory,
+                            FilterMode::TRACKED,
+                        );
+                    }
+                }
+                (child_states, Filter::emit(&child_path, reason))
+            };
             if excluded {
-                if !tracked && holds_any(child_nodes) {
+                let replaced = holds_any(child_nodes)
+                    && !match tracked {
+                        Some(tracked) => tracked,
+                        None => tracks(walk, child_nodes, Some(is_directory)).await?,
+                    };
+                if replaced {
                     if let Some(listed) = listed.as_mut() {
                         listed.staged.drop_mark();
                     }

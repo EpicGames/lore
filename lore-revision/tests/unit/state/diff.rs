@@ -4,6 +4,7 @@
 //! what it seeds each side with, what it asks the to side about a paired node, and what it
 //! does with a subtree it has no budget left to walk in a task.
 
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -33,6 +34,7 @@ use lore_storage::hash::hash_slice;
 use lore_storage::hash::hash_string;
 use tokio::sync::Semaphore;
 
+use crate::helper::RepositoryContextCreationArgsExt;
 use crate::helper::in_memory;
 use crate::helper::test_store_create;
 
@@ -133,52 +135,124 @@ fn excluding(path: &str) -> Filter {
     filter
 }
 
+/// [`to_subtree_verdict`] from the root in `mode`, of a node whose tracking is `tracked`.
+#[allow(clippy::too_many_arguments)]
+async fn subtree_verdict(
+    filter: &Filter,
+    path: &RelativePath,
+    was_file: bool,
+    is_file: bool,
+    flags: DiffFlags,
+    mode: FilterMode,
+    tracked: bool,
+    stats: &DiffWalkStats,
+) -> (FilterStates, bool) {
+    let Ok(verdict) = to_subtree_verdict(
+        filter,
+        FilterStates::ROOT,
+        path,
+        was_file,
+        is_file,
+        flags,
+        mode,
+        stats,
+        async || Ok::<_, Infallible>(tracked),
+    )
+    .await;
+    verdict
+}
+
 /// The to side is not asked about a paired file under one filter.
-#[test]
-fn a_paired_file_under_one_filter_costs_no_to_side_query() {
+#[tokio::test]
+async fn a_paired_file_under_one_filter_costs_no_to_side_query() {
     let filter = excluding("x");
     let path = RelativePath::new_from_initial_path("x").expect("valid path");
     let stats = DiffWalkStats::default();
-    let verdict = |flags| {
-        to_subtree_verdict(
+    let verdict = async |flags| {
+        subtree_verdict(
             &filter,
-            FilterStates::ROOT,
             &path,
             true,
             true,
             flags,
             FilterMode::Full,
+            false,
             &stats,
         )
+        .await
     };
 
-    assert_eq!(verdict(DiffFlags::empty()), (FilterStates::ROOT, false));
+    assert_eq!(
+        verdict(DiffFlags::empty()).await,
+        (FilterStates::ROOT, false)
+    );
     assert_eq!(stats.filter_queries.load(Ordering::Relaxed), 0);
     assert!(
-        verdict(DiffFlags::TwoViews).1,
+        verdict(DiffFlags::TwoViews).await.1,
         "the filter must be one that answers true, or the case above proves nothing"
     );
     assert_eq!(stats.filter_queries.load(Ordering::Relaxed), 1);
 }
 
+/// A directory the to side's ignore rules name is excluded under two views only where its tree
+/// does not track it, and its children inherit the ignore slot's step either way.
+#[tokio::test]
+async fn a_tracked_directory_passes_the_to_side_ignore_slot() {
+    let mut filter = Filter::default();
+    filter.ignore.add_exclusion("/x").expect("ignore exclusion");
+    let path = stepped_path();
+    let stats = DiffWalkStats::default();
+    let verdict = async |tracked| {
+        subtree_verdict(
+            &filter,
+            &path,
+            false,
+            false,
+            DiffFlags::TwoViews,
+            FilterMode::TRACKED,
+            tracked,
+            &stats,
+        )
+        .await
+    };
+
+    let (untracked_states, untracked) = verdict(false).await;
+    let (tracked_states, tracked) = verdict(true).await;
+    assert!(
+        untracked,
+        "an untracked directory the rules name is excluded"
+    );
+    assert!(!tracked, "a tracked directory is past the ignore slot");
+    assert_eq!(
+        tracked_states, untracked_states,
+        "the keep bits decide which slots exclude, not the states"
+    );
+    assert_ne!(
+        tracked_states,
+        FilterStates::ROOT,
+        "the states must be stepped"
+    );
+}
+
 /// A paired directory needs the states below it whatever the flags say, so it is
 /// asked either way -- and reports no exclusion under one filter, where the from
 /// side's verdict already stands for both.
-#[test]
-fn a_paired_directory_is_asked_under_one_filter_and_reports_nothing() {
+#[tokio::test]
+async fn a_paired_directory_is_asked_under_one_filter_and_reports_nothing() {
     let filter = excluding("x");
     let path = RelativePath::new_from_initial_path("x").expect("valid path");
     let stats = DiffWalkStats::default();
-    let (states, excluded) = to_subtree_verdict(
+    let (states, excluded) = subtree_verdict(
         &filter,
-        FilterStates::ROOT,
         &path,
         false,
         false,
         DiffFlags::empty(),
         FilterMode::Full,
+        false,
         &stats,
-    );
+    )
+    .await;
 
     assert_ne!(states, FilterStates::ROOT, "the states must be stepped");
     assert!(!excluded, "one filter cannot route the two sides apart");
@@ -188,20 +262,21 @@ fn a_paired_directory_is_asked_under_one_filter_and_reports_nothing() {
 /// A directory the to side excludes but re-includes under is still held there, so the
 /// verdict is the subtree's and not the node's: deleting it would take the re-included
 /// content with it.
-#[test]
-fn a_directory_re_including_below_itself_is_not_excluded() {
+#[tokio::test]
+async fn a_directory_re_including_below_itself_is_not_excluded() {
     let path = RelativePath::new_from_initial_path("x").expect("valid path");
-    let excluded = |filter: &Filter| {
-        to_subtree_verdict(
+    let excluded = async |filter: &Filter| {
+        subtree_verdict(
             filter,
-            FilterStates::ROOT,
             &path,
             false,
             false,
             DiffFlags::TwoViews,
             FilterMode::Full,
+            false,
             &DiffWalkStats::default(),
         )
+        .await
         .1
     };
     let mut re_including = excluding("x");
@@ -211,11 +286,11 @@ fn a_directory_re_including_below_itself_is_not_excluded() {
         .expect("view inclusion");
 
     assert!(
-        excluded(&excluding("x")),
+        excluded(&excluding("x")).await,
         "the rule alone must exclude the directory"
     );
     assert!(
-        !excluded(&re_including),
+        !excluded(&re_including).await,
         "a re-inclusion below must keep the directory"
     );
 }
@@ -227,28 +302,32 @@ fn a_directory_re_including_below_itself_is_not_excluded() {
 /// subtree question is asked of it, and the rule reaches what a mount holds without
 /// matching the mount. The node question, which the type-change branch puts, answers the
 /// other way -- so neither call stands in for the other.
-#[test]
-fn a_directory_only_rule_answers_the_two_questions_differently() {
+#[tokio::test]
+async fn a_directory_only_rule_answers_the_two_questions_differently() {
     let mut filter = Filter::default();
     filter.view.add_exclusion("/x/").expect("view exclusion");
     let path = stepped_path();
-    let excluded = |was_file, is_file| {
-        to_subtree_verdict(
+    let excluded = async |was_file, is_file| {
+        subtree_verdict(
             &filter,
-            FilterStates::ROOT,
             &path,
             was_file,
             is_file,
             DiffFlags::TwoViews,
             FilterMode::Full,
+            false,
             &DiffWalkStats::default(),
         )
+        .await
         .1
     };
 
-    assert!(excluded(false, false), "the subtree question must exclude");
     assert!(
-        !excluded(true, true),
+        excluded(false, false).await,
+        "the subtree question must exclude"
+    );
+    assert!(
+        !excluded(true, true).await,
         "the node question must not match what is no directory"
     );
 }
@@ -532,13 +611,14 @@ fn link_node(name: &str, target: RepositoryId, revision: Hash, child: NodeID) ->
     }
 }
 
-/// The changes a walk between the roots of `from` and `to` emits with `extra`, as the action
-/// letter and the path of each, sorted.
+/// The changes a walk between the roots of `from` and `to` emits with `extra` in `mode`, as the
+/// action letter and the path of each, sorted.
 async fn walk_flagged(
     repository: &Arc<RepositoryContext>,
     from: &Arc<State>,
     to: &Arc<State>,
     extra: DiffFlags,
+    mode: FilterMode,
 ) -> Vec<(String, String)> {
     let root = |state: &Arc<State>| NodeChangeState {
         mapping: NodeMapping {
@@ -554,16 +634,7 @@ async fn walk_flagged(
     };
     let (from, to) = (root(from), root(to));
     let mut walk = ChangeStream::spawn(async move |changes| {
-        diff_subtree_flagged(
-            from,
-            to,
-            RelativePath::new(),
-            None,
-            extra,
-            &changes,
-            FilterMode::empty(),
-        )
-        .await
+        diff_subtree_flagged(from, to, RelativePath::new(), None, extra, &changes, mode).await
     });
     let mut emitted = Vec::new();
     while let Some(change) = walk.next().await {
@@ -575,6 +646,85 @@ async fn walk_flagged(
     walk.finish().await.expect("a walk of the two states");
     emitted.sort();
     emitted
+}
+
+/// A staged link that replaces a directory is a type change, asked about as the node it is: the
+/// ignore rules exclude it as a node, and would descend below it as a directory, and the to side's
+/// tree holding it staged takes it past them, so the walk reports its add with the delete.
+#[tokio::test]
+async fn a_staged_link_replacing_a_directory_passes_the_ignore_rules_as_a_node() {
+    let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let mut filter = Filter::default();
+            filter
+                .ignore
+                .add_exclusion("/mnt")
+                .expect("ignore exclusion");
+            filter
+                .ignore
+                .add_inclusion("/mnt/keep")
+                .expect("ignore inclusion");
+            let repository = Arc::new(
+                RepositoryContext::new(
+                    crate::helper::default_repository_creation_args(immutable, mutable)
+                        .with_id(RepositoryId::from(uuid::Uuid::now_v7()))
+                        .with_filter(Arc::new(filter)),
+                )
+                .with_write_token(in_memory::token()),
+            );
+            let target_id: RepositoryId = Context::from(uuid::Uuid::now_v7()).into();
+            let target_revision = in_memory::linked_revision(&repository, target_id).await;
+
+            let state = State::new();
+            let directory = in_memory::add(
+                &state,
+                repository.clone(),
+                ROOT_NODE,
+                in_memory::directory("mnt"),
+                "mnt",
+            )
+            .await;
+            in_memory::add(
+                &state,
+                repository.clone(),
+                directory,
+                in_memory::file("a.txt"),
+                "a.txt",
+            )
+            .await;
+            let revision =
+                in_memory::commit(&repository, &state, Hash::default(), in_memory::branch_id())
+                    .await;
+            let from = in_memory::revision_state(&repository, revision).await;
+            let to = State::new();
+            in_memory::add(
+                &to,
+                repository.clone(),
+                ROOT_NODE,
+                in_memory::link_node("mnt", target_id, target_revision),
+                "mnt",
+            )
+            .await;
+
+            let reported = walk_flagged(
+                &repository,
+                &from,
+                &to,
+                DiffFlags::empty(),
+                FilterMode::TRACKED,
+            )
+            .await;
+            assert_eq!(
+                reported,
+                [
+                    ("A".to_string(), "mnt".to_string()),
+                    ("D".to_string(), "mnt".to_string())
+                ],
+                "the staged link passes the ignore rules"
+            );
+        })
+        .await;
 }
 
 /// A walk leaving link pins to the link registry neither descends into nor reports a link that
@@ -653,11 +803,25 @@ async fn a_walk_leaving_link_pins_reports_a_link_only_where_its_mount_changes() 
             let to = parent([(second, ROOT_NODE), (second, sub_in_second)]).await;
 
             assert_eq!(
-                walk_flagged(&repository, &from, &to, DiffFlags::LeavesLinkPins).await,
+                walk_flagged(
+                    &repository,
+                    &from,
+                    &to,
+                    DiffFlags::LeavesLinkPins,
+                    FilterMode::empty(),
+                )
+                .await,
                 vec![("M".to_string(), "remounted".to_string())],
                 "a pin moved under the same mount is the link registry's to report"
             );
-            let descended = walk_flagged(&repository, &from, &to, DiffFlags::empty()).await;
+            let descended = walk_flagged(
+                &repository,
+                &from,
+                &to,
+                DiffFlags::empty(),
+                FilterMode::empty(),
+            )
+            .await;
             assert!(
                 descended.contains(&("M".to_string(), "pinned/outer.bin".to_string()))
                     && descended.contains(&("M".to_string(), "remounted".to_string())),

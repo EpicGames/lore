@@ -1933,6 +1933,7 @@ impl FilterMode {
 /// Only a directory can tell the two apart: it can be excluded by its own rule
 /// and still hold content a later rule re-includes, and then the answer depends
 /// on which question was asked.
+#[lore_macro::test_pub]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Scope {
     /// The path itself. Says nothing about what sits below it.
@@ -2078,31 +2079,73 @@ impl Filter {
             && self.child_emit_excludes(parent, path, true, mode).1
     }
 
-    /// The mode a walk asks about `path` in, from `parent`: `mode` where `tracked` answers that the
-    /// tree tracks the node there, and `mode` without its keep bits otherwise ([`FilterMode::at`]).
-    /// `tracked` is awaited only where `mode` carries a keep bit and the filter would leave the
-    /// node out, so a walk reads nothing more for a node it keeps.
-    pub async fn tracked_mode<E, F>(
+    /// One step of a walk in `mode` at the node's tracking ([`FilterMode::at`]): the states `path`'s
+    /// children inherit, and why the walk drops `path`. `tracked` answers whether the tree tracks
+    /// the node, and is awaited only where [`child_untracked_reason`](Self::child_untracked_reason)
+    /// asks.
+    ///
+    /// The slots are stepped once: the keep bits decide which slots exclude, not the states.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
+    #[allow(clippy::manual_async_fn)]
+    pub fn child_tracked_reason<E, F>(
         &self,
         parent: FilterStates,
         path: &impl FilterPath,
         is_directory: bool,
         mode: FilterMode,
         tracked: impl FnOnce() -> F,
-    ) -> Result<FilterMode, E>
+    ) -> impl std::future::Future<Output = Result<(FilterStates, Option<FilterReason>), E>>
     where
         F: std::future::Future<Output = Result<bool, E>>,
     {
-        let untracked = mode.at(false);
-        if !mode.intersects(FilterMode::KEEPS)
-            || !self
-                .child_excludes_tree(parent, path, is_directory, untracked)
-                .1
-        {
-            return Ok(untracked);
+        let (states, reason, asks) = self.child_untracked_reason(parent, path, is_directory, mode);
+        async move {
+            // Boxed: a cold path, which unboxed would sit in every walk future that asks.
+            if !asks || !Box::pin(tracked()).await? {
+                return Ok((states, reason));
+            }
+            Ok((
+                states,
+                self.tracked_reason(states, path, is_directory, mode),
+            ))
         }
-        // Boxed: a cold path, which unboxed would sit in every walk future that asks.
-        Ok(mode.at(Box::pin(tracked()).await?))
+    }
+
+    /// The first half of [`child_tracked_reason`](Self::child_tracked_reason), for a walk that
+    /// awaits the tree's answer inline: the states `path`'s children inherit, why the walk drops
+    /// `path` where the tree does not track it, and whether the tree's answer can keep it, which
+    /// is where the filter drops it and `mode` carries the keep bit that passes the slot dropping
+    /// it. Where the tree tracks the node, [`tracked_reason`](Self::tracked_reason) answers.
+    pub(crate) fn child_untracked_reason(
+        &self,
+        parent: FilterStates,
+        path: &impl FilterPath,
+        is_directory: bool,
+        mode: FilterMode,
+    ) -> (FilterStates, Option<FilterReason>, bool) {
+        let (states, reason) =
+            self.child_exclude_reason(parent, path, is_directory, mode.at(false), Scope::Tree);
+        let keep = match reason {
+            None => return (states, None, false),
+            Some(FilterReason::Ignore) => FilterMode::KeepTracked,
+            Some(FilterReason::View) => FilterMode::KeepStagedInView,
+        };
+        (states, reason, mode.contains(keep))
+    }
+
+    /// Why a walk in `mode` drops `path`, which the tree tracks, from the `states` its step
+    /// ([`child_untracked_reason`](Self::child_untracked_reason)) handed down.
+    pub(crate) fn tracked_reason(
+        &self,
+        states: FilterStates,
+        path: &impl FilterPath,
+        is_directory: bool,
+        mode: FilterMode,
+    ) -> Option<FilterReason> {
+        let lowercase = path.as_lowercase_str();
+        let depth = component_count(lowercase);
+        self.reason_at(states, lowercase, depth, is_directory, mode, Scope::Tree)
     }
 
     /// [`emit_excludes_any_kind`](Self::emit_excludes_any_kind) without the event.
@@ -2148,6 +2191,7 @@ impl Filter {
     /// is one index lookup rather than a second pass over the lines.
     ///
     /// A file has no subtree, so it is answered the same at either scope.
+    #[lore_macro::test_pub]
     pub(crate) fn child_exclude_reason(
         &self,
         parent: FilterStates,
@@ -2173,13 +2217,27 @@ impl Filter {
                 .view
                 .step(parent.view, lowercase, name, is_directory, depth);
         }
+        let reason = self.reason_at(states, lowercase, depth, is_directory, mode, scope);
+        (states, reason)
+    }
+
+    /// Why `states` exclude the lowercase `path`, `depth` components deep, at `scope` in `mode`:
+    /// `None` to keep it and, for a directory at [`Scope::Tree`], to descend into it.
+    fn reason_at(
+        &self,
+        states: FilterStates,
+        path: &str,
+        depth: u32,
+        is_directory: bool,
+        mode: FilterMode,
+        scope: Scope,
+    ) -> Option<FilterReason> {
         let mode = mode.excluding();
-        let reason = if scope == Scope::Tree && is_directory {
-            self.descend_reason(states, lowercase, depth, mode)
+        if scope == Scope::Tree && is_directory {
+            self.descend_reason(states, path, depth, mode)
         } else {
             states.reason(mode)
-        };
-        (states, reason)
+        }
     }
 
     /// [`excludes_tree`](Self::excludes_tree) for a walk that threads state:
@@ -2209,23 +2267,6 @@ impl Filter {
         let (states, reason) =
             self.child_exclude_reason(parent, path, is_directory, mode, Scope::Tree);
         (states, Self::emit(path, reason))
-    }
-
-    /// [`child_excludes_tree`](Self::child_excludes_tree) unless `force` puts the walk past the
-    /// filter, where it leaves out nothing and hands back [`FilterStates::ROOT`] without reading
-    /// the lines.
-    pub fn child_excludes_tree_unless_forced(
-        &self,
-        force: bool,
-        parent: FilterStates,
-        path: &impl FilterPath,
-        is_directory: bool,
-        mode: FilterMode,
-    ) -> (FilterStates, bool) {
-        if force {
-            return (FilterStates::ROOT, false);
-        }
-        self.child_excludes_tree(parent, path, is_directory, mode)
     }
 
     /// [`child_emit_excludes`](Self::child_emit_excludes) for the slots in `mode`, unless `force`

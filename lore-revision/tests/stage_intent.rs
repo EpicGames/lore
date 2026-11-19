@@ -449,6 +449,64 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// A marking walk enters a tracked directory the ignore file names and asks below it whether
+    /// the tree tracks each entry: it reports the tracked files there modified, at any depth, and
+    /// leaves out the untracked files beside them and the directory the view excludes.
+    #[tokio::test]
+    async fn a_marking_walk_reports_what_the_tree_tracks_below_a_directory_the_ignore_file_names() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tracked = [
+                    "build/tracked.txt",
+                    "build/sub/deep.txt",
+                    "build/hidden/x.txt",
+                    "src/a.txt",
+                ];
+                let fixture = test_repository_excluding(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                    &["/build/"],
+                    &["/build/hidden/"],
+                )
+                .await;
+                write_paths(&fixture, &tracked);
+                let repository = fixture.repository.clone();
+                force_commit_fixture(&fixture).await;
+
+                for path in tracked {
+                    test_file_write(&fixture.path.join(path), b"modified since");
+                }
+                write_paths(&fixture, &["build/new.txt", "build/sub/new.txt"]);
+
+                let (current, staged) = test_anchor_states(&repository).await;
+                let changes = test_scan_with_intent(
+                    repository.clone(),
+                    staged,
+                    current,
+                    FilesystemDiffIntent::MarkDirty,
+                )
+                .await;
+
+                let mut reported = test_reported(&changes);
+                reported.sort();
+                assert_eq!(
+                    reported,
+                    [
+                        ("M".to_string(), "build/sub/deep.txt".to_string()),
+                        ("M".to_string(), "build/tracked.txt".to_string()),
+                        ("M".to_string(), "src/a.txt".to_string()),
+                    ],
+                    "the tracked files outside the view's exclusion are reported, and nothing else"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     /// Ignore rules excluding `Engine` and re-including every `Build` directory below it, by a
     /// rule no literal prefix bounds, so a walk enters each directory below `Engine`.
     const REACHING_IGNORE: &[&str] = &["/Engine/", "!/Engine/**/Build/"];

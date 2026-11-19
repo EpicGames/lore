@@ -1675,15 +1675,6 @@ fn a_forced_step_excludes_nothing_and_carries_no_verdict() {
             FilterStates::ROOT,
             "a forced step carries no verdict, {name} returned one"
         );
-        let (tree_states, tree) = filter.child_excludes_tree_unless_forced(
-            true,
-            FilterStates::ROOT,
-            &subject,
-            is_directory,
-            FilterMode::Full,
-        );
-        assert!(!tree, "a forced step excludes nothing, {name} was dropped");
-        assert_eq!(tree_states, FilterStates::ROOT);
         // The rules do bite when the walk is not forced, or the assertions above
         // would hold for a filter that excludes nothing.
         if name != "keep.txt" {
@@ -1806,6 +1797,107 @@ fn a_tracked_step_answers_to_the_view_alone() {
         FilterMode::TRACKED.at(true),
     );
     assert!(!tracked, "a tracked file in an ignored directory is kept");
+}
+
+/// A tracked step answers as a step in the mode its node's tracking gives: the states its
+/// children inherit, and the slot that drops the node, in modes with keep bits and without.
+///
+/// The rules sit in both slots, over the ground truth, and the walk threads the states the
+/// tracked step hands back and descends where it keeps a directory, as a walk over a tree does.
+/// Which nodes the tree tracks, and which hold a staged change, is drawn at random, so a tracked
+/// directory holds untracked children and an untracked one tracked children.
+#[tokio::test]
+async fn a_tracked_step_answers_as_a_step_in_the_mode_its_tracking_gives() {
+    use std::convert::Infallible;
+
+    use lore_revision::filter::Filter;
+    use lore_revision::filter::FilterMode;
+    use lore_revision::filter::Scope;
+
+    let modes = [
+        FilterMode::Full,
+        FilterMode::View,
+        FilterMode::TRACKED,
+        FilterMode::CHANGES,
+    ];
+    let mut rng = Xorshift(0x2545_f491_4f6c_dd1d);
+    let mut compared = 0usize;
+    let mut kept_by_tracking = 0usize;
+    for ignore_case in CASES {
+        let Some(ignore) = build(ignore_case.patterns) else {
+            continue;
+        };
+        for view_case in CASES.iter().rev().take(4) {
+            let Some(view) = build(view_case.patterns) else {
+                continue;
+            };
+            let mut filter = Filter::default();
+            filter.ignore = ignore.clone();
+            filter.view = view;
+            for mode in modes {
+                let mut stack = vec![(String::new(), FilterStates::ROOT)];
+                while let Some((dir, states)) = stack.pop() {
+                    let (subdirs, files) = children(FILES, &dir);
+                    let nodes = files
+                        .into_iter()
+                        .map(|file| (file, false))
+                        .chain(subdirs.into_iter().map(|subdir| (subdir, true)));
+                    for (name, is_directory) in nodes {
+                        let subject = path(&name);
+                        let tracked = rng.next().is_multiple_of(2);
+                        let node_mode = mode.at_staged(rng.next().is_multiple_of(2));
+                        let Ok((stepped, reason)) = filter
+                            .child_tracked_reason(
+                                states,
+                                &subject,
+                                is_directory,
+                                node_mode,
+                                async || Ok::<_, Infallible>(tracked),
+                            )
+                            .await;
+                        let (plain_states, plain_reason) = filter.child_exclude_reason(
+                            states,
+                            &subject,
+                            is_directory,
+                            node_mode.at(tracked),
+                            Scope::Tree,
+                        );
+                        assert_eq!(
+                            (stepped, reason.map(|reason| reason as u8)),
+                            (plain_states, plain_reason.map(|reason| reason as u8)),
+                            "{name}, tracked {tracked}, in {node_mode:?} for ignore {:?} view {:?}",
+                            ignore_case.patterns,
+                            view_case.patterns
+                        );
+                        compared += 1;
+                        if reason.is_none()
+                            && filter
+                                .child_excludes_tree(
+                                    states,
+                                    &subject,
+                                    is_directory,
+                                    node_mode.at(false),
+                                )
+                                .1
+                        {
+                            kept_by_tracking += 1;
+                        }
+                        if is_directory && reason.is_none() {
+                            stack.push((name, stepped));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        compared > 100_000,
+        "expected a broad comparison, got {compared}"
+    );
+    assert!(
+        kept_by_tracking > 1_000,
+        "expected the tracking to keep what the rules exclude, got {kept_by_tracking}"
+    );
 }
 
 /// Folding a whole path and stepping down it one component at a time reach the

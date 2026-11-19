@@ -30,6 +30,7 @@ use crate::change::FileAction;
 use crate::change::NodeChange;
 use crate::change::NodeChangeState;
 use crate::errors::NodeNotFound;
+use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::filter::WalkPath;
@@ -1717,12 +1718,12 @@ async fn diff_filesystem_directory_walk(
             claim_named_child(node_list, node_list_found, item.name_hash, staging).await?;
         let is_directory = item.info.is_dir();
         let filter = &ctx.from.repository.filter;
-        let mode = filter
-            .tracked_mode(
+        let (item_states, reason) = filter
+            .child_tracked_reason(
                 ctx.states,
                 entry.path(),
                 is_directory,
-                ctx.filter_mode | FilterMode::KeepTracked,
+                (ctx.filter_mode | FilterMode::KeepTracked).at(claimed.is_some()),
                 async || match claimed {
                     Some(index) => {
                         let named = &node_list.children[index];
@@ -1740,9 +1741,7 @@ async fn diff_filesystem_directory_walk(
                 },
             )
             .await?;
-        let (item_states, excluded) =
-            filter.child_emit_excludes(ctx.states, entry.path(), is_directory, mode);
-        if excluded {
+        if Filter::emit(entry.path(), reason) {
             continue;
         }
 
@@ -2108,12 +2107,7 @@ async fn diff_filesystem_linked_directory(
         current_link.as_ref(),
     )
     .await?;
-    let from_item_states = ctx
-        .from
-        .repository
-        .filter
-        .child_excludes_tree(ctx.from_states, &from_path, true, ctx.filter_mode)
-        .0;
+    let from_item_states = from_directory_states(ctx, &from_path, &item_path, item_states);
     // The mounts are spelled from the from-side path the walk below compares against.
     let linked_mounts =
         crate::state::collect_crossed_mounts(&from, from.node, &current, current.node, &from_path)
@@ -2276,6 +2270,26 @@ async fn descends_into_replacement(
     !nested
 }
 
+/// The states below the `from` side's directory `from_path`, matched to the working tree's
+/// directory at `item_path`, whose step handed back `item_states`: those same states where both
+/// sides stand at one path below one parent verdict.
+fn from_directory_states(
+    ctx: &FilesystemDiffContext,
+    from_path: &RelativePath,
+    item_path: &RelativePath,
+    item_states: FilterStates,
+) -> FilterStates {
+    if ctx.from_states == ctx.states && from_path.as_lowercase_str() == item_path.as_lowercase_str()
+    {
+        return item_states;
+    }
+    ctx.from
+        .repository
+        .filter
+        .child_excludes_tree(ctx.from_states, from_path, true, ctx.filter_mode)
+        .0
+}
+
 /// Settles a directory both the tree and the file system hold and walks below it, for
 /// [`diff_filesystem_directory_walk`]. `false` when a marking walk finds an uncommitted entry at
 /// the root of a nested repository, which the walk discards rather than descends into.
@@ -2408,12 +2422,7 @@ async fn diff_filesystem_matched_directory(
         )
         .await?;
     }
-    let from_item_states = ctx
-        .from
-        .repository
-        .filter
-        .child_excludes_tree(ctx.from_states, &from_path, true, ctx.filter_mode)
-        .0;
+    let from_item_states = from_directory_states(ctx, &from_path, &item_path, item_states);
     let current_link = current_node.is_link().then(|| current_node.linked_node());
     let (from, current) = crate::state::cross_links(
         DiffSide {

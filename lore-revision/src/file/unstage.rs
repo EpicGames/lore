@@ -15,6 +15,7 @@ use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
 use crate::file::stage::route_layer_paths;
+use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::fs::filesystem_provider::InstanceOperation;
@@ -1102,12 +1103,12 @@ async fn unstage_node(
     // Past the ignore rules where the staged tree tracks a change at or below the node, which it
     // is asked only where the rules would leave the node out.
     let force = execution_context().globals().force();
-    let mode = if force {
-        FilterMode::TRACKED
+    let (child_states, reason) = if force {
+        (FilterStates::ROOT, None)
     } else {
         repository
             .filter
-            .tracked_mode(
+            .child_tracked_reason(
                 states,
                 &node_path,
                 !node.is_file(),
@@ -1125,15 +1126,7 @@ async fn unstage_node(
             .await
             .forward::<UnstageError>("Failed to read the revision the staged tree was built on")?
     };
-    let (child_states, excluded) = repository.filter.child_emit_unless_forced(
-        force,
-        FilterMode::empty(),
-        states,
-        &node_path,
-        !node.is_file(),
-        mode,
-    );
-    if excluded {
+    if Filter::emit(&node_path, reason) {
         lore_debug!("Node excluded by filter: {}", node_path.as_str());
         return Ok(());
     }
