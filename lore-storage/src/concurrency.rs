@@ -16,15 +16,32 @@ pub use lore_base::types::FRAGMENT_SIZE_EXPECTED;
 /// Default file count concurrency limit when not configured.
 pub const FILE_COUNT_LIMIT_DEFAULT: usize = 10000;
 
-// Fragment concurrency is budgeted in KiB units. The total budget allows ~4000
-// maximum-size (256 KiB) fragments in flight simultaneously (1 GiB total).
-// Each fragment acquires ceil(content_size / 1024) permits, floored at
-// FRAGMENT_MINIMUM_COST_KIB so tiny fragments bound the fragment count as well as
-// the bytes (~265k of them).
-pub const FRAGMENT_BUDGET_KIB: usize = 1024 * 1024; // 1 GiB
+/// Least permits, in KiB, a fragment buffer costs against the fragment budget, which otherwise
+/// charges `ceil(content_size / 1024)`, so tiny fragments bound the fragment count as well as
+/// the bytes: about 262k of them under the default budget.
 pub const FRAGMENT_MINIMUM_COST_KIB: u32 = 4;
 
+/// Environment variable that sets the process-wide fragment budget in MiB, which bounds the
+/// fragment buffers of writes, streamed reads and reads into a file. Read once per process, on
+/// first use.
+const FRAGMENT_BUDGET_VAR: &str = "LORE_FRAGMENT_BUDGET_MIB";
+
+/// Fragment budget when [`FRAGMENT_BUDGET_VAR`] is unset, blank or does not parse (1 GiB).
+#[lore_macro::test_pub]
+const FRAGMENT_BUDGET_DEFAULT_MIB: usize = 1024;
+
+/// Least fragment budget [`FRAGMENT_BUDGET_VAR`] sets: room for the reservations of three
+/// files' chunkers at once.
+#[lore_macro::test_pub]
+const FRAGMENT_BUDGET_MINIMUM_MIB: usize = 4;
+
+/// Greatest fragment budget [`FRAGMENT_BUDGET_VAR`] sets: the most whole MiB within
+/// `u32::MAX >> 3` KiB, the most permits a tokio semaphore holds on a 32-bit target.
+#[lore_macro::test_pub]
+const FRAGMENT_BUDGET_MAXIMUM_MIB: usize = (u32::MAX >> 3) as usize / 1024;
+
 static FILE_COUNT_LIMITER: OnceLock<Semaphore> = OnceLock::<Semaphore>::new();
+static FRAGMENT_BUDGET_KIB: OnceLock<usize> = OnceLock::new();
 static FRAGMENT_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static COMPRESS_LIMITER: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
 
@@ -117,7 +134,55 @@ pub fn fragment_limiter_owned() -> Arc<Semaphore> {
 }
 
 fn fragment_limiter_arc() -> &'static Arc<Semaphore> {
-    FRAGMENT_LIMITER.get_or_init(|| Arc::new(Semaphore::new(FRAGMENT_BUDGET_KIB)))
+    FRAGMENT_LIMITER.get_or_init(|| Arc::new(Semaphore::new(fragment_budget_kib())))
+}
+
+/// Total permits of the fragment limiter, in KiB, read from [`FRAGMENT_BUDGET_VAR`] on first use.
+#[lore_macro::test_pub]
+pub(crate) fn fragment_budget_kib() -> usize {
+    *FRAGMENT_BUDGET_KIB.get_or_init(|| {
+        let budget = fragment_budget_kib_from(std::env::var_os(FRAGMENT_BUDGET_VAR).as_deref());
+        lore_base::lore_debug!("Fragment budget set to {budget} KiB");
+        budget
+    })
+}
+
+/// The fragment budget in KiB that a value of [`FRAGMENT_BUDGET_VAR`] sets, where `None` or a
+/// blank value counts as unset.
+///
+/// A value that does not parse as a whole number of MiB yields the default, and one outside
+/// [`FRAGMENT_BUDGET_MINIMUM_MIB`]..=[`FRAGMENT_BUDGET_MAXIMUM_MIB`], however large, is clamped
+/// into it. Each logs a warning, since the variable is read where no error can reach the
+/// operator.
+#[lore_macro::test_pub]
+fn fragment_budget_kib_from(value: Option<&std::ffi::OsStr>) -> usize {
+    let Some(value) = value else {
+        return FRAGMENT_BUDGET_DEFAULT_MIB * 1024;
+    };
+    let text = value.to_str().map(str::trim);
+    if text == Some("") {
+        return FRAGMENT_BUDGET_DEFAULT_MIB * 1024;
+    }
+    let parsed = text.and_then(|text| match text.parse::<usize>() {
+        Ok(mib) => Some(mib),
+        Err(error) if *error.kind() == std::num::IntErrorKind::PosOverflow => Some(usize::MAX),
+        Err(_) => None,
+    });
+    let Some(mib) = parsed else {
+        lore_base::lore_warn!(
+            "{FRAGMENT_BUDGET_VAR} of {value:?} is not a whole number of MiB, using the default \
+             {FRAGMENT_BUDGET_DEFAULT_MIB} MiB"
+        );
+        return FRAGMENT_BUDGET_DEFAULT_MIB * 1024;
+    };
+    let clamped = mib.clamp(FRAGMENT_BUDGET_MINIMUM_MIB, FRAGMENT_BUDGET_MAXIMUM_MIB);
+    if clamped != mib {
+        lore_base::lore_warn!(
+            "{FRAGMENT_BUDGET_VAR} of {value:?} is outside {FRAGMENT_BUDGET_MINIMUM_MIB} to \
+             {FRAGMENT_BUDGET_MAXIMUM_MIB} MiB, using {clamped} MiB"
+        );
+    }
+    clamped * 1024
 }
 
 /// Acquire an owned memory permit sized for a fragment buffer of `buffer_len`
@@ -182,14 +247,14 @@ async fn acquire_chunk_budget_from(
 
 /// Permits a buffer of `content_size` bytes costs against the fragment limiter.
 ///
-/// Capped at the limiter's own total: a larger request could never be satisfied, and one past
-/// `u32::MAX >> 3` panics inside tokio. Not capped at one fragment — the chunker charges whole
-/// windows here. A size taken from a fragment list is bounded before it arrives, by the tier
-/// check in `walk_leaf_level`.
+/// Capped at the limiter's own total, [`fragment_budget_kib`]: a larger request could never be
+/// satisfied, and [`FRAGMENT_BUDGET_MAXIMUM_MIB`] keeps the total within what tokio acquires.
+/// Not capped at one fragment — the chunker charges whole windows here. A size taken from a
+/// fragment list is bounded before it arrives, by the tier check in `walk_leaf_level`.
 pub fn fragment_permit_count(content_size: usize) -> u32 {
     content_size
         .div_ceil(1024)
-        .clamp(FRAGMENT_MINIMUM_COST_KIB as usize, FRAGMENT_BUDGET_KIB) as u32
+        .clamp(FRAGMENT_MINIMUM_COST_KIB as usize, fragment_budget_kib()) as u32
 }
 
 #[error_set]

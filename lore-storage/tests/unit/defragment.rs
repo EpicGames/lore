@@ -2001,7 +2001,7 @@ mod defragment_integration {
 
     /// A payload must stay charged to the fragment budget until the caller has taken
     /// it. Releasing at load bounds only the fetch, leaving the payloads themselves to
-    /// pile up in a queue sized for 262,144 of them.
+    /// pile up in a queue sized for 262,144 of them under the default budget.
     ///
     /// Budget for two payloads, four leaves, and a caller that stops consuming: the
     /// pipeline must run out of budget and stay out of it. With the permit released at

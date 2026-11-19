@@ -21,8 +21,8 @@ use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::concurrency::FRAGMENT_BUDGET_KIB;
 use crate::concurrency::FRAGMENT_MINIMUM_COST_KIB;
+use crate::concurrency::fragment_budget_kib;
 use crate::concurrency::fragment_limiter;
 use crate::concurrency::fragment_permit_count;
 use crate::error::StorageError;
@@ -1519,7 +1519,7 @@ where
     H: Fn(u64) -> (T, u64),
 {
     // Sized so it never binds before the budget does; every payload in it holds a permit.
-    let max_tasks = FRAGMENT_BUDGET_KIB / FRAGMENT_MINIMUM_COST_KIB as usize;
+    let max_tasks = fragment_budget_kib() / FRAGMENT_MINIMUM_COST_KIB as usize;
     let (fetch_queue_tx, mut fetch_queue_rx) = channel::<Queued<T>>(max_tasks);
 
     // Launcher: read leaf refs from walker, spawn fetch tasks, push handles

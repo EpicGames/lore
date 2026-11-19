@@ -59,7 +59,6 @@ pub use compress::suggest_compression_mode;
 pub use compress::writable_compression_mode;
 // Re-export concurrency primitives
 pub use concurrency::FILE_COUNT_LIMIT_DEFAULT;
-pub use concurrency::FRAGMENT_BUDGET_KIB;
 pub use concurrency::FRAGMENT_MINIMUM_COST_KIB;
 pub use concurrency::FRAGMENT_SIZE_EXPECTED;
 pub use concurrency::FRAGMENT_SIZE_MINIMUM;

@@ -1,10 +1,64 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::ffi::OsStr;
 use std::sync::Arc;
 
 use lore_storage::compress::FRAGMENT_SIZE_THRESHOLD;
 use lore_storage::concurrency::*;
 use tokio::sync::Semaphore;
+
+fn budget_mib(value: &str) -> usize {
+    fragment_budget_kib_from(Some(OsStr::new(value))) / 1024
+}
+
+#[test]
+fn fragment_budget_defaults_to_one_gib_when_unset_or_blank() {
+    assert_eq!(fragment_budget_kib_from(None), 1024 * 1024);
+    assert_eq!(budget_mib(""), 1024);
+    assert_eq!(budget_mib(" \t"), 1024);
+}
+
+#[test]
+fn fragment_budget_takes_a_value_in_range() {
+    assert_eq!(budget_mib("64"), 64);
+    assert_eq!(budget_mib(" 64\n"), 64);
+    assert_eq!(budget_mib("4"), 4);
+    assert_eq!(budget_mib("524287"), 524_287);
+}
+
+#[test]
+fn fragment_budget_raises_a_value_below_the_floor() {
+    assert_eq!(budget_mib("0"), FRAGMENT_BUDGET_MINIMUM_MIB);
+    assert_eq!(budget_mib("3"), FRAGMENT_BUDGET_MINIMUM_MIB);
+}
+
+/// A whole number too large to read is above the ceiling, not unparsable.
+#[test]
+fn fragment_budget_lowers_a_value_above_the_ceiling() {
+    assert_eq!(budget_mib("524288"), FRAGMENT_BUDGET_MAXIMUM_MIB);
+    assert_eq!(
+        budget_mib("99999999999999999999999"),
+        FRAGMENT_BUDGET_MAXIMUM_MIB
+    );
+}
+
+#[test]
+fn fragment_budget_uses_the_default_for_a_value_that_is_not_a_whole_number() {
+    for value in ["abc", "-1", "1.5", "64MiB"] {
+        assert_eq!(budget_mib(value), FRAGMENT_BUDGET_DEFAULT_MIB, "{value:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fragment_budget_uses_the_default_for_a_value_that_is_not_unicode() {
+    use std::os::unix::ffi::OsStrExt;
+
+    assert_eq!(
+        fragment_budget_kib_from(Some(OsStr::from_bytes(b"6\xff4"))),
+        FRAGMENT_BUDGET_DEFAULT_MIB * 1024
+    );
+}
 
 #[test]
 fn fragment_permit_count_minimum() {
@@ -19,7 +73,7 @@ fn fragment_permit_count_minimum() {
 fn fragment_permit_count_maximum() {
     assert_eq!(
         fragment_permit_count(usize::MAX),
-        FRAGMENT_BUDGET_KIB as u32
+        fragment_budget_kib() as u32
     );
 }
 
@@ -131,7 +185,7 @@ async fn a_queued_waiter_starves_try_acquire_of_released_permits() {
 
 #[tokio::test]
 async fn chunk_budget_prefers_a_permit_when_the_budget_has_room() {
-    let limiter = Arc::new(Semaphore::new(FRAGMENT_BUDGET_KIB));
+    let limiter = Arc::new(Semaphore::new(fragment_budget_kib()));
     let reserved = Arc::new(Semaphore::new(1));
 
     let budget = acquire_chunk_budget_from(&limiter, 100 * 1024, &reserved).await;

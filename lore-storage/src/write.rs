@@ -2211,7 +2211,7 @@ impl<'a> ContentHashMemo<'a> {
     /// the content could not be read.
     ///
     /// The whole content is resident while it is hashed, so the budget for it comes from the
-    /// fragment limiter that bounds every other buffer of a fragment's size.
+    /// fragment limiter.
     async fn whole_content_hash(&self, file_size: usize) -> Option<Hash> {
         if let Some(hash) = self.established.whole.get() {
             return Some(*hash);
