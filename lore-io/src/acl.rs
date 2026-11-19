@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 
-//! Whether a path's extended access control list, on macOS, lets anyone but its owner change it.
+//! Whether a path's extended access control list, on macOS, lets anyone but its owner change it,
+//! the copy of an extended ACL from one entry to another, and its clearing.
 //!
 //! `libc` binds none of the ACL calls, so they are declared here as `sys/acl.h` and
 //! `membership.h` declare them.
@@ -36,6 +37,9 @@ unsafe extern "C" {
     fn acl_get_perm_np(permset: AclPermset, perm: c_int) -> c_int;
     fn acl_get_qualifier(entry: AclEntry) -> *mut c_void;
     fn acl_free(object: *mut c_void) -> c_int;
+    fn acl_init(count: c_int) -> Acl;
+    fn acl_get_fd_np(fd: c_int, acl_type: c_int) -> Acl;
+    fn acl_set_fd_np(fd: c_int, acl: Acl, acl_type: c_int) -> c_int;
     fn mbr_uuid_to_id(uuid: *const u8, id: *mut libc::id_t, id_type: *mut c_int) -> c_int;
 }
 
@@ -46,6 +50,82 @@ impl Drop for Owned {
     fn drop(&mut self) {
         // SAFETY: the pointer came from an ACL call that allocates, and is freed once.
         unsafe { acl_free(self.0) };
+    }
+}
+
+/// An entry whose extended ACL is read or set: an open file or directory, or a link at a path,
+/// not followed.
+#[derive(Clone, Copy)]
+pub(crate) enum Target<'a> {
+    Fd(c_int),
+    Link(&'a std::ffi::CStr),
+}
+
+/// Gives `to` the extended ACL of `from`, where `from` has one, which a link that answers `ENOTSUP`
+/// doesn't. A link's ACL is read and set through a descriptor of the link itself, as an open
+/// file's is. A failure names the read or the set.
+pub(crate) fn copy_extended(from: Target<'_>, to: Target<'_>) -> io::Result<()> {
+    let reading = |err| crate::clone::failed_call(err, "reading the extended ACL");
+    let (from_fd, _from_link) = descriptor(from).map_err(reading)?;
+    // SAFETY: the descriptor is open for the call.
+    let acl = unsafe { acl_get_fd_np(from_fd, ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let err = io::Error::last_os_error();
+        return match (err.raw_os_error(), from) {
+            (Some(libc::ENOENT), _) | (Some(libc::ENOTSUP), Target::Link(_)) => Ok(()),
+            _ => Err(reading(err)),
+        };
+    }
+    let acl = Owned(acl);
+    let setting = |err| crate::clone::failed_call(err, "setting the extended ACL");
+    let (to_fd, _to_link) = descriptor(to).map_err(setting)?;
+    // SAFETY: `acl` is a valid ACL, and the descriptor is open for the call.
+    if unsafe { acl_set_fd_np(to_fd, acl.0, ACL_TYPE_EXTENDED) } == 0 {
+        Ok(())
+    } else {
+        Err(setting(io::Error::last_os_error()))
+    }
+}
+
+/// The descriptor the ACL calls take for `target`, with the one opened for a link, which closes
+/// as it drops: a link is opened itself, with `O_SYMLINK`.
+fn descriptor(target: Target<'_>) -> io::Result<(c_int, Option<std::os::fd::OwnedFd>)> {
+    let path = match target {
+        Target::Fd(fd) => return Ok((fd, None)),
+        Target::Link(path) => path,
+    };
+    // SAFETY: the path is NUL-terminated for the call.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_SYMLINK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the call returned a descriptor no one else owns.
+    let owned = unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) };
+    Ok((fd, Some(owned)))
+}
+
+/// Clears the extended ACL of `fd`, an open file or directory. A file system that holds no ACLs
+/// has none to clear.
+pub(crate) fn clear_extended(fd: c_int) -> io::Result<()> {
+    // SAFETY: `acl_init` has no preconditions.
+    let acl = unsafe { acl_init(0) };
+    if acl.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let acl = Owned(acl);
+    // SAFETY: `acl` is a valid ACL, and the descriptor is open for the call.
+    if unsafe { acl_set_fd_np(fd, acl.0, ACL_TYPE_EXTENDED) } == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ENOTSUP) => Ok(()),
+        _ => Err(err),
     }
 }
 

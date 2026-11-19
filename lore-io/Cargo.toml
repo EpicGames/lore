@@ -70,11 +70,16 @@ tokio = { workspace = true }
 # conformance suite names `ERROR_SHARING_VIOLATION` and `FILE_SHARE_READ` when it pins the share
 # modes, hence the foundation and filesystem modules here as well. The listing tests name the
 # reparse tags of a symbolic link, a junction and a deduplicated file, which the
-# `Win32_System_SystemServices` module holds.
+# `Win32_System_SystemServices` module holds. The faithful copy's tests read and set security
+# descriptors as SDDL, and mark a file sparse.
 [target.'cfg(target_family = "windows")'.dev-dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
     "Win32_System_Pipes",
     "Win32_System_SystemServices",
 ] }

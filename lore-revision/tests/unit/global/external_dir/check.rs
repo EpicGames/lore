@@ -430,9 +430,9 @@ fn a_target_in_a_directory_an_extended_acl_opens_is_refused() {
 }
 
 /// D20: the root renames where both paths have one volume ID and, on Linux, one mount ID, or on
-/// macOS and Windows one mount point, and a move that would copy is refused.
+/// macOS and Windows one mount point, and copies otherwise.
 #[test]
-fn a_move_renames_on_one_volume_and_mount_and_refuses_a_copy() {
+fn a_move_renames_on_one_volume_and_mount_and_copies_otherwise() {
     let volume = |id: u64, mount_point: &str, mount_id: Option<u64>| {
         (
             Volume {
@@ -447,8 +447,8 @@ fn a_move_renames_on_one_volume_and_mount_and_refuses_a_copy() {
         (&current.0, current.1),
         (&target.0, target.1),
     ) {
-        Ok(MoveKind::Rename) => true,
-        Err(err) if err.is_invalid_arguments() => false,
+        MoveKind::Rename => true,
+        MoveKind::Copy => false,
         other => panic!("{other:?}"),
     };
 

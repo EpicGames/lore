@@ -1152,6 +1152,37 @@ def test_set_external_directory_moves_the_root_by_rename_and_back(
 
 @pytest.mark.verified_volume
 @pytest.mark.smoke
+def test_set_external_directory_moves_the_root_by_copy_and_back(
+    new_lore_repo, global_dir_name, apfs_volume, stops_background_services
+):
+    """On macOS, a move to another volume stops the running service, copies the external
+    directories to the target, leaves the redirect at the default location, and starts the
+    service again; moving back copies them to the default location and sets the target aside."""
+    repo, name, _ = external_root_repo(new_lore_repo, global_dir_name)
+    default = Path(global_dir_name) / "data" / "external"
+    repo.service_start()
+    target = apfs_volume / "root"
+
+    repo.service_set_external_directory(target)
+
+    assert (target / name / "file").read_text() == "kept"
+    assert Path(external_root(global_dir_name)) == target
+    assert default.is_symlink()
+    assert default.resolve() == target.resolve()
+    status = repo.service_status()
+    assert LORE_SERVICE_RUNNING_MESSAGE in status, status
+    assert str(target) in status, status
+
+    repo.service_set_external_directory("")
+
+    assert (default / name / "file").read_text() == "kept"
+    assert not default.is_symlink()
+    assert not target.exists()
+    assert LORE_SERVICE_RUNNING_MESSAGE in repo.service_status()
+
+
+@pytest.mark.verified_volume
+@pytest.mark.smoke
 def test_set_external_directory_dry_run_and_refusals(
     new_lore_repo, global_dir_name, scratch_dir, stops_background_services
 ):

@@ -2707,12 +2707,14 @@ Set whether commands are carried out by the service
 
 Move every virtual instance's external directory to a new external root
 
-Stops the running service and holds its socket until the move ends, then starts the service again. Refuses a service
-that runs inside another program, and a stop while a program is inside a virtual instance, unless --force, which
-detaches busy mounts lazily. Ctrl-C before the final switch undoes a move; an --adopt or --abandon it interrupts is
-finished later, by recovery. Ctrl-C while the command finishes an earlier interrupted move ends it, and leaves that move
-to recovery. With --dry-run, runs every check that needs nothing stopped and reports what the move would do; while a
-move is interrupted, it reports that move, and the target is checked once recovery has finished it.
+Stops the running service and holds its socket until the move ends, then starts the service again. Renames the external
+root within its volume, and copies it to another volume, keeping holes, owners, permissions, attributes, access control
+lists and times, and refusing what a copy can't keep, such as a hard link. Refuses a service that runs inside another
+program, and a stop while a program is inside a virtual instance, unless --force, which detaches busy mounts lazily.
+Ctrl-C before the final switch undoes a move; an --adopt or --abandon it interrupts is finished later, by recovery.
+Ctrl-C while the command finishes an earlier interrupted move ends it, and leaves that move to recovery. With --dry-run,
+runs every check that needs nothing stopped and reports what the move would do; while a move is interrupted, it reports
+that move, and the target is checked once recovery has finished it.
 
 **Usage:** `lore service set-external-directory [OPTIONS] <path>`
 

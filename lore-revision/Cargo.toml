@@ -114,7 +114,7 @@ failure_generator = []
 seeding = []
 trace_log = ["lore-base/trace_log"]
 vfs = []
-test-util = []
+test-util = ["lore-io/test-util"]
 # A build the instruction gate counts (`state-bench`, and lore's `revision-tree-bench`): the
 # test-only lock counters (`state::lock_counting`, `node::read_contention`) count nothing, so the
 # count measures the paths that ship. Examples build with the dev-dependencies, which turn on

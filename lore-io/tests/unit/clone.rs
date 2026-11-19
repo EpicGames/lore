@@ -17,6 +17,7 @@ use std::time::SystemTime;
 
 use lore_base::test_util::TempDir;
 use lore_io::clone::Backend;
+use lore_io::clone::Found;
 use lore_io::clone::Kind;
 use lore_io::clone::Progress;
 use lore_io::clone::Source;
@@ -919,6 +920,16 @@ fn junctions_and_links_are_copied_as_they_are() {
     }
 }
 
+/// Hands each of `directories` on to the walk's queue, or keeps it for this thread where the queue
+/// has no room.
+fn hand_on<J>(found: &mut Found<'_, J>, directories: impl IntoIterator<Item = J>) {
+    for directory in directories {
+        if let Err(directory) = found.offer(directory) {
+            found.keep(directory);
+        }
+    }
+}
+
 /// Every directory of a wide and deep tree is listed once, on many threads, and the walk ends.
 #[test]
 fn a_walk_lists_every_directory_once_on_many_threads() {
@@ -927,7 +938,7 @@ fn a_walk_lists_every_directory_once_on_many_threads() {
     lore_io::clone::run(0u32, 8, &|depth, found| {
         listed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if depth < 4 {
-            found.extend(std::iter::repeat_n(depth + 1, 6));
+            hand_on(found, std::iter::repeat_n(depth + 1, 6));
         }
         Ok(())
     })
@@ -944,7 +955,7 @@ fn a_panic_while_listing_fails_the_walk() {
         if depth == 2 {
             panic!("listing failed");
         }
-        found.extend([depth + 1, depth + 1]);
+        hand_on(found, [depth + 1, depth + 1]);
         Ok(())
     })
     .expect_err("the panic fails the walk");
@@ -961,7 +972,7 @@ fn a_walk_reports_the_failure_that_stopped_it() {
 
     let err = lore_io::clone::run(0u32, 4, &|depth, found| match depth {
         0 => {
-            found.extend([1, 2]);
+            hand_on(found, [1, 2]);
             Ok(())
         }
         1 => {
@@ -1647,9 +1658,9 @@ fn a_walk_runs_on_threads_its_pool_lends() {
     let pool = lore_io::pool::SyscallPool::new(4);
     let seen = Default::default();
 
-    lore_io::clone::run_lent_on(&pool, 0usize, &|item, found| {
+    lore_io::clone::run_lent_on(&pool, 0usize, &Progress::default(), &|item, found| {
         if item == 0 {
-            found.extend(1..=4);
+            hand_on(found, 1..=4);
         } else {
             assert!(meet(&seen, 2), "a second thread lists beside the first");
         }
@@ -1666,9 +1677,9 @@ fn a_walk_takes_threads_its_pool_frees_after_it_starts() {
     let started = std::sync::atomic::AtomicBool::new(false);
     let seen = Default::default();
 
-    lore_io::clone::run_lent_on(&pool, 0usize, &|item, found| {
+    lore_io::clone::run_lent_on(&pool, 0usize, &Progress::default(), &|item, found| {
         match item {
-            0 => found.extend(1..=8),
+            0 => hand_on(found, 1..=8),
             // Listed first, by the calling thread alone: frees the pool's threads, and lists for
             // longer than the walk waits between asks for another thread.
             8 => {
@@ -1851,4 +1862,1747 @@ fn two_directories_on_one_mount_have_one_volume() {
     assert!(locality.mount_id.is_some(), "{locality:?}");
     #[cfg(not(target_os = "linux"))]
     assert_eq!(locality.mount_id, None);
+}
+
+/// Makes `width` directories in `parent`, each holding a file and `width` directories below it
+/// to `depth` levels.
+fn make_tree(parent: &Path, width: usize, depth: usize) {
+    std::fs::write(parent.join("f"), parent.as_os_str().as_encoded_bytes()).expect("write");
+    if depth == 0 {
+        return;
+    }
+    for directory in 0..width {
+        let below = parent.join(format!("d{directory}"));
+        std::fs::create_dir(&below).expect("create");
+        make_tree(&below, width, depth - 1);
+    }
+}
+
+/// The entries of the tree at `root`, by path relative to it, with each file's contents.
+fn tree_of(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let mut entries = std::collections::BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).expect("list") {
+            let path = entry.expect("entry").path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("below the root")
+                .to_path_buf();
+            if path.is_dir() {
+                entries.insert(relative, None);
+                pending.push(path);
+            } else {
+                entries.insert(relative, Some(std::fs::read(&path).expect("read")));
+            }
+        }
+    }
+    entries
+}
+
+/// Copies the tree at `source` into a new directory beside it with `progress`, and checks the
+/// copy holds every entry.
+fn copy_whole(root: &TempDir, source: &Path, progress: &Progress) {
+    let destination = root.join("destination");
+    std::fs::create_dir(&destination).expect("create");
+    clone_into(
+        Backend::Copy,
+        source,
+        &destination,
+        &every_entry,
+        false,
+        progress,
+    )
+    .expect("clone");
+    assert_eq!(tree_of(&destination), tree_of(source));
+}
+
+/// The queue never holds more directories than its cap over a tree wider than the cap, and the
+/// directories it has no room for are walked depth-first by the thread that found them.
+#[test]
+fn a_clone_queues_no_more_directories_than_its_cap() {
+    let root = TempDir::new("lore-io-clone-queue-cap-");
+    let source = root.join("source");
+    std::fs::create_dir(&source).expect("create");
+    make_tree(&source, 12, 2);
+    let progress = Progress::bounded(2, 64, 4);
+
+    copy_whole(&root, &source, &progress);
+
+    let held = progress.counts();
+    assert!(held.queued <= 2, "{held:?}");
+    assert!(held.kept >= 2, "the walk descends depth-first: {held:?}");
+}
+
+/// A step of the walk hands on at most a batch of the directories it finds, and the rest of its
+/// directory, over a directory holding more directories than a batch.
+#[test]
+fn a_clone_thread_holds_at_most_one_batch() {
+    let root = TempDir::new("lore-io-clone-one-batch-");
+    let source = root.join("source");
+    std::fs::create_dir(&source).expect("create");
+    make_tree(&source, 40, 1);
+    let progress = Progress::bounded(4096, 64, 8);
+
+    copy_whole(&root, &source, &progress);
+
+    let held = progress.counts();
+    assert!(held.handed <= 9, "{held:?}");
+    assert!(held.continued >= 4, "{held:?}");
+}
+
+/// Over a tree deeper than the queue's cap, no thread keeps more directories than the tree has
+/// levels.
+#[test]
+fn a_clone_descends_no_deeper_than_the_tree() {
+    let root = TempDir::new("lore-io-clone-depth-");
+    let source = root.join("source");
+    let mut level = source.clone();
+    for _ in 0..10 {
+        std::fs::create_dir_all(level.join("a")).expect("create");
+        std::fs::create_dir_all(level.join("b")).expect("create");
+        std::fs::write(level.join("f"), b"f").expect("write");
+        level.push("c");
+    }
+    std::fs::create_dir(&level).expect("create");
+    let progress = Progress::bounded(1, 64, 2);
+
+    copy_whole(&root, &source, &progress);
+
+    let held = progress.counts();
+    assert!(held.kept >= 2, "the walk descends depth-first: {held:?}");
+    assert!(held.kept <= 11, "{held:?}");
+}
+
+/// A directory wider than a batch is listed a batch at a time, the rest of it put back as a
+/// continuation, and copied whole.
+#[test]
+fn a_directory_wider_than_a_batch_is_copied_whole() {
+    let root = TempDir::new("lore-io-clone-wide-");
+    let source = root.join("source");
+    std::fs::create_dir(&source).expect("create");
+    for file in 0..2500 {
+        std::fs::write(source.join(format!("f{file}")), file.to_string()).expect("write");
+    }
+    for directory in 0..20 {
+        std::fs::create_dir(source.join(format!("d{directory}"))).expect("create");
+    }
+    let progress = Progress::default();
+
+    copy_whole(&root, &source, &progress);
+
+    assert!(progress.counts().continued >= 2, "{:?}", progress.counts());
+}
+
+/// The queue never holds more continuations than their cap over a tree of directories wider than
+/// a batch, and a thread lists the rest of a directory itself once the cap is reached.
+#[test]
+fn a_clone_queues_no_more_continuations_than_their_cap() {
+    let root = TempDir::new("lore-io-clone-continuation-cap-");
+    let source = root.join("source");
+    for directory in 0..16 {
+        let at = source.join(format!("d{directory}"));
+        std::fs::create_dir_all(&at).expect("create");
+        for file in 0..40 {
+            std::fs::write(at.join(format!("f{file}")), b"f").expect("write");
+        }
+    }
+    let progress = Progress::bounded(4096, 1, 4);
+
+    copy_whole(&root, &source, &progress);
+
+    let held = progress.counts();
+    assert!(held.continuations <= 1, "{held:?}");
+    assert!(held.continued >= 1, "{held:?}");
+}
+
+/// An extended attribute name the tests' user can set: in the `user` namespace on Linux.
+#[cfg(target_os = "linux")]
+const ATTRIBUTE: &str = "user.lore";
+/// An extended attribute name the tests' user can set.
+#[cfg(target_os = "macos")]
+const ATTRIBUTE: &str = "com.lore.test";
+
+/// Sets the extended attribute `name` of `path` to `value`, a link at `path` not followed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn set_attribute(path: &Path, name: &str, value: &[u8]) {
+    try_set_attribute(path, name, value)
+        .unwrap_or_else(|err| panic!("set {name:?} on {}: {err}", path.display()));
+}
+
+/// Sets the extended attribute `name` of `path` to `value`, a link at `path` not followed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn try_set_attribute(path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a path");
+    let name = std::ffi::CString::new(name).expect("a name");
+    // SAFETY: the path and name are NUL-terminated, and the value is readable for its length.
+    #[cfg(target_os = "linux")]
+    let set = unsafe {
+        libc::lsetxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    // SAFETY: the path and name are NUL-terminated, and the value is readable for its length.
+    #[cfg(target_os = "macos")]
+    let set = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    if set == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// The extended attributes of `path`, by name, a link at `path` not followed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn attributes(path: &Path) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a path");
+    let mut names = vec![0u8; 65536];
+    // SAFETY: the path is NUL-terminated, and `names` is writable for its length.
+    #[cfg(target_os = "linux")]
+    let listed = unsafe { libc::llistxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
+    // SAFETY: the path is NUL-terminated, and `names` is writable for its length.
+    #[cfg(target_os = "macos")]
+    let listed = unsafe {
+        libc::listxattr(
+            path.as_ptr(),
+            names.as_mut_ptr().cast(),
+            names.len(),
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    let listed = usize::try_from(listed).expect("list the attributes");
+    names
+        .get(..listed)
+        .expect("listed")
+        .split(|&byte| byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            let c_name = std::ffi::CString::new(name).expect("a name");
+            let mut value = vec![0u8; 65536];
+            // SAFETY: the path and name are NUL-terminated, and `value` is writable for its
+            // length.
+            #[cfg(target_os = "linux")]
+            let read = unsafe {
+                libc::lgetxattr(
+                    path.as_ptr(),
+                    c_name.as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                )
+            };
+            // SAFETY: the path and name are NUL-terminated, and `value` is writable for its
+            // length.
+            #[cfg(target_os = "macos")]
+            let read = unsafe {
+                libc::getxattr(
+                    path.as_ptr(),
+                    c_name.as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                    0,
+                    libc::XATTR_NOFOLLOW,
+                )
+            };
+            value.truncate(usize::try_from(read).expect("read the attribute"));
+            (name.to_vec(), value)
+        })
+        .collect()
+}
+
+/// A POSIX ACL as Linux holds it in `system.posix_acl_*`: the owner, `user` with `user_bits`,
+/// the group, the mask and others, each with its permission bits.
+#[cfg(target_os = "linux")]
+fn posix_acl(user: u32, user_bits: u16) -> Vec<u8> {
+    const UNDEFINED: u32 = u32::MAX;
+    let entries: [(u16, u16, u32); 5] = [
+        (0x01, 7, UNDEFINED),
+        (0x02, user_bits, user),
+        (0x04, 5, UNDEFINED),
+        (0x10, 7, UNDEFINED),
+        (0x20, 0, UNDEFINED),
+    ];
+    let mut acl = 2u32.to_le_bytes().to_vec();
+    for (tag, bits, id) in entries {
+        acl.extend_from_slice(&tag.to_le_bytes());
+        acl.extend_from_slice(&bits.to_le_bytes());
+        acl.extend_from_slice(&id.to_le_bytes());
+    }
+    acl
+}
+
+/// The access and modification times of `path`, to the nanosecond, a link not followed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn times_of(path: &Path) -> (i64, i64, i64, i64) {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path).expect("stat");
+    (
+        metadata.atime(),
+        metadata.atime_nsec(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+    )
+}
+
+/// Sets the access and modification times of `path`, a link not followed, to odd nanoseconds.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn set_odd_times(path: &Path, seed: i64) {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a path");
+    let times = [
+        libc::timespec {
+            tv_sec: 1_600_000_000 + seed,
+            tv_nsec: 123_456_789,
+        },
+        libc::timespec {
+            tv_sec: 1_700_000_000 + seed,
+            tv_nsec: 987_654_321,
+        },
+    ];
+    // SAFETY: the path is NUL-terminated, and `times` holds two entries.
+    let set = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    assert_eq!(set, 0, "{}", io::Error::last_os_error());
+}
+
+/// Copies the tree at `source` faithfully into a new directory beside it, on the threads the
+/// syscall pool lends.
+#[cfg(any(target_os = "linux", target_os = "macos", target_family = "windows"))]
+fn copy_faithfully_beside(
+    root: &TempDir,
+    source: &Path,
+    visit: &lore_io::clone::VisitFn<'_>,
+    progress: &Progress,
+) -> io::Result<PathBuf> {
+    let destination = root.join("destination");
+    std::fs::create_dir(&destination).expect("create");
+    lore_io::clone::copy_faithfully(source, &destination, visit, progress)?;
+    Ok(destination)
+}
+
+/// A faithful copy keeps a file's holes: on APFS, which fills a hole of under 16 MiB beside data
+/// when it writes the data out, the 31 MiB and 32 MiB ones.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_faithful_copy_keeps_holes() {
+    use std::os::unix::fs::FileExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let root = TempDir::new("lore-io-faithful-holes-");
+    let source = root.join("source");
+    std::fs::create_dir(&source).expect("create");
+    let file = std::fs::File::create(source.join("sparse")).expect("create");
+    file.set_len(64 << 20).expect("size");
+    file.write_all_at(&[7; 4096], 1 << 20).expect("write");
+    file.write_all_at(&[9; 4096], 32 << 20).expect("write");
+    file.sync_all().expect("sync");
+
+    let destination =
+        copy_faithfully_beside(&root, &source, &every_entry, &Progress::default()).expect("copy");
+
+    let copy = destination.join("sparse");
+    assert_eq!(
+        std::fs::read(&copy).expect("read"),
+        std::fs::read(source.join("sparse")).expect("read")
+    );
+    let allocated = std::fs::metadata(&copy).expect("stat").blocks() * 512;
+    assert!(
+        allocated < 4 << 20,
+        "{allocated} bytes allocated for 8 KiB of data"
+    );
+}
+
+/// The lines of `ls -le` that list the extended ACL of `path`, a link not followed.
+#[cfg(target_os = "macos")]
+fn acl_of(path: &Path) -> Vec<String> {
+    let listed = std::process::Command::new("ls")
+        .arg("-led")
+        .arg(path)
+        .output()
+        .expect("ls");
+    String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .skip(1)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Adds the extended ACL entry `entry` to `path`, a link not followed.
+#[cfg(target_os = "macos")]
+fn add_acl(path: &Path, entry: &str) {
+    let status = std::process::Command::new("chmod")
+        .args(["-h", "+a", entry])
+        .arg(path)
+        .status()
+        .expect("chmod");
+    assert!(status.success(), "chmod +a {entry}");
+}
+
+/// Gives `file` a POSIX ACL that lets user 4321 read and write, and `directory` a default ACL
+/// that lets that user read what is created in it.
+#[cfg(target_os = "linux")]
+fn set_acls(file: &Path, directory: &Path, _link: &Path) {
+    set_attribute(file, "system.posix_acl_access", &posix_acl(4321, 6));
+    set_attribute(directory, "system.posix_acl_default", &posix_acl(4321, 4));
+}
+
+/// Gives `file` and `link` an extended ACL that keeps everyone from deleting them, and
+/// `directory` one that lets everyone read it and what is created in it.
+#[cfg(target_os = "macos")]
+fn set_acls(file: &Path, directory: &Path, link: &Path) {
+    add_acl(file, "everyone deny delete");
+    add_acl(
+        directory,
+        "everyone allow read,file_inherit,directory_inherit",
+    );
+    add_acl(link, "everyone deny delete");
+}
+
+/// Whether `path` has a POSIX ACL.
+#[cfg(target_os = "linux")]
+fn has_acl(path: &Path) -> bool {
+    attributes(path).contains_key(b"system.posix_acl_access".as_slice())
+}
+
+/// Whether `path` has an extended ACL.
+#[cfg(target_os = "macos")]
+fn has_acl(path: &Path) -> bool {
+    !acl_of(path).is_empty()
+}
+
+/// A faithful copy keeps the permission bits, extended attributes, ACLs, owner and times to the
+/// nanosecond of files, directories and links, and gives an entry no ACL from its directory. On
+/// Linux it leaves the access times of files and directories as they are.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_faithful_copy_keeps_metadata() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TempDir::new("lore-io-faithful-metadata-");
+    let source = root.join("source");
+    let directory = source.join("directory");
+    std::fs::create_dir_all(&directory).expect("create");
+    std::fs::write(directory.join("plain"), b"plain").expect("write");
+    let file = source.join("file");
+    std::fs::write(&file, b"data").expect("write");
+    std::os::unix::fs::symlink("file", source.join("link")).expect("link");
+    // SAFETY: `geteuid` has no preconditions.
+    let (uid, gid) = if unsafe { libc::geteuid() } == 0 {
+        (1234, 5678)
+    } else {
+        let metadata = std::fs::metadata(&file).expect("stat");
+        (metadata.uid(), metadata.gid())
+    };
+    for path in [&file, &directory.join("plain"), &directory] {
+        std::os::unix::fs::chown(path, Some(uid), Some(gid)).expect("chown");
+    }
+    std::os::unix::fs::lchown(source.join("link"), Some(uid), Some(gid)).expect("chown");
+    set_attribute(&file, ATTRIBUTE, b"file value");
+    set_attribute(&directory, ATTRIBUTE, b"directory value");
+    set_acls(&file, &directory, &source.join("link"));
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o4751)).expect("chmod");
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o750)).expect("chmod");
+    #[cfg(target_os = "macos")]
+    assert!(
+        std::process::Command::new("chmod")
+            .args(["-h", "700"])
+            .arg(source.join("link"))
+            .status()
+            .expect("chmod")
+            .success(),
+        "set the link's own permission bits"
+    );
+    for (seed, path) in [
+        &file,
+        &source.join("link"),
+        &directory.join("plain"),
+        &directory,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        set_odd_times(path, i64::try_from(seed).expect("small"));
+    }
+    let entries = ["file", "link", "directory", "directory/plain"];
+    let before = entries.map(|entry| times_of(&source.join(entry)));
+
+    let destination =
+        copy_faithfully_beside(&root, &source, &every_entry, &Progress::default()).expect("copy");
+
+    for (entry, before) in entries.iter().zip(before) {
+        #[cfg(target_os = "linux")]
+        if *entry != "link" {
+            let left = times_of(&source.join(entry));
+            assert_eq!(
+                left, before,
+                "{entry}: the source's access time is left as it is"
+            );
+        }
+        assert_eq!(times_of(&destination.join(entry)), before, "{entry}");
+    }
+    for entry in entries {
+        let (from, to) = (source.join(entry), destination.join(entry));
+        let (from_metadata, to_metadata) = (
+            std::fs::symlink_metadata(&from).expect("stat"),
+            std::fs::symlink_metadata(&to).expect("stat"),
+        );
+        assert_eq!(to_metadata.mode(), from_metadata.mode(), "{entry}");
+        assert_eq!(
+            (to_metadata.uid(), to_metadata.gid()),
+            (uid, gid),
+            "{entry}"
+        );
+        assert_eq!(attributes(&to), attributes(&from), "{entry}");
+        #[cfg(target_os = "macos")]
+        assert_eq!(acl_of(&to), acl_of(&from), "{entry}");
+    }
+    assert_eq!(
+        std::fs::read_link(destination.join("link")).expect("read"),
+        Path::new("file")
+    );
+    assert!(has_acl(&destination.join("file")));
+    assert!(
+        !has_acl(&destination.join("directory/plain")),
+        "an entry takes no ACL from its directory"
+    );
+}
+
+/// Gives `directory` an ACL that what is created in it inherits: a default ACL on Linux, and an
+/// inheritable entry of its extended ACL on macOS.
+#[cfg(target_os = "linux")]
+fn set_inherited_acl(directory: &Path) {
+    set_attribute(directory, "system.posix_acl_default", &posix_acl(4321, 4));
+}
+
+/// Gives `directory` an ACL that what is created in it inherits: a default ACL on Linux, and an
+/// inheritable entry of its extended ACL on macOS.
+#[cfg(target_os = "macos")]
+fn set_inherited_acl(directory: &Path) {
+    add_acl(
+        directory,
+        "everyone allow read,file_inherit,directory_inherit",
+    );
+}
+
+/// A faithful copy into a directory that inherited an ACL from its parent gives no entry that
+/// ACL, and gives the directory the source's metadata once filled, as it does each directory.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_faithful_copy_takes_no_acl_from_the_destinations_parent() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TempDir::new("lore-io-faithful-inherited-");
+    let source = root.join("source");
+    std::fs::create_dir_all(source.join("directory")).expect("create");
+    std::fs::write(source.join("file"), b"f").expect("write");
+    std::fs::write(source.join("directory/file"), b"f").expect("write");
+    set_attribute(&source, ATTRIBUTE, b"root value");
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o750)).expect("chmod");
+    set_odd_times(&source, 0);
+    let before = times_of(&source);
+    let parent = root.join("parent");
+    std::fs::create_dir(&parent).expect("create");
+    set_inherited_acl(&parent);
+    let destination = parent.join("destination");
+    std::fs::create_dir(&destination).expect("create");
+    assert!(has_acl(&destination), "the destination inherits an ACL");
+
+    lore_io::clone::copy_faithfully(&source, &destination, &every_entry, &Progress::default())
+        .expect("copy");
+
+    for entry in ["", "file", "directory", "directory/file"] {
+        let (from, to) = (source.join(entry), destination.join(entry));
+        assert_eq!(attributes(&to), attributes(&from), "{entry}");
+        #[cfg(target_os = "macos")]
+        assert_eq!(acl_of(&to), acl_of(&from), "{entry}");
+        assert_eq!(
+            std::fs::metadata(&to).expect("stat").mode(),
+            std::fs::metadata(&from).expect("stat").mode(),
+            "{entry}"
+        );
+    }
+    assert_eq!(times_of(&destination), before);
+}
+
+/// A faithful copy copies a resource fork larger than its buffer a buffer's length at a time, and
+/// holds no more of it at once.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_faithful_copy_copies_a_resource_fork_by_chunks() {
+    let root = TempDir::new("lore-io-faithful-fork-");
+    let source = root.join("source");
+    std::fs::create_dir(&source).expect("create");
+    let file = source.join("file");
+    std::fs::write(&file, b"data").expect("write");
+    let fork: Vec<u8> = (0..1u32 << 20)
+        .map(|byte| u8::try_from(byte % 251).expect("small"))
+        .collect();
+    set_attribute(&file, "com.apple.ResourceFork", &fork);
+    let progress = Progress::default();
+
+    let destination =
+        copy_faithfully_beside(&root, &source, &every_entry, &progress).expect("copy");
+
+    assert_eq!(attributes(&destination.join("file")), attributes(&file));
+    let held = progress.counts().value_held;
+    assert!(held > 0 && held <= 256 << 10, "{held} bytes held at once");
+}
+
+/// A faithful copy refuses a file with a second link, a FIFO and a socket.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_faithful_copy_refuses_links_fifos_and_sockets() {
+    type Make = fn(&Path);
+    let makes: [(&str, Make); 3] = [
+        ("hard link", |source| {
+            std::fs::write(source.join("file"), b"f").expect("write");
+            std::fs::hard_link(source.join("file"), source.join("second")).expect("link");
+        }),
+        ("fifo", |source| {
+            let status = std::process::Command::new("mkfifo")
+                .arg(source.join("fifo"))
+                .status()
+                .expect("mkfifo");
+            assert!(status.success());
+        }),
+        ("socket", |source| {
+            std::os::unix::net::UnixListener::bind(source.join("socket")).expect("bind");
+        }),
+    ];
+    for (what, make) in makes {
+        let root = TempDir::new("lore-io-faithful-refused-");
+        let source = root.join("source");
+        std::fs::create_dir(&source).expect("create");
+        make(&source);
+
+        let err = copy_faithfully_beside(&root, &source, &every_entry, &Progress::default())
+            .expect_err(what);
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{what}: {err}");
+    }
+}
+
+/// A faithful copy leaves out what its visit skips: the contents of each external directory's
+/// `write-staging/`, which it keeps, and the root's marker, as a move of the external root asks.
+#[cfg(any(target_os = "linux", target_os = "macos", target_family = "windows"))]
+#[test]
+fn a_faithful_copy_leaves_out_write_staging_and_the_marker() {
+    let root = TempDir::new("lore-io-faithful-staging-");
+    let source = root.join("source");
+    std::fs::create_dir_all(source.join("instance/write-staging/nested")).expect("create");
+    std::fs::write(source.join("instance/write-staging/staged"), b"s").expect("write");
+    std::fs::write(source.join("instance/kept"), b"k").expect("write");
+    std::fs::write(source.join(".lore-external-root"), b"marker").expect("write");
+    let visit = |_: &Path, relative: &Path, kind: Kind| {
+        let mut components = relative.components().map(|part| part.as_os_str());
+        let first = components.next();
+        if first == Some(std::ffi::OsStr::new(".lore-external-root")) {
+            return Visit::Skip;
+        }
+        if components.next() == Some(std::ffi::OsStr::new("write-staging"))
+            && components.next().is_some()
+        {
+            return Visit::Skip;
+        }
+        if kind == Kind::Directory {
+            Visit::EachEntry
+        } else {
+            Visit::Clone
+        }
+    };
+
+    let destination =
+        copy_faithfully_beside(&root, &source, &visit, &Progress::default()).expect("copy");
+
+    let copied: Vec<_> = tree_of(&destination).into_keys().collect();
+    assert_eq!(
+        copied,
+        [
+            PathBuf::from("instance"),
+            PathBuf::from("instance/kept"),
+            PathBuf::from("instance/write-staging"),
+        ]
+    );
+}
+
+/// One flush of the copy's file system follows its last file: on macOS one `F_FULLFSYNC`, on the
+/// calling thread, after an `fsync` of each file on its copying thread.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_faithful_copy_flushes_its_file_system_once() {
+    let root = TempDir::new("lore-io-faithful-flush-");
+    let source = root.join("source");
+    std::fs::create_dir(&source).expect("create");
+    make_tree(&source, 3, 2);
+    #[cfg(target_os = "macos")]
+    let files = tree_of(&source)
+        .values()
+        .filter(|file| file.is_some())
+        .count();
+    let progress = Progress::default();
+    #[cfg(target_os = "macos")]
+    let full_syncs = lore_io::psync::test_util::full_syncs_on_this_thread();
+
+    copy_faithfully_beside(&root, &source, &every_entry, &progress).expect("copy");
+
+    let counts = progress.counts();
+    assert_eq!(counts.flushed, 1);
+    #[cfg(target_os = "linux")]
+    assert_eq!(counts.flushed_files, 0);
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(counts.flushed_files, files);
+        assert_eq!(
+            lore_io::psync::test_util::full_syncs_on_this_thread() - full_syncs,
+            1
+        );
+    }
+}
+
+/// The walk's bounds hold in the faithful mode: the queue's cap over a tree wider than it, and
+/// a directory wider than a batch copied whole through continuations.
+#[cfg(any(target_os = "linux", target_os = "macos", target_family = "windows"))]
+#[test]
+fn a_faithful_copy_keeps_the_walks_bounds() {
+    let root = TempDir::new("lore-io-faithful-bounds-");
+    let source = root.join("source");
+    std::fs::create_dir(&source).expect("create");
+    make_tree(&source, 12, 2);
+    for file in 0..20 {
+        std::fs::write(source.join(format!("w{file}")), b"w").expect("write");
+    }
+    let progress = Progress::bounded(2, 64, 4);
+
+    let destination =
+        copy_faithfully_beside(&root, &source, &every_entry, &progress).expect("copy");
+
+    assert_eq!(tree_of(&destination), tree_of(&source));
+    let counts = progress.counts();
+    assert!(counts.queued <= 2, "{counts:?}");
+    assert!(counts.handed <= 5, "{counts:?}");
+    assert!(counts.kept >= 2, "{counts:?}");
+    assert!(counts.continued >= 2, "{counts:?}");
+}
+
+/// A `security.*` attribute the system's policy refuses to set keeps the value the target gives
+/// it; every other failure, and an attribute the target's file system can't hold, fails the copy.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn only_a_refused_security_attribute_keeps_the_targets_value() {
+    use lore_io::clone::target_keeps;
+
+    let failed = io::Error::from_raw_os_error;
+    for name in [b"security.selinux".as_slice(), b"security.capability"] {
+        assert!(target_keeps(name, &failed(libc::EPERM)));
+        assert!(target_keeps(name, &failed(libc::EACCES)));
+        assert!(!target_keeps(name, &failed(libc::ENOTSUP)));
+        assert!(!target_keeps(name, &failed(libc::ENOSPC)));
+    }
+    for name in [
+        b"user.lore".as_slice(),
+        b"trusted.lore",
+        b"system.posix_acl_access",
+        b"system.posix_acl_default",
+    ] {
+        for code in [
+            libc::EPERM,
+            libc::EACCES,
+            libc::ENOTSUP,
+            libc::ENOSPC,
+            libc::EIO,
+        ] {
+            assert!(!target_keeps(name, &failed(code)), "{code}");
+        }
+    }
+    assert!(!target_keeps(b"security.selinux", &failed(libc::EIO)));
+    assert!(!target_keeps(
+        b"security.capability",
+        &io::Error::other("not an OS error")
+    ));
+}
+
+/// A file capability `security.capability` with no capabilities, which only a caller with
+/// `CAP_SETFCAP` can set.
+#[cfg(target_os = "linux")]
+const EMPTY_CAPABILITY: [u8; 20] = [
+    0, 0, 0, 2, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Writes two files with a file capability and a `user.*` attribute under a new `source`, or
+/// `None` where the caller can't set a file capability.
+#[cfg(target_os = "linux")]
+fn source_with_capabilities(root: &TempDir) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = root.join("source");
+    std::fs::create_dir(&source).expect("create");
+    for file in ["one", "two"] {
+        let path = source.join(file);
+        std::fs::write(&path, b"f").expect("write");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a path");
+        // SAFETY: the path and name are NUL-terminated, and the value is readable for its
+        // length.
+        let set = unsafe {
+            libc::setxattr(
+                c_path.as_ptr(),
+                c"security.capability".as_ptr(),
+                EMPTY_CAPABILITY.as_ptr().cast(),
+                EMPTY_CAPABILITY.len(),
+                0,
+            )
+        };
+        if set != 0 {
+            return None;
+        }
+        set_attribute(&path, "user.lore", b"kept");
+    }
+    Some(source)
+}
+
+/// A `security.*` attribute whose set the system refuses with `EPERM` or `EACCES` keeps the
+/// value the target gives it, and the copy reports it with the entries it affected. Returns early
+/// where the test can't set a file capability, which takes `CAP_SETFCAP`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_refused_security_attribute_is_reported_with_its_entries() {
+    for code in [libc::EPERM, libc::EACCES] {
+        let root = TempDir::new("lore-io-faithful-relabeled-");
+        let Some(source) = source_with_capabilities(&root) else {
+            return;
+        };
+        let destination = root.join("destination");
+        std::fs::create_dir(&destination).expect("create");
+        let progress = Progress::refusing_attribute("security.capability", code);
+
+        let copied = lore_io::clone::copy_faithfully_on(
+            None,
+            &source,
+            &destination,
+            &every_entry,
+            &progress,
+        )
+        .expect("copy");
+
+        assert_eq!(
+            copied.relabeled,
+            [("security.capability".to_string(), 2)],
+            "{code}"
+        );
+        for file in ["one", "two"] {
+            let kept = attributes(&destination.join(file));
+            assert!(
+                !kept.contains_key(b"security.capability".as_slice()),
+                "{code}"
+            );
+            assert_eq!(
+                kept.get(b"user.lore".as_slice()).map(Vec::as_slice),
+                Some(&b"kept"[..])
+            );
+        }
+    }
+}
+
+/// Any other refused set fails the copy: a `security.*` attribute the target can't hold, and a
+/// `user.*` attribute the system refuses. Returns early where the test can't set a file
+/// capability.
+#[cfg(target_os = "linux")]
+#[test]
+fn any_other_refused_attribute_fails_the_copy() {
+    for (name, code) in [
+        ("security.capability", libc::ENOTSUP),
+        ("security.capability", libc::EIO),
+        ("user.lore", libc::EPERM),
+        ("user.lore", libc::ENOTSUP),
+    ] {
+        let root = TempDir::new("lore-io-faithful-refused-attribute-");
+        let Some(source) = source_with_capabilities(&root) else {
+            return;
+        };
+        let destination = root.join("destination");
+        std::fs::create_dir(&destination).expect("create");
+
+        let failed = lore_io::clone::copy_faithfully_on(
+            None,
+            &source,
+            &destination,
+            &every_entry,
+            &Progress::refusing_attribute(name, code),
+        )
+        .expect_err(name);
+
+        assert_eq!(
+            failed.kind(),
+            io::Error::from_raw_os_error(code).kind(),
+            "{name}"
+        );
+        assert!(
+            failed
+                .to_string()
+                .contains(&format!("setting the extended attribute {name}: ")),
+            "{failed}"
+        );
+    }
+}
+
+/// Writes a file, a directory and a link under a new `source`, each given the group 5678 where
+/// the caller is root, and answers it with the owner and group they have.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn source_with_a_group(root: &TempDir) -> (PathBuf, u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+
+    let source = root.join("source");
+    std::fs::create_dir_all(source.join("directory")).expect("create");
+    std::fs::write(source.join("file"), b"f").expect("write");
+    std::os::unix::fs::symlink("file", source.join("link")).expect("link");
+    // SAFETY: `geteuid` has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        for entry in ["", "file", "directory"] {
+            std::os::unix::fs::chown(source.join(entry), None, Some(5678)).expect("chown");
+        }
+        std::os::unix::fs::lchown(source.join("link"), None, Some(5678)).expect("chown");
+    }
+    let metadata = std::fs::metadata(source.join("file")).expect("stat");
+    (source, metadata.uid(), metadata.gid())
+}
+
+/// An entry whose group the caller may not give it, as one it isn't a member of, keeps the group
+/// the target gives it, and the copy counts it: the root, a file, a directory and a link, through
+/// the test point that refuses each set that gives a group.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_group_the_caller_may_not_give_keeps_the_targets() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = TempDir::new("lore-io-faithful-group-");
+    let (source, uid, _) = source_with_a_group(&root);
+    let destination = root.join("destination");
+    std::fs::create_dir(&destination).expect("create");
+    let given = std::fs::metadata(&destination).expect("stat").gid();
+
+    let copied = lore_io::clone::copy_faithfully_on(
+        None,
+        &source,
+        &destination,
+        &every_entry,
+        &Progress::refusing_owners(lore_io::clone::Refused::Group),
+    )
+    .expect("copy");
+
+    assert_eq!(copied.kept_groups, 4);
+    for entry in ["", "file", "directory", "link"] {
+        let metadata = std::fs::symlink_metadata(destination.join(entry)).expect("stat");
+        assert_eq!((metadata.uid(), metadata.gid()), (uid, given), "{entry}");
+    }
+}
+
+/// An owner the caller may not give fails the copy, even once the group is left as the target
+/// gives it, and the failure names the call and the owner and group asked for.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_owner_the_caller_may_not_give_fails_the_copy() {
+    let root = TempDir::new("lore-io-faithful-owner-");
+    let (source, uid, gid) = source_with_a_group(&root);
+    let destination = root.join("destination");
+    std::fs::create_dir(&destination).expect("create");
+
+    let failed = lore_io::clone::copy_faithfully_on(
+        None,
+        &source,
+        &destination,
+        &every_entry,
+        &Progress::refusing_owners(lore_io::clone::Refused::Owner),
+    )
+    .expect_err("an owner the caller may not give");
+
+    assert_eq!(failed.kind(), io::ErrorKind::PermissionDenied);
+    assert!(
+        failed
+            .to_string()
+            .contains(&format!("setting the owner {uid}:{gid}: ")),
+        "{failed}"
+    );
+}
+
+/// An attribute of a link that the target refuses to set as unsupported fails the copy, and the
+/// failure names the call and the attribute. Returns early where a link can't hold an attribute
+/// the tests' user can set, as on Linux.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_link_attribute_the_target_refuses_fails_the_copy() {
+    let root = TempDir::new("lore-io-faithful-link-attribute-");
+    let source = root.join("source");
+    std::fs::create_dir(&source).expect("create");
+    std::fs::write(source.join("file"), b"f").expect("write");
+    let link = source.join("link");
+    std::os::unix::fs::symlink("file", &link).expect("link");
+    if try_set_attribute(&link, ATTRIBUTE, b"link value").is_err() {
+        return;
+    }
+    let destination = root.join("destination");
+    std::fs::create_dir(&destination).expect("create");
+
+    let failed = lore_io::clone::copy_faithfully_on(
+        None,
+        &source,
+        &destination,
+        &every_entry,
+        &Progress::refusing_attribute(ATTRIBUTE, libc::ENOTSUP),
+    )
+    .expect_err("an attribute the target link can't hold");
+
+    assert_eq!(failed.kind(), io::ErrorKind::Unsupported);
+    assert!(
+        failed
+            .to_string()
+            .contains(&format!("setting the extended attribute {ATTRIBUTE}: ")),
+        "{failed}"
+    );
+}
+
+/// A `security.*` attribute that the target refuses to set with `ENOTSUP` but holds, as one the
+/// system gives each new entry, keeps the target's value, and the copy reports it with the entries
+/// it affected. Returns early where the test can't set a file capability.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_security_attribute_the_system_gives_the_target_keeps_its_value() {
+    let root = TempDir::new("lore-io-faithful-assigned-");
+    let Some(source) = source_with_capabilities(&root) else {
+        return;
+    };
+    let destination = root.join("destination");
+    std::fs::create_dir(&destination).expect("create");
+    let progress =
+        Progress::refusing_attribute_the_target_holds("security.capability", libc::ENOTSUP);
+
+    let copied =
+        lore_io::clone::copy_faithfully_on(None, &source, &destination, &every_entry, &progress)
+            .expect("copy");
+
+    assert_eq!(copied.relabeled, [("security.capability".to_string(), 2)]);
+    for file in ["one", "two"] {
+        assert_eq!(
+            attributes(&destination.join(file))
+                .get(b"user.lore".as_slice())
+                .map(Vec::as_slice),
+            Some(&b"kept"[..])
+        );
+    }
+}
+
+/// `flag` as the faithful copy reads flags.
+#[cfg(target_os = "linux")]
+fn flag_bits(flag: libc::c_int) -> u64 {
+    u64::try_from(flag).expect("flags")
+}
+
+/// `flag` as the faithful copy reads flags.
+#[cfg(target_os = "macos")]
+fn flag_bits(flag: libc::c_uint) -> u64 {
+    u64::from(flag)
+}
+
+/// An entry marked immutable or append-only is refused, and the flags that mark how a file is
+/// shown, backed up or stored are left out.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn only_immutable_and_append_only_flags_are_refused() {
+    use lore_io::clone::refuses_flags;
+
+    #[cfg(target_os = "linux")]
+    let (refused, kept) = (
+        [
+            libc::STATX_ATTR_IMMUTABLE,
+            libc::STATX_ATTR_APPEND,
+            libc::STATX_ATTR_IMMUTABLE | libc::STATX_ATTR_APPEND | libc::STATX_ATTR_NODUMP,
+        ],
+        [0, libc::STATX_ATTR_COMPRESSED, libc::STATX_ATTR_NODUMP],
+    );
+    #[cfg(target_os = "macos")]
+    let (refused, kept) = (
+        [
+            libc::UF_IMMUTABLE,
+            libc::UF_APPEND,
+            libc::SF_IMMUTABLE,
+            libc::SF_APPEND,
+            libc::UF_IMMUTABLE | libc::UF_HIDDEN,
+        ],
+        [0, libc::UF_HIDDEN, libc::UF_COMPRESSED, libc::UF_NODUMP],
+    );
+    for flags in refused {
+        assert!(refuses_flags(flag_bits(flags)), "{flags:#x}");
+    }
+    for flags in kept {
+        assert!(!refuses_flags(flag_bits(flags)), "{flags:#x}");
+    }
+}
+
+/// Sets the flag `flag` of `path` on, or off where `on` is clear: `false` where the caller can't.
+#[cfg(target_os = "linux")]
+fn set_flag(path: &Path, flag: i32, on: bool) -> bool {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    else {
+        return false;
+    };
+    let mut flags: libc::c_int = 0;
+    // SAFETY: the descriptor is open, and `flags` is writable.
+    if unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &raw mut flags) } != 0 {
+        return false;
+    }
+    flags = if on { flags | flag } else { flags & !flag };
+    // SAFETY: the descriptor is open, and `flags` is readable.
+    unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_SETFLAGS, &raw const flags) == 0 }
+}
+
+/// Sets the flag `flag` of `path` on, or off where `on` is clear: `false` where the caller can't.
+#[cfg(target_os = "macos")]
+fn set_flag(path: &Path, flag: libc::c_uint, on: bool) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    let flags = if on {
+        metadata.st_flags() | flag
+    } else {
+        metadata.st_flags() & !flag
+    };
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a path");
+    // SAFETY: the path is NUL-terminated.
+    unsafe { libc::chflags(c_path.as_ptr(), flags) == 0 }
+}
+
+/// A faithful copy refuses a file, a link, a directory or the root it copies whose status it reads
+/// as immutable or append-only, through flags the test stands in for, which it couldn't set
+/// itself.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_faithful_copy_refuses_entries_it_reads_as_immutable() {
+    #[cfg(target_os = "linux")]
+    let flags = [libc::STATX_ATTR_IMMUTABLE, libc::STATX_ATTR_APPEND];
+    #[cfg(target_os = "macos")]
+    let flags = [libc::UF_IMMUTABLE, libc::SF_APPEND];
+    for flag in flags {
+        for entry in ["file", "link", "directory", "source"] {
+            let root = TempDir::new("lore-io-faithful-read-flags-");
+            let source = root.join("source");
+            std::fs::create_dir_all(source.join("directory")).expect("create");
+            std::fs::write(source.join("file"), b"f").expect("write");
+            std::os::unix::fs::symlink("file", source.join("link")).expect("link");
+            let progress = Progress::flagging(entry, flag_bits(flag));
+
+            let err =
+                copy_faithfully_beside(&root, &source, &every_entry, &progress).expect_err(entry);
+
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidInput,
+                "{entry} {flag:#x}: {err}"
+            );
+        }
+    }
+    let root = TempDir::new("lore-io-faithful-read-flags-");
+    let source = root.join("source");
+    std::fs::create_dir(&source).expect("create");
+    std::fs::write(source.join("file"), b"f").expect("write");
+    #[cfg(target_os = "linux")]
+    let shown = libc::STATX_ATTR_NODUMP;
+    #[cfg(target_os = "macos")]
+    let shown = libc::UF_HIDDEN;
+    let progress = Progress::flagging("file", flag_bits(shown));
+    copy_faithfully_beside(&root, &source, &every_entry, &progress).expect("a flag left out");
+}
+
+/// A faithful copy refuses a file or a directory marked immutable or append-only. Returns early
+/// where the caller can't set the flag, which takes `CAP_LINUX_IMMUTABLE` on Linux.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_faithful_copy_refuses_immutable_and_append_only_entries() {
+    // `FS_IMMUTABLE_FL` and `FS_APPEND_FL`, which `libc` doesn't bind.
+    #[cfg(target_os = "linux")]
+    let flags = [0x10, 0x20];
+    #[cfg(target_os = "macos")]
+    let flags = [libc::UF_IMMUTABLE, libc::UF_APPEND];
+    for flag in flags {
+        for entry in ["file", "directory"] {
+            let root = TempDir::new("lore-io-faithful-flags-");
+            let source = root.join("source");
+            std::fs::create_dir_all(source.join("directory")).expect("create");
+            std::fs::write(source.join("file"), b"f").expect("write");
+            let flagged = source.join(entry);
+            if !set_flag(&flagged, flag, true) {
+                return;
+            }
+
+            let copied = copy_faithfully_beside(&root, &source, &every_entry, &Progress::default());
+
+            assert!(set_flag(&flagged, flag, false), "clear the flag");
+            let err = copied.expect_err(entry);
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidInput,
+                "{entry} {flag:#x}: {err}"
+            );
+        }
+    }
+}
+
+/// An attribute list or value read as empty is empty, even where the call would answer more had
+/// it been asked again, as when an attribute is set between the two calls: the buffer never takes
+/// a length larger than it holds.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_attribute_read_as_empty_stays_empty() {
+    let calls = std::cell::Cell::new(0);
+    let mut buffer = Vec::new();
+
+    lore_io::clone::read_sized(&mut buffer, |_buffer, _size| {
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 { 0 } else { 5 }
+    })
+    .expect("read");
+
+    assert!(buffer.is_empty());
+    assert!(buffer.len() <= buffer.capacity());
+}
+
+/// `path` with its alternate data stream `name`.
+#[cfg(target_family = "windows")]
+fn stream_of(path: &Path, name: &str) -> PathBuf {
+    let mut named = path.as_os_str().to_os_string();
+    named.push(format!(":{name}"));
+    PathBuf::from(named)
+}
+
+/// The named data streams of `path`, each with its contents.
+#[cfg(target_family = "windows")]
+fn streams_of(path: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::FindClose;
+    use windows_sys::Win32::Storage::FileSystem::FindFirstStreamW;
+    use windows_sys::Win32::Storage::FileSystem::FindNextStreamW;
+    use windows_sys::Win32::Storage::FileSystem::FindStreamInfoStandard;
+    use windows_sys::Win32::Storage::FileSystem::WIN32_FIND_STREAM_DATA;
+
+    let wide = wide(path);
+    let mut found = WIN32_FIND_STREAM_DATA::default();
+    // SAFETY: the path is NUL-terminated, and `found` is writable.
+    let search = unsafe {
+        FindFirstStreamW(
+            wide.as_ptr(),
+            FindStreamInfoStandard,
+            (&raw mut found).cast(),
+            0,
+        )
+    };
+    let mut streams = std::collections::BTreeMap::new();
+    if search == INVALID_HANDLE_VALUE {
+        return streams;
+    }
+    loop {
+        let length = found
+            .cStreamName
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(found.cStreamName.len());
+        let name = String::from_utf16(&found.cStreamName[..length]).expect("a stream name");
+        if name != "::$DATA" {
+            let stream = name.trim_start_matches(':').trim_end_matches(":$DATA");
+            streams.insert(
+                name.clone(),
+                std::fs::read(stream_of(path, stream)).expect("read the stream"),
+            );
+        }
+        // SAFETY: the search is open, and `found` is writable.
+        if unsafe { FindNextStreamW(search, (&raw mut found).cast()) } == 0 {
+            break;
+        }
+    }
+    // SAFETY: the search is open, and closed only here.
+    unsafe { FindClose(search) };
+    streams
+}
+
+/// `path` as a NUL-terminated wide string.
+#[cfg(target_family = "windows")]
+fn wide(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str().encode_wide().chain([0]).collect()
+}
+
+/// A faithful copy of a file that fails once its data is written removes what it wrote, through
+/// the test point that fails the copy of a file then.
+#[cfg(target_family = "windows")]
+#[test]
+fn a_faithful_copy_that_fails_partway_removes_the_file() {
+    let root = TempDir::new("lore-io-faithful-partway-");
+    let source = root.join("source");
+    std::fs::create_dir(&source).expect("create");
+    std::fs::write(source.join("partway"), vec![7; 1 << 20]).expect("write");
+
+    let failed = copy_faithfully_beside(
+        &root,
+        &source,
+        &every_entry,
+        &Progress::failing_file("partway"),
+    );
+
+    assert!(failed.is_err());
+    assert!(
+        !root.join("destination").join("partway").exists(),
+        "the file whose copy failed is removed"
+    );
+}
+
+/// The owner, group, DACL and mandatory label of `path`, as SDDL.
+#[cfg(target_family = "windows")]
+fn security_of(path: &Path) -> String {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+    use windows_sys::Win32::Security::Authorization::SDDL_REVISION_1;
+    use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+    use windows_sys::Win32::Security::GROUP_SECURITY_INFORMATION;
+    use windows_sys::Win32::Security::GetFileSecurityW;
+    use windows_sys::Win32::Security::LABEL_SECURITY_INFORMATION;
+    use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+
+    let what = OWNER_SECURITY_INFORMATION
+        | GROUP_SECURITY_INFORMATION
+        | DACL_SECURITY_INFORMATION
+        | LABEL_SECURITY_INFORMATION;
+    let wide = wide(path);
+    let mut needed = 0u32;
+    // SAFETY: the path is NUL-terminated, and a call with no buffer only sizes it.
+    unsafe { GetFileSecurityW(wide.as_ptr(), what, std::ptr::null_mut(), 0, &mut needed) };
+    let mut descriptor = vec![0u8; needed as usize];
+    // SAFETY: the path is NUL-terminated, and `descriptor` is writable for `needed` bytes.
+    let read = unsafe {
+        GetFileSecurityW(
+            wide.as_ptr(),
+            what,
+            descriptor.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    };
+    assert_ne!(read, 0, "read the security: {}", io::Error::last_os_error());
+    let mut text = std::ptr::null_mut();
+    let mut length = 0u32;
+    // SAFETY: `descriptor` holds a self-relative security descriptor, and the outputs are
+    // writable.
+    let converted = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor.as_mut_ptr().cast(),
+            SDDL_REVISION_1,
+            what,
+            &mut text,
+            &mut length,
+        )
+    };
+    assert_ne!(converted, 0, "{}", io::Error::last_os_error());
+    // SAFETY: the call wrote `length` characters at `text`.
+    let sddl =
+        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length as usize) });
+    // SAFETY: the call allocated `text` with `LocalAlloc`.
+    unsafe { LocalFree(text.cast()) };
+    sddl.trim_end_matches('\0').to_owned()
+}
+
+/// Sets the DACL and the mandatory label of `path` to those `sddl` names.
+#[cfg(target_family = "windows")]
+fn set_security(path: &Path, sddl: &str) {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::Authorization::SDDL_REVISION_1;
+    use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+    use windows_sys::Win32::Security::LABEL_SECURITY_INFORMATION;
+    use windows_sys::Win32::Security::SetFileSecurityW;
+
+    let labelled = sddl.contains("S:");
+    let sddl: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: the text is NUL-terminated, and `descriptor` is writable.
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(converted, 0, "{}", io::Error::last_os_error());
+    let what = DACL_SECURITY_INFORMATION
+        | if labelled {
+            LABEL_SECURITY_INFORMATION
+        } else {
+            0
+        };
+    // SAFETY: the path is NUL-terminated, and `descriptor` is a security descriptor.
+    let set = unsafe { SetFileSecurityW(wide(path).as_ptr(), what, descriptor) };
+    let failure = io::Error::last_os_error();
+    // SAFETY: the call allocated `descriptor` with `LocalAlloc`.
+    unsafe { LocalFree(descriptor.cast()) };
+    assert_ne!(set, 0, "set the security of {}: {failure}", path.display());
+}
+
+/// Sets the creation, access and write times of the file or directory `path` to odd times.
+#[cfg(target_family = "windows")]
+fn set_odd_times(path: &Path, seed: u64) {
+    use std::os::windows::fs::FileTimesExt;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .expect("open to set the times")
+        .set_times(
+            FileTimes::new()
+                .set_created(odd_time(seed))
+                .set_accessed(odd_time(seed + 100))
+                .set_modified(odd_time(seed + 200)),
+        )
+        .expect("set the times");
+}
+
+/// Sets the attributes of `path` to `attributes`.
+#[cfg(target_family = "windows")]
+fn set_attributes(path: &Path, attributes: u32) {
+    use windows_sys::Win32::Storage::FileSystem::SetFileAttributesW;
+
+    // SAFETY: the path is NUL-terminated.
+    let set = unsafe { SetFileAttributesW(wide(path).as_ptr(), attributes) };
+    assert_ne!(set, 0, "{}", io::Error::last_os_error());
+}
+
+/// The bytes the volume holds for the data of the file `path`.
+#[cfg(target_family = "windows")]
+fn allocated(path: &Path) -> u64 {
+    use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
+
+    let mut high = 0u32;
+    // SAFETY: the path is NUL-terminated, and `high` is writable.
+    let low = unsafe { GetCompressedFileSizeW(wide(path).as_ptr(), &mut high) };
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+/// What a faithful copy keeps of an entry on Windows: its attributes, its creation, access and
+/// write times, its security and its named data streams.
+#[cfg(target_family = "windows")]
+type Kept = (
+    u32,
+    (u64, u64, u64),
+    String,
+    std::collections::BTreeMap<String, Vec<u8>>,
+);
+
+/// What a faithful copy keeps of the entry `path`.
+#[cfg(target_family = "windows")]
+fn kept_of(path: &Path) -> Kept {
+    use std::os::windows::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path).expect("stat");
+    (
+        metadata.file_attributes(),
+        (
+            metadata.creation_time(),
+            metadata.last_access_time(),
+            metadata.last_write_time(),
+        ),
+        security_of(path),
+        streams_of(path),
+    )
+}
+
+/// A faithful copy keeps the data, the alternate data streams, the security, the attributes and
+/// the times of files and directories, and the sparse ranges of a file: of a file whose DACL grants
+/// no write too, and of data and streams longer than the copy's buffer.
+#[cfg(target_family = "windows")]
+#[test]
+fn a_faithful_copy_keeps_streams_security_attributes_and_sparse_ranges() {
+    use std::os::windows::fs::FileExt;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_ARCHIVE;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SPARSE_FILE;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SYSTEM;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+
+    let root = TempDir::new("lore-io-faithful-windows-");
+    let source = root.join("source");
+    let directory = source.join("directory");
+    std::fs::create_dir_all(&directory).expect("create");
+    std::fs::write(directory.join("plain"), b"plain").expect("write");
+    let sparse = source.join("sparse");
+    {
+        let file = std::fs::File::create(&sparse).expect("create");
+        let mut returned = 0u32;
+        // SAFETY: the handle is open, and the control takes no buffers.
+        let made = unsafe {
+            DeviceIoControl(
+                std::os::windows::io::AsRawHandle::as_raw_handle(&file),
+                FSCTL_SET_SPARSE,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(made, 0, "{}", io::Error::last_os_error());
+        file.set_len(64 << 20).expect("size");
+        file.seek_write(&[7; 4096], 1 << 20).expect("write");
+        file.seek_write(&[9; 4096], 32 << 20).expect("write");
+    }
+    std::fs::write(stream_of(&sparse, "lore"), b"file stream").expect("write");
+    let long: Vec<u8> = (0..(1 << 20) + 12_345)
+        .map(|byte: u32| (byte % 251) as u8)
+        .collect();
+    let read_only = source.join("read-only");
+    std::fs::write(&read_only, &long).expect("write");
+    std::fs::write(stream_of(&read_only, "long"), &long[..300_000]).expect("write");
+    std::fs::write(stream_of(&directory, "lore"), &long[..300_000]).expect("write");
+    set_security(
+        &sparse,
+        "D:P(A;;FA;;;WD)(A;;FR;;;S-1-5-32-545)S:(ML;;NW;;;LW)",
+    );
+    set_security(
+        &directory,
+        "D:P(A;OICI;FA;;;WD)(A;;0x1200a9;;;S-1-5-32-545)",
+    );
+    for (seed, path) in [&sparse, &directory.join("plain"), &directory, &read_only]
+        .into_iter()
+        .enumerate()
+    {
+        set_odd_times(path, 1000 * seed as u64);
+    }
+    set_attributes(
+        &sparse,
+        FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED | FILE_ATTRIBUTE_READONLY,
+    );
+    set_attributes(&directory.join("plain"), FILE_ATTRIBUTE_NORMAL);
+    set_attributes(&directory, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+    set_security(&read_only, "D:P(A;;FR;;;WD)");
+
+    let destination =
+        copy_faithfully_beside(&root, &source, &every_entry, &Progress::default()).expect("copy");
+
+    for entry in ["sparse", "directory", "directory/plain", "read-only"] {
+        let (from, to) = (source.join(entry), destination.join(entry));
+        assert_eq!(kept_of(&to), kept_of(&from), "{entry}");
+    }
+    assert_eq!(
+        std::fs::read(destination.join("read-only")).expect("read"),
+        long
+    );
+    let (attributes, ..) = kept_of(&destination.join("directory/plain"));
+    assert_eq!(
+        attributes & FILE_ATTRIBUTE_ARCHIVE,
+        0,
+        "the archive bit is cleared"
+    );
+    let copy = destination.join("sparse");
+    assert_eq!(
+        std::fs::read(&copy).expect("read"),
+        std::fs::read(&sparse).expect("read")
+    );
+    assert_eq!(
+        std::fs::read(destination.join("directory/plain")).expect("read"),
+        b"plain"
+    );
+    let (attributes, ..) = kept_of(&copy);
+    assert_ne!(attributes & FILE_ATTRIBUTE_SPARSE_FILE, 0);
+    let allocated = allocated(&copy);
+    assert!(
+        allocated < 4 << 20,
+        "{allocated} bytes allocated for 8 KiB of data"
+    );
+}
+
+/// A faithful copy refuses a file with a second link, a junction, a compressed file and directory,
+/// and, where this account may create one, a symbolic link.
+#[cfg(target_family = "windows")]
+#[test]
+fn a_faithful_copy_refuses_reparse_points_and_second_links() {
+    type Make = fn(&Path) -> bool;
+    let makes: [(&str, Make); 5] = [
+        ("hard link", |source| {
+            std::fs::write(source.join("file"), b"f").expect("write");
+            std::fs::hard_link(source.join("file"), source.join("second")).expect("link");
+            true
+        }),
+        ("junction", |source| {
+            std::fs::create_dir(source.join("target")).expect("create");
+            lore_io::junction::create_junction(&source.join("target"), &source.join("junction"))
+                .expect("junction");
+            true
+        }),
+        ("symbolic link", |source| {
+            std::fs::write(source.join("file"), b"f").expect("write");
+            std::os::windows::fs::symlink_file("file", source.join("link")).is_ok()
+        }),
+        ("compressed file", |source| {
+            std::fs::write(source.join("file"), b"f").expect("write");
+            compress(&source.join("file"));
+            true
+        }),
+        ("compressed directory", |source| {
+            std::fs::create_dir(source.join("directory")).expect("create");
+            compress(&source.join("directory"));
+            true
+        }),
+    ];
+    for (what, make) in makes {
+        let root = TempDir::new("lore-io-faithful-refused-");
+        let source = root.join("source");
+        std::fs::create_dir(&source).expect("create");
+        if !make(&source) {
+            continue;
+        }
+
+        let err = copy_faithfully_beside(&root, &source, &every_entry, &Progress::default())
+            .expect_err(what);
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{what}: {err}");
+    }
+}
+
+/// Compresses the file or directory `path` with NTFS compression.
+#[cfg(target_family = "windows")]
+fn compress(path: &Path) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_COMPRESSION;
+
+    let entry = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .expect("open to compress");
+    let format: u16 = 1;
+    let mut returned = 0u32;
+    // SAFETY: the handle is open, and `format` is readable for its size.
+    let compressed = unsafe {
+        DeviceIoControl(
+            std::os::windows::io::AsRawHandle::as_raw_handle(&entry),
+            FSCTL_SET_COMPRESSION,
+            (&raw const format).cast(),
+            size_of::<u16>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(compressed, 0, "{}", io::Error::last_os_error());
+}
+
+/// A faithful copy refuses an entry with more than one link, or with an attribute it doesn't keep,
+/// such as a reparse point's, an encrypted or a compressed entry's, and keeps every other.
+#[cfg(target_family = "windows")]
+#[test]
+fn a_faithful_copy_refuses_what_backup_writes_cannot_keep() {
+    use lore_io::clone::refusal;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_ARCHIVE;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_COMPRESSED;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_ENCRYPTED;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_INTEGRITY_STREAM;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SPARSE_FILE;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SYSTEM;
+
+    let kept = FILE_ATTRIBUTE_ARCHIVE
+        | FILE_ATTRIBUTE_HIDDEN
+        | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED
+        | FILE_ATTRIBUTE_READONLY
+        | FILE_ATTRIBUTE_SPARSE_FILE
+        | FILE_ATTRIBUTE_SYSTEM;
+    assert!(refusal(kept, 1).is_none());
+    assert!(refusal(FILE_ATTRIBUTE_DIRECTORY, 1).is_none());
+    assert!(refusal(FILE_ATTRIBUTE_NORMAL, 1).is_none());
+    assert!(refusal(FILE_ATTRIBUTE_INTEGRITY_STREAM, 1).is_some());
+    assert!(refusal(kept, 2).is_some());
+    for refused in [
+        FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_ATTRIBUTE_ENCRYPTED,
+        FILE_ATTRIBUTE_COMPRESSED,
+    ] {
+        assert!(refusal(kept | refused, 1).is_some(), "{refused:#x}");
+        assert!(
+            refusal(FILE_ATTRIBUTE_DIRECTORY | refused, 1).is_some(),
+            "{refused:#x}"
+        );
+    }
+}
+
+/// Each file of a faithful copy is flushed once, by the call that holds its handle, before the
+/// handle closes, as the test-util counter beside the flush counts, and the copy flushes no file
+/// system as a whole.
+#[cfg(target_family = "windows")]
+#[test]
+fn a_faithful_copy_flushes_each_file_before_it_closes() {
+    let root = TempDir::new("lore-io-faithful-flush-");
+    let source = root.join("source");
+    std::fs::create_dir(&source).expect("create");
+    make_tree(&source, 3, 2);
+    let progress = Progress::default();
+
+    copy_faithfully_beside(&root, &source, &every_entry, &progress).expect("copy");
+
+    let files = tree_of(&source)
+        .values()
+        .filter(|data| data.is_some())
+        .count();
+    assert_eq!(files, 13);
+    assert_eq!(progress.counts().flushed_files, files);
+    assert_eq!(progress.counts().flushed, 0);
 }

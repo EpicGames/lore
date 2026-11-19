@@ -46,11 +46,13 @@ impl AsRef<Path> for Source<'_> {
 }
 
 /// A directory of the source tree as its parent listed it: its identity, and on Unix its
-/// permission bits.
+/// permission bits, on Windows its attributes.
 pub(super) struct ListedDirectory {
     pub(super) identity: Identity,
     #[cfg(target_family = "unix")]
     pub(super) mode: u32,
+    #[cfg(target_family = "windows")]
+    pub(super) attributes: u32,
 }
 
 impl Source<'_> {
@@ -108,8 +110,14 @@ impl Source<'_> {
     /// The entry as a directory, or `None` where something else is there now.
     #[cfg(target_family = "windows")]
     pub(super) fn directory(&self) -> io::Result<Option<ListedDirectory>> {
-        Ok(super::entry::directory_identity(self.path)?
-            .map(|identity| ListedDirectory { identity }))
+        Ok(
+            super::entry::directory_identity(self.path)?.map(|(identity, attributes)| {
+                ListedDirectory {
+                    identity,
+                    attributes,
+                }
+            }),
+        )
     }
 
     /// The length of the file.
@@ -215,10 +223,18 @@ pub(super) fn at_path<R>(
 }
 
 /// A directory of the source tree the walk lists, held open once the walk has checked that the
-/// directory is the one its parent listed.
+/// directory is the one its parent listed. On Unix its one descriptor is the one its `readdir`
+/// stream reads, which the walk reaches its entries through.
 pub(super) struct OpenDirectory {
-    /// On Windows only held, so the directory keeps its path while it is listed.
-    #[cfg_attr(target_family = "windows", allow(dead_code))]
+    #[cfg(target_family = "unix")]
+    stream: Stream,
+    /// The access time the directory had as it was opened, where the listing keeps it, in seconds
+    /// and nanoseconds: on macOS, which has no `O_NOATIME`, the listing sets it.
+    #[cfg(target_family = "unix")]
+    atime: Option<(i64, i64)>,
+    /// Only held, so the directory keeps its path while it is listed.
+    #[cfg(target_family = "windows")]
+    #[allow(dead_code)]
     handle: std::fs::File,
 }
 
@@ -226,9 +242,15 @@ impl OpenDirectory {
     /// Opens the directory at `path`, without following a link at its last component, unless
     /// `expected` is `None`, as for the walk's root, which may be reached through a link. `None`
     /// where a directory with an identity other than `expected` is there, as where it was
-    /// replaced, or a link swapped in above it leads elsewhere, since its parent listed it.
+    /// replaced, or a link swapped in above it leads elsewhere, since its parent listed it. Where
+    /// `keeps_atime` is set, listing it leaves its access time as it is, on Linux where the caller
+    /// owns it.
     #[cfg(target_family = "unix")]
-    pub(super) fn open(path: &Path, expected: Option<&Identity>) -> io::Result<Option<Self>> {
+    pub(super) fn open(
+        path: &Path,
+        expected: Option<&Identity>,
+        keeps_atime: bool,
+    ) -> io::Result<Option<Self>> {
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::OpenOptionsExt;
 
@@ -237,15 +259,34 @@ impl OpenDirectory {
         } else {
             0
         };
-        let handle = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | no_follow)
-            .open(path)?;
+        let open = |flags| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | no_follow | flags)
+                .open(path)
+        };
+        #[cfg(target_os = "linux")]
+        let handle = if keeps_atime {
+            match open(libc::O_NOATIME) {
+                Err(err) if err.raw_os_error() == Some(libc::EPERM) => open(0),
+                opened => opened,
+            }
+        } else {
+            open(0)
+        }?;
+        #[cfg(not(target_os = "linux"))]
+        let handle = {
+            let _ = keeps_atime;
+            open(0)?
+        };
         let metadata = handle.metadata()?;
         if expected.is_some_and(|expected| *expected != (metadata.dev(), metadata.ino())) {
             return Ok(None);
         }
-        Ok(Some(Self { handle }))
+        Ok(Some(Self {
+            stream: Stream::of(handle)?,
+            atime: keeps_atime.then(|| (metadata.atime(), metadata.atime_nsec())),
+        }))
     }
 
     /// Opens the directory at `path`, held so that neither it nor a directory above it is renamed
@@ -254,7 +295,11 @@ impl OpenDirectory {
     /// `None` where a directory with an identity other than `expected` is there, or something
     /// other than a directory is.
     #[cfg(target_family = "windows")]
-    pub(super) fn open(path: &Path, expected: Option<&Identity>) -> io::Result<Option<Self>> {
+    pub(super) fn open(
+        path: &Path,
+        expected: Option<&Identity>,
+        _keeps_atime: bool,
+    ) -> io::Result<Option<Self>> {
         let Some((handle, identity)) = super::entry::open_directory_held(path, expected.is_none())?
         else {
             return Ok(None);
@@ -268,11 +313,9 @@ impl OpenDirectory {
     /// The entry `name` of this directory, whose path is `path`.
     #[cfg(target_family = "unix")]
     pub(super) fn entry<'a>(&'a self, path: &'a Path, name: &'a OsStr) -> Source<'a> {
-        use std::os::fd::AsFd;
-
         Source {
             path,
-            parent: self.handle.as_fd(),
+            parent: self.stream.fd(),
             name,
         }
     }
@@ -284,62 +327,110 @@ impl OpenDirectory {
         Source { path }
     }
 
-    /// The names and kinds the directory lists, read through the open handle: `.` and `..`
-    /// are left out, and a kind the listing does not give is read with `fstatat`.
+    /// The directory's descriptor.
     #[cfg(target_family = "unix")]
-    pub(super) fn names(
-        &self,
-    ) -> io::Result<impl Iterator<Item = io::Result<(std::ffi::OsString, super::Kind)>> + '_> {
+    pub(super) fn fd(&self) -> BorrowedFd<'_> {
+        self.stream.fd()
+    }
+
+    /// The access time the directory had as it was opened, where the listing keeps it.
+    #[cfg(target_family = "unix")]
+    pub(super) fn atime(&self) -> Option<(i64, i64)> {
+        self.atime
+    }
+
+    /// The next name and kind the directory lists: `.` and `..` are left out, and a kind the
+    /// listing does not give is read with `fstatat`. `None` at the end, and after a failure.
+    #[cfg(target_family = "unix")]
+    pub(super) fn next(&mut self) -> Option<io::Result<(std::ffi::OsString, super::Kind)>> {
+        self.stream.next()
+    }
+}
+
+/// A stream from `fdopendir` of the names a directory lists, which owns the directory's
+/// descriptor and closes it when dropped. It moves to another thread with the position it has
+/// read to, without the directory being opened again.
+#[cfg(target_family = "unix")]
+struct Stream {
+    stream: std::ptr::NonNull<libc::DIR>,
+    /// Set once `readdir` failed, as it may fail the same way again.
+    failed: bool,
+}
+
+// SAFETY: a directory stream is not tied to the thread that opened it, and `Stream` reads it only
+// through `&mut self`, so one thread reads it at a time.
+#[cfg(target_family = "unix")]
+unsafe impl Send for Stream {}
+
+#[cfg(target_family = "unix")]
+impl Stream {
+    /// The stream of the directory `handle` is open on, which takes the handle's descriptor.
+    fn of(handle: std::fs::File) -> io::Result<Self> {
+        use std::os::fd::FromRawFd;
         use std::os::fd::IntoRawFd;
 
-        // `fdopendir` takes the descriptor it is given, so it gets a duplicate of the handle.
-        let duplicate = self.handle.try_clone()?.into_raw_fd();
+        let descriptor = handle.into_raw_fd();
         // SAFETY: the descriptor is open and owned here; `fdopendir` takes it over on success.
-        let stream = unsafe { libc::fdopendir(duplicate) };
+        let stream = unsafe { libc::fdopendir(descriptor) };
         let Some(stream) = std::ptr::NonNull::new(stream) else {
             let err = io::Error::last_os_error();
-            // SAFETY: `fdopendir` failed, so the descriptor is still owned here.
-            unsafe { libc::close(duplicate) };
+            // SAFETY: `fdopendir` failed, so the descriptor is still owned here, and is closed once.
+            drop(unsafe { std::fs::File::from_raw_fd(descriptor) });
             return Err(err);
         };
-        let stream = Stream(stream);
-        // A stream that failed is read no further, as `readdir` may fail the same way again.
-        let mut failed = false;
-        Ok(std::iter::from_fn(move || {
-            loop {
-                if failed {
-                    return None;
-                }
-                set_errno_zero();
-                // SAFETY: the stream is open until `Stream` is dropped with the iterator.
-                let found = unsafe { libc::readdir(stream.as_ptr()) };
-                if found.is_null() {
-                    let err = io::Error::last_os_error();
-                    failed = true;
-                    return (err.raw_os_error() != Some(0)).then_some(Err(err));
-                }
-                // SAFETY: `readdir` returned an entry valid until the next call on the stream.
-                let entry = unsafe { &*found };
-                // SAFETY: `d_name` is NUL-terminated.
-                let name = unsafe { std::ffi::CStr::from_ptr(entry.d_name.as_ptr()) };
-                let bytes = name.to_bytes();
-                if bytes == b"." || bytes == b".." {
-                    continue;
-                }
-                let name: &OsStr = std::os::unix::ffi::OsStrExt::from_bytes(bytes);
-                let kind = match entry.d_type {
-                    libc::DT_DIR => super::Kind::Directory,
-                    libc::DT_REG => super::Kind::File,
-                    libc::DT_LNK => super::Kind::Symlink,
-                    libc::DT_UNKNOWN => match self.entry(Path::new(""), name).stat() {
-                        Ok(stat) => kind_of_mode(mode_bits(stat.st_mode)),
-                        Err(err) => return Some(Err(err)),
-                    },
-                    _ => super::Kind::Other,
-                };
-                return Some(Ok((name.to_os_string(), kind)));
+        Ok(Stream {
+            stream,
+            failed: false,
+        })
+    }
+
+    /// The directory's descriptor, which the stream owns.
+    fn fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: the stream is open, and its descriptor stays open for as long as it is.
+        unsafe { BorrowedFd::borrow_raw(libc::dirfd(self.stream.as_ptr())) }
+    }
+
+    /// [`OpenDirectory::next`].
+    fn next(&mut self) -> Option<io::Result<(std::ffi::OsString, super::Kind)>> {
+        loop {
+            if self.failed {
+                return None;
             }
-        }))
+            set_errno_zero();
+            // SAFETY: the stream is open until `Stream` is dropped.
+            let found = unsafe { libc::readdir(self.stream.as_ptr()) };
+            if found.is_null() {
+                let err = io::Error::last_os_error();
+                self.failed = true;
+                return (err.raw_os_error() != Some(0)).then_some(Err(err));
+            }
+            // SAFETY: `readdir` returned an entry valid until the next call on the stream.
+            let entry = unsafe { &*found };
+            // SAFETY: `d_name` is NUL-terminated.
+            let name = unsafe { std::ffi::CStr::from_ptr(entry.d_name.as_ptr()) };
+            let bytes = name.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            let name: &OsStr = std::os::unix::ffi::OsStrExt::from_bytes(bytes);
+            let kind = match entry.d_type {
+                libc::DT_DIR => super::Kind::Directory,
+                libc::DT_REG => super::Kind::File,
+                libc::DT_LNK => super::Kind::Symlink,
+                libc::DT_UNKNOWN => match (Source {
+                    path: Path::new(""),
+                    parent: self.fd(),
+                    name,
+                })
+                .stat()
+                {
+                    Ok(stat) => kind_of_mode(mode_bits(stat.st_mode)),
+                    Err(err) => return Some(Err(err)),
+                },
+                _ => super::Kind::Other,
+            };
+            return Some(Ok((name.to_os_string(), kind)));
+        }
     }
 }
 
@@ -358,23 +449,11 @@ fn kind_of_mode(mode: u32) -> super::Kind {
     }
 }
 
-/// A directory stream from `fdopendir`, closed when dropped.
-#[cfg(target_family = "unix")]
-struct Stream(std::ptr::NonNull<libc::DIR>);
-
-#[cfg(target_family = "unix")]
-impl Stream {
-    /// The stream, borrowed from `self` so a closure that reads it owns the whole `Stream`.
-    fn as_ptr(&self) -> *mut libc::DIR {
-        self.0.as_ptr()
-    }
-}
-
 #[cfg(target_family = "unix")]
 impl Drop for Stream {
     fn drop(&mut self) {
         // SAFETY: the stream is open and closed only here.
-        unsafe { libc::closedir(self.0.as_ptr()) };
+        unsafe { libc::closedir(self.stream.as_ptr()) };
     }
 }
 

@@ -54,6 +54,23 @@ pub(super) enum OpenedSource {
 /// [`io::ErrorKind::IsADirectory`].
 #[cfg(target_family = "unix")]
 pub(super) fn open_source(source: Source<'_>) -> io::Result<OpenedSource> {
+    open_source_with(source, 0)
+}
+
+/// [`open_source`], leaving the file's access time as it is, which `O_NOATIME` asks of a file
+/// the caller owns; a file it doesn't own is opened again without it.
+#[cfg(target_os = "linux")]
+pub(super) fn open_source_keeping_atime(source: Source<'_>) -> io::Result<OpenedSource> {
+    match open_source_with(source, libc::O_NOATIME) {
+        Err(err) if err.raw_os_error() == Some(libc::EPERM) => open_source(source),
+        opened => opened,
+    }
+}
+
+/// [`open_source`] with the open's `flags` beside its own.
+#[cfg(target_family = "unix")]
+#[inline]
+fn open_source_with(source: Source<'_>, flags: libc::c_int) -> io::Result<OpenedSource> {
     use std::os::fd::FromRawFd;
 
     let name = source.name_for_call()?;
@@ -62,7 +79,7 @@ pub(super) fn open_source(source: Source<'_>) -> io::Result<OpenedSource> {
         libc::openat(
             source.parent_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | flags,
         )
     };
     if opened < 0 {
@@ -229,12 +246,12 @@ pub(super) type Identity = (u64, u64);
 #[cfg(target_family = "windows")]
 pub(super) type Identity = (u64, [u8; 16]);
 
-/// The identity of the directory at `path`, or `None` where something else is there, such as a
-/// link or a junction. Every component of `path` but the last is resolved, so a directory reached
-/// through a link swapped in above it answers with the identity of the directory the link leads
-/// to.
+/// The identity and the attributes of the directory at `path`, or `None` where something else is
+/// there, such as a link or a junction. Every component of `path` but the last is resolved, so a
+/// directory reached through a link swapped in above it answers with the identity of the directory
+/// the link leads to.
 #[cfg(target_family = "windows")]
-pub(super) fn directory_identity(path: &Path) -> io::Result<Option<Identity>> {
+pub(super) fn directory_identity(path: &Path) -> io::Result<Option<(Identity, u32)>> {
     windows::directory_identity(path)
 }
 
@@ -456,13 +473,15 @@ mod windows {
     }
 
     /// [`super::directory_identity`].
-    pub(super) fn directory_identity(path: &Path) -> io::Result<Option<super::Identity>> {
+    pub(super) fn directory_identity(path: &Path) -> io::Result<Option<(super::Identity, u32)>> {
         let entry = open_entry(path, FILE_READ_ATTRIBUTES)?;
-        let is_directory = entry.metadata()?.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0;
-        if !is_directory || reparse_tag(&entry)?.is_some_and(|tag| tag & NAME_SURROGATE != 0) {
+        let attributes = entry.metadata()?.file_attributes();
+        if attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+            || reparse_tag(&entry)?.is_some_and(|tag| tag & NAME_SURROGATE != 0)
+        {
             return Ok(None);
         }
-        file_id(&entry).map(Some)
+        Ok(Some((file_id(&entry)?, attributes)))
     }
 
     /// The first pause before a held open refused for sharing is tried again, doubled before each

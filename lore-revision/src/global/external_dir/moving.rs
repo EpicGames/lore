@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! A move of the external root by rename, or the creation of a first root, once the service is
-//! stopped: recovery of an interrupted move, the checks after the stop, the record and the final
-//! switch under the store locks.
+//! A move of the external root by rename or by copy, or the creation of a first root, once the
+//! service is stopped: recovery of an interrupted move, the checks after the stop, the record, the
+//! copy and the final switch under the store locks.
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use lore_base::error::MountsBusy;
 use lore_base::fs::lock::FSLock;
@@ -21,6 +22,7 @@ use super::record::MoveKind;
 use super::record::MovePhase;
 use super::record::MoveRecord;
 use super::recovery;
+use super::recovery::CopyRun;
 use super::recovery::Locking;
 use super::recovery::Recovered;
 use super::redirect::Redirect;
@@ -51,29 +53,35 @@ pub struct Moved {
 }
 
 /// Moves the external root of the global data directory `global` to the absolute path `target`,
-/// by rename, or creates it there where no default root exists, with no service running and
-/// the exclusive access to the root that [`super::access::try_exclusive_for_move`] takes held:
+/// by rename on one volume and by copy across volumes, or creates it there where no default root
+/// exists, once the checks before the stop, [`super::check::require_copy_space`] among them for a
+/// copy, have passed, with no service running and the exclusive access to the root that
+/// [`super::access::try_exclusive_for_move`] takes held:
 ///
 /// 1. recovers an interrupted move, refusing where it waits;
-/// 2. checks the target again, refuses a target inside a registered virtual instance's path, and
-///    a live mount of a virtual instance in the root with `MountsBusy`;
-/// 3. writes the move record and runs the phases before the final switch;
+/// 2. checks the target again, refuses a target inside a registered virtual instance's path, read
+///    under the store locks, which names each held store to `on_held` before a copy starts, and a
+///    live mount of a virtual instance in the root with `MountsBusy`;
+/// 3. writes the move record and runs the phases before the final switch, the copy among them,
+///    telling `on_copying` the name of each external directory as the copy reaches it;
 /// 4. checks the mount table again, and takes the store locks, naming each held store to
 ///    `on_held`;
 /// 5. runs the final switch.
 ///
 /// A failure after the record is written, a live mount found in step 4, and `termination`
-/// completing while the locks are taken, take the move as recovery would, undoing it before the
-/// final switch. `termination` completing while the registrations are read cancels the move
-/// before it changes anything, and completing after the locks are taken takes effect once the
-/// move has finished. `termination` completing while the recovery in step 1, or the recovery of a
-/// failed final switch, waits for a store fails the command, keeping the move's record.
+/// completing during step 3, which stops the copy, or while the locks are taken, take the move as
+/// recovery would, undoing it before the final switch. `termination` completing while the
+/// registrations are read cancels the move before it changes anything, and completing after the
+/// locks are taken takes effect once the move has finished. `termination` completing while the
+/// recovery in step 1, or the recovery of a failed final switch, waits for a store fails the
+/// command, keeping the move's record.
 pub async fn move_root(
     global: &Path,
     target: &Path,
     _access: &FSLock,
     termination: impl Future<Output = ()>,
     mut on_held: impl FnMut(&Path) + Send,
+    on_copying: impl Fn(&str) + Send + Sync + 'static,
 ) -> Result<Moved, MoveError> {
     let mut termination = std::pin::pin!(termination);
     let recovered = recovery::recover(
@@ -111,7 +119,7 @@ pub async fn move_root(
         return Err(MoveError::internal("the external root isn't available"));
     };
     let stores = match kind {
-        MoveKind::Rename => store_set(&root)
+        MoveKind::Rename | MoveKind::Copy => store_set(&root)
             .await
             .forward::<MoveError>("reading the stores of the external root")?,
         _ => Vec::new(),
@@ -130,20 +138,38 @@ pub async fn move_root(
         from: setting.map_or_default(|setting| setting.path),
         to: path_text(global, target)?,
         kind,
-        phase: if first_move && kind == MoveKind::Rename {
-            MovePhase::Mark
-        } else {
-            MovePhase::Place
+        phase: match kind {
+            MoveKind::Rename | MoveKind::Copy if first_move => MovePhase::Mark,
+            MoveKind::Copy => MovePhase::Copy,
+            _ => MovePhase::Place,
         },
     };
     record
         .save(global)
         .await
         .forward::<MoveError>("writing the external root move record")?;
+    let copy = (kind == MoveKind::Copy).then(|| CopyRun {
+        progress: Arc::new(copy_progress(global)),
+        on_copying: Arc::new(on_copying),
+    });
+    let progress = copy.as_ref().map(|copy| Arc::clone(&copy.progress));
     let before_switch = async {
-        recovery::run_phases(global, &mut record, Some(MovePhase::Place))
-            .await
-            .forward::<MoveError>("running the first phases of a move of the external root")?;
+        let phases = recovery::copying_as(
+            copy,
+            recovery::run_phases(global, &mut record, Some(MovePhase::Place)),
+        );
+        let mut phases = std::pin::pin!(phases);
+        let ran = tokio::select! {
+            ran = &mut phases => ran,
+            () = &mut termination => {
+                if let Some(progress) = &progress {
+                    progress.stop();
+                }
+                let _ = phases.await;
+                return Ok(None);
+            }
+        };
+        ran.forward::<MoveError>("running the first phases of a move of the external root")?;
         refuse_live_mounts(&root).await?;
         tokio::select! {
             locks = lock_stores(&stores, Joining::Never, &mut on_held) => Ok(Some(
@@ -196,6 +222,18 @@ pub async fn move_root(
             }
         }
     }
+}
+
+/// The progress of a move's copy, which holds the copy once it has copied an entry until it is
+/// stopped where a test overrides the moves of `global` with
+/// [`crate::test_util::MoveOverride::CopyHeld`].
+#[cfg_attr(not(feature = "test-util"), allow(unused_variables))]
+fn copy_progress(global: &Path) -> lore_io::clone::Progress {
+    #[cfg(feature = "test-util")]
+    if crate::test_util::move_override(global) == Some(crate::test_util::MoveOverride::CopyHeld) {
+        return lore_io::clone::Progress::holding();
+    }
+    lore_io::clone::Progress::default()
 }
 
 /// Undoes the move recorded in `global`, which hasn't reached its final switch.

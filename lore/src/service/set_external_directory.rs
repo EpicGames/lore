@@ -12,11 +12,13 @@ use lore_base::error::InvalidArguments;
 use lore_base::error::MountsBusy;
 use lore_error_set::prelude::*;
 use lore_io::clone::Progress;
+use lore_io::clone::TreeSize;
 use lore_revision::event::EventError;
 use lore_revision::global::external_dir::check::check_new_root;
 use lore_revision::global::external_dir::check::check_target;
 use lore_revision::global::external_dir::check::measure_root;
 use lore_revision::global::external_dir::check::refuse_linked_root;
+use lore_revision::global::external_dir::check::require_copy_space;
 use lore_revision::global::external_dir::moving::Moved;
 use lore_revision::global::external_dir::moving::move_root;
 use lore_revision::global::external_dir::record::MoveKind;
@@ -153,6 +155,7 @@ pub(crate) async fn set_external_directory(
             store.display()
         );
     };
+    let on_copying = |name: &str| lore_info!("Copying the external directory {name}");
     let moved = match form {
         Form::Move => {
             move_root(
@@ -161,6 +164,7 @@ pub(crate) async fn set_external_directory(
                 stopped.access(),
                 &mut termination,
                 on_held,
+                on_copying,
             )
             .await
         }
@@ -256,12 +260,19 @@ fn check_before_stop(
         Availability::Available(root) => Some(root.clone()),
         _ => None,
     };
+    let mut measured = None;
     let kind = match form {
         Form::Move if interrupted.is_some() => None,
         Form::Move => {
             let kind = check_target(&state, target)
                 .forward::<SetExternalDirectoryError>("checking the target")?;
-            if kind == Some(MoveKind::Rename)
+            if kind == Some(MoveKind::Copy) {
+                measured = Some(
+                    require_copy_space(&state, target, progress)
+                        .forward::<SetExternalDirectoryError>("checking the target")?,
+                );
+            }
+            if matches!(kind, Some(MoveKind::Rename | MoveKind::Copy))
                 && setting.is_none()
                 && let Some(root) = &root
             {
@@ -302,7 +313,7 @@ fn check_before_stop(
         }
     };
     if dry_run && let Some(root) = &root {
-        report_root(root, progress);
+        report_root(root, progress, measured);
     }
     Ok(Checked {
         kind,
@@ -312,8 +323,9 @@ fn check_before_stop(
 }
 
 /// Reports how many external directories the root at `root` holds and what a copy of them
-/// would take, measured until `progress` is stopped. Blocking.
-fn report_root(root: &Path, progress: &Progress) {
+/// would take: `measured`, where the checks measured it, and otherwise measured until `progress`
+/// is stopped. Blocking.
+fn report_root(root: &Path, progress: &Progress, measured: Option<TreeSize>) {
     let count = std::fs::read_dir(root).map_or(0, |entries| {
         entries
             .filter_map(Result::ok)
@@ -326,8 +338,14 @@ fn report_root(root: &Path, progress: &Progress) {
             })
             .count()
     });
-    let block = lore_io::clone::space_of(root).map_or(4096, |space| space.block);
-    match measure_root(root, block, progress) {
+    let measured = measured.map_or_else(
+        || {
+            let block = lore_io::clone::space_of(root).map_or(4096, |space| space.block);
+            measure_root(root, block, progress)
+        },
+        Ok,
+    );
+    match measured {
         Ok(size) => lore_info!(
             "The external root {} holds {count} external directories, {} bytes",
             root.display(),
@@ -382,6 +400,11 @@ fn report_dry_run(
         (Form::Move, Some(MoveKind::Create)) => {
             lore_info!("Would create the external root at {}", target.display());
         }
+        (Form::Move, Some(MoveKind::Copy)) => lore_info!(
+            "Would move the external root to {} by copying it, after which each FUSE instance \
+             reads and hashes the files in its overlay again",
+            target.display()
+        ),
         (Form::Move, Some(_)) => lore_info!(
             "Would move the external root to {} by renaming it",
             target.display()
@@ -406,9 +429,11 @@ fn report_moved(target: &Path, moved: &Moved, from: Option<&Path>) {
             "Abandoned the external root{from} for a new, empty one at {}",
             target.display()
         ),
-        Some(MoveKind::Copy) | None => {
-            lore_info!("{} is the external root", target.display());
-        }
+        Some(MoveKind::Copy) => lore_info!(
+            "Moved the external root{from} to {} by copying it",
+            target.display()
+        ),
+        None => lore_info!("{} is the external root", target.display()),
     }
     if let Redirect::Kept(occupant) = &moved.redirect {
         lore_warn!(

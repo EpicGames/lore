@@ -35,13 +35,13 @@ use super::resolve::root_available;
 use super::resolve::root_path;
 use super::setting::Setting;
 
-/// Points the setting of `global` at the existing directory `target`, which holds the marker of
-/// the setting's root ID and generation and, on Unix, is the user's alone, and makes the redirect
+/// Points the setting of `global` at the existing directory `target`, which holds the marker of the
+/// setting's root ID and generation and, on Unix, is the user's alone, and makes the redirect
 /// match. With no setting, the marker's root ID and generation are taken, and the setting written
 /// again. The adopted root is taken off the leftover list. A move that waits for a root is taken
-/// over: the move's other roots are listed as leftovers first. So is an adopt whose root has gone,
-/// which made no root and gives up none. Runs as [`super::moving::move_root`] runs, with no
-/// service and exclusive access held.
+/// over: the move's other roots, and the temporary directory of a move by copy, are listed as
+/// leftovers first. So is an adopt whose root has gone, which made no root and gives up none. Runs
+/// as [`super::moving::move_root`] runs, with no service and exclusive access held.
 pub async fn adopt(
     global: &Path,
     target: &Path,
@@ -87,9 +87,11 @@ pub async fn adopt(
     };
     let locks = lock_for_takeover(global, &record, &stores, termination, &mut on_held).await?;
     if let Some(waiting) = &waiting {
-        let given_up: Vec<&str> = [waiting.from.as_str(), waiting.to.as_str()]
+        let given_up: Vec<PathBuf> = [&waiting.from, &waiting.to]
             .into_iter()
-            .filter(|root| waiting.kind != MoveKind::Adopt && root_path(global, root) != target)
+            .map(|root| root_path(global, root))
+            .chain(copying_of(global, waiting))
+            .filter(|root| waiting.kind != MoveKind::Adopt && root != target)
             .collect();
         give_up(global, &given_up).await?;
     }
@@ -105,7 +107,8 @@ pub async fn adopt(
 /// next generation, so the old root stays unavailable when it returns, and makes the redirect
 /// match. Refuses while the current root is available, and with no setting. A move that waits for
 /// a root, or an adopt whose root has gone, is taken over, unless the root it leaves is available:
-/// what the move made at its target is listed as a leftover first, which for an adopt is nothing.
+/// what the move made at its target, and the temporary directory of a move by copy, is listed as a
+/// leftover first, which for an adopt is nothing.
 /// Runs as [`super::moving::move_root`] runs, with no service and exclusive access held.
 pub async fn abandon(
     global: &Path,
@@ -154,13 +157,14 @@ pub async fn abandon(
     };
     let locks = lock_for_takeover(global, &record, &[], termination, &mut on_held).await?;
     if let Some(waiting) = &waiting {
-        let made = [waiting.to.as_str()];
-        let made: &[&str] = if waiting.kind == MoveKind::Adopt {
-            &[]
+        let made: Vec<PathBuf> = if waiting.kind == MoveKind::Adopt {
+            Vec::new()
         } else {
-            &made
+            std::iter::once(root_path(global, &waiting.to))
+                .chain(copying_of(global, waiting))
+                .collect()
         };
-        give_up(global, made).await?;
+        give_up(global, &made).await?;
     }
     let redirect = finish_switch(global, &mut record, locks).await?;
     Ok(Moved {
@@ -203,6 +207,13 @@ async fn recover_or_wait(
     Ok((recovered, waiting))
 }
 
+/// The temporary directory a waiting move by copy, `waiting`, copies into, which a takeover gives
+/// up with the move's roots.
+fn copying_of(global: &Path, waiting: &MoveRecord) -> Option<PathBuf> {
+    (waiting.kind == MoveKind::Copy)
+        .then(|| recovery::copying_path(&root_path(global, &waiting.to)))
+}
+
 /// The root of `global` a resolution finds available, if any.
 async fn current_root(global: &Path) -> Result<Option<PathBuf>, MoveError> {
     blocking(global, |global| {
@@ -214,11 +225,10 @@ async fn current_root(global: &Path) -> Result<Option<PathBuf>, MoveError> {
     .await
 }
 
-/// Lists the roots `given_up`, as a move record names them, as leftovers of `global` that keep
-/// their marker until their removal begins, leaving out a redirect, which is no root.
-async fn give_up(global: &Path, given_up: &[&str]) -> Result<(), MoveError> {
-    for root in given_up {
-        let path = root_path(global, root);
+/// Lists the roots `given_up` as leftovers of `global` that keep their marker until their removal
+/// begins, leaving out a redirect, which is no root.
+async fn give_up(global: &Path, given_up: &[PathBuf]) -> Result<(), MoveError> {
+    for path in given_up {
         let examined = path.clone();
         let redirect = blocking(global, move |_global| {
             Ok(std::fs::symlink_metadata(&examined)
@@ -226,7 +236,7 @@ async fn give_up(global: &Path, given_up: &[&str]) -> Result<(), MoveError> {
         })
         .await?;
         if !redirect {
-            recovery::list_leftover(global, &path, true)
+            recovery::list_leftover(global, path, true)
                 .await
                 .forward::<MoveError>("listing what a takeover gives up")?;
         }

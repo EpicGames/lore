@@ -2522,6 +2522,77 @@ mod tests {
         assert!(global.join("external").join(name).join("file").exists());
     }
 
+    /// A dry run of a move that copies to a volume without the room for it is refused with
+    /// `InvalidArguments`, as the move would be before anything stops, and changes nothing.
+    #[test]
+    #[serial]
+    fn a_dry_run_of_a_copy_to_a_full_volume_is_refused() {
+        let settings = machine_settings("service-api-set-external-dry-run-full-");
+        let global = global_data_dir(&settings);
+        let name = default_root_with_an_instance(&global);
+        let target = settings.path().join("target");
+        let _full = lore_revision::test_util::override_moves(
+            &global,
+            lore_revision::test_util::MoveOverride::CopyToFullVolume,
+        );
+        let dry_run = LoreGlobalArgs {
+            dry_run: 1,
+            ..globals()
+        };
+
+        let status = lore::runtime().block_on(set_external_directory(
+            dry_run,
+            target.to_str().expect("UTF-8"),
+            (false, false),
+            std::future::pending(),
+        ));
+
+        assert_eq!(
+            status,
+            code_of(lore_base::error::InvalidArguments {
+                reason: String::new()
+            })
+        );
+        assert!(!target.exists());
+        assert!(global.join("external").join(name).join("file").exists());
+    }
+
+    /// A dry run of a first move by copy refuses a default root another user owns, as the move
+    /// would before anything stops, and changes nothing. Runs as root, which can give the root away.
+    #[cfg(target_family = "unix")]
+    #[test]
+    #[serial]
+    fn a_dry_run_of_a_first_copy_refuses_a_root_another_user_owns() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let settings = machine_settings("service-api-set-external-dry-run-owner-");
+        let global = global_data_dir(&settings);
+        let name = default_root_with_an_instance(&global);
+        std::os::unix::fs::chown(global.join("external"), Some(4321), None).expect("chown");
+        let target = settings.path().join("target");
+        let _copying = lore_revision::test_util::override_moves(
+            &global,
+            lore_revision::test_util::MoveOverride::Copy,
+        );
+        let dry_run = LoreGlobalArgs {
+            dry_run: 1,
+            ..globals()
+        };
+
+        let status = lore::runtime().block_on(set_external_directory(
+            dry_run,
+            target.to_str().expect("UTF-8"),
+            (false, false),
+            std::future::pending(),
+        ));
+
+        assert_ne!(status, 0);
+        assert!(!target.exists());
+        assert!(global.join("external").join(name).join("file").exists());
+    }
+
     /// A dry run while another move holds the service socket is refused with `MountsBusy`, as the
     /// move would be.
     #[test]

@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 //! The checks on a move's target that need nothing stopped: its path, its parent, its file
-//! system and the executable that serves after the move, and whether the move renames the root.
+//! system and the executable that serves after the move, whether the move renames or copies the
+//! root, and the free space a copy needs.
 // The capability probe writes and removes a directory of its own, outside any repository.
 #![allow(clippy::disallowed_methods)]
 
@@ -50,12 +51,14 @@ const PROBE_MODE: u32 = 0o604;
 #[cfg(target_family = "unix")]
 const PROBE_TIME: Duration = Duration::new(1_700_000_000, 123_456_789);
 
-/// Checks that the available external root of `state` can move to the absolute path `target`,
-/// and answers how: `None` where `target` is the current root, [`MoveKind::Create`] where the
-/// default root doesn't exist yet, and [`MoveKind::Rename`] otherwise. Refuses a move that would
-/// copy. Runs every check on the target that needs nothing stopped, from the path to the file
-/// system, and the default location is exempt from the file-system checks. It leaves nothing on
-/// disk, so it serves a dry run as it is. Blocking.
+/// Checks that the available external root of `state` can move to the absolute path `target`, and
+/// answers how: `None` where `target` is the current root, [`MoveKind::Create`] where the default
+/// root doesn't exist yet, and [`MoveKind::Rename`] or [`MoveKind::Copy`] otherwise, as
+/// [`move_kind`] chooses. For a copy, refuses on Windows a target that can't hold ACLs, alternate
+/// data streams and sparse files, as [`require_copy_features`] does; [`require_copy_space`] checks
+/// its free space. Runs every other check on the target that needs nothing stopped, from the path
+/// to the file system, and the default location is exempt from the file-system checks. It leaves
+/// nothing on disk, so it serves a dry run as it is. Blocking.
 pub fn check_target(state: &RootState, target: &Path) -> Result<Option<MoveKind>, CheckError> {
     if target.to_str().is_none() {
         return Err(refused(format!(
@@ -126,11 +129,52 @@ pub fn check_target(state: &RootState, target: &Path) -> Result<Option<MoveKind>
         return Ok(Some(MoveKind::Create));
     }
     let (root_volume, root_locality) = volume_of(&root_resolved)?;
-    move_kind(
+    let kind = move_kind(
         (&root_volume, root_locality.mount_id),
         (&target_volume, target_locality.mount_id),
-    )
-    .map(Some)
+    );
+    #[cfg(feature = "test-util")]
+    let kind = if crate::test_util::move_override(&state.global).is_some() {
+        MoveKind::Copy
+    } else {
+        kind
+    };
+    #[cfg(target_family = "windows")]
+    if kind == MoveKind::Copy {
+        require_copy_features(&target_volume, target_locality)?;
+    }
+    Ok(Some(kind))
+}
+
+/// Refuses a copy of the available external root of `state` to the absolute path `target` where
+/// the volume of the target's nearest existing ancestor has less free space than the copy takes,
+/// measured as [`measure_root`] measures it, until `progress` is stopped. Answers what the copy
+/// takes. Blocking.
+pub fn require_copy_space(
+    state: &RootState,
+    target: &Path,
+    progress: &Progress,
+) -> Result<TreeSize, CheckError> {
+    let Availability::Available(root) = &state.availability else {
+        return Err(CheckError::internal("The external root isn't available"));
+    };
+    let (ancestor, _) = through_nearest_existing(target)?;
+    let space = lore_io::clone::space_of(&ancestor)
+        .map_err(|err| read_failure("read the free space of", &ancestor, &err))?;
+    #[cfg(feature = "test-util")]
+    let space = if crate::test_util::move_override(&state.global)
+        == Some(crate::test_util::MoveOverride::CopyToFullVolume)
+    {
+        Space {
+            available: 0,
+            ..space
+        }
+    } else {
+        space
+    };
+    let needed = measure_root(root, space.block, progress)?;
+    require_space(needed.size, &space, &ancestor)?;
+    Ok(needed)
 }
 
 /// Checks that a new, empty root can be made at the absolute path `target`, as `--abandon`
@@ -431,28 +475,22 @@ impl Drop for ProbeDir {
 
 /// How a move from a root on the volume `current` to a target on the volume `target`, each with
 /// the mount ID [`Locality::mount_id`] reads, goes: a rename where both have one volume ID and
-/// either one mount ID, which `statx` names on Linux, or, without mount IDs, one mount point.
-/// Refuses a move that would copy, naming both volumes.
+/// either one mount ID, which `statx` names on Linux, or, without mount IDs, one mount point, and
+/// a copy otherwise.
 #[lore_macro::test_pub]
 fn move_kind(
     (current, current_mount): (&Volume, Option<u64>),
     (target, target_mount): (&Volume, Option<u64>),
-) -> Result<MoveKind, CheckError> {
+) -> MoveKind {
     let same_mount = match (current_mount, target_mount) {
         (Some(current), Some(target)) => current == target,
         _ => current.mount_point == target.mount_point,
     };
     if current.id == target.id && same_mount {
-        return Ok(MoveKind::Rename);
+        MoveKind::Rename
+    } else {
+        MoveKind::Copy
     }
-    Err(refused(format!(
-        "the external root is on the {} volume at {}, and the target on the {} volume at {}: \
-         the external root can only move within its volume",
-        current.filesystem,
-        current.mount_point.display(),
-        target.filesystem,
-        target.mount_point.display()
-    )))
 }
 
 /// Measures what a copy of the external root at `root` takes on a volume whose blocks are
@@ -477,7 +515,7 @@ pub fn measure_root(root: &Path, block: u64, progress: &Progress) -> Result<Tree
 /// Whether the entry at `relative` in an external root lies inside an external directory's
 /// `write-staging/`.
 #[cfg(target_os = "linux")]
-fn in_write_staging(relative: &Path) -> bool {
+pub(super) fn in_write_staging(relative: &Path) -> bool {
     let mut components = relative.components();
     components.next();
     components
@@ -488,7 +526,7 @@ fn in_write_staging(relative: &Path) -> bool {
 
 /// Only FUSE instances, which run on Linux, stage writes.
 #[cfg(not(target_os = "linux"))]
-fn in_write_staging(_relative: &Path) -> bool {
+pub(super) fn in_write_staging(_relative: &Path) -> bool {
     false
 }
 

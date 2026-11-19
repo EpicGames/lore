@@ -642,3 +642,146 @@ async fn an_adopt_cancelled_while_it_waits_for_a_store_changes_nothing() {
     assert_eq!(fixture.setting(), setting);
     assert_eq!(fixture.leftovers(), Leftovers::default());
 }
+
+/// Each takeover of a copy that waits for its old root's volume replaces its record and
+/// finishes, and lists the copy's temporary directory, with what else it gives up, as a
+/// leftover.
+#[tokio::test]
+async fn each_takeover_of_a_waiting_copy_finishes() {
+    use lore_revision::global::external_dir::recovery::copying_path;
+
+    for adopting in [true, false] {
+        let fixture = Fixture::new();
+        let root = fixture.moved_to("root").await;
+        let copy = fixture.root("copy");
+        copy_root(&root, &copy);
+        let target = fixture.root("target");
+        let copying = copying_path(&target);
+        std::fs::create_dir_all(copying.join("partial")).expect("a partial copy");
+        std::fs::rename(&root, fixture.root("away")).expect("the old root's volume goes");
+        MoveRecord {
+            from: root.display().to_string(),
+            to: target.display().to_string(),
+            kind: MoveKind::Copy,
+            phase: MovePhase::Copy,
+        }
+        .save(fixture.global())
+        .await
+        .expect("the record");
+        let replacement = if adopting {
+            copy.clone()
+        } else {
+            fixture.root("new")
+        };
+
+        let taken = if adopting {
+            fixture.adopt(&replacement).await
+        } else {
+            fixture.abandon(&replacement).await
+        }
+        .expect("the takeover");
+
+        assert!(taken.kind.is_some(), "adopting: {adopting}");
+        assert!(fixture.record().is_none());
+        assert_eq!(fixture.availability(), Availability::Available(replacement));
+        let leftovers = fixture.leftovers();
+        let listed = copying.display().to_string();
+        assert!(
+            leftovers.paths.contains(&listed) || leftovers.marked.contains(&listed),
+            "adopting: {adopting}"
+        );
+    }
+}
+
+/// An abandon of a copy back to the default location that waits for its old root's volume lists
+/// the copy's temporary directory as a leftover, in a global data directory whose path isn't
+/// UTF-8.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_abandon_gives_up_a_waiting_copys_directory_on_a_path_that_is_not_utf8() {
+    use std::os::unix::ffi::OsStrExt;
+
+    use lore_revision::global::external_dir::recovery::copying_path;
+    use lore_revision::global::external_dir::recovery::leftover_path;
+
+    let base = crate::helper::verified_temp_dir("lore-external-takeover-not-utf8-");
+    let parent = base
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"not-\xFF-utf8"));
+    std::fs::create_dir(&parent).expect("the parent");
+    let fixture = Fixture {
+        global: lore_base::test_util::TempDir::new_in(&parent, "lore-external-move-global-"),
+        ..Fixture::new()
+    };
+    let root = fixture.moved_to("root").await;
+    let copying = copying_path(&fixture.default_location());
+    std::fs::create_dir_all(copying.join("partial")).expect("a partial copy");
+    std::fs::rename(&root, fixture.root("away")).expect("the old root's volume goes");
+    MoveRecord {
+        from: root.display().to_string(),
+        to: String::new(),
+        kind: MoveKind::Copy,
+        phase: MovePhase::Copy,
+    }
+    .save(fixture.global())
+    .await
+    .expect("the record");
+
+    fixture
+        .abandon(&fixture.root("new"))
+        .await
+        .expect("the abandon");
+
+    let leftovers = fixture.leftovers();
+    assert!(
+        leftovers
+            .paths
+            .iter()
+            .chain(&leftovers.marked)
+            .any(|entry| leftover_path(fixture.global(), entry) == copying),
+        "{leftovers:?}"
+    );
+}
+
+/// An adopt of the finished copy that a waiting copy made, its temporary directory, gives up the
+/// move's old root but never the copy it adopts: failed once it listed what it gives up, the
+/// adopted directory isn't listed as a leftover, which a service start would remove.
+#[tokio::test]
+async fn an_adopt_of_a_waiting_copys_directory_never_lists_it() {
+    use lore_revision::global::external_dir::recovery::copying_path;
+
+    let fixture = Fixture::new();
+    let root = fixture.moved_to("root").await;
+    let target = fixture.root("target");
+    let copying = copying_path(&target);
+    copy_root(&root, &copying);
+    std::fs::rename(&root, fixture.root("away")).expect("the old root's volume goes");
+    MoveRecord {
+        from: root.display().to_string(),
+        to: target.display().to_string(),
+        kind: MoveKind::Copy,
+        phase: MovePhase::Place,
+    }
+    .save(fixture.global())
+    .await
+    .expect("the record");
+    let (reached, mut steps) =
+        tokio::sync::mpsc::unbounded_channel::<(MoveStep, tokio::sync::oneshot::Sender<bool>)>();
+    let failing = tokio::spawn(async move {
+        while let Some((step, answer)) = steps.recv().await {
+            let _ = answer.send(step != MoveStep::TakeoverListed);
+        }
+    });
+
+    assert!(step_moves(reached, fixture.adopt(&copying)).await.is_err());
+    failing.abort();
+
+    let leftovers = fixture.leftovers();
+    let adopted = copying.display().to_string();
+    assert!(!leftovers.marked.contains(&adopted), "{leftovers:?}");
+    assert!(!leftovers.paths.contains(&adopted), "{leftovers:?}");
+    assert!(
+        leftovers.marked.contains(&root.display().to_string()),
+        "the old root is given up: {leftovers:?}"
+    );
+}

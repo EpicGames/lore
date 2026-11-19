@@ -1161,3 +1161,51 @@ def pytest_collection_modifyitems(config, items):
                     reason="bug_reproduction: known unfixed bug", strict=True
                 )
             )
+
+
+def _hdiutil_volume(scratch_dir, name: str, file_system: str, size: str):
+    """A volume of `file_system` mounted for the test from a disk image made with hdiutil, or a
+    skip where hdiutil can't make one."""
+    if sys.platform != "darwin":
+        pytest.skip("the volume is made with hdiutil, which only macOS has")
+    image = scratch_dir(f"{name}_image", create=True) / "volume.dmg"
+    mount = scratch_dir(name, create=True)
+    for command in (
+        [
+            "hdiutil",
+            "create",
+            "-size",
+            size,
+            "-fs",
+            file_system,
+            "-volname",
+            "LoreTest",
+            str(image),
+        ],
+        ["hdiutil", "attach", "-nobrowse", "-mountpoint", str(mount), str(image)],
+    ):
+        made = subprocess.run(command, capture_output=True, text=True, check=False)
+        if made.returncode != 0:
+            pytest.skip(f"hdiutil cannot make a volume here: {made.stderr}")
+    try:
+        yield mount
+    finally:
+        subprocess.run(
+            ["hdiutil", "detach", "-force", str(mount)],
+            capture_output=True,
+            check=False,
+        )
+
+
+@pytest.fixture
+def other_volume(scratch_dir):
+    """A small HFS+ volume mounted for the test, which shares no blocks with the volume the
+    repositories are on and cannot clone files itself, but keeps permissions and links."""
+    yield from _hdiutil_volume(scratch_dir, "other_volume", "HFS+", "50m")
+
+
+@pytest.fixture
+def apfs_volume(scratch_dir):
+    """A small APFS volume mounted for the test, another volume than the one the repositories
+    are on, of the one file system Lore verifies as local on macOS."""
+    yield from _hdiutil_volume(scratch_dir, "apfs_volume", "APFS", "100m")

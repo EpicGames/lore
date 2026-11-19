@@ -29,11 +29,25 @@
 //! directory cloned entry by entry leaves out sockets, pipes and devices, and any entry gone by
 //! the time the clone reaches it. Directories keep their permissions on Unix; their times are not
 //! kept, apart from those of a directory APFS clones as a whole.
+//!
+//! [`copy_faithfully`] is the walk's faithful mode, which keeps what the clone mode leaves: holes,
+//! owners, extended attributes, ACLs, and the times of directories and links on Linux and macOS,
+//! and sparse ranges, alternate data streams, security descriptors and attributes on Windows. It
+//! shares the clone mode's walk and entry code through a constant parameter, so each mode's code
+//! is compiled on its own. It runs on the threads the syscall pool lends, at most half its cap, as
+//! the clone mode does: on Linux the walk benchmark measured the whole cap slower on every tree it
+//! copies but the one of large files, where they tie (`lore-io/BENCHMARKS.md`, *The walk's
+//! bounds*).
 
 mod apfs;
 mod copy;
 mod detect;
 mod entry;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod faithful;
+#[cfg(target_family = "windows")]
+#[path = "faithful_windows.rs"]
+mod faithful;
 mod reflink;
 mod refs;
 mod source;
@@ -51,6 +65,14 @@ pub use detect::PROBE_PREFIX;
 #[cfg(feature = "test-util")]
 pub use detect::choose;
 pub use detect::detect;
+#[cfg(all(feature = "test-util", any(target_os = "linux", target_os = "macos")))]
+pub use faithful::read_sized;
+#[cfg(all(feature = "test-util", target_family = "windows"))]
+pub use faithful::refusal;
+#[cfg(all(feature = "test-util", any(target_os = "linux", target_os = "macos")))]
+pub use faithful::refuses_flags;
+#[cfg(all(feature = "test-util", any(target_os = "linux", target_os = "macos")))]
+pub use faithful::target_keeps;
 #[cfg(feature = "test-util")]
 pub use refs::duplicate_ranges;
 #[cfg(feature = "test-util")]
@@ -71,12 +93,21 @@ pub use volume::magic_is_local;
 pub use volume::name_is_local;
 pub use volume::space_of;
 pub use volume::volume_of;
+#[cfg(feature = "test-util")]
+pub use walk::Counts;
+#[cfg(feature = "test-util")]
+pub use walk::Found;
 pub use walk::Kind;
 pub use walk::VisitFn;
 #[cfg(feature = "test-util")]
 pub use walk::clone_entry;
 #[cfg(feature = "test-util")]
 pub use walk::clone_into_with;
+#[cfg(all(
+    feature = "test-util",
+    any(target_os = "linux", target_os = "macos", target_family = "windows")
+))]
+pub use walk::copy_faithfully_on;
 #[cfg(feature = "test-util")]
 pub use walk::run;
 #[cfg(feature = "test-util")]
@@ -163,9 +194,211 @@ pub struct Progress {
     cloned_entry_count: AtomicU64,
     copied_file_count: AtomicU64,
     stopped: AtomicBool,
+    #[cfg(feature = "test-util")]
+    bounds: walk::Bounds,
+    #[cfg(feature = "test-util")]
+    counters: walk::Counters,
+    /// The attribute whose every set a faithful copy given this progress fails, and the OS error
+    /// it fails with, standing in for a set the system refuses.
+    #[cfg(feature = "test-util")]
+    refused_attribute: Option<(Vec<u8>, i32)>,
+    /// Whether the target reads as holding the refused attribute, as one the system gives each
+    /// new entry.
+    #[cfg(feature = "test-util")]
+    refused_held: bool,
+    /// The name of the entries a faithful copy given this progress reads `flags` for, besides
+    /// their own, standing in for flags a test can't set.
+    #[cfg(feature = "test-util")]
+    flagged: Option<(std::ffi::OsString, u64)>,
+    /// Whether the walk, once it has cloned or copied an entry, waits before its next until it is
+    /// stopped, standing in for a walk too long to finish before a stop, until it has waited.
+    #[cfg(feature = "test-util")]
+    held: AtomicBool,
+    /// The name of the files whose faithful copy fails once its data is written, on Windows,
+    /// standing in for a copy that fails partway.
+    #[cfg(feature = "test-util")]
+    failing: Option<std::ffi::OsString>,
+    /// Which sets of an owner and group a faithful copy refuses with `EPERM`, standing in for a
+    /// caller that isn't a member of the group, or may not give the owner either.
+    #[cfg(all(feature = "test-util", any(target_os = "linux", target_os = "macos")))]
+    owners_refused: Option<Refused>,
+}
+
+/// The sets of an owner and group a test build's faithful copy refuses.
+#[cfg(all(feature = "test-util", any(target_os = "linux", target_os = "macos")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// Each set that gives a group.
+    Group,
+    /// Each set.
+    Owner,
 }
 
 impl Progress {
+    /// A progress whose walk queues at most `queue` directories and `continuations`
+    /// continuations, and lists `batch` entries of a directory at a time.
+    #[cfg(feature = "test-util")]
+    pub fn bounded(queue: usize, continuations: usize, batch: usize) -> Self {
+        Self {
+            bounds: walk::Bounds {
+                queue,
+                continuations,
+                batch,
+            },
+            ..Self::default()
+        }
+    }
+
+    /// A progress whose faithful copy fails every set of the extended attribute `name` with the
+    /// OS error `code`, in place of setting it.
+    #[cfg(feature = "test-util")]
+    pub fn refusing_attribute(name: &str, code: i32) -> Self {
+        Self {
+            refused_attribute: Some((name.as_bytes().to_vec(), code)),
+            ..Self::default()
+        }
+    }
+
+    /// A progress whose faithful copy fails every set of the extended attribute `name` with the
+    /// OS error `code`, and reads the target as holding it, as one the system gives each new entry.
+    #[cfg(feature = "test-util")]
+    pub fn refusing_attribute_the_target_holds(name: &str, code: i32) -> Self {
+        Self {
+            refused_held: true,
+            ..Self::refusing_attribute(name, code)
+        }
+    }
+
+    /// Whether this progress's faithful copy reads the target as holding the refused attribute
+    /// `name`.
+    #[cfg(feature = "test-util")]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    fn target_holds_refused(&self, name: &[u8]) -> bool {
+        self.refused_held
+            && self
+                .refused_attribute
+                .as_ref()
+                .is_some_and(|(refused, _)| refused.as_slice() == name)
+    }
+
+    /// A progress whose faithful copy reads the flags `flags`, `stx_attributes` on Linux and
+    /// `st_flags` on macOS, for each entry named `name`, besides its own.
+    #[cfg(feature = "test-util")]
+    pub fn flagging(name: &str, flags: u64) -> Self {
+        Self {
+            flagged: Some((name.into(), flags)),
+            ..Self::default()
+        }
+    }
+
+    /// A progress whose walk, once it has cloned or copied an entry, waits before its next until
+    /// it is stopped, for at most a minute, and then goes on.
+    #[cfg(feature = "test-util")]
+    pub fn holding() -> Self {
+        Self {
+            held: AtomicBool::new(true),
+            ..Self::default()
+        }
+    }
+
+    /// A progress whose faithful copy refuses the sets of an owner and group `refused` names with
+    /// `EPERM`.
+    #[cfg(all(feature = "test-util", any(target_os = "linux", target_os = "macos")))]
+    pub fn refusing_owners(refused: Refused) -> Self {
+        Self {
+            owners_refused: Some(refused),
+            ..Self::default()
+        }
+    }
+
+    /// The failure this progress's faithful copy stands in for a set of an owner, with a group
+    /// where `gives_group` is set, where it refuses one.
+    #[cfg(all(feature = "test-util", any(target_os = "linux", target_os = "macos")))]
+    fn owner_refusal(&self, gives_group: bool) -> Option<io::Error> {
+        match self.owners_refused {
+            Some(Refused::Owner) => Some(io::Error::from_raw_os_error(libc::EPERM)),
+            Some(Refused::Group) if gives_group => Some(io::Error::from_raw_os_error(libc::EPERM)),
+            _ => None,
+        }
+    }
+
+    /// A progress whose faithful copy fails the copy of each file named `name` once its data is
+    /// written, on Windows.
+    #[cfg(feature = "test-util")]
+    pub fn failing_file(name: &str) -> Self {
+        Self {
+            failing: Some(name.into()),
+            ..Self::default()
+        }
+    }
+
+    /// The failure this progress's faithful copy stands in for once the data of the file at
+    /// `path` is written, where it names the file.
+    #[cfg(feature = "test-util")]
+    #[cfg_attr(not(target_family = "windows"), allow(dead_code))]
+    fn failure_after_data(&self, path: &Path) -> io::Result<()> {
+        match &self.failing {
+            Some(name) if path.file_name() == Some(name.as_os_str()) => {
+                Err(io::Error::other("a copy that fails partway"))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Waits until this progress is stopped, for at most a minute, where it holds its walk and the
+    /// walk has cloned or copied an entry, and holds it no longer.
+    #[cfg(feature = "test-util")]
+    fn hold(&self) {
+        if !self.held.load(Ordering::Relaxed) || self.stats() == CloneStats::default() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        while !self.is_stopped() && started.elapsed() < std::time::Duration::from_secs(60) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.held.store(false, Ordering::Relaxed);
+    }
+
+    /// The flags this progress's faithful copy stands in for the entry at `path`.
+    #[cfg(feature = "test-util")]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    fn flags_standing_in(&self, path: &Path) -> u64 {
+        self.flagged
+            .as_ref()
+            .filter(|(name, _)| path.file_name() == Some(name.as_os_str()))
+            .map_or(0, |&(_, flags)| flags)
+    }
+
+    /// The failure this progress's faithful copy stands in for the set of the attribute `name`,
+    /// where it names one.
+    #[cfg(feature = "test-util")]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    fn attribute_refusal(&self, name: &[u8]) -> Option<io::Error> {
+        self.refused_attribute
+            .as_ref()
+            .filter(|(refused, _)| refused.as_slice() == name)
+            .map(|&(_, code)| io::Error::from_raw_os_error(code))
+    }
+
+    /// What the test build counted of the walk.
+    #[cfg(feature = "test-util")]
+    pub fn counts(&self) -> Counts {
+        self.counters.stats()
+    }
+
+    /// The bounds of the walk, which only a test build sets.
+    #[cfg_attr(not(feature = "test-util"), allow(clippy::unused_self))]
+    fn bounds(&self) -> walk::Bounds {
+        #[cfg(feature = "test-util")]
+        {
+            self.bounds
+        }
+        #[cfg(not(feature = "test-util"))]
+        {
+            walk::BOUNDS
+        }
+    }
+
     /// What the clone has done so far.
     pub fn stats(&self) -> CloneStats {
         CloneStats {
@@ -186,6 +419,58 @@ impl Progress {
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::Relaxed)
     }
+}
+
+/// What a running [`copy_faithfully`] left as its target set it: the `security.*` extended
+/// attributes, each with the entries it did so for, and the entries that kept the target's group.
+#[derive(Debug, Default)]
+struct Kept {
+    attributes: parking_lot::Mutex<Vec<(String, u64)>>,
+    groups: AtomicU64,
+}
+
+impl Kept {
+    /// Counts one more entry for the attribute `name`.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    fn count(&self, name: &[u8]) {
+        let mut counts = self.attributes.lock();
+        match counts
+            .iter_mut()
+            .find(|(counted, _)| counted.as_bytes() == name)
+        {
+            Some((_, count)) => *count += 1,
+            None => counts.push((String::from_utf8_lossy(name).into_owned(), 1)),
+        }
+    }
+
+    /// Counts one more entry that kept the target's group.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    fn count_group(&self) {
+        self.groups.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The attributes counted, each with its count, and the entries that kept the target's group.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", target_family = "windows")),
+        allow(dead_code)
+    )]
+    fn into_counts(self) -> (Vec<(String, u64)>, u64) {
+        (self.attributes.into_inner(), self.groups.into_inner())
+    }
+}
+
+/// What [`copy_faithfully`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FaithfulCopy {
+    /// What the copy counted.
+    pub stats: CloneStats,
+    /// The `security.*` extended attributes the system refused to set on the copy,
+    /// which keep the values the target gave them, each with the entries it affected. None on
+    /// Windows.
+    pub relabeled: Vec<(String, u64)>,
+    /// The entries that kept the group the target gave them, a group this process may not give,
+    /// as it isn't a member of it. None on Windows.
+    pub kept_groups: u64,
 }
 
 /// The size of a tree, as [`measure`] finds it.
@@ -225,10 +510,60 @@ pub fn find_directories(
     walk::find_directories(root, matches, progress)
 }
 
+/// Copies the entries of the directory `source` into the empty directory `destination`, leaving
+/// out those `visit` skips, so that the copy holds what the source does and is on its device, as
+/// `faithful.rs` and `faithful_windows.rs` describe. Fails with [`io::ErrorKind::Unsupported`] on
+/// other platforms.
+pub fn copy_faithfully(
+    source: &Path,
+    destination: &Path,
+    visit: &VisitFn<'_>,
+    progress: &Progress,
+) -> io::Result<FaithfulCopy> {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_family = "windows"))]
+    {
+        walk::copy_faithfully_on(
+            Some(crate::pool::SyscallPool::global()),
+            source,
+            destination,
+            visit,
+            progress,
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_family = "windows")))]
+    {
+        let _ = (source, destination, visit, progress);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "a faithful copy runs on Linux, macOS and Windows only",
+        ))
+    }
+}
+
+/// The bytes a thread of a faithful copy copies through at a time, where `copy_file_range` can't
+/// copy on Linux, and on macOS and Windows.
+#[cfg(any(target_os = "linux", target_os = "macos", target_family = "windows"))]
+const COPY_BUFFER: usize = 256 << 10;
+
+/// `err`, which `call` failed with, naming the call, as a faithful copy's error does.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn failed_call(err: io::Error, call: &str) -> io::Error {
+    io::Error::new(err.kind(), format!("{call}: {err}"))
+}
+
+/// The failure of an entry a faithful copy doesn't keep, named by `what` it is.
+fn refused(what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{what}, which a faithful copy can't keep"),
+    )
+}
+
 /// Clones the entries of the directory `source` into the directory `destination`, which exists,
 /// with `backend`, leaving out the entries `visit` skips, on the calling thread and the threads
-/// the syscall pool lends it, at most half its cap, so other file operations keep the rest.
-/// `progress` counts what it does and can stop it.
+/// the syscall pool lends it, at most half its cap, so other file operations keep the rest. Its
+/// memory does not grow with the number of files or the width of a directory, as the walk's
+/// bounds hold it. `progress` counts what it does and can stop it.
 ///
 /// A file the backend cannot clone fails the clone with [`io::ErrorKind::Unsupported`], unless
 /// `copy_unclonable` is set, in which case its data is copied. A directory already present in

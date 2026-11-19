@@ -489,3 +489,105 @@ async fn each_takeover_of_an_adopt_whose_root_has_gone_crashed_at_each_phase_is_
         }
     }
 }
+
+/// A copy to `target`, forced for `fixture`, crashed at each phase, then recovered: undone until
+/// the setting names the copy, since the old root stays available, and finished after, with the
+/// old root's files at the root recovery leaves and no temporary directory.
+async fn a_copy_crashed_at_each_phase(phases: &[(MovePhase, Taken)], between_roots: bool) {
+    use lore_revision::global::external_dir::recovery::copying_path;
+    use lore_revision::test_util::MoveOverride;
+    use lore_revision::test_util::override_moves;
+
+    for &(phase, taken) in phases {
+        let fixture = Fixture::new();
+        let _copying = override_moves(fixture.global(), MoveOverride::Copy);
+        let from = if between_roots {
+            fixture.moved_to("from").await
+        } else {
+            fixture.default_root_with_an_instance();
+            fixture.default_location()
+        };
+        let name = std::fs::read_dir(&from)
+            .expect("list the root")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .find(|name| !name.starts_with('.'))
+            .expect("an external directory");
+        let target = fixture.root("target");
+        assert!(crash_at(MoveStep::Phase(phase), fixture.move_to(&target)).await);
+
+        let root = match taken {
+            Taken::Finished => target.clone(),
+            _ => from.clone(),
+        };
+        fixture
+            .recovers_as(taken, &root, &format!("{phase:?}"))
+            .await;
+        assert!(root.join(&name).join("file").exists(), "{phase:?}");
+        assert!(!copying_path(&target).exists(), "{phase:?}");
+        if taken == Taken::Undone {
+            assert!(!target.exists(), "{phase:?}");
+        }
+    }
+}
+
+/// A first copy from the default location, crashed at each phase.
+#[tokio::test]
+async fn a_first_copy_crashed_at_each_phase_is_recovered() {
+    a_copy_crashed_at_each_phase(
+        &[
+            (MovePhase::Mark, Taken::Undone),
+            (MovePhase::Identify, Taken::Undone),
+            (MovePhase::Copy, Taken::Undone),
+            (MovePhase::Place, Taken::Undone),
+            (MovePhase::Switch, Taken::Undone),
+            (MovePhase::Unmark, Taken::Finished),
+            (MovePhase::SetAside, Taken::Finished),
+            (MovePhase::Redirect, Taken::Finished),
+        ],
+        false,
+    )
+    .await;
+}
+
+/// A copy between two configured roots, crashed at each phase.
+#[tokio::test]
+async fn a_copy_between_roots_crashed_at_each_phase_is_recovered() {
+    a_copy_crashed_at_each_phase(
+        &[
+            (MovePhase::Copy, Taken::Undone),
+            (MovePhase::Place, Taken::Undone),
+            (MovePhase::Switch, Taken::Undone),
+            (MovePhase::Unmark, Taken::Finished),
+            (MovePhase::SetAside, Taken::Finished),
+            (MovePhase::Redirect, Taken::Finished),
+        ],
+        true,
+    )
+    .await;
+}
+
+/// A copy crashed once the setting names the copy, whose old root's volume is then gone, is
+/// finished, and lists the old root as a leftover that keeps its marker until it returns.
+#[tokio::test]
+async fn a_copy_whose_old_root_is_gone_lists_it_as_marked() {
+    use lore_revision::test_util::MoveOverride;
+    use lore_revision::test_util::override_moves;
+
+    let fixture = Fixture::new();
+    let _copying = override_moves(fixture.global(), MoveOverride::Copy);
+    let from = fixture.moved_to("from").await;
+    let target = fixture.root("target");
+    assert!(crash_at(MoveStep::Phase(MovePhase::Unmark), fixture.move_to(&target)).await);
+    std::fs::rename(&from, fixture.root("away")).expect("the old root's volume goes");
+
+    fixture
+        .recovers_as(Taken::Finished, &target, "unmark")
+        .await;
+
+    assert_eq!(
+        fixture.leftovers().marked,
+        [from.display().to_string()],
+        "the old root is listed as still marked"
+    );
+}

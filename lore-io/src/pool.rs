@@ -106,6 +106,7 @@ pub fn set_max_threads(count: usize) -> bool {
 
 /// The cap the process-wide pool is built with: its budgeted share when one has been set, else
 /// what the crate asks for on its own.
+#[lore_macro::test_pub]
 fn configured_max_threads() -> usize {
     BUDGETED_MAX_THREADS
         .get()

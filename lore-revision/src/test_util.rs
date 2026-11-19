@@ -387,6 +387,56 @@ pub(crate) async fn move_step(step: MoveStep) -> bool {
     answered.await.unwrap_or(true)
 }
 
+/// What a test makes the moves of the external root of one global data directory read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveOverride {
+    /// Every move copies, as a move between two volumes does, whatever the volumes are.
+    Copy,
+    /// Every move copies, and the target's volume reads as having no free space.
+    CopyToFullVolume,
+    /// Every move copies, and the copy, once it has copied an entry, waits until it is stopped.
+    CopyHeld,
+}
+
+/// The global data directories whose moves tests override, with how.
+static MOVE_OVERRIDES: std::sync::Mutex<Vec<(std::path::PathBuf, MoveOverride)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Makes the moves of the external root of `global` read as `how` says until the guard drops.
+/// Keyed by the global data directory, so tests with directories of their own don't see each
+/// other's.
+#[must_use]
+pub fn override_moves(global: &Path, how: MoveOverride) -> MoveOverridden {
+    let global = global.to_path_buf();
+    MOVE_OVERRIDES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((global.clone(), how));
+    MoveOverridden(global)
+}
+
+/// Ends an [`override_moves`] when dropped.
+pub struct MoveOverridden(std::path::PathBuf);
+
+impl Drop for MoveOverridden {
+    fn drop(&mut self) {
+        MOVE_OVERRIDES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(global, _)| *global != self.0);
+    }
+}
+
+/// How a test overrides the moves of the external root of `global`, if it does.
+pub(crate) fn move_override(global: &Path) -> Option<MoveOverride> {
+    MOVE_OVERRIDES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(overridden, _)| overridden == global)
+        .map(|&(_, how)| how)
+}
+
 /// A pause a test arms: once armed, the next [`pass`](Self::pass) stops, whichever task makes it,
 /// until it is resumed.
 #[derive(Default)]

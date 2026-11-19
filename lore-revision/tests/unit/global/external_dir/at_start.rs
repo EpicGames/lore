@@ -304,15 +304,18 @@ async fn recovery_in_the_background_polls_a_held_store() {
     assert_eq!(fixture.availability(), Availability::Available(target));
 }
 
-/// A record of a move by copy, which this version doesn't run, waits for the next start with no
-/// access held, and the background task doesn't retry it.
+/// A move by copy interrupted at its `copy` phase, while the setting names the root it leaves,
+/// is undone at the start: what it copied is set aside, and the old root stays available.
 #[tokio::test]
-async fn a_copy_record_waits_for_the_next_start() {
+async fn a_copy_interrupted_at_its_copy_phase_is_undone_at_the_start() {
     let fixture = Fixture::new();
-    fixture.default_root_with_an_instance();
+    let name = fixture.default_root_with_an_instance();
+    let target = fixture.root("copy");
+    let copying = lore_revision::global::external_dir::recovery::copying_path(&target);
+    std::fs::create_dir_all(copying.join(&name)).expect("a partial copy");
     MoveRecord {
         from: String::new(),
-        to: fixture.root("copy").display().to_string(),
+        to: target.display().to_string(),
         kind: MoveKind::Copy,
         phase: MovePhase::Copy,
     }
@@ -320,12 +323,16 @@ async fn a_copy_record_waits_for_the_next_start() {
     .await
     .expect("the record");
 
-    assert_eq!(fixture.at_start().await, AtStart::NextStart);
-    assert!(others_could_take_exclusive(fixture.global()));
-    tokio::time::timeout(Duration::from_secs(2), fixture.in_background(async {}))
-        .await
-        .expect("the background task doesn't retry a copy");
-    assert!(fixture.record().is_some(), "the record stays");
+    assert_eq!(fixture.at_start().await, AtStart::Recovered);
+
+    assert!(fixture.record().is_none());
+    assert!(!copying.exists(), "the partial copy is set aside");
+    assert!(!target.exists());
+    assert_eq!(
+        fixture.availability(),
+        Availability::Available(fixture.default_location())
+    );
+    assert!(fixture.default_location().join(&name).exists());
 }
 
 /// A record that names neither root the setting names waits for the next start with no access

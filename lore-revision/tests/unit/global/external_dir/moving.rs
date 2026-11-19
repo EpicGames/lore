@@ -140,6 +140,7 @@ impl Fixture {
                     &self.exclusive(),
                     termination,
                     |_store| {},
+                    |_name| {},
                 ),
             )
             .await
@@ -321,6 +322,7 @@ async fn a_first_move_cancelled_during_the_lock_poll_leaves_the_root_available()
                     let _ = cancel.send(());
                 }
             },
+            |_name| {},
         ),
     );
     let refused = step_moves(reached, moving).await;

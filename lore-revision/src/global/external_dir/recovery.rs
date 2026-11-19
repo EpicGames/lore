@@ -13,19 +13,24 @@
 //! | `rename` | `mark` | Checks that the user owns the current root, on Unix, sets its mode to `0o700`, and writes a marker of a new root ID and generation 1 into it. First move only. | The current root holds a marker. |
 //! | `rename` | `identify` | Writes the setting: the current root, with its marker's root ID and generation. First move only. | The setting holds the marker's root ID. |
 //! | `rename` | `place` | To the default location, first removes the command's redirect there. Sets the current root's mode to `0o700`, on Unix, makes the target's missing parents, with access for the user only, and renames the root to the target. | The target holds the setting's marker. |
+//! | `copy` | `copy` | Makes the target's missing parents and a temporary directory beside it, with access for the user only, removing one an earlier attempt left. Sets the current root's mode to `0o700`, on Unix, so the copy takes it, and copies the current root into it faithfully, leaving out its marker and the contents of each `write-staging/`, then writes the setting's marker into it. | The temporary directory or the target holds the setting's marker. |
+//! | `copy` | `place` | To the default location, first removes the command's redirect there. Renames the temporary directory to the target. | The target holds the setting's marker. |
 //! | `create` | `place` | Makes the target's missing parents, then the target at a temporary name beside it, with a marker of a new root ID and generation 1, and renames it to the target. | The target holds a marker. |
 //! | `abandon` | `place` | To the default location, first removes the command's redirect there. Then as `create`, with a marker of the setting's root ID and the next generation. | The target holds a marker of the setting's root ID and the next generation. |
 //! | every kind | `switch` | Takes the target off the leftover list, then writes the setting: the target, with its marker's root ID and generation. | The setting holds them, and the list doesn't name the target. |
+//! | `copy` | `unmark` | Deletes the marker of the current root, `from`, durably. A root that isn't there, as where its volume is gone, is listed as a leftover in the leftover list's `marked`, so its marker and contents go when it returns. | `from` holds no marker, or is listed. |
+//! | `copy` | `set-aside` | Lists an aside name beside `from`, with a random suffix, in the leftover list's `paths`, and renames `from` to it, durably. | No directory is at `from`. |
 //! | every kind | `redirect` | Makes the default location match the setting: a redirect to a configured root. A setting that names the default location leaves it as it is. | What [`redirect_to`] finds. |
 //! | every kind | (last) | Removes the record. | The record is absent. |
 //!
 //! `place` through `redirect`, and `switch` and `redirect` for `adopt`, form the final switch,
 //! which runs under the store locks.
 //!
-//! Undo runs fixed steps, also each with its check, for `rename` and `create`. *What the move
-//! made* is the temporary directory beside the target, for `create`, and the target where it holds
-//! a marker the move placed there, a marker of the setting for `rename` and any for `create`,
-//! or where the leftover list names an aside name for it that is still free.
+//! Undo runs fixed steps, also each with its check, for `rename`, `copy` and `create`. *What the
+//! move made* is the temporary directory beside the target, for `copy` and `create`, and the
+//! target where it holds a marker the move placed there, a marker of the setting for `rename` and
+//! `copy` and any for `create`, or where the leftover list names an aside name for it that is
+//! still free.
 //!
 //! | [`UndoStep`] | Step | Done when |
 //! |---|---|---|
@@ -49,16 +54,19 @@
 //!
 //! With no setting, the setting names the default location, which is then available while it is
 //! missing or a directory: so a `create` before its `switch`, and a first `rename` before its
-//! `identify`, are undone. A move by `copy` is never run, so recovery refuses its record. An
-//! `adopt` whose root has gone can't finish: recovery fails on its record, which only a takeover
-//! replaces.
+//! `identify`, are undone. An `adopt` whose root has gone can't finish: recovery fails on its
+//! record, which only a takeover replaces.
 
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use lore_error_set::prelude::*;
+use lore_io::clone::Kind;
+use lore_io::clone::Progress;
+use lore_io::clone::Visit;
 
 use super::ExternalDirError;
 use super::leftovers::LEFTOVERS;
@@ -111,6 +119,8 @@ macro_rules! stop_at {
 /// The suffix of the temporary name beside a target that a new root is made at before it is
 /// placed.
 const PLACING_SUFFIX: &str = ".lore-placing";
+/// The suffix of the temporary name beside a target that a move by copy copies the root into.
+const COPYING_SUFFIX: &str = ".lore-copying";
 /// The suffix of an aside name, before its random part.
 const ASIDE_SUFFIX: &str = ".lore-aside-";
 
@@ -280,6 +290,31 @@ pub async fn finish(global: &Path, record: &mut MoveRecord) -> Result<Redirect, 
     finish_with(global, record, Renames::RetriedWhileInUse).await
 }
 
+/// How a move's `copy` step runs: the progress that counts the copy and stops it, and what it
+/// tells the name of each external directory as the copy reaches it.
+#[derive(Clone)]
+pub(super) struct CopyRun {
+    /// Counts the copy, and stops it once stopped.
+    pub(super) progress: Arc<Progress>,
+    /// Told the name of each external directory as the copy reaches it.
+    pub(super) on_copying: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+tokio::task_local! {
+    /// How the `copy` step of a move run under [`copying_as`] runs.
+    static COPY_RUN: Option<CopyRun>;
+}
+
+/// Runs `future`, whose `copy` step runs as `run` says. A `copy` step run with no `run`, or
+/// outside it, is stopped by no one and reports nothing. A task-local, so that the futures of the
+/// steps every other move runs hold nothing of it.
+pub(super) fn copying_as<F: Future>(
+    run: Option<CopyRun>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    COPY_RUN.scope(run, future)
+}
+
 /// How a step renames a root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Renames {
@@ -318,9 +353,6 @@ async fn phases_from(
     before: Option<MovePhase>,
     renames: Renames,
 ) -> Result<Redirect, ExternalDirError> {
-    if record.kind == MoveKind::Copy {
-        return Err(copy_unsupported(record));
-    }
     let all = phases(record.kind);
     let Some(start) = all.iter().position(|phase| *phase == record.phase) else {
         return Err(ExternalDirError::internal(format!(
@@ -402,12 +434,6 @@ pub async fn recover(
         )));
     }
     let record = &mut assessment.record;
-    if record.kind == MoveKind::Copy {
-        return Err(LocksError::internal_with_context(
-            copy_unsupported(record),
-            "recovering a move of the external root",
-        ));
-    }
     let direction = assessment.direction;
     match direction {
         Direction::Refuse => {
@@ -658,12 +684,9 @@ pub async fn recover_in_background(global: PathBuf, mount: impl Future<Output = 
 }
 
 /// Whether recovery in the service leaves the move `assessment` reads for the next start, with no
-/// retry: one the table refuses, a move by copy, which this version doesn't run, and an adopt
-/// whose root has gone.
+/// retry: one the table refuses, and an adopt whose root has gone.
 fn waits_for_a_start(assessment: &Assessment) -> bool {
-    assessment.direction == Direction::Refuse
-        || assessment.record.kind == MoveKind::Copy
-        || assessment.adopted_root_gone
+    assessment.direction == Direction::Refuse || assessment.adopted_root_gone
 }
 
 /// Deletes the marker of each still-marked leftover of `global` whose path exists again, and
@@ -772,8 +795,7 @@ pub fn store_root(global: &Path, record: &MoveRecord, to_available: bool) -> Opt
 /// the default location holds once the redirect matches the setting.
 pub async fn undo(global: &Path, record: &MoveRecord) -> Result<Redirect, ExternalDirError> {
     match record.kind {
-        MoveKind::Rename | MoveKind::Create => {}
-        MoveKind::Copy => return Err(copy_unsupported(record)),
+        MoveKind::Rename | MoveKind::Copy | MoveKind::Create => {}
         MoveKind::Adopt | MoveKind::Abandon => {
             return Err(ExternalDirError::internal(
                 "an --adopt or --abandon of the external root is never undone",
@@ -782,8 +804,10 @@ pub async fn undo(global: &Path, record: &MoveRecord) -> Result<Redirect, Extern
     }
     let setting = Setting::load(global)?;
     let target = root_path(global, &record.to);
-    if record.kind == MoveKind::Create {
-        set_aside_if_made(global, &placing_path(&target), None).await?;
+    match record.kind {
+        MoveKind::Create => set_aside_if_made(global, &placing_path(&target), None).await?,
+        MoveKind::Copy => set_aside_if_made(global, &copying_path(&target), None).await?,
+        _ => {}
     }
     let placed = match record.kind {
         MoveKind::Create => Placed::AnyMarker,
@@ -873,7 +897,8 @@ async fn set_aside_if_made(
 }
 
 /// Runs the step of `phase` for `record` in `global`, after its check. Answers what the default
-/// location holds, for the `redirect` phase.
+/// location holds, for the `redirect` phase. The steps only a move by copy runs are boxed, as a
+/// cold path, so that the futures of every other move hold none of them.
 async fn run_phase(
     global: &Path,
     record: &MoveRecord,
@@ -883,16 +908,16 @@ async fn run_phase(
     match phase {
         MovePhase::Mark => mark(&root_path(global, &record.from)).await?,
         MovePhase::Identify => identify(global, record).await?,
+        MovePhase::Copy => Box::pin(copy_root(global, record)).await?,
         MovePhase::Place => place(global, record, renames).await?,
         MovePhase::Switch => switch(global, record).await?,
+        MovePhase::Unmark => Box::pin(unmark_old_root(global, record)).await?,
+        MovePhase::SetAside => Box::pin(set_aside_old_root(global, record, renames)).await?,
         MovePhase::Redirect => {
             let setting = Setting::load(global)?;
             return Ok(Some(
                 match_redirect(global, setting.as_ref(), Some(record)).await?,
             ));
-        }
-        MovePhase::Copy | MovePhase::Unmark | MovePhase::SetAside => {
-            return Err(copy_unsupported(record));
         }
     }
     Ok(None)
@@ -1006,7 +1031,16 @@ async fn place(
             )
             .await
         }
-        MoveKind::Adopt | MoveKind::Copy => Err(ExternalDirError::internal(format!(
+        MoveKind::Copy => {
+            let setting = setting.ok_or_else(no_setting)?;
+            if marker.is_some_and(|marker| {
+                marker.id == setting.id && marker.generation == setting.generation
+            }) {
+                return Ok(());
+            }
+            Box::pin(place_copy(global, record, &setting, &target, renames)).await
+        }
+        MoveKind::Adopt => Err(ExternalDirError::internal(format!(
             "a move of kind {:?} has no place phase here",
             record.kind
         ))),
@@ -1031,6 +1065,200 @@ async fn clear_default_location(
         )));
     }
     Ok(())
+}
+
+/// Places the copy of `record`'s root in `global` at `target`, under `setting`, as the `place`
+/// step of a move by copy does: to the default location, it first removes the command's redirect
+/// there.
+async fn place_copy(
+    global: &Path,
+    record: &MoveRecord,
+    setting: &Setting,
+    target: &Path,
+    renames: Renames,
+) -> Result<(), ExternalDirError> {
+    clear_default_location(global, record, setting, target).await?;
+    rename_root(&copying_path(target), target, renames).await
+}
+
+/// Copies the current root of `record` in `global` into the temporary directory beside its
+/// target, as the `copy` step of the module's documentation describes, and as [`copying_as`]
+/// says: the copy stops once its progress is stopped, and it tells each external directory it
+/// reaches. Gives the current root access for its owner only first, as a rename does, so the
+/// copy takes that mode; warns once of the attributes the system refused to copy, and logs once
+/// the entries that kept the target's group.
+async fn copy_root(global: &Path, record: &MoveRecord) -> Result<(), ExternalDirError> {
+    let setting = Setting::load(global)?.ok_or_else(no_setting)?;
+    let target = root_path(global, &record.to);
+    let copied = copying_path(&target);
+    let holds_setting = |marker: Option<Marker>| {
+        marker.is_some_and(|marker| {
+            marker.id == setting.id && marker.generation == setting.generation
+        })
+    };
+    if holds_setting(placed_marker(&target).await?) || holds_setting(placed_marker(&copied).await?)
+    {
+        return Ok(());
+    }
+    crate::util::fs::unlink_recursive(&copied)
+        .await
+        .internal_with(|| format!("removing {}", copied.display()))?;
+    let made = copied.clone();
+    blocking(
+        move || lore_io::create_dir_all_private(&made),
+        "making the directory the external root is copied into",
+    )
+    .await?;
+    let from = root_path(global, &record.from);
+    let private = from.clone();
+    blocking(
+        move || make_private(&private),
+        "giving the external root access for its owner only before its copy",
+    )
+    .await?;
+    let copy = COPY_RUN
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| CopyRun {
+            progress: Arc::new(Progress::default()),
+            on_copying: Arc::new(|_| {}),
+        });
+    let faithful = copy_faithfully(&from, &copied, &copy).await?;
+    if !faithful.relabeled.is_empty() {
+        let kept: Vec<String> = faithful
+            .relabeled
+            .iter()
+            .map(|(name, entries)| format!("{name} on {entries} entries"))
+            .collect();
+        crate::lore_warn!(
+            "The copy of the external root keeps the values its file system gives these \
+             attributes, which the system refused to copy: {}",
+            kept.join(", ")
+        );
+    }
+    if faithful.kept_groups > 0 {
+        crate::lore_info!(
+            "{} entries of the copy of the external root keep the group of their new location,              as this user isn't a member of the group they had",
+            faithful.kept_groups
+        );
+    }
+    Marker {
+        id: setting.id,
+        generation: setting.generation,
+    }
+    .save(&copied)
+    .await
+}
+
+/// Copies the root `from` into the directory `copied` with [`lore_io::clone::copy_faithfully`],
+/// leaving out its marker and the contents of each `write-staging/`, on the blocking pool, and
+/// tells `copy` the name of each external directory as the copy reaches it.
+async fn copy_faithfully(
+    from: &Path,
+    copied: &Path,
+    copy: &CopyRun,
+) -> Result<lore_io::clone::FaithfulCopy, ExternalDirError> {
+    let (reached, mut reports) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (source, destination, progress) = (
+        from.to_path_buf(),
+        copied.to_path_buf(),
+        Arc::clone(&copy.progress),
+    );
+    let copying = lore_base::lore_spawn_blocking!(move || {
+        lore_io::clone::copy_faithfully(
+            &source,
+            &destination,
+            &|_path, relative, kind| copied_visit(relative, kind, &reached),
+            &progress,
+        )
+    });
+    let mut copying = std::pin::pin!(copying);
+    let copied_root = loop {
+        tokio::select! {
+            done = &mut copying => break done,
+            Some(name) = reports.recv() => (copy.on_copying)(&name),
+        }
+    };
+    while let Ok(name) = reports.try_recv() {
+        (copy.on_copying)(&name);
+    }
+    Ok(copied_root
+        .internal("copying the external root")?
+        .internal_with(|| {
+            format!(
+                "copying the external root {} to {}",
+                from.display(),
+                copied.display()
+            )
+        })?)
+}
+
+/// What a copy of an external root does with the entry at `relative` in it, of `kind`: leaves out
+/// the root's marker and the contents of each `write-staging/`, and sends the name of each
+/// external directory on `reached` as it reaches it.
+#[lore_macro::test_pub]
+fn copied_visit(
+    relative: &Path,
+    kind: Kind,
+    reached: &tokio::sync::mpsc::UnboundedSender<String>,
+) -> Visit {
+    let mut components = relative.components();
+    if let (Some(name), None) = (components.next(), components.next()) {
+        if name.as_os_str() == MARKER {
+            return Visit::Skip;
+        }
+        if kind == Kind::Directory {
+            let _ = reached.send(name.as_os_str().to_string_lossy().into_owned());
+        }
+    }
+    if super::check::in_write_staging(relative) {
+        return Visit::Skip;
+    }
+    if kind == Kind::Directory {
+        Visit::EachEntry
+    } else {
+        Visit::Clone
+    }
+}
+
+/// Deletes the marker of the old root of `record` in `global`, durably, as the `unmark` step of
+/// the module's documentation describes.
+async fn unmark_old_root(global: &Path, record: &MoveRecord) -> Result<(), ExternalDirError> {
+    let from = root_path(global, &record.from);
+    if is_real_directory(&from).await? {
+        return remove_marker(&from).await;
+    }
+    if !exists(&from).await {
+        list_leftover(global, &from, true).await?;
+    }
+    Ok(())
+}
+
+/// Sets what is left of the old root of `record` in `global` aside, as the `set-aside` step of
+/// the module's documentation describes, renaming it as `renames` says.
+async fn set_aside_old_root(
+    global: &Path,
+    record: &MoveRecord,
+    renames: Renames,
+) -> Result<(), ExternalDirError> {
+    let from = root_path(global, &record.from);
+    if !is_real_directory(&from).await? {
+        return Ok(());
+    }
+    let aside = if let Some(aside) = listed_aside(global, &from).await? {
+        aside
+    } else {
+        let aside = aside_path(&from);
+        let entry = leftover_entry(global, &aside);
+        update_leftovers(global, |list| {
+            list.paths.push(entry);
+            true
+        })
+        .await?;
+        aside
+    };
+    rename_root(&from, &aside, renames).await
 }
 
 /// Renames the root at `from` to `target`, durably, reissuing the rename as `renames` says while
@@ -1270,6 +1498,14 @@ fn placing_path(target: &Path) -> PathBuf {
     target.with_file_name(name)
 }
 
+/// The temporary name beside `target` that a move by copy copies the root into.
+#[lore_macro::test_pub]
+pub(super) fn copying_path(target: &Path) -> PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_owned();
+    name.push(COPYING_SUFFIX);
+    target.with_file_name(name)
+}
+
 /// The leftover list's entry for `path`: its name alone where it lies in `global`, else the path.
 fn leftover_entry(global: &Path, path: &Path) -> String {
     match path.strip_prefix(global) {
@@ -1299,17 +1535,21 @@ async fn load_marker(root: &Path) -> Result<Option<Marker>, ExternalDirError> {
 /// The marker of the root placed at `target`, read only where `target` is a directory and not a
 /// redirect, which leads elsewhere.
 async fn placed_marker(target: &Path) -> Result<Option<Marker>, ExternalDirError> {
-    let examined = target.to_path_buf();
-    let real_directory = lore_base::lore_spawn_blocking!(move || {
+    if !is_real_directory(target).await? {
+        return Ok(None);
+    }
+    load_marker(target).await
+}
+
+/// Whether `path` is a directory and not a redirect, which leads elsewhere.
+async fn is_real_directory(path: &Path) -> Result<bool, ExternalDirError> {
+    let examined = path.to_path_buf();
+    Ok(lore_base::lore_spawn_blocking!(move || {
         std::fs::symlink_metadata(&examined)
             .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
     })
     .await
-    .internal("examining the target of a move of the external root")?;
-    if !real_directory {
-        return Ok(None);
-    }
-    load_marker(target).await
+    .internal("examining a root of a move of the external root")?)
 }
 
 /// The marker of the root at `root`, which must hold one.
@@ -1386,13 +1626,4 @@ async fn blocking<T: Send + 'static, E: std::error::Error + Send + Sync + 'stati
 /// The error of a recovery that needs a setting where there is none.
 fn no_setting() -> ExternalDirError {
     ExternalDirError::internal("external-root is missing")
-}
-
-/// The error of the move by copy `record`, which this version doesn't run.
-fn copy_unsupported(record: &MoveRecord) -> ExternalDirError {
-    ExternalDirError::internal(format!(
-        "the external root move record names a move by copy from {:?} to {:?} at its {:?} phase, \
-         which this version can't run",
-        record.from, record.to, record.phase
-    ))
 }

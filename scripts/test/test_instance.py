@@ -8,7 +8,6 @@ Tests the `lore repository instance delete`, `move` and `clone` commands.
 import json
 import logging
 import os
-import subprocess
 import sys
 import time
 
@@ -723,27 +722,6 @@ def _uuid7_hex() -> str:
     value = (milliseconds << 80) | (0x7 << 76) | ((rest >> 64) & 0xFFF) << 64
     value |= (0b10 << 62) | (rest & ((1 << 62) - 1))
     return f"{value:032x}"
-
-
-@pytest.fixture
-def other_volume(scratch_dir):
-    """A small HFS+ volume mounted for the test, which shares no blocks with the volume the
-    repositories are on and cannot clone files itself, but keeps permissions and links."""
-    if sys.platform != "darwin":
-        pytest.skip("the volume is made with hdiutil, which only macOS has")
-    image = scratch_dir("other_volume_image", create=True) / "volume.dmg"
-    mount = scratch_dir("other_volume", create=True)
-    for command in (
-        ["hdiutil", "create", "-size", "50m", "-fs", "HFS+", "-volname", "LoreTest", str(image)],
-        ["hdiutil", "attach", "-nobrowse", "-mountpoint", str(mount), str(image)],
-    ):
-        made = subprocess.run(command, capture_output=True, text=True)
-        if made.returncode != 0:
-            pytest.skip(f"hdiutil cannot make a volume here: {made.stderr}")
-    try:
-        yield mount
-    finally:
-        subprocess.run(["hdiutil", "detach", "-force", str(mount)], capture_output=True)
 
 
 @pytest.mark.smoke
