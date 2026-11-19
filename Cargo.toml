@@ -8,6 +8,7 @@ members = [
     "lore-chaos-client",
     "lore-client",
     "lore-credential",
+    "lore-desktop",
     "lore-error-set",
     "lore-error-set-macro",
     "lore-fuse",

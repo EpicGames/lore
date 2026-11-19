@@ -75,10 +75,10 @@ client ships its own small set of widgets and theme rather than a design system.
 
 ### Toolkit
 
-The client is written with a pure-Rust GUI toolkit, so the whole application builds with the Rust toolchain
-the workspace already uses and needs no JavaScript runtime or webview. The choice of toolkit is hard to
-reverse and sets the pattern for every view, so it is recorded as an ADR in `docs/developing/decisions/` with
-the first code. [Unresolved Questions](#unresolved-questions) lists the candidates.
+The client is written with [egui](https://github.com/emilk/egui) and eframe, a pure-Rust GUI toolkit,
+so the whole application builds with the Rust toolchain the workspace already uses and needs no JavaScript
+runtime or webview. [ADR-00042](../developing/decisions/00042-desktop-client-toolkit-egui.md) records the
+choice.
 
 ### Operations off the UI thread (G4)
 
@@ -216,9 +216,6 @@ client it can change.
 
 ## Unresolved Questions
 
-- Which toolkit: [egui/eframe](https://github.com/emilk/egui) (immediate mode, simple virtualised tables),
-  [Iced](https://github.com/iced-rs/iced) (Elm-style, retained) or [Slint](https://slint.dev/) (declarative,
-  but its licence needs a check against `deny.toml`)? Settled by the phase 1 prototype and recorded as an ADR.
 - Does the client start the service process when one is configured, or always call the library in-process?
 - Packaging and signing per platform, and whether the release workflow builds the client.
 - Should the client ship in the same release as the CLI, versioned with the workspace?
