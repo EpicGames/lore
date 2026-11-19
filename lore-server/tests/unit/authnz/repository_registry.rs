@@ -96,6 +96,10 @@ fn add_outcome_maps_the_registration_status() {
         (Status::permission_denied(""), Code::PermissionDenied),
         (Status::unauthenticated(""), Code::Unauthenticated),
         (Status::not_found(""), Code::FailedPrecondition),
+        (
+            Status::invalid_argument("invalid resource_id"),
+            Code::Internal,
+        ),
         (Status::unavailable("down"), Code::Internal),
     ];
     for (status, expected) in cases {
@@ -103,6 +107,14 @@ fn add_outcome_maps_the_registration_status() {
     }
     let err = outcome(Status::unavailable("down")).unwrap_err();
     assert!(err.message().contains("Failed to call rpc: "), "{err}");
+
+    let name_format = r#"resource_name must be "<org>/<repo>", got "repo""#;
+    let err = outcome(Status::invalid_argument(name_format)).unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(
+        err.message(),
+        format!("Invalid repository name: {name_format}")
+    );
 }
 
 #[test]
@@ -374,6 +386,31 @@ mod repository_create_auth_resource_tests {
         assert_eq!(
             error.message(),
             "Invalid repository name - missing Organization context"
+        );
+    }
+
+    #[tokio::test]
+    async fn name_format_rejection_returns_invalid_argument_with_registry_message() {
+        let repo_name = "2fc8bf934117e250152eba9a1fc78e71";
+        let repository: RepositoryId = Context::from_str(repo_name)
+            .expect("Failed to create repository")
+            .into();
+        let registry_message =
+            format!("resource_name must be \"<org>/<repo>\", got \"{repo_name}\"");
+
+        let mut client = MockMockRebacApiClient::new();
+        let rejection = registry_message.clone();
+        client
+            .expect_create_resource()
+            .return_once(move |_| Err(Status::invalid_argument(rejection)));
+
+        let error = repository_create_auth_resource(Box::new(client), None, repository, repo_name)
+            .await
+            .expect_err("Should have errored");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(
+            error.message(),
+            format!("Invalid repository name: {registry_message}")
         );
     }
 

@@ -175,6 +175,10 @@ async fn repository_create_auth_resource(
     )
 }
 
+/// Start of the `InvalidArgument` message a registry returns when a repository
+/// name doesn't match its required format.
+const NAME_FORMAT_REJECTION_PREFIX: &str = "resource_name must be";
+
 /// What a registration's answer means for the create. A repository already
 /// registered continues the create, so a retried create succeeds.
 #[lore_macro::test_pub]
@@ -223,6 +227,17 @@ fn add_outcome(
             Err(Status::invalid_argument(
                 "Invalid repository name - missing Organization context",
             ))
+        }
+        Err(err)
+            if err.code() == Code::InvalidArgument
+                && err.message().starts_with(NAME_FORMAT_REJECTION_PREFIX) =>
+        {
+            info!(auth_error = ?err, requested_name = name, "Repository registration failed - name format rejected");
+            // The registry's message states the name format it expects.
+            Err(Status::invalid_argument(format!(
+                "Invalid repository name: {}",
+                err.message()
+            )))
         }
         Err(err) => Err(warn_error_to_status(&err, |err| {
             Status::internal(format!("Failed to call {rpc}: {err}"))
