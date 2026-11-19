@@ -3,7 +3,7 @@
 
 //! The history a 3-way diff reads for its conflicts: whether a merge joins its two sides above the
 //! base, and the walk of a history line for where each of the paths its first revision lacks was
-//! last held.
+//! last held. Also the deletes of directories the diff drops for its conflicts.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -476,6 +476,90 @@ async fn two_lines_sharing_one_comparison_each_find_their_deletions() {
                     .last_held(&instance.repository, &feature_state, "Dir/b.txt")
                     .expect("The feature branch's line was walked"),
                 Some(last_held(&instance, feature_held, feature_removed, "Dir/b.txt").await)
+            );
+        },
+    )
+    .await;
+}
+
+/// The files of the fixture of a deleted directory holding a conflict. `Dir-x` sorts between `Dir`
+/// and `Dir/`, so a search for the paths below `Dir` that starts at `Dir` meets it first.
+const DELETED_DIRECTORIES: [&str; 5] = [
+    "Dir/a.txt",
+    "Dir/Deep/c.txt",
+    "Dir-x/e.txt",
+    "Gone/d.txt",
+    "Top.txt",
+];
+
+/// The feature branch deletes three directories, and main edits a file in two of them. The edits
+/// conflict with the deletions, and the diff drops the delete of each directory holding a
+/// conflict, at any depth, so the conflict stands for its path; the delete of the directory
+/// holding none stays.
+#[tokio::test]
+async fn the_delete_of_a_directory_holding_a_conflict_is_dropped() {
+    run(
+        "the_delete_of_a_directory_holding_a_conflict_is_dropped",
+        &DELETED_DIRECTORIES,
+        |instance| async move {
+            create_branch(&instance, "feature").await;
+            let feature = commit_edits(
+                &instance,
+                &[
+                    Edit::Delete("Dir"),
+                    Edit::Delete("Dir-x"),
+                    Edit::Delete("Gone"),
+                ],
+                "Delete",
+            )
+            .await;
+            switch_to(&instance, branch::DEFAULT_DEFAULT_NAME).await;
+            let main = commit_edits(
+                &instance,
+                &[
+                    Edit::Write("Dir/Deep/c.txt", "main"),
+                    Edit::Write("Dir-x/e.txt", "main"),
+                ],
+                "Edit",
+            )
+            .await;
+            let feature_id = branch::resolve(instance.repository.clone(), "feature")
+                .await
+                .expect("Failed to resolve the feature branch")
+                .id;
+
+            let diff = branch::diff3_collect(
+                instance.repository.clone(),
+                feature_id,
+                feature,
+                instance.main,
+                main,
+                None,
+                false,
+                false,
+            )
+            .await
+            .expect("Failed to diff the branches");
+
+            let mut conflicts: Vec<&str> = diff
+                .conflicts
+                .iter()
+                .map(|(from, _)| from.path().as_str())
+                .collect();
+            conflicts.sort_unstable();
+            assert_eq!(conflicts, ["Dir-x/e.txt", "Dir/Deep/c.txt"]);
+            let deleted_directories: Vec<&str> = diff
+                .changes
+                .iter()
+                .filter(|change| {
+                    change.action == FileAction::Delete && change.from.flags.is_directory()
+                })
+                .map(|change| change.path().as_str())
+                .collect();
+            assert_eq!(
+                deleted_directories,
+                ["Gone"],
+                "Only the delete of the directory holding no conflict stays"
             );
         },
     )

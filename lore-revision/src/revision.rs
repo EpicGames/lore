@@ -59,6 +59,9 @@ use crate::state::StateError;
 use crate::state::TreeWalk;
 use crate::state::gather_tree_paths;
 use crate::util::path::RelativePath;
+use crate::util::path::covers_any;
+use crate::util::path::overlaps_any;
+use crate::util::path::sorted_paths;
 
 /// Base metadata for revision
 #[derive(Default)]
@@ -543,15 +546,11 @@ pub async fn diff3_with_source_cap(
     };
 
     if !joined_conflicts.is_empty() {
+        let conflicted = sorted_paths(joined_conflicts.iter().map(|(from, _to)| from.path()));
         joined_changes.retain(|item| {
-            if item.from.flags.is_directory() && item.action == FileAction::Delete {
-                for (from, _to) in joined_conflicts.iter() {
-                    if from.path().overlaps(item.path()) {
-                        return false;
-                    }
-                }
-            }
-            true
+            !(item.from.flags.is_directory()
+                && item.action == FileAction::Delete
+                && overlaps_any(&conflicted, item.path().as_str()))
         });
         lore_debug!("Identify resolved conflicts through merges");
     }
@@ -873,7 +872,7 @@ fn conflicting_replacements(
             {
                 continue;
             }
-            if covers_any(&conflicted, path) || covers_any(&changed, path) {
+            if covers_any(&conflicted, path.as_str()) || covers_any(&changed, path.as_str()) {
                 push_unique_path(&mut paths, path);
             }
         }
@@ -905,24 +904,6 @@ fn sorted_replacements(mut replacements: Vec<Replacement>) -> Vec<Replacement> {
     replacements.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.as_str().cmp(rhs.as_str()));
     replacements.dedup_by(|(lhs, _), (rhs, _)| lhs == rhs);
     replacements
-}
-
-fn sorted_paths<'a>(paths: impl Iterator<Item = &'a RelativePath>) -> Vec<&'a str> {
-    let mut sorted: Vec<&str> = paths.map(RelativePath::as_str).collect();
-    sorted.sort_unstable();
-    sorted
-}
-
-/// Whether `sorted` holds `path` or a path below it.
-fn covers_any(sorted: &[&str], path: &RelativePath) -> bool {
-    if sorted.binary_search(&path.as_str()).is_ok() {
-        return true;
-    }
-    let prefix = format!("{path}/");
-    let first = sorted.partition_point(|candidate| *candidate < prefix.as_str());
-    sorted
-        .get(first)
-        .is_some_and(|candidate| candidate.starts_with(&prefix))
 }
 
 async fn replacement_conflict(
