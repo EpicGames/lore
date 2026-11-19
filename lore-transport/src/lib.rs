@@ -24,22 +24,23 @@ pub use session::*;
 pub use traits::*;
 pub use types::*;
 
-/// The env var to read to retrieve a user agent `product` override
+/// Names the application embedding Lore, ahead of everything else in the user agent.
+const USER_AGENT_ENV_VAR: &str = "LORE_USER_AGENT";
+
+/// Names the Lore binary, overriding [`set_fallback_user_agent_product`].
 const USER_AGENT_PRODUCT_ENV_VAR: &str = "LORE_USER_AGENT_PRODUCT";
 
 static USER_AGENT: OnceLock<String> = OnceLock::new();
-static USER_AGENT_PRODUCT: OnceLock<String> = OnceLock::new();
+static USER_AGENT_PRODUCT: OnceLock<Option<String>> = OnceLock::new();
 
-/// The product name identifying this binary in the user agent.
+/// The product name identifying this binary in the user agent, if one is set.
 ///
 /// Resolves on first call and is fixed from then on: `LORE_USER_AGENT_PRODUCT` when set, else
-/// whatever [`set_fallback_user_agent_product`] supplied, else `lore-transport`.
-pub fn user_agent_product() -> &'static str {
+/// whatever [`set_fallback_user_agent_product`] supplied, else none.
+pub fn user_agent_product() -> Option<&'static str> {
     USER_AGENT_PRODUCT
-        .get_or_init(|| {
-            std::env::var(USER_AGENT_PRODUCT_ENV_VAR).unwrap_or("lore-transport".to_string())
-        })
-        .as_str()
+        .get_or_init(|| non_empty_env(USER_AGENT_PRODUCT_ENV_VAR))
+        .as_deref()
 }
 
 /// Supplies the product for [`user_agent_product`] to report, unless
@@ -52,33 +53,50 @@ pub fn user_agent_product() -> &'static str {
 /// overriding it and the product having already resolved, so a caller needing to tell those apart
 /// must read the variable itself.
 pub fn set_fallback_user_agent_product(name: String) -> bool {
-    if std::env::var(USER_AGENT_PRODUCT_ENV_VAR).is_ok() {
+    if non_empty_env(USER_AGENT_PRODUCT_ENV_VAR).is_some() {
         return false;
     }
-    USER_AGENT_PRODUCT.set(name).is_ok()
+    USER_AGENT_PRODUCT.set(Some(name)).is_ok()
 }
 
-/// User agent string for all transport connections.
+/// User agent string for all transport connections:
+/// `[application] [product] lore/<library version>`.
 ///
-/// Resolves on first call and is fixed from then on: `LORE_USER_AGENT` when set, else
-/// [`user_agent_product`] and the library version.
+/// `LORE_USER_AGENT` names the application, and [`user_agent_product`] names the product. Each is
+/// omitted when unset. The `lore/<version>` token is always present, regardless of the application
+/// or product name. The string is resolved on the first call and remains fixed afterward.
 pub fn user_agent() -> &'static str {
     USER_AGENT
         .get_or_init(|| {
-            std::env::var("LORE_USER_AGENT")
-                .unwrap_or_else(|_| make_user_agent(user_agent_product()))
+            compose_user_agent(
+                non_empty_env(USER_AGENT_ENV_VAR).as_deref(),
+                user_agent_product(),
+            )
         })
         .as_str()
 }
 
-pub fn make_user_agent(product: &str) -> String {
-    let lib_version = LORE_LIBRARY_VERSION.as_str();
-    format!("{product}/{lib_version}")
+/// Identifies a connection opened by one subsystem of a binary: [`user_agent`] with `component`
+/// appended as an RFC 9110 comment. `component` must not contain parentheses.
+pub fn user_agent_with_component(component: &str) -> String {
+    format!("{} ({component})", user_agent())
 }
 
-/// Identifies a connection opened by one subsystem of a binary. `component` is
-/// emitted as an RFC 9110 comment and must not contain parentheses.
-pub fn make_user_agent_with_component(product: &str, component: &str) -> String {
-    let product = make_user_agent(product);
-    format!("{product} ({component})")
+/// Joins whichever of `application` and `product` are present, in that order, ahead of the
+/// `lore/<library version>` token.
+#[lore_macro::test_pub]
+fn compose_user_agent(application: Option<&str>, product: Option<&str>) -> String {
+    let lib_version = LORE_LIBRARY_VERSION.as_str();
+    match (application, product) {
+        (Some(application), Some(product)) => format!("{application} {product} lore/{lib_version}"),
+        (Some(prefix), None) | (None, Some(prefix)) => format!("{prefix} lore/{lib_version}"),
+        (None, None) => format!("lore/{lib_version}"),
+    }
+}
+
+/// Reads `name`, trimmed, treating an unset or blank variable as absent.
+fn non_empty_env(name: &str) -> Option<String> {
+    let value = std::env::var(name).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }

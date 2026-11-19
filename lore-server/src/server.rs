@@ -48,14 +48,13 @@ use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
 use lore_storage::local::store_lock::StoreHold;
 use lore_telemetry::execution_state::ServerExecutionState;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
-use lore_transport::make_user_agent_with_component;
 use lore_transport::quic::client;
 use lore_transport::quic::client::ClientCerts;
 use lore_transport::quic::client::STREAM_COUNT;
 use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::storage_service::client::StorageClient;
 use lore_transport::set_fallback_user_agent_product;
-use lore_transport::user_agent_product;
+use lore_transport::user_agent_with_component;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 use opentelemetry::metrics::UpDownCounter;
@@ -1488,10 +1487,7 @@ fn replicated_client_factory(
     }
     factory.transport_config.initial_cwnd = Some(settings.initial_cwnd_bytes.get());
     factory.transport_config.congestion_algorithm = settings.congestion_algorithm;
-    factory.user_agent = Some(make_user_agent_with_component(
-        user_agent_product(),
-        "replicated-immutable-store",
-    ));
+    factory.user_agent = Some(user_agent_with_component("replicated-immutable-store"));
     factory
 }
 

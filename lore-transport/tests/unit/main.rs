@@ -14,6 +14,7 @@ mod quic;
 mod session;
 mod types;
 mod uds;
+mod user_agent;
 
 /// Points the token store at a directory of this process's own, in its fallback form, so that no
 /// test reads or writes the developer's credentials or keyring. It is removed when the process

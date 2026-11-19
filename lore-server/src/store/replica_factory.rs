@@ -18,9 +18,8 @@ use lore_revision::store::composite::ReplicationTarget;
 use lore_revision::store::composite::replica_factory::ReplicaFactory;
 use lore_revision::store::composite::replica_factory::ReplicaTargets;
 use lore_revision::util::time::RetryPolicy;
-use lore_transport::make_user_agent_with_component;
 use lore_transport::quic::client::CertificateSettings as QuicCertificateSettings;
-use lore_transport::user_agent_product;
+use lore_transport::user_agent_with_component;
 use opentelemetry::KeyValue;
 use serde::Deserialize;
 use smallvec::smallvec;
@@ -204,10 +203,7 @@ impl ReplicationStoreTargetFactory {
         factory.sni_override = sni_override;
         factory.transport_config.expected_rtt_ms = rtt_ms;
         factory.transport_config.initial_cwnd = Some(self.initial_cwnd_bytes.get());
-        factory.user_agent = Some(make_user_agent_with_component(
-            user_agent_product(),
-            user_agent_component,
-        ));
+        factory.user_agent = Some(user_agent_with_component(user_agent_component));
 
         let container_config = ClientContainerConfig {
             regenerate_retry_policy: RetryPolicy::builder()
