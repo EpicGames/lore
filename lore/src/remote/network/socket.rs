@@ -66,6 +66,14 @@ impl UdsListener {
         let stream = self.listener.accept().internal("accept error")?;
         Ok(UdsStream { stream })
     }
+
+    /// The same listener on the runtime this is called on.
+    pub fn into_async(self) -> Result<local_socket::AsyncListener, UdsListenerError> {
+        Ok(self
+            .listener
+            .into_async()
+            .internal("putting the service socket on the runtime")?)
+    }
 }
 
 impl UdsListenerClaim {

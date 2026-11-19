@@ -6,6 +6,7 @@ pub mod config;
 pub mod encoding;
 pub mod fan_out;
 pub mod fs;
+pub mod in_use;
 pub mod inflight;
 pub mod path;
 pub mod request_tracker;

@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 
 mod network;
+mod occupy;
 mod service_process;
 
 use lore::remote::command::LoreCommand;

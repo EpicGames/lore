@@ -6500,6 +6500,19 @@ typedef struct lore_service_set_executable_args_t {
   struct lore_string_t executable;
 } lore_service_set_executable_args_t;
 
+// Arguments for moving the external root, where every virtual instance's external directory
+// lives.
+typedef struct lore_service_set_external_directory_args_t {
+  // The new external root: an absolute path, one relative to the caller's working directory,
+  // or empty for the default location in the global data directory.
+  struct lore_string_t path;
+  // Point the setting at `path`, a root that holds the marker of this global data directory's
+  // root ID and generation, or any marker where `external-root` is missing, and move nothing.
+  uint8_t adopt;
+  // Give up the unavailable current root for a new, empty one at `path`, and move nothing.
+  uint8_t abandon;
+} lore_service_set_external_directory_args_t;
+
 // Arguments for setting whether commands are carried out by the Lore service.
 typedef struct lore_service_set_use_automatically_args_t {
   // Carry out commands in the service rather than in the process that was run
@@ -13151,11 +13164,12 @@ void lore_storage_upload_async(const struct lore_global_args_t *globals,
 //
 // Connects to the running service, and starts one when nothing is listening,
 // then asks it for its status. Returns `0` once a service is reachable, whether
-// it was already running or was started by this call. Each log message the
-// service buffered while no command was running arrives as a `LORE_EVENT_LOG`
-// event of its level, emptying the buffer. Fails with error code 32 (service
-// unavailable) while a move of the external directories holds the service
-// socket, as no service runs then.
+// it was already running or was started by this call, and at once in a program
+// whose service has claimed the service socket, while it may still be starting.
+// Each log message the service buffered while no command was running arrives as
+// a `LORE_EVENT_LOG` event of its level, emptying the buffer. Fails with error
+// code 32 (service unavailable) while a move of the external directories holds
+// the service socket, as no service runs then.
 //
 // # Events
 //
@@ -13352,6 +13366,62 @@ int32_t lore_service_set_executable(const struct lore_global_args_t *globals,
 void lore_service_set_executable_async(const struct lore_global_args_t *globals,
                                        const struct lore_service_set_executable_args_t *args,
                                        struct lore_event_callback_config_t callback);
+
+// Move every virtual instance's external directory to a new external root, `args->path`, and
+// name it in the setting, for the caller's global data directory.
+//
+// Runs in the calling process, and is never relayed to the service. Stops the running service
+// and holds its socket until the move ends, then starts the service again. A relative `path`
+// resolves against the caller's working directory, and an empty one names the default location
+// in the global data directory. With `adopt`, points the setting at `path`, a root that holds
+// this global data directory's marker, and moves nothing; with `abandon`, gives up the
+// unavailable current root for a new, empty one at `path`. Both together fail with error code
+// 3 (invalid arguments). With `globals->dry_run`, runs every check that needs nothing stopped,
+// reports what it would do in `LORE_EVENT_LOG` events, and changes nothing. With
+// `globals->force`, the stop detaches busy mounts lazily, and programs with files open through
+// them get errors; without it, a busy mount fails the call with error code 51 (mounts busy). A
+// service that runs inside another program or in the calling program, and another move that
+// holds the service's socket, fail the call with error code 51. The call returns only once the
+// move holds the lock of every shared store its final switch needs, and a store the calling
+// program holds fails it with error code 51.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+int32_t lore_service_set_external_directory(const struct lore_global_args_t *globals,
+                                            const struct lore_service_set_external_directory_args_t *args,
+                                            struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_service_set_external_directory`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+void lore_service_set_external_directory_async(const struct lore_global_args_t *globals,
+                                               const struct lore_service_set_external_directory_args_t *args,
+                                               struct lore_event_callback_config_t callback);
 
 // Set whether commands are carried out by the Lore background service.
 //

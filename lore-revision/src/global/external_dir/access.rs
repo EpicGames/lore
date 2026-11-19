@@ -88,6 +88,16 @@ pub fn try_exclusive(global: &Path) -> Result<bool, ExternalDirError> {
     Ok(true)
 }
 
+/// Takes exclusive access to the external root of `global` for a move, without waiting: a lock the
+/// caller holds until it drops, outside this process's entries. `None` while another holder has
+/// access. Blocking.
+pub fn try_exclusive_for_move(global: &Path) -> Result<Option<FSLock>, ExternalDirError> {
+    Ok(
+        FSLock::try_acquire_file_lock(canonical_global(global)?.join(EXTERNAL))
+            .internal("taking exclusive access to the external root")?,
+    )
+}
+
 /// Releases exclusive access to the external root of `global` into shared access, without
 /// waiting. Fails, holding none, where another process took exclusive access since. Blocking.
 pub fn release_exclusive(global: &Path) -> Result<(), ExternalDirError> {
@@ -101,6 +111,14 @@ pub fn release_exclusive(global: &Path) -> Result<(), ExternalDirError> {
         }
         None => take_shared(&mut access, key),
     }
+}
+
+/// Releases the access this process holds to the external root of `global`, whether shared or
+/// exclusive. Blocking.
+pub fn release(global: &Path) -> Result<(), ExternalDirError> {
+    let key = canonical_global(global)?;
+    ACCESS.lock().remove(&key);
+    Ok(())
 }
 
 /// Takes the shared OS lock of the global data directory whose canonical path is `key`, which

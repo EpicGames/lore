@@ -2821,6 +2821,20 @@ class Lore:
     def service_status(self, **kwargs: Unpack[GlobalOptions]):
         return self.run(["service", "status"], **kwargs)
 
+    def service_set_external_directory(
+        self,
+        path: str | os.PathLike[str],
+        adopt: bool = False,
+        abandon: bool = False,
+        **kwargs: Unpack[GlobalOptions],
+    ):
+        return self.run(
+            ["service", "set-external-directory", os.fspath(path)]
+            + (["--adopt"] if adopt else [])
+            + (["--abandon"] if abandon else []),
+            **kwargs,
+        )
+
     def notification_subscribe(
         self, timeout: int | None = None, **kwargs: Unpack[GlobalOptions]
     ):

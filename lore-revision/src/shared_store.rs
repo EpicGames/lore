@@ -483,18 +483,30 @@ pub async fn get_shared_store_path_for_repo(
         .map(|(shared_store_path, _)| shared_store_path))
 }
 
+/// The directory of the shared store `config` names, found as [`get_shared_store_for_repo`] finds
+/// it, without reading the store's config. `None` where `config` names no shared store.
+pub async fn locate_shared_store_for_repo(
+    config: &RepositoryConfig,
+) -> Result<Option<PathBuf>, SharedStoreError> {
+    let Some(shared_store_to_use_config) = config
+        .shared_store_to_use
+        .as_ref()
+        .filter(|to_use| to_use.use_shared_store.unwrap_or(false))
+    else {
+        return Ok(None);
+    };
+    let directory_with_shared_store =
+        resolve_shared_store_dir(shared_store_to_use_config, &config.remote_url).await?;
+    find_existing_shared_store_in_dir(directory_with_shared_store).map(Some)
+}
+
 /// The path and config of the shared store a repository uses, as
 /// [`get_shared_store_path_for_repo`] finds it.
 pub async fn get_shared_store_for_repo(
     config: &RepositoryConfig,
 ) -> Result<Option<(PathBuf, SharedStoreConfig)>, SharedStoreError> {
     Ok(
-        if let Some(shared_store_to_use_config) = config.shared_store_to_use.as_ref()
-            && shared_store_to_use_config.use_shared_store.unwrap_or(false)
-        {
-            let directory_with_shared_store =
-                resolve_shared_store_dir(shared_store_to_use_config, &config.remote_url).await?;
-            let shared_store_path = find_existing_shared_store_in_dir(directory_with_shared_store)?;
+        if let Some(shared_store_path) = locate_shared_store_for_repo(config).await? {
             let shared_store_config =
                 load_shared_store_config(&shared_store_path)
                     .await

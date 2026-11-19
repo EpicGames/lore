@@ -73,3 +73,16 @@ fn a_root_id_is_random_and_reads_back_from_its_text() {
     assert_ne!(first, second);
     assert_eq!(first.to_string().parse::<RootId>(), Ok(first));
 }
+
+/// A root ID aligns no wider than a pointer, so the futures that hold a setting or a marker,
+/// among them every command's dispatch, keep the alignment they have without one.
+#[test]
+fn a_root_id_aligns_no_wider_than_a_pointer() {
+    use lore_revision::global::external_dir::marker::Marker;
+    use lore_revision::global::external_dir::setting::RootId;
+    use lore_revision::global::external_dir::setting::Setting;
+
+    assert!(align_of::<RootId>() <= align_of::<usize>());
+    assert!(align_of::<Setting>() <= align_of::<usize>());
+    assert!(align_of::<Marker>() <= align_of::<usize>());
+}

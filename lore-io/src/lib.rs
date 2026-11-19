@@ -56,6 +56,8 @@ mod iocp;
 #[cfg(all(target_family = "windows", feature = "test-util"))]
 pub mod iocp;
 #[cfg(target_family = "windows")]
+pub mod junction;
+#[cfg(target_family = "windows")]
 mod overlapped;
 #[cfg(not(feature = "test-util"))]
 mod pool;
@@ -74,6 +76,8 @@ pub mod rename;
 mod stat;
 #[cfg(feature = "test-util")]
 pub mod stat;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 #[cfg(target_os = "linux")]
 mod uring;
 #[cfg(target_family = "windows")]

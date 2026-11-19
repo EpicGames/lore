@@ -221,6 +221,36 @@ pub fn resolve_in(global: PathBuf) -> RootState {
     }
 }
 
+/// The path of the root that a setting or a move record names as `path`, the default location of
+/// `global` where `path` is empty.
+pub fn root_path(global: &Path, path: &str) -> PathBuf {
+    if path.is_empty() {
+        global.join(EXTERNAL)
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+/// Whether the root that a setting or a move record names as `path` in `global` is available by
+/// the rules a resolution applies, for `setting`. With no setting, only the default location is
+/// available, while it is missing or a directory. Blocking.
+pub fn root_available(global: &Path, path: &str, setting: Option<&Setting>) -> bool {
+    let root = root_path(global, path);
+    let default_path = global.join(EXTERNAL);
+    let at_default = root == default_path;
+    let Some(setting) = setting else {
+        return at_default
+            && matches!(
+                default_location(&default_path),
+                DefaultLocation::Missing | DefaultLocation::Directory
+            );
+    };
+    if at_default && default_location(&default_path) != DefaultLocation::Directory {
+        return false;
+    }
+    root.is_absolute() && marked_root(global, &root, setting).is_ok()
+}
+
 /// What the default location at `path` holds.
 fn default_location(path: &Path) -> DefaultLocation {
     match std::fs::symlink_metadata(path) {
@@ -291,6 +321,16 @@ fn availability(global: &Path, default_path: PathBuf, default: DefaultLocation) 
 /// root is the user's alone. Its marker gets no such check: no one else can change an entry of a
 /// root that passes it.
 fn marked_root(global: &Path, root: &Path, setting: &Setting) -> Result<(), Unavailable> {
+    checked_marker(global, root, Some(setting)).map(drop)
+}
+
+/// The marker of `root`, checked as [`marked_root`] checks it, against `setting` where there is
+/// one, and accepting any marker where there is none. Blocking.
+pub fn checked_marker(
+    global: &Path,
+    root: &Path,
+    setting: Option<&Setting>,
+) -> Result<Marker, Unavailable> {
     let metadata =
         std::fs::metadata(root).map_err(|err| failed_read(&err, Unavailable::Missing))?;
     if !metadata.is_dir() {
@@ -307,13 +347,16 @@ fn marked_root(global: &Path, root: &Path, setting: &Setting) -> Result<(), Unav
         Ok(None) => return Err(Unavailable::NoMarker),
         Err(_) => return Err(Unavailable::Unreadable),
     };
+    let Some(setting) = setting else {
+        return Ok(marker);
+    };
     if marker.id != setting.id {
         return Err(Unavailable::ForeignMarker);
     }
     if marker.generation != setting.generation {
         return Err(Unavailable::OtherGeneration);
     }
-    Ok(())
+    Ok(marker)
 }
 
 /// The reason a read that failed with `err` gives: `missing` where nothing is at the path, else
@@ -344,14 +387,14 @@ fn private_to_user(path: &Path, metadata: &std::fs::Metadata) -> Result<(), Unav
 
 /// Whether the extended ACL of `path` lets anyone but its owner `owner` write it.
 #[cfg(target_os = "macos")]
-fn acl_lets_others_write(path: &Path, owner: u32) -> Result<bool, Unavailable> {
+pub(super) fn acl_lets_others_write(path: &Path, owner: u32) -> Result<bool, Unavailable> {
     lore_io::acl::extended_acl_lets_others_write(path, owner)
         .map_err(|err| failed_read(&err, Unavailable::Missing))
 }
 
 /// Linux has no ACL beyond what the mode's group bits bound, as [`is_private`] describes.
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]
-fn acl_lets_others_write(_path: &Path, _owner: u32) -> Result<bool, Unavailable> {
+pub(super) fn acl_lets_others_write(_path: &Path, _owner: u32) -> Result<bool, Unavailable> {
     Ok(false)
 }
 
@@ -361,7 +404,7 @@ fn acl_lets_others_write(_path: &Path, _owner: u32) -> Result<bool, Unavailable>
 /// ACL's mask, which bounds every entry but the owner's and others', so `mode` covers the ACL.
 #[cfg(target_family = "unix")]
 #[lore_macro::test_pub]
-fn is_private(owner: u32, mode: u32, acl_lets_others_write: bool, user: u32) -> bool {
+pub(super) fn is_private(owner: u32, mode: u32, acl_lets_others_write: bool, user: u32) -> bool {
     owner == user && mode & 0o022 == 0 && !acl_lets_others_write
 }
 

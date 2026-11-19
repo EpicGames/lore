@@ -1320,3 +1320,33 @@ def test_a_fuse_instance_and_an_instance_cloned_from_it_change_apart(
     fuse.status()
     assert is_mounted(fuse.path) and is_mounted(str(target)), "a new service mounts both"
     assert_apart("a new service")
+
+
+@pytest.mark.verified_volume
+@pytest.mark.smoke
+def test_a_move_by_rename_mounts_fuse_instances_again_from_the_new_root(
+    new_lore_repo, fuse_mounts, scratch_dir, global_dir_name
+):
+    """A move by rename stops the service, which unmounts the FUSE instance, moves its external
+    directory with the root, and starts the service again from the same `lore`, which mounts
+    the instance from the new root with what it read and what was written through it."""
+    repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    committed = b"committed before the move\n"
+    repo.write_commit_push("initial", {"readme.txt": committed})
+    fuse = fuse_clone(repo, fuse_mounts)
+    written = b"written through the mount\n"
+    Path(fuse.path, "written.txt").write_bytes(written)
+    target = scratch_dir("external-root") / "root"
+
+    repo.service_set_external_directory(target)
+
+    assert Path(external_root(global_dir_name)) == target
+    assert is_mounted(fuse.path), "the restarted service mounts the instance again"
+    assert cat(os.path.join(fuse.path, "readme.txt")) == committed
+    assert cat(os.path.join(fuse.path, "written.txt")) == written
+
+    repo.service_set_external_directory("")
+
+    assert is_mounted(fuse.path)
+    assert cat(os.path.join(fuse.path, "written.txt")) == written
+    assert not target.exists()

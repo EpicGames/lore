@@ -17,6 +17,13 @@ use crate::remote::command::LoreCommand;
 #[error_set]
 pub enum MessageError {}
 
+/// The context of a failure to decode a message, which a peer of another build sends.
+/// `find_service` matches it in a failure's text to tell a service of another build apart.
+pub(crate) const DECODING_MESSAGE: &str = "decoding message";
+/// The failure of a message of another protocol version. `find_service` matches it in a
+/// failure's text to tell a service of another build apart.
+pub(crate) const WRONG_VERSION: &str = "Message received with wrong version";
+
 /// Reads one message, or `None` when the peer has closed the connection.
 ///
 /// Returns the payload the message was decoded from beside it: a `LoreBytes` the message carries
@@ -24,6 +31,29 @@ pub enum MessageError {}
 pub fn blocking_read_message<Message: bitcode::DecodeOwned, Reader: Read + Unpin>(
     reader: &mut Reader,
 ) -> Result<Option<(Message, Bytes)>, MessageError> {
+    let Some(header) = blocking_read_header(reader)? else {
+        return Ok(None);
+    };
+
+    let mut payload = vec![0; header.payload_size as usize];
+    reader
+        .read_exact(&mut payload)
+        .internal("reading message payload")?;
+    let payload = Bytes::from(payload);
+
+    let message = bitcode::decode(&payload)
+        .map_err(|err| MessageError::internal(format!("{DECODING_MESSAGE}: {err}")))?;
+    Ok(Some((message, payload)))
+}
+
+/// The bytes of a message before its payload: its version and its header.
+pub(crate) const MESSAGE_HEAD_SIZE: usize = 1 + Header::SIZE;
+
+/// Reads the version and header of one message, leaving its payload to be read, or `None` when the
+/// peer has closed the connection.
+pub fn blocking_read_header<Reader: Read>(
+    reader: &mut Reader,
+) -> Result<Option<Header>, MessageError> {
     let mut version_byte: [u8; 1] = [0];
     let version = match reader.read_exact(&mut version_byte) {
         Ok(_) => version_byte[0],
@@ -40,25 +70,14 @@ pub fn blocking_read_message<Message: bitcode::DecodeOwned, Reader: Read + Unpin
     };
 
     if version != MessageProtocol::V2 as u8 {
-        return Err(MessageError::internal(
-            "Message received with wrong version",
-        ));
+        return Err(MessageError::internal(WRONG_VERSION));
     }
 
     let mut header_bytes = [0; Header::SIZE];
     reader
         .read_exact(&mut header_bytes)
         .internal("reading message header")?;
-    let header = Header::from_bytes(&header_bytes)?;
-
-    let mut payload = vec![0; header.payload_size as usize];
-    reader
-        .read_exact(&mut payload)
-        .internal("reading message payload")?;
-    let payload = Bytes::from(payload);
-
-    let message = bitcode::decode(&payload).internal("decoding message")?;
-    Ok(Some((message, payload)))
+    Header::from_bytes(&header_bytes).map(Some)
 }
 
 /// Writes one message.

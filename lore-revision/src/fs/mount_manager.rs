@@ -28,8 +28,10 @@ use crate::fs::swfs::mount_manager::SwfsMountManager;
 use crate::fs::swfs::paths::MountPath;
 use crate::global::external_dir::access::resolve_shared_in;
 use crate::global::external_dir::canonical_global;
+use crate::global::external_dir::resolve::Availability;
 use crate::global::external_dir::resolve::Lookup;
 use crate::global::external_dir::resolve::RootState;
+use crate::global::external_dir::resolve::Unknown;
 use crate::global::external_dir::resolve::resolve;
 use crate::instance::InstanceId;
 #[cfg(target_os = "linux")]
@@ -99,11 +101,15 @@ impl MountManager {
     /// and skipped rather than stopping the rest, and no external directory is removed for them.
     ///
     /// At the first virtual instance found, `state` is resolved again under shared access, and
-    /// whether it was is returned. Where shared access is refused, no virtual instance is mounted.
+    /// whether it was is returned. Where shared access is refused, no virtual instance is mounted,
+    /// and where `state` reads a move of the root as interrupted, no store is opened either, so a
+    /// start doesn't wait for a store the move waits for. An instance whose path `skip` answers for is
+    /// left as it is.
     #[lore_macro::test_pub]
-    async fn mounts_of_entries(
+    async fn mounts_of_entries_skipping(
         entries: &[SharedStoreRegistryEntry],
         state: &mut RootState,
+        skip: impl Fn(&Path) -> bool,
     ) -> Result<
         (
             FoundSwfsMounts,
@@ -113,6 +119,15 @@ impl MountManager {
         ),
         MountManagerError,
     > {
+        if matches!(state.availability, Availability::Interrupted) {
+            if !entries.is_empty() {
+                lore_warn!(
+                    "Not mounting any virtual instance: {}",
+                    Unknown::Interrupted
+                );
+            }
+            return Ok((Vec::new(), Vec::new(), None, false));
+        }
         let mut swfs = Vec::new();
         #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut pending_fuse = Vec::new();
@@ -144,6 +159,9 @@ impl MountManager {
                 registered.extend(instances.iter().map(|instance| instance.instance_id));
             }
             for instance in &instances {
+                if skip(Path::new(&instance.path)) {
+                    continue;
+                }
                 let lookup = match lookup_under_shared(state, &mut shared, instance.instance_id) {
                     Ok(lookup) => lookup,
                     Err(error) => {
@@ -223,25 +241,58 @@ impl MountManager {
         Ok((swfs, pending_fuse, registered, shared))
     }
 
-    /// The manager of a starting service, with every registered instance mounted, as
-    /// [`Self::mounts_of_entries`] mounts them, and what interrupted clones left removed.
-    pub async fn initialize() -> Result<Arc<Self>, MountManagerError> {
-        let registry = SharedStoreRegistry::load()
-            .await
-            .forward::<MountManagerError>("Unable to load shared store registry")?;
-        let mut state = resolve().forward::<MountManagerError>("resolving the external root")?;
+    /// As [`Self::mounts_of_entries_skipping`], skipping no instance.
+    #[cfg(feature = "test-util")]
+    pub fn mounts_of_entries(
+        entries: &[SharedStoreRegistryEntry],
+        state: &mut RootState,
+    ) -> impl Future<
+        Output = Result<
+            (
+                FoundSwfsMounts,
+                Vec<PendingFuseMount>,
+                RegisteredInstances,
+                bool,
+            ),
+            MountManagerError,
+        >,
+    > {
+        Self::mounts_of_entries_skipping(entries, state, |_| false)
+    }
+
+    /// The mounts [`Self::mounts_of_entries_skipping`] finds in `entries` with `skip`, in the
+    /// external root `state`, with what interrupted clones left among its external directories
+    /// removed once they are read under shared access.
+    #[lore_macro::test_pub]
+    async fn registered_mounts(
+        entries: &[SharedStoreRegistryEntry],
+        state: &mut RootState,
+        skip: impl Fn(&Path) -> bool,
+    ) -> Result<(FoundSwfsMounts, Vec<PendingFuseMount>), MountManagerError> {
         let (swfs, pending_fuse, registered, shared) =
-            Self::mounts_of_entries(registry.entries(), &mut state).await?;
+            Self::mounts_of_entries_skipping(entries, state, skip).await?;
         #[cfg(target_os = "linux")]
         if shared {
             Box::pin(crate::fs::fuse::mount_manager::remove_interrupted_clones(
-                &state,
+                state,
                 registered.as_ref(),
             ))
             .await;
         }
         #[cfg(not(target_os = "linux"))]
         let _ = (registered, shared);
+        Ok((swfs, pending_fuse))
+    }
+
+    /// The manager of a starting service, with every registered instance mounted, as
+    /// [`Self::registered_mounts`] finds them, and what interrupted clones left removed.
+    pub async fn initialize() -> Result<Arc<Self>, MountManagerError> {
+        let registry = SharedStoreRegistry::load()
+            .await
+            .forward::<MountManagerError>("Unable to load shared store registry")?;
+        let mut state = resolve().forward::<MountManagerError>("resolving the external root")?;
+        let (swfs, pending_fuse) =
+            Self::registered_mounts(registry.entries(), &mut state, |_| false).await?;
         let manager = Arc::new(MountManager {
             swfs: SwfsMountManager::with_mounts(swfs).await?,
             #[cfg(target_os = "linux")]
@@ -252,6 +303,28 @@ impl MountManager {
         #[cfg(not(target_os = "linux"))]
         let _ = pending_fuse;
         Ok(manager)
+    }
+
+    /// Mounts the registered instances of the caller's global data directory into this running
+    /// manager, as [`Self::initialize`] mounts them at a start: SWFS mounts join the live SWFS
+    /// manager, and FUSE mounts run through its remount. For a service whose start skipped them
+    /// while a move of the external root waited for recovery, and what interrupted clones left is
+    /// removed, as at a start. An instance whose path this manager mounts already is left as it
+    /// is.
+    pub async fn mount_registered_instances(&self) -> Result<(), MountManagerError> {
+        let registry = SharedStoreRegistry::load()
+            .await
+            .forward::<MountManagerError>("Unable to load shared store registry")?;
+        let mut state = resolve().forward::<MountManagerError>("resolving the external root")?;
+        let mounted = |path: &Path| matches!(self.is_mounted(path), Ok(true));
+        let (swfs, pending_fuse) =
+            Self::registered_mounts(registry.entries(), &mut state, mounted).await?;
+        self.swfs.add_mounts(swfs).await?;
+        #[cfg(target_os = "linux")]
+        self.fuse.remount_instances(pending_fuse).await;
+        #[cfg(not(target_os = "linux"))]
+        let _ = pending_fuse;
+        Ok(())
     }
 
     /// The SWFS mounts.

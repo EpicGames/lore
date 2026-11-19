@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
+import atexit
 import json
 import logging
 import os
@@ -230,8 +231,111 @@ def _remove_tmp_path(request, keep_test_data):
         remove_tree(tmp_path, label="tmp_path")
 
 
+# The file systems Lore verifies on Linux as local and durable, as `volume.rs` in lore-io names
+# them, by the type `/proc/self/mountinfo` gives.
+VERIFIED_LINUX_FILE_SYSTEMS = {
+    "btrfs",
+    "xfs",
+    "bcachefs",
+    "ext2",
+    "ext3",
+    "ext4",
+    "zfs",
+}
+
+
+def _linux_file_system(path: Path) -> str:
+    """The type of the file system that holds the existing `path`, from the mount of the longest
+    mount point above it in `/proc/self/mountinfo`."""
+    resolved = os.path.realpath(path)
+    best, kind = "", "unknown"
+    with open("/proc/self/mountinfo") as table:
+        for line in table:
+            fields = line.split()
+            mount_point = fields[4].replace("\\040", " ")
+            below = resolved == mount_point or resolved.startswith(
+                mount_point.rstrip("/") + "/"
+            )
+            if below and len(mount_point) >= len(best):
+                best, kind = mount_point, fields[fields.index("-") + 1]
+    return kind
+
+
+# The scratch directory made beside the outermost Lore working tree that holds the rootdir.
+BESIDE_TREE = "lore-test-scratch"
+
+
+def _outermost_tree(path: Path):
+    """The outermost directory at or above `path` that holds a `.lore` directory, if any."""
+    trees = [
+        ancestor for ancestor in [path, *path.parents] if (ancestor / ".lore").is_dir()
+    ]
+    return trees[-1] if trees else None
+
+
+def _refusal(candidate: Path):
+    """Why `candidate` can't hold a test's global directory and move targets, made where it is
+    missing: the working tree it lies in, or on Linux its file system. `None` where it can."""
+    tree = _outermost_tree(candidate)
+    if tree is not None:
+        return f"inside the Lore working tree at {tree}"
+    candidate.mkdir(parents=True, exist_ok=True)
+    if platform.system() != "Linux":
+        return None
+    kind = _linux_file_system(candidate)
+    return None if kind in VERIFIED_LINUX_FILE_SYSTEMS else kind
+
+
+# The scratch directories beside a working tree this process chose, removed as it ends.
+_MADE_BESIDE_TREE: set = set()
+
+
+def _remove_if_empty(path: Path):
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
+def _verified_scratch_base(config, tmp_path_factory) -> Path:
+    """Where a test marked `verified_volume` makes its global directory and the targets it moves
+    the external root to: the first of pytest's base temp directory, `target/tmp` under the
+    rootdir, and a directory beside the outermost Lore working tree that holds the rootdir, in
+    that tree's parent, with no Lore working tree above it and, on Linux, on a file system Lore
+    verifies. The last is made where needed and removed, once empty, as the process that chose it
+    ends. Fails,
+    naming each candidate and why it was refused, where none qualifies. The temp directories of
+    macOS and Windows are on volumes Lore verifies, so only Linux checks the file system."""
+    build_tmp = Path(config.rootpath) / "target" / "tmp"
+    tree = _outermost_tree(build_tmp)
+    candidates = [tmp_path_factory.getbasetemp(), build_tmp]
+    if tree is not None:
+        candidates.append(tree.parent / BESIDE_TREE)
+    refused = []
+    for index, candidate in enumerate(candidates):
+        why = _refusal(candidate)
+        if why is None:
+            if index == 2 and candidate not in _MADE_BESIDE_TREE:
+                _MADE_BESIDE_TREE.add(candidate)
+                atexit.register(_remove_if_empty, candidate)
+            return candidate
+        refused.append(f"{candidate} ({why})")
+    pytest.fail(
+        "no scratch directory is on a file system Lore has verified as local and durable, "
+        "outside any Lore working tree: " + ", ".join(refused)
+    )
+
+
+def _scratch_base(request, tmp_path_factory) -> Path:
+    """The directory a test's scratch paths and global directory go in: a verified one for a test
+    marked `verified_volume`, else pytest's base temp directory."""
+    if request.node.get_closest_marker("verified_volume") is None:
+        return tmp_path_factory.getbasetemp()
+    return _verified_scratch_base(request.config, tmp_path_factory)
+
+
 @pytest.fixture(scope="function")
-def scratch_dir(tmp_path_factory, keep_test_data):
+def scratch_dir(tmp_path_factory, keep_test_data, request):
     """Returns a function handing out paths beside the test's repositories for
     the test to create things at -- shared stores, clone targets, instances --
     each removed when the test ends, pass or fail.
@@ -242,11 +346,12 @@ def scratch_dir(tmp_path_factory, keep_test_data):
     unless `unique=False` asks for the name verbatim.
     """
     created: list[Path] = []
+    base = _scratch_base(request, tmp_path_factory)
 
     def _scratch_dir(name: str, *, unique: bool = True, create: bool = False) -> Path:
         if unique:
             name = Lore.generate_random_name(name)
-        path = tmp_path_factory.getbasetemp() / name
+        path = base / name
         created.append(path)
         if create:
             path.mkdir(parents=True, exist_ok=True)
@@ -261,9 +366,10 @@ def scratch_dir(tmp_path_factory, keep_test_data):
 
 
 @pytest.fixture(scope="function")
-def global_dir_name(tmp_path_factory, keep_test_data):
+def global_dir_name(tmp_path_factory, keep_test_data, request):
     path = str(
-        tmp_path_factory.getbasetemp() / Lore.generate_random_name("lore_global")
+        _scratch_base(request, tmp_path_factory)
+        / Lore.generate_random_name("lore_global")
     )
     logger.info(f"Setting global directory for test to {path}")
     os.makedirs(path)
@@ -1021,6 +1127,11 @@ def pytest_configure(config):
     config.pluginmanager.register(_SessionCleanup(), "lore_session_cleanup")
     config.addinivalue_line(
         "markers", "regression: mark tests that don't run on every CI"
+    )
+    config.addinivalue_line(
+        "markers",
+        "verified_volume: make the test's global directory and scratch paths on a file system "
+        "Lore verifies as local and durable, as a move of the external root needs",
     )
     config.addinivalue_line(
         "markers",

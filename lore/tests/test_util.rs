@@ -30,6 +30,29 @@ impl Replier {
 
     /// Listens on `name` and answers every request on it with a message of the bytes `payload`.
     pub fn with(name: &str, payload: Vec<u8>) -> Replier {
+        Replier::answering(name, vec![payload], false, false)
+    }
+
+    /// Listens on `name` and answers its requests in turn with a message of each of `payloads`,
+    /// then stops listening.
+    pub fn in_turn(name: &str, payloads: Vec<Vec<u8>>) -> Replier {
+        Replier::answering(name, payloads, true, false)
+    }
+
+    /// As [`Replier::in_turn`], with each reply the bytes of whole messages, as
+    /// `lore::remote::message::write_payload` writes them.
+    pub fn in_turn_framed(name: &str, replies: Vec<Vec<u8>>) -> Replier {
+        Replier::answering(name, replies, true, true)
+    }
+
+    /// Answers request `i` with `payloads[i]`, or the last of them past its end, stopping after the
+    /// last where `stop_after_last` is set, written as they are where `framed` is set.
+    fn answering(
+        name: &str,
+        payloads: Vec<Vec<u8>>,
+        stop_after_last: bool,
+        framed: bool,
+    ) -> Replier {
         use std::sync::atomic::Ordering;
 
         let listener = lore::remote::network::UdsListener::new(name).expect("listen on the socket");
@@ -48,8 +71,16 @@ impl Replier {
                         _,
                     >(stream.reader());
                     if let Ok(Some(_)) = request {
-                        answered.fetch_add(1, Ordering::SeqCst);
-                        let _ = lore::remote::message::write_payload(stream.writer(), &payload);
+                        let turn = answered.fetch_add(1, Ordering::SeqCst);
+                        let payload = &payloads[turn.min(payloads.len() - 1)];
+                        if framed {
+                            let _ = std::io::Write::write_all(stream.writer(), payload);
+                        } else {
+                            let _ = lore::remote::message::write_payload(stream.writer(), payload);
+                        }
+                        if stop_after_last && turn + 1 >= payloads.len() {
+                            break;
+                        }
                     }
                 }
             }

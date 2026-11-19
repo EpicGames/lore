@@ -3045,3 +3045,253 @@ async fn the_lookup_of_a_mounted_path_stays_within_its_budget() {
     }))
     .await;
 }
+
+const RECOVERY_CHILD_ENV: &str = "LORE_FUSE_MOUNT_TEST_RECOVERY_CHILD";
+
+/// Writes a log message of the recovery child to its stderr, which its parent reports on failure.
+fn log_to_stderr(level: lore_base::log::LoreLogLevel, location: &str, message: &str) {
+    eprintln!("[{level:?}] {location}: {message}");
+}
+
+/// A first move interrupted at its switch, after the root was renamed, with a store of its FUSE
+/// instance held at start by another holder: the start leaves the move waiting and the instance
+/// unmounted, and once the holder lets go, the background recovery joins a command's hold in this
+/// process, finishes the move and mounts the instance into the running manager, from the moved
+/// root, while the command still holds the store.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_child() {
+    use lore_base::fs::lock::FSLock;
+    use lore_revision::global::external_dir::marker::Marker;
+    use lore_revision::global::external_dir::record::MoveKind;
+    use lore_revision::global::external_dir::record::MovePhase;
+    use lore_revision::global::external_dir::record::MoveRecord;
+    use lore_revision::global::external_dir::recovery::AtStart;
+    use lore_revision::global::external_dir::recovery::recover_at_start;
+    use lore_revision::global::external_dir::recovery::recover_in_background;
+    use lore_storage::local::store_lock::Intent;
+
+    if std::env::var_os(RECOVERY_CHILD_ENV).is_none() {
+        return;
+    }
+    skip_without_fuse!();
+    lore_base::log::set_log_level(lore_base::log::LoreLogLevel::Debug);
+    lore_base::log::set_log_callback(Some(log_to_stderr));
+    let _serial = SERIAL.lock().await;
+    let execution = service_execution().await;
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let (_store_dir, store) = canonical_dir("lore-fuse-mount-store-");
+        let (_dir, path) = canonical_dir("lore-fuse-mount-recovery-");
+        eprintln!("recovery child: creating the instance");
+        let _guard = MountGuard(path.clone());
+        let config = shared_store_config(&store, VfsType::Fuse);
+        let (repository, token) = create_instance(
+            &path,
+            RepositoryId::from(uuid::Uuid::now_v7()),
+            config.clone(),
+        )
+        .await;
+        let instance_id = repository.instance_id;
+        repository
+            .flush(FlushOptions::SYNC_DATA)
+            .await
+            .expect("flushes");
+        drop(repository);
+        drop(token);
+        let manager = MountManagerState::mount_manager().expect("manager is initialised");
+        manager.fuse().unmount_all(false).await.expect("unmounts");
+        manager.fuse().resume_mounting();
+        assert!(!is_mounted(&path));
+
+        let global =
+            lore_revision::global::get_global_data_dir().expect("the global data directory");
+        let default = global.join("external");
+        let (_volume, volume) = canonical_dir("lore-fuse-mount-volume-");
+        let target = volume.join("root");
+        let id = RootId::generate();
+        Marker {
+            id,
+            generation: NonZeroU64::MIN,
+        }
+        .save(&default)
+        .await
+        .expect("the marker");
+        Setting {
+            path: String::new(),
+            id,
+            generation: NonZeroU64::MIN,
+        }
+        .save(&global)
+        .await
+        .expect("the setting");
+        // A fixture rename of the root, as a move does, outside any repository write.
+        #[allow(clippy::disallowed_methods)]
+        std::fs::rename(&default, &target).expect("the rename");
+        MoveRecord {
+            from: String::new(),
+            to: target.display().to_string(),
+            kind: MoveKind::Rename,
+            phase: MovePhase::Switch,
+        }
+        .save(&global)
+        .await
+        .expect("the record");
+        let shared = lore_revision::shared_store::locate_shared_store_for_repo(&config)
+            .await
+            .expect("find the shared store")
+            .expect("the config names one");
+        let other = FSLock::try_acquire_exact_path(&shared.join("immutable").join("lock"))
+            .await
+            .expect("look at the flock")
+            .expect("hold the store");
+
+        eprintln!("recovery child: recovering at the start");
+        assert_eq!(
+            recover_at_start(&global, std::time::Duration::ZERO).await,
+            AtStart::Retry
+        );
+        eprintln!("recovery child: mounting while the move waits");
+        Box::pin(manager.mount_registered_instances())
+            .await
+            .expect("the start's mounting skips the waiting root");
+        assert!(!is_mounted(&path), "nothing mounts while the move waits");
+
+        drop(other);
+        let command = StoreLock::new(shared.join("immutable"), true).expect("the lock");
+        let mut held = command
+            .acquire(Intent::Read)
+            .await
+            .expect("a command holds the store");
+        held.note_refreshed();
+        eprintln!("recovery child: recovering in the background");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            recover_in_background(global.clone(), async {
+                eprintln!("recovery child: mounting the recovered root");
+                Box::pin(manager.mount_registered_instances())
+                    .await
+                    .expect("the recovered root's instances mount");
+            }),
+        )
+        .await
+        .expect("recovery in the background ends within 60 s");
+        drop(held);
+        eprintln!("recovery child: recovered");
+
+        assert!(
+            is_mounted(&path),
+            "the instance mounts once the move is recovered"
+        );
+        let record = manager
+            .record_at(&path)
+            .expect("the path makes a mount path")
+            .expect("a mount records where its instance lives");
+        assert_eq!(
+            record.external_dir,
+            target.join(instance_id.text_encoding())
+        );
+        manager.fuse().unmount_all(false).await.expect("unmounts");
+    }))
+    .await;
+}
+
+/// How long [`a_held_store_is_recovered_in_the_background_and_mounted`] waits for its child before
+/// it kills it, so that a child that hangs fails the test, naming where its threads wait, rather
+/// than holding up the binary. A killed child's mount is stale, which probes of the mount table
+/// pass over.
+const RECOVERY_CHILD_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_store_is_recovered_in_the_background_and_mounted() {
+    skip_without_fuse!();
+    let _serial = SERIAL.lock().await;
+    let exe = std::env::current_exe().expect("test binary path");
+    let (ran, waited) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = ran.send(run_recovery_child(exe));
+    });
+    let (status, stdout, stderr, stopped) = waited
+        .await
+        .expect("the child's thread answers")
+        .expect("the child runs");
+    let stdout = String::from_utf8_lossy(&stdout);
+    assert!(
+        status.success() && stdout.contains("1 passed"),
+        "child failed{stopped}:\n{stdout}\n{}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+/// Runs [`recovery_child`] in a child process for up to [`RECOVERY_CHILD_BOUND`], reading its
+/// output as it runs, and answers its status, its stdout, its stderr, and, where it was killed at
+/// the bound, where each of its threads stopped.
+fn run_recovery_child(
+    exe: std::path::PathBuf,
+) -> std::io::Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>, String)> {
+    let mut child = std::process::Command::new(exe)
+        .args(["--exact", "needs_fuse::recovery_child", "--nocapture"])
+        .env(RECOVERY_CHILD_ENV, "1")
+        .env_remove("LORE_GLOBAL_PATH")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let readers = [
+        child
+            .stdout
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+    ]
+    .map(|pipe| {
+        std::thread::spawn(move || {
+            let mut text = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = std::io::Read::read_to_end(&mut pipe, &mut text);
+            }
+            text
+        })
+    });
+    let started = std::time::Instant::now();
+    let mut stopped = String::new();
+    while child.try_wait()?.is_none() {
+        if started.elapsed() >= RECOVERY_CHILD_BOUND {
+            stopped = threads_of(child.id());
+            child.kill()?;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let status = child.wait()?;
+    let [stdout, stderr] = readers.map(|reader| reader.join().unwrap_or_default());
+    Ok((status, stdout, stderr, stopped))
+}
+
+/// Where each thread of the process `pid` stopped, by its name and the kernel function it waits
+/// in, as `/proc` shows them to the same user.
+fn threads_of(pid: u32) -> String {
+    let read = |path: std::path::PathBuf| {
+        std::fs::read_to_string(path)
+            .map_or_else(|err| err.to_string(), |text| text.trim().to_string())
+    };
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return format!(" at the bound, with no threads to read for process {pid}");
+    };
+    let mut threads: Vec<String> = tasks
+        .filter_map(Result::ok)
+        .map(|task| {
+            format!(
+                "{} {}: {}",
+                task.file_name().to_string_lossy(),
+                read(task.path().join("comm")),
+                read(task.path().join("wchan"))
+            )
+        })
+        .collect();
+    threads.sort();
+    format!(
+        " at the bound, its threads waiting in:\n{}",
+        threads.join("\n")
+    )
+}

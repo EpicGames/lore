@@ -179,6 +179,7 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * [`lore service status`↴](#lore-service-status)
 * [`lore service set-executable`↴](#lore-service-set-executable)
 * [`lore service set-use-automatically`↴](#lore-service-set-use-automatically)
+* [`lore service set-external-directory`↴](#lore-service-set-external-directory)
 * [`lore notification`↴](#lore-notification)
 * [`lore notification subscribe`↴](#lore-notification-subscribe)
 * [`lore completions`↴](#lore-completions)
@@ -2651,6 +2652,7 @@ Manage the repository in a service process
 * `status` — Report whether the service is running, what it is doing, and where the external directories are
 * `set-executable` — Set which executable is started as the service
 * `set-use-automatically` — Set whether commands are carried out by the service
+* `set-external-directory` — Move every virtual instance's external directory to a new external root
 
 ## `lore service run`
 
@@ -2700,6 +2702,29 @@ Set whether commands are carried out by the service
   clap refuses a positional whose action takes none.
 
   Possible values: `true`, `false`
+
+## `lore service set-external-directory`
+
+Move every virtual instance's external directory to a new external root
+
+Stops the running service and holds its socket until the move ends, then starts the service again. Refuses a service
+that runs inside another program, and a stop while a program is inside a virtual instance, unless --force, which
+detaches busy mounts lazily. Ctrl-C before the final switch undoes a move; an --adopt or --abandon it interrupts is
+finished later, by recovery. Ctrl-C while the command finishes an earlier interrupted move ends it, and leaves that move
+to recovery. With --dry-run, runs every check that needs nothing stopped and reports what the move would do; while a
+move is interrupted, it reports that move, and the target is checked once recovery has finished it.
+
+**Usage:** `lore service set-external-directory [OPTIONS] <path>`
+
+###### **Arguments:**
+
+* `<path>` — The new external root: an absolute path, one relative to the working directory, or empty for the default
+  location in the global data directory
+
+###### **Options:**
+
+* `--adopt` — Point the setting at the path, a root that holds this global data directory's marker, and move nothing
+* `--abandon` — Give up the unavailable external root for a new, empty one at the path, and move nothing
 
 ## `lore notification`
 

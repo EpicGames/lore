@@ -987,6 +987,30 @@ fn revision_graph_commands_follow_the_last_existing_command() {
     }
 }
 
+/// The command that moves the external root follows the last command before it, so no earlier
+/// command's encoding moves.
+#[test]
+fn set_external_directory_follows_the_last_existing_command() {
+    let last = bitcode::encode(&LoreCommand::BranchMergeConflictsList(
+        lore::branch::LoreBranchMergeConflictsListArgs {},
+    ))[0];
+    let command = LoreCommand::ServiceSetExternalDirectory(
+        lore::service::LoreServiceSetExternalDirectoryArgs {
+            path: LoreString::from_str("/roots/next"),
+            adopt: 1,
+            abandon: 0,
+        },
+    );
+    assert_eq!(bitcode::encode(&command)[0], last + 1);
+    match relayed(command) {
+        LoreCommand::ServiceSetExternalDirectory(read_back) => {
+            assert_eq!(read_back.path.as_str(), "/roots/next");
+            assert_eq!((read_back.adopt, read_back.abandon), (1, 0));
+        }
+        other => panic!("Unexpected command: {other:?}"),
+    }
+}
+
 /// The move reply is the variant after `ApiResult`. A client's decoder from before it read the
 /// existing variants from the same bytes, and refuses the move reply rather than reading it as
 /// another message.

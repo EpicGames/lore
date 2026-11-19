@@ -4,11 +4,18 @@
 //! the global data directory that name it.
 
 pub mod access;
+pub mod check;
 pub mod leftovers;
+pub mod locks;
 pub mod marker;
+pub mod mounts;
+pub mod moving;
 pub mod record;
+pub mod recovery;
+pub mod redirect;
 pub mod resolve;
 pub mod setting;
+pub mod takeover;
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -26,7 +33,7 @@ use crate::instance::InstanceId;
 pub enum ExternalDirError {}
 
 /// The default location of the external root, in the global data directory.
-const EXTERNAL: &str = "external";
+pub const EXTERNAL: &str = "external";
 /// The directory in an instance's external directory holding what its mount wrote.
 pub const WRITE_DIR: &str = "write";
 
@@ -83,6 +90,11 @@ pub fn reported_root(state: &RootState) -> PathBuf {
         Ok(_) => state.global.join(EXTERNAL),
         Err(_) => PathBuf::new(),
     }
+}
+
+/// The refusal of a target or a form of the command for `reason`, as invalid arguments.
+pub fn refused<E: From<crate::errors::InvalidArguments>>(reason: String) -> E {
+    E::from(crate::errors::InvalidArguments { reason })
 }
 
 /// The canonical path of the global data directory `global`, as a mount records it.

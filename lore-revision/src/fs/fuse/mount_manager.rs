@@ -187,7 +187,7 @@ async fn mount_at_current(
 /// - a lock file that cloning left with no marked directory.
 ///
 /// The external directories are those in the external root `state` found available. Cold: runs
-/// once, as a service starts.
+/// once as a service starts, and once as recovery in the background finishes.
 #[lore_macro::test_pub]
 pub(crate) async fn remove_interrupted_clones(
     state: &RootState,

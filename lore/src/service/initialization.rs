@@ -3,6 +3,7 @@
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::time::Duration;
 
 use lore_base::error::InvalidPath;
 use lore_base::runtime::LORE_CONTEXT;
@@ -10,6 +11,12 @@ use lore_error_set::ForwardAny;
 use lore_error_set::error_set;
 use lore_revision::event::LoreErrorDetail;
 use lore_revision::fs::mount_manager_state::MountManagerState;
+use lore_revision::global::external_dir::recovery::AtStartFound;
+use lore_revision::global::external_dir::recovery::examine_at_start;
+use lore_revision::global::external_dir::recovery::recover_at_start;
+use lore_revision::global::external_dir::recovery::recover_in_background;
+use lore_revision::global::get_global_data_dir;
+use lore_revision::global::global_data_dir_path;
 use lore_revision::lore::execution_context;
 use lore_revision::service_state::ServiceStateImpl;
 
@@ -44,10 +51,14 @@ fn service_log_callback(service_state: Arc<ServiceStateImpl>) -> LoreEventCallba
     }))
 }
 
+/// Brings up the service, and answers whether it has work for [`background_recovery`]: a move
+/// of the external root of its global data directory recorded, which the quick steps of recovery
+/// run on before anything mounts, or a setting, with leftovers to remove. A global data directory
+/// whose root never moved costs a look for each of two files, which finds nothing.
 pub async fn initialize_service(
     globals: LoreGlobalArgs,
     service_state: Arc<ServiceStateImpl>,
-) -> Result<(), ServiceInitializationError> {
+) -> Result<bool, ServiceInitializationError> {
     mark_running_as_service();
     lore_revision::store::immutable::set_background_flush_delay(SERVICE_STORE_FLUSH_SECONDS);
     service_state.initialize();
@@ -56,6 +67,7 @@ pub async fn initialize_service(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            let background = recover_before_mounting().await;
             let detail = LoreErrorDetail::from_result(
                 &MountManagerState::initialize()
                     .await
@@ -64,11 +76,55 @@ pub async fn initialize_service(
                     ),
             );
 
-            execution_context().dispatcher.complete(detail).await
+            execution_context().dispatcher.complete(detail).await;
+            Ok(background)
         })
-        .await;
+        .await
+}
 
-    Ok(())
+/// Examines the external root of the service's global data directory as [`examine_at_start`]
+/// does, runs the quick steps of recovery on a recorded move, and answers whether
+/// [`background_recovery`] has work.
+async fn recover_before_mounting() -> bool {
+    let Some(global) = global_data_dir_path() else {
+        return false;
+    };
+    match examine_at_start(&global) {
+        AtStartFound::Recorded => {
+            Box::pin(recover_at_start(&global, Duration::ZERO)).await;
+            true
+        }
+        AtStartFound::Configured => true,
+        AtStartFound::Unmoved => false,
+    }
+}
+
+/// The work a service runs in a task of its own once it listens, in an execution that buffers its
+/// messages in `service_state`: the recovery of a move of the external root that the start left
+/// waiting, the mounting of the recovered root's virtual instances, and the removal of what is
+/// left of earlier roots.
+pub fn background_recovery(
+    service_state: Arc<ServiceStateImpl>,
+) -> impl Future<Output = ()> + Send + 'static {
+    let execution = setup_execution(
+        LoreGlobalArgs::default(),
+        service_log_callback(service_state),
+    );
+    LORE_CONTEXT.scope(execution, async {
+        let Ok(global) = get_global_data_dir() else {
+            return;
+        };
+        let mount = async {
+            if let Some(manager) = MountManagerState::mount_manager()
+                && let Err(err) = Box::pin(manager.mount_registered_instances()).await
+            {
+                lore_revision::lore_warn!(
+                    "Mounting the virtual instances of the recovered external root failed: {err}"
+                );
+            }
+        };
+        recover_in_background(global, mount).await;
+    })
 }
 
 #[cfg(test)]

@@ -51,6 +51,8 @@ pub struct ServiceStateImpl {
     dropped_count: AtomicU64,
     /// Buffered service-level log messages.
     log_buffer: Mutex<VecDeque<LogMessage>>,
+    /// The task that recovers a move of the external root in the background, if one runs.
+    background_recovery: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// RAII guard holding one unit of the active connection count.
@@ -77,6 +79,23 @@ impl ServiceStateImpl {
             connection_count: AtomicU32::new(0),
             dropped_count: AtomicU64::new(0),
             log_buffer: Mutex::new(VecDeque::new()),
+            background_recovery: Mutex::new(None),
+        }
+    }
+
+    /// Holds `task`, which recovers a move of the external root in the background, until
+    /// [`Self::end_background_recovery`] ends it.
+    pub fn hold_background_recovery(&self, task: tokio::task::JoinHandle<()>) {
+        *self.background_recovery.lock() = Some(task);
+    }
+
+    /// Aborts the task [`Self::hold_background_recovery`] holds, if any, and waits for it to end,
+    /// so that it mounts nothing once the service's mounts close.
+    pub async fn end_background_recovery(&self) {
+        let task = self.background_recovery.lock().take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
         }
     }
 

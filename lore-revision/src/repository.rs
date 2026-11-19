@@ -1998,8 +1998,8 @@ pub(crate) fn refuse_nesting_in_swfs_mount(
     {
         return Err(crate::errors::InvalidArguments {
             reason: format!(
-                "unable to put a repository at {} inside the SWFS instance at {}: an SWFS \
-                 instance holds no nested repository with its own state",
+                "{} can't be used: it lies inside the SWFS instance at {}, which holds no nested \
+                 repository with its own state",
                 path.display(),
                 mount.display()
             ),
@@ -2008,9 +2008,10 @@ pub(crate) fn refuse_nesting_in_swfs_mount(
     Ok(())
 }
 
-/// Refuses a new instance at `path` nested in another: inside another repository's working tree,
-/// where it would be a tree the parent's walks cross, or inside an SWFS or FUSE instance's mount,
-/// whose Lore directory is outside its tree and whose files the mount presents.
+/// Refuses `path`, for a new instance or an external root, where it is nested in an instance:
+/// inside another repository's working tree, where it would be a tree the parent's scans include,
+/// or inside an SWFS or FUSE instance's mount, whose Lore directory is outside its tree and whose
+/// files the mount presents.
 pub(crate) fn refuse_instance_nested_at(
     path: &std::path::Path,
 ) -> Result<(), crate::errors::InvalidArguments> {
@@ -2019,8 +2020,8 @@ pub(crate) fn refuse_instance_nested_at(
     if let Some((mount, _)) = crate::fs::fuse::discover::lore_mount_containing(path) {
         return Err(crate::errors::InvalidArguments {
             reason: format!(
-                "unable to put an instance at {} inside the FUSE instance at {}: a virtual \
-                 instance holds no nested instance",
+                "{} can't be used: it lies inside the FUSE instance mounted at {}, whose files the \
+                 mount presents",
                 path.display(),
                 mount.display()
             ),
@@ -2033,8 +2034,8 @@ pub(crate) fn refuse_instance_nested_at(
     {
         return Err(crate::errors::InvalidArguments {
             reason: format!(
-                "unable to put an instance at {} inside the repository at {}: an instance \
-                 cannot be nested in another repository",
+                "{} can't be used: it lies inside the working tree of the repository at {}, whose \
+                 scans would include it",
                 path.display(),
                 parent.display()
             ),

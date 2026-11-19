@@ -50,16 +50,19 @@ fn global_config_dir_path() -> Option<PathBuf> {
 }
 
 pub fn get_global_data_dir() -> Result<PathBuf, GlobalConfigError> {
-    let path = if let Some(override_dir) = lore_base::env::var(GLOBAL_PATH_VAR) {
-        PathBuf::from(override_dir).join("data")
-    } else {
-        project_directory()
-            .ok_or_else(|| GlobalConfigError::internal("project directory not found"))?
-            .data_local_dir()
-            .to_path_buf()
-    };
+    let path = global_data_dir_path()
+        .ok_or_else(|| GlobalConfigError::internal("project directory not found"))?;
     make_path_if_nonexistent(&path)?;
     Ok(path)
+}
+
+/// The global data directory, without creating it, or `None` where there is no per-user directory
+/// to put it in.
+pub fn global_data_dir_path() -> Option<PathBuf> {
+    match lore_base::env::var(GLOBAL_PATH_VAR) {
+        Some(override_dir) => Some(PathBuf::from(override_dir).join("data")),
+        None => Some(project_directory()?.data_local_dir().to_path_buf()),
+    }
 }
 
 pub const CONFIG: &str = "config.toml";

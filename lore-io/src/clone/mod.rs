@@ -55,8 +55,20 @@ pub use detect::detect;
 pub use refs::duplicate_ranges;
 #[cfg(feature = "test-util")]
 pub use source::Source;
+pub use volume::Locality;
 pub use volume::Space;
 pub use volume::Volume;
+#[cfg(all(feature = "test-util", target_family = "windows"))]
+pub use volume::drive_type_is_local;
+pub use volume::locality_of;
+#[cfg(all(
+    feature = "test-util",
+    target_family = "unix",
+    not(target_os = "macos")
+))]
+pub use volume::magic_is_local;
+#[cfg(all(feature = "test-util", target_os = "macos"))]
+pub use volume::name_is_local;
 pub use volume::space_of;
 pub use volume::volume_of;
 pub use walk::Kind;
@@ -170,7 +182,8 @@ impl Progress {
         self.stopped.store(true, Ordering::Relaxed);
     }
 
-    fn is_stopped(&self) -> bool {
+    /// Whether the clone has been asked to stop.
+    pub fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::Relaxed)
     }
 }

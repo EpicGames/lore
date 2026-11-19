@@ -32,6 +32,7 @@ use crate::remote::service_process::register_service_process;
 use crate::remote::service_process::service_executable_in;
 use crate::remote::service_process::wait_until_a_service_is_listening;
 use crate::remote::service_socket_name;
+use crate::service::initialization::background_recovery;
 use crate::service::initialization::initialize_service;
 
 #[error_set]
@@ -55,6 +56,24 @@ const STOP_REPLY_DRAIN: Duration = Duration::from_millis(500);
 /// Printed once the socket is bound, so that whoever started the service can
 /// tell when it began accepting connections.
 const LISTENING_MESSAGE: &str = "Lore service listening";
+
+/// Stops a service start, once armed, after it listens on its socket and before it serves
+/// connections.
+#[cfg(feature = "test-util")]
+pub static LISTENED: std::sync::LazyLock<lore_revision::test_util::ArmedPause> =
+    std::sync::LazyLock::new(lore_revision::test_util::ArmedPause::default);
+
+/// Stops a service start, once armed, after it claims its socket and records that it runs in this
+/// process, and before it initializes and listens.
+#[cfg(feature = "test-util")]
+pub static CLAIMED: std::sync::LazyLock<lore_revision::test_util::ArmedPause> =
+    std::sync::LazyLock::new(lore_revision::test_util::ArmedPause::default);
+
+/// Stops a service start, once armed, whose socket claim another holder refused, before it waits
+/// for that holder to answer.
+#[cfg(feature = "test-util")]
+pub static REFUSED: std::sync::LazyLock<lore_revision::test_util::ArmedPause> =
+    std::sync::LazyLock::new(lore_revision::test_util::ArmedPause::default);
 
 /// Reported by a service that exits because another one has claimed the socket.
 const CLAIM_REFUSED_MESSAGE: &str = "Another Lore service has claimed the socket";
@@ -94,16 +113,23 @@ pub async fn service_main(
     else {
         return Err(refuse_claimed_socket(&start).await);
     };
+    // Before the listen, so that a command in this process acts on this service here.
+    register_service_process(&start);
+    #[cfg(feature = "test-util")]
+    CLAIMED.pass().await;
 
     // Taken before the mounts are made, so that every way out of the service from here closes
-    // them, dropping this future at an await among them.
+    // them, dropping this future at an await among them, once the background recovery has ended.
     let mounts = CloseOnExit::new({
         let service_state = Arc::clone(&service_state);
-        move || async move { close_swfs_mounts(&service_state).await }
+        move || async move {
+            service_state.end_background_recovery().await;
+            close_swfs_mounts(&service_state).await;
+        }
     });
 
     // Brings up the mount manager and routes its events into the service state.
-    initialize_service(globals, Arc::clone(&service_state))
+    let recovers = initialize_service(globals, Arc::clone(&service_state))
         .await
         .forward::<ServiceMainError>("Failed initializing service")?;
 
@@ -115,6 +141,14 @@ pub async fn service_main(
         }
     };
     println!("{LISTENING_MESSAGE}");
+    #[cfg(feature = "test-util")]
+    LISTENED.pass().await;
+    if recovers {
+        service_state.hold_background_recovery(lore_spawn!(
+            "external root recovery",
+            background_recovery(Arc::clone(&service_state))
+        ));
+    }
     let idle_connection_timeout = {
         let config = service_config().await;
         report_build_that_is_not_the_configured_one(config.as_ref());
@@ -124,9 +158,6 @@ pub async fn service_main(
         )
     };
 
-    // Recorded once the socket is bound, so that a process which lost it never
-    // claims to be the service for the moments before it exits.
-    register_service_process(&start);
     let stop_request = start.stop_request();
 
     let _idle_connections = close_idle_connections(idle_connection_timeout);
@@ -310,6 +341,8 @@ impl Drop for AcceptShutdown {
 /// started this process gives it a short grace once it exits, which a winner still mounting its
 /// instances can outlast, so exiting at once would fail that command. A quit ends the wait.
 async fn refuse_claimed_socket(start: &ServiceStartGuard) -> ServiceMainError {
+    #[cfg(feature = "test-util")]
+    REFUSED.pass().await;
     let stop_request = start.stop_request();
     let outcome = match tokio::select! {
         outcome = wait_until_a_service_is_listening() => Some(outcome),

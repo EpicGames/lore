@@ -20,6 +20,8 @@ use lore_revision::global::external_dir::setting::Setting;
 use lore_revision::instance::InstanceId;
 use lore_revision::repository::DOT_LORE;
 
+use super::redirect;
+
 /// A global data directory, and a directory beside it for configured roots.
 struct Fixture {
     global: TempDir,
@@ -91,22 +93,6 @@ async fn configured(fixture: &Fixture) -> (PathBuf, RootId) {
     )
     .await;
     (root, id)
-}
-
-/// Places a redirect at `link` to `target`: a symbolic link on Unix, a junction on Windows.
-pub(crate) fn redirect(link: &Path, target: &Path) {
-    #[cfg(target_family = "unix")]
-    std::os::unix::fs::symlink(target, link).expect("make the link");
-    #[cfg(target_family = "windows")]
-    {
-        let created = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(link)
-            .arg(target)
-            .output()
-            .expect("run mklink");
-        assert!(created.status.success(), "mklink /J failed: {created:?}");
-    }
 }
 
 /// With no setting and nothing at the default location, the root there is available and empty.

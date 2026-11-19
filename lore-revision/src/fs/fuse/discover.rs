@@ -43,60 +43,43 @@ fn unescape_octal(field: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Finds the innermost `fuse.lore` mount above `path` in the given mountinfo text, returning
-/// its mount point and the instance ID encoded in its `lore:<hex>` source field.
+/// Every `fuse.lore` mount in the given mountinfo text, in table order, with its mount point and
+/// the instance ID encoded in its `lore:<hex>` source field.
+pub fn lore_mounts(mountinfo: &str) -> impl Iterator<Item = (PathBuf, InstanceId)> + '_ {
+    mountinfo.lines().filter_map(lore_mount_in_line)
+}
+
+/// The `fuse.lore` mount a mountinfo line lists, if it lists one.
 ///
 /// Per `proc_pid_mountinfo(5)`: fields are space-separated; field 5 (index 4) is the mount
 /// point; zero or more optional fields follow the mount options before a literal `-`
 /// separator; the field after that is the filesystem type, then the mount source.
-pub fn lore_mount_for_path(mountinfo: &str, path: &Path) -> Option<(PathBuf, InstanceId)> {
-    let mut best: Option<(PathBuf, InstanceId)> = None;
-    for line in mountinfo.lines() {
-        let fields: Vec<&str> = line.split(' ').collect();
-        if fields.len() < 5 {
-            continue;
-        }
-        let Some(separator_index) = fields
-            .iter()
-            .skip(6)
-            .position(|field| *field == "-")
-            .map(|i| i + 6)
-        else {
-            continue;
-        };
-        let Some(fstype) = fields.get(separator_index + 1) else {
-            continue;
-        };
-        if *fstype != FUSE_LORE_FSTYPE {
-            continue;
-        }
-        let Some(source) = fields.get(separator_index + 2) else {
-            continue;
-        };
-        let Some(hex) = unescape_octal(source)
-            .strip_prefix(LORE_SOURCE_PREFIX)
-            .map(str::to_owned)
-        else {
-            continue;
-        };
-        let Some(instance_id) = InstanceId::from_hex(&hex) else {
-            continue;
-        };
-        let mount_point = PathBuf::from(unescape_octal(fields[4]));
-        if !path.starts_with(&mount_point) {
-            continue;
-        }
-        let is_deeper = match &best {
-            Some((best_point, _)) => {
-                mount_point.components().count() > best_point.components().count()
-            }
-            None => true,
-        };
-        if is_deeper {
-            best = Some((mount_point, instance_id));
-        }
+fn lore_mount_in_line(line: &str) -> Option<(PathBuf, InstanceId)> {
+    let mut fields = line.split(' ');
+    let mount_point = fields.nth(4)?;
+    fields.next()?;
+    fields.find(|field| *field == "-")?;
+    if fields.next()? != FUSE_LORE_FSTYPE {
+        return None;
     }
-    best
+    let source = unescape_octal(fields.next()?);
+    let instance_id = InstanceId::from_hex(source.strip_prefix(LORE_SOURCE_PREFIX)?)?;
+    Some((PathBuf::from(unescape_octal(mount_point)), instance_id))
+}
+
+/// Finds the innermost `fuse.lore` mount above `path` in the given mountinfo text, returning
+/// its mount point and the instance ID encoded in its `lore:<hex>` source field. Of mounts
+/// stacked at one mount point, the one listed first answers.
+pub fn lore_mount_for_path(mountinfo: &str, path: &Path) -> Option<(PathBuf, InstanceId)> {
+    lore_mounts(mountinfo)
+        .filter(|(mount_point, _)| path.starts_with(mount_point))
+        .reduce(|best, mount| {
+            if mount.0.components().count() > best.0.components().count() {
+                mount
+            } else {
+                best
+            }
+        })
 }
 
 /// The innermost `fuse.lore` mount at or above `path` in `/proc/self/mountinfo`, as
@@ -147,7 +130,38 @@ pub fn discover_external_dot_lore(
 /// a `statfs` its server answers, so a caller on a runtime runs it on a blocking thread.
 pub fn answering_lore_mount(path: &Path) -> Option<PathBuf> {
     let (mount_point, _) = lore_mount_containing(path)?;
-    (!lore_fuse::mount::is_stale_mount(&mount_point)).then_some(mount_point)
+    answers(&mount_point).then_some(mount_point)
+}
+
+/// Every `fuse.lore` mount in `/proc/self/mountinfo` whose instance `kept` keeps and that answers,
+/// leaving out stale mounts as [`answering_lore_mount`] does. Only a kept mount is probed, so a
+/// mount of another root, whose server may not answer, is never probed. Built with `test-util`,
+/// the table read is the one planted at or above `table_for`. Fails where the table can't be read.
+/// Probes each kept mount point with a `statfs`, so a caller on a runtime runs it on a blocking
+/// thread.
+pub fn live_lore_mounts_kept(
+    table_for: &Path,
+    mut kept: impl FnMut(InstanceId) -> Result<bool, ExternalDirError>,
+) -> Result<Vec<(PathBuf, InstanceId)>, ExternalDirError> {
+    use lore_error_set::prelude::*;
+
+    let mountinfo = mountinfo_for(table_for).internal("reading the mount table")?;
+    let mut live = Vec::new();
+    for (mount_point, instance_id) in lore_mounts(&mountinfo) {
+        if kept(instance_id)? && answers(&mount_point) {
+            live.push((mount_point, instance_id));
+        }
+    }
+    Ok(live)
+}
+
+/// Whether the mount at `mount_point` answers, as a stale mount, left by a server that ended
+/// without unmounting it, doesn't. Built with `test-util`, counts each probe in
+/// [`test_util::probes`].
+fn answers(mount_point: &Path) -> bool {
+    #[cfg(feature = "test-util")]
+    test_util::PROBES.with(|probes| probes.set(probes.get() + 1));
+    !lore_fuse::mount::is_stale_mount(mount_point)
 }
 
 /// Mount tables a test plants for the paths below a mount point, so a test of a lookup inside a
@@ -163,6 +177,16 @@ pub mod test_util {
     use super::FUSE_LORE_FSTYPE;
     use super::LORE_SOURCE_PREFIX;
     use crate::instance::InstanceId;
+
+    thread_local! {
+        /// How many mounts this thread has probed.
+        pub(super) static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// How many mounts this thread has probed for whether they answer.
+    pub fn probes() -> usize {
+        PROBES.with(std::cell::Cell::get)
+    }
 
     /// Each planted mount point, with its table's text, or `None` for a table that fails to read.
     type PlantedTables = Vec<(PathBuf, Option<String>)>;

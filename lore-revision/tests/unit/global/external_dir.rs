@@ -3,11 +3,19 @@
 //! The external root's files and its resolution.
 
 mod access;
+mod at_start;
+mod check;
+mod crash;
 mod leftovers;
+mod locks;
 mod marker;
+pub(crate) mod moving;
 mod record;
-pub(crate) mod resolve;
+mod recovery;
+mod redirect;
+mod resolve;
 mod setting;
+pub(crate) mod takeover;
 
 /// An instance's external directory is made in a root a resolution finds available. With no root
 /// ID, the first one makes the missing default location. A configured root that is missing makes
@@ -109,4 +117,20 @@ async fn a_status_reports_the_available_root_else_the_one_the_setting_names() {
         reported_root(&resolve_in(global.path().to_path_buf())),
         std::path::PathBuf::new()
     );
+}
+
+/// Places a redirect at `link` to `target`: a symbolic link on Unix, a junction on Windows.
+pub(crate) fn redirect(link: &std::path::Path, target: &std::path::Path) {
+    #[cfg(target_family = "unix")]
+    std::os::unix::fs::symlink(target, link).expect("make the link");
+    #[cfg(target_family = "windows")]
+    {
+        let created = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("run mklink");
+        assert!(created.status.success(), "mklink /J failed: {created:?}");
+    }
 }

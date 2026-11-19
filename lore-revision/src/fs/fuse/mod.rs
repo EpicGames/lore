@@ -42,7 +42,7 @@ pub mod spelling;
 pub mod swap;
 pub mod view;
 #[cfg(not(feature = "test-util"))]
-mod write;
+pub(crate) mod write;
 #[cfg(feature = "test-util")]
 pub mod write;
 

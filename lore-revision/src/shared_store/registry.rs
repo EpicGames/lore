@@ -93,6 +93,15 @@ impl SharedStoreRegistryEntry {
                 .with_store_hold(stores),
         ))
     }
+
+    /// The entry of the shared store in the directory `dir`, which holds its `shared_store`
+    /// directory, with no remote named.
+    pub fn in_directory(dir: String) -> SharedStoreRegistryEntry {
+        SharedStoreRegistryEntry {
+            remote_url: String::new(),
+            path: dir,
+        }
+    }
 }
 
 impl SaveableConfig for SharedStoreRegistry {

@@ -4,8 +4,8 @@
 //! `clone_into` copies a tree with contents, permissions, modification times and symbolic links
 //! kept, through each backend, leaves out what it is told to and what disappears, never takes
 //! over an entry that exists, and fails on a file its backend cannot clone unless told to copy
-//! it. `detect` and `choose` pick the backend for a pair of directories, and `measure` sizes a
-//! copy.
+//! it. `detect` and `choose` pick the backend for a pair of directories, `measure` sizes a
+//! copy, `volume_of` names a volume, and `locality_of` says whether its file system is local.
 
 use std::fs::FileTimes;
 use std::io;
@@ -29,6 +29,7 @@ use lore_io::clone::clone_into_with;
 use lore_io::clone::detect;
 use lore_io::clone::duplicate_ranges;
 use lore_io::clone::measure;
+use lore_io::clone::volume_of;
 
 /// A time with a nanosecond part, so a copy that rounds it is caught.
 fn odd_time(offset: u64) -> SystemTime {
@@ -1730,4 +1731,124 @@ fn a_directory_held_with_delete_access_is_listed_once_released() {
         std::fs::read(destination.join("held/file")).expect("read"),
         b"file"
     );
+}
+
+/// On Linux, the file systems Lore has verified as local and durable across a power loss are
+/// local by their `statfs` magic number, and every other is not, tmpfs included.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_linux_file_system_is_local_by_its_magic_number() {
+    use lore_io::clone::magic_is_local;
+
+    for (name, magic) in [
+        ("btrfs", 0x9123_683E),
+        ("xfs", 0x5846_5342),
+        ("bcachefs", 0xCA45_1A4E),
+        ("ext2/ext3/ext4", 0xEF53),
+        ("zfs", 0x2FC1_2FC1),
+    ] {
+        assert!(magic_is_local(magic), "{name} is local");
+    }
+    for (name, magic) in [
+        ("tmpfs", 0x0102_1994),
+        ("overlayfs", 0x794C_7630),
+        ("nfs", 0x6969),
+        ("smb2", 0xFE53_4D42),
+        ("cifs", 0xFF53_4D42),
+        ("fuse", 0x6573_5546),
+        ("unknown", 0),
+    ] {
+        assert!(!magic_is_local(magic), "{name} is not local");
+    }
+}
+
+/// On macOS, apfs is the local file system by its `f_fstypename`, and every other is not, hfs
+/// included.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_macos_file_system_is_local_by_its_name() {
+    use lore_io::clone::name_is_local;
+
+    assert!(name_is_local("apfs"));
+    for name in [
+        "hfs", "smbfs", "nfs", "afpfs", "msdos", "exfat", "webdav", "APFS", "",
+    ] {
+        assert!(!name_is_local(name), "{name} is not local");
+    }
+}
+
+/// On Windows, a fixed or removable drive is local, and every other drive type is not.
+#[cfg(target_family = "windows")]
+#[test]
+fn a_windows_drive_is_local_by_its_type() {
+    use lore_io::clone::drive_type_is_local;
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_CDROM;
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_NO_ROOT_DIR;
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_RAMDISK;
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOVABLE;
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_UNKNOWN;
+
+    assert!(drive_type_is_local(DRIVE_FIXED));
+    assert!(drive_type_is_local(DRIVE_REMOVABLE));
+    for drive_type in [
+        DRIVE_REMOTE,
+        DRIVE_CDROM,
+        DRIVE_RAMDISK,
+        DRIVE_UNKNOWN,
+        DRIVE_NO_ROOT_DIR,
+    ] {
+        assert!(!drive_type_is_local(drive_type), "{drive_type}");
+    }
+}
+
+/// On Windows, a volume holds access control lists, alternate data streams and sparse files only
+/// with all three of their file system flags.
+#[cfg(target_family = "windows")]
+#[test]
+fn a_windows_volume_holds_what_a_copy_keeps_only_with_every_flag() {
+    use windows_sys::Win32::System::SystemServices::FILE_NAMED_STREAMS;
+    use windows_sys::Win32::System::SystemServices::FILE_PERSISTENT_ACLS;
+    use windows_sys::Win32::System::SystemServices::FILE_SUPPORTS_SPARSE_FILES;
+
+    let all = FILE_PERSISTENT_ACLS | FILE_NAMED_STREAMS | FILE_SUPPORTS_SPARSE_FILES;
+    let volume = |flags| lore_io::clone::Locality {
+        local: true,
+        mount_id: None,
+        flags,
+    };
+    assert!(volume(all).holds_acls_streams_and_sparse_files());
+    assert!(volume(all | 1).holds_acls_streams_and_sparse_files());
+    for missing in [
+        FILE_PERSISTENT_ACLS,
+        FILE_NAMED_STREAMS,
+        FILE_SUPPORTS_SPARSE_FILES,
+    ] {
+        assert!(!volume(all & !missing).holds_acls_streams_and_sparse_files());
+    }
+}
+
+/// Two directories on one mount have one volume and one locality, with the mount ID `statx`
+/// names on Linux.
+#[test]
+fn two_directories_on_one_mount_have_one_volume() {
+    let root = TempDir::new("lore-io-clone-volume-");
+    let inner = root.join("inner");
+    std::fs::create_dir(&inner).expect("create the directory");
+
+    let outer = volume_of(root.path()).expect("the volume of the root");
+    assert_eq!(
+        volume_of(&inner).expect("the volume of the directory"),
+        outer
+    );
+    let locality = lore_io::clone::locality_of(root.path()).expect("the locality of the root");
+    assert_eq!(
+        lore_io::clone::locality_of(&inner).expect("the locality of the directory"),
+        locality
+    );
+    #[cfg(target_os = "linux")]
+    assert!(locality.mount_id.is_some(), "{locality:?}");
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(locality.mount_id, None);
 }

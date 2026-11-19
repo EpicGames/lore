@@ -1521,3 +1521,13 @@ pub async fn test_leaked_slots(
     }
     leaked
 }
+
+/// A scratch directory named for `prefix` in the base [`lore_io::test_util::verified_scratch_base`]
+/// finds for the build's temp directory, as a move of the external root needs.
+#[allow(dead_code)]
+pub fn verified_temp_dir(prefix: &str) -> lore_base::test_util::TempDir {
+    static BASE: std::sync::LazyLock<std::path::PathBuf> = std::sync::LazyLock::new(|| {
+        lore_io::test_util::verified_scratch_base(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")))
+    });
+    lore_base::test_util::TempDir::new_in(&BASE, prefix)
+}

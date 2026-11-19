@@ -343,11 +343,56 @@ pub(crate) async fn branch_step(step: BranchStep) {
     stop_where_held(&STEPPED, step).await;
 }
 
+/// A point of a move of the external root where a task run under [`step_moves`] stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveStep {
+    /// The move has recorded this phase and not yet run its step.
+    Phase(crate::global::external_dir::record::MovePhase),
+    /// An undo has not yet run this step.
+    Undo(crate::global::external_dir::recovery::UndoStep),
+    /// A leftover's removal has deleted its marker and not yet removed its contents.
+    LeftoverUnmarked,
+    /// A takeover has listed what it gives up and not yet replaced the move record.
+    TakeoverListed,
+    /// A move's final switch has failed and let go of the store locks, and its recovery has not
+    /// yet begun.
+    SwitchFailed,
+}
+
+/// Where a task run under [`step_moves`] reports each step it reaches, with the sender a test
+/// answers on: `true` to go on, `false` to fail the step. A dropped sender goes on.
+pub type MoveStepped =
+    tokio::sync::mpsc::UnboundedSender<(MoveStep, tokio::sync::oneshot::Sender<bool>)>;
+
+tokio::task_local! {
+    static MOVE_STEPPED: MoveStepped;
+}
+
+/// Runs `future`, stopping at each [`MoveStep`] it reaches until the test answers it on the
+/// sender sent with the step on `reached`. Tasks `future` spawns don't stop.
+pub fn step_moves<F: Future>(reached: MoveStepped, future: F) -> impl Future<Output = F::Output> {
+    MOVE_STEPPED.scope(reached, future)
+}
+
+/// Stops this task at `step`, where it runs under [`step_moves`], and answers whether the step
+/// goes on.
+pub(crate) async fn move_step(step: MoveStep) -> bool {
+    let Ok(reached) = MOVE_STEPPED.try_with(MoveStepped::clone) else {
+        return true;
+    };
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    if reached.send((step, answer)).is_err() {
+        return true;
+    }
+    answered.await.unwrap_or(true)
+}
+
 /// A pause a test arms: once armed, the next [`pass`](Self::pass) stops, whichever task makes it,
 /// until it is resumed.
 #[derive(Default)]
 pub struct ArmedPause {
     armed: AtomicBool,
+    paused: AtomicBool,
     reached: Notify,
     resume: Notify,
 }
@@ -365,15 +410,42 @@ impl ArmedPause {
 
     /// Lets the stopped pass go on.
     pub fn resume(&self) {
-        self.resume.notify_one();
+        self.paused.store(false, Ordering::SeqCst);
+        self.resume.notify_waiters();
+    }
+
+    /// Arms the pause until the guard it answers drops, which disarms it and lets a stopped pass go
+    /// on, so that a test that fails leaves no pass stopped and none armed for the next test.
+    pub fn arm_while_held(&self) -> ArmedPauseGuard<'_> {
+        self.arm();
+        ArmedPauseGuard(self)
     }
 
     /// Stops here where the pause is armed.
     pub async fn pass(&self) {
-        if self.armed.swap(false, Ordering::SeqCst) {
-            self.reached.notify_one();
-            self.resume.notified().await;
+        if !self.armed.swap(false, Ordering::SeqCst) {
+            return;
         }
+        self.paused.store(true, Ordering::SeqCst);
+        self.reached.notify_one();
+        loop {
+            let mut resumed = std::pin::pin!(self.resume.notified());
+            resumed.as_mut().enable();
+            if !self.paused.load(Ordering::SeqCst) {
+                return;
+            }
+            resumed.await;
+        }
+    }
+}
+
+/// The hold [`ArmedPause::arm_while_held`] answers.
+pub struct ArmedPauseGuard<'a>(&'a ArmedPause);
+
+impl Drop for ArmedPauseGuard<'_> {
+    fn drop(&mut self) {
+        self.0.armed.store(false, Ordering::SeqCst);
+        self.0.resume();
     }
 }
 

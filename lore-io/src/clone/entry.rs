@@ -354,7 +354,6 @@ mod windows {
     use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
     use windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED;
     use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
-    use windows_sys::Win32::Foundation::GENERIC_WRITE;
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
@@ -374,7 +373,6 @@ mod windows {
     use windows_sys::Win32::Storage::FileSystem::MAXIMUM_REPARSE_DATA_BUFFER_SIZE;
     use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
-    use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
     use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_SYMLINK;
 
     /// The tag bit that marks a reparse point standing for another name, as a symbolic link and a
@@ -574,27 +572,7 @@ mod windows {
                 .create_new(true)
                 .open(destination)?;
         }
-        let set = open_entry(destination, GENERIC_WRITE).and_then(|to| {
-            let mut returned = 0u32;
-            // SAFETY: the handle is open, and `data` holds `length` bytes of reparse data.
-            let done = unsafe {
-                DeviceIoControl(
-                    to.as_raw_handle() as HANDLE,
-                    FSCTL_SET_REPARSE_POINT,
-                    data.as_ptr().cast(),
-                    length,
-                    std::ptr::null_mut(),
-                    0,
-                    &mut returned,
-                    std::ptr::null_mut(),
-                )
-            };
-            if done == 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
+        let set = crate::junction::set_reparse_point(destination, &data[..length as usize]);
         if set.is_err() {
             let _ = if is_directory {
                 std::fs::remove_dir(destination)

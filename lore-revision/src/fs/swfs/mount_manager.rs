@@ -85,6 +85,22 @@ impl SwfsMountManager {
         Ok(manager)
     }
 
+    /// Records the mounts `found`, which [`Self::mount_registered`] made, in this running manager,
+    /// as [`Self::with_mounts`] records them in a starting one, whose maps it builds and moves in.
+    pub(crate) async fn add_mounts(
+        &self,
+        found: Vec<(MountPath, SwfsMount)>,
+    ) -> Result<(), MountManagerError> {
+        let added = Box::pin(Self::with_mounts(found)).await?;
+        for (handle, interface) in added.handles {
+            self.handles.insert(handle, interface);
+        }
+        for (mount_path, mount) in added.mounts {
+            self.mounts.insert(mount_path, mount);
+        }
+        Ok(())
+    }
+
     /// Mounts the registered instance `instance_id`, whose external directory is `external_dir`,
     /// at `mount_path` through SWFS, without waiting for SWFS to be ready or recording the mount.
     pub(crate) async fn mount_registered(

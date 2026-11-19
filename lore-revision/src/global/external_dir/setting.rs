@@ -17,20 +17,21 @@ use crate::util::config;
 pub const EXTERNAL_ROOT: &str = "external-root";
 
 /// The random value that identifies a global data directory's external roots, written as 32
-/// lower-case hex digits.
+/// lower-case hex digits. Held as 16 bytes, with an alignment of 1, so a future or a record that
+/// holds one is aligned as it would be without it, where a `u128` would align it to 16.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct RootId(u128);
+pub struct RootId([u8; 16]);
 
 impl RootId {
     /// A new random root ID.
     pub fn generate() -> RootId {
-        RootId(uuid::Uuid::new_v4().as_u128())
+        RootId(uuid::Uuid::new_v4().into_bytes())
     }
 }
 
 impl std::fmt::Display for RootId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:032x}", self.0)
+        write!(f, "{:032x}", u128::from_be_bytes(self.0))
     }
 }
 
@@ -47,7 +48,7 @@ impl std::str::FromStr for RootId {
             return Err(format!("{text:?} is not 32 lower-case hex digits"));
         }
         u128::from_str_radix(text, 16)
-            .map(RootId)
+            .map(|id| RootId(id.to_be_bytes()))
             .map_err(|err| err.to_string())
     }
 }

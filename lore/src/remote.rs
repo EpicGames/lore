@@ -6,6 +6,8 @@ pub mod connection;
 pub mod message;
 
 pub mod network;
+#[cfg(any(target_os = "windows", target_family = "unix"))]
+pub mod occupy;
 pub mod service_process;
 
 use std::ffi::OsString;

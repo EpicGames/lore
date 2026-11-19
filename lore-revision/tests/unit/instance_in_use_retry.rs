@@ -11,15 +11,15 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use lore_revision::instance::FailedRemoval;
-use lore_revision::instance::IN_USE_RETRY_LIMIT;
-use lore_revision::instance::IN_USE_RETRY_MAXIMUM_MILLIS;
-use lore_revision::instance::IN_USE_RETRY_START_MILLIS;
 use lore_revision::instance::delete_is_retryable;
-use lore_revision::instance::is_in_use;
 use lore_revision::instance::removal_is_retryable;
 use lore_revision::instance::remove_instance_directory_with;
-use lore_revision::instance::rename_is_retryable;
-use lore_revision::instance::retry_while_in_use;
+use lore_revision::util::in_use::IN_USE_RETRY_LIMIT;
+use lore_revision::util::in_use::IN_USE_RETRY_MAXIMUM_MILLIS;
+use lore_revision::util::in_use::IN_USE_RETRY_START_MILLIS;
+use lore_revision::util::in_use::is_in_use;
+use lore_revision::util::in_use::rename_is_retryable;
+use lore_revision::util::in_use::retry_while_in_use;
 
 /// `predicate` as the asynchronous predicate `retry_while_in_use` takes.
 fn ready(predicate: fn(&io::Error) -> bool) -> impl Fn(&io::Error) -> Ready<bool> {

@@ -22,7 +22,7 @@ const TEST_STRING: &str = "ABC";
 /// Kept short because the name joins the temporary directory into an address
 /// that holds 108 bytes. The process suffix keeps two concurrent runs off a
 /// single path, where one would find the other's claim.
-fn socket_name(test: &str) -> String {
+pub(super) fn socket_name(test: &str) -> String {
     format!("{test}-{}", std::process::id())
 }
 
@@ -65,7 +65,7 @@ fn run_both(name: &str) -> String {
 }
 
 /// Removes the lock file a claim on `name` leaves behind.
-fn remove_claim_lock(name: &str) {
+pub(super) fn remove_claim_lock(name: &str) {
     let mut lock = uds_sock_path(name)
         .expect("the socket path is known")
         .into_os_string();

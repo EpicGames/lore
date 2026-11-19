@@ -1,11 +1,17 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+#[cfg(any(target_os = "windows", target_family = "unix"))]
+pub mod external_root;
 pub mod initialization;
 pub mod service_main;
+#[cfg(any(target_os = "windows", target_family = "unix"))]
+pub mod set_external_directory;
 pub mod state;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use lore_base::error::InvalidArguments;
 use lore_base::error::MountsBusy;
 use lore_base::error::ServiceUnavailable;
 use lore_base::log::LoreLogLevel;
@@ -39,18 +45,21 @@ use crate::remote::call::HandedBack;
 use crate::remote::call::Relayed;
 use crate::remote::call::run_service_call;
 use crate::remote::network::UdsStream;
+use crate::remote::service_process::Reached;
 use crate::remote::service_process::ServiceProcessError;
 use crate::remote::service_process::ServiceStart;
 use crate::remote::service_process::collect_exited_services;
-use crate::remote::service_process::connect_or_spawn_service;
-use crate::remote::service_process::connect_to_running_service;
 use crate::remote::service_process::forget_whether_service_is_in_use;
+use crate::remote::service_process::reach_running_service;
 use crate::remote::service_process::report_settings_update_that_will_not_relay;
 use crate::remote::service_process::request_service_stop;
 use crate::remote::service_process::serves_from_this_executable;
 use crate::remote::service_process::service_runs_in_this_process;
+use crate::remote::service_process::start_and_connect;
 use crate::remote::service_process::wait_until_no_service_is_listening;
 use crate::service::service_main::service_main;
+#[cfg(any(target_os = "windows", target_family = "unix"))]
+use crate::service::set_external_directory::Form;
 
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
@@ -64,7 +73,8 @@ pub struct LoreServiceStartArgs {}
 /// executable named in `LORE_SERVICE_EXECUTABLE` or `[service] executable`, else from this
 /// program's own where it runs the service ([`crate::serve_from_this_executable`]). Then asks it
 /// for its status. Succeeds once a service is reachable, whether it was already running or was
-/// started here, and fails with `ServiceUnavailable` while a move of the external root holds the
+/// started here, and at once in a program whose service has claimed the service socket, while it
+/// may still be starting; fails with `ServiceUnavailable` while a move of the external root holds the
 /// service socket. The messages the service buffered arrive as `Log` events.
 ///
 /// # Events
@@ -102,7 +112,14 @@ fn start_local(
             return Ok(());
         }
 
-        let connection = connect_or_spawn_service(ServiceStart::NamedOrThisProgram).await?;
+        let connection = match reach_running_service().await? {
+            Reached::Here => return Ok(()),
+            Reached::Connected(connection) => connection,
+            Reached::Nothing => start_and_connect(ServiceStart::NamedOrThisProgram).await?,
+        };
+        if service_runs_in_this_process() {
+            return Ok(());
+        }
         relay_a_status(connection).await?;
         lore_info!("Lore service is running");
         Ok::<(), ServiceProcessError>(())
@@ -182,37 +199,46 @@ pub async fn stop(
     stop_local(globals, args, callback).await
 }
 
+/// Stops the service that runs in this process, unmounting its FUSE instances first.
+fn stop_here(
+    globals: LoreGlobalArgs,
+    args: LoreServiceStopArgs,
+    callback: LoreEventCallback,
+) -> impl Future<Output = i32> {
+    no_repository_call(globals, callback, args, stop, move |_args| async move {
+        // A busy mount keeps the service serving it, so the stop is refused before the
+        // service is asked to exit. `force` is read from the execution context: read from
+        // `globals` before they move, it would keep a second copy of them in the future of
+        // `stop_local`.
+        // SWFS mounts are closed as the service exits, once it takes no more commands.
+        #[cfg(target_os = "linux")]
+        if let Some(manager) = MountManagerState::mount_manager() {
+            manager
+                .fuse()
+                .unmount_all(lore_revision::lore::execution_context().globals().force())
+                .await
+                .forward_any::<ServiceStopError>("Unmounting before the service stops")?;
+        }
+        request_service_stop();
+        Ok::<(), ServiceStopError>(())
+    })
+}
+
 async fn stop_local(
     globals: LoreGlobalArgs,
     args: LoreServiceStopArgs,
     callback: LoreEventCallback,
 ) -> i32 {
     if service_runs_in_this_process() {
-        return no_repository_call(globals, callback, args, stop, move |_args| async move {
-            // A busy mount keeps the service serving it, so the stop is refused before the
-            // service is asked to exit. `force` is read from the execution context: read from
-            // `globals` before they move, it would keep a second copy of them in the future of
-            // `stop_local`.
-            // SWFS mounts are closed as the service exits, once it takes no more commands.
-            #[cfg(target_os = "linux")]
-            if let Some(manager) = MountManagerState::mount_manager() {
-                manager
-                    .fuse()
-                    .unmount_all(lore_revision::lore::execution_context().globals().force())
-                    .await
-                    .forward_any::<ServiceStopError>("Unmounting before the service stops")?;
-            }
-            request_service_stop();
-            Ok::<(), ServiceStopError>(())
-        })
-        .await;
+        return stop_here(globals, args, callback).await;
     }
 
     // Reached in the process the caller ran. Hand the command to the service so
     // that the branch above runs there, over a connection made here: a stop acts
     // on a service that is running and must not be what starts one.
-    match connect_to_running_service().await {
-        Ok(Some(connection)) => {
+    match reach_running_service().await {
+        Ok(Reached::Here) => stop_here(globals, args, callback).await,
+        Ok(Reached::Connected(connection)) => {
             let status = match run_service_call(Some(connection), globals, args.into(), callback)
                 .await
             {
@@ -250,7 +276,7 @@ async fn stop_local(
                 }
             }
         }
-        Ok(None) => {
+        Ok(Reached::Nothing) => {
             // Nothing was listening, so a service started here has already gone.
             collect_exited_services();
             no_repository_call(globals, callback, args, stop, move |_args| async move {
@@ -352,6 +378,128 @@ async fn set_executable_local(
             Ok(())
         };
     no_repository_call(globals, callback, args, set_executable, command).await
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[handler(set_external_directory_local)]
+/// Arguments for moving the external root, where every virtual instance's external directory
+/// lives.
+pub struct LoreServiceSetExternalDirectoryArgs {
+    /// The new external root: an absolute path, one relative to the caller's working directory,
+    /// or empty for the default location in the global data directory.
+    pub path: LoreString,
+    /// Point the setting at `path`, a root that holds the marker of this global data directory's
+    /// root ID and generation, or any marker where `external-root` is missing, and move nothing.
+    pub adopt: u8,
+    /// Give up the unavailable current root for a new, empty one at `path`, and move nothing.
+    pub abandon: u8,
+}
+
+/// Move every virtual instance's external directory to a new external root, `args.path`, and
+/// name it in the setting, for the caller's global data directory.
+///
+/// Runs in the calling process. Stops the running service and holds its socket until the move
+/// ends, then starts the service again. Refuses a service that runs inside another program
+/// through `lore::service::run`, and a program that runs the service itself. `adopt` and
+/// `abandon` change the setting and move nothing, and are refused together. The global
+/// `dry_run` runs every check that needs nothing stopped and reports what the move would do.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+pub async fn set_external_directory(
+    globals: LoreGlobalArgs,
+    args: LoreServiceSetExternalDirectoryArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    // Never relayed: the move stops the service a relay would reach.
+    set_external_directory_local(globals, args, callback).await
+}
+
+fn set_external_directory_local(
+    globals: LoreGlobalArgs,
+    args: LoreServiceSetExternalDirectoryArgs,
+    callback: LoreEventCallback,
+) -> impl Future<Output = i32> {
+    set_external_directory_until(globals, args, callback, std::future::pending())
+}
+
+/// [`set_external_directory`], with `termination`, which cancels the move: completed before the
+/// final switch, it undoes the move, and later, it takes effect once the move has finished.
+pub fn set_external_directory_until(
+    globals: LoreGlobalArgs,
+    args: LoreServiceSetExternalDirectoryArgs,
+    callback: LoreEventCallback,
+    termination: impl Future<Output = ()> + 'static,
+) -> impl Future<Output = i32> {
+    let (dry_run, force) = (globals.dry_run(), globals.force());
+    let working_directory = globals.working_directory().map(PathBuf::from);
+    no_repository_call(
+        globals,
+        callback,
+        args,
+        set_external_directory,
+        move |args: LoreServiceSetExternalDirectoryArgs| {
+            set_external_directory_with(args, dry_run, force, working_directory, termination)
+        },
+    )
+}
+
+/// Runs the move `args` asks for, with the globals' `dry_run` and `force`, relative paths against
+/// `working_directory`, until `termination`.
+#[cfg(any(target_os = "windows", target_family = "unix"))]
+async fn set_external_directory_with(
+    args: LoreServiceSetExternalDirectoryArgs,
+    dry_run: bool,
+    force: bool,
+    working_directory: Option<PathBuf>,
+    termination: impl Future<Output = ()>,
+) -> Result<(), set_external_directory::SetExternalDirectoryError> {
+    let form = match (args.adopt != 0, args.abandon != 0) {
+        (true, true) => {
+            return Err(InvalidArguments {
+                reason: "adopt and abandon can't be given together".to_string(),
+            }
+            .into());
+        }
+        (true, false) => Form::Adopt,
+        (false, true) => Form::Abandon,
+        (false, false) => Form::Move,
+    };
+    set_external_directory::set_external_directory(
+        args.path.as_str(),
+        form,
+        dry_run,
+        force,
+        working_directory,
+        termination,
+    )
+    .await
+}
+
+/// Fails, as a target with no IPC runs no service to move the external directories of.
+#[cfg(not(any(target_os = "windows", target_family = "unix")))]
+async fn set_external_directory_with(
+    _args: LoreServiceSetExternalDirectoryArgs,
+    _dry_run: bool,
+    _force: bool,
+    _working_directory: Option<PathBuf>,
+    _termination: impl Future<Output = ()>,
+) -> Result<(), ServiceProcessError> {
+    Err(ServiceUnavailable {
+        reason: "OS doesn't support IPC".to_string(),
+    }
+    .into())
 }
 
 #[repr(C)]
@@ -475,24 +623,32 @@ pub async fn status(
     status_local(globals, args, callback).await
 }
 
+/// Reports the status of the service that runs in this process, from its own state.
+fn status_here(
+    globals: LoreGlobalArgs,
+    args: LoreServiceStatusArgs,
+    callback: LoreEventCallback,
+) -> impl Future<Output = i32> {
+    no_repository_call(globals, callback, args, status, move |_args| async move {
+        emit_status_from_service(root_status().await?);
+        Ok::<(), ServiceProcessError>(())
+    })
+}
+
 async fn status_local(
     globals: LoreGlobalArgs,
     args: LoreServiceStatusArgs,
     callback: LoreEventCallback,
 ) -> i32 {
     if service_runs_in_this_process() {
-        // Running inside the service: query local state.
-        return no_repository_call(globals, callback, args, status, move |_args| async move {
-            emit_status_from_service(root_status().await?);
-            Ok::<(), ServiceProcessError>(())
-        })
-        .await;
+        return status_here(globals, args, callback).await;
     }
 
     // Running in a client process: try to connect to the service. No service runs while a move
     // of the external root holds the socket, so its status is reported as with none listening.
-    let (globals, callback, moving) = match connect_to_running_service().await {
-        Ok(Some(connection)) => {
+    let (globals, callback, moving) = match reach_running_service().await {
+        Ok(Reached::Here) => return status_here(globals, args, callback).await,
+        Ok(Reached::Connected(connection)) => {
             let relayed = run_service_call(Some(connection), globals, args.into(), callback).await;
             match relayed {
                 Relayed::Ran(status) => return status,
@@ -504,7 +660,7 @@ async fn status_local(
                 }
             }
         }
-        Ok(None) => (globals, callback, false),
+        Ok(Reached::Nothing) => (globals, callback, false),
         Err(error) => {
             return no_repository_call(globals, callback, args, status, move |_args| async move {
                 Err::<(), ServiceProcessError>(error)

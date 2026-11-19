@@ -1894,3 +1894,100 @@ async fn a_nested_write_advances_only_its_own_epoch() {
     assert_eq!(epoch_count(inner_dir.path()).await, Some(1));
     assert_eq!(epoch_count(outer_dir.path()).await, None);
 }
+
+/// **A try that never joins answers that this process holds the store** rather than joining its
+/// hold, while the hold lasts.
+#[tokio::test]
+async fn a_try_that_never_joins_answers_a_hold_of_this_process() {
+    let dir = dir("unjoined-held-here");
+    let lock = store_lock(dir.path());
+    let mut held = lock.acquire(Intent::Read).await.expect("acquires");
+    held.note_refreshed();
+
+    let other = store_lock(dir.path());
+    assert!(matches!(
+        other.try_acquire_unjoined(Intent::Read).await,
+        Ok(Attempt::HeldByThisProcess)
+    ));
+    drop(held);
+    assert!(matches!(
+        other.try_acquire_unjoined(Intent::Read).await,
+        Ok(Attempt::Acquired(_))
+    ));
+}
+
+/// **A try that never joins answers that another holds the store** where the flock is held
+/// through a lock file of its own, as another process holds it.
+#[tokio::test]
+async fn a_try_that_never_joins_answers_a_hold_of_another() {
+    let dir = dir("unjoined-held-elsewhere");
+    let lock = store_lock(dir.path());
+    let other = FSLock::try_acquire_exact_path(&dir.path().join("lock"))
+        .await
+        .expect("looks at the flock")
+        .expect("takes the flock");
+
+    assert!(matches!(
+        lock.try_acquire_unjoined(Intent::Read).await,
+        Ok(Attempt::HeldElsewhere)
+    ));
+    assert!(!lock.is_held());
+    drop(other);
+    assert!(matches!(
+        lock.try_acquire_unjoined(Intent::Read).await,
+        Ok(Attempt::Acquired(_))
+    ));
+}
+
+/// **A try that never joins answers that another holds the store while a task in this process
+/// is taking its flock**, without waiting for that task: here the task waits for the flock its
+/// lock is nested in, which a lock file of its own holds, as another process holds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_try_that_never_joins_answers_a_hold_being_taken() {
+    let (outer_dir, inner_dir) = (dir("unjoined-gate-outer"), dir("unjoined-gate-inner"));
+    let outer = store_lock(outer_dir.path());
+    let inner = StoreLock::new_within(inner_dir.path(), true, &outer).expect("opens");
+    let other = FSLock::try_acquire_exact_path(&outer_dir.path().join("lock"))
+        .await
+        .expect("looks at the flock")
+        .expect("takes the flock");
+    let taking = lore_base::lore_spawn!({
+        let inner = Arc::clone(&inner);
+        async move { drop(inner.acquire(Intent::Read).await) }
+    });
+    assert!(
+        eventually(|| inner.gate_is_taken()).await,
+        "the task takes the gate"
+    );
+
+    let attempt = tokio::time::timeout(
+        Duration::from_secs(5),
+        inner.try_acquire_unjoined(Intent::Read),
+    )
+    .await
+    .expect("the try doesn't wait for the task");
+
+    assert!(matches!(attempt, Ok(Attempt::HeldElsewhere)));
+    drop(other);
+    taking
+        .await
+        .expect("the task takes the lock once it is free");
+}
+
+/// **A try that never joins, for a read, advances no epoch**, so other processes keep the state
+/// they built against it.
+#[tokio::test]
+async fn a_try_that_never_joins_for_a_read_advances_no_epoch() {
+    let dir = dir("unjoined-read");
+    let lock = store_lock(dir.path());
+    drop(lock.acquire(Intent::Write).await.expect("a write"));
+    let before = epoch_count(dir.path()).await;
+    assert!(before.is_some(), "the write advanced the epoch");
+
+    let Ok(Attempt::Acquired(guard)) = lock.try_acquire_unjoined(Intent::Read).await else {
+        panic!("the try acquires a free store");
+    };
+    assert!(lock.is_held());
+    drop(guard);
+    assert_eq!(epoch_count(dir.path()).await, before);
+}

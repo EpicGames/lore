@@ -12,7 +12,7 @@ from error_types import (
     SwfsOutsideServiceError,
 )
 from lore_parsers import parse_jsonl
-from service_util import LORE_SERVICE_ENVIRONMENT
+from service_util import LORE_SERVICE_ENVIRONMENT, stop_lore_service
 from test_repository_info import get_instance_id
 
 from lore import Lore, external_root, per_url_store_path
@@ -1809,3 +1809,31 @@ def test_swfs_resetting_a_file_move_puts_the_file_back(new_lore_repo, background
     assert not swfs_repo.file_exists("new.txt")
     status = swfs_repo.status(scan=True)
     assert "old.txt" not in status and "new.txt" not in status, status
+
+
+@pytest.mark.verified_volume
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_a_move_by_rename_mounts_an_swfs_instance_again_from_the_new_root(
+    new_lore_repo, lore_service_runner, scratch_dir, global_dir_name
+):
+    """A move by rename stops the service, which closes the SWFS instance's mount, moves its
+    external directory with the root, and starts the service again, which mounts the instance
+    from the new root with its files."""
+    lore_service_runner.start()
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    file_contents = _random_files()
+    original_repo.write_commit_push("test message", file_contents)
+    swfs_repo = _swfs_clone(original_repo)
+    target = scratch_dir("external-root") / "root"
+
+    try:
+        original_repo.service_set_external_directory(target)
+
+        assert os.path.normcase(external_root(global_dir_name)) == os.path.normcase(
+            str(target)
+        )
+        _repositories_match_files(original_repo, swfs_repo, file_contents)
+    finally:
+        stop_lore_service(original_repo.lore_executable_path, global_dir_name)

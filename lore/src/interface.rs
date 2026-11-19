@@ -7671,11 +7671,12 @@ pub type LoreServiceStartArgs = crate::service::LoreServiceStartArgs;
 ///
 /// Connects to the running service, and starts one when nothing is listening,
 /// then asks it for its status. Returns `0` once a service is reachable, whether
-/// it was already running or was started by this call. Each log message the
-/// service buffered while no command was running arrives as a `LORE_EVENT_LOG`
-/// event of its level, emptying the buffer. Fails with error code 32 (service
-/// unavailable) while a move of the external directories holds the service
-/// socket, as no service runs then.
+/// it was already running or was started by this call, and at once in a program
+/// whose service has claimed the service socket, while it may still be starting.
+/// Each log message the service buffered while no command was running arrives as
+/// a `LORE_EVENT_LOG` event of its level, emptying the buffer. Fails with error
+/// code 32 (service unavailable) while a move of the external directories holds
+/// the service socket, as no service runs then.
 ///
 /// # Events
 ///
@@ -7914,6 +7915,74 @@ pub extern "C" fn lore_service_set_executable(
 pub extern "C" fn lore_service_set_executable_async(
     globals: &LoreGlobalArgs,
     args: &LoreServiceSetExecutableArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, invoke_locally);
+}
+
+pub type LoreServiceSetExternalDirectoryArgs = crate::service::LoreServiceSetExternalDirectoryArgs;
+
+/// Move every virtual instance's external directory to a new external root, `args->path`, and
+/// name it in the setting, for the caller's global data directory.
+///
+/// Runs in the calling process, and is never relayed to the service. Stops the running service
+/// and holds its socket until the move ends, then starts the service again. A relative `path`
+/// resolves against the caller's working directory, and an empty one names the default location
+/// in the global data directory. With `adopt`, points the setting at `path`, a root that holds
+/// this global data directory's marker, and moves nothing; with `abandon`, gives up the
+/// unavailable current root for a new, empty one at `path`. Both together fail with error code
+/// 3 (invalid arguments). With `globals->dry_run`, runs every check that needs nothing stopped,
+/// reports what it would do in `LORE_EVENT_LOG` events, and changes nothing. With
+/// `globals->force`, the stop detaches busy mounts lazily, and programs with files open through
+/// them get errors; without it, a busy mount fails the call with error code 51 (mounts busy). A
+/// service that runs inside another program or in the calling program, and another move that
+/// holds the service's socket, fail the call with error code 51. The call returns only once the
+/// move holds the lock of every shared store its final switch needs, and a store the calling
+/// program holds fails it with error code 51.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_service_set_external_directory(
+    globals: &LoreGlobalArgs,
+    args: &LoreServiceSetExternalDirectoryArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, run_command_locally)
+}
+
+/// Asynchronous version of `lore_service_set_external_directory`.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_service_set_external_directory_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreServiceSetExternalDirectoryArgs,
     callback: LoreEventCallbackConfig,
 ) {
     run_asynchronously(globals, args, callback, invoke_locally);

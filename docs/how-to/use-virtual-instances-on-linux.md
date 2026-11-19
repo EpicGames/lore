@@ -67,6 +67,16 @@ lore --repository ~/work/my-project-fuse repository instance delete
 
 The service takes the mount down, deregisters the virtual instance, and removes its directory.
 
+## Move the external directories
+
+Each virtual instance keeps its Lore directory, and every file written through its mount, in an external directory in `~/.local/share/lore/external`. To keep them in another directory on the same volume, move them with the service's own command, which stops the service and starts it again around the move:
+
+```bash
+lore service set-external-directory ~/work/lore-external
+```
+
+See [Move the external directories of virtual instances](move-the-external-directories-of-virtual-instances.md) for the precautions to take first and how to move them back.
+
 ## Stop the service
 
 ```bash

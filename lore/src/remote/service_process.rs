@@ -326,8 +326,8 @@ impl ServiceSettings {
 /// A FUSE instance's commands, and a clone or create whose `vfs` resolves to FUSE, are always
 /// forced to relay to the service (see `command_requires_service` in `call_delegation`), but the
 /// service handling a relayed command re-enters the same dispatch path — without this flag it
-/// would relay to itself forever. Not the same thing as [`service_runs_in_this_process`], which
-/// answers true only later, once the service has bound its socket ([`register_service_process`]).
+/// would relay to itself forever. Never cleared, unlike [`service_runs_in_this_process`], which
+/// answers false again once the service ends.
 ///
 /// [`initialize_service`]: crate::service::initialization::initialize_service
 static IN_SERVICE_PROCESS: AtomicBool = AtomicBool::new(false);
@@ -569,8 +569,15 @@ pub(crate) async fn connect_to_running_service() -> Result<Option<UdsStream>, Se
     if !uds_supported() {
         return Err(unavailable("OS doesn't support IPC"));
     }
+    #[cfg(feature = "test-util")]
+    CONNECTING.pass().await;
     connect_attempt().await
 }
+
+/// Stops a connection to the running service, once armed, before it connects.
+#[cfg(feature = "test-util")]
+pub static CONNECTING: std::sync::LazyLock<lore_revision::test_util::ArmedPause> =
+    std::sync::LazyLock::new(lore_revision::test_util::ArmedPause::default);
 
 /// Connects to the service, starting one when none is running from an executable
 /// `start` allows.
@@ -586,9 +593,14 @@ pub(crate) async fn connect_or_spawn_service(
     if let Some(connection) = connect_to_running_service().await? {
         return Ok(connection);
     }
+    start_and_connect(start).await
+}
 
-    collect_exited_services();
-
+/// Starts a service from an executable `start` allows, and connects to the first service that
+/// answers, as [`connect_or_spawn_service`] does where none is running.
+pub(crate) async fn start_and_connect(
+    start: ServiceStart,
+) -> Result<UdsStream, ServiceProcessError> {
     let (named, config_read) = service_executable().await;
     let executable = executable_to_start(
         named,
@@ -596,6 +608,17 @@ pub(crate) async fn connect_or_spawn_service(
         config_read && serves_from_this_executable(),
         std::env::current_exe,
     )?;
+    spawn_service_and_connect(executable).await
+}
+
+/// Starts a service from `executable` and connects to the first service that answers, whether it
+/// is the one started here or another that won the socket. Fails once none has answered within
+/// [`SERVICE_START_TIMEOUT`], or soon after the started one exits.
+pub(crate) async fn spawn_service_and_connect(
+    executable: PathBuf,
+) -> Result<UdsStream, ServiceProcessError> {
+    collect_exited_services();
+
     let mut service = lore_base::lore_spawn_blocking!(move || spawn_service(executable))
         .await
         .internal("joining the service start task")??;
@@ -693,8 +716,8 @@ struct StopState {
     /// begins to start.
     requested: bool,
     /// Whether a service is running in this process at the moment: it has
-    /// bound its socket and not yet ended. Clear for a process that has stopped,
-    /// or has not got as far as serving.
+    /// claimed its socket and not yet ended. Clear for a process that has stopped,
+    /// or has not got as far as claiming its socket.
     running: bool,
     /// Whether a service is starting in this process, from the moment it begins
     /// until it ends. A stop asked for in that window is kept for the service
@@ -836,21 +859,44 @@ pub fn begin_service_start() -> Option<ServiceStartGuard> {
     request.begin_start().then(|| ServiceStartGuard { request })
 }
 
-/// Records that this process runs the service, which is what makes a stop act on
-/// it rather than reach for a socket this process owns. Left until the socket is
-/// bound, so that a process which lost it never claims to be the service for the
-/// moments before it exits.
+/// Records that this process runs the service, which is what makes a command here act on it
+/// rather than reach for the socket this process owns. Left until the socket is claimed, so
+/// that a process whose claim is refused is not taken for the service.
 pub fn register_service_process(guard: &ServiceStartGuard) {
     guard.request.set_running();
 }
 
-/// Whether the service runs in this process, which is what makes a stop act on
-/// it rather than reach for a socket this process owns.
+/// Whether the service runs in this process, from the moment it has claimed its socket, before
+/// the socket accepts anything, until it ends. A command in this process acts on that service
+/// here rather than reach for the socket it owns.
 #[lore_macro::test_pub]
 pub(crate) fn service_runs_in_this_process() -> bool {
     STOP_REQUEST
         .get()
         .is_some_and(|request| request.is_running())
+}
+
+/// The service a call that acts on the running service reaches.
+pub(crate) enum Reached {
+    /// The service that runs in this process.
+    Here,
+    /// The service of another process, which listens on the socket.
+    Connected(UdsStream),
+    /// No service.
+    Nothing,
+}
+
+/// Connects to the running service, as [`connect_to_running_service`] does, then reads again
+/// whether the service runs in this process. A service start in this process records that it runs
+/// here once it claims the socket, before it listens, so a connect made or refused meanwhile finds
+/// the record. A call relayed to this process's service would wait indefinitely on a reply that
+/// needs the blocking thread its wait holds.
+pub(crate) async fn reach_running_service() -> Result<Reached, ServiceProcessError> {
+    let connection = connect_to_running_service().await?;
+    if service_runs_in_this_process() {
+        return Ok(Reached::Here);
+    }
+    Ok(connection.map_or(Reached::Nothing, Reached::Connected))
 }
 
 /// Asks the service running in this process to stop, and reports whether there

@@ -15,7 +15,7 @@ from time import monotonic, sleep
 
 import pytest
 
-from lore import Lore
+from lore import Lore, external_root, strip_protocol
 from service_util import (
     LORE_NO_SERVICE_EXECUTABLE_MESSAGE,
     LORE_NO_SERVICE_MESSAGE,
@@ -28,6 +28,7 @@ from service_util import (
     LORE_SERVICE_STATUS_LABELS,
     LORE_EXTERNAL_ROOT_STATUS_LABELS,
 )
+from test_repository_info import get_instance_id
 
 logger = logging.getLogger(__name__)
 
@@ -1057,4 +1058,244 @@ def test_a_second_service_exits_rather_than_take_the_socket(
     assert first.poll() is None, "the first service still runs"
     assert LORE_SERVICE_RUNNING_MESSAGE in status.stdout.splitlines(), (
         f"the first service still answers: {status.stdout}{status.stderr}"
+    )
+
+
+# `InvalidArguments`: a refused target of `service set-external-directory`.
+INVALID_ARGUMENTS = 3
+# What `service status` prints of the external root's state while a move hasn't finished.
+EXTERNAL_ROOT_MOVING = "a move hasn't finished"
+
+
+def external_root_repo(
+    new_lore_repo, global_dir_name: str, registered: bool = False
+) -> tuple[Lore, str, str]:
+    """A repository over a shared store, with an external directory planted for it at the
+    default location as a virtual instance's would be, whose config names that store, and
+    named for the repository's instance where `registered`. Answers the repository, the
+    planted external directory's name, and the store."""
+    repo: Lore = new_lore_repo(create_repo=False)
+    repo.shared_store_create(repo.remote)
+    repo.repository_create(use_shared_store=True)
+    name = get_instance_id(repo.repository_info()) if registered else uuid.uuid4().hex
+    dot_lore = Path(external_root(global_dir_name)) / name / ".lore"
+    dot_lore.mkdir(parents=True)
+    shutil.copyfile(Path(repo.dot_path()) / "config.toml", dot_lore / "config.toml")
+    (dot_lore.parent / "file").write_text("kept")
+    store = repo.shared_store_info().stores[strip_protocol(repo.remote)].path
+    return repo, name, store
+
+
+def _wait_for(condition, what: str, timeout: float = 60.0):
+    deadline = monotonic() + timeout
+    while not condition():
+        assert monotonic() < deadline, f"timed out waiting for {what}"
+        sleep(0.1)
+
+
+@contextlib.contextmanager
+def held_store(store: str):
+    """Holds the lock file of the shared store `store` with an OS lock of the test's own, as
+    another process holding the store does."""
+    import fcntl
+
+    with open(Path(store) / "immutable" / "lock", "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _set_external_directory_process(repo: Lore, target: Path) -> subprocess.Popen:
+    """`service set-external-directory` to `target`, run in the background."""
+    return subprocess.Popen(
+        [repo.lore_executable_path, "service", "set-external-directory", str(target)],
+        env=repo.sandboxed_env(),
+        cwd=repo.path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+@pytest.mark.verified_volume
+@pytest.mark.smoke
+def test_set_external_directory_moves_the_root_by_rename_and_back(
+    new_lore_repo, global_dir_name, scratch_dir, stops_background_services
+):
+    """A move by rename stops the running service, moves the external directories with the
+    root, leaves the redirect at the default location, and starts the service again; moving
+    back puts the root at the default location."""
+    repo, name, _ = external_root_repo(new_lore_repo, global_dir_name)
+    default = Path(global_dir_name) / "data" / "external"
+    repo.service_start()
+    target = scratch_dir("external-root") / "root"
+
+    repo.service_set_external_directory(target)
+
+    assert (target / name / "file").read_text() == "kept"
+    assert Path(external_root(global_dir_name)) == target
+    assert default.is_symlink() or default.is_junction()
+    assert default.resolve() == target.resolve()
+    status = repo.service_status()
+    assert LORE_SERVICE_RUNNING_MESSAGE in status, status
+    assert str(target) in status, status
+
+    repo.service_set_external_directory("")
+
+    assert (default / name / "file").read_text() == "kept"
+    assert not default.is_symlink() and not default.is_junction()
+    assert not target.exists()
+    assert LORE_SERVICE_RUNNING_MESSAGE in repo.service_status()
+
+
+@pytest.mark.verified_volume
+@pytest.mark.smoke
+def test_set_external_directory_dry_run_and_refusals(
+    new_lore_repo, global_dir_name, scratch_dir, stops_background_services
+):
+    """A dry run changes nothing, and the CLI refuses a target that
+    exists, one inside the current root, and `--adopt` with `--abandon`, with
+    `InvalidArguments`."""
+    repo, name, _ = external_root_repo(new_lore_repo, global_dir_name)
+    target = scratch_dir("external-root") / "root"
+
+    repo.service_set_external_directory(target, dry_run=True)
+
+    assert not target.exists()
+    assert not (Path(global_dir_name) / "data" / "external-root").exists()
+    root = Path(external_root(global_dir_name))
+    existing = scratch_dir("external-root-existing", create=True)
+    for refused, options in [
+        (existing, {}),
+        (root / name / "inside", {}),
+        (target, {"adopt": True, "abandon": True}),
+    ]:
+        with pytest.raises(Exception) as error:
+            repo.service_set_external_directory(refused, **options)
+        assert error.value.returncode == INVALID_ARGUMENTS, (refused, options)
+    assert (root / name / "file").read_text() == "kept"
+
+
+@pytest.mark.verified_volume
+@pytest.mark.smoke
+def test_set_external_directory_adopt_and_abandon(
+    new_lore_repo, global_dir_name, scratch_dir, stops_background_services
+):
+    """`--adopt` points the setting at a copy of the root and makes the redirect lead there;
+    `--abandon` gives up a root that is gone for a new, empty one."""
+    repo, name, _ = external_root_repo(new_lore_repo, global_dir_name)
+    first = scratch_dir("external-root") / "root"
+    repo.service_set_external_directory(first)
+    copy = scratch_dir("external-root-copy")
+    shutil.copytree(first, copy, symlinks=True)
+
+    repo.service_set_external_directory(copy, adopt=True)
+
+    assert Path(external_root(global_dir_name)) == copy
+    assert (copy / name / "file").read_text() == "kept"
+    assert (Path(global_dir_name) / "data" / "external").resolve() == copy.resolve()
+
+    shutil.rmtree(copy)
+    new = scratch_dir("external-root-new") / "root"
+    repo.service_set_external_directory(new, abandon=True)
+
+    assert Path(external_root(global_dir_name)) == new
+    assert [entry.name for entry in new.iterdir()] == [".lore-external-root"]
+
+
+@pytest.mark.verified_volume
+@pytest.mark.smoke
+@pytest.mark.skipif(sys.platform == "win32", reason="holds the store with flock")
+def test_calls_during_a_move_that_waits_for_a_held_store(
+    new_lore_repo, global_dir_name, scratch_dir, stops_background_services
+):
+    """While a move waits for a store another process holds, the occupied socket answers each
+    call: a relayed command in an ordinary instance and one outside any instance run in their
+    own process, status reports the move, and stop and start fail. Once the store is free,
+    the move finishes and a service runs again."""
+    repo, name, store = external_root_repo(new_lore_repo, global_dir_name)
+    ordinary: Lore = new_lore_repo()
+    repo.service_start()
+    target = scratch_dir("external-root") / "root"
+
+    with held_store(store):
+        moving = _set_external_directory_process(repo, target)
+        _wait_for(
+            lambda: EXTERNAL_ROOT_MOVING in repo.service_status(check=False),
+            "the move to wait for the store",
+        )
+        relayed = {**LORE_SERVICE_ENVIRONMENT}
+        ordinary.environment_vars.update(relayed)
+        ordinary.run(["status"])
+        ordinary.run(
+            ["shared-store", "list"],
+            use_os_dir=True,
+            cwd=str(scratch_dir("outside", create=True)),
+        )
+        for refused in (["service", "stop"], ["service", "start"]):
+            with pytest.raises(Exception) as error:
+                repo.run(refused)
+            assert error.value.returncode == SERVICE_UNAVAILABLE, refused
+        assert moving.poll() is None, "the move waits while the store is held"
+
+    output, _ = moving.communicate(timeout=120)
+    assert moving.returncode == 0, output
+    assert (target / name / "file").read_text() == "kept"
+    assert LORE_SERVICE_RUNNING_MESSAGE in repo.service_status()
+
+
+@pytest.mark.verified_volume
+@pytest.mark.smoke
+def test_a_refusal_after_the_stop_leaves_a_service_running(
+    new_lore_repo, global_dir_name, stops_background_services
+):
+    """A target inside the path of a registered virtual instance is refused once the service
+    is stopped, with `InvalidArguments`, and the service is started again."""
+    repo, _, _ = external_root_repo(new_lore_repo, global_dir_name, registered=True)
+    caller: Lore = new_lore_repo()
+    registered = Path(repo.path)
+    # The registered instance's path empties, as an unmounted virtual instance's does, so
+    # only the registration tells that the target lies inside it.
+    shutil.rmtree(registered)
+    caller.service_start()
+
+    with pytest.raises(Exception) as error:
+        caller.service_set_external_directory(registered / "root")
+
+    assert error.value.returncode == INVALID_ARGUMENTS
+    assert not (Path(global_dir_name) / "data" / "external-root").exists()
+    assert LORE_SERVICE_RUNNING_MESSAGE in caller.service_status()
+
+
+@pytest.mark.verified_volume
+@pytest.mark.smoke
+@pytest.mark.skipif(sys.platform != "linux", reason="sends SIGINT")
+def test_sigint_during_a_move_undoes_it_and_starts_the_service_again(
+    new_lore_repo, global_dir_name, scratch_dir, stops_background_services
+):
+    """SIGINT to the CLI while the move waits for a held store undoes the move, and a service
+    runs again."""
+    repo, name, store = external_root_repo(new_lore_repo, global_dir_name)
+    repo.service_start()
+    target = scratch_dir("external-root") / "root"
+
+    with held_store(store):
+        moving = _set_external_directory_process(repo, target)
+        _wait_for(
+            lambda: EXTERNAL_ROOT_MOVING in repo.service_status(check=False),
+            "the move to wait for the store",
+        )
+        moving.send_signal(signal.SIGINT)
+        output, _ = moving.communicate(timeout=120)
+
+    assert moving.returncode != 0, output
+    assert not target.exists()
+    root = Path(external_root(global_dir_name))
+    assert (root / name / "file").read_text() == "kept"
+    assert not (Path(global_dir_name) / "data" / "external.move").exists()
+    _wait_for(
+        lambda: LORE_SERVICE_RUNNING_MESSAGE in repo.service_status(check=False),
+        "the service to run again",
     )

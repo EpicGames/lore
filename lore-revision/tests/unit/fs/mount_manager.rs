@@ -769,3 +769,128 @@ async fn a_start_refused_access_to_the_external_root_skips_every_virtual_instanc
         })
         .await;
 }
+
+/// An instance whose path the skip answers for is neither mounted nor left to mount, as the
+/// mount of a recovered root leaves one the service mounts already.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_instance_the_skip_answers_for_is_left_as_it_is() {
+    let store = TempDir::new("lore-mount-manager-skipped-store-");
+    let mut registry = SharedStoreRegistry::default();
+    registry
+        .register("lore://skipped".to_string(), store.path())
+        .expect("register the store");
+    let mount_point = TempDir::new("lore-mount-manager-skipped-mount-");
+    let mounted_path = mount_point.path().to_str().expect("UTF-8");
+    register_fuse_instance(&registry.entries()[0], mounted_path).await;
+    let mut state =
+        lore_revision::global::external_dir::resolve::resolve().expect("resolve the external root");
+
+    let (mounted, pending, _, _) =
+        MountManager::mounts_of_entries_skipping(registry.entries(), &mut state, |path| {
+            path == Path::new(mounted_path)
+        })
+        .await
+        .expect("the instances");
+    let (_, kept, _, _) =
+        MountManager::mounts_of_entries_skipping(registry.entries(), &mut state, |_| false)
+            .await
+            .expect("the instances");
+
+    assert!(mounted.is_empty());
+    assert!(pending.is_empty());
+    assert_eq!(kept.len(), 1, "unskipped, the instance is left to mount");
+}
+
+/// The mounts of the registered instances, as a start and recovery in the background find them,
+/// come with what interrupted clones left removed: here a lock file no clone holds.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_registered_mounts_come_with_what_interrupted_clones_left_removed() {
+    let store = TempDir::new("lore-mount-manager-swept-store-");
+    let mut registry = SharedStoreRegistry::default();
+    registry
+        .register("lore://swept".to_string(), store.path())
+        .expect("register the store");
+    let mount_point = TempDir::new("lore-mount-manager-swept-instance-");
+    let instance_id = register_fuse_instance(
+        &registry.entries()[0],
+        mount_point.path().to_str().expect("UTF-8"),
+    )
+    .await;
+    let mut state =
+        lore_revision::global::external_dir::resolve::resolve().expect("resolve the external root");
+    let dot_lore = external_dir_for_instance(&state, instance_id)
+        .expect("external dir resolves")
+        .join(DOT_LORE);
+    std::fs::write(dot_lore.join(CONFIG), b"").expect("a config naming no VFS");
+    let stray_lock = lore_revision::global::external_dir::external_dirs_root(&state)
+        .expect("the external root")
+        .join(format!(
+            "{}{}",
+            InstanceId::generate().text_encoding(),
+            lore_base::fs::lock::FSLock::FILE_LOCK_SUFFIX
+        ));
+    std::fs::write(&stray_lock, b"").expect("a lock file no clone holds");
+
+    let (mounted, pending) =
+        MountManager::registered_mounts(registry.entries(), &mut state, |_| false)
+            .await
+            .expect("the mounts");
+
+    assert!(mounted.is_empty() && pending.is_empty());
+    assert!(
+        !stray_lock.exists(),
+        "the lock file no clone holds is removed"
+    );
+}
+
+/// While the external root waits for a move, a start's mounting mounts no virtual instance, and
+/// answers at once, without opening a store another holder keeps: a start then goes on, accepts
+/// calls, and leaves the move to recovery in the background.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_mounting_of_a_root_waiting_for_a_move_opens_no_store() {
+    let store = TempDir::new("lore-mount-manager-waiting-store-");
+    let mut registry = SharedStoreRegistry::default();
+    registry
+        .register("lore://waiting".to_string(), store.path())
+        .expect("register the store");
+    let mount_point = TempDir::new("lore-mount-manager-waiting-instance-");
+    register_fuse_instance(
+        &registry.entries()[0],
+        mount_point.path().to_str().expect("UTF-8"),
+    )
+    .await;
+    let global = TempDir::new("lore-mount-manager-waiting-global-");
+    lore_revision::global::external_dir::record::MoveRecord {
+        from: String::new(),
+        to: global.path().join("moved").display().to_string(),
+        kind: lore_revision::global::external_dir::record::MoveKind::Rename,
+        phase: lore_revision::global::external_dir::record::MovePhase::Switch,
+    }
+    .save(global.path())
+    .await
+    .expect("the record of a waiting move");
+    let mut state =
+        lore_revision::global::external_dir::resolve::resolve_in(global.path().to_path_buf());
+    let _other = lore_base::fs::lock::FSLock::try_acquire_exact_path(
+        &Path::new(registry.entries()[0].path())
+            .join(SHARED_STORE_DIR)
+            .join("immutable")
+            .join("lock"),
+    )
+    .await
+    .expect("look at the flock")
+    .expect("hold the store");
+
+    let found = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        MountManager::mounts_of_entries_skipping(registry.entries(), &mut state, |_| false),
+    )
+    .await
+    .expect("the mounting answers without waiting for the store");
+
+    let (mounted, pending, _, _) = found.expect("the mounting succeeds");
+    assert!(mounted.is_empty() && pending.is_empty());
+}

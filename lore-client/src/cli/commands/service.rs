@@ -12,6 +12,7 @@ use lore::interface::LoreGlobalArgs;
 use lore::interface::LoreLogLevel;
 use lore::interface::LoreServiceMessageEventData;
 use lore::interface::LoreServiceSetExecutableArgs;
+use lore::interface::LoreServiceSetExternalDirectoryArgs;
 use lore::interface::LoreServiceSetUseAutomaticallyArgs;
 use lore::interface::LoreServiceStartArgs;
 use lore::interface::LoreServiceStatusArgs;
@@ -69,6 +70,23 @@ pub struct ServiceSetUseAutomaticallyArgs {
     enabled: bool,
 }
 
+#[derive(Args)]
+pub struct ServiceSetExternalDirectoryArgs {
+    /// The new external root: an absolute path, one relative to the working directory, or empty
+    /// for the default location in the global data directory
+    #[clap(value_name = "path")]
+    path: String,
+
+    /// Point the setting at the path, a root that holds this global data directory's marker, and
+    /// move nothing
+    #[clap(long)]
+    adopt: bool,
+
+    /// Give up the unavailable external root for a new, empty one at the path, and move nothing
+    #[clap(long)]
+    abandon: bool,
+}
+
 #[derive(Subcommand)]
 pub enum ServiceCommands {
     ///Run this process as the service
@@ -88,6 +106,18 @@ pub enum ServiceCommands {
 
     /// Set whether commands are carried out by the service
     SetUseAutomatically(ServiceSetUseAutomaticallyArgs),
+
+    /// Move every virtual instance's external directory to a new external root
+    ///
+    /// Stops the running service and holds its socket until the move ends, then starts the
+    /// service again. Refuses a service that runs inside another program, and a stop while a
+    /// program is inside a virtual instance, unless --force, which detaches busy mounts lazily.
+    /// Ctrl-C before the final switch undoes a move; an --adopt or --abandon it interrupts is
+    /// finished later, by recovery. Ctrl-C while the command finishes an earlier interrupted move
+    /// ends it, and leaves that move to recovery. With --dry-run, runs every check that needs
+    /// nothing stopped and reports what the move would do; while a move is interrupted, it reports
+    /// that move, and the target is checked once recovery has finished it.
+    SetExternalDirectory(ServiceSetExternalDirectoryArgs),
 }
 
 /// Where the service process parks its working directory. It inherits one from
@@ -128,18 +158,8 @@ fn handle_service_run(globals: LoreGlobalArgs, _args: &ServiceRunArgs) -> u8 {
         // outright until a handler is in place: registering after the service
         // binds its socket leaves a window in which a service callers can already
         // reach dies rather than stopping, leaving the socket behind.
-        let signals = match TerminationSignals::register() {
-            Ok(signals) => Some(signals),
-            Err(error) => {
-                eprintln!(
-                    "{}Failed to listen for termination signals:{} {error}",
-                    CommonStyles::FAILURE,
-                    anstyle::Reset
-                );
-                // Without signals the service is still stoppable over IPC
-                None
-            }
-        };
+        // Without signals the service is still stoppable over IPC
+        let signals = register_termination_signals();
 
         let run = service::run(globals.clone(), LoreServiceRunArgs {}, service_callback());
         tokio::pin!(run);
@@ -162,6 +182,22 @@ fn handle_service_run(globals: LoreGlobalArgs, _args: &ServiceRunArgs) -> u8 {
             }
         }
     })
+}
+
+/// The termination signals, registered, or `None` where they can't be, which is reported on
+/// stderr.
+fn register_termination_signals() -> Option<TerminationSignals> {
+    match TerminationSignals::register() {
+        Ok(signals) => Some(signals),
+        Err(error) => {
+            eprintln!(
+                "{}Failed to listen for termination signals:{} {error}",
+                CommonStyles::FAILURE,
+                anstyle::Reset
+            );
+            None
+        }
+    }
 }
 
 /// The default handlers, which put errors on stderr, plus the maintenance
@@ -370,6 +406,28 @@ fn handle_service_set_use_automatically(
     return run_command_locally(globals, set_args.into(), service_callback()) as u8;
 }
 
+fn handle_service_set_external_directory(
+    globals: LoreGlobalArgs,
+    args: &ServiceSetExternalDirectoryArgs,
+) -> u8 {
+    let set_args = LoreServiceSetExternalDirectoryArgs {
+        path: args.path.as_str().into(),
+        adopt: u8::from(args.adopt),
+        abandon: u8::from(args.abandon),
+    };
+    runtime().block_on(async move {
+        let signals = register_termination_signals();
+        let termination = async move {
+            match signals {
+                Some(mut signals) => signals.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        service::set_external_directory_until(globals, set_args, service_callback(), termination)
+            .await as u8
+    })
+}
+
 pub fn handle_service_commands(cmd: &ServiceCommands, globals: LoreGlobalArgs) -> u8 {
     match cmd {
         ServiceCommands::Run(args) => {
@@ -389,6 +447,9 @@ pub fn handle_service_commands(cmd: &ServiceCommands, globals: LoreGlobalArgs) -
         }
         ServiceCommands::SetUseAutomatically(args) => {
             return handle_service_set_use_automatically(globals, args);
+        }
+        ServiceCommands::SetExternalDirectory(args) => {
+            return handle_service_set_external_directory(globals, args);
         }
     }
 }

@@ -183,6 +183,8 @@ If none of those resolve, starting a service fails and names both places one can
 idle_connection_timeout = 600
 ```
 
+Where the external directories of virtual instances live isn't a `config.toml` key. Lore records it in `external-root` in its global data directory, and changes it only through [`lore service set-external-directory`](lore-cli-commands.md#lore-service-set-external-directory), which moves them, or with `--adopt` or `--abandon` points the setting at another external root. See [Move the external directories of virtual instances](../how-to/move-the-external-directories-of-virtual-instances.md).
+
 ### `[auth]` table
 
 | Field | Type | Default | Description |

@@ -45,7 +45,7 @@ use lore_storage::test_util::HookedStore;
 use lore_storage::test_util::StoreCall;
 use zerocopy::IntoBytes;
 
-use crate::global::external_dir::resolve::redirect;
+use crate::global::external_dir::redirect;
 use crate::helper::RepositoryContextCreationArgsExt;
 use crate::helper::default_repository_creation_args;
 use crate::helper::execution_in;

@@ -301,6 +301,8 @@ the Rust equivalent of the smoke tests' `--keep-test-data`. The prefix is all
 there is to identify one afterwards, so give it the test's name wherever several
 tests in a module would otherwise share it.
 
+A test that moves the external root needs its global directory and its targets on one volume Lore verifies as local and durable, and outside any Lore working tree. It makes them in the base `lore_io::test_util::verified_scratch_base` finds, through `verified_temp_dir` in `lore-revision/tests/helper.rs`, or with the `verified_volume` marker in the smoke tests: the system temp directory where it qualifies, else the build's temp directory, else `lore-test-scratch` beside the outermost working tree that holds the build. The last lies outside pytest's base temp directory, so the session sweep doesn't reach it: the process that chose it removes it once empty as it exits, a Rust test binary only on Unix. Where no candidate qualifies, the test fails, naming each.
+
 `tempfile` is the implementation and a dependency of `lore-base` only. Do not add
 it to another crate: a second guard type is a second set of rules, and it does not
 honour `LORE_KEEP_TEST_DATA`.
@@ -602,6 +604,7 @@ is legitimately slower.
 | `@pytest.mark.swfs` | Tests that need the EpicVFS driver, which is available only on Windows machines where it is installed. Deselect with `-m "smoke and not swfs"` if you don't have the driver. |
 | `@pytest.mark.slow` | Slow running tests |
 | `@pytest.mark.disable_auto_server` | Tests requiring the `--disable-auto-server` flag |
+| `@pytest.mark.verified_volume` | Tests that move the external root: their global directory and scratch paths go on a volume Lore verifies, outside any Lore working tree, as [Scratch space on disk](#scratch-space-on-disk) describes |
 
 ---
 

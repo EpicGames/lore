@@ -229,6 +229,16 @@ pub enum Intent {
     Write,
 }
 
+/// What [`StoreLock::try_acquire_unjoined`] found.
+pub enum Attempt {
+    /// The lock, taken by this attempt.
+    Acquired(StoreGuard),
+    /// This process holds the flock.
+    HeldByThisProcess,
+    /// Another process holds the flock, or another task in this process is taking it.
+    HeldElsewhere,
+}
+
 /// How an acquisition that has to take the flock treats another process holding it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Contention {
@@ -645,6 +655,36 @@ impl StoreLock {
         Box::pin(self.acquire_at_gate(gate, intent, Contention::Skip)).await
     }
 
+    /// Takes the lock for a holder that must exclude this process's own work on the store too,
+    /// never joining a hold this process has. Answers [`Attempt::HeldByThisProcess`] while this
+    /// process holds the flock, and [`Attempt::HeldElsewhere`] where another process holds it, or
+    /// another task in this process is taking it, without waiting for either.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::acquire`], contention aside.
+    pub async fn try_acquire_unjoined(
+        self: &Arc<Self>,
+        intent: Intent,
+    ) -> std::io::Result<Attempt> {
+        if self.is_held() {
+            return Ok(Attempt::HeldByThisProcess);
+        }
+        let Ok(gate) = Arc::clone(&self.shared.gate).try_lock_owned() else {
+            return Ok(Attempt::HeldElsewhere);
+        };
+        if self.is_held() {
+            return Ok(Attempt::HeldByThisProcess);
+        }
+        // Boxed, for the reason `acquire` gives.
+        Ok(
+            match Box::pin(self.acquire_at_gate(gate, intent, Contention::Skip)).await? {
+                Some(guard) => Attempt::Acquired(guard),
+                None => Attempt::HeldElsewhere,
+            },
+        )
+    }
+
     /// The part of an acquisition that holds the gate: joining a flock another task took
     /// while this one waited, or taking the flock and reading the epoch. A flock taken here
     /// is taken after a hold on the flock its lock is nested in, which it keeps, so the two
@@ -1016,6 +1056,14 @@ impl StoreLock {
     #[must_use]
     pub fn is_held(&self) -> bool {
         self.shared.state.lock().held.is_some()
+    }
+
+    /// Whether a task in this process is taking the flock right now, inside the gate an
+    /// acquisition holds while it takes it.
+    #[cfg(feature = "test-util")]
+    #[must_use]
+    pub fn gate_is_taken(&self) -> bool {
+        self.shared.gate.try_lock().is_err()
     }
 
     /// How many times the stores on this directory have loaded their state from disk in
