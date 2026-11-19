@@ -1821,8 +1821,11 @@ struct TargetRun {
     storage: Arc<StorageSession>,
     /// The peer's latest revision of the branch.
     remote_latest: Hash,
-    /// The last revision the peer accepted, which the next revision is rebased on.
+    /// The last revision the peer accepted, which the next revision is rebased on unless the peer
+    /// merged one.
     current_latest: Hash,
+    /// Whether the peer merged a revision of this push into its latest. The revisions after it are
+    /// offered as they are, for the peer to merge in turn.
     fast_forward_merged: bool,
 }
 
@@ -2005,9 +2008,10 @@ async fn start_target(target: &PushTarget) -> Result<Option<TargetRun>, PushErro
 }
 
 /// Push `revision` of the history of `target`'s branch: rebase it on the last revision the peer
-/// accepted, upload what it holds, and offer it as the branch's latest revision when it belongs to
-/// the branch. A linked repository's offer the peer refuses onto revisions the local history does
-/// not hold fails as [`Divergent`].
+/// accepted, unless the peer merged an earlier one, when it is offered as committed for the peer to
+/// merge in turn, upload what it holds, and offer it as the branch's latest revision when it
+/// belongs to the branch. A linked repository's offer the peer refuses onto revisions the local
+/// history does not hold fails as [`Divergent`].
 async fn push_local_revision(
     target: &PushTarget,
     run: &mut TargetRun,
@@ -2026,9 +2030,14 @@ async fn push_local_revision(
         .await
         .forward::<PushError>("deserializing revision state")?;
 
-    if !run.current_latest.is_zero() && state.parent_self() != run.current_latest {
-        // TODO(mjansson): This only handles revision number rewrite for now, implement proper
-        //                 automatic rebase if the push resulted in a clean rebase
+    // A rewrite changes the first parent alone and keeps the revision's tree, which lacks what a
+    // merge by the peer brought in.
+    if !run.current_latest.is_zero()
+        && !run.fast_forward_merged
+        && state.parent_self() != run.current_latest
+    {
+        // TODO(mjansson): This only handles the peer renumbering the revision before, implement
+        //                 proper automatic rebase if the push resulted in a clean rebase
 
         event::LoreEvent::BranchPushRevisionUpdateBegin(
             LoreBranchPushRevisionUpdateBeginEventData {
@@ -2108,22 +2117,10 @@ async fn push_local_revision(
         .await
         .map_err(|err| refused_offer(err, repository.is_link() && plan.diverged))?;
         if response.fast_forward_merged {
-            // Server performed a fast-forward merge — push succeeded with a new revision.
-            // Store the server-created revision as local latest (marked divergent since the
-            // local working directory still reflects the original merge revision).
-            let local_latest = branch::load_latest(repository.clone(), branch)
-                .await
-                .unwrap_or_default();
-            branch::store_latest(
-                repository.clone(),
-                branch,
-                local_latest,
-                response.revision,
-                BranchLatestStatus::Divergent,
-            )
-            .await
-            .forward::<PushError>("setting new latest revision for branch")?;
-            branch::store_last_sync(repository.clone(), branch, response.revision).await;
+            // The peer merged the revision into its latest. The local latest and the last
+            // synchronized revision stay where they are until every revision is pushed
+            // (`finish_target`): a later revision the peer refuses stays on the local latest, and
+            // the last synchronized revision on its history.
 
             run.remote_latest = response.revision;
             run.current_latest = response.revision;
@@ -2197,24 +2194,38 @@ async fn push_local_revision(
 }
 
 /// Record the last revision the peer accepted for `target` as its branch's local latest revision.
-/// Only the pushing repository keeps one, and a fast-forward merge leaves it to the next sync.
+/// Only the pushing repository keeps one. One the peer merged is recorded divergent: the working
+/// tree holds the revision pushed, and the next sync carries it to the merge.
 async fn finish_target(target: &PushTarget, run: &TargetRun) -> Result<(), PushError> {
     let repository = &target.repository;
     lore_debug!(
         "All revisions pushed, updating current local latest to {}",
         run.current_latest
     );
-    if run.current_latest.is_zero()
-        || !records_branch_latest(repository)
-        || run.fast_forward_merged
-        || execution_context().globals().dry_run()
-    {
+    if run.current_latest.is_zero() || execution_context().globals().dry_run() {
+        return Ok(());
+    }
+    if run.fast_forward_merged {
+        branch::store_last_sync(repository.clone(), target.branch, run.current_latest).await;
+    }
+    if !records_branch_latest(repository) {
         return Ok(());
     }
 
     let local_latest = branch::load_latest(repository.clone(), target.branch)
         .await
         .unwrap_or_default();
+    if run.fast_forward_merged {
+        return branch::store_latest(
+            repository.clone(),
+            target.branch,
+            local_latest,
+            run.current_latest,
+            BranchLatestStatus::Divergent,
+        )
+        .await
+        .forward::<PushError>("setting new latest revision for branch");
+    }
     branch::store_synced_latest(repository, target.branch, local_latest, run.current_latest)
         .await
         .forward::<PushError>("setting new latest revision for branch")?;

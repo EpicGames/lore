@@ -1672,9 +1672,12 @@ attempts to create the merged revision itself - `parent_self` set to the current
 latest, `parent_other` set to the incoming revision - and advances the latest pointer to
 that merged revision. This succeeds when the parallel changes don't touch the same content.
 If merging on the server encounters a conflict, the push fails with a signal back to the
-client that the user should sync and merge locally. Server-side fast-forward merge is an
-optimization that lets a successful concurrent push complete in one round trip; it is not a
-substitute for client-side reconciliation when there is a real conflict.
+client that the user should sync and merge locally. A push of several revisions has the
+changes of each one from its own first parent merged onto the latest in turn, from the first
+revision that needs a merge on; one that conflicts fails the push, with the revisions before it
+pushed, and stays the local latest for a sync to merge. Server-side fast-forward merge is an
+optimization that lets a successful concurrent push complete with one offer per revision; it is
+not a substitute for client-side reconciliation when there is a real conflict.
 
 ### 15. State Detection and Staging
 

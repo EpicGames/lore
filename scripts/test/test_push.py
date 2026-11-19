@@ -375,6 +375,66 @@ def test_push_fast_forward_merge_non_merge(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_push_fast_forward_merge_of_several_revisions_keeps_the_merged_changes(new_lore_repo):
+    """Two revisions pushed with a fast-forward merge after another instance pushed two of its
+    own. A fresh clone of the remote's latest has both instances' changes, and so does the instance
+    once it syncs."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("First", {"a.txt": "first"})
+    other = repo.clone()
+    repo.write_commit_push("Mine", {"b.txt": "mine"}, offline=True)
+    repo.write_commit_push("Mine again", {"b.txt": "mine again"}, offline=True)
+    other.write_commit_push("Theirs", {"c.txt": "theirs"})
+    other.write_commit_push("Theirs again", {"c.txt": "theirs again"})
+
+    repo.push(fast_forward_merge=True)
+
+    verify = repo.clone()
+    assert _collect_repo_files(verify) == {"a.txt", "b.txt", "c.txt"}
+    with verify.open_file("b.txt", "r") as f:
+        assert f.read() == "mine again"
+    with verify.open_file("c.txt", "r") as f:
+        assert f.read() == "theirs again"
+    repo.sync()
+    assert _collect_repo_files(repo) == {"a.txt", "b.txt", "c.txt"}
+    with repo.open_file("c.txt", "r") as f:
+        assert f.read() == "theirs again"
+
+
+@pytest.mark.smoke
+def test_push_fast_forward_merge_of_a_conflicting_later_revision_keeps_it(new_lore_repo):
+    """Two revisions pushed with a fast-forward merge after another instance changed the file the
+    second changes: the remote merges the first and refuses the second, the push fails, and the
+    branch's local latest stays at the second: status reports it diverged, and a sync merges it
+    rather than discarding it."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("First", {"a.txt": "first", "c.txt": "first"})
+    other = repo.clone()
+    repo.write_commit_push("Mine", {"b.txt": "mine"}, offline=True)
+    repo.write_commit_push("Mine on c", {"c.txt": "mine"}, offline=True)
+    mine_on_c = repo.branch_info("main").local_latest
+    other.write_commit_push("Theirs on c", {"c.txt": "theirs"})
+
+    with pytest.raises(Exception):
+        repo.push(fast_forward_merge=True)
+
+    after = repo.branch_info("main")
+    merged = repo.revision_info(after.remote_latest, remote=True)
+    assert after.local_latest == mine_on_c
+    assert merged.message == "Mine"
+    assert merged.merge != ""
+    status = parse_jsonl(repo.status(json=True), "repositoryStatusRevision")[0]
+    assert (status["isLocalAhead"], status["isRemoteAhead"]) == (1, 1)
+
+    repo.sync(check=False)
+    with repo.open_file("b.txt", "r") as f:
+        assert f.read() == "mine"
+    with repo.open_file("c.txt", "r") as f:
+        conflicted = f.read()
+    assert "mine" in conflicted and "theirs" in conflicted, conflicted
+
+
+@pytest.mark.smoke
 def test_push_fast_forward_merge_case_rename(new_lore_repo):
     """A fast-forward merge of a revision that renames a directory only in case
     keeps the new name and every file below it, an instance that pushed the
