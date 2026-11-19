@@ -57,6 +57,7 @@ use smallvec::SmallVec;
 use crate::filter::FilterStates;
 use crate::fs::fuse::FuseProviderError;
 use crate::fs::fuse::attr::host_attr;
+use crate::fs::fuse::attr::served_file_permissions;
 use crate::fs::fuse::filesystem::FuseFilesystem;
 use crate::fs::fuse::filesystem::HostKind;
 use crate::fs::fuse::filesystem::LookupCase;
@@ -2344,7 +2345,7 @@ impl FuseFilesystem {
         if len != content {
             file.set_len(len).map_err(|error| io_errno(&error))?;
         }
-        set_file_mode(&file, if executable { 0o755 } else { 0o644 })?;
+        set_file_mode(&file, served_file_permissions(executable))?;
         let ((), raced) =
             self.at_host_path_watched(parent, Some(name.as_bytes()), |path, made_dirs| {
                 self.write_step_allowed(WriteStep::CopyUpPathBuilt { parent });
@@ -3742,6 +3743,13 @@ impl FuseFilesystem {
     /// by the node, place and inode recorded at its read, never by its path. A file or directory
     /// that cannot be read stays dirty, which is where it stood. Serialized with swaps.
     ///
+    /// The commit recorded the time each file showed as it was read, however recent. Before the
+    /// flips, the filesystem holding `write/` is waited on until it stamps later than each of them
+    /// ([`crate::state::wait_until_settled`]), so a write after a flip shows a later time; a file
+    /// a write changed since its read stays local, and its record is cleared, whatever time a
+    /// diff recorded for it before the lock was taken, and the records written back, so a diff
+    /// reads the file rather than compare it by a time.
+    ///
     /// `handed` are the directories the commit adds or moves, settled as the others are, empty
     /// ones included. The host directories of those cleared go once the deletion list is
     /// rewritten. Answers whether every step completed with no error, swallowed ones included,
@@ -3754,8 +3762,17 @@ impl FuseFilesystem {
         served: &ServedContent,
         handed: Vec<RelativePath>,
     ) -> Result<bool, FuseProviderError> {
-        if self.local_files().is_none() {
+        let Some(local) = self.local_files() else {
             return Ok(true);
+        };
+        let stored = served.stored_files();
+        if let Some(mtime_max) = stored.iter().map(|file| file.mtime).max() {
+            // Boxed, once per commit: the probe's futures would otherwise sit in the commit's.
+            Box::pin(crate::state::wait_until_settled(
+                local.staging_dir(),
+                mtime_max,
+            ))
+            .await;
         }
         let _swaps = self.swap_plan().lock().await;
         if let Some(hook) = self.commit_hook() {
@@ -3768,7 +3785,7 @@ impl FuseFilesystem {
         let mut dirs = handed;
         let mut kept = Vec::new();
         let mut unheld = Vec::new();
-        for file in served.stored_files() {
+        for file in stored {
             match self.flip_to_tracked(&current, &file).await {
                 Ok(Flip::Flipped) => {
                     self.count_commit_outcome(true);
@@ -3799,8 +3816,12 @@ impl FuseFilesystem {
             }
         }
         let mut gone = Vec::new();
+        let cleared = !kept.is_empty();
         for file in kept {
             self.count_commit_outcome(false);
+            self.recorded_times()
+                .set(&repository, &file.spelled, 0)
+                .await;
             match self.keep_committed(&current, &file).await {
                 Ok(true) => dirs.push(file.spelled.parent_path()),
                 Ok(false) => gone.push(file.spelled),
@@ -3812,6 +3833,10 @@ impl FuseFilesystem {
                     clean = false;
                 }
             }
+        }
+        if cleared && let Err(error) = Box::pin(self.recorded_times().write_back(&repository)).await
+        {
+            lore_warn!("FUSE writing back the records a commit cleared failed: {error}");
         }
         // Unread, the list is left whole, and the settle stays owed.
         let listed = self.read_deletions().unwrap_or_else(|| {
@@ -3845,6 +3870,62 @@ impl FuseFilesystem {
             .await?;
         self.remove_settled_host_dirs(&current, &settled.cleared);
         Ok(clean && settled.clean)
+    }
+
+    /// Serves from the store each of `files`, local files whose content an operation read from
+    /// `served` and found to be what `revision` holds for their node, as [`Self::committed`] flips
+    /// the files a commit stored ([`Self::flip_to_tracked`]): a file a write changed since its
+    /// read stays local. Then, as after a commit, the deletion list keeps only the paths the
+    /// revision holds and the State does not serve from it, so a path a move recorded while the
+    /// file was read leaves it.
+    /// Serialized with swaps; where `served` is no longer the one served, or stands at another
+    /// revision, nothing is flipped. Answers how many files it flipped.
+    pub(crate) async fn serve_unchanged(
+        &self,
+        files: &[ServedFile],
+        served: &Arc<Served>,
+        revision: &State,
+    ) -> usize {
+        if self.local_files().is_none() || files.is_empty() {
+            return 0;
+        }
+        let _swaps = self.swap_plan().lock().await;
+        if let Some(hook) = self.commit_hook() {
+            hook().await;
+        }
+        let current = self.served();
+        if !Arc::ptr_eq(&current, served) || current.revision() != revision.revision() {
+            return 0;
+        }
+        let mut flipped = 0;
+        let mut unheld = Vec::new();
+        for file in files {
+            match self.flip_to_tracked(&current, file).await {
+                Ok(Flip::Flipped) => flipped += 1,
+                Ok(Flip::Kept) => {}
+                Ok(Flip::Unheld(held)) => unheld.push(*held),
+                Err(error) => lore_warn!(
+                    "FUSE serving '{}' from the store failed: {error}",
+                    file.spelled
+                ),
+            }
+        }
+        for (settled, file) in unheld.iter().enumerate() {
+            if settled % SETTLES_BETWEEN_YIELDS == SETTLES_BETWEEN_YIELDS - 1 {
+                tokio::task::yield_now().await;
+            }
+            flipped += usize::from(self.settle_unheld(&current, file));
+        }
+        if flipped > 0
+            && let Err(error) = self
+                .rewrite_deletions_for(&current, (revision, &current.repository))
+                .await
+        {
+            lore_warn!(
+                "FUSE rewriting the deletion list after serving files from the store failed: {error}"
+            );
+        }
+        flipped
     }
 
     /// Arms the settle a commit owes before its revision may become current ([`SettleOwed`]),

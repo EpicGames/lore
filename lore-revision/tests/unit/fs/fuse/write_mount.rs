@@ -10654,11 +10654,8 @@ async fn commit_in(
     token: &lore_revision::repository::RepositoryWriteToken,
     dry_run: bool,
 ) -> Result<Hash, String> {
-    use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreArray;
-    use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
-    use lore_revision::relay::EventDispatcher;
 
     LORE_CONTEXT
         .scope(
@@ -10672,6 +10669,20 @@ async fn commit_in(
         )
         .await
         .map_err(|error| format!("stage: {error}"))?;
+    commit_staged_in(context, token, dry_run).await
+}
+
+/// Commits what is staged through `context`, which holds `token`; answers the stored revision,
+/// or the error as text.
+async fn commit_staged_in(
+    context: Arc<lore_revision::repository::RepositoryContext>,
+    token: &lore_revision::repository::RepositoryWriteToken,
+    dry_run: bool,
+) -> Result<Hash, String> {
+    use lore_revision::interface::ExecutionContext;
+    use lore_revision::interface::LoreGlobalArgs;
+    use lore_revision::relay::EventDispatcher;
+
     let execution = Arc::new(ExecutionContext::new_client_with_user_id(
         LoreGlobalArgs {
             dry_run: u8::from(dry_run),
@@ -10696,7 +10707,14 @@ async fn commit_in(
 /// Stages the working tree through `fs`, as `lore stage` relayed to the service does; answers
 /// the staged revision, or the error as text.
 async fn stage_through(instance: &Instance, fs: &Arc<FuseFilesystem>) -> Result<Hash, String> {
-    stage_hosts_through(instance, fs, vec![instance.fixture.path.clone()]).await
+    stage_hosts_through(
+        instance,
+        fs,
+        vec![instance.fixture.path.clone()],
+        Default::default(),
+        Default::default(),
+    )
+    .await
 }
 
 /// [`stage_through`] of `paths` alone, as `lore stage <paths>` names them.
@@ -10709,13 +10727,17 @@ async fn stage_paths_through(
         .iter()
         .map(|path| instance.fixture.path.join(path))
         .collect();
-    stage_hosts_through(instance, fs, hosts).await
+    stage_hosts_through(instance, fs, hosts, Default::default(), Default::default()).await
 }
 
+/// Stages `hosts` through `fs` with `options` under `globals`, as `lore stage <hosts>` relayed to
+/// the service does; answers the staged revision, or the error as text.
 async fn stage_hosts_through(
     instance: &Instance,
     fs: &Arc<FuseFilesystem>,
     hosts: Vec<PathBuf>,
+    globals: lore_revision::interface::LoreGlobalArgs,
+    options: lore_revision::stage::StageOptions,
 ) -> Result<Hash, String> {
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreString;
@@ -10724,12 +10746,12 @@ async fn stage_hosts_through(
     let token = RepositoryWriteToken::acquire(&instance.fixture.path).await;
     LORE_CONTEXT
         .scope(
-            fuse_fixture::setup_test_execution(),
+            fuse_fixture::test_execution_with(globals),
             lore_revision::file::stage::stage(
                 instance.command_context(fs, Some(token.share())),
                 &token,
                 LoreArray::from_vec(hosts.iter().map(LoreString::from).collect()),
-                lore_revision::stage::StageOptions::default(),
+                options,
             ),
         )
         .await
@@ -10919,6 +10941,481 @@ async fn a_committed_file_is_served_from_the_revision_and_leaves_write() {
             assert_eq!(fs.served().revision(), revision);
             assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
             assert_eq!(fs.commit_outcomes(), (1, 0));
+        })
+        .await;
+}
+
+/// The paths a status through `fs` reports under the instance's write token, as `lore status`
+/// relayed to the service reports them.
+async fn changed_paths_holding_token(instance: &Instance, fs: &Arc<FuseFilesystem>) -> Vec<String> {
+    let token =
+        lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    staged_state::status_files(instance.command_context(fs, Some(token.share())), false)
+        .await
+        .into_keys()
+        .collect()
+}
+
+/// Asserts that `path` is served from the store: its node holds the address `revision` holds
+/// there, clean, and `write/` holds no copy of it.
+async fn assert_served_from(instance: &Instance, fs: &FuseFilesystem, path: &str, revision: Hash) {
+    assert!(
+        !instance.write_dir().join(path).exists(),
+        "write/{path} is left behind"
+    );
+    let node = fs_node(instance, fs, path).await;
+    assert_eq!(
+        node.address,
+        committed_node(instance, revision, path).await.address
+    );
+    assert!(!node.is_dirty() && !is_local(&node), "{node:?}");
+}
+
+/// Writes `path` through `fs` with other content of its size and writes `content`, what the
+/// revision holds there, back, which leaves it a local file holding the revision's content, and
+/// dates its host file an hour back, older than the clock a later diff reads; answers its inode.
+async fn rewrite_identically(
+    instance: &Instance,
+    fs: &FuseFilesystem,
+    path: &str,
+    content: &[u8],
+) -> u64 {
+    let ino = lookup_path(fs, path).await.expect(path);
+    fs.write(&request(), ino, 0, 0, &content.to_ascii_uppercase(), 0)
+        .await
+        .expect("write");
+    fs.write(&request(), ino, 0, 0, content, 0)
+        .await
+        .expect("write back");
+    set_host_time(
+        instance,
+        path,
+        std::time::SystemTime::now() - Duration::from_secs(3600),
+    );
+    ino
+}
+
+/// A file rewritten through the mount with the content the revision holds is served from the
+/// store by a status under the write token: its node takes the revision's address, clean, its
+/// inode turns store-served, and `write/` holds it no more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_under_the_token_serves_an_identical_rewrite_from_the_revision() {
+    let instance = Instance::new(&[("a.txt", b"alpha"), ("b.txt", b"bee")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = rewrite_identically(&instance, &fs, "a.txt", b"alpha").await;
+            assert!(is_local(&fs_node(&instance, &fs, "a.txt").await));
+
+            assert_eq!(
+                changed_paths_holding_token(&instance, &fs).await,
+                Vec::<String>::new()
+            );
+
+            assert_served_from(&instance, &fs, "a.txt", fs.served().revision()).await;
+            assert!(
+                !fs.inodes()
+                    .get(ino)
+                    .expect("the inode")
+                    .kind
+                    .is_local_file(),
+                "the inode still reads write/"
+            );
+            assert_eq!(read(&fs, ino, 64).await, b"alpha");
+            assert_eq!(fs.commit_outcomes(), (0, 0));
+        })
+        .await;
+}
+
+/// A status without the write token, which records nothing, leaves an identical rewrite local.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_without_the_token_leaves_an_identical_rewrite_local() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            rewrite_identically(&instance, &fs, "a.txt", b"alpha").await;
+
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+
+            assert!(instance.write_dir().join("a.txt").exists());
+            assert!(is_local(&fs_node(&instance, &fs, "a.txt").await));
+        })
+        .await;
+}
+
+/// A stage serves an identical rewrite from the store, as a status under the token does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_serves_an_identical_rewrite_from_the_revision() {
+    let instance = Instance::new(&[("a.txt", b"alpha"), ("b.txt", b"bee")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            rewrite_identically(&instance, &fs, "a.txt", b"alpha").await;
+
+            stage_through(&instance, &fs).await.expect("stage");
+
+            assert_served_from(&instance, &fs, "a.txt", fs.served().revision()).await;
+        })
+        .await;
+}
+
+/// A stage naming several directories serves the identical rewrites below them from the store
+/// once, as its operation ends, rather than once per directory it names.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_of_several_directories_serves_their_identical_rewrites_once() {
+    let instance = Instance::new(&[("d1/a.txt", b"alpha"), ("d2/b.txt", b"bee")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            rewrite_identically(&instance, &fs, "d1/a.txt", b"alpha").await;
+            rewrite_identically(&instance, &fs, "d2/b.txt", b"bee").await;
+            let serves = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            fs.set_commit_hook(commit_step(&fs, {
+                let serves = serves.clone();
+                move |_| {
+                    serves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async {}
+                }
+            }));
+
+            stage_paths_through(&instance, &fs, &["d1", "d2"])
+                .await
+                .expect("stage");
+
+            assert_eq!(serves.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let revision = fs.served().revision();
+            assert_served_from(&instance, &fs, "d1/a.txt", revision).await;
+            assert_served_from(&instance, &fs, "d2/b.txt", revision).await;
+        })
+        .await;
+}
+
+/// A write landing between a status's read of an identical rewrite and its flip keeps the file
+/// local, holding the write, and the next status reports it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_racing_the_flip_of_an_identical_rewrite_keeps_it_local() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = rewrite_identically(&instance, &fs, "a.txt", b"alpha").await;
+            fs.set_commit_hook(commit_step(&fs, move |fs| async move {
+                fs.write(&request(), ino, 0, 0, b"OMEGA", 0)
+                    .await
+                    .expect("the racing write");
+            }));
+
+            assert_eq!(
+                changed_paths_holding_token(&instance, &fs).await,
+                Vec::<String>::new()
+            );
+
+            assert!(instance.write_dir().join("a.txt").exists());
+            assert!(is_local(&fs_node(&instance, &fs, "a.txt").await));
+            assert_eq!(read(&fs, ino, 64).await, b"OMEGA");
+            assert_eq!(
+                changed_paths(&instance, &fs).await,
+                vec!["a.txt".to_string()]
+            );
+        })
+        .await;
+}
+
+/// A file moved away and back between a status's read of it and its flip is served from the
+/// store, and the deletion its move recorded leaves the list, so a remount serves the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_away_and_back_racing_the_flip_of_an_identical_rewrite_leaves_no_deletion() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            rewrite_identically(&instance, &fs, "a.txt", b"alpha").await;
+            fs.set_commit_hook(commit_step(&fs, |fs| async move {
+                fs.rename(&request(), ROOT_INO, b"a.txt", ROOT_INO, b"b.txt", 0)
+                    .await
+                    .expect("rename away");
+                fs.rename(&request(), ROOT_INO, b"b.txt", ROOT_INO, b"a.txt", 0)
+                    .await
+                    .expect("rename back");
+            }));
+
+            assert_eq!(
+                changed_paths_holding_token(&instance, &fs).await,
+                Vec::<String>::new()
+            );
+
+            assert_served_from(&instance, &fs, "a.txt", fs.served().revision()).await;
+            drop(fs);
+            let remounted = provider(&instance).await;
+            let ino = lookup(&remounted, ROOT_INO, "a.txt")
+                .await
+                .expect("a.txt survives the remount");
+            assert_eq!(read(&remounted, ino, 64).await, b"alpha");
+        })
+        .await;
+}
+
+/// A file a write rewrote with the committed content while a commit stored it stays local after
+/// the commit, and the next status under the write token serves it from the committed revision,
+/// once its time is older than the clock the status reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_serves_a_file_a_commit_left_local_holding_the_committed_content() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            fs.write(&request(), ino, 0, 0, b"ALPHA", 0)
+                .await
+                .expect("write");
+            let raced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            fs.set_commit_hook(commit_step(&fs, move |fs| {
+                let first = !raced.swap(true, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if first {
+                        fs.write(&request(), ino, 0, 0, b"ALPHA", 0)
+                            .await
+                            .expect("the racing write");
+                    }
+                }
+            }));
+            let revision = commit_through(&instance, &fs, false).await.expect("commit");
+            assert_eq!(fs.commit_outcomes(), (0, 1));
+            assert!(instance.write_dir().join("a.txt").exists());
+            set_host_time(
+                &instance,
+                "a.txt",
+                std::time::SystemTime::now() - Duration::from_secs(3600),
+            );
+
+            assert_eq!(
+                changed_paths_holding_token(&instance, &fs).await,
+                Vec::<String>::new()
+            );
+
+            assert_served_from(&instance, &fs, "a.txt", revision).await;
+            assert_eq!(read(&fs, ino, 64).await, b"ALPHA");
+        })
+        .await;
+}
+
+/// A local file no inode holds, holding the revision's content, is served from the store by a
+/// status under the write token, and a lookup makes a store-served inode of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_serves_an_unheld_identical_local_file_from_the_revision() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    plant(&instance, &[("a.txt", b"alpha")]);
+    std::fs::set_permissions(
+        instance.write_dir().join("a.txt"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .expect("the permissions a copy-up gives");
+    set_host_time(
+        &instance,
+        "a.txt",
+        std::time::SystemTime::now() - Duration::from_secs(3600),
+    );
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            assert!(is_local(&fs_node(&instance, &fs, "a.txt").await));
+
+            assert_eq!(
+                changed_paths_holding_token(&instance, &fs).await,
+                Vec::<String>::new()
+            );
+
+            assert_served_from(&instance, &fs, "a.txt", fs.served().revision()).await;
+            let ino = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            assert!(
+                !fs.inodes()
+                    .get(ino)
+                    .expect("the inode")
+                    .kind
+                    .is_local_file()
+            );
+            assert_eq!(read(&fs, ino, 64).await, b"alpha");
+        })
+        .await;
+}
+
+/// A file a status serves from the store reports the time it showed while local: the inode held
+/// across the flip, a lookup after a FORGET and a remount all report it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_a_status_serves_from_the_revision_reports_the_time_it_showed() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = rewrite_identically(&instance, &fs, "a.txt", b"alpha").await;
+            let shown = reported_time(&fs, ino).await;
+
+            assert_eq!(
+                changed_paths_holding_token(&instance, &fs).await,
+                Vec::<String>::new()
+            );
+
+            assert!(!instance.write_dir().join("a.txt").exists());
+            assert_eq!(reported_time(&fs, ino).await, shown, "held");
+            fs.forget(ino, 1);
+            let ino = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            assert_eq!(reported_time(&fs, ino).await, shown, "after a FORGET");
+            drop(fs);
+            let remounted = provider(&instance).await;
+            let ino = lookup(&remounted, ROOT_INO, "a.txt").await.expect("a.txt");
+            assert_eq!(
+                reported_time(&remounted, ino).await,
+                shown,
+                "after a remount"
+            );
+        })
+        .await;
+}
+
+/// A file moved away and back keeps its node over the deletion its move recorded, which the next
+/// mount applies unless `write/` holds the file: a status leaves it local though it holds the
+/// revision's content.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_leaves_an_identical_file_local_over_a_recorded_deletion() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            rewrite_identically(&instance, &fs, "a.txt", b"alpha").await;
+            fs.rename(&request(), ROOT_INO, b"a.txt", ROOT_INO, b"b.txt", 0)
+                .await
+                .expect("rename away");
+            fs.rename(&request(), ROOT_INO, b"b.txt", ROOT_INO, b"a.txt", 0)
+                .await
+                .expect("rename back");
+
+            changed_paths_holding_token(&instance, &fs).await;
+
+            assert!(instance.write_dir().join("a.txt").exists());
+            assert!(is_local(&fs_node(&instance, &fs, "a.txt").await));
+            drop(fs);
+            let remounted = provider(&instance).await;
+            let ino = lookup(&remounted, ROOT_INO, "a.txt")
+                .await
+                .expect("a.txt survives the remount");
+            assert_eq!(read(&remounted, ino, 64).await, b"alpha");
+        })
+        .await;
+}
+
+/// A file holding the revision's content whose permissions a chmod changed stays local after a
+/// status under the write token, keeping them: served from the store, it would report those of
+/// a file the store serves.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_leaves_an_identical_file_with_other_permissions_local() {
+    use lore_fuse::abi::SetattrIn;
+    use lore_fuse::abi::entry::setattr_valid;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            let chmod = SetattrIn {
+                valid: setattr_valid::MODE,
+                mode: libc::S_IFREG | 0o600,
+                ..SetattrIn::default()
+            };
+            fs.setattr(&request(), ino, &chmod).await.expect("chmod");
+
+            changed_paths_holding_token(&instance, &fs).await;
+
+            assert!(instance.write_dir().join("a.txt").exists());
+            assert_eq!(
+                fs.getattr(&request(), ino).await.expect("attr").attr.mode,
+                libc::S_IFREG | 0o600
+            );
+        })
+        .await;
+}
+
+/// A file holding the revision's content under a case-only respell stays local after a status
+/// under the write token: the revision spells it otherwise, so served from the store it would
+/// lose the respell at the next mount.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_leaves_an_identical_file_respelled_local() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            fs.rename(&request(), ROOT_INO, b"a.txt", ROOT_INO, b"A.txt", 0)
+                .await
+                .expect("the respell");
+            stage_hosts_through(
+                &instance,
+                &fs,
+                vec![instance.fixture.path.join("A.txt")],
+                Default::default(),
+                lore_revision::stage::StageOptions {
+                    case_change: lore_revision::stage::StageCaseChange::Rename,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("stage");
+
+            changed_paths_holding_token(&instance, &fs).await;
+
+            assert!(instance.write_dir().join("A.txt").exists());
+            drop(fs);
+            let remounted = provider(&instance).await;
+            assert_eq!(listed(&remounted, ROOT_INO).await, vec!["A.txt"]);
+        })
+        .await;
+}
+
+/// A dry-run stage writes nothing through the mount, so it leaves an identical rewrite local.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dry_run_stage_leaves_an_identical_rewrite_local() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            rewrite_identically(&instance, &fs, "a.txt", b"alpha").await;
+
+            stage_hosts_through(
+                &instance,
+                &fs,
+                vec![instance.fixture.path.clone()],
+                lore_revision::interface::LoreGlobalArgs {
+                    dry_run: 1,
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+            .await
+            .expect("the dry run");
+
+            assert!(instance.write_dir().join("a.txt").exists());
+            assert!(is_local(&fs_node(&instance, &fs, "a.txt").await));
+        })
+        .await;
+}
+
+/// A status without the write token records the time of an identical rewrite, which a later
+/// stage does not answer by: it reads the file, and serves it from the store.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_serves_an_identical_rewrite_a_status_without_the_token_timed() {
+    let instance = Instance::new(&[("a.txt", b"alpha"), ("b.txt", b"bee")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            rewrite_identically(&instance, &fs, "a.txt", b"alpha").await;
+            changed_paths(&instance, &fs).await;
+            assert!(instance.write_dir().join("a.txt").exists());
+
+            stage_through(&instance, &fs).await.expect("stage");
+
+            assert_served_from(&instance, &fs, "a.txt", fs.served().revision()).await;
         })
         .await;
 }
@@ -12844,7 +13341,8 @@ async fn a_commit_records_the_modification_time_of_a_local_file_written_before_i
 }
 
 /// A local file modified in or after the tick a commit reads its clock in has its modification time
-/// recorded too: a virtual clone compares no file by time, so no time is too recent to record.
+/// recorded too: the mount waits for the filesystem holding `write/` to stamp later before it serves
+/// the file from the store, so no time is too recent to record.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_commit_records_the_modification_time_of_a_local_file_written_after_its_clock() {
     let instance = Instance::new(&[("a.txt", b"alpha")]).await;
@@ -12867,6 +13365,474 @@ async fn a_commit_records_the_modification_time_of_a_local_file_written_after_it
 
             commit_through(&instance, &fs, false).await.expect("commit");
             assert_eq!(recorded_time(&instance, &fs, "a.txt").await, modified);
+        })
+        .await;
+}
+
+/// A commit holds its flips back until the filesystem holding `write/` stamps later than the
+/// latest time it recorded, up to the limit on the wait: a file dated an hour ahead holds them
+/// back for the whole limit, 10 ms.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_flips_its_files_once_the_clock_passed_the_times_it_recorded() {
+    use lore_revision::fs::fuse::filesystem::WriteStep;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            fs.write(&request(), ino, 0, 0, b"ONE..", 0)
+                .await
+                .expect("write");
+            set_host_time(
+                &instance,
+                "a.txt",
+                std::time::SystemTime::now() + Duration::from_secs(3600),
+            );
+            let reconciled = Arc::new(parking_lot::Mutex::new(None::<Instant>));
+            let held = Arc::new(parking_lot::Mutex::new(None::<Duration>));
+            fs.set_write_hook(Arc::new({
+                let reconciled = reconciled.clone();
+                move |step| {
+                    if step == WriteStep::Reconcile {
+                        *reconciled.lock() = Some(Instant::now());
+                    }
+                    true
+                }
+            }));
+            fs.set_commit_hook(commit_step(&fs, {
+                let held = held.clone();
+                move |_| {
+                    if let Some(reconciled) = *reconciled.lock() {
+                        held.lock().get_or_insert(reconciled.elapsed());
+                    }
+                    async {}
+                }
+            }));
+
+            commit_locked_through(&instance, &fs).await.expect("commit");
+
+            assert_eq!(fs.commit_outcomes(), (1, 0));
+            let held = held
+                .lock()
+                .expect("the flips ran after the reconcile began");
+            assert!(held >= Duration::from_millis(10), "flipped after {held:?}");
+        })
+        .await;
+}
+
+/// A file a write changes at its size while a commit stores it, dated back to the time the commit
+/// read, stays local with no recorded time: a status without the write token reads it and reports
+/// the change, rather than answering it by the time the commit recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_a_commit_left_local_has_its_recorded_time_cleared() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            fs.write(&request(), ino, 0, 0, b"ONE..", 0)
+                .await
+                .expect("write");
+            let read_at = std::time::SystemTime::now() - Duration::from_secs(3600);
+            set_host_time(&instance, "a.txt", read_at);
+            let host = instance.write_dir().join("a.txt");
+            let raced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            fs.set_commit_hook(commit_step(&fs, move |fs| {
+                let first = !raced.swap(true, std::sync::atomic::Ordering::SeqCst);
+                let host = host.clone();
+                async move {
+                    if first {
+                        fs.write(&request(), ino, 0, 0, b"TWO..", 0)
+                            .await
+                            .expect("the racing write");
+                        std::fs::File::options()
+                            .write(true)
+                            .open(&host)
+                            .expect("a.txt")
+                            .set_modified(read_at)
+                            .expect("a modified time");
+                    }
+                }
+            }));
+
+            commit_locked_through(&instance, &fs).await.expect("commit");
+            assert_eq!(fs.commit_outcomes(), (0, 1));
+            assert!(instance.write_dir().join("a.txt").exists());
+
+            assert_eq!(
+                changed_paths(&instance, &fs).await,
+                vec!["a.txt".to_string()]
+            );
+        })
+        .await;
+}
+
+/// A file a commit leaves local has its record cleared whatever time it holds, as one a status
+/// without the write token recorded for the file before the mount took the swaps lock, and the
+/// mount writes the records back before it settles the directories, ahead of the command's flush:
+/// a status reads the file and reports the change, and the records on disk then hold no time for
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_a_commit_left_local_has_any_recorded_time_cleared_and_written_back() {
+    use lore_revision::fs::fuse::filesystem::WriteStep;
+    use lore_revision::records::InstanceRecords;
+    use lore_revision::records::Lookup;
+    use lore_revision::records::RECORDS_DIR;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            fs.write(&request(), ino, 0, 0, b"ONE..", 0)
+                .await
+                .expect("write");
+            let raced_at = std::time::SystemTime::now() - Duration::from_secs(3600);
+            let raced_millis = raced_at
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a time after the epoch")
+                .as_millis() as u64;
+            let host = instance.write_dir().join("a.txt");
+            let raced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            fs.set_commit_hook(commit_step(&fs, move |fs| {
+                let first = !raced.swap(true, std::sync::atomic::Ordering::SeqCst);
+                let host = host.clone();
+                async move {
+                    if first {
+                        fs.write(&request(), ino, 0, 0, b"TWO..", 0)
+                            .await
+                            .expect("the racing write");
+                        std::fs::File::options()
+                            .write(true)
+                            .open(&host)
+                            .expect("a.txt")
+                            .set_modified(raced_at)
+                            .expect("a modified time");
+                        let served = fs.served();
+                        fs.recorded_times()
+                            .set(&served.repository, &relative("a.txt"), raced_millis)
+                            .await;
+                    }
+                }
+            }));
+            let records = instance.fixture.path.join(".lore").join(RECORDS_DIR);
+            let on_disk = TempDir::new("lore-fuse-records-at-the-settle-");
+            let copied = on_disk.path().join(RECORDS_DIR);
+            fs.set_write_hook(Arc::new(move |step| {
+                if step == WriteStep::DirectoriesSettled {
+                    copy_files(&records, &copied);
+                }
+                true
+            }));
+
+            commit_locked_through(&instance, &fs).await.expect("commit");
+            assert_eq!(fs.commit_outcomes(), (0, 1));
+
+            assert_eq!(
+                changed_paths(&instance, &fs).await,
+                vec!["a.txt".to_string()]
+            );
+            let key = lore_revision::state::file_modified_time_record_key(
+                instance.fixture.repository.salt(),
+                &relative("a.txt"),
+            );
+            let found = InstanceRecords::open(on_disk.path())
+                .await
+                .lookup(&key)
+                .await;
+            assert!(
+                matches!(found, Lookup::Missing(_) | Lookup::Recorded(0)),
+                "the records on disk hold {found:?} for a.txt"
+            );
+        })
+        .await;
+}
+
+/// Runs `lore sync <revision> --forward-changes` through `fs`, as relayed to the service, which
+/// keeps each local file in place.
+async fn sync_forwarding(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+    revision: Hash,
+) -> Result<(), lore_revision::revision::sync::SyncError> {
+    let options = lore_revision::revision::sync::SyncOptions {
+        revision: Some(revision.to_string()),
+        forward_changes: true,
+        ..Default::default()
+    };
+    sync_reporting(instance, fs, options, Default::default())
+        .await
+        .0
+}
+
+/// A local file a sync forwarding local changes keeps in place, where the target changes the
+/// file, has the time the swap recorded for its path cleared: a status without the write token
+/// reads the file, though it shows that time, and reports it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_file_a_forwarding_sync_keeps_has_the_time_of_the_swap_cleared() {
+    use lore_revision::fs::hold::SwapPhase;
+    use lore_revision::records::InstanceRecords;
+    use lore_revision::records::Lookup;
+
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = lookup_path(&fs, "dir/f.txt").await.expect("dir/f.txt");
+            fs.write(&request(), ino, 0, 0, b"TWO", 0)
+                .await
+                .expect("write");
+            let records = InstanceRecords::open(
+                instance
+                    .fixture
+                    .repository
+                    .dot_dir_path()
+                    .expect("a Lore directory"),
+            )
+            .await;
+            let key = lore_revision::state::file_modified_time_record_key(
+                instance.fixture.repository.salt(),
+                &relative("dir/f.txt"),
+            );
+            let host = instance.write_dir().join("dir/f.txt");
+            fs.set_swap_hook(Arc::new(move |phase| {
+                let (records, host) = (records.clone(), host.clone());
+                Box::pin(async move {
+                    if phase == SwapPhase::Removed
+                        && let Lookup::Recorded(swapped) = records.lookup(&key).await
+                    {
+                        std::fs::File::options()
+                            .write(true)
+                            .open(&host)
+                            .expect("dir/f.txt")
+                            .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(swapped))
+                            .expect("the swap's time");
+                    }
+                    true
+                })
+            }));
+
+            sync_forwarding(&instance, &fs, first).await.expect("sync");
+
+            assert_eq!(served_at(&fs, "dir/f.txt").await, b"TWO");
+            assert_eq!(
+                changed_paths(&instance, &fs).await,
+                vec!["dir/f.txt".to_string()]
+            );
+        })
+        .await;
+}
+
+/// A status without the write token that read a local file holding the content of the revision
+/// it began at, while a sync forwarding local changes moved the mount to a revision changing the
+/// file and kept the file in place, records no time for the file: the next status reads it and
+/// reports it. A first status records the file's time, which opens the records to lookups, and
+/// the file is then dated back again, so the second reads it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_records_no_time_for_a_file_a_sync_moved_the_mount_away_from() {
+    use lore_revision::records::InstanceRecords;
+
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            rewrite_identically(&instance, &fs, "dir/f.txt", b"two").await;
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+            set_host_time(
+                &instance,
+                "dir/f.txt",
+                std::time::SystemTime::now() - Duration::from_secs(7200),
+            );
+            let records = InstanceRecords::open(
+                instance
+                    .fixture
+                    .repository
+                    .dot_dir_path()
+                    .expect("a Lore directory"),
+            )
+            .await;
+            let pause = records.lookup_pause();
+            pause.arm();
+
+            tokio::join!(changed_paths(&instance, &fs), async {
+                tokio::time::timeout(Duration::from_secs(30), pause.reached())
+                    .await
+                    .expect("the status looks dir/f.txt up");
+                sync_forwarding(&instance, &fs, first).await.expect("sync");
+                pause.resume();
+            });
+
+            assert_eq!(fs.served().revision(), first);
+            assert_eq!(
+                changed_paths(&instance, &fs).await,
+                vec!["dir/f.txt".to_string()]
+            );
+        })
+        .await;
+}
+
+/// The time recorded for `path` in the instance's records.
+async fn record_of(instance: &Instance, path: &str) -> lore_revision::records::Lookup {
+    let records = lore_revision::records::InstanceRecords::open(
+        instance
+            .fixture
+            .repository
+            .dot_dir_path()
+            .expect("a Lore directory"),
+    )
+    .await;
+    let key = lore_revision::state::file_modified_time_record_key(
+        instance.fixture.repository.salt(),
+        &relative(path),
+    );
+    records.lookup(&key).await
+}
+
+/// Rewrites `path` with `content`, which its node holds, has a status record its time, then dates
+/// the file back, so the next status without the write token reads it and records its time.
+async fn identical_rewrite_to_record(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+    path: &str,
+    content: &[u8],
+) {
+    rewrite_identically(instance, fs, path, content).await;
+    assert!(
+        !changed_paths(instance, fs)
+            .await
+            .contains(&path.to_string())
+    );
+    set_host_time(
+        instance,
+        path,
+        std::time::SystemTime::now() - Duration::from_secs(7200),
+    );
+}
+
+/// A hook step that tells `reached` it runs, then waits for `resume`.
+fn pause_at(
+    reached: &Arc<tokio::sync::Notify>,
+    resume: &Arc<tokio::sync::Notify>,
+) -> impl Fn(Arc<FuseFilesystem>) -> lore_revision::BoxFuture<'static, ()> + Send + Sync + 'static {
+    let (reached, resume) = (reached.clone(), resume.clone());
+    let armed = std::sync::atomic::AtomicBool::new(true);
+    move |_| {
+        let pauses = armed.swap(false, std::sync::atomic::Ordering::SeqCst);
+        let (reached, resume) = (reached.clone(), resume.clone());
+        Box::pin(async move {
+            if pauses {
+                reached.notify_one();
+                resume.notified().await;
+            }
+        })
+    }
+}
+
+/// A status without the write token that compares a local file while a swap holds the swaps lock
+/// records no time for it, though the swap leaves the file and its node as they stand.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_records_no_time_while_a_swap_holds_the_mount() {
+    use lore_revision::fs::hold::SwapPhase;
+
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            identical_rewrite_to_record(&instance, &fs, "keep/k.txt", b"kept").await;
+            let before = record_of(&instance, "keep/k.txt").await;
+            let (reached, resume) = (
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(tokio::sync::Notify::new()),
+            );
+            fs.set_swap_hook(at_first(
+                &fs,
+                SwapPhase::Removed,
+                pause_at(&reached, &resume),
+            ));
+
+            let (synced, during) = tokio::join!(sync_forwarding(&instance, &fs, first), async {
+                tokio::time::timeout(Duration::from_secs(30), reached.notified())
+                    .await
+                    .expect("the swap reaches its removals");
+                changed_paths(&instance, &fs).await;
+                let during = record_of(&instance, "keep/k.txt").await;
+                resume.notify_one();
+                during
+            });
+
+            synced.expect("sync");
+            assert_eq!(during, before);
+        })
+        .await;
+}
+
+/// A status without the write token that looked a local file up before a commit took the swaps
+/// lock, and compares the file while the commit holds it, records no time for it: the mount still
+/// stands at the revision the status compares against until the commit hands it the new one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_records_no_time_while_a_commit_holds_the_mount() {
+    use lore_revision::records::InstanceRecords;
+
+    let instance = Instance::new(&[("a.txt", b"alpha"), ("b.txt", b"bravo")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            create_with(&fs, ROOT_INO, "n.txt", b"new").await;
+            stage_paths_through(&instance, &fs, &["n.txt"])
+                .await
+                .expect("stage");
+            identical_rewrite_to_record(&instance, &fs, "b.txt", b"bravo").await;
+            let before = record_of(&instance, "b.txt").await;
+            let records = InstanceRecords::open(
+                instance
+                    .fixture
+                    .repository
+                    .dot_dir_path()
+                    .expect("a Lore directory"),
+            )
+            .await;
+            let lookup = records.lookup_pause();
+            lookup.arm();
+            let token =
+                lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path)
+                    .await;
+            let context = instance.locked_command_context(&fs, token.share()).await;
+            let (reached, resume, compared) = (
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(tokio::sync::Notify::new()),
+            );
+            fs.set_commit_hook(commit_step(&fs, pause_at(&reached, &resume)));
+
+            let (_, committed, during) = tokio::join!(
+                async {
+                    changed_paths(&instance, &fs).await;
+                    compared.notify_one();
+                },
+                async {
+                    tokio::time::timeout(Duration::from_secs(30), lookup.reached())
+                        .await
+                        .expect("the status looks b.txt up");
+                    commit_staged_in(context, &token, false).await
+                },
+                async {
+                    tokio::time::timeout(Duration::from_secs(30), reached.notified())
+                        .await
+                        .expect("the commit takes the swaps lock");
+                    lookup.resume();
+                    compared.notified().await;
+                    let during = record_of(&instance, "b.txt").await;
+                    resume.notify_one();
+                    during
+                }
+            );
+
+            committed.expect("commit");
+            assert_eq!(during, before);
         })
         .await;
 }
@@ -13346,13 +14312,19 @@ async fn a_file_created_after_an_unlink_with_the_recorded_time_is_staged() {
             fs.forget(ino, 1);
             let millisecond = std::time::SystemTime::now() - Duration::from_secs(3600);
             set_host_time(&instance, "a.txt", millisecond);
-            stage_through(&instance, &fs).await.expect("stage a.txt");
-            commit_staged(&instance, &fs).await.expect("commit a.txt");
-            assert_ne!(
-                recorded_time(&instance, &fs, "a.txt").await,
-                0,
-                "the commit recorded a time for a.txt"
+            let shown = lore_revision::util::fs::file_mtime(
+                &std::fs::metadata(instance.write_dir().join("a.txt")).expect("a.txt"),
             );
+            commit_locked_through(&instance, &fs)
+                .await
+                .expect("commit a.txt");
+            let served = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            assert_eq!(
+                reported_time(&fs, served).await,
+                shown,
+                "the commit recorded a.txt's time"
+            );
+            fs.forget(served, 1);
             fs.unlink(&request(), ROOT_INO, b"a.txt")
                 .await
                 .expect("unlink a.txt");
@@ -13360,7 +14332,7 @@ async fn a_file_created_after_an_unlink_with_the_recorded_time_is_staged() {
             set_host_time(&instance, "a.txt", millisecond);
             fs.forget(created, 1);
 
-            let revision = commit_through(&instance, &fs, false)
+            let revision = commit_locked_through(&instance, &fs)
                 .await
                 .expect("the next commit stages the new file");
             assert_eq!(

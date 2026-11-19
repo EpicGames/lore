@@ -47,6 +47,19 @@ impl AttrContext {
 const BLOCK_SIZE: u64 = 512;
 const NAME_MAX: u32 = 255;
 
+/// The permission bits of a file served from the store, before a writable mount adds the
+/// owner's write bit.
+fn file_permissions(executable: bool) -> u32 {
+    if executable { 0o555 } else { 0o444 }
+}
+
+/// The permission bits a writable mount reports for a file it serves from the store, with the
+/// owner's write bit it adds (`FuseFilesystem::entry_attr`), and those a copy-up gives the file's
+/// host copy.
+pub fn served_file_permissions(executable: bool) -> u32 {
+    file_permissions(executable) | libc::S_IWUSR
+}
+
 /// Attributes of an entry from what the inode holds. A local file or symlink reports its host
 /// file's instead ([`host_attr`]); this answers for one only while no host file is at hand.
 pub fn attr_for(entry: &InodeEntry, ctx: &AttrContext) -> Attr {
@@ -54,14 +67,11 @@ pub fn attr_for(entry: &InodeEntry, ctx: &AttrContext) -> Attr {
         InodeKind::Dir { .. } => (libc::S_IFDIR | 0o555, 0, 1),
         InodeKind::File {
             size, executable, ..
-        } => {
-            let permissions = if executable { 0o555 } else { 0o444 };
-            (
-                libc::S_IFREG | permissions,
-                size,
-                u32::from(!entry.orphaned),
-            )
-        }
+        } => (
+            libc::S_IFREG | file_permissions(executable),
+            size,
+            u32::from(!entry.orphaned),
+        ),
         InodeKind::Symlink => (libc::S_IFLNK | 0o777, 0, 1),
     };
     let millis = recorded_or_base(entry.mtime, ctx.base_time);
@@ -127,8 +137,10 @@ pub fn statfs(ctx: &AttrContext, tree_bytes: u64, node_slots: u64) -> Kstatfs {
 /// stores on disk share: a swap records its time for each path it changes, before it publishes,
 /// an operation that serves files from the store again sets its time for each before it serves it
 /// and writes them back as it ends, and a commit records the time it read for each file it
-/// stores. The mount's scans compare addresses and read no record, so a record only answers what
-/// the mount reports. A copy of the Lore directory carries them.
+/// stores. A record answers what the mount reports for a file it serves from the store. A local
+/// file reports its host file's time, and a diff compares the file by its record before reading
+/// it, and records the time it shows where it finds it holding the current revision's content
+/// ([`Self::replace`]). A copy of the Lore directory carries them.
 ///
 /// A new instance records none, so until a time is recorded every path reports the base time and
 /// no lookup is made. The gate opens at mount where the records hold a shard file, and once a time
@@ -184,7 +196,8 @@ impl RecordedTimes {
     }
 
     /// Sets `mtime` for `path` in the instance's records, where a lookup sees it at once, ahead of
-    /// [`Self::write_back`]. Awaited per file an operation serves from the store again.
+    /// [`Self::write_back`]. Awaited per file an operation serves from the store again, and per
+    /// local file a swap or a commit leaves local, cleared to 0.
     ///
     /// Answers the records' own future, with the key taken, so it holds no path.
     pub fn set<'a>(
@@ -195,6 +208,23 @@ impl RecordedTimes {
     ) -> impl Future<Output = ()> + 'a {
         self.records.set(
             file_modified_time_record_key(repository.salt(), path),
+            mtime,
+        )
+    }
+
+    /// Sets `mtime` for `path` in the instance's records, as [`Self::set`] does, where the records
+    /// still hold `expected` for it, the time read before a diff compared the file, 0 for none:
+    /// a time a swap, a commit or a restore set since is the one the path is served with.
+    pub fn replace<'a>(
+        &'a self,
+        repository: &RepositoryContext,
+        path: &RelativePath,
+        expected: u64,
+        mtime: u64,
+    ) -> impl Future<Output = ()> + 'a {
+        self.records.replace(
+            file_modified_time_record_key(repository.salt(), path),
+            expected,
             mtime,
         )
     }

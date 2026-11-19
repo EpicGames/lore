@@ -10881,8 +10881,10 @@ pub enum NodeComparison {
 /// several nodes passes one across them and the file is read no more than the answers require; a
 /// caller asking once passes a fresh one.
 ///
-/// Reads no recorded modification time and records none: a recorded time speaks for the current
-/// revision's node, and this answers about any node. Reads the operation's clock floor
+/// Reads no recorded modification time: a recorded time speaks for the current revision's node,
+/// and this answers about any node. `file_mtime` is the modification time the caller read for the
+/// file, 0 where it read none, which a provider serving a matching file from the store records for
+/// it ([`InstanceOperation::file_holds_content`]). Reads the operation's clock floor
 /// ([`InstanceOperationImpl::clock_floor`]) before reading the file, so a time recorded from what
 /// the read establishes is compared against a clock read before it.
 ///
@@ -10892,6 +10894,7 @@ pub fn file_matches_node<'a>(
     repository: Arc<RepositoryContext>,
     node: &'a Node,
     file_size: u64,
+    file_mtime: u64,
     file_path: &'a impl WalkPath,
     operation: &'a InstanceOperationImpl,
     established: &'a lore_storage::ContentHashes,
@@ -10912,6 +10915,7 @@ pub fn file_matches_node<'a>(
             .file_holds_content(
                 repository,
                 &file_path.to_path(),
+                file_mtime,
                 node.address,
                 node.size,
                 established,
@@ -11034,6 +11038,7 @@ pub async fn file_modification(
             repository,
             node,
             file_size,
+            file_mtime,
             file_path,
             operation,
             established,
@@ -11056,7 +11061,7 @@ pub async fn file_modification(
 /// spares the next scan the hash check this one just paid for. A time not older than the
 /// filesystem clock the operation read before reading the file is not recorded: a write after
 /// the read may share it ([`InstanceOperationImpl::clock_floor`]). Nothing is recorded through a
-/// provider that holds its state, whose comparisons read no recorded time.
+/// provider that holds its state, which keeps the times its own diffs compare by.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -11160,8 +11165,9 @@ impl RecordedModifiedTimes {
     /// none of them can be shared by a write that follows — bounded, so a filesystem that does not
     /// appear to move on is left with times a following write can still share rather than being
     /// waited on forever. See [`wait_until_settled`]. A collector with a floor holds only times
-    /// older than a stamp the filesystem has already given, so it has nothing to wait for, and
-    /// nothing waits for a provider that holds its state, which compares no file by time.
+    /// older than a stamp the filesystem has already given, so it has nothing to wait for. A
+    /// provider that holds its state waits on the filesystem holding its local files, as it serves
+    /// the files a commit stored.
     pub async fn store(&self, repository: Arc<RepositoryContext>) {
         let store = match repository.try_mutable_store_arc() {
             Some(store) if !execution_context().globals().dry_run() => store,
@@ -11229,8 +11235,12 @@ impl RecordedModifiedTimes {
             }
         }
 
-        if self.floor == u64::MAX && mtime_max != 0 && !repository.file_system().holds_state() {
-            wait_until_settled(&repository, mtime_max).await;
+        if self.floor == u64::MAX
+            && mtime_max != 0
+            && !repository.file_system().holds_state()
+            && let Ok(dot_dir) = repository.dot_dir_path()
+        {
+            wait_until_settled(dot_dir, mtime_max).await;
         }
     }
 
@@ -11340,6 +11350,26 @@ pub(crate) async fn read_clock_floor(repository: &RepositoryContext) -> u64 {
     filesystem_stamp_now(repository).await.unwrap_or(0)
 }
 
+/// [`read_clock_floor`] of the filesystem that holds `dir`, stamped with a probe of its own in
+/// `dir`, so several readers can stamp there at once.
+#[cfg(target_os = "linux")]
+pub(crate) async fn read_clock_floor_in(dir: &std::path::Path) -> u64 {
+    if crate::runtime::try_execution_context().is_some_and(|context| context.globals().dry_run()) {
+        return 0;
+    }
+    stamp_and_remove_probe(&probe_of_its_own(dir))
+        .await
+        .unwrap_or(0)
+}
+
+/// A probe path in `dir` no other stamp in this process takes, so stamps made there at once each
+/// read their own probe.
+fn probe_of_its_own(dir: &std::path::Path) -> std::path::PathBuf {
+    static PROBES: AtomicU64 = AtomicU64::new(0);
+    let probe = PROBES.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("{MODIFIED_TIME_PROBE}-{probe}"))
+}
+
 /// The time the working copy's filesystem is currently stamping writes with.
 ///
 /// A file's modified time comes from a clock the filesystem advances on its own schedule and
@@ -11364,15 +11394,16 @@ async fn stamp_and_remove_probe(path: &std::path::Path) -> Option<u64> {
 }
 
 /// A time older than the modified time of any file written from now on to the filesystem that
-/// holds `dir`: one millisecond before the stamp a probe written in `dir` gets. The probe is
-/// removed once read.
+/// holds `dir`: one millisecond before the stamp a probe of its own written in `dir` gets
+/// ([`probe_of_its_own`]), so reads made at once each stamp their own. The probe is removed once
+/// read.
 ///
 /// The process clock where `dir` is `None` or cannot be stamped. A file written within the
 /// filesystem's clock tick can then carry the time returned.
 #[lore_macro::test_pub]
 pub(crate) async fn time_before_next_write(dir: Option<&std::path::Path>) -> u64 {
     let stamp = match dir {
-        Some(dir) => stamp_and_remove_probe(&dir.join(MODIFIED_TIME_PROBE)).await,
+        Some(dir) => stamp_and_remove_probe(&probe_of_its_own(dir)).await,
         None => None,
     };
     match stamp {
@@ -11381,7 +11412,7 @@ pub(crate) async fn time_before_next_write(dir: Option<&std::path::Path>) -> u64
     }
 }
 
-/// Waits until the working copy's filesystem stamps later than `mtime_max`.
+/// Waits until the filesystem holding `dir` stamps later than `mtime_max`, probed in `dir`.
 ///
 /// A file carrying the stamp the filesystem is still handing out can be written again without
 /// that stamp changing, so a time recorded for it cannot tell the two states apart. Holding
@@ -11395,14 +11426,9 @@ pub(crate) async fn time_before_next_write(dir: Option<&std::path::Path>) -> u64
 /// wait that cannot get an answer.
 ///
 /// The probe is removed on the way out however the wait ended, so a stamp file is not left
-/// behind in the dot directory.
-///
-/// Returns without waiting when the working copy cannot be stamped, which leaves no way to
-/// tell whether the times have settled.
-pub async fn wait_until_settled(repository: &RepositoryContext, mtime_max: u64) {
-    let Some(path) = modified_time_probe_path(repository) else {
-        return;
-    };
+/// behind in `dir`.
+pub async fn wait_until_settled(dir: &std::path::Path, mtime_max: u64) {
+    let path = dir.join(MODIFIED_TIME_PROBE);
     let _ = tokio::time::timeout(MODIFIED_TIME_SETTLE_LIMIT, async {
         while stamp_probe(&path)
             .await

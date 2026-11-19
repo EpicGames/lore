@@ -909,6 +909,10 @@ pub trait InstanceOperation: Send + Sync {
     /// of one can ask about either. Reads no recorded modification time: a recorded time speaks
     /// for the node the current revision holds and answers for no other.
     ///
+    /// `mtime` is the modification time the caller read for the file before asking, 0 where it read
+    /// none. A provider that serves a matching file from the store records that time for it; the
+    /// others ignore it.
+    ///
     /// `established` carries what comparing this file has already settled, so a caller measuring
     /// one path against several addresses reads it no more than the answers require. A provider
     /// answering without reading leaves it untouched.
@@ -916,6 +920,7 @@ pub trait InstanceOperation: Send + Sync {
         &self,
         repository: Arc<RepositoryContext>,
         path: &RelativePath,
+        mtime: u64,
         previous: Address,
         previous_size: u64,
         established: &lore_storage::ContentHashes,
@@ -1095,7 +1100,8 @@ pub trait InstanceOperation: Send + Sync {
     }
 
     /// Takes that a commit of the instance's repository stored the content read at `path` through
-    /// this operation as `address`, `size` bytes long, with `mode`. The commit tells it of each
+    /// this operation as `address`, `size` bytes long, with `mode`, from a file that showed
+    /// `mtime` before the commit read it, the time it records for the path. The commit tells it of each
     /// file it reads from the working tree, before it hands over the revision holding them
     /// ([`committed`](Self::committed)), and of no view-excluded file, whose content it takes
     /// from the staged node. A dry run, and a commit that fails, tells of the content it stored
@@ -1107,7 +1113,8 @@ pub trait InstanceOperation: Send + Sync {
     /// - **`OsFilesystem`**, **`SWFS`**: nothing, the default.
     /// - **FUSE**: keeps it with what it recorded of the file as it served it, which `committed`
     ///   serves the file from without resolving its path again.
-    fn stored(&self, _path: &RelativePath, _address: Address, _size: u64, _mode: u16) {}
+    fn stored(&self, _path: &RelativePath, _address: Address, _size: u64, _mode: u16, _mtime: u64) {
+    }
 
     /// Takes `committed`, the revision a commit of the instance's repository stored, made current
     /// and flushed, as the revision the working tree stands at, from the files read through this
@@ -1240,7 +1247,9 @@ impl InstanceOperationImpl {
     /// The filesystem clock of `repository`'s working copy as the operation first asked for it,
     /// read then ([`crate::state::read_clock_floor`]): a file the operation reads after asking
     /// may record its time only where it is older, so no write after the read shares it. No
-    /// floor, `u64::MAX`, for a provider that holds its state: it compares no file by time.
+    /// floor, `u64::MAX`, for a provider that holds its state: a commit there records the time of
+    /// each file it stores however recent, and a diff's comparison records against the floor the
+    /// provider reads itself (`record_local_time`).
     pub async fn clock_floor(&self, repository: &RepositoryContext) -> u64 {
         if self.holds_state {
             return u64::MAX;
@@ -1340,8 +1349,9 @@ impl InstanceOperationImpl {
     /// - **`OsOperation`**: Nothing to finish, the writes having gone to the filesystem the
     ///   reads come from.
     /// - **`SWFS`**: Thaws the filesystem, clearing the write cache where writes were made.
-    /// - **`FuseOperation`**: Records the time of the files the operation served from the store
-    ///   again.
+    /// - **`FuseOperation`**: Serves from the store the local files a marking diff under the
+    ///   command's write token found unchanged, then writes back the time of the files the
+    ///   operation served from the store again.
     pub async fn finalize(&self) -> Result<(), FsError> {
         if !self.claim_finalize() {
             return Err(FsError::internal("Operation already finalized"));
@@ -1421,6 +1431,46 @@ impl InstanceOperationImpl {
             && self.holds_state
         {
             this.owe_settle().await;
+        }
+    }
+
+    /// Whether the operation is a dry run's, which writes nothing.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn dry_run(&self) -> bool {
+        self.dry_run
+    }
+
+    /// The time recorded for `path`, where the provider compares a local file of its State by it
+    /// before reading it, as an instance on disk compares each file: 0 for none, and `None`
+    /// where the provider reads the file instead.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn recorded_local_time(
+        &self,
+        repository: &RepositoryContext,
+        path: &RelativePath,
+    ) -> Option<u64> {
+        match &self.dispatch {
+            StaticDispatchInstanceOperation::Fuse(this) => {
+                this.recorded_time(repository, path).await
+            }
+            _ => None,
+        }
+    }
+
+    /// Records `mtime` for `path`, a local file a diff found holding the content of `revision`,
+    /// the diff's current revision, after [`Self::recorded_local_time`] answered `expected` for
+    /// it.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn record_local_time(
+        &self,
+        repository: &RepositoryContext,
+        path: &RelativePath,
+        times: (u64, u64),
+        revision: crate::lore::Hash,
+    ) {
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch {
+            this.record_compared_time(repository, path, times, revision)
+                .await;
         }
     }
 
@@ -1700,6 +1750,7 @@ impl InstanceOperation for InstanceOperationImpl {
         &self,
         repository: Arc<RepositoryContext>,
         path: &RelativePath,
+        mtime: u64,
         previous: Address,
         previous_size: u64,
         established: &lore_storage::ContentHashes,
@@ -1707,21 +1758,49 @@ impl InstanceOperation for InstanceOperationImpl {
         match &self.dispatch {
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => {
-                this.file_holds_content(repository, path, previous, previous_size, established)
-                    .await
+                this.file_holds_content(
+                    repository,
+                    path,
+                    mtime,
+                    previous,
+                    previous_size,
+                    established,
+                )
+                .await
             }
             StaticDispatchInstanceOperation::Os(this) => {
-                this.file_holds_content(repository, path, previous, previous_size, established)
-                    .await
+                this.file_holds_content(
+                    repository,
+                    path,
+                    mtime,
+                    previous,
+                    previous_size,
+                    established,
+                )
+                .await
             }
             StaticDispatchInstanceOperation::Swfs(this) => {
-                this.file_holds_content(repository, path, previous, previous_size, established)
-                    .await
+                this.file_holds_content(
+                    repository,
+                    path,
+                    mtime,
+                    previous,
+                    previous_size,
+                    established,
+                )
+                .await
             }
             #[cfg(target_os = "linux")]
             StaticDispatchInstanceOperation::Fuse(this) => {
-                this.file_holds_content(repository, path, previous, previous_size, established)
-                    .await
+                this.file_holds_content(
+                    repository,
+                    path,
+                    mtime,
+                    previous,
+                    previous_size,
+                    established,
+                )
+                .await
             }
         }
     }
@@ -1956,17 +2035,25 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    fn stored(&self, path: &RelativePath, address: Address, size: u64, mode: u16) {
+    fn stored(&self, path: &RelativePath, address: Address, size: u64, mode: u16, mtime: u64) {
         if !self.holds_state {
             return;
         }
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(this) => this.stored(path, address, size, mode),
-            StaticDispatchInstanceOperation::Os(this) => this.stored(path, address, size, mode),
-            StaticDispatchInstanceOperation::Swfs(this) => this.stored(path, address, size, mode),
+            StaticDispatchInstanceOperation::Test(this) => {
+                this.stored(path, address, size, mode, mtime);
+            }
+            StaticDispatchInstanceOperation::Os(this) => {
+                this.stored(path, address, size, mode, mtime);
+            }
+            StaticDispatchInstanceOperation::Swfs(this) => {
+                this.stored(path, address, size, mode, mtime);
+            }
             #[cfg(target_os = "linux")]
-            StaticDispatchInstanceOperation::Fuse(this) => this.stored(path, address, size, mode),
+            StaticDispatchInstanceOperation::Fuse(this) => {
+                this.stored(path, address, size, mode, mtime);
+            }
         }
     }
 
@@ -2265,6 +2352,7 @@ pub mod test_util {
             &self,
             repository: Arc<RepositoryContext>,
             path: &RelativePath,
+            mtime: u64,
             previous: Address,
             previous_size: u64,
             established: &lore_storage::ContentHashes,
@@ -2272,7 +2360,14 @@ pub mod test_util {
             match &self.reads {
                 Some(reads) => {
                     reads
-                        .file_holds_content(repository, path, previous, previous_size, established)
+                        .file_holds_content(
+                            repository,
+                            path,
+                            mtime,
+                            previous,
+                            previous_size,
+                            established,
+                        )
                         .await
                 }
                 None => panic!("Test operation unimplemented except finalize"),
@@ -2381,7 +2476,7 @@ pub mod test_util {
         }
 
         /// Records what was stored, and whether a revision had been handed over before.
-        fn stored(&self, path: &RelativePath, address: Address, size: u64, mode: u16) {
+        fn stored(&self, path: &RelativePath, address: Address, size: u64, mode: u16, _mtime: u64) {
             let handed_over = !self.committed_calls.lock().is_empty();
             self.stored_calls.lock().push((
                 path.as_str().to_owned(),

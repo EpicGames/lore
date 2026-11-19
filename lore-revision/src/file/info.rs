@@ -550,6 +550,7 @@ async fn compare_to_node(
         repository.clone(),
         node,
         file_size,
+        0,
         relative_path,
         operation,
         &lore_storage::ContentHashes::default(),

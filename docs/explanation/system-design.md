@@ -1756,12 +1756,16 @@ the process releases them, and an instance an older client created still reads a
 the mutable store when its own records hold none. This is what keeps a full scan linear
 in file count rather than in total bytes: most files are dismissed on metadata alone.
 
-A FUSE instance compares no file by time. It holds the working tree as a state tree, so
-a scan diffs addresses and descends only where either side is dirty, and a single file is
-compared by address, or by content where it was written. Its records instead hold the time the
-mount reports for each file it serves from the store: a sync or switch records its time for
-the paths it changes, a reset to the content the mount serves a time read as it serves the first
-such file, and a commit the time of each file it stores.
+A FUSE instance holds the working tree as a state tree, so a scan diffs addresses and descends only
+where either side is dirty, and a file the mount serves from the store is compared by address. Its
+records hold the time the mount reports for each such file, recorded by the operation that serves
+it. A file written through the mount is held locally. A plain status compares it as an instance on
+disk compares a file, by size and recorded time, reading it only where those differ and recording
+its time once its content matches. A stage, and a status that updates dirty flags, read every such
+file, and the mount serves one that holds the revision's content from the store again, as it does a
+file a commit stores. A recorded time stands only for content read after no write could still carry
+that time, and only for the revision the mount serves, and a file returns to the store only while
+it still shows the time that was read, so no write racing a status, a stage or a commit is missed.
 
 #### 15.3 Paths into the dirty set
 

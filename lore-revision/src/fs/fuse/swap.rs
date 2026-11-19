@@ -561,6 +561,7 @@ async fn swap_through(
     }
     let mut reconciled = Vec::new();
     let mut overwritten = Vec::new();
+    let mut kept = Vec::new();
     let result = fs
         .scoped(Box::pin(hold::apply(
             (&host, paths),
@@ -568,11 +569,14 @@ async fn swap_through(
             (options, &matching),
             &mut applying.changed,
             reads,
-            (&unsettled, &mut reconciled, &mut overwritten),
+            (&unsettled, &mut reconciled, &mut overwritten, &mut kept),
             fs.swap_hook(),
         )))
         .await
         .forward_any::<FsError>("applying the target revision to the served State");
+    if !kept.is_empty() {
+        Box::pin(clear_kept_times(fs, &repository, &kept)).await;
+    }
     let tree = match result {
         Ok(()) => target
             .tree(repository.clone())
@@ -764,6 +768,23 @@ impl Drop for Applying<'_> {
     }
 }
 
+/// Clears the time a swap recorded for each of `kept`, the local files its apply left in place,
+/// which report their own time, and writes the records back, so a diff reads each file rather than
+/// compare it by the swap's time. A failed write-back is logged, as the swap has applied.
+async fn clear_kept_times(
+    fs: &FuseFilesystem,
+    repository: &RepositoryContext,
+    kept: &[RelativePath],
+) {
+    let times = fs.recorded_times();
+    for path in kept {
+        times.set(repository, path, 0).await;
+    }
+    if let Err(error) = times.write_back(repository).await {
+        lore_warn!("FUSE writing back the records of the local files a swap kept failed: {error}");
+    }
+}
+
 /// The directory nodes, sorted, of the inodes the kernel holds at the paths `changes` delete,
 /// move away or turn into files, and at `reconciled`, which the State still holds after the
 /// apply, as where they hold local content. Each parent directory is resolved once.
@@ -903,7 +924,7 @@ impl HoldHost for Host<'_> {
     ) -> Result<bool, FsError> {
         let compared = self
             .operation
-            .file_holds_content(self.repository.clone(), path, address, size, established)
+            .file_holds_content(self.repository.clone(), path, 0, address, size, established)
             .await?;
         Ok(matches!(compared, NodeComparison::Matches))
     }

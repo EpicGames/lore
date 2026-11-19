@@ -621,11 +621,46 @@ State is rebuilt at every mount.
   `fs/filesystem_provider.rs`).
 - **Status and stage cost over written files.** A written file has the zero address until a commit
   stores it, so the diff compares it by size, from its host file's `stat`, then by content through
-  the operation (`measure`, `file_holds_content`, `fs/fuse/operation.rs`). Each status
-  therefore reads every written file whose size equals the tree's, until a commit flips it; a file
-  of another size costs a `stat`. A clean subtree costs nothing: it is skipped by address equality.
+  the operation (`measure`, `file_holds_content`, `fs/fuse/operation.rs`). A diff under the
+  command's write token, as a stage, a commit and a status with `--scan` run, therefore reads every
+  written file whose size equals the tree's, until a commit flips it or a marking diff serves it
+  from the store. A diff without the token, as a plain status runs, compares such a file by time
+  first, as an instance on disk does: where its node holds the current revision's content and its
+  host file shows the time recorded for its path, the file is unchanged and is not read
+  (`Settling::differs`, `lore-revision/src/state/diff.rs`). A read that finds the current
+  revision's content records the time the host file shows, where the records still hold the time
+  looked up and the host time is older than the clock read in the staging directory before the
+  operation's first comparison, so no later write shares it. It records under the swaps lock, only
+  where the lock is free and the mount still stands at the diff's current revision, so a sync or a
+  commit beside the status leaves no time for content the mount no longer holds
+  (`FuseOperation::recorded_time` and `record_compared_time`, `fs/fuse/operation.rs`;
+  `RecordedTimes::replace`, `fs/fuse/attr.rs`). The records hold it in memory until an operation
+  writes them back, and a dry run records nothing. A file of another size costs a `stat`. A clean
+  subtree costs nothing: it is skipped by address equality.
+- **Unchanged written files.** Once a marking diff under the command's write token begins, as
+  `lore stage` and `lore status` with `--scan`, `--check-dirty` or `--reset` run, the operation
+  records each written file a comparison finds holding the content compared, with the inode,
+  incarnation and write generation read before the file is located, as `content_source` records a
+  file it serves, and with the time the diff's walk read from its host file before the read
+  (`measure`, handed to `file_holds_content`), where that is older than the clock read in the
+  staging directory before the operation's first comparison, so no write after the read shows it
+  (`FuseOperation::serving`, `matched`, `held_inode`, `compared_floor`, `fs/fuse/operation.rs`). A
+  comparison whose caller read no time for the file records none. As the operation ends (`finalize`,
+  `serve_unchanged`), and only while the State the diff walked is still served, each file the
+  mounted revision holds at its node with that content and size, spelled as the State spells it,
+  whose host file still shows that time and has the permissions a file served from the store reports
+  (`served_file_permissions`, `fs/fuse/attr.rs`, which a copy-up gives) and whose path the deletion
+  list does not hold, takes that time in the records, written back as a reset's restore writes its
+  time. The mount (`FuseFilesystem::serve_unchanged`, `fs/fuse/write.rs`), serialized with swaps,
+  then flips the files as a commit flips the files it stored (`flip_to_tracked`, `settle_unheld`),
+  so a file a write changed after its read stays local; and, as after a commit, the deletion list
+  keeps only the paths the revision holds and the State does not serve from it, so a move away and
+  back during the read leaves no deletion over a flipped file. No directory is settled, so a
+  directory above a flipped file stays dirty until a commit. A dry run and a plain `lore status`,
+  which holds no write token, leave the files local.
 - **Commit.** As it stores each file it read, a commit tells the operation it read its files
-  through the address, size and mode it stored (`InstanceOperation::stored`), on a dry run too.
+  through the address, size and mode it stored and the time it read (`InstanceOperation::stored`),
+  on a dry run too.
   Once the revision is stored, made current and flushed, before its staged anchor is stored, and
   never on a dry run, it hands the stored revision to that operation (`hand_over_committed`,
   `InstanceOperation::committed`, `commit.rs`). A failed hand-over is logged as
@@ -760,7 +795,8 @@ State is rebuilt at every mount.
   so the next mount takes the spelling. `copy_file` keeps the source's executable bit. Stored
   content is staged under `write-staging/` and copied in 1 MiB WRITEs. Each changed name and file
   is then invalidated in the kernel. A written file is a dirty local file with the zero address,
-  as a user's write leaves it, and stays dirty until a commit stores it (plan decision 9 as built;
+  as a user's write leaves it, and stays dirty until a commit stores it, or a stage or status
+  serves it from the store holding the mounted revision's content (plan decision 9 as built;
   follow-up lore-ew0, Remaining work), so a merge's files survive a remount through `write/` and
   its deletions through the deletion list. A `write_node` of the content the mounted revision
   holds at the path, over the revision's own node there, as a reset of an edited file asks,
@@ -943,11 +979,18 @@ State is rebuilt at every mount.
   refuses a context without a Lore directory. The mount and the commands the service runs on the
   instance share one set of records (`InstanceRecords::open`, `lore-revision/src/records.rs`). A
   swap records its time for each path it changes and writes the records back before it publishes,
-  synced under `--sync-data`. A commit records the modification time it read for each file it
+  synced under `--sync-data`; it clears the time of each local file its apply leaves in place, as a
+  sync with `--forward-changes` leaves an edit, and writes the records back again
+  (`clear_kept_times`, `fs/fuse/swap.rs`). A commit records the modification time it read for each file it
   stores, however recent, so a committed file keeps the time it showed, and writes the records back
   after its store flush and before it serves the files from the store, synced under `--sync-data`;
   a commit whose records cannot be written back serves none of them from the store
-  (`hand_over_committed`, `lore-revision/src/commit.rs`). A write that serves a file from the store
+  (`hand_over_committed`, `lore-revision/src/commit.rs`). Before it flips them, the mount waits,
+  up to 10 ms, until the filesystem holding `write/` stamps later than the latest of those times
+  (`wait_until_settled`), so a write after a flip shows a later time than the one recorded. It
+  clears the record of each file it keeps local, whatever time a plain status recorded for it
+  before, and writes the records back, so a plain status reads the file rather than compare it by
+  a time (`FuseFilesystem::committed`). A write that serves a file from the store
   again, as a reset of an edited file to the content the mount serves does, sets one time, read
   before the first such file, for each of them in the records before it serves the file, where a
   lookup sees it at once, and writes them back as its operation ends, synced under `--sync-data`
@@ -956,10 +999,12 @@ State is rebuilt at every mount.
   as in an instance on disk. An inode the kernel holds across a swap or such a write takes the time
   recorded for its path. Until the records hold a shard file or a time is set, no inode creation
   looks a time up. Cloning an instance carries the records.
-- A FUSE instance tells a changed file by address and content, never by a recorded time: its
-  scan is the diff of the filesystem State (see "Status and diff"), a single file is compared
-  through `file_holds_content`, and no comparison records a time (`file_modification` and
-  `file_modified_against_node`, `lore-revision/src/state.rs`).
+- A FUSE instance tells a changed file by address where the State holds one: its scan is the
+  diff of the filesystem State (see "Status and diff"). A written file is compared by content,
+  through `file_holds_content`, and by a recorded time first only in a diff that serves no file
+  (see "Status and stage cost over written files"). A single file's comparison reads no recorded
+  time and records none (`file_modification` and `file_modified_against_node`,
+  `lore-revision/src/state.rs`).
 - v0.14.0 also stored swap times in the mutable store (`fuse-recorded-time`, with a
   `fuse-recorded-times` marker). Its swaps recorded the same times in the records, which this client
   reads alone. After a downgrade, v0.14.0 reports older times for the files this client's swaps
@@ -1683,15 +1728,17 @@ Open follow-ups from milestone 3:
 - **A file arriving with the recorded time and size** (lore-2yv; all instances). Status and stage
   trust a recorded modification time when the size matches, in milliseconds. A different file
   renamed over the path with the same size and millisecond, or one written by `cp -p`, `tar x`
-  or `rsync -t`, is never read. On a FUSE instance the provider handles the rename case in RENAME;
-  ordinary instances still miss it.
+  or `rsync -t`, is never read. On a FUSE instance a stage and a commit read the file; a plain
+  status misses it as an ordinary instance does.
 - **A stage that only discards in nested repositories** (lore-q53; all instances). `stage()` saves
   the staged State only where the main repository changed, so a stage whose only effect is
   discarding entries queued for nested repositories loses those discards.
-- **Residue that equals the revision** (lore-5xd). A local file whose content equals the current
-  revision, as a refused flip or a rename back leaves, stays local until a later commit stores
-  it, and every status hashes it again. A sync leaves a local file whose content equals the
-  target's the same way. A marking diff that finds such a file could flip it as a commit does.
+- **Residue that equals the revision** (lore-5xd). A stage, or a status with `--scan`,
+  `--check-dirty` or `--reset`, serves from the store a local file holding what the mounted
+  revision holds for its node (see Unchanged written files); a plain status leaves it local and
+  compares it by the time it records. A file at a node the revision does not hold at its path, as
+  a save by rename over the file leaves, one with other permissions or another spelling, and one
+  over a recorded deletion, as a move away and back leaves, stay local until a commit stores them.
 - **Desktop trash** (lore-9fr). See "Desktop trash" under Writes.
 - **Prefetch and demand fetches on a slow link** (lore-58g). On a slow link a recording's
   prefetch fills it for the whole build, and every demand fetch queues behind it; milestone 2 is
@@ -1707,8 +1754,9 @@ point leaves the State whole, at worst leaking a slot or leaving a directory dir
 around it cannot yet, so a cancelled commit or requests racing can leave `write/` or the deletion
 list disagreeing with the State, and the next mount then loses or brings back a change:
 
-- **The deletion list across a remount and swaps.** A commit cancelled between a flip's host
-  removal and the deletion list's rewrite leaves a listed path with no `write/` entry. A mount
+- **The deletion list across a remount and swaps.** A commit, or an operation serving unchanged
+  files from the store, cancelled between a flip's host removal and the deletion list's rewrite
+  leaves a listed path with no `write/` entry. A mount
   keeps a listed directory that has a same-kind host entry with the revision's children
   (`apply_deletions`). An RMDIR of an added directory during a swap goes unrecorded where it runs
   between the swap's apply and its settle. A removal appended after a swap read the list names a

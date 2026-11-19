@@ -2529,8 +2529,14 @@ impl Settling {
     }
 
     /// Whether the tree's file differs from `from_node`: by address where the tree knows its
-    /// content's, else by size, then content, measured through the operation. A from node with
-    /// no stored address holds no content, so it equals only an empty file.
+    /// content's, else by size, then by the time recorded for the path where `from_node` is the
+    /// current revision's node there, then content, measured through the operation, as an
+    /// instance on disk compares a file. A content match against the current revision's node
+    /// records the time the file shows. Not
+    /// [`file_modified_against_node`](crate::state::file_modified_against_node): the provider keeps the
+    /// times it compares by itself, and records one without the write token that function's
+    /// record needs. A from node with no stored address holds no content, so it equals only an
+    /// empty file.
     async fn differs(
         &self,
         change: &NodeChange,
@@ -2551,17 +2557,57 @@ impl Settling {
         if from_node.address.hash.is_zero() {
             return Ok(observed.size() != 0);
         }
+        let recorded = self.recorded_time(path, from_node).await;
+        if recorded.is_some_and(|recorded| recorded != 0 && recorded == observed.mtime()) {
+            self.stats.file_mtime_match.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
         self.stats.file_hash.fetch_add(1, Ordering::Relaxed);
         let comparison = file_matches_node(
             self.from.repository.clone(),
             from_node,
             observed.size(),
+            observed.mtime(),
             path,
             &self.operation,
             &lore_storage::ContentHashes::default(),
         )
         .await?;
-        Ok(!matches!(comparison, NodeComparison::Matches))
+        let matches = matches!(comparison, NodeComparison::Matches);
+        if matches && let Some(recorded) = recorded {
+            self.operation
+                .record_local_time(
+                    &self.from.repository,
+                    path,
+                    (recorded, observed.mtime()),
+                    self.current.state.revision(),
+                )
+                .await;
+        }
+        Ok(!matches)
+    }
+
+    /// The time recorded for `path` ([`InstanceOperationImpl::recorded_local_time`]), where
+    /// `from_node` holds the content of the node the diff's current tree holds there, the node a
+    /// recorded time speaks for, as the walk of an instance on disk asks.
+    async fn recorded_time(&self, path: &RelativePath, from_node: &Node) -> Option<u64> {
+        let recorded = self
+            .operation
+            .recorded_local_time(&self.from.repository, path)
+            .await?;
+        if Arc::ptr_eq(&self.from.state, &self.current.state) {
+            return Some(recorded);
+        }
+        let link = self.current.node_at(path).await;
+        if !link.is_valid() || link.revision != self.current.state.revision() {
+            return None;
+        }
+        self.current
+            .state
+            .node(self.current.repository.clone(), link.node)
+            .await
+            .is_ok_and(|current| current.address.hash == from_node.address.hash)
+            .then_some(recorded)
     }
 
     /// Whether a find by name on the filesystem State finds a node at `path`. An error other than

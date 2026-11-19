@@ -120,6 +120,7 @@ impl Fixture {
             .file_holds_content(
                 self.repository.clone(),
                 &node(path),
+                0,
                 address_of(content),
                 content.len() as u64,
                 &ContentHashes::default(),

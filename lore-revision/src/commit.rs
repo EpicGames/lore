@@ -5447,7 +5447,7 @@ fn commit_file(
                     written
                 };
             let mode = info.mode(node.mode);
-            operation.stored(&relative_path, address, size_content, mode);
+            operation.stored(&relative_path, address, size_content, mode, info.mtime());
 
             (address, size_content, mode, Some(info.mtime()))
         };

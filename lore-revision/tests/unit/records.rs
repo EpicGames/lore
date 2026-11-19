@@ -361,6 +361,38 @@ async fn a_shard_that_does_not_parse_is_absent() {
     .await;
 }
 
+/// A replace sets its time only where the key still holds the time expected, none included: a
+/// time set since is kept.
+#[tokio::test]
+async fn a_replace_keeps_a_time_set_since_the_time_expected() {
+    in_context(async {
+        let dir = TempDir::new("records-replace-");
+        let records = InstanceRecords::open(dir.path()).await;
+
+        records.replace(key(6, 1), 0, 100).await;
+        assert!(matches!(
+            records.lookup(&key(6, 1)).await,
+            Lookup::Recorded(100)
+        ));
+        records.replace(key(6, 1), 50, 200).await;
+        assert!(matches!(
+            records.lookup(&key(6, 1)).await,
+            Lookup::Recorded(100)
+        ));
+        records.replace(key(6, 1), 100, 300).await;
+        assert!(matches!(
+            records.lookup(&key(6, 1)).await,
+            Lookup::Recorded(300)
+        ));
+        records.replace(key(6, 2), 300, 400).await;
+        assert!(matches!(
+            records.lookup(&key(6, 2)).await,
+            Lookup::Missing(_)
+        ));
+    })
+    .await;
+}
+
 /// A time read from elsewhere after a lookup missed is not adopted once the shard has changed,
 /// since the change may be a newer record of the path, or its removal.
 #[tokio::test]

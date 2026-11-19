@@ -319,6 +319,7 @@ impl InstanceOperation for OsOperation {
         &self,
         repository: Arc<RepositoryContext>,
         path: &RelativePath,
+        _mtime: u64,
         previous: Address,
         previous_size: u64,
         established: &lore_storage::ContentHashes,

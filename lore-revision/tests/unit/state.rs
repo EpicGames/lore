@@ -1433,6 +1433,7 @@ async fn what_one_comparison_established_answers_the_next() {
             repository.clone(),
             &first,
             first.size,
+            0,
             &path,
             &operation,
             &established,
@@ -1457,6 +1458,7 @@ async fn what_one_comparison_established_answers_the_next() {
             repository,
             &second,
             second.size,
+            0,
             &path,
             &operation,
             &established,
@@ -1493,6 +1495,46 @@ async fn a_file_written_after_the_time_before_the_next_write_carries_a_later_tim
         assert!(
             written > before,
             "round {round}: written at {written}, recorded {before}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(&probe)
+            .expect("list the probe directory")
+            .count(),
+        0,
+        "the probe is removed"
+    );
+}
+
+/// A file written right after [`wait_until_settled`] returns for the time the filesystem stamped
+/// a file with carries a later time. Each round can write within the millisecond of the stamp.
+/// The probe directory is in no working tree and holds nothing afterward.
+#[tokio::test]
+async fn a_file_written_after_the_wait_until_settled_carries_a_later_time() {
+    let dir = lore_base::test_util::TempDir::new("lore-state-test-");
+    let probe = dir.child("probe");
+    let driver = lore_io::IoDriver::global();
+    driver
+        .create_dir_all(&probe)
+        .await
+        .expect("create the probe directory");
+    let file = dir.path().join("written.bin");
+    let written = async |round: u8| {
+        driver
+            .write_file_bytes(&file, Bytes::copy_from_slice(&[round]), false)
+            .await
+            .expect("write the file");
+        lore_revision::util::fs::modified_millis(
+            driver.stat(&file).await.expect("stat the file").modified,
+        )
+    };
+    for round in 0..64u8 {
+        let stamped = written(round).await;
+        wait_until_settled(&probe, stamped).await;
+        let after = written(round).await;
+        assert!(
+            after > stamped,
+            "round {round}: written at {after}, settled past {stamped}"
         );
     }
     assert_eq!(
@@ -1541,6 +1583,7 @@ async fn a_file_removed_between_comparisons_reads_as_unreadable() {
             repository.clone(),
             &first,
             first.size,
+            0,
             &path,
             &operation,
             &established,
@@ -1565,6 +1608,7 @@ async fn a_file_removed_between_comparisons_reads_as_unreadable() {
             repository,
             &second,
             second.size,
+            0,
             &path,
             &operation,
             &established,
@@ -1596,6 +1640,7 @@ async fn a_comparison_that_settles_nothing_reads_as_modified() {
             repository.clone(),
             &node,
             node.size,
+            0,
             &path,
             &operation,
             &established,
@@ -1638,6 +1683,7 @@ async fn an_unfragmented_file_is_decided_by_its_own_hash() {
             repository.clone(),
             &node,
             node.size,
+            0,
             &path,
             &operation,
             &established,

@@ -915,7 +915,8 @@ pub type SwapHook = Arc<dyn Fn(SwapPhase) -> BoxFuture<'static, bool> + Send + S
 /// reads `paths` made in `reads`. Nothing below a directory it copied is placed again. A directory
 /// at a path of `unsettled`, which an earlier apply that did not complete changed or a reset
 /// re-places, is made to match the target whole; each path below it that this changes goes to
-/// `reconciled`, and each local file a forced hold overwrote to `overwritten`. Each local file of
+/// `reconciled`, each local file a forced hold overwrote to `overwritten`, and each local file a
+/// change leaves in place to `kept`. Each local file of
 /// `matching`, which [`check`] found holding what a change replaces or brings, is overwritten or
 /// removed as a forced hold does. `hook`, a test's, runs after each pass and around each copy;
 /// `false` fails the apply there.
@@ -925,10 +926,11 @@ pub async fn apply<H: HoldHost>(
     (options, matching): (HoldOptions, &Matching),
     changed: &mut BTreeMap<String, bool>,
     reads: &mut u64,
-    (unsettled, reconciled, overwritten): (
+    (unsettled, reconciled, overwritten, kept): (
         &BTreeMap<String, bool>,
         &mut Vec<RelativePath>,
         &mut Overwritten,
+        &mut Vec<RelativePath>,
     ),
     hook: Option<SwapHook>,
 ) -> Result<(), StateError> {
@@ -937,6 +939,7 @@ pub async fn apply<H: HoldHost>(
     *reads = dirs.paths.reads();
     reconciled.append(&mut dirs.reconciled);
     overwritten.append(&mut dirs.overwritten);
+    kept.append(&mut dirs.kept);
     result
 }
 
@@ -1038,6 +1041,8 @@ struct Directories<'a, H> {
     reconciled: Vec<RelativePath>,
     /// The local files a forced hold overwrote.
     overwritten: Overwritten,
+    /// The local files a change left in place.
+    kept: Vec<RelativePath>,
     hook: Option<SwapHook>,
 }
 
@@ -1059,6 +1064,7 @@ impl<'a, H: HoldHost> Directories<'a, H> {
             unsettled,
             reconciled: Vec::new(),
             overwritten: Vec::new(),
+            kept: Vec::new(),
             hook,
         }
     }
@@ -1504,8 +1510,12 @@ impl<'a, H: HoldHost> Directories<'a, H> {
                     )
                     .await
                 {
+                    Ok(true) => return Ok(()),
                     // Made local meanwhile: local content stays.
-                    Ok(_) => return Ok(()),
+                    Ok(false) => {
+                        self.kept.push(path.clone());
+                        return Ok(());
+                    }
                     Err(error) => error,
                 };
                 if !self.paths.node(existing).await?.is_discarded() {
@@ -1556,7 +1566,11 @@ impl<'a, H: HoldHost> Directories<'a, H> {
             (false, false) if added || exact => {
                 Box::pin(fill_in(self, existing, side, path, exact)).await
             }
-            (true, true) | (false, false) => Ok(()),
+            (true, true) => {
+                self.kept.push(path.clone());
+                Ok(())
+            }
+            (false, false) => Ok(()),
             _ => {
                 let whole = self.options.reset_local;
                 if Box::pin(self.remove_node(existing, held, path, whole)).await? {

@@ -497,8 +497,9 @@ pub type WriteHook = Arc<dyn Fn(WriteStep) -> bool + Send + Sync>;
 /// racing the build would.
 pub type ListingHook = Arc<dyn Fn(NodeID) -> crate::BoxFuture<'static, ()> + Send + Sync>;
 
-/// A test's hook run once a commit has read the files it stores and before it flips them, as a
-/// request racing the commit would.
+/// A test's hook run once a commit has read the files it stores, or an operation has read the
+/// local files its marking diff found unchanged, and before they are flipped, as a request racing
+/// the flip would.
 pub type CommitHook = Arc<dyn Fn() -> crate::BoxFuture<'static, ()> + Send + Sync>;
 
 /// Where a LOOKUP of a node attached since its directory's listing runs a test's hook, as a
@@ -1347,8 +1348,9 @@ impl FuseFilesystem {
         }
     }
 
-    /// Runs `hook` in every later commit once it has read the files it stores, before they are
-    /// flipped. For tests; a second call panics.
+    /// Runs `hook` in every later commit once it has read the files it stores, and as every later
+    /// operation ends whose marking diff found local files unchanged, before they are flipped. For
+    /// tests; a second call panics.
     pub fn set_commit_hook(&self, hook: CommitHook) {
         assert!(
             self.commit_hook.set(hook).is_ok(),

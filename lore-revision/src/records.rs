@@ -400,13 +400,35 @@ impl InstanceRecords {
 
     /// Records `mtime` for `key`.
     pub fn set(&self, key: RecordKey, mtime: u64) -> impl Future<Output = ()> + '_ {
+        self.change(key[0], move |shard| self.set_in(shard, key, mtime))
+    }
+
+    /// Records `mtime` for `key` where the key still holds `expected`, the time a lookup answered,
+    /// 0 for none: a time set since can describe content the path took after `mtime`.
+    pub fn replace(
+        &self,
+        key: RecordKey,
+        expected: u64,
+        mtime: u64,
+    ) -> impl Future<Output = ()> + '_ {
         self.change(key[0], move |shard| {
-            if shard.set(key, mtime) {
-                shard.generation += 1;
-                shard.merge_if_due();
-                self.mark_dirty(key[0]);
+            let held = match shard.lookup(&key) {
+                Lookup::Recorded(held) => held,
+                Lookup::Missing(_) => 0,
+            };
+            if held == expected {
+                self.set_in(shard, key, mtime);
             }
         })
+    }
+
+    /// Sets `mtime` for `key` in `shard`, the shard the key falls in, under its write lock.
+    fn set_in(&self, shard: &mut Shard, key: RecordKey, mtime: u64) {
+        if shard.set(key, mtime) {
+            shard.generation += 1;
+            shard.merge_if_due();
+            self.mark_dirty(key[0]);
+        }
     }
 
     /// Records every time in `batch`, and merges each shard it reaches. A shard whose records the
