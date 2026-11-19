@@ -26,6 +26,7 @@ use lore_revision::interface::LoreString;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::MetadataInherit;
+use lore_revision::node::Node;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::relay::EventDispatcher;
@@ -280,6 +281,20 @@ pub(super) async fn revision_state(instance: &Instance, revision: Hash) -> Arc<S
     State::deserialize(instance.repository.clone(), revision)
         .await
         .expect("Failed to read the revision")
+}
+
+/// The node `revision` holds at `path`.
+pub(super) async fn node_at(instance: &Instance, revision: Hash, path: &str) -> Node {
+    let state = revision_state(instance, revision).await;
+    let node = state
+        .find_node_link(instance.repository.clone(), path)
+        .await
+        .expect("Failed to find the path")
+        .node;
+    state
+        .node(instance.repository.clone(), node)
+        .await
+        .expect("Failed to read the node")
 }
 
 /// Merges branch `name` into the current one, answering whether the merge committed.

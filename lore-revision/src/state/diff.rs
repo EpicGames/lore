@@ -115,9 +115,13 @@ impl GraftOracle {
         }
     }
 
-    /// True when `path` in the target tree still matches `base_address` and
-    /// holds no uncommitted work.
-    async fn adoptable(&self, path: &RelativePath, base_address: Address) -> bool {
+    /// True when `path` in the target tree still matches `base`, the base's directory there, and
+    /// holds no uncommitted work. A staged `base` matches nothing: its address can predate the
+    /// changes staged below it.
+    async fn adoptable(&self, path: &RelativePath, base: &Node) -> bool {
+        if base.is_staged() {
+            return false;
+        }
         // An out-of-view subtree never reaches the working tree, so merging it
         // is a tree operation only. An in-view subtree keeps the per-file
         // merge, because there the detail is needed on disk.
@@ -152,7 +156,7 @@ impl GraftOracle {
             return false;
         }
         // Target's subtree is identical to base's.
-        if node.address != base_address {
+        if node.address != base.address {
             return false;
         }
         // Do not adopt over uncommitted work.
@@ -1361,6 +1365,16 @@ fn presence_change(
     }
 }
 
+/// Whether the walk descends into a paired directory for the from side's node alone: a staged
+/// directory can keep the address it held before the changes staged below it, so an equal address
+/// says nothing of its tree. A link's address is its pin, which says all of it. A walk over a FUSE
+/// instance's served tree prunes there all the same, since both its sides take their directory
+/// addresses from one tree and every change on the served side is marked dirty.
+#[inline]
+fn from_staged_descends(from_node: &Node, flags: DiffFlags) -> bool {
+    from_node.is_staged() && from_node.is_directory() && !flags.contains(DiffFlags::FilesystemTo)
+}
+
 /// Whether the to side's tree tracks a change at or below its node `node`, carrying `flags`, which
 /// takes the node past the slots the mode keeps. A working tree's State answers nothing of what
 /// Lore tracks, so there the node is tracked where `held_as_kind` says Lore's tree, on the from
@@ -1648,6 +1662,7 @@ async fn add_change_for_paired_nodes(
                 || is_staged
                 || is_staged_merge
                 || is_dirty
+                || from_staged_descends(from_node, flags)
                 || (flags.contains(DiffFlags::TwoViews)
                     && filter_mode.contains(FilterMode::View)
                     && views_diverge_below(
@@ -1742,9 +1757,7 @@ async fn add_change_for_paired_nodes(
                     // not, so nothing inside needs a three-way merge. Emit one
                     // change for the subtree instead of one per file.
                     let adopted = match graft.as_ref() {
-                        Some(oracle) if !hash_equal => {
-                            oracle.adoptable(&subpath, from_address).await
-                        }
+                        Some(oracle) if !hash_equal => oracle.adoptable(&subpath, from_node).await,
                         _ => false,
                     };
 

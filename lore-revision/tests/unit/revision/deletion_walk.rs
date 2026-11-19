@@ -34,6 +34,8 @@ use super::instance::merge_branch;
 use super::instance::revision_state;
 use super::instance::run;
 use super::instance::switch_to;
+use super::stale_directory;
+use super::stale_directory::Revisions;
 use crate::branch::write_line;
 use crate::helper::in_memory;
 use crate::helper::in_memory::add;
@@ -165,6 +167,29 @@ async fn the_walk_ends_at_the_first_revision_at_or_below_the_bound() {
             assert_eq!(
                 above_first["Dir/b.txt"], None,
                 "The walk stops at the revision that deleted the file, the first at the bound"
+            );
+        },
+    )
+    .await;
+}
+
+/// A file added below a staged directory that keeps the address of the directory in its first
+/// parent, and deleted in the revision after it, which holds that address clean, is found where
+/// the line last held it.
+#[tokio::test]
+async fn the_walk_finds_a_path_below_a_staged_directory_with_a_stale_address() {
+    run(
+        "the_walk_finds_a_path_below_a_staged_directory_with_a_stale_address",
+        &stale_directory::TREE,
+        |instance| async move {
+            let Revisions { stale, deleted } = stale_directory::revisions(&instance).await;
+            let bound = revision_state(&instance, stale).await.revision_number();
+
+            let found = walk(&instance, deleted, &["Dir/x.txt"], bound, 4).await;
+
+            assert_eq!(
+                found["Dir/x.txt"],
+                Some(last_held(&instance, stale, deleted, "Dir/x.txt").await)
             );
         },
     )

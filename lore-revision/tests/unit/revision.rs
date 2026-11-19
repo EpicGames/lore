@@ -34,6 +34,7 @@ mod merge_modes;
 mod merge_moves;
 mod remote_comparison;
 mod resolve;
+mod stale_directory;
 mod sync;
 mod sync_hold;
 mod tree_walk;

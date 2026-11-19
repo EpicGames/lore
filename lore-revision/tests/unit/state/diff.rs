@@ -831,3 +831,58 @@ async fn a_walk_leaving_link_pins_reports_a_link_only_where_its_mount_changes() 
         })
         .await;
 }
+
+/// A walk from a tree holding a link staged, to a revision holding it pinned alike, neither reports
+/// the link nor enters what it mounts: a link's address is its pin, so the staged flag says nothing
+/// of it.
+#[tokio::test]
+async fn a_walk_from_a_staged_link_pinned_alike_enters_nothing_below_it() {
+    let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let repository = in_memory::repository(immutable, mutable);
+            let target_id: RepositoryId = Context::from(uuid::Uuid::now_v7()).into();
+            let target = repository.to_link_context(target_id).await;
+            let state = State::new();
+            let sub = in_memory::add(
+                &state,
+                target.clone(),
+                ROOT_NODE,
+                in_memory::directory("sub"),
+                "sub",
+            )
+            .await;
+            in_memory::add(
+                &state,
+                target.clone(),
+                sub,
+                in_memory::file("inner.bin"),
+                "inner.bin",
+            )
+            .await;
+            let pin =
+                in_memory::commit(&target, &state, Hash::default(), in_memory::branch_id()).await;
+            let staged = async || {
+                let state = State::new();
+                in_memory::add(
+                    &state,
+                    repository.clone(),
+                    ROOT_NODE,
+                    link_node("pinned", target_id, pin, ROOT_NODE),
+                    "pinned",
+                )
+                .await;
+                state
+            };
+            let to = staged().await;
+            let revision =
+                in_memory::commit(&repository, &to, Hash::default(), in_memory::branch_id()).await;
+            let to = in_memory::revision_state(&repository, revision).await;
+
+            assert_eq!(
+                walk(&repository, &staged().await, &to).await,
+                (Vec::new(), 1)
+            );
+        })
+        .await;
+}

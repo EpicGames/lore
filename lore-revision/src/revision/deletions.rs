@@ -570,7 +570,7 @@ enum Child {
     Missing,
     /// A file or a link, which holds no path below it in this repository's tree.
     Leaf(NodeID),
-    /// A directory, with the address of the tree below it.
+    /// A directory, with the address of the tree below it, or none where it is staged.
     Directory(NodeID, Address),
 }
 
@@ -588,10 +588,9 @@ struct Candidates {
 /// Both revisions are walked down the paths together, a level at a time, from the root. A
 /// directory with the same address in both holds the same tree, so where `newer` holds none of the
 /// paths below it, `older` holds none either and the walk leaves it. A directory without an
-/// address, as the root is, is compared with none. This trusts a directory's address to be that of
-/// the tree below it, as a diff does: a revision stored with a directory address that does not
-/// match its files can hide a deletion below that directory. A path is held where `older` holds a
-/// node at it, not held below a link, and unsure where a lookup on the way fails.
+/// address, as the root is, is compared with none, and so is a staged directory, whose address can
+/// predate the changes staged below it ([`Child::Directory`]). A path is held where `older` holds
+/// a node at it, not held below a link, and unsure where a lookup on the way fails.
 async fn candidates(
     repository: &Arc<RepositoryContext>,
     newer: &State,
@@ -738,7 +737,12 @@ async fn child(
     };
     let node = state.node(repository.clone(), node_id).await?;
     Ok(if node.is_directory() {
-        Child::Directory(node_id, node.address)
+        let address = if node.is_staged() {
+            Address::default()
+        } else {
+            node.address
+        };
+        Child::Directory(node_id, address)
     } else {
         Child::Leaf(node_id)
     })

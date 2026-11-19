@@ -9,7 +9,6 @@ use lore_base::types::Hash;
 use lore_revision::branch;
 use lore_revision::branch::BranchLatestStatus;
 use lore_revision::filter::FilterMode;
-use lore_revision::node::Node;
 use lore_revision::state;
 
 use super::instance::Instance;
@@ -18,6 +17,7 @@ use super::instance::create_branch;
 use super::instance::current;
 use super::instance::merge_branch;
 use super::instance::names_along;
+use super::instance::node_at;
 use super::instance::renamed;
 use super::instance::revision_state;
 use super::instance::run;
@@ -179,20 +179,6 @@ async fn a_case_only_rename_of_a_directory_reaches_a_merge() {
         "Dir/sub",
     )
     .await;
-}
-
-/// The node `revision` holds at `path`.
-async fn node_at(instance: &Instance, revision: Hash, path: &str) -> Node {
-    let state = revision_state(instance, revision).await;
-    let node = state
-        .find_node_link(instance.repository.clone(), path)
-        .await
-        .expect("Failed to find the path")
-        .node;
-    state
-        .node(instance.repository.clone(), node)
-        .await
-        .expect("Failed to read the node")
 }
 
 /// A directory's address covers the case of its children's names, and differs from the address
