@@ -34,14 +34,21 @@ use super::instance::merge_branch;
 use super::instance::revision_state;
 use super::instance::run;
 use super::instance::switch_to;
+use crate::branch::write_line;
 use crate::helper::in_memory;
 use crate::helper::in_memory::add;
 use crate::helper::in_memory::directory;
 use crate::helper::in_memory::file;
 use crate::helper::in_memory::link_node;
 use crate::helper::setup_test_execution;
+use crate::paged_remote::anchors;
+use crate::paged_remote::branch_metadata;
+use crate::paged_remote::client_on;
 use crate::paged_remote::client_stores;
 use crate::paged_remote::counted_client_stores;
+use crate::paged_remote::paging_remote;
+use crate::paged_remote::remote_line;
+use crate::paged_remote::signature_of;
 
 /// The files every fixture starts from, each holding its own path.
 const TREE: [&str; 6] = [
@@ -408,6 +415,45 @@ async fn foo_is_directory(
         .await
         .expect("The node was just added")
         .is_directory()
+}
+
+/// A walk from a local revision down a long line that only the remote holds reads its first two
+/// pages by hash signature, and every page below them by revision number on the branch of the
+/// line, requested ahead of it.
+#[tokio::test]
+async fn a_long_remote_line_is_read_ahead_by_number() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let stores = client_stores().await;
+            let branch = in_memory::branch_id();
+            let line = remote_line(1000, branch_metadata(&stores, branch).await).await;
+            let remote = std::sync::Arc::new(paging_remote(branch, &line));
+            let start = write_line(&stores.writer, line[999].signature, 1001, 1).await[0];
+            let client = client_on(&stores, remote.clone());
+            let start = State::deserialize(client.clone(), start)
+                .await
+                .expect("reading the local revision");
+
+            let walked = walk_line(
+                client,
+                start,
+                vec!["Dir/a.txt".to_string()],
+                0,
+                &LineWalks::new(2),
+            )
+            .await
+            .expect("The line can be read");
+
+            assert_eq!(walked, BTreeMap::from([("Dir/a.txt".to_string(), None)]));
+            assert_eq!(
+                anchors(&remote),
+                (
+                    vec![signature_of(&line, 1000), signature_of(&line, 900)],
+                    vec![800, 700, 600, 500, 400, 300, 200, 100],
+                )
+            );
+        })
+        .await;
 }
 
 /// Comparisons that end out of order are taken in line order, each once, and none past one that

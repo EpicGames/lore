@@ -20,6 +20,7 @@ use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
+use lore_revision::metadata::Metadata;
 use lore_revision::repository::RemoteState;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::allow_all_repositories;
@@ -53,7 +54,7 @@ use zerocopy::IntoBytes;
 use crate::helper::in_memory;
 
 /// What a page answers: a revision number on the remote's branch, or a revision signature.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Anchor {
     Number(u64),
     Signature(Hash),
@@ -71,7 +72,8 @@ struct Page {
 /// list for an anchor registered as failing fails, and a list for an anchor registered as stalling
 /// is never answered. A page item carries the state of a revision the remote holds, and no state
 /// otherwise. A remote with a `refusal` answers every branch query with it, and one built
-/// `deleted` answers that its branch is deleted. It records each name a branch query asks for.
+/// `deleted` answers that its branch is deleted. It records each name a branch query asks for, and
+/// each anchor a revision list asks for.
 pub(crate) struct PagedRemote {
     branch: BranchId,
     latest: Hash,
@@ -84,20 +86,25 @@ pub(crate) struct PagedRemote {
     stalled: Notify,
     /// Signalled when a list left unanswered is dropped, which is the only way it ends.
     abandoned: Notify,
+    /// How many lists left unanswered are not yet dropped.
+    unanswered: AtomicUsize,
     held: Vec<RemoteRevision>,
     /// The metadata hash a page item carries for a revision, by signature; zero for any other.
     listed_metadata: Vec<(Hash, Hash)>,
     lists: AtomicUsize,
     refusal: Option<ProtocolError>,
     queried_names: std::sync::Mutex<Vec<String>>,
+    listed_anchors: std::sync::Mutex<Vec<Anchor>>,
 }
 
-/// Signals a [`PagedRemote`]'s `abandoned` when the list left unanswered that holds it is dropped.
-struct Abandoned<'a>(&'a Notify);
+/// A list left unanswered by a [`PagedRemote`]. When dropped, counts the list as ended and signals
+/// `abandoned`.
+struct Abandoned<'a>(&'a PagedRemote);
 
 impl Drop for Abandoned<'_> {
     fn drop(&mut self) {
-        self.0.notify_one();
+        self.0.unanswered.fetch_sub(1, Ordering::SeqCst);
+        self.0.abandoned.notify_one();
     }
 }
 
@@ -130,6 +137,81 @@ pub(crate) async fn remote_revision(number: u64, parent: Hash, metadata: Hash) -
         "a revision's signature is the hash of its state"
     );
     RemoteRevision { signature, state }
+}
+
+/// The hash of metadata naming `branch` as the branch of a revision, written to the local store of
+/// `stores`.
+pub(crate) async fn branch_metadata(stores: &ClientStores, branch: BranchId) -> Hash {
+    let mut metadata = Metadata::new();
+    metadata
+        .set_branch(branch)
+        .expect("the metadata holds the branch");
+    metadata
+        .serialize_local(stores.writer.clone())
+        .await
+        .expect("writing the metadata")
+}
+
+/// Revisions numbered 1 to `count` that only the remote holds, oldest first, each with `metadata`
+/// as its metadata hash.
+pub(crate) async fn remote_line(count: u64, metadata: Hash) -> Vec<RemoteRevision> {
+    let mut line: Vec<RemoteRevision> = Vec::new();
+    for number in 1..=count {
+        let parent = line.last().map_or(Hash::default(), |below| below.signature);
+        line.push(remote_revision(number, parent, metadata).await);
+    }
+    line
+}
+
+/// The page items of `line` from the revision numbered `newest` down to the one numbered `oldest`.
+pub(crate) fn span(line: &[RemoteRevision], newest: u64, oldest: u64) -> Vec<(u64, Hash)> {
+    (oldest..=newest)
+        .rev()
+        .map(|number| (number, line[number as usize - 1].signature))
+        .collect()
+}
+
+/// The hash signature anchor of the revision numbered `number` of `line`.
+pub(crate) fn signature_of(line: &[RemoteRevision], number: u64) -> Anchor {
+    Anchor::Signature(line[number as usize - 1].signature)
+}
+
+/// A remote holding `line`, whose latest is the line's newest revision, that lists the pages of a
+/// hundred revisions a walk down the line reads: the first two by hash signature, and those below
+/// them by revision number on `branch`.
+pub(crate) fn paging_remote(branch: BranchId, line: &[RemoteRevision]) -> PagedRemote {
+    let newest = line.len() as u64;
+    let mut remote = PagedRemote::new(branch, line[line.len() - 1].signature).holding(line);
+    for top in (1..=newest).rev().step_by(100) {
+        let oldest = top.saturating_sub(99).max(1);
+        let anchor = if top + 200 > newest {
+            signature_of(line, top)
+        } else {
+            Anchor::Number(top)
+        };
+        remote = remote.page(anchor, span(line, top, oldest), Hash::default());
+    }
+    remote
+}
+
+/// The anchors `remote` was asked to list by hash signature, in order, and by number, newest
+/// first.
+pub(crate) fn anchors(remote: &PagedRemote) -> (Vec<Anchor>, Vec<u64>) {
+    let listed = remote.listed_anchors();
+    let signatures = listed
+        .iter()
+        .filter(|anchor| matches!(anchor, Anchor::Signature(_)))
+        .copied()
+        .collect();
+    let mut numbers: Vec<u64> = listed
+        .iter()
+        .filter_map(|anchor| match anchor {
+            Anchor::Number(number) => Some(*number),
+            Anchor::Signature(_) => None,
+        })
+        .collect();
+    numbers.sort_unstable_by(|a, b| b.cmp(a));
+    (signatures, numbers)
 }
 
 /// `revision` in each way a page can list it without its own state: with no state, with its state
@@ -230,11 +312,13 @@ impl PagedRemote {
             stalls: Vec::new(),
             stalled: Notify::new(),
             abandoned: Notify::new(),
+            unanswered: AtomicUsize::new(0),
             held: Vec::new(),
             listed_metadata: Vec::new(),
             lists: AtomicUsize::new(0),
             refusal: None,
             queried_names: std::sync::Mutex::default(),
+            listed_anchors: std::sync::Mutex::default(),
         }
     }
 
@@ -306,6 +390,14 @@ impl PagedRemote {
             .clone()
     }
 
+    /// The anchors the revision lists asked for, in order.
+    pub(crate) fn listed_anchors(&self) -> Vec<Anchor> {
+        self.listed_anchors
+            .lock()
+            .expect("the listed anchors' lock")
+            .clone()
+    }
+
     /// Wait until a list left unanswered starts.
     pub(crate) async fn stalled(&self) {
         self.stalled.notified().await;
@@ -314,6 +406,25 @@ impl PagedRemote {
     /// Wait until a list left unanswered is dropped.
     pub(crate) async fn abandoned(&self) {
         self.abandoned.notified().await;
+    }
+
+    /// Wait until `count` lists are left unanswered at once.
+    pub(crate) async fn unanswered(&self, count: usize) {
+        while self.unanswered.load(Ordering::SeqCst) < count {
+            self.stalled.notified().await;
+        }
+    }
+
+    /// How many lists are left unanswered now.
+    pub(crate) fn lists_unanswered(&self) -> usize {
+        self.unanswered.load(Ordering::SeqCst)
+    }
+
+    /// Wait until every list left unanswered is dropped.
+    pub(crate) async fn all_abandoned(&self) {
+        while self.unanswered.load(Ordering::SeqCst) > 0 {
+            self.abandoned.notified().await;
+        }
     }
 }
 
@@ -843,11 +954,16 @@ impl Revision for PagedRemote {
             }
             RevisionListStart::Signature(signature) => Anchor::Signature(signature),
         };
+        self.listed_anchors
+            .lock()
+            .expect("the listed anchors' lock")
+            .push(anchor);
         if let Some((_, failure)) = self.failures.iter().find(|(failing, _)| *failing == anchor) {
             return Err(failure.clone());
         }
         if self.stalls.contains(&anchor) {
-            let _abandoned = Abandoned(&self.abandoned);
+            self.unanswered.fetch_add(1, Ordering::SeqCst);
+            let _abandoned = Abandoned(self);
             self.stalled.notify_one();
             std::future::pending::<()>().await;
         }

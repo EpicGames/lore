@@ -164,12 +164,16 @@ struct LineStart {
 }
 
 /// What the walks of several lines share: the revision comparisons they may keep in flight
-/// between them, and whether one failed, which stops the others issuing more.
+/// between them, the permits of their pagers to request pages ahead, and whether one failed, which
+/// stops the others issuing more.
 #[lore_macro::test_pub]
 struct LineWalks {
     permits: Arc<Semaphore>,
     /// The most comparisons of a line issued and not yet taken in line order.
     window: usize,
+    /// The permits of the walks' pagers to request pages ahead, as [`find::lines_ahead`] gives
+    /// them.
+    lines_ahead: Arc<Semaphore>,
     stopped: AtomicBool,
 }
 
@@ -180,6 +184,7 @@ impl LineWalks {
         Self {
             permits: Arc::new(Semaphore::new(permits)),
             window: permits,
+            lines_ahead: find::lines_ahead(),
             stopped: AtomicBool::new(false),
         }
     }
@@ -311,12 +316,13 @@ impl<T> InOrder<T> {
 /// too.
 ///
 /// A revision is compared with the one after it, so one is only searched where the two differ
-/// above a pending path. A path below a link is not held in `repository`. Revisions are read a
-/// page at a time from the remote where the local store lacks them. Each comparison in flight
-/// holds one of the permits `shared` holds, a line issues at most its window past the comparisons
-/// taken, and results are taken in line order, so each path is found in the newest revision
-/// holding it. A revision that cannot be read fails the walk once the comparisons in flight end,
-/// and stops the other walks sharing `shared` issuing comparisons.
+/// above a pending path. A path below a link is not held in `repository`. Revisions the local
+/// store lacks are read from the remote by a [`find::LinePager`], which takes its permit to request
+/// pages ahead from `shared`. Each comparison in flight holds one of the comparison permits
+/// `shared` holds, a line issues at most its window past the comparisons taken, and results are
+/// taken in line order, so each path is found in the newest revision holding it. A revision that
+/// cannot be read fails the walk once the comparisons in flight end, and stops the other walks
+/// sharing `shared` issuing comparisons.
 #[lore_macro::test_pub]
 async fn walk_line(
     repository: Arc<RepositoryContext>,
@@ -363,7 +369,7 @@ async fn walk_line(
     let mut issued = 0usize;
     let mut newer = start;
     let mut line_ended = newer.revision_number() <= bound;
-    let mut paging = true;
+    let mut pager = find::LinePager::new(repository.clone(), shared.lines_ahead.clone());
     let mut failure = None;
     loop {
         while !line_ended
@@ -389,9 +395,7 @@ async fn walk_line(
                 line_ended = true;
                 break;
             }
-            if paging {
-                paging = find::page_in_line(repository.clone(), parent, bound).await;
-            }
+            pager.page_in(parent, newer.revision_number(), bound).await;
             let older = match State::deserialize(repository.clone(), parent).await {
                 Ok(older) => older,
                 Err(err) => {
@@ -472,6 +476,7 @@ async fn walk_line(
                 .collect();
         }
     }
+    pager.finish().await;
 
     if let Some(err) = failure {
         return Err(err);

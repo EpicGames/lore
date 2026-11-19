@@ -1,11 +1,18 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
+use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use lore_storage::options::ReadOptions;
+use lore_transport::RevisionListIdentifier;
+use lore_transport::RevisionListStart;
 use serde::Serialize;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
+use tokio_util::task::AbortOnDropHandle;
 use zerocopy::FromBytes;
 
 use crate::branch;
@@ -100,9 +107,7 @@ where
         }
 
         // Check if we have the revision cached locally
-        if !immutable::is_stored_local(repository.clone(), Address::zero_context_hash(revision))
-            .await
-        {
+        if !stored_local(&repository, revision).await {
             // Batch load a chunk of history
             // TODO(mjansson): Hide batch cache latency by issuing requests while iterating
             //                 previous batch of history, trying to stay ahead of the load curve
@@ -482,57 +487,458 @@ pub async fn batch_load_history(
     Ok(history)
 }
 
-/// Reads the page of the line from `revision` from the remote into the local store, where the
-/// store lacks `revision`'s state, so that a walk down the line reads a page per request rather
-/// than a revision. The page ends at its first revision numbered `floor` or lower, and only the
-/// states of the revisions it lists are cached, without their metadata: the remote answers a page
-/// whole, so the bound saves no request, but keeps the walk from storing what it will not read.
-///
-/// Answers whether the store holds `revision`'s state, or the remote listed its page. A walk that
-/// asks for each revision the store lacks stops asking once the answer is no, and reads each
-/// revision on its own: where the repository has no remote, as on a server, or the remote lists
-/// nothing. The page is read on a cold path, once a page, so its future is boxed.
-///
-/// Not an `async fn`, which would hold a second copy of its arguments.
+/// How many pages a [`LinePager`] keeps requested ahead of its walk, the page the walk is in among
+/// them.
 #[lore_macro::test_pub]
-#[allow(clippy::manual_async_fn)]
-pub(crate) fn page_in_line(
+pub(crate) const PAGES_AHEAD: usize = 4;
+
+/// How many pages of its own, read by hash signature, a walk reads before its [`LinePager`]
+/// requests pages ahead of it, so that a walk that ends within a page or two of its start requests
+/// none.
+const OWN_PAGES_BEFORE_AHEAD: usize = 2;
+
+/// How many walks sharing the permits of [`lines_ahead`] request the pages of their lines ahead at
+/// once. The first walks to read [`OWN_PAGES_BEFORE_AHEAD`] pages of their own take the permits.
+/// A walk refused one asks again at each next page of its own, and a permit comes free once a walk
+/// ends or stops requesting pages ahead.
+#[lore_macro::test_pub]
+pub(crate) const LINES_AHEAD: usize = 2;
+
+/// The permits that the pagers of one search's walks share, [`LINES_AHEAD`] of them.
+#[lore_macro::test_pub]
+pub(crate) fn lines_ahead() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(LINES_AHEAD))
+}
+
+/// How many revision numbers the remote's page of a branch's history line lists by default,
+/// aligned on multiples of it, as [`page_floor`] answers. The remote picks the size of its pages,
+/// so this is a guess: where it holds, each page requested ahead takes one request. Where the
+/// remote's pages are larger, as Lore Server's are with a larger history step, each request lists
+/// the remote's page whole, so a page of `n` revision numbers is listed `n / PAGE_NUMBERS` times.
+const PAGE_NUMBERS: u64 = branch::DEFAULT_HISTORY_STEP_SIZE;
+
+/// The lowest revision number of the remote's default page that holds revision number `number`:
+/// those pages list the revision numbers above a multiple of [`PAGE_NUMBERS`] up to the next.
+fn page_floor(number: u64) -> u64 {
+    number.saturating_sub(1) / PAGE_NUMBERS * PAGE_NUMBERS + 1
+}
+
+/// Reads the history line a walk follows back through first parents from the remote into the
+/// local store a page at a time, so that the walk reads a page per request rather than a revision,
+/// and on a long line, requests [`PAGES_AHEAD`] pages at once.
+///
+/// The walk asks for each revision before it reads it, as [`Self::page_in`] describes. A revision
+/// the store lacks is read with its page, by hash signature. Once the walk has read
+/// [`OWN_PAGES_BEFORE_AHEAD`] such pages, and the pager holds one of the permits its search shares
+/// between its pagers, it also requests the pages below, as [`PagesAhead`] describes. A pager
+/// without a permit asks for one again at its walk's next page of its own.
+///
+/// Dropped, a pager aborts the pages it requested. Every page task it stops holding has ended,
+/// and [`Self::finish`] ends the rest.
+#[lore_macro::test_pub]
+pub(crate) struct LinePager {
     repository: Arc<RepositoryContext>,
-    revision: Hash,
-    floor: u64,
-) -> impl Future<Output = bool> + Send {
-    async move {
-        if immutable::is_stored_local(repository.clone(), Address::zero_context_hash(revision))
-            .await
-        {
-            return true;
+    lines_ahead: Arc<Semaphore>,
+    /// Whether the remote lists pages: once it lists none, the walk reads each revision on its own.
+    paging: bool,
+    own_pages: usize,
+    ahead: Ahead,
+}
+
+/// Whether a [`LinePager`] requests pages ahead of its walk.
+enum Ahead {
+    /// Not yet: the walk has read too few pages of its own, or the pager has no permit.
+    NotYet,
+    /// Requesting: the pages requested and not retired.
+    On(PagesAhead),
+    /// Never again for this walk: the metadata naming the branch of its line could not be read,
+    /// the pages requested were ended as [`PagesAhead`] describes, the remote lists no pages, or
+    /// the walk has finished.
+    Off,
+}
+
+/// The pages of a walk's line requested ahead of it, newest first, by revision number on the
+/// branch its revisions were created on, as their metadata records it. A revision number at or
+/// below that of the branch's branch point names the revision of the branch it was created from,
+/// so the branch's revision numbers name every revision of the line. Not every number names one:
+/// a merged revision is numbered one above the higher of its parents, so the line skips the
+/// numbers between it and a first parent numbered below its other parent, and the remote lists no
+/// page from a skipped number. The first page is requested from the revision number below the
+/// walk's last page of its own, and each after it from the highest revision number of the
+/// remote's default page below, as [`page_floor`] answers. Each page reads the line down to the
+/// next page, however the remote sizes and aligns its pages, as [`page_by_number`] describes.
+///
+/// A page the walk has read below is retired, and the next requested, so the pages requested run
+/// [`PAGES_AHEAD`] ahead of the walk ([`Self::pass`]). A revision the store lacks is waited for in
+/// the pages in the order requested, up to a page that lists nothing ([`Self::wait_for`]). Where
+/// none of them holds it, the walk reads its page by hash signature, which retires the pages it
+/// covers. The pages go on where that page's revisions are numbered below the number a page that
+/// listed nothing was requested from, so the line skips that number, or where [`Self::held`] holds.
+/// Otherwise the pages are ended, as where the remote's line of the branch isn't the walk's, or
+/// the remote lists no pages by number.
+struct PagesAhead {
+    branch: BranchId,
+    /// The revision number to request the next page from.
+    next: u64,
+    /// The pages requested and not retired, newest first, each with the revision number it was
+    /// requested from. Each task answers whether its page listed any of the line.
+    pages: VecDeque<(u64, AbortOnDropHandle<bool>)>,
+    /// Whether, since the walk last read a page of its own, a page the walk read below listed any
+    /// of the line, or a page waited for held the revision the walk lacked.
+    held: bool,
+    /// The search's permit for the line, released with it.
+    _permit: OwnedSemaphorePermit,
+}
+
+/// What waiting for the pages requested ahead found for a revision the local store lacks.
+enum Waited {
+    /// A page held the revision.
+    Held,
+    /// The page requested from this revision number listed none of the line. The pages after it
+    /// are still requested.
+    ListedNothing(u64),
+    /// No page left holds the revision.
+    NotHeld,
+}
+
+impl LinePager {
+    /// A pager for one walk of a search, whose pagers share the permits of `lines_ahead`.
+    #[lore_macro::test_pub]
+    pub(crate) fn new(repository: Arc<RepositoryContext>, lines_ahead: Arc<Semaphore>) -> Self {
+        Self {
+            repository,
+            lines_ahead,
+            paging: true,
+            own_pages: 0,
+            ahead: Ahead::NotYet,
         }
-        matches!(
-            Box::pin(remote_page(repository, revision, Some(floor), None)).await,
-            Ok(listed) if listed > 0
-        )
+    }
+
+    /// Whether the remote lists pages, so that the walk asks for each revision before it reads it.
+    #[lore_macro::test_pub]
+    pub(crate) fn paging(&self) -> bool {
+        self.paging
+    }
+
+    /// Makes the local store hold the state of `revision`, the next revision the walk reads, where
+    /// the remote lists it. `below` is the revision number of the revision the walk read before
+    /// it, or `u64::MAX` for the first. Where the store lacks the revision, the pager waits for the
+    /// pages requested ahead, in order, and where none of them holds it, reads its page by hash
+    /// signature, a remote request on a cold path, once a page, so its future is boxed.
+    ///
+    /// The pages are read only down to the line's first revision numbered `floor` or lower, and
+    /// only the states of the revisions they list are cached, without their metadata: the remote
+    /// answers a page whole, so the bound saves no request, but keeps the walk from storing what
+    /// it won't read. Once the remote lists no page by hash signature, as where the repository has
+    /// no remote, such as on a server, or the remote lists nothing, the pager stops paging, and the
+    /// walk reads each revision on its own.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
+    #[lore_macro::test_pub]
+    #[allow(clippy::manual_async_fn)]
+    pub(crate) fn page_in(
+        &mut self,
+        revision: Hash,
+        below: u64,
+        floor: u64,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        async move {
+            if !self.paging {
+                return;
+            }
+            if let Ahead::On(ahead) = &mut self.ahead {
+                ahead.pass(below).await;
+                ahead.request(&self.repository, floor);
+            }
+            if stored_local(&self.repository, revision).await {
+                return;
+            }
+            let mut listed_nothing = None;
+            if let Ahead::On(ahead) = &mut self.ahead {
+                match ahead.wait_for(&self.repository, revision).await {
+                    Waited::Held => {
+                        ahead.request(&self.repository, floor);
+                        return;
+                    }
+                    Waited::ListedNothing(number) => listed_nothing = Some(number),
+                    Waited::NotHeld => {}
+                }
+            }
+            let Ok(Some(page)) = Box::pin(remote_page(
+                self.repository.clone(),
+                revision,
+                Some(floor),
+                None,
+            ))
+            .await
+            else {
+                self.paging = false;
+                self.finish().await;
+                return;
+            };
+            self.own_pages += 1;
+            match &mut self.ahead {
+                Ahead::On(ahead)
+                    if ahead.held || listed_nothing.is_some_and(|number| page.newest < number) =>
+                {
+                    ahead.pass(page.oldest).await;
+                    if ahead.pages.is_empty() {
+                        ahead.next = page.oldest.saturating_sub(1);
+                    }
+                    ahead.held = false;
+                    ahead.request(&self.repository, floor);
+                }
+                Ahead::On(_) => self.finish().await,
+                Ahead::NotYet
+                    if self.own_pages >= OWN_PAGES_BEFORE_AHEAD
+                        && page.oldest.saturating_sub(1) > floor =>
+                {
+                    self.start_ahead(page, floor).await;
+                }
+                Ahead::NotYet | Ahead::Off => {}
+            }
+        }
+    }
+
+    /// Requests the pages below `page`, the walk's last page of its own, where the pager takes a
+    /// permit and reads the branch of the page's oldest revision from its metadata. The metadata
+    /// is read once a walk, a cold path, so its future is boxed.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
+    #[allow(clippy::manual_async_fn)]
+    fn start_ahead(&mut self, page: Listed, floor: u64) -> impl Future<Output = ()> + Send + '_ {
+        async move {
+            let Ok(permit) = self.lines_ahead.clone().try_acquire_owned() else {
+                return;
+            };
+            let read = Box::pin(Metadata::deserialize(
+                self.repository.clone(),
+                page.metadata,
+            ))
+            .await;
+            let Some(branch) = read.ok().and_then(|metadata| metadata.get_branch().ok()) else {
+                self.ahead = Ahead::Off;
+                return;
+            };
+            let next = page.oldest.saturating_sub(1);
+            lore_debug!(
+                "Requesting pages of branch {branch} ahead of the walk from revision number {next}"
+            );
+            let mut ahead = PagesAhead {
+                branch,
+                next,
+                pages: VecDeque::with_capacity(PAGES_AHEAD),
+                held: false,
+                _permit: permit,
+            };
+            ahead.request(&self.repository, floor);
+            self.ahead = Ahead::On(ahead);
+        }
+    }
+
+    /// Ends the pages requested ahead, waiting for their tasks to end, and returns the pager's
+    /// permit: the pager requests no pages ahead again.
+    #[lore_macro::test_pub]
+    pub(crate) async fn finish(&mut self) {
+        if let Ahead::On(ahead) = &mut self.ahead {
+            ahead.end().await;
+        }
+        self.ahead = Ahead::Off;
     }
 }
 
+impl PagesAhead {
+    /// Requests pages until [`PAGES_AHEAD`] are requested and not retired, or the next would list
+    /// only revisions numbered `floor` or lower.
+    fn request(&mut self, repository: &Arc<RepositoryContext>, floor: u64) {
+        while self.pages.len() < PAGES_AHEAD && self.next > floor {
+            let bottom = page_floor(self.next);
+            let page = page_by_number(repository.clone(), self.branch, self.next, bottom, floor);
+            self.pages
+                .push_back((self.next, AbortOnDropHandle::new(lore_spawn!(page))));
+            self.next = bottom.saturating_sub(1);
+        }
+    }
+
+    /// Retires the pages whose revision numbers down to the next page are all `below` or higher,
+    /// the store holding the line down to the revision numbered `below`: a page still in flight is
+    /// aborted, and each has ended once retired. A retired page that listed any of the line sets
+    /// [`Self::held`].
+    async fn pass(&mut self, below: u64) {
+        while let Some(&(number, _)) = self.pages.front()
+            && page_floor(number) >= below
+            && let Some((_, page)) = self.pages.pop_front()
+        {
+            if !page.is_finished() {
+                page.abort();
+            }
+            if matches!(page.await, Ok(true)) {
+                self.held = true;
+            }
+        }
+    }
+
+    /// Waits for the pages in the order requested until the local store holds the state of
+    /// `revision`, or a page lists none of the line, which stops the wait.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
+    #[allow(clippy::manual_async_fn)]
+    fn wait_for<'a>(
+        &'a mut self,
+        repository: &'a Arc<RepositoryContext>,
+        revision: Hash,
+    ) -> impl Future<Output = Waited> + Send + 'a {
+        async move {
+            loop {
+                let Some((number, page)) = self.pages.pop_front() else {
+                    return Waited::NotHeld;
+                };
+                if !matches!(page.await, Ok(true)) {
+                    return Waited::ListedNothing(number);
+                }
+                if stored_local(repository, revision).await {
+                    self.held = true;
+                    return Waited::Held;
+                }
+            }
+        }
+    }
+
+    /// Aborts the pages requested and not retired, and waits for their tasks to end.
+    async fn end(&mut self) {
+        for (_, page) in &self.pages {
+            page.abort();
+        }
+        while let Some((_, page)) = self.pages.pop_front() {
+            let _ended = page.await;
+        }
+    }
+}
+
+/// Whether the local store of `repository` holds the state of `revision`.
+fn stored_local(
+    repository: &Arc<RepositoryContext>,
+    revision: Hash,
+) -> impl Future<Output = bool> + Send + use<> {
+    immutable::is_stored_local(repository.clone(), Address::zero_context_hash(revision))
+}
+
+/// Reads the history line of `branch` from revision number `number` from the remote into the local
+/// store, down to revision number `bottom` or to the line's first revision numbered `floor` or
+/// lower, as [`LinePager::page_in`] reads a page by hash signature. The remote's page holds the
+/// revision its request names somewhere among the revisions it lists, newest first, and the remote
+/// picks the page's size. So the line starts at the first revision the page lists as numbered
+/// `number` or lower. Where a page ends above `bottom`, the page below it is read by the page's
+/// cursor, or where it has none, from the revision number below its oldest revision, and the line
+/// continues at the first revision that page lists as numbered below the line read so far. Only
+/// the states of the line are cached, and the line ends at the first state that isn't its
+/// revision's own, or isn't numbered below the one above it. Answers whether a page listed any of
+/// the line.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn page_by_number(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    number: u64,
+    bottom: u64,
+    floor: u64,
+) -> impl Future<Output = bool> + Send {
+    async move {
+        let Ok(remote) = repository.remote().await else {
+            return false;
+        };
+        let Ok(revision_protocol) = remote.revision(repository.id).await else {
+            return false;
+        };
+        let mut start: RevisionListStart = RevisionListIdentifier { branch, number }.into();
+        let mut above = number.saturating_add(1);
+        let mut listed_any = false;
+        loop {
+            let response = match revision_protocol.revision_list(start).await {
+                Ok(response) => response,
+                Err(err) => {
+                    if listed_any {
+                        lore_debug!(
+                            "The remote lists no page of branch {branch} below revision number {above}: {err}"
+                        );
+                    } else {
+                        lore_debug!(
+                            "The remote lists no page of branch {branch} from revision number {number}: {err}"
+                        );
+                    }
+                    return listed_any;
+                }
+            };
+            let Some(first) = response.items.iter().position(|item| item.number < above) else {
+                return listed_any;
+            };
+            let line = &response.items[first..];
+            let mut listed = 0;
+            for item in line {
+                let Some(item_number) =
+                    verified_number(item).filter(|&item_number| item_number < above)
+                else {
+                    break;
+                };
+                listed += 1;
+                above = item_number;
+                if item_number <= floor {
+                    break;
+                }
+            }
+            if listed == 0 {
+                return listed_any;
+            }
+            cache_page_states(repository.clone(), &line[..listed], 0).await;
+            listed_any = true;
+            if above <= bottom.max(floor) || listed < line.len() {
+                return true;
+            }
+            // `above` is above `bottom`, so the request's revision number is never 0, which the
+            // remote reads as naming the branch's latest revision.
+            start = if response.next_revision.is_zero() {
+                RevisionListIdentifier {
+                    branch,
+                    number: above - 1,
+                }
+                .into()
+            } else {
+                response.next_revision.into()
+            };
+        }
+    }
+}
+
+/// The revision numbers of the newest and the oldest revision of a line a page lists, and the
+/// metadata hash of the oldest, as their states record them.
+#[derive(Clone, Copy)]
+struct Listed {
+    newest: u64,
+    oldest: u64,
+    metadata: Hash,
+}
+
 /// Reads the remote's page of the line from `revision`, which the local store lacks, ending at its
-/// first revision numbered `floor` or lower where there is a floor. Answers how many revisions of
-/// the line it listed, none where the remote cannot list it, and appends each to `history`, if
-/// any, with its number as [`verified_number`] reads it.
+/// first revision numbered `floor` or lower where there is a floor. Answers what it listed of the
+/// line, as [`Listed`] records it, none where it listed none or the remote cannot list it, and
+/// appends each revision it listed to `history`, if any, with its number as its state records it,
+/// read by [`verified_state`].
 ///
 /// Without a floor the page's states and the metadata of the revisions on the line are cached, as
 /// [`batch_load_history`] describes. With one, only the states of the listed revisions are, as
-/// [`page_in_line`] describes.
+/// [`LinePager::page_in`] describes.
 async fn remote_page(
     repository: Arc<RepositoryContext>,
     revision: Hash,
     floor: Option<u64>,
     mut history: Option<&mut Vec<(u64, Hash)>>,
-) -> Result<usize, FindError> {
+) -> Result<Option<Listed>, FindError> {
     let Ok(remote) = repository.remote().await else {
-        return Ok(0);
+        return Ok(None);
     };
     let Ok(revision_protocol) = remote.revision(repository.id).await else {
-        return Ok(0);
+        return Ok(None);
     };
 
     if let Some(floor) = floor {
@@ -542,31 +948,38 @@ async fn remote_page(
     }
 
     let Ok(response) = revision_protocol.revision_list(revision.into()).await else {
-        return Ok(0);
+        return Ok(None);
     };
 
     lore_debug!("Got {} revisions", response.items.len(),);
 
     let line = response.items_from(revision);
     let mut listed = 0;
+    let mut page: Option<Listed> = None;
     for item in line {
-        let Some(number) = verified_number(item) else {
+        let Some(state) = verified_state(item) else {
             return Err(FindError::internal(format!(
                 "the remote listed revision {} without its own state",
                 item.signature
             )));
         };
+        let number = state.revision_number;
         if let Some(history) = history.as_deref_mut() {
             history.push((number, item.signature));
         }
         listed += 1;
+        page = Some(Listed {
+            newest: page.map_or(number, |page| page.newest),
+            oldest: number,
+            metadata: state.metadata_hash(),
+        });
         if floor.is_some_and(|floor| number <= floor) {
             break;
         }
     }
     if floor.is_some() {
         cache_page_states(repository, &line[..listed], 0).await;
-        return Ok(listed);
+        return Ok(page);
     }
 
     let metadata_addresses: Vec<Address> = line
@@ -578,7 +991,7 @@ async fn remote_page(
     let _ = immutable::cache(repository.clone(), metadata_addresses, true).await;
     cache_page_states(repository, &response.items, unverified).await;
 
-    Ok(listed)
+    Ok(page)
 }
 
 /// Cache the per-item state blobs from a remote `revision_list` response into

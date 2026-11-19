@@ -32,6 +32,7 @@ use lore_transport::ProtocolError;
 use serde::Serialize;
 use tokio::join;
 use tokio::sync::RwLock;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::try_join;
@@ -6043,6 +6044,9 @@ struct AncestorWalk {
     /// First read failure that cut a walk short, kept so the search can report
     /// an incomplete history rather than an absent common ancestor.
     failure: RwLock<Option<StateError>>,
+    /// The permits of the walks' pagers to request pages ahead, as [`find::lines_ahead`] gives
+    /// them.
+    lines_ahead: Arc<Semaphore>,
 }
 
 impl AncestorWalk {
@@ -6053,6 +6057,7 @@ impl AncestorWalk {
             floor_revision,
             floor_revision_number,
             failure: RwLock::new(None),
+            lines_ahead: find::lines_ahead(),
         }
     }
 
@@ -6091,14 +6096,15 @@ async fn find_ancestor_walker(
     let mut tasks = JoinSet::new();
 
     let mut revision = revision_start;
-    let mut paging = true;
+    let mut pager = find::LinePager::new(repository.clone(), walk.lines_ahead.clone());
+    let mut below = u64::MAX;
     while revision != Hash::default() {
         // Read the line a page at a time rather than a revision per request, no further down than
         // the walks prune: the floor, or the newest common ancestor found so far. A refused page
         // leaves each state to be read on its own below.
-        if paging {
+        if pager.paging() {
             let floor = walk.prune_at_or_below().await;
-            paging = find::page_in_line(repository.clone(), revision, floor).await;
+            pager.page_in(revision, below, floor).await;
         }
         let state = match state::State::deserialize(repository.clone(), revision).await {
             Ok(state) => state,
@@ -6178,9 +6184,11 @@ async fn find_ancestor_walker(
             });
         }
 
+        below = state_revision_number;
         revision = state.parent_self();
     }
 
+    pager.finish().await;
     walk.join(&mut tasks).await;
 }
 

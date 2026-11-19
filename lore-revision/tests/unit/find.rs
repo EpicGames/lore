@@ -544,59 +544,1086 @@ mod revision_state {
     }
 }
 
-mod page_in_line {
+mod line_pager {
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use lore_base::error::NotAuthorized;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::BranchId;
     use lore_base::types::Hash;
-    use lore_revision::find::page_in_line;
-    use lore_transport::ProtocolError;
+    use lore_revision::find::LINES_AHEAD;
+    use lore_revision::find::LinePager;
+    use lore_revision::find::PAGES_AHEAD;
+    use lore_revision::find::lines_ahead;
+    use lore_revision::metadata::Metadata;
+    use lore_revision::repository::RepositoryContext;
+    use lore_revision::state::State;
+    use tokio::sync::Semaphore;
 
     use crate::branch::write_line;
     use crate::helper::setup_test_execution;
     use crate::paged_remote::Anchor;
-    use crate::paged_remote::ClientStores;
     use crate::paged_remote::PagedRemote;
     use crate::paged_remote::RemoteRevision;
+    use crate::paged_remote::anchors;
+    use crate::paged_remote::branch_metadata;
     use crate::paged_remote::client_on;
     use crate::paged_remote::client_stores;
     use crate::paged_remote::counted_client_stores;
+    use crate::paged_remote::paging_remote;
+    use crate::paged_remote::remote_line;
     use crate::paged_remote::remote_revision;
+    use crate::paged_remote::signature_of;
+    use crate::paged_remote::span;
     use crate::paged_remote::stored_locally;
+    use crate::paged_remote::without_its_own_state;
 
-    /// Five revisions numbered 1 to 5 that only the remote holds, oldest first.
-    async fn remote_line() -> Vec<RemoteRevision> {
-        let mut line: Vec<RemoteRevision> = Vec::new();
-        for number in 1..=5 {
-            let parent = line.last().map_or(Hash::default(), |below| below.signature);
-            line.push(remote_revision(number, parent, Hash::from([0xA0; 32])).await);
+    /// The branch of the remote's line.
+    fn branch() -> BranchId {
+        BranchId::from([7; 16])
+    }
+
+    /// Walks the line from `revision` back through first parents as a walk of a search does,
+    /// asking `pager` for each revision before reading it, down to the first revision numbered
+    /// `floor` or lower. Answers the numbers of the revisions read, newest first, up to the first
+    /// that could not be read.
+    async fn walk(
+        pager: &mut LinePager,
+        client: &Arc<RepositoryContext>,
+        revision: Hash,
+        floor: u64,
+    ) -> Vec<u64> {
+        walk_until(pager, client, revision, floor, floor).await
+    }
+
+    /// [`walk`], ending at the first revision numbered `until` or lower.
+    async fn walk_until(
+        pager: &mut LinePager,
+        client: &Arc<RepositoryContext>,
+        mut revision: Hash,
+        floor: u64,
+        until: u64,
+    ) -> Vec<u64> {
+        let mut numbers = Vec::new();
+        while !revision.is_zero() {
+            if pager.paging() {
+                let below = numbers.last().copied().unwrap_or(u64::MAX);
+                pager.page_in(revision, below, floor).await;
+            }
+            let Ok(state) = State::deserialize(client.clone(), revision).await else {
+                break;
+            };
+            numbers.push(state.revision_number());
+            if state.revision_number() <= until {
+                break;
+            }
+            revision = state.parent_self();
+        }
+        numbers
+    }
+
+    fn permits() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(1))
+    }
+
+    /// A walk down a long line reads its first two pages by hash signature, and every page below
+    /// them by revision number on the branch of the line, requested ahead of it.
+    #[tokio::test]
+    async fn a_long_line_is_read_ahead_by_number() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                let remote = Arc::new(paging_remote(branch(), &line));
+                let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client.clone(), permits());
+
+                let walked = walk(&mut pager, &client, line[999].signature, 0).await;
+                pager.finish().await;
+
+                assert_eq!(walked, (1..=1000).rev().collect::<Vec<u64>>());
+                assert_eq!(
+                    anchors(&remote),
+                    (
+                        vec![signature_of(&line, 1000), signature_of(&line, 900)],
+                        vec![800, 700, 600, 500, 400, 300, 200, 100],
+                    )
+                );
+            })
+            .await;
+    }
+
+    /// A remote holding `line` of a thousand revisions whose first two pages, listed by hash
+    /// signature, end off its page boundaries, at revision number 812. By revision number, it
+    /// lists the whole page of a hundred revisions that holds revision number 811, and each page
+    /// below from its top.
+    fn unaligned_paging_remote(line: &[RemoteRevision]) -> PagedRemote {
+        let mut remote = PagedRemote::new(branch(), line[999].signature)
+            .holding(line)
+            .page(
+                signature_of(line, 1000),
+                span(line, 1000, 912),
+                Hash::default(),
+            )
+            .page(
+                signature_of(line, 911),
+                span(line, 911, 812),
+                Hash::default(),
+            )
+            .page(Anchor::Number(811), span(line, 900, 801), Hash::default());
+        for top in (100..=800).rev().step_by(100) {
+            remote = remote.page(
+                Anchor::Number(top),
+                span(line, top, top - 99),
+                Hash::default(),
+            );
+        }
+        remote
+    }
+
+    /// Where the walk's own pages end off a page boundary of the remote, the first page ahead,
+    /// which the remote lists from the top of its page, is cached from the number below them, and
+    /// those after it are requested at the tops of the pages below, so the pages leave no gap.
+    #[tokio::test]
+    async fn pages_ahead_follow_the_remote_page_boundaries() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                let remote = Arc::new(unaligned_paging_remote(&line));
+                let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client.clone(), permits());
+
+                let walked = walk(&mut pager, &client, line[999].signature, 0).await;
+                pager.finish().await;
+
+                assert_eq!(walked, (1..=1000).rev().collect::<Vec<u64>>());
+                assert_eq!(
+                    anchors(&remote),
+                    (
+                        vec![signature_of(&line, 1000), signature_of(&line, 911)],
+                        vec![811, 800, 700, 600, 500, 400, 300, 200, 100],
+                    )
+                );
+            })
+            .await;
+    }
+
+    /// The first page ahead, requested off a page boundary of the remote, is retired once the walk
+    /// reads below the lowest revision number of the remote's page that holds it, and the next
+    /// page is requested then. The walk reads on once the pages have landed, as a walk that waited
+    /// for the first would take it from the pages itself.
+    #[tokio::test]
+    async fn a_page_ahead_off_a_page_boundary_is_retired_below_its_page() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                let remote = Arc::new(unaligned_paging_remote(&line));
+                let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client.clone(), permits());
+
+                walk_until(&mut pager, &client, line[999].signature, 0, 812).await;
+                let bottoms = [800, 700, 600, 500].map(|index| line[index].signature);
+                let landed = tokio::time::timeout(Duration::from_secs(5), async {
+                    while stored_locally(&client, &bottoms).await != [true; 4] {
+                        tokio::task::yield_now().await;
+                    }
+                });
+                assert!(landed.await.is_ok(), "the pages requested ahead land");
+                let walked = walk_until(&mut pager, &client, line[810].signature, 0, 790).await;
+                for _ in 0..16 {
+                    tokio::task::yield_now().await;
+                }
+
+                assert_eq!(walked.last(), Some(&790));
+                assert_eq!(anchors(&remote).1, [811, 800, 700, 600, 500]);
+                pager.finish().await;
+            })
+            .await;
+    }
+
+    /// The numbers of the revisions of `line` that `signatures` anchor, newest first.
+    fn numbers_of(line: &[RemoteRevision], signatures: &[Anchor]) -> Vec<u64> {
+        let mut numbers: Vec<u64> = signatures
+            .iter()
+            .map(|anchor| {
+                line.iter()
+                    .position(|revision| Anchor::Signature(revision.signature) == *anchor)
+                    .expect("an anchor of the line") as u64
+                    + 1
+            })
+            .collect();
+        numbers.sort_unstable_by(|a, b| b.cmp(a));
+        numbers
+    }
+
+    /// A remote holding `line` of a thousand revisions that lists its first two pages whole by hash
+    /// signature, and from each revision number below them a page that holds the revision so
+    /// numbered among newer and older ones, and ends half way to the next page. The page below it
+    /// is listed by its cursor where `cursors`, and by the revision number below its oldest
+    /// revision where not, and holds that revision among newer ones.
+    fn short_paging_remote(line: &[RemoteRevision], cursors: bool) -> PagedRemote {
+        let mut remote = PagedRemote::new(branch(), line[999].signature)
+            .holding(line)
+            .page(
+                signature_of(line, 1000),
+                span(line, 1000, 901),
+                Hash::default(),
+            )
+            .page(
+                signature_of(line, 900),
+                span(line, 900, 801),
+                Hash::default(),
+            );
+        for top in (100..=800).rev().step_by(100) {
+            let below = top - 50;
+            let (cursor, anchor) = if cursors {
+                (
+                    line[below as usize - 1].signature,
+                    signature_of(line, below),
+                )
+            } else {
+                (Hash::default(), Anchor::Number(below))
+            };
+            remote = remote
+                .page(Anchor::Number(top), span(line, top + 30, below + 1), cursor)
+                .page(anchor, span(line, below + 30, top - 99), Hash::default());
+        }
+        remote
+    }
+
+    /// A page ahead that ends above the next page requested is followed by the page below it, by
+    /// its cursor, so the pages leave no gap however the remote sizes and aligns its pages.
+    #[tokio::test]
+    async fn a_short_page_ahead_is_followed_by_its_cursor() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                let remote = Arc::new(short_paging_remote(&line, true));
+                let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client.clone(), permits());
+
+                let walked = walk(&mut pager, &client, line[999].signature, 0).await;
+                pager.finish().await;
+
+                assert_eq!(walked, (1..=1000).rev().collect::<Vec<u64>>());
+                let (signatures, numbers) = anchors(&remote);
+                assert_eq!(
+                    numbers_of(&line, &signatures),
+                    [1000, 900, 750, 650, 550, 450, 350, 250, 150, 50]
+                );
+                assert_eq!(numbers, [800, 700, 600, 500, 400, 300, 200, 100]);
+            })
+            .await;
+    }
+
+    /// A short page ahead without a cursor to the page below it is followed by the page from the
+    /// number below its oldest revision.
+    #[tokio::test]
+    async fn a_short_page_ahead_without_a_cursor_is_followed_by_number() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                let remote = Arc::new(short_paging_remote(&line, false));
+                let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client.clone(), permits());
+
+                let walked = walk(&mut pager, &client, line[999].signature, 0).await;
+                pager.finish().await;
+
+                assert_eq!(walked, (1..=1000).rev().collect::<Vec<u64>>());
+                assert_eq!(
+                    anchors(&remote),
+                    (
+                        vec![signature_of(&line, 1000), signature_of(&line, 900)],
+                        (1..=16).rev().map(|step| step * 50).collect::<Vec<u64>>(),
+                    )
+                );
+            })
+            .await;
+    }
+
+    /// A page ahead ends the line at a revision the remote lists out of order, and follows no
+    /// cursor past it.
+    #[tokio::test]
+    async fn a_page_ahead_ends_at_a_revision_listed_out_of_order() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                let mut out_of_order = span(&line, 750, 750);
+                out_of_order.extend(span(&line, 760, 760));
+                let mut remote = PagedRemote::new(branch(), line[999].signature)
+                    .holding(&line)
+                    .page(
+                        signature_of(&line, 1000),
+                        span(&line, 1000, 901),
+                        Hash::default(),
+                    )
+                    .page(
+                        signature_of(&line, 900),
+                        span(&line, 900, 801),
+                        Hash::default(),
+                    )
+                    .page(
+                        Anchor::Number(800),
+                        span(&line, 800, 751),
+                        line[749].signature,
+                    )
+                    .page(signature_of(&line, 750), out_of_order, line[758].signature)
+                    .page(
+                        signature_of(&line, 759),
+                        span(&line, 759, 701),
+                        Hash::default(),
+                    );
+                for top in (100..=700).rev().step_by(100) {
+                    remote = remote.page(
+                        Anchor::Number(top),
+                        span(&line, top, top - 99),
+                        Hash::default(),
+                    );
+                }
+                let remote = Arc::new(remote);
+                let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client.clone(), permits());
+
+                let walked = walk(&mut pager, &client, line[999].signature, 0).await;
+                pager.finish().await;
+
+                assert_eq!(
+                    walked.last(),
+                    Some(&750),
+                    "the walk reads the line the page listed"
+                );
+                assert!(
+                    !anchors(&remote).0.contains(&signature_of(&line, 759)),
+                    "no cursor past the revision listed out of order is followed"
+                );
+            })
+            .await;
+    }
+
+    /// The pages requested run ahead of where the walk reads, not of where the pages land: a walk
+    /// that reads into the second page requested ahead has one more page requested than the first
+    /// window, though every page lands at once.
+    #[tokio::test]
+    async fn pages_ahead_follow_the_walk() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                let remote = Arc::new(paging_remote(branch(), &line));
+                let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client.clone(), permits());
+
+                let walked = walk_until(&mut pager, &client, line[999].signature, 0, 700).await;
+                for _ in 0..16 {
+                    tokio::task::yield_now().await;
+                }
+
+                assert_eq!(walked.last(), Some(&700));
+                assert_eq!(anchors(&remote).1, [800, 700, 600, 500, 400]);
+                pager.finish().await;
+            })
+            .await;
+    }
+
+    /// Pages are requested ahead down to the first that lists the floor, and each stores the line
+    /// down to it, and none below.
+    #[tokio::test]
+    async fn pages_ahead_stop_at_the_floor() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                let remote = Arc::new(paging_remote(branch(), &line));
+                let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client.clone(), permits());
+
+                let walked = walk(&mut pager, &client, line[999].signature, 450).await;
+                pager.finish().await;
+
+                assert_eq!(walked.last(), Some(&450));
+                assert_eq!(anchors(&remote).1, [800, 700, 600, 500]);
+                assert_eq!(
+                    stored_locally(&client, &[line[449].signature, line[448].signature]).await,
+                    [true, false]
+                );
+            })
+            .await;
+    }
+
+    /// A walk that ends within its first two pages requests no page ahead, and takes no permit to.
+    #[tokio::test]
+    async fn a_short_walk_requests_no_pages_ahead() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                for floor in [950, 850, 801] {
+                    let stores = client_stores().await;
+                    let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                    let remote = Arc::new(paging_remote(branch(), &line));
+                    let client = client_on(&stores, remote.clone());
+                    let lines_ahead = permits();
+                    let mut pager = LinePager::new(client.clone(), lines_ahead.clone());
+
+                    walk(&mut pager, &client, line[999].signature, floor).await;
+
+                    assert_eq!(anchors(&remote).1, [] as [u64; 0], "floor {floor}");
+                    assert_eq!(
+                        lines_ahead.available_permits(),
+                        1,
+                        "floor {floor}: the pager took no permit"
+                    );
+                    pager.finish().await;
+                }
+            })
+            .await;
+    }
+
+    /// A pager keeps at most [`PAGES_AHEAD`] pages requested ahead of its walk, and dropping it
+    /// ends their requests.
+    #[tokio::test]
+    async fn at_most_the_window_of_pages_is_requested_ahead() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                let mut remote = paging_remote(branch(), &line);
+                for number in (100..=800).step_by(100) {
+                    remote = remote.stalling(Anchor::Number(number));
+                }
+                let remote = Arc::new(remote);
+                let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client.clone(), permits());
+
+                pager.page_in(line[999].signature, u64::MAX, 0).await;
+                pager.page_in(line[899].signature, 901, 0).await;
+                remote.unanswered(PAGES_AHEAD).await;
+                tokio::task::yield_now().await;
+
+                assert_eq!(anchors(&remote).1, [800, 700, 600, 500]);
+                drop(pager);
+                let ended = tokio::time::timeout(Duration::from_secs(5), remote.all_abandoned());
+                assert!(ended.await.is_ok(), "dropping the pager ends its requests");
+            })
+            .await;
+    }
+
+    /// Finishing a pager ends the requests of its pages before it returns.
+    #[tokio::test]
+    async fn finishing_a_pager_ends_its_pages() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                let mut remote = paging_remote(branch(), &line);
+                for number in (100..=800).step_by(100) {
+                    remote = remote.stalling(Anchor::Number(number));
+                }
+                let remote = Arc::new(remote);
+                let client = client_on(&stores, remote.clone());
+                let lines_ahead = permits();
+                let mut pager = LinePager::new(client.clone(), lines_ahead.clone());
+                pager.page_in(line[999].signature, u64::MAX, 0).await;
+                pager.page_in(line[899].signature, 901, 0).await;
+                remote.unanswered(PAGES_AHEAD).await;
+
+                pager.finish().await;
+
+                assert_eq!(remote.lists_unanswered(), 0);
+                assert_eq!(
+                    lines_ahead.available_permits(),
+                    1,
+                    "the pager returns its permit"
+                );
+            })
+            .await;
+    }
+
+    /// A page ahead that the remote fails stops the walk's wait at it. The walk reads the page it
+    /// lacks by hash signature, and the pages after the failed one go on, since those above held
+    /// what the walk asked for, so no page is requested twice.
+    #[tokio::test]
+    async fn a_page_ahead_that_lists_nothing_is_read_by_signature() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                let remote = paging_remote(branch(), &line)
+                    .failing(
+                        Anchor::Number(700),
+                        lore_transport::ProtocolError::from(lore_base::error::NotFound),
+                    )
+                    .page(
+                        signature_of(&line, 700),
+                        span(&line, 700, 601),
+                        Hash::default(),
+                    );
+                let remote = Arc::new(remote);
+                let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client.clone(), permits());
+
+                let walked = walk(&mut pager, &client, line[999].signature, 0).await;
+                pager.finish().await;
+
+                assert_eq!(walked, (1..=1000).rev().collect::<Vec<u64>>());
+                let (signatures, numbers) = anchors(&remote);
+                assert_eq!(
+                    signatures,
+                    [
+                        signature_of(&line, 1000),
+                        signature_of(&line, 900),
+                        signature_of(&line, 700)
+                    ]
+                );
+                assert_eq!(numbers, [800, 700, 600, 500, 400, 300, 200, 100]);
+            })
+            .await;
+    }
+
+    /// Pages ahead that hold none of the revisions the walk asks for, as those of a line other
+    /// than the walk's do, stop the pager requesting more, and the walk reads its line by hash
+    /// signature.
+    #[tokio::test]
+    async fn pages_ahead_that_hold_nothing_asked_for_stop() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let metadata = branch_metadata(&stores, branch()).await;
+                let line = remote_line(1000, metadata).await;
+                let mut other = Vec::new();
+                for number in 1..=1000 {
+                    other.push(
+                        remote_revision(number, Hash::default(), Hash::from([0xB0; 32])).await,
+                    );
+                }
+                let mut remote = PagedRemote::new(branch(), line[999].signature)
+                    .holding(&line)
+                    .holding(&other);
+                for top in (100..=1000).rev().step_by(100) {
+                    remote = remote
+                        .page(
+                            signature_of(&line, top),
+                            span(&line, top, top - 99),
+                            Hash::default(),
+                        )
+                        .page(
+                            Anchor::Number(top),
+                            span(&other, top, top - 99),
+                            Hash::default(),
+                        );
+                }
+                let remote = Arc::new(remote);
+                let client = client_on(&stores, remote.clone());
+                let lines_ahead = permits();
+                let mut pager = LinePager::new(client.clone(), lines_ahead.clone());
+
+                let walked = walk(&mut pager, &client, line[999].signature, 0).await;
+                pager.finish().await;
+
+                assert_eq!(walked, (1..=1000).rev().collect::<Vec<u64>>());
+                let (signatures, numbers) = anchors(&remote);
+                assert_eq!(numbers, [800, 700, 600, 500]);
+                assert_eq!(signatures.len(), 10, "every page is read by signature");
+                assert_eq!(
+                    lines_ahead.available_permits(),
+                    1,
+                    "the pager returns its permit"
+                );
+            })
+            .await;
+    }
+
+    /// A page ahead stores the line only down to the first state that isn't its revision's own,
+    /// whether that is the revision the page starts at or one below it. A page ahead that so lists
+    /// none of the line stops the walk's wait at it, and the walk waits for no page after it.
+    #[tokio::test]
+    async fn a_page_ahead_stores_no_state_not_its_own() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let metadata = branch_metadata(&stores, branch()).await;
+                let line = remote_line(1000, metadata).await;
+                for unowned in [750, 800] {
+                    let index = unowned as usize - 1;
+                    let other =
+                        remote_revision(unowned, Hash::default(), Hash::from([0xB0; 32])).await;
+                    for (kind, listed) in without_its_own_state(&line[index], &other) {
+                        let stores = client_stores().await;
+                        branch_metadata(&stores, branch()).await;
+                        let held: Vec<RemoteRevision> = line
+                            .iter()
+                            .filter(|revision| revision.signature != line[index].signature)
+                            .cloned()
+                            .chain(listed)
+                            .collect();
+                        let mut remote =
+                            PagedRemote::new(branch(), line[999].signature).holding(&held);
+                        remote = remote
+                            .page(
+                                signature_of(&line, 1000),
+                                span(&line, 1000, 901),
+                                Hash::default(),
+                            )
+                            .page(
+                                signature_of(&line, 900),
+                                span(&line, 900, 801),
+                                Hash::default(),
+                            );
+                        for top in (100..=800).rev().step_by(100) {
+                            remote = remote.page(
+                                Anchor::Number(top),
+                                span(&line, top, top - 99),
+                                Hash::default(),
+                            );
+                        }
+                        if unowned == 800 {
+                            for top in [700, 600, 500] {
+                                remote = remote.stalling(Anchor::Number(top));
+                            }
+                        }
+                        let client = client_on(&stores, Arc::new(remote));
+                        let mut pager = LinePager::new(client.clone(), permits());
+
+                        let walked = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            walk(&mut pager, &client, line[999].signature, 0),
+                        )
+                        .await
+                        .expect("the walk waits for no page after one that lists none of the line");
+                        pager.finish().await;
+
+                        assert_eq!(
+                            walked.last(),
+                            Some(&(unowned + 1)),
+                            "{kind} at {unowned}: the walk reads down to it"
+                        );
+                        assert_eq!(
+                            stored_locally(
+                                &client,
+                                &[
+                                    line[index + 1].signature,
+                                    line[index].signature,
+                                    line[index - 1].signature
+                                ]
+                            )
+                            .await,
+                            [true, false, false],
+                            "{kind} at {unowned}"
+                        );
+                    }
+                }
+            })
+            .await;
+    }
+
+    /// A pager that finds no permit free requests no page ahead, and reads its walk's pages by hash
+    /// signature. A later pager takes the permit once the pager holding it finishes.
+    #[tokio::test]
+    async fn a_pager_without_a_permit_reads_its_own_pages() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let lines_ahead = permits();
+                let mut holding = None;
+                for expected in [8, 0, 8] {
+                    let stores = client_stores().await;
+                    let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                    let remote = Arc::new(paging_remote(branch(), &line));
+                    let client = client_on(&stores, remote.clone());
+                    let mut pager = LinePager::new(client.clone(), lines_ahead.clone());
+
+                    walk(&mut pager, &client, line[999].signature, 0).await;
+
+                    assert_eq!(anchors(&remote).1.len(), expected);
+                    match holding.take() {
+                        None => holding = Some(pager),
+                        Some(mut first) => {
+                            first.finish().await;
+                            pager.finish().await;
+                        }
+                    }
+                }
+            })
+            .await;
+    }
+
+    /// Revisions numbered 1 to 1000 that only the remote holds, as [`remote_line`] gives them, but
+    /// revision 805 has the revision numbered `below` as its first parent, as a merged revision
+    /// numbered above its other parent does. The line skips the revision numbers between them,
+    /// whose revisions are off it.
+    async fn skipping_line(metadata: Hash, below: u64) -> Vec<RemoteRevision> {
+        let mut line = remote_line(1000, metadata).await;
+        for number in 805..=1000 {
+            let parent = if number == 805 { below } else { number - 1 };
+            line[number as usize - 1] =
+                remote_revision(number, line[parent as usize - 1].signature, metadata).await;
         }
         line
     }
 
-    /// A remote holding `line`, which lists it whole from its newest revision, or refuses to.
-    fn remote(line: &[RemoteRevision], refusing: bool) -> Arc<PagedRemote> {
-        let newest = line.last().expect("the line has revisions").signature;
-        let remote = PagedRemote::new(BranchId::from([7; 16]), newest).holding(line);
+    /// Pages requested ahead from revision numbers the line skips list nothing. The walk reads the
+    /// page below the skipped numbers by hash signature, which retires the pages it covers, and the
+    /// pages below it go on, each requested once: after a page from the first window, where the
+    /// skipped numbers end within it, or from the next page down, where they run past it.
+    #[tokio::test]
+    async fn pages_ahead_go_on_below_numbers_the_line_skips() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                for below in [640, 300] {
+                    let stores = client_stores().await;
+                    let line =
+                        skipping_line(branch_metadata(&stores, branch()).await, below).await;
+                    let bottom = (below - 1) / 100 * 100 + 1;
+                    let mut remote = PagedRemote::new(branch(), line[999].signature)
+                        .holding(&line)
+                        .page(
+                            signature_of(&line, 1000),
+                            span(&line, 1000, 901),
+                            Hash::default(),
+                        )
+                        .page(
+                            signature_of(&line, 900),
+                            span(&line, 900, 805),
+                            line[below as usize - 1].signature,
+                        )
+                        .page(
+                            signature_of(&line, below),
+                            span(&line, below, bottom),
+                            Hash::default(),
+                        );
+                    let tops: Vec<u64> = (100..bottom).rev().step_by(100).collect();
+                    for &top in &tops {
+                        remote = remote.page(
+                            Anchor::Number(top),
+                            span(&line, top, top - 99),
+                            Hash::default(),
+                        );
+                    }
+                    let remote = Arc::new(remote);
+                    let client = client_on(&stores, remote.clone());
+                    let mut pager = LinePager::new(client.clone(), permits());
+
+                    let walked = walk(&mut pager, &client, line[999].signature, 0).await;
+                    pager.finish().await;
+
+                    let line_numbers: Vec<u64> =
+                        (805..=1000).rev().chain((1..=below).rev()).collect();
+                    assert_eq!(walked, line_numbers, "below {below}");
+                    let (signatures, numbers) = anchors(&remote);
+                    assert_eq!(
+                        signatures,
+                        [
+                            signature_of(&line, 1000),
+                            signature_of(&line, 900),
+                            signature_of(&line, below)
+                        ],
+                        "below {below}"
+                    );
+                    assert_eq!(numbers.first(), Some(&804), "below {below}");
+                    let (on_line, skipped): (Vec<u64>, Vec<u64>) =
+                        numbers.iter().partition(|&&number| number <= below);
+                    assert_eq!(
+                        on_line, tops,
+                        "below {below}: pages are requested ahead below the skipped numbers"
+                    );
+                    assert!(
+                        skipped
+                            .iter()
+                            .all(|number| [804, 800, 700, 600].contains(number)),
+                        "below {below}: no page is requested from a skipped number past the first window: {numbers:?}"
+                    );
+                    let mut once = numbers.clone();
+                    once.dedup();
+                    assert_eq!(once, numbers, "below {below}: no page is requested twice");
+                }
+            })
+            .await;
+    }
+
+    /// Pages ahead that list nothing from revision numbers the walk's line holds stop the pager
+    /// requesting more, as from a remote that lists no pages by number, and the walk reads its line
+    /// by hash signature.
+    #[tokio::test]
+    async fn pages_ahead_that_list_nothing_the_line_holds_stop() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                let mut remote = PagedRemote::new(branch(), line[999].signature).holding(&line);
+                for top in (100..=1000).rev().step_by(100) {
+                    remote = remote.page(
+                        signature_of(&line, top),
+                        span(&line, top, top - 99),
+                        Hash::default(),
+                    );
+                }
+                let remote = Arc::new(remote);
+                let client = client_on(&stores, remote.clone());
+                let lines_ahead = permits();
+                let mut pager = LinePager::new(client.clone(), lines_ahead.clone());
+
+                let walked = walk(&mut pager, &client, line[999].signature, 0).await;
+                pager.finish().await;
+
+                assert_eq!(walked, (1..=1000).rev().collect::<Vec<u64>>());
+                let (signatures, numbers) = anchors(&remote);
+                assert_eq!(signatures.len(), 10, "every page is read by signature");
+                assert!(
+                    numbers.iter().all(|&number| number >= 500),
+                    "no page is requested past the first window: {numbers:?}"
+                );
+                assert_eq!(
+                    lines_ahead.available_permits(),
+                    1,
+                    "the pager returns its permit"
+                );
+            })
+            .await;
+    }
+
+    /// Pages ahead go on past a page the walk reads by hash signature where a page listed some of
+    /// the line since the walk's last page of its own, and end at its next page where none has
+    /// since.
+    #[tokio::test]
+    async fn pages_ahead_end_where_none_listed_the_line_since_the_walks_last_page() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                let mut remote = paging_remote(branch(), &line);
+                for top in [600, 500] {
+                    remote = remote.failing(
+                        Anchor::Number(top),
+                        lore_transport::ProtocolError::from(lore_base::error::NotFound),
+                    );
+                }
+                for top in (100..=600).rev().step_by(100) {
+                    remote = remote.page(
+                        signature_of(&line, top),
+                        span(&line, top, top - 99),
+                        Hash::default(),
+                    );
+                }
+                let remote = Arc::new(remote);
+                let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client.clone(), permits());
+
+                let walked = walk(&mut pager, &client, line[999].signature, 0).await;
+                pager.finish().await;
+
+                assert_eq!(walked, (1..=1000).rev().collect::<Vec<u64>>());
+                let (signatures, numbers) = anchors(&remote);
+                assert_eq!(
+                    signatures[..4],
+                    [
+                        signature_of(&line, 1000),
+                        signature_of(&line, 900),
+                        signature_of(&line, 600),
+                        signature_of(&line, 500)
+                    ]
+                );
+                assert_eq!(signatures.last(), Some(&signature_of(&line, 100)));
+                assert!(
+                    !numbers.contains(&100),
+                    "the pages ahead end at the page from revision number 500: {numbers:?}"
+                );
+            })
+            .await;
+    }
+
+    /// A walk whose line's metadata can't be read, or names no branch, requests no page ahead, and
+    /// reads its line by hash signature.
+    #[tokio::test]
+    async fn a_line_without_a_known_branch_is_read_by_signature() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                for unreadable in [true, false] {
+                    let stores = client_stores().await;
+                    let metadata = if unreadable {
+                        Hash::from([0xC0; 32])
+                    } else {
+                        Metadata::new()
+                            .serialize_local(stores.writer.clone())
+                            .await
+                            .expect("writing the metadata")
+                    };
+                    let line = remote_line(1000, metadata).await;
+                    let mut remote = PagedRemote::new(branch(), line[999].signature).holding(&line);
+                    for top in (100..=1000).rev().step_by(100) {
+                        remote = remote
+                            .page(
+                                signature_of(&line, top),
+                                span(&line, top, top - 99),
+                                Hash::default(),
+                            )
+                            .page(
+                                Anchor::Number(top),
+                                span(&line, top, top - 99),
+                                Hash::default(),
+                            );
+                    }
+                    let remote = Arc::new(remote);
+                    let client = client_on(&stores, remote.clone());
+                    let lines_ahead = permits();
+                    let mut pager = LinePager::new(client.clone(), lines_ahead.clone());
+
+                    let walked = walk(&mut pager, &client, line[999].signature, 0).await;
+
+                    assert_eq!(walked.len(), 1000, "unreadable {unreadable}");
+                    let (signatures, numbers) = anchors(&remote);
+                    assert_eq!(signatures.len(), 10, "unreadable {unreadable}");
+                    assert_eq!(numbers, [] as [u64; 0], "unreadable {unreadable}");
+                    assert_eq!(
+                        lines_ahead.available_permits(),
+                        1,
+                        "unreadable {unreadable}: the pager holds no permit"
+                    );
+                    pager.finish().await;
+                }
+            })
+            .await;
+    }
+
+    /// A pager refused a permit takes one at a later page of its walk's own, once one is free, and
+    /// requests the pages below that page ahead.
+    #[tokio::test]
+    async fn a_pager_takes_a_permit_freed_during_its_walk() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                let remote = Arc::new(paging_remote(branch(), &line).page(
+                    signature_of(&line, 800),
+                    span(&line, 800, 701),
+                    Hash::default(),
+                ));
+                let client = client_on(&stores, remote.clone());
+                let lines_ahead = permits();
+                let taken = lines_ahead
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("the only permit");
+                let mut pager = LinePager::new(client.clone(), lines_ahead.clone());
+
+                let above = walk_until(&mut pager, &client, line[999].signature, 0, 801).await;
+                drop(taken);
+                let below = walk(&mut pager, &client, line[799].signature, 0).await;
+                pager.finish().await;
+
+                assert_eq!((above.last(), below.last()), (Some(&801), Some(&1)));
+                assert_eq!(
+                    anchors(&remote),
+                    (
+                        vec![
+                            signature_of(&line, 1000),
+                            signature_of(&line, 900),
+                            signature_of(&line, 800)
+                        ],
+                        vec![700, 600, 500, 400, 300, 200, 100],
+                    )
+                );
+            })
+            .await;
+    }
+
+    /// A page the remote lists neither by number nor by hash signature, while pages are requested
+    /// ahead, stops the pager paging, and the pages requested have ended once it returns.
+    #[tokio::test]
+    async fn a_page_listed_neither_way_ends_the_pages_ahead() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                let mut remote = paging_remote(branch(), &line).failing(
+                    Anchor::Number(700),
+                    lore_transport::ProtocolError::from(lore_base::error::NotFound),
+                );
+                for top in [600, 500, 400] {
+                    remote = remote.stalling(Anchor::Number(top));
+                }
+                let remote = Arc::new(remote);
+                let client = client_on(&stores, remote.clone());
+                let lines_ahead = permits();
+                let mut pager = LinePager::new(client.clone(), lines_ahead.clone());
+
+                walk_until(&mut pager, &client, line[999].signature, 0, 701).await;
+                remote.unanswered(2).await;
+                pager.page_in(line[699].signature, 701, 0).await;
+
+                assert!(!pager.paging());
+                assert_eq!(remote.lists_unanswered(), 0, "the pages ahead have ended");
+                assert_eq!(
+                    lines_ahead.available_permits(),
+                    1,
+                    "the pager returns its permit"
+                );
+            })
+            .await;
+    }
+
+    /// Of the pagers sharing [`lines_ahead`], only [`LINES_AHEAD`] request pages ahead at once,
+    /// [`PAGES_AHEAD`] each, however many walks read long lines.
+    #[tokio::test]
+    async fn pagers_sharing_their_permits_request_pages_ahead_for_at_most_their_lines() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let lines_ahead = lines_ahead();
+                let mut walks = Vec::new();
+                for _ in 0..=LINES_AHEAD {
+                    let stores = client_stores().await;
+                    let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                    let mut remote = paging_remote(branch(), &line);
+                    for top in (100..=800).step_by(100) {
+                        remote = remote.stalling(Anchor::Number(top));
+                    }
+                    let remote = Arc::new(remote);
+                    let client = client_on(&stores, remote.clone());
+                    let mut pager = LinePager::new(client.clone(), lines_ahead.clone());
+                    pager.page_in(line[999].signature, u64::MAX, 0).await;
+                    pager.page_in(line[899].signature, 901, 0).await;
+                    walks.push((pager, remote));
+                }
+                for (_, remote) in &walks[..LINES_AHEAD] {
+                    remote.unanswered(PAGES_AHEAD).await;
+                }
+                tokio::task::yield_now().await;
+
+                let requested: Vec<usize> = walks
+                    .iter()
+                    .map(|(_, remote)| anchors(remote).1.len())
+                    .collect();
+                let mut expected = vec![PAGES_AHEAD; LINES_AHEAD];
+                expected.push(0);
+                assert_eq!(requested, expected);
+                for (mut pager, _) in walks {
+                    pager.finish().await;
+                }
+            })
+            .await;
+    }
+
+    /// Five revisions numbered 1 to 5 that only the remote holds, and a remote holding them, which
+    /// lists them whole from the newest, or refuses to.
+    async fn short_line(refusing: bool) -> (Vec<RemoteRevision>, Arc<PagedRemote>) {
+        let line = remote_line(5, Hash::from([0xA0; 32])).await;
+        let newest = line[4].signature;
+        let remote = PagedRemote::new(branch(), newest).holding(&line);
         let remote = if refusing {
             remote.failing(
                 Anchor::Signature(newest),
-                ProtocolError::from(NotAuthorized),
+                lore_transport::ProtocolError::from(lore_base::error::NotAuthorized),
             )
         } else {
             remote.page(
                 Anchor::Signature(newest),
-                line.iter()
-                    .rev()
-                    .zip((1..=5).rev())
-                    .map(|(revision, number)| (number, revision.signature))
-                    .collect(),
+                span(&line, 5, 1),
                 Hash::default(),
             )
         };
-        Arc::new(remote)
+        (line, Arc::new(remote))
     }
 
     fn signatures(line: &[RemoteRevision]) -> Vec<Hash> {
@@ -609,14 +1636,14 @@ mod page_in_line {
     async fn a_page_is_stored_down_to_the_floor() {
         LORE_CONTEXT
             .scope(setup_test_execution(), async {
-                let line = remote_line().await;
-                let stores: ClientStores = client_stores().await;
-                let remote = remote(&line, false);
+                let stores = client_stores().await;
+                let (line, remote) = short_line(false).await;
                 let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client.clone(), permits());
 
-                let paged = page_in_line(client.clone(), line[4].signature, 3).await;
+                pager.page_in(line[4].signature, u64::MAX, 3).await;
 
-                assert!(paged);
+                assert!(pager.paging());
                 assert_eq!(remote.lists(), 1);
                 assert_eq!(
                     stored_locally(&client, &signatures(&line)).await,
@@ -631,33 +1658,33 @@ mod page_in_line {
     async fn a_revision_the_store_holds_asks_the_remote_nothing() {
         LORE_CONTEXT
             .scope(setup_test_execution(), async {
-                let line = remote_line().await;
                 let stores = client_stores().await;
+                let (line, remote) = short_line(false).await;
                 let local = write_line(&stores.writer, line[4].signature, 6, 1).await[0];
-                let remote = remote(&line, false);
                 let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client, permits());
 
-                let paged = page_in_line(client, local, 3).await;
+                pager.page_in(local, u64::MAX, 3).await;
 
-                assert!(paged);
+                assert!(pager.paging());
                 assert_eq!(remote.lists(), 0);
             })
             .await;
     }
 
-    /// A page the remote refuses answers that the line is not paged in, so a walk stops asking.
+    /// A page the remote refuses stops the pager paging, so the walk stops asking.
     #[tokio::test]
-    async fn a_refused_page_answers_the_line_is_not_paged_in() {
+    async fn a_refused_page_stops_the_pager_paging() {
         LORE_CONTEXT
             .scope(setup_test_execution(), async {
-                let line = remote_line().await;
                 let stores = client_stores().await;
-                let remote = remote(&line, true);
-                let client = client_on(&stores, remote.clone());
+                let (line, remote) = short_line(true).await;
+                let client = client_on(&stores, remote);
+                let mut pager = LinePager::new(client.clone(), permits());
 
-                let paged = page_in_line(client.clone(), line[4].signature, 3).await;
+                pager.page_in(line[4].signature, u64::MAX, 3).await;
 
-                assert!(!paged);
+                assert!(!pager.paging());
                 assert_eq!(
                     stored_locally(&client, &signatures(&line)).await,
                     [false; 5]
@@ -666,44 +1693,46 @@ mod page_in_line {
             .await;
     }
 
-    /// An empty page answers that the line is not paged in.
+    /// An empty page stops the pager paging.
     #[tokio::test]
-    async fn an_empty_page_answers_the_line_is_not_paged_in() {
+    async fn an_empty_page_stops_the_pager_paging() {
         LORE_CONTEXT
             .scope(setup_test_execution(), async {
-                let line = remote_line().await;
+                let line = remote_line(5, Hash::from([0xA0; 32])).await;
                 let newest = line[4].signature;
                 let stores = client_stores().await;
-                let remote = Arc::new(
-                    PagedRemote::new(BranchId::from([7; 16]), newest)
-                        .holding(&line)
-                        .page(Anchor::Signature(newest), Vec::new(), Hash::default()),
-                );
+                let remote = Arc::new(PagedRemote::new(branch(), newest).holding(&line).page(
+                    Anchor::Signature(newest),
+                    Vec::new(),
+                    Hash::default(),
+                ));
                 let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client, permits());
 
-                let paged = page_in_line(client, newest, 3).await;
+                pager.page_in(newest, u64::MAX, 3).await;
 
-                assert!(!paged);
+                assert!(!pager.paging());
                 assert_eq!(remote.lists(), 1);
             })
             .await;
     }
 
-    /// A store that reports nothing held locally, as a server's does, without a remote, answers
-    /// that the line is not paged in without reading a payload, so a walk reads each revision
-    /// from the store on its own.
+    /// A store that reports nothing held locally, as a server's does, without a remote, stops the
+    /// pager paging without reading a payload, so a walk reads each revision from the store on its
+    /// own.
     #[tokio::test]
-    async fn a_store_without_a_remote_answers_the_line_is_not_paged_in() {
+    async fn a_store_without_a_remote_stops_the_pager_paging() {
         LORE_CONTEXT
             .scope(setup_test_execution(), async {
                 let (stores, counting) = counted_client_stores().await;
                 let revision = write_line(&stores.writer, Hash::default(), 1, 1).await[0];
                 counting.report_durable_only();
                 counting.take_reads();
+                let mut pager = LinePager::new(stores.writer.clone(), permits());
 
-                let paged = page_in_line(stores.writer.clone(), revision, 0).await;
+                pager.page_in(revision, u64::MAX, 0).await;
 
-                assert!(!paged);
+                assert!(!pager.paging());
                 assert_eq!(counting.take_reads().payloads, 0);
             })
             .await;

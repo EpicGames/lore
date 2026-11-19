@@ -68,8 +68,12 @@ use crate::helper::test_execution_with;
 use crate::helper::test_file_write;
 use crate::paged_remote::PagedRemote;
 use crate::paged_remote::above_unverified;
+use crate::paged_remote::anchors;
+use crate::paged_remote::branch_metadata;
 use crate::paged_remote::client_stores;
 use crate::paged_remote::hooked_client_stores;
+use crate::paged_remote::paging_remote;
+use crate::paged_remote::remote_line;
 use crate::paged_remote::writing_client_on;
 
 fn branch_id(byte: u8) -> BranchId {
@@ -1304,6 +1308,60 @@ async fn merges_search_reads_a_remote_line_a_page_at_a_time() {
                 remote.lists(),
                 1,
                 "One page holds the line down to the floor"
+            );
+        })
+        .await;
+}
+
+/// A line too long for the walk's first two pages is read by its pages ahead, by number on the
+/// branch its revisions were created on, and the search answers as it does reading each page by
+/// hash signature.
+#[tokio::test]
+async fn merges_search_reads_a_long_remote_line_ahead_by_number() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let stores = client_stores().await;
+            let metadata = branch_metadata(&stores, branch_id(9)).await;
+            let line = remote_line(1000, metadata).await;
+            let latest = line[999].signature;
+            let remote = Arc::new(paging_remote(branch_id(9), &line));
+            // A local revision on a branch from revision 4 of the remote line, the floor.
+            let state = State::new();
+            state.set_parent_self(line[3].signature);
+            state.set_revision_number(5);
+            let token = stores
+                .writer
+                .try_write_token()
+                .expect("a null context carries a write token");
+            let local = state
+                .serialize(stores.writer.clone(), token)
+                .await
+                .expect("serializing the local revision");
+            let client = crate::paged_remote::client_on(&stores, remote.clone());
+
+            let search = search_common_ancestor_from_merges(
+                client,
+                branch_id(9),
+                latest,
+                branch_id(1),
+                local,
+                local,
+            )
+            .await
+            .expect("the walks read the remote line");
+
+            assert_eq!(
+                search,
+                MergeSearch {
+                    found: None,
+                    none_above_floor: true,
+                }
+            );
+            let (signatures, numbers) = anchors(&remote);
+            assert_eq!(
+                (signatures.len(), numbers.len()),
+                (2, 8),
+                "The two pages from latest are read by signature, the eight below by number"
             );
         })
         .await;
