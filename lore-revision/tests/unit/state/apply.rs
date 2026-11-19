@@ -21,6 +21,7 @@ use lore_revision::state::LinkPin;
 use lore_revision::state::State;
 use lore_revision::state::apply_tree_changes;
 use lore_revision::state::diff_collect;
+use lore_revision::state::no_link_traversal;
 use lore_storage::hash::hash_string;
 
 use crate::case_folding::case_folding;
@@ -3366,7 +3367,7 @@ async fn a_link_renamed_only_in_case_and_repinned_is_one_change_where_the_walk_s
         let unreadable = Arc::new(
             repository
                 .to_filter_context(repository.filter.clone())
-                .with_link_read(Arc::new(|_| false)),
+                .with_link_read(no_link_traversal()),
         );
         let renamed = vec!["Move mount <- Mount".to_string()];
         for (reader, pin) in [(unreadable, repinned), (repository.clone(), remounted)] {

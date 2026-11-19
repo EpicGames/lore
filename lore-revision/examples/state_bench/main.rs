@@ -47,6 +47,7 @@ use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
+use lore_revision::state::allow_all_repositories;
 use ops::Repo;
 
 const WORKLOADS: &[&str] = &[
@@ -397,7 +398,11 @@ async fn repository() -> Repo {
             )
             .await
             .expect("an in-memory mutable store");
-            Arc::new(RepositoryContext::new_null_context(immutable, mutable))
+            Arc::new(RepositoryContext::new_null_context(
+                immutable,
+                mutable,
+                allow_all_repositories(),
+            ))
         })
         .await
 }

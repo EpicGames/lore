@@ -15,6 +15,7 @@ use lore_revision::metadata::Metadata;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
+use lore_revision::state::allow_all_repositories;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_metadata_set;
@@ -52,6 +53,7 @@ async fn seed(
         immutable_store.clone(),
         mutable_store.clone(),
         id,
+        allow_all_repositories(),
     ));
     let metadata_hash = repository::metadata_store(
         repository.clone(),
@@ -229,6 +231,7 @@ async fn set_metadata(
             fixture.immutable_store.clone(),
             fixture.mutable_store.clone(),
             fixture.repository,
+            allow_all_repositories(),
         ));
 
         for v1 in [false, true] {
@@ -365,6 +368,7 @@ async fn the_creator_is_read_only_when_the_decision_rests_on_it() {
             immutable_store.clone(),
             mutable_store.clone(),
             id,
+            allow_all_repositories(),
         ));
         let branch = BranchId::from(uuid::Uuid::now_v7());
         branch::create(

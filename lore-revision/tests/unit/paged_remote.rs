@@ -22,6 +22,7 @@ use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_revision::repository::RemoteState;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::KeyType;
@@ -386,8 +387,12 @@ impl ClientStores {
     /// a miss ([`RepositoryContext::strict_local_reads`]).
     pub(crate) fn strict_reader(&self) -> Arc<RepositoryContext> {
         Arc::new(
-            RepositoryContext::new_null_context(self.immutable.clone(), self.mutable.clone())
-                .strict_local_reads(),
+            RepositoryContext::new_null_context(
+                self.immutable.clone(),
+                self.mutable.clone(),
+                allow_all_repositories(),
+            )
+            .strict_local_reads(),
         )
     }
 }
@@ -396,6 +401,7 @@ fn stores_over(immutable: Arc<dyn ImmutableStore>, mutable: Arc<dyn MutableStore
     let writer = Arc::new(RepositoryContext::new_null_context(
         immutable.clone(),
         mutable.clone(),
+        allow_all_repositories(),
     ));
     ClientStores {
         immutable,

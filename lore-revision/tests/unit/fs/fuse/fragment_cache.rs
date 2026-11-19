@@ -25,6 +25,7 @@ use lore_revision::fs::fuse::fragment_cache::copy_range;
 use lore_revision::fs::fuse::fragment_cache::is_list;
 use lore_revision::fs::fuse::fragment_cache::read_options;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_storage::FlushOptions;
 use lore_storage::FragmentFlags;
 use lore_storage::ImmutableStore;
@@ -48,7 +49,11 @@ pub(super) fn execution() -> Arc<lore_revision::interface::ExecutionContext> {
 
 async fn repository() -> Arc<RepositoryContext> {
     let (immutable, mutable) = stores().await;
-    Arc::new(RepositoryContext::new_null_context(immutable, mutable))
+    Arc::new(RepositoryContext::new_null_context(
+        immutable,
+        mutable,
+        allow_all_repositories(),
+    ))
 }
 
 pub(super) async fn stores() -> (Arc<dyn ImmutableStore>, Arc<dyn lore_storage::MutableStore>) {
@@ -686,7 +691,11 @@ async fn test_repository() -> (Arc<RepositoryContext>, Arc<StoreLog>) {
     let (inner, mutable) = stores().await;
     let (store, log) = counting_store(inner, None);
     (
-        Arc::new(RepositoryContext::new_null_context(store, mutable)),
+        Arc::new(RepositoryContext::new_null_context(
+            store,
+            mutable,
+            allow_all_repositories(),
+        )),
         log,
     )
 }
@@ -939,7 +948,11 @@ async fn a_read_across_compressed_leaves_loads_them_side_by_side() {
         .scope(execution(), async {
             let (inner, mutable) = stores().await;
             let (store, log) = counting_store(inner, Some(std::time::Duration::from_millis(20)));
-            let repository = Arc::new(RepositoryContext::new_null_context(store, mutable));
+            let repository = Arc::new(RepositoryContext::new_null_context(
+                store,
+                mutable,
+                allow_all_repositories(),
+            ));
             let content = compressible(LEN, 96);
             let address = write(&repository, &content).await;
             let cache = FragmentCache::new(DEFAULT_FRAGMENT_CACHE);
@@ -986,7 +999,11 @@ async fn per_read_operations_of_s0_and_the_default() {
             .await
             .expect("mutable store");
             let (store, log) = counting_store(inner, None);
-            let repository = Arc::new(RepositoryContext::new_null_context(store, mutable));
+            let repository = Arc::new(RepositoryContext::new_null_context(
+                store,
+                mutable,
+                allow_all_repositories(),
+            ));
             let mib = std::env::var("LORE_COUNT_MIB")
                 .ok()
                 .and_then(|value| value.parse().ok())

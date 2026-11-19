@@ -23,6 +23,7 @@ use lore_base::types::Context;
 use lore_revision::immutable;
 use lore_revision::immutable::ImmutableError;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_telemetry::tracing::fields::ADDRESS;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use reqwest::header::CONTENT_LENGTH;
@@ -158,6 +159,7 @@ pub async fn handler(
                 immutable_store,
                 mutable_store,
                 parsed_repository.into(),
+                no_link_traversal(),
             ));
 
             let options = immutable::read_options_from_repository(&repository);

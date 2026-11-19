@@ -18,6 +18,7 @@ use lore_revision::metadata::Metadata;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
 use lore_server::grpc::handlers::branch_push::PushHandler;
@@ -319,6 +320,7 @@ async fn lists_branch_history_via_tip_identifier() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signatures) = create_branch_with_history(&repository_context, 3).await;
 
@@ -365,6 +367,7 @@ async fn empty_branch_returns_no_items() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let write_token = get_write_token();
         let branch_id = BranchId::from(uuid::Uuid::now_v7());
@@ -414,6 +417,7 @@ async fn pages_via_signature_backward_cursor_segment_aligned() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         // 250 revisions, step=100. Segments 100 and 200 are closed
         // (their +step boundary was crossed by subsequent pushes).
@@ -497,6 +501,7 @@ async fn lists_via_by_number_identifier_uses_list_cache_strategy() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signatures) = create_branch_with_history(&repository_context, 250).await;
 
@@ -546,6 +551,7 @@ async fn lists_via_signature_anchor() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         // 250 revisions: segment 100 closes when revision 101 is
         // pushed, so List_100 is populated. The signature anchor
@@ -603,6 +609,7 @@ async fn forward_cursor_slow_down_returns_resource_exhausted() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signatures) = create_branch_with_history(&repository_context, 250).await;
 
@@ -651,6 +658,7 @@ async fn identifier_backfills_when_cache_missing_but_next_skip_exists() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, _) = create_branch_with_history(&repository_context, 250).await;
 
@@ -727,6 +735,7 @@ async fn forward_cursor_resolves_within_open_latest_band_when_no_step_key_covers
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         // 50 revisions: only block 0 is populated; no step key
         // ever registered (no boundary crossing happened). Anchor
@@ -794,6 +803,7 @@ async fn page_above_latest_has_no_forward_cursor(
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signatures) = create_branch_with_history(&repository_context, 5).await;
         let unpushed =
@@ -894,6 +904,7 @@ async fn mid_segment_signature_returns_full_cached_segment() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (_branch, signatures) = create_branch_with_history(&repository_context, 250).await;
 
@@ -952,6 +963,7 @@ async fn signature_path_backfills_evicted_segment() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signatures) = create_branch_with_history(&repository_context, 250).await;
 
@@ -1029,6 +1041,7 @@ async fn open_segment_signature_walk_is_segment_aligned() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         // 250 revs: segment 300 is open (rev 250 lives there but
         // nothing crosses into seg 400 to register the +step key).
@@ -1083,6 +1096,7 @@ async fn mismatched_cache_version_is_discarded_and_rebuilt() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, _) = create_branch_with_history(&repository_context, 250).await;
 
@@ -1188,6 +1202,7 @@ async fn item_state_round_trips_to_state_data() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signatures) = create_branch_with_history(&repository_context, 250).await;
 
@@ -1246,6 +1261,7 @@ async fn list_cache_disabled_skips_cache() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, _) = create_branch_with_history(&repository_context, 250).await;
 
@@ -1287,6 +1303,7 @@ async fn both_disabled_falls_through_to_full_iteration() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, _) = create_branch_with_history(&repository_context, 250).await;
 
@@ -1331,6 +1348,7 @@ async fn throttled_branch_latest_resolves_to_resource_exhausted_not_not_found() 
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, _) = create_branch_with_history(&repository_context, 250).await;
 
@@ -1376,6 +1394,7 @@ async fn list_cache_disabled_signature_uses_direct_walk() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (_branch, signatures) = create_branch_with_history(&repository_context, 250).await;
 
@@ -1424,6 +1443,7 @@ async fn finds_revision_below_a_jump_that_skipped_a_boundary() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         // 1..=99, then a merge jumping to 105, then 106..=150.
         let (branch_id, revisions) =
@@ -1471,6 +1491,7 @@ async fn finds_revisions_below_a_multi_boundary_jump() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         // 1..=150, then a merge jumping to 400 (skipping boundaries 200
         // and 300), then 401..=405.
@@ -1514,6 +1535,7 @@ async fn revision_number_skipped_by_a_jump_is_not_found() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, revisions) =
             create_branch_with_jump_history(&repository_context, 150, 399, 5).await;
@@ -1547,6 +1569,7 @@ async fn jump_does_not_seal_the_segment_it_landed_in() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         // Head lands at 105 and stops, leaving segment 200 open.
         let (branch_id, revisions) =
@@ -1602,6 +1625,7 @@ async fn forward_cursor_finds_the_real_revision_across_a_jump() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         // 1..=150, then a merge jumping to 400, then 401..=405 —
         // the last five pushes seal boundary 400, so the target
@@ -1644,6 +1668,7 @@ async fn forward_cursor_skips_several_empty_bands_to_find_the_target() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         // 1..=150, then a merge jumping to 700 — skipping the empty
         // boundaries 200, 300, 400, 500 and 600 — then 701..=705 to
@@ -1688,6 +1713,7 @@ async fn forward_cursor_resolves_a_jump_spanning_many_boundaries() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         // 1..=150, then a merge jumping to 5100 — sealing 48
         // consecutive empty boundaries (200..=5000) at the pre-jump
@@ -1732,6 +1758,7 @@ async fn paging_forward_via_signature_forward_reaches_every_revision() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         // 1..=150, then a merge jumping to 400, then 401..=405.
         let (branch_id, revisions) =
@@ -1790,6 +1817,7 @@ async fn forward_cursor_survives_an_evicted_anchor_list_cache() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signatures) = create_branch_with_history(&repository_context, 250).await;
 
@@ -1848,6 +1876,7 @@ async fn forward_cursor_repairs_a_missing_skip_pointer_below_a_found_anchor() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signatures) = create_branch_with_history(&repository_context, 350).await;
 
@@ -1913,6 +1942,7 @@ async fn forward_cursor_repairs_the_boundary_nearest_first_number() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signatures) = create_branch_with_history(&repository_context, 250).await;
 
@@ -2021,6 +2051,7 @@ async fn forward_cursor_resolves_a_page_a_full_band_below_latest() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         // Revision 200 is the branch's latest, so boundary 200 is
         // unsealed: sealing it waits on a revision above it. A page
@@ -2071,6 +2102,7 @@ async fn forward_cursor_binary_searches_past_a_missing_first_boundary() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signatures) = create_branch_with_history(&repository_context, 350).await;
 
@@ -2156,6 +2188,7 @@ async fn forward_cursor_binary_searches_past_a_missing_mid_boundary() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signatures) = create_branch_with_history(&repository_context, 550).await;
 
@@ -2312,6 +2345,7 @@ async fn forward_cursor_propagates_a_genuine_store_failure() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, _) = create_branch_with_history(&repository_context, 250).await;
 
@@ -2362,6 +2396,7 @@ async fn forward_cursor_step_keys_disabled_never_reads_a_wrong_skip_pointer() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signatures) = create_branch_with_history(&repository_context, 250).await;
 
@@ -2424,6 +2459,7 @@ async fn forward_cursor_list_cache_disabled_never_reads_a_wrong_cached_list() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signatures) = create_branch_with_history(&repository_context, 250).await;
 
@@ -2588,6 +2624,7 @@ mod handler_on_child_branch {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let (parent, parent_signatures) =
                 create_branch_with_history(&repository_context, 250).await;
@@ -2858,6 +2895,7 @@ mod handler_on_grandchild_branch {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let (main, main_signatures) =
                 create_branch_with_history(&repository_context, 250).await;

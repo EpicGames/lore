@@ -713,8 +713,9 @@ pub struct RepositoryContext {
     pub instance_id: crate::instance::InstanceId,
     remote: Arc<tokio::sync::RwLock<RemoteState>>,
     pub filter: Arc<Filter>,
-    /// Defaults to allowing every repository; server handlers replace it with
-    /// the requester's authorization.
+    /// Which linked repositories a walk may descend into; every context derived from this one keeps
+    /// it. A client reads everything, as the server authorizes its reads; a server context takes
+    /// one at construction, so none is permissive by default.
     link_read: CanReadRepository,
     settings: RepositoryRuntimeSettings,
     /// How this context was mounted, or `None` where it stands on its own.
@@ -956,7 +957,7 @@ impl RepositoryContext {
         }
     }
 
-    /// Propagates into every context derived from this one.
+    #[cfg(feature = "test-util")]
     pub fn with_link_read(mut self, link_read: CanReadRepository) -> Self {
         self.link_read = link_read;
         self
@@ -1425,9 +1426,10 @@ impl RepositoryContext {
         immutable_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
         id: RepositoryId,
+        link_read: CanReadRepository,
     ) -> Self {
         RepositoryContext {
-            link_read: allow_all_repositories(),
+            link_read,
             file_system: Self::default_filesystem(Path::new("")),
             paths: None,
             immutable_store,
@@ -1452,6 +1454,8 @@ impl RepositoryContext {
         }
     }
 
+    /// Takes no link read policy: retargeting the repository must not widen what the requester
+    /// may read.
     pub fn to_server_context(&self, id: RepositoryId) -> Self {
         RepositoryContext {
             id,
@@ -1469,8 +1473,14 @@ impl RepositoryContext {
     pub fn new_null_context(
         immutable_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
+        link_read: CanReadRepository,
     ) -> Self {
-        Self::new_server_context(immutable_store, mutable_store, RepositoryId::default())
+        Self::new_server_context(
+            immutable_store,
+            mutable_store,
+            RepositoryId::default(),
+            link_read,
+        )
     }
 
     /// This context without the write token and repository lock, for a holder that outlives
@@ -3971,6 +3981,7 @@ async fn open_shared_stores_for_creation(
         immutable_store.clone(),
         mutable_store.clone(),
         repository,
+        allow_all_repositories(),
     ));
     let state = resolve().forward::<RepositoryError>("resolving the external root")?;
     crate::instance::refuse_registered_virtual_instance_at(

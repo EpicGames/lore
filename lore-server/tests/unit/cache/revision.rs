@@ -14,6 +14,7 @@ use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
 use lore_revision::state::StateData;
+use lore_revision::state::allow_all_repositories;
 use lore_server::cache::revision::*;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push::PushHandler;
@@ -44,6 +45,7 @@ fn test_repository(
         immutable_store,
         mutable_store,
         random::<RepositoryId>(),
+        allow_all_repositories(),
     ))
 }
 

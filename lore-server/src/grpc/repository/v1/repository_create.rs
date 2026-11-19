@@ -12,6 +12,7 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
+use lore_revision::state::no_link_traversal;
 use lore_revision::util;
 use lore_telemetry::InstrumentProvider;
 use tonic::Request;
@@ -147,6 +148,7 @@ pub async fn repository_create_implementation(
         immutable_store,
         mutable_store,
         id,
+        no_link_traversal(),
     ));
     Span::current().record("requested_repo_id", id.to_string());
 

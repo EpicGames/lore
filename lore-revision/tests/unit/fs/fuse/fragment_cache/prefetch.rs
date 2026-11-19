@@ -20,6 +20,7 @@ use lore_revision::fs::fuse::fragment_cache::InodeSlot;
 use lore_revision::fs::fuse::fragment_cache::LeafPolicy;
 use lore_revision::fs::fuse::fragment_cache::prefetch::Stream;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_storage::FlushOptions;
 use lore_storage::ReadOptions;
 use lore_storage::WriteOptions;
@@ -44,7 +45,11 @@ async fn counted(hold: Option<Duration>) -> (Arc<RepositoryContext>, Arc<StoreLo
     let (inner, mutable) = stores().await;
     let (store, log) = counting_store(inner, hold);
     (
-        Arc::new(RepositoryContext::new_null_context(store, mutable)),
+        Arc::new(RepositoryContext::new_null_context(
+            store,
+            mutable,
+            allow_all_repositories(),
+        )),
         log,
     )
 }
@@ -876,7 +881,11 @@ async fn sequential_read_counts() {
             .await
             .expect("mutable store");
             let (store, log) = counting_store(inner, None);
-            let repository = Arc::new(RepositoryContext::new_null_context(store, mutable));
+            let repository = Arc::new(RepositoryContext::new_null_context(
+                store,
+                mutable,
+                allow_all_repositories(),
+            ));
             let mib = std::env::var("LORE_COUNT_MIB")
                 .ok()
                 .and_then(|value| value.parse().ok())

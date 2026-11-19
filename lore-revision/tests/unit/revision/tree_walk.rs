@@ -27,7 +27,6 @@ use lore_revision::state::AttributionFailures;
 use lore_revision::state::State;
 use lore_revision::state::StateError;
 use lore_revision::state::TreeWalk;
-use lore_revision::state::allow_all_repositories;
 use lore_revision::state::skip_linked_subtree;
 use lore_revision::util::path::RelativePath;
 use lore_storage::hash::hash_string;
@@ -70,7 +69,6 @@ async fn walk_below(
         revision,
         RelativePath::new_from_initial_path(path).expect("a relative path"),
         max_depth,
-        allow_all_repositories(),
         attribute,
     )
     .await
@@ -178,7 +176,6 @@ async fn walk_through_failures(repository: &Arc<RepositoryContext>, revision: Ha
         revision,
         RelativePath::default(),
         0,
-        allow_all_repositories(),
         true,
     )
     .await

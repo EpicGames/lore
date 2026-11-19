@@ -35,6 +35,7 @@ use lore_revision::revision;
 use lore_revision::revision::DiffItem;
 use lore_revision::state;
 use lore_revision::state::State;
+use lore_revision::state::allow_all_repositories;
 use lore_storage::KeyType;
 use lore_storage::MutableStore;
 use lore_storage::ReadOptions;
@@ -383,6 +384,7 @@ pub(crate) async fn null_repository() -> Arc<RepositoryContext> {
     Arc::new(RepositoryContext::new_null_context(
         immutable_store,
         mutable_store,
+        allow_all_repositories(),
     ))
 }
 
@@ -1897,6 +1899,7 @@ async fn answering_repository(
             hook,
             answered,
         ),
+        allow_all_repositories(),
     ))
 }
 
@@ -2757,6 +2760,7 @@ async fn failing_derived_metadata_read() -> Arc<RepositoryContext> {
         stores
             .try_mutable_store_arc()
             .expect("a null context holds a write token"),
+        allow_all_repositories(),
     ));
     let mut archived = derived_metadata(CLAIMED_NAME);
     archived

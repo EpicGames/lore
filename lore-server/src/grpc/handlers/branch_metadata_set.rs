@@ -15,6 +15,7 @@ use lore_revision::metadata::branch::ARCHIVE_KEYS;
 use lore_revision::metadata::branch::READ_ONLY_KEYS;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -132,6 +133,7 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository_id,
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT

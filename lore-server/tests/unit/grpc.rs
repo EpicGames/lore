@@ -33,6 +33,7 @@ use lore_revision::metadata::branch::BranchMetadataError;
 use lore_revision::metadata::repository::RepositoryMetadataError;
 use lore_revision::repository::RepositoryError;
 use lore_revision::state::StateError;
+use lore_revision::state::allow_all_repositories;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::ResourcePermission;
 use lore_server::authnz::repository_authorizer::Action;
@@ -455,6 +456,7 @@ mod may_administer {
                 immutable_store,
                 mutable_store,
                 RepositoryId::default(),
+                allow_all_repositories(),
             ),
         );
         require_branch_protection_administration(&authorizer, &extensions, repository, "mallory")

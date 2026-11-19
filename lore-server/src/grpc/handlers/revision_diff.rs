@@ -48,10 +48,12 @@ pub async fn handler(
         "Handling revision diff",
     );
 
-    let repository = Arc::new(
-        RepositoryContext::new_server_context(immutable_store, mutable_store, repository_id)
-            .with_link_read(can_read),
-    );
+    let repository = Arc::new(RepositoryContext::new_server_context(
+        immutable_store,
+        mutable_store,
+        repository_id,
+        can_read,
+    ));
 
     LORE_CONTEXT
         .scope(execution, async move {

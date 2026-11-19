@@ -9,6 +9,7 @@ use lore_proto::RevisionStateHistoryRequest;
 use lore_proto::RevisionStateHistoryResponse;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_revision::state::no_link_traversal;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -56,6 +57,7 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository,
+        no_link_traversal(),
     ));
     LORE_CONTEXT
         .scope(execution.clone(), async move {

@@ -57,6 +57,7 @@ use lore_revision::branch;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_revision::util;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::grpc::revision::v1::branch_create::*;
@@ -388,6 +389,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             crate::util::test_support::create_test_branch(repository_context.clone(), branch_id)
                 .await;
@@ -597,6 +599,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             assert!(
                 branch::load_name_to_id_local(repository_context, "main")

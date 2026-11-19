@@ -56,6 +56,7 @@ use lore_revision::branch;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::handlers::branch_create::*;
 use lore_server::hooks::HookDispatcher;
 use lore_server::hooks::HookPoint;
@@ -208,6 +209,7 @@ async fn a_dropped_create_restores_the_branch() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         crate::util::test_support::create_test_branch(repository_context.clone(), branch_id).await;
         branch::delete(repository_context.clone(), branch_id)

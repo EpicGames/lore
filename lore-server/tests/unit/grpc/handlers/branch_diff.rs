@@ -15,6 +15,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::metadata;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_revision::state::allow_all_repositories;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::grpc::get_write_token;
@@ -166,6 +167,7 @@ async fn divergence_returns_ok_for_exceeded_max_search_depth() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository.into(),
+            allow_all_repositories(),
         ));
 
         let (
@@ -357,6 +359,7 @@ async fn two_branch_divergence_returns_ok_for_exceeded_max_search_depth() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository.into(),
+            allow_all_repositories(),
         ));
 
         let (
@@ -600,6 +603,7 @@ async fn no_shared_branch_in_stacks_is_rejected() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository.into(),
+            allow_all_repositories(),
         ));
 
         let (_main_branch, main_revision) = create_test_main(repository_context.clone()).await;
@@ -691,6 +695,7 @@ async fn disjoint_histories_fall_back_to_the_older_branch_point() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository.into(),
+            allow_all_repositories(),
         ));
 
         let (main_branch, revision_1) = create_test_main(repository_context.clone()).await;

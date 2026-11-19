@@ -10,6 +10,7 @@ use lore_proto::RevisionStateHistoryResponse;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::revision_state_history::*;
 use lore_server::protocol::attribute_map::AttributeMap;
@@ -35,6 +36,7 @@ async fn test_handle() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let write_token = get_write_token();
             // Create the main branch (without parent)

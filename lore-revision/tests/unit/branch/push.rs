@@ -13,6 +13,7 @@ use lore_revision::branch::push::*;
 use lore_revision::event::EventError;
 use lore_revision::interface::LoreError;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_transport::ProtocolError;
 use lore_transport::quic::storage_service::QueryStatus;
 
@@ -257,6 +258,7 @@ async fn null_repository() -> Arc<RepositoryContext> {
     Arc::new(RepositoryContext::new_null_context(
         immutable_store,
         mutable_store,
+        allow_all_repositories(),
     ))
 }
 

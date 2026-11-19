@@ -8,6 +8,7 @@ use lore_proto::BranchUnprotectResponse;
 use lore_revision::branch;
 use lore_revision::lore::BranchId;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -44,6 +45,7 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository_id,
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT

@@ -10,6 +10,7 @@ use lore_revision::branch;
 use lore_revision::lore::BranchId;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 use tonic::Request;
@@ -46,6 +47,7 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository,
+        no_link_traversal(),
     ));
     LORE_CONTEXT
         .scope(

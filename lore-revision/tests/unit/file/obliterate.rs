@@ -19,6 +19,7 @@ use lore_revision::node::NodeFlags;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
+use lore_revision::state::allow_all_repositories;
 use lore_storage::hash::hash_string;
 use zerocopy::IntoBytes;
 
@@ -112,6 +113,7 @@ async fn different_roots_sharing_a_child_affect_latest() {
                 immutable,
                 mutable,
                 Context::from([1; 16]).into(),
+                allow_all_repositories(),
             ));
             let context = Context::from([2; 16]);
             let shared = leaf(&repository, context, 1).await;
@@ -145,6 +147,7 @@ async fn superseded_content_and_other_contexts_do_not_match() {
                 immutable,
                 mutable,
                 Context::from([1; 16]).into(),
+                allow_all_repositories(),
             ));
             let context = Context::from([2; 16]);
             let target = leaf(&repository, context, 1).await;
@@ -182,6 +185,7 @@ async fn missing_fragment_and_exhausted_budget_are_incomplete() {
                 immutable,
                 mutable,
                 Context::from([1; 16]).into(),
+                allow_all_repositories(),
             ));
             let missing = Address {
                 hash: Hash::from([8; 32]),
@@ -224,6 +228,7 @@ async fn nested_fragments_missing_lists_and_depth_limit() {
                 immutable,
                 mutable,
                 Context::from([1; 16]).into(),
+                allow_all_repositories(),
             ));
             let context = Context::from([2; 16]);
             let leaf = leaf(&repository, context, 1).await;
@@ -302,11 +307,13 @@ async fn links_follow_recorded_snapshots_and_respect_repository_partition() {
                 immutable.clone(),
                 mutable.clone(),
                 Context::from([1; 16]).into(),
+                allow_all_repositories(),
             ));
             let other = Arc::new(RepositoryContext::new_server_context(
                 immutable,
                 mutable,
                 Context::from([4; 16]).into(),
+                allow_all_repositories(),
             ));
             let target = leaf(&repository, Context::from([2; 16]), 1).await;
             let other_target = leaf(&other, target.context, 1).await;
@@ -364,6 +371,7 @@ async fn nonzero_offset_lists_preserve_deletion_and_head_dependencies() {
                     immutable,
                     mutable,
                     Context::from([1; 16]).into(),
+                    allow_all_repositories(),
                 ));
                 let context = Context::from([2; 16]);
                 let shared = leaf(&repository, context, 1).await;
@@ -437,6 +445,7 @@ async fn invalid_fragment_dependency_bounds_are_incomplete() {
                     immutable,
                     mutable,
                     Context::from([1; 16]).into(),
+                    allow_all_repositories(),
                 ));
                 let context = Context::from([2; 16]);
                 let child = leaf(&repository, context, 1).await;
@@ -507,6 +516,7 @@ async fn a_hole_in_a_list_is_no_dependency() {
                 immutable,
                 mutable,
                 Context::from([1; 16]).into(),
+                allow_all_repositories(),
             ));
             let context = Context::from([2; 16]);
             let first = leaf(&repository, context, 1).await;

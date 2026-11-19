@@ -49,6 +49,7 @@ use lore_revision::repository::InMemoryContext;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::state::Mark;
+use lore_revision::state::allow_all_repositories;
 use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
@@ -706,6 +707,7 @@ async fn a_provider_over_a_context_without_a_lore_directory_is_refused_and_serve
             let repository = Arc::new(RepositoryContext::new_null_context(
                 immutable_store,
                 mutable_store,
+                allow_all_repositories(),
             ));
             let state = lore_revision::state::State::new();
             let built = FuseFilesystem::new(repository, state.clone(), attr_context()).await;

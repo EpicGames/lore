@@ -8,6 +8,7 @@ use lore_base::types::RepositoryId;
 use lore_proto::RepositoryMetadataGetRequest;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
+use lore_revision::state::allow_all_repositories;
 use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -62,6 +63,7 @@ async fn seed_metadata(
         immutable,
         mutable,
         Context::from(REPOSITORY_ID).into(),
+        allow_all_repositories(),
     ));
     let hash = lore_revision::repository::metadata_store(
         repo_ctx.clone(),

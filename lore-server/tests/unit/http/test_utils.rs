@@ -11,6 +11,7 @@ use lore_base::types::Context;
 use lore_revision::immutable;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::http::security_headers::ContentTypeAllowlist;
@@ -75,6 +76,7 @@ pub(crate) async fn write_fragmented_content(
         immutable_store,
         mutable_store,
         repository,
+        allow_all_repositories(),
     ));
     let mut content = vec![0; RANGED_CONTENT_SIZE];
     rand::fill(&mut content[..]);

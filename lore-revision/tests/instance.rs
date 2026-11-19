@@ -327,6 +327,7 @@ mod tests {
                 let instances = list_instances(&Arc::new(RepositoryContext::new_null_context(
                     immutable_store,
                     mutable_store,
+                    lore_revision::state::allow_all_repositories(),
                 )))
                 .await
                 .expect("List instances failed");

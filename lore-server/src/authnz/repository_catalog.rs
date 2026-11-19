@@ -18,6 +18,7 @@ use lore_proto::lore::user::v1::RepositoryListResponse;
 use lore_revision::lore_debug;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use tokio_stream::StreamExt;
@@ -144,6 +145,7 @@ impl BaselineRepositoryCatalog {
             self.immutable_store.clone(),
             self.mutable_store.clone(),
             Context::default().into(),
+            no_link_traversal(),
         ));
         let mut stream = repository::list_local(repository)
             .await

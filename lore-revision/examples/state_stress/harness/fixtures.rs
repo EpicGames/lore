@@ -26,6 +26,7 @@ use lore_revision::state::Ext;
 use lore_revision::state::LinkPin;
 use lore_revision::state::Mark;
 use lore_revision::state::State;
+use lore_revision::state::allow_all_repositories;
 use lore_storage::hash::hash_string;
 
 use crate::harness::faults::FailingStore;
@@ -68,7 +69,11 @@ pub async fn immutable() -> Arc<dyn lore_storage::ImmutableStore> {
 /// A repository context over `immutable` and an in-memory mutable store over it.
 async fn over(immutable: Arc<dyn lore_storage::ImmutableStore>) -> Arc<RepositoryContext> {
     let mutable = mutable_over(immutable.clone()).await;
-    Arc::new(RepositoryContext::new_null_context(immutable, mutable))
+    Arc::new(RepositoryContext::new_null_context(
+        immutable,
+        mutable,
+        allow_all_repositories(),
+    ))
 }
 
 /// An in-memory mutable store over `immutable`.

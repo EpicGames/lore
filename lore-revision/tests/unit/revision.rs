@@ -12,6 +12,7 @@ use lore_revision::node::NodeFlags;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::NodeMapping;
 use lore_revision::state::State;
+use lore_revision::state::allow_all_repositories;
 use lore_revision::state::stream::ChangeStream;
 use lore_revision::util::path::RelativePath;
 
@@ -125,6 +126,7 @@ async fn the_target_walk_holds_no_change_beside_the_join() {
             let repository = Arc::new(RepositoryContext::new_null_context(
                 immutable_store,
                 mutable_store,
+                allow_all_repositories(),
             ));
             let state = State::new();
             let side = NodeChangeState {
@@ -196,6 +198,7 @@ async fn a_file_replaced_by_a_directory_conflicts_only_with_a_change_there_or_be
             let repository = Arc::new(RepositoryContext::new_null_context(
                 immutable_store,
                 mutable_store,
+                allow_all_repositories(),
             ));
             let state = State::new();
             let at = |text: &str| change_at(&repository, &state, text);
@@ -254,6 +257,7 @@ async fn nodes_of_different_types_added_at_one_path_conflict_there() {
             let repository = Arc::new(RepositoryContext::new_null_context(
                 immutable_store,
                 mutable_store,
+                allow_all_repositories(),
             ));
             let state = State::new();
             let added = |flags: NodeFlags| {

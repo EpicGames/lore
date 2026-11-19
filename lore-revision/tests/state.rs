@@ -3544,6 +3544,7 @@ mod block_single_flight {
                 let repository = Arc::new(RepositoryContext::new_null_context(
                     immutable_store,
                     mutable_store,
+                    lore_revision::state::allow_all_repositories(),
                 ));
                 let state = State::new();
 
@@ -3575,6 +3576,7 @@ mod block_single_flight {
                 let repository = Arc::new(RepositoryContext::new_null_context(
                     immutable_store,
                     mutable_store,
+                    lore_revision::state::allow_all_repositories(),
                 ));
                 let state = State::new();
                 let options = immutable::read_options_from_repository(&repository);
@@ -3622,6 +3624,7 @@ mod block_single_flight {
                 let repository = Arc::new(RepositoryContext::new_null_context(
                     immutable_store,
                     mutable_store,
+                    lore_revision::state::allow_all_repositories(),
                 ));
                 let state = State::new();
                 let mut tree_walk = lore_revision::state::TreeWalk::default();
@@ -3634,7 +3637,6 @@ mod block_single_flight {
                     0,
                     0,
                     0,
-                    lore_revision::state::allow_all_repositories(),
                     &mut tree_walk,
                     true,
                 );
@@ -3661,6 +3663,7 @@ mod block_single_flight {
                 let repository = Arc::new(RepositoryContext::new_null_context(
                     immutable_store,
                     mutable_store,
+                    lore_revision::state::allow_all_repositories(),
                 ));
                 let state = State::new();
 

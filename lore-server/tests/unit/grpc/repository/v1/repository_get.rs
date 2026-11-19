@@ -11,6 +11,7 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::forwarded_requests::ForwardedRequests;
 use tonic::Request;
 use tonic::Response;
@@ -133,6 +134,7 @@ mod forwarded_request {
             immutable_store,
             mutable_store,
             id,
+            allow_all_repositories(),
         ));
         let metadata_hash = repository::metadata_store(
             repository.clone(),

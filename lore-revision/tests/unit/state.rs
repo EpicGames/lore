@@ -20,6 +20,7 @@ use lore_revision::nametable::NameTable;
 use lore_revision::node::*;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
+use lore_revision::state::allow_all_repositories;
 use lore_revision::util::path::RelativePath;
 use lore_revision::util::path::RelativePathBuf;
 use lore_storage::hash;
@@ -254,7 +255,11 @@ async fn null_repository_filtering(ignore: &[&str], view: &[&str]) -> Arc<Reposi
         filter.view.add_exclusion(glob).expect("view exclusion");
     }
 
-    let mut context = RepositoryContext::new_null_context(immutable_store, mutable_store);
+    let mut context = RepositoryContext::new_null_context(
+        immutable_store,
+        mutable_store,
+        allow_all_repositories(),
+    );
     context.filter = Arc::new(filter);
     Arc::new(context)
 }
@@ -487,7 +492,8 @@ async fn holding_context(
     )
     .await
     .expect("in-memory mutable store");
-    let repository = RepositoryContext::new_null_context(store.clone(), mutable);
+    let repository =
+        RepositoryContext::new_null_context(store.clone(), mutable, allow_all_repositories());
     (store, repository)
 }
 

@@ -14,6 +14,7 @@ use lore_revision::fs::fuse::served::Served;
 use lore_revision::fs::fuse::served::ServedCell;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
+use lore_revision::state::allow_all_repositories;
 
 async fn test_repository() -> Arc<RepositoryContext> {
     let immutable_store = lore_storage::local::immutable_store::create(
@@ -34,6 +35,7 @@ async fn test_repository() -> Arc<RepositoryContext> {
     Arc::new(RepositoryContext::new_null_context(
         immutable_store,
         mutable_store,
+        allow_all_repositories(),
     ))
 }
 

@@ -11,6 +11,7 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::lore::execution_context;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_telemetry::InstrumentProvider;
 use tonic::Request;
 use tonic::Response;
@@ -56,6 +57,7 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         id,
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT

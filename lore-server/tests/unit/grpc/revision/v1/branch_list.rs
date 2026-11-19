@@ -13,6 +13,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
 use lore_server::grpc::handlers::branch_push::PushHandler;
@@ -144,6 +145,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_root_branch(&repository_context, "main", "alice").await;
             let main_latest = seed_revision(&repository_context, main).await;
@@ -192,6 +194,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_root_branch(&repository_context, "main", "alice").await;
             let main_latest = seed_revision(&repository_context, main).await;
@@ -245,6 +248,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_root_branch(&repository_context, "main", "alice").await;
             let main_latest = seed_revision(&repository_context, main).await;
@@ -311,6 +315,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_root_branch(&repository_context, "main", "alice").await;
             let main_latest = seed_revision(&repository_context, main).await;
@@ -367,6 +372,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_root_branch(&repository_context, "main", "alice").await;
             let main_latest = seed_revision(&repository_context, main).await;
@@ -415,6 +421,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_root_branch(&repository_context, "main", "alice").await;
             let main_latest = seed_revision(&repository_context, main).await;
@@ -457,6 +464,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_root_branch(&repository_context, "main", "alice").await;
             let main_latest = seed_revision(&repository_context, main).await;
@@ -512,6 +520,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_root_branch(&repository_context, "main", "alice").await;
             let main_latest = seed_revision(&repository_context, main).await;
@@ -605,6 +614,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             create_root_branch(&repository_context, "main", "alice").await;
             create_root_branch(&repository_context, "feature", "bob").await;
@@ -647,6 +657,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             create_root_branch(&repository_context, "main", "alice").await;
             create_root_branch(&repository_context, "feature1", "alice").await;
@@ -735,6 +746,7 @@ mod direct_handling {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let mut latest_keys = Vec::with_capacity(branch_count);
         for index in 0..branch_count {
@@ -842,6 +854,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_root_branch(&repository_context, "main", "alice").await;
             let gated_keys = [branch::METADATA, branch::LATEST].map(|function| {
@@ -895,6 +908,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             create_root_branch(&repository_context, "main", "alice").await;
             let other = create_root_branch(&repository_context, "other", "bob").await;
@@ -949,6 +963,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_root_branch(&repository_context, "main", "alice").await;
             let other = create_root_branch(&repository_context, "other", "bob").await;
@@ -999,6 +1014,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_root_branch(&repository_context, "main", "alice").await;
             let main_latest = seed_revision(&repository_context, main).await;
@@ -1313,6 +1329,7 @@ mod forwarded_request {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             create_root_branch(&repository_context, "local-branch", "alice").await;
 

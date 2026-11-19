@@ -17,6 +17,7 @@ use lore_revision::node::NodeFlags;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_revision::state::allow_all_repositories;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::grpc::get_write_token;
@@ -48,6 +49,7 @@ async fn tree_on_file_returns_invalid_argument() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository.into(),
+                allow_all_repositories(),
             ));
 
             let main = lore_revision::branch::create(
@@ -138,6 +140,7 @@ async fn tree_on_missing_path_returns_not_found() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository.into(),
+                allow_all_repositories(),
             ));
 
             let main = lore_revision::branch::create(
@@ -221,6 +224,7 @@ async fn tree_emits_link_node_with_target_repository_context() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository_id.into(),
+                allow_all_repositories(),
             ));
 
             let main = lore_revision::branch::create(
@@ -331,6 +335,7 @@ async fn link_tree_path(
         immutable_store.clone(),
         mutable_store.clone(),
         repository_id.into(),
+        allow_all_repositories(),
     ));
 
     let main = lore_revision::branch::create(

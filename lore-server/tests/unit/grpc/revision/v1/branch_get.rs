@@ -14,6 +14,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
 use lore_server::grpc::handlers::branch_push::PushHandler;
@@ -124,6 +125,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let latest = create_test_branch(repository_context, branch_id).await;
 
@@ -164,6 +166,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let latest = create_test_branch(repository_context, branch_id).await;
 
@@ -199,6 +202,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             create_test_branch(repository_context.clone(), branch_id).await;
             branch::delete(repository_context, branch_id)
@@ -233,6 +237,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             create_test_branch(repository_context.clone(), branch_id).await;
             branch::delete(repository_context, branch_id)
@@ -552,6 +557,7 @@ mod forwarded_request {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             create_test_branch(repository_context, branch_id).await;
 

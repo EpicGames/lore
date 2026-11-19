@@ -11,6 +11,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::notification::NotificationSender;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::REVISION;
@@ -109,10 +110,13 @@ pub async fn handler(
                 "Handling branch push request",
             );
 
+            // The fast-forward merge must build the same revision whoever pushes; narrowing its
+            // diff to the pusher's reads would change it.
             let repository = Arc::new(RepositoryContext::new_server_context(
                 immutable_store,
                 mutable_store,
                 repository_id,
+                allow_all_repositories(),
             ));
             let repository_id: RepositoryId = repository.id;
 

@@ -97,6 +97,7 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository_id,
+        can_read,
     ));
 
     LORE_CONTEXT
@@ -126,7 +127,6 @@ pub async fn handler(
                     signature,
                     path,
                     max_depth,
-                    can_read,
                     header,
                     tx,
                     include_last_revision,
@@ -144,13 +144,12 @@ pub async fn handler(
 /// unattributed is reported in one warning.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
-#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+#[allow(clippy::manual_async_fn)]
 fn stream_tree(
     repository: Arc<RepositoryContext>,
     signature: Hash,
     path: RelativePath,
     max_depth: usize,
-    can_read: lore_revision::state::CanReadRepository,
     header: thin_client_v1::RevisionTreeHeader,
     tx: mpsc::Sender<Result<RevisionTreeResponse, Status>>,
     include_last_revision: bool,
@@ -169,7 +168,6 @@ fn stream_tree(
             signature,
             path,
             max_depth,
-            can_read,
             include_last_revision,
         )
         .await

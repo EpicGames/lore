@@ -8,6 +8,7 @@ use lore_revision::branch;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_metadata_get::*;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
@@ -40,6 +41,7 @@ async fn returns_metadata_hash_for_existing_branch() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
 
         let write_token = get_write_token();

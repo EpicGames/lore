@@ -41,6 +41,7 @@ use lore_revision::instance::InstanceId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
+use lore_revision::state::allow_all_repositories;
 use lore_storage::FlushOptions;
 
 use crate::fs::fuse::bench_stats::Summary;
@@ -826,7 +827,11 @@ async fn bench_fragment_cache_read_breakdown() {
     let (immutable, mutable, store_dir) = bench_stores().await;
     let execution = fuse_fixture::setup_test_execution();
     Box::pin(LORE_CONTEXT.scope(execution, async move {
-        let repository = Arc::new(RepositoryContext::new_null_context(immutable, mutable));
+        let repository = Arc::new(RepositoryContext::new_null_context(
+            immutable,
+            mutable,
+            allow_all_repositories(),
+        ));
         let mut bytes = bytes::BytesMut::with_capacity(CONTENT_SIZE as usize);
         let mut chunk = vec![0u8; MIB];
         for index in 0..CONTENT_SIZE / MIB as u64 {
@@ -979,7 +984,7 @@ async fn bench_hot_inode_reads() {
     let (immutable, mutable, _store_dir) = bench_stores().await;
     let execution = fuse_fixture::setup_test_execution();
     Box::pin(LORE_CONTEXT.scope(execution, async move {
-        let repository = Arc::new(RepositoryContext::new_null_context(immutable, mutable));
+        let repository = Arc::new(RepositoryContext::new_null_context(immutable, mutable, allow_all_repositories()));
         let size = env_usize("LORE_BENCH_HOT_MIB", 64) * MIB;
         let mut bytes = bytes::BytesMut::with_capacity(size);
         let mut chunk = vec![0u8; MIB];

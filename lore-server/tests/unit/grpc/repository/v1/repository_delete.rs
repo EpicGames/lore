@@ -9,6 +9,7 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
+use lore_revision::state::allow_all_repositories;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::ResourcePermission;
 use lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer;
@@ -43,6 +44,7 @@ async fn seed_repository(
         immutable_store,
         mutable_store,
         id,
+        allow_all_repositories(),
     ));
     let metadata_hash = repository::metadata_store(
         repository.clone(),
@@ -238,6 +240,7 @@ async fn a_registry_is_asked_only_after_the_token_check() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 id,
+                allow_all_repositories(),
             ));
             assert_eq!(
                 repository::id_from_name(repository, "the-repository")
@@ -431,6 +434,7 @@ mod zero_repository_id {
                 immutable_store,
                 mutable_store,
                 namespace_root,
+                allow_all_repositories(),
             ));
             repository::metadata_hash(repository)
                 .await

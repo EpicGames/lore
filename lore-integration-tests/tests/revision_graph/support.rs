@@ -105,6 +105,7 @@ use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
 use lore_revision::repository::SALT_LORE;
 use lore_revision::state::State;
+use lore_revision::state::allow_all_repositories;
 use lore_revision::test_util::register_live_instance;
 use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
@@ -374,6 +375,7 @@ pub(crate) async fn on_server<T>(
         f.uncounted_immutable.clone(),
         f.server_mutable.clone(),
         f.repository,
+        allow_all_repositories(),
     ));
     LORE_CONTEXT
         .scope(crate::setup_execution(String::new()), work(context))

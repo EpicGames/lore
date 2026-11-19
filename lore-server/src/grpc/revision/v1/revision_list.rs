@@ -19,6 +19,7 @@ use lore_revision::repository::RepositoryContext;
 use lore_revision::revision;
 use lore_revision::revision::ResolveSearchLocation;
 use lore_revision::state;
+use lore_revision::state::no_link_traversal;
 use lore_revision::util;
 use lore_storage::StoreError;
 use lore_telemetry::LabelArray;
@@ -183,6 +184,7 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository_id,
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT

@@ -32,7 +32,6 @@ use lore_revision::state::State;
 use lore_revision::state::StateError;
 use lore_revision::state::Tree;
 use lore_revision::state::TreeWalk;
-use lore_revision::state::allow_all_repositories;
 use lore_revision::util::path::RelativePath;
 use lore_storage::hash::hash_string;
 use lore_transport::Connection;
@@ -180,7 +179,6 @@ async fn walk_refusing(
         revision,
         RelativePath::default(),
         max_depth,
-        allow_all_repositories(),
         attribute,
     )
     .await

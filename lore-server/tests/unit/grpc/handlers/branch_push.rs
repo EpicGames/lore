@@ -26,6 +26,7 @@ use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
 use lore_revision::state::Mark;
 use lore_revision::state::State;
+use lore_revision::state::allow_all_repositories;
 use lore_revision::util::request_tracker::StoreRequestTracker;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push::*;
@@ -646,6 +647,7 @@ mod push {
                 immutable_store,
                 mutable_store,
                 repository_id,
+                allow_all_repositories(),
             ));
 
             let write_token = get_write_token();
@@ -706,11 +708,13 @@ mod push {
                 peer_store.clone(),
                 peer_mutable,
                 repository_id,
+                allow_all_repositories(),
             ));
             let repository = Arc::new(RepositoryContext::new_server_context(
                 store.clone(),
                 mutable_store,
                 repository_id,
+                allow_all_repositories(),
             ));
 
             let branch = create_test_branch(&repository).await;
@@ -768,11 +772,13 @@ mod push {
                 peer_store.clone(),
                 peer_mutable,
                 repository_id,
+                allow_all_repositories(),
             ));
             let repository = Arc::new(RepositoryContext::new_server_context(
                 store.clone(),
                 mutable_store,
                 repository_id,
+                allow_all_repositories(),
             ));
 
             let branch = create_test_branch(&repository).await;
@@ -829,11 +835,13 @@ mod push {
                 peer_store.clone(),
                 peer_mutable,
                 repository_id,
+                allow_all_repositories(),
             ));
             let repository = Arc::new(RepositoryContext::new_server_context(
                 store.clone(),
                 mutable_store,
                 repository_id,
+                allow_all_repositories(),
             ));
 
             let branch = create_test_branch(&repository).await;
@@ -896,11 +904,13 @@ mod push {
                 peer_store.clone(),
                 peer_mutable,
                 repository_id,
+                allow_all_repositories(),
             ));
             let repository = Arc::new(RepositoryContext::new_server_context(
                 store.clone(),
                 mutable_store,
                 repository_id,
+                allow_all_repositories(),
             ));
 
             let branch = create_test_branch(&repository).await;
@@ -957,6 +967,7 @@ mod push {
                 immutable_store,
                 mutable_store,
                 random::<RepositoryId>(),
+                allow_all_repositories(),
             ));
             let branch = create_test_branch(&repository).await;
 
@@ -988,6 +999,7 @@ mod push {
                 immutable_store,
                 mutable_store,
                 random::<RepositoryId>(),
+                allow_all_repositories(),
             ));
             let branch = create_test_branch(&repository).await;
 
@@ -1020,6 +1032,7 @@ mod push {
                 immutable_store,
                 mutable_store,
                 random::<RepositoryId>(),
+                allow_all_repositories(),
             ));
             let branch = create_test_branch(&repository).await;
 
@@ -1050,6 +1063,7 @@ mod push {
                 immutable_store,
                 mutable_store,
                 random::<RepositoryId>(),
+                allow_all_repositories(),
             ));
             let branch = create_test_branch(&repository).await;
 
@@ -1095,6 +1109,7 @@ mod push {
                 immutable_store,
                 mutable_store,
                 random::<RepositoryId>(),
+                allow_all_repositories(),
             ));
             let branch = create_test_branch(&repository).await;
             let chain = push_linear_revisions(&repository, branch, Hash::default(), 1..=1).await;
@@ -1159,6 +1174,7 @@ mod push {
                 immutable_store,
                 mutable_store,
                 random::<RepositoryId>(),
+                allow_all_repositories(),
             ));
             let branch = create_test_branch(&repository).await;
             let chain = push_linear_revisions(&repository, branch, Hash::default(), 1..=1).await;
@@ -1247,6 +1263,7 @@ mod push {
                 immutable_store,
                 mutable_store,
                 random::<RepositoryId>(),
+                allow_all_repositories(),
             ));
             let branch = create_test_branch(&repository).await;
             let chain = push_linear_revisions(&repository, branch, Hash::default(), 1..=2).await;
@@ -1326,6 +1343,7 @@ mod push {
                 immutable_store,
                 mutable_store,
                 random::<RepositoryId>(),
+                allow_all_repositories(),
             ));
             let branch = create_test_branch(&repository).await;
             let base = commit_files(
@@ -1438,6 +1456,7 @@ mod push {
                 immutable_store,
                 mutable_store,
                 random::<RepositoryId>(),
+                lore_revision::state::allow_all_repositories(),
             ));
             let branch = create_test_branch(&repository).await;
             let base = commit_files(
@@ -1524,6 +1543,7 @@ mod push {
                 immutable_store,
                 mutable_store,
                 random::<RepositoryId>(),
+                allow_all_repositories(),
             ));
             let branch = create_test_branch(&repository).await;
             let base = commit_files(
@@ -1564,6 +1584,7 @@ mod push {
                 immutable_store,
                 mutable_store,
                 random::<RepositoryId>(),
+                allow_all_repositories(),
             ));
             let branch = create_test_branch(&repository).await;
             let chain = push_linear_revisions(&repository, branch, Hash::default(), 1..=2).await;
@@ -1700,6 +1721,7 @@ mod collect_new_addresses {
                 immutable_store,
                 mutable_store,
                 repository_id,
+                allow_all_repositories(),
             ));
 
             let branch = create_test_branch(&repository).await;
@@ -1789,11 +1811,13 @@ mod collect_new_addresses {
                 peer_store.clone(),
                 peer_mutable,
                 repository_id,
+                allow_all_repositories(),
             ));
             let repository = Arc::new(RepositoryContext::new_server_context(
                 store.clone(),
                 mutable_store,
                 repository_id,
+                allow_all_repositories(),
             ));
 
             let branch = create_test_branch(&repository).await;
@@ -1909,6 +1933,7 @@ mod push_protected_action {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository_id,
+                allow_all_repositories(),
             ));
             let main = create_test_branch(&repository).await;
             if protected {

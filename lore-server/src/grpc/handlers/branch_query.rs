@@ -8,6 +8,7 @@ use lore_proto::BranchQueryRequest;
 use lore_proto::BranchQueryResponse;
 use lore_revision::branch;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::METADATA;
 use lore_telemetry::tracing::fields::REVISION;
@@ -56,6 +57,7 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository,
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT

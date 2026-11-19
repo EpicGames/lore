@@ -140,10 +140,12 @@ pub async fn handler(
     let autoresolve = req.autoresolve;
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
-    let repository = Arc::new(
-        RepositoryContext::new_server_context(immutable_store, mutable_store, repository_id)
-            .with_link_read(can_read),
-    );
+    let repository = Arc::new(RepositoryContext::new_server_context(
+        immutable_store,
+        mutable_store,
+        repository_id,
+        can_read,
+    ));
 
     LORE_CONTEXT
         .scope(execution, async move {

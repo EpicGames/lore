@@ -22,6 +22,7 @@ use lore_proto::lore::user::v1::repository_registry_service_server::RepositoryRe
 use lore_proto::lore::user::v1::repository_registry_service_server::RepositoryRegistryServiceServer;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -59,6 +60,7 @@ async fn stores_holding(ids: &[RepositoryId]) -> (Arc<dyn ImmutableStore>, Arc<d
         immutable.clone(),
         mutable.clone(),
         Context::default().into(),
+        allow_all_repositories(),
     ));
     for (index, id) in ids.iter().enumerate() {
         repository::store_name_to_id(context.clone(), format!("repository-{index}"), *id)

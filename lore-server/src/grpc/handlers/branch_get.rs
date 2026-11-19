@@ -8,6 +8,7 @@ use lore_proto::BranchGetResponse;
 use lore_revision::branch;
 use lore_revision::lore::BranchId;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use tonic::Request;
 use tonic::Response;
@@ -41,6 +42,7 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository,
+        no_link_traversal(),
     ));
     LORE_CONTEXT
         .scope(execution, async move {

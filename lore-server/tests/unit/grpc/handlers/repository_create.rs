@@ -69,6 +69,7 @@ mod zero_repository_id {
     use lore_revision::lore::RepositoryId;
     use lore_revision::repository;
     use lore_revision::repository::RepositoryContext;
+    use lore_revision::state::allow_all_repositories;
     use lore_server::authnz::repository_registry::RepositoryRegistry;
     use lore_server::grpc::handlers::repository_create::*;
     use lore_server::hooks::HookDispatcher;
@@ -117,6 +118,7 @@ mod zero_repository_id {
                 immutable_store,
                 mutable_store,
                 RepositoryId::default(),
+                allow_all_repositories(),
             ));
             let err = repository::metadata_hash(namespace_root)
                 .await

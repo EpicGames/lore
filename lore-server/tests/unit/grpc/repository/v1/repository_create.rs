@@ -385,6 +385,7 @@ mod zero_repository_id {
                 immutable_store,
                 mutable_store,
                 RepositoryId::default(),
+                lore_revision::state::allow_all_repositories(),
             ));
             let err = repository::metadata_hash(namespace_root)
                 .await

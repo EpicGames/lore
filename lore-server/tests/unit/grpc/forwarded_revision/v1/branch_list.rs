@@ -6,6 +6,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_proto::lore::revision::v1::BranchListRequest;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::forwarded_requests::CallerContext;
 use lore_server::grpc::forwarded_revision::v1::branch_list::*;
 use lore_server::grpc::revision::v1::branch_list::BranchListStream;
@@ -94,6 +95,7 @@ mod base_branch_list_handler {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             create_root_branch(&repository_context, "main", "lily").await;
             create_root_branch(&repository_context, "feature", "james").await;

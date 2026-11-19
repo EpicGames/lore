@@ -13,6 +13,7 @@ use lore_revision::metadata::Metadata;
 use lore_revision::metadata::MetadataType;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
+use lore_revision::state::no_link_traversal;
 use lore_telemetry::tracing::fields::METADATA;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use lore_telemetry::tracing::fields::REVISION;
@@ -62,6 +63,7 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository_id,
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT

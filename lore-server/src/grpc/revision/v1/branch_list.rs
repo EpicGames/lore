@@ -18,6 +18,7 @@ use lore_revision::branch::BranchError;
 use lore_revision::lore::BranchId;
 use lore_revision::metadata::Metadata;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -136,6 +137,7 @@ pub async fn branch_list_implementation(
         immutable_store,
         mutable_store,
         caller_context.repository_id,
+        no_link_traversal(),
     ));
 
     let (tx, rx) = mpsc::channel(64);

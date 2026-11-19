@@ -9,6 +9,7 @@ use lore_proto::lore::revision::v1::branch_get_request::Query as BranchGetQuery;
 use lore_revision::branch;
 use lore_revision::lore::BranchId;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::METADATA;
 use tonic::Request;
@@ -91,6 +92,7 @@ pub async fn branch_get_implementation(
         immutable_store,
         mutable_store,
         caller_context.repository_id,
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT

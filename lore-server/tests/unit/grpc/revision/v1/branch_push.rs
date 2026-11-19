@@ -11,6 +11,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_revision::state::allow_all_repositories;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::revision::v1::branch_push::*;
@@ -137,6 +138,7 @@ async fn push_advances_branch_latest() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let revision = build_revision(&repository_context, Hash::default(), 1).await;
@@ -178,6 +180,7 @@ async fn push_zero_revision_returns_invalid_argument() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
 
@@ -219,6 +222,7 @@ async fn push_with_stale_parent_returns_failed_precondition() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let first = build_revision(&repository_context, Hash::default(), 1).await;
@@ -278,6 +282,7 @@ async fn force_push_overrides_stale_parent() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let first = build_revision(&repository_context, Hash::default(), 1).await;
@@ -339,6 +344,7 @@ async fn push_to_protected_branch_returns_permission_denied() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         // Protect the branch — non-service-account pushes must be denied.
@@ -390,6 +396,7 @@ async fn push_idempotent_on_current_latest() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let revision = build_revision(&repository_context, Hash::default(), 1).await;
@@ -483,6 +490,7 @@ async fn push_to_protected_branch(
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         branch::protect(repository_context.clone(), main)
@@ -544,6 +552,7 @@ async fn service_account_claim_no_longer_bypasses_protection() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         branch::protect(repository_context.clone(), main)
@@ -602,6 +611,7 @@ async fn push_to_deleted_branch_fails_not_found_and_leaves_it_deleted() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let main_latest = build_revision(&repository_context, Hash::default(), 1).await;
@@ -679,6 +689,7 @@ async fn push_to_deleted_branch_fails_when_name_taken() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let main_latest = build_revision(&repository_context, Hash::default(), 1).await;
@@ -758,6 +769,7 @@ async fn push_to_deleted_branch_whose_name_is_held(holder: NameHolder) -> (tonic
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let main_latest = build_revision(&repository_context, Hash::default(), 1).await;
@@ -905,6 +917,7 @@ async fn push_to_deleted_branch_over_a_stale_mapping_fails_not_found() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let main_latest = build_revision(&repository_context, Hash::default(), 1).await;
@@ -981,6 +994,7 @@ async fn fast_forward_merge_succeeds_for_clean_diff() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
 
@@ -1082,6 +1096,7 @@ async fn pre_hook_sees_branch_name_and_service_account() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let revision = build_revision(&repository_context, Hash::default(), 1).await;
@@ -1137,6 +1152,7 @@ async fn rejected_push_to_deleted_branch_does_not_reinstate_name() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let main_latest = build_revision(&repository_context, Hash::default(), 1).await;
@@ -1276,6 +1292,7 @@ mod handler {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_root_branch(&repository_context, "main").await;
             store_repository_metadata(&repository_context, main).await;
@@ -1338,6 +1355,7 @@ mod handler {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_root_branch(&repository_context, "main").await;
             store_repository_metadata(&repository_context, main).await;
@@ -1396,6 +1414,7 @@ mod handler {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_root_branch(&repository_context, "main").await;
             let main_latest = build_revision(&repository_context, Hash::default(), 1).await;

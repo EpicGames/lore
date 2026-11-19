@@ -21,6 +21,7 @@ use lore_revision::state::LinkReference;
 use lore_revision::state::Mark;
 use lore_revision::state::NodeMapping;
 use lore_revision::state::State;
+use lore_revision::state::allow_all_repositories;
 use lore_revision::util::path::RelativePath;
 use lore_storage::hash::hash_string;
 
@@ -51,7 +52,11 @@ async fn only_a_node_change_in_a_linked_repository_marks_links() {
         .scope(setup_test_execution(), async {
             let (immutable_store, mutable_store, _execution) =
                 test_store_create().await.expect("making test stores");
-            let top_level = RepositoryContext::new_null_context(immutable_store, mutable_store);
+            let top_level = RepositoryContext::new_null_context(
+                immutable_store,
+                mutable_store,
+                allow_all_repositories(),
+            );
             let linked = top_level.to_link_context(RepositoryId::from([1; 16])).await;
 
             let tracker = LinkTracker::new();
@@ -948,6 +953,7 @@ async fn a_link_walk_reads_each_pin_once_and_skips_the_root() {
             let root = Arc::new(RepositoryContext::new_null_context(
                 immutable_store,
                 mutable_store,
+                allow_all_repositories(),
             ));
             let (a, b) = (RepositoryId::from([1; 16]), RepositoryId::from([2; 16]));
             let a_unlinked = revision_linking(&root, a, &[]).await;
@@ -989,6 +995,7 @@ async fn a_link_walk_stops_at_the_depth_limit() {
             let root = Arc::new(RepositoryContext::new_null_context(
                 immutable_store,
                 mutable_store,
+                allow_all_repositories(),
             ));
             let chain: Vec<RepositoryId> = (1..=lore_revision::state::MAX_LINK_DEPTH as u8 + 1)
                 .map(|byte| RepositoryId::from([byte; 16]))

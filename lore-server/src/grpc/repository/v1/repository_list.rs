@@ -12,6 +12,7 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::lore::execution_context;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::Stream;
@@ -126,6 +127,7 @@ async fn load_and_filter_repository(
         immutable_store,
         mutable_store,
         id,
+        no_link_traversal(),
     ));
 
     let metadata_hash = match repository::metadata_hash(repository.clone())

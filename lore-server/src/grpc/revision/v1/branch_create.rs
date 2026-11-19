@@ -11,6 +11,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::notification::NotificationSender;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_revision::util;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::tracing::fields::BRANCH_ID;
@@ -151,6 +152,7 @@ pub async fn branch_create_implementation(
         immutable_store,
         mutable_store,
         context.repository_id,
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT

@@ -8,6 +8,7 @@ use lore_proto::lore::repository::v1::RepositoryGetRequest;
 use lore_proto::lore::repository::v1::repository_get_request::Query;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_server::auth::jwt::JwtVerifier;
 use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
@@ -31,6 +32,7 @@ async fn store_repository(
         immutable_store,
         mutable_store,
         id,
+        allow_all_repositories(),
     ));
     let metadata = lore_revision::repository::RepositoryMetadata {
         name: name.to_string(),

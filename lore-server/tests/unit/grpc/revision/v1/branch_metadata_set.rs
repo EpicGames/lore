@@ -11,6 +11,7 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::Metadata;
 use lore_revision::metadata::branch::ARCHIVE_KEYS;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push::PushHandler;
 use lore_server::grpc::handlers::branch_push::PushReport;
@@ -81,6 +82,7 @@ async fn cas_hit_swaps_pointer_and_returns_updated() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let current = create_branch(repository.clone(), branch_id).await;
 
@@ -117,6 +119,7 @@ async fn cas_miss_returns_current_pointer_in_band() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let current = create_branch(repository.clone(), branch_id).await;
 
@@ -168,6 +171,7 @@ async fn rejects_modification_of_read_only_name() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let current = create_branch(repository.clone(), branch_id).await;
 
@@ -205,6 +209,7 @@ async fn rejects_modification_of_read_only_category() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let current = create_branch(repository.clone(), branch_id).await;
 
@@ -242,6 +247,7 @@ async fn rejects_removal_of_read_only_creator() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let current = create_branch(repository.clone(), branch_id).await;
 
@@ -280,6 +286,7 @@ async fn rejects_addition_of_an_archive_key() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository_id,
+                allow_all_repositories(),
             ));
             let current = create_branch(repository.clone(), branch_id).await;
 
@@ -324,6 +331,7 @@ async fn rejects_change_or_removal_of_an_archive_key() {
                     immutable_store.clone(),
                     mutable_store.clone(),
                     repository_id,
+                    allow_all_repositories(),
                 ));
                 let created = create_branch(repository.clone(), branch_id).await;
                 let mut stamped = Metadata::deserialize(repository.clone(), created)
@@ -386,6 +394,7 @@ async fn allows_protect_modification() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let current = create_branch(repository.clone(), branch_id).await;
 
@@ -444,6 +453,7 @@ async fn cas_succeeds_on_deleted_branch() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let write_token = get_write_token();
 
@@ -546,6 +556,7 @@ async fn rejects_garbage_updated_hash() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let current = create_branch(repository.clone(), branch_id).await;
 
@@ -578,6 +589,7 @@ async fn rejects_garbage_expected_hash() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let current = create_branch(repository.clone(), branch_id).await;
 
@@ -616,6 +628,7 @@ async fn rejects_dangling_address_reference() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let current = create_branch(repository.clone(), branch_id).await;
 

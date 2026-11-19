@@ -18,6 +18,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Context;
 use lore_revision::immutable;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_storage::options::WriteOptions;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use serde::Serialize;
@@ -97,6 +98,7 @@ pub async fn handler(
                         state.immutable_store.clone(),
                         state.mutable_store.clone(),
                         repository_id.into(),
+                        no_link_traversal(),
                     ))
                 }
                 Err(error) => {

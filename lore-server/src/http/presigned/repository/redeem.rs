@@ -25,6 +25,7 @@ use lore_revision::immutable::ImmutableError;
 use lore_revision::immutable::read_options_from_repository;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use reqwest::header::CONTENT_LENGTH;
 use serde::Deserialize;
@@ -161,6 +162,7 @@ pub async fn handler(
                 immutable_store,
                 mutable_store,
                 parsed_repository,
+                no_link_traversal(),
             ));
 
             let options = read_options_from_repository(&repository);

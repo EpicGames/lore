@@ -5757,7 +5757,8 @@ impl State {
         self.clears_found_gone.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Resolves `path` below `root`, entering links on the way.
+    /// Resolves `path` below `root`, entering the links the link read policy of `repository`
+    /// admits. A path through a link it denies resolves to nothing.
     ///
     /// A component naming the repository's own directory resolves to nothing: no node carries
     /// that name, and a revision holding one anyway is not reached through it, whichever case
@@ -5835,6 +5836,13 @@ impl State {
             }
             Stop::Link(link) => link,
         };
+        if !repository.can_read_link(link.repository) {
+            lore_debug!(
+                "Path resolution stops at unauthorized repository {}",
+                link.repository,
+            );
+            return futures::future::Either::Left(std::future::ready(Err(NodeNotFound.into())));
+        }
         let rest = path.get(stop.length + 1..).unwrap_or_default();
         futures::future::Either::Right(async move {
             let repository = repository.to_link_context(link.repository).await;
@@ -7936,19 +7944,22 @@ pub fn allow_all_repositories() -> CanReadRepository {
     Arc::new(|_| true)
 }
 
+pub fn no_link_traversal() -> CanReadRepository {
+    Arc::new(|_| false)
+}
+
 /// Maximum number of link hops a tree walk follows before giving up. Bounds
 /// both unbounded link chains and link cycles so a walk terminates.
 pub const MAX_LINK_DEPTH: usize = 8;
 
 /// The entries of the tree of `state` below `path`, `max_depth` levels deep or all of them for 0,
-/// descending the links `can_read` admits. With `include_last_revision`, each entry is attributed
-/// to the revision that last changed it.
+/// descending the links the link read policy of `repository` admits. With `include_last_revision`,
+/// each entry is attributed to the revision that last changed it.
 pub async fn gather_tree_paths(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
     path: RelativePath,
     max_depth: usize,
-    can_read: CanReadRepository,
     include_last_revision: bool,
 ) -> Result<TreeWalk, StateError> {
     let (walk_state, walk_repository, parent_node_id, starts_linked) = if path.is_empty() {
@@ -7958,13 +7969,6 @@ pub async fn gather_tree_paths(
             .find_node_link(repository.clone(), path.as_str())
             .await?;
         if !node_link.is_valid() {
-            return Err(NodeNotFound.into());
-        }
-        if !can_read(node_link.repository) {
-            lore_debug!(
-                "Path resolution stops at unauthorized repository {}",
-                node_link.repository,
-            );
             return Err(NodeNotFound.into());
         }
         if node_link.revision == state.revision() {
@@ -7989,7 +7993,6 @@ pub async fn gather_tree_paths(
         0,
         max_depth,
         0,
-        can_read,
         &mut walk,
         include_last_revision,
     )
@@ -8017,7 +8020,6 @@ async fn enumerate_children(
     depth: usize,
     max_depth: usize,
     link_depth: usize,
-    can_read: CanReadRepository,
     walk: &mut TreeWalk,
     include_last_revision: bool,
 ) -> Result<(), StateError> {
@@ -8043,7 +8045,6 @@ async fn enumerate_children(
         depth,
         max_depth,
         link_depth,
-        can_read,
         walk,
         &mut cycle,
         attribution.as_deref_mut(),
@@ -8099,7 +8100,6 @@ async fn gather_tree_paths_node(
     depth: usize,
     max_depth: usize,
     link_depth: usize,
-    can_read: CanReadRepository,
     walk: &mut TreeWalk,
     cycle: &mut SiblingCycleGuard,
     mut attribution: Option<&mut TreeAttribution>,
@@ -8181,7 +8181,6 @@ async fn gather_tree_paths_node(
             depth + 1,
             max_depth,
             link_depth,
-            can_read,
             walk,
             &mut child_cycle,
             attribution,
@@ -8189,7 +8188,7 @@ async fn gather_tree_paths_node(
         .await?;
     } else if node.is_link() && depth_remaining && link_depth < MAX_LINK_DEPTH {
         let link = node.linked_node();
-        if !can_read(link.repository) {
+        if !repository.can_read_link(link.repository) {
             lore_debug!(
                 "Skipping linked subtree: caller not authorized for repository {}",
                 link.repository,
@@ -8207,7 +8206,6 @@ async fn gather_tree_paths_node(
                         depth + 1,
                         max_depth,
                         link_depth + 1,
-                        can_read,
                         walk,
                         attribution.is_some(),
                     )
@@ -8249,7 +8247,6 @@ fn gather_tree_paths_node_recurse<'a>(
     depth: usize,
     max_depth: usize,
     link_depth: usize,
-    can_read: CanReadRepository,
     walk: &'a mut TreeWalk,
     cycle: &'a mut SiblingCycleGuard,
     mut attribution: Option<&'a mut TreeAttribution>,
@@ -8266,7 +8263,6 @@ fn gather_tree_paths_node_recurse<'a>(
                 depth,
                 max_depth,
                 link_depth,
-                can_read.clone(),
                 walk,
                 cycle,
                 attribution.as_deref_mut(),

@@ -2760,7 +2760,6 @@ pub async fn tree(
     revision: Hash,
     path: RelativePath,
     max_depth: usize,
-    can_read: crate::state::CanReadRepository,
     include_last_revision: bool,
 ) -> Result<TreeWalk, StateError> {
     lore_debug!(
@@ -2770,15 +2769,7 @@ pub async fn tree(
         path.as_str()
     );
     let state = State::deserialize(repository.clone(), revision).await?;
-    gather_tree_paths(
-        state,
-        repository,
-        path,
-        max_depth,
-        can_read,
-        include_last_revision,
-    )
-    .await
+    gather_tree_paths(state, repository, path, max_depth, include_last_revision).await
 }
 
 /// What a revision specifier names on a branch.

@@ -10,6 +10,7 @@ use lore_revision::link;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::diff::*;
 use lore_revision::state::State;
+use lore_revision::state::allow_all_repositories;
 use lore_revision::util::path::RelativePath;
 
 use crate::fs::filesystem_provider::setup_test_execution;
@@ -96,6 +97,7 @@ async fn the_link_pin_diff_is_held_without_a_change() {
             let repository = Arc::new(RepositoryContext::new_null_context(
                 immutable_store,
                 mutable_store,
+                allow_all_repositories(),
             ));
             let state = State::new();
 
