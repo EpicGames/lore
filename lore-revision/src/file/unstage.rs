@@ -308,7 +308,10 @@ async fn unstage_parent(
     let link_tracker = LinkTracker::new();
     let is_merge_or_cherry_pick_or_revert = state_staged.is_merge_or_cherry_pick_or_revert();
 
-    with_operation(repository.file_system(), async |operation| {
+    // One operation covers the unstaging and storing what it leaves staged: an SWFS instance
+    // serves links from what is stored when the operation finalizes, so a link whose repin is
+    // unstaged has to be stored by then (ADR-00042).
+    let signature = with_operation(repository.file_system(), async |operation| {
         unstage_each_path(UnstagePaths {
             operation: &operation,
             repository: &repository,
@@ -320,81 +323,84 @@ async fn unstage_parent(
             stats: &stats,
             link_tracker: &link_tracker,
         })
-        .await
-    })
-    .await?;
+        .await?;
 
-    let mut clear = !is_merge_or_cherry_pick_or_revert
-        && !state_staged
-            .node_has_staged_or_dirty_children(repository.clone(), ROOT_NODE)
-            .await
-            .forward::<UnstageError>("Failed to find subnode")?;
+        let mut clear = !is_merge_or_cherry_pick_or_revert
+            && !state_staged
+                .node_has_staged_or_dirty_children(repository.clone(), ROOT_NODE)
+                .await
+                .forward::<UnstageError>("Failed to find subnode")?;
 
-    if clear {
-        lore_debug!("Unstaged all, clean by removing staged state anchor");
-        if crate::instance::delete_staged_anchor(&repository)
-            .await
-            .is_err()
-        {
-            clear = false;
+        if clear {
+            lore_debug!("Unstaged all, clean by removing staged state anchor");
+            if crate::instance::delete_staged_anchor(&repository)
+                .await
+                .is_err()
+            {
+                clear = false;
+            }
         }
-    }
 
-    if !clear {
-        discard_nodes(
+        if !clear {
+            discard_nodes(
+                repository.clone(),
+                state_staged.clone(),
+                discard.clone(),
+                link_tracker.clone(),
+            )
+            .await?;
+        }
+
+        process_link_unstage_updates(
             repository.clone(),
+            token,
+            state_current.clone(),
             state_staged.clone(),
-            discard,
             link_tracker.clone(),
         )
         .await?;
-    }
 
-    process_link_unstage_updates(
-        repository.clone(),
-        token,
-        state_current.clone(),
-        state_staged.clone(),
-        link_tracker.clone(),
-    )
+        let total_count = stats.directory_unstaged_count.load(Ordering::Relaxed)
+            + stats.directory_discarded_count.load(Ordering::Relaxed)
+            + stats.file_unstaged_count.load(Ordering::Relaxed)
+            + stats.file_discarded_count.load(Ordering::Relaxed);
+
+        if total_count == 0 || clear {
+            lore_debug!(
+                "Nothing unstaged or nothing remains staged, not serializing new staged state and anchor"
+            );
+            return Ok(None);
+        }
+
+        state_staged.mark_dirty();
+
+        if state_staged.holds_promoted_moves() {
+            Box::pin(crate::file::stage::stage_promoted_moves_of_call(
+                &repository,
+                &state_staged,
+                None,
+            ))
+            .await
+            .forward::<UnstageError>("Failed to stage the move of a directory holding a staged link")?;
+        }
+        let signature = state_staged
+            .serialize(repository.clone(), token)
+            .await
+            .forward::<UnstageError>("Failed to serialize staged revision state")?;
+        crate::instance::store_staged_anchor(&repository, signature)
+            .await
+            .forward::<UnstageError>("Failed to serialize staged anchor")?;
+        Ok::<_, UnstageError>(Some(signature))
+    })
     .await?;
 
-    let total_count = stats.directory_unstaged_count.load(Ordering::Relaxed)
-        + stats.directory_discarded_count.load(Ordering::Relaxed)
-        + stats.file_unstaged_count.load(Ordering::Relaxed)
-        + stats.file_discarded_count.load(Ordering::Relaxed);
-
-    if total_count == 0 || clear {
-        lore_debug!(
-            "Nothing unstaged or nothing remains staged, not serializing new staged state and anchor"
-        );
-        return Ok(());
+    if let Some(signature) = signature {
+        event::LoreEvent::FileUnstageRevision(LoreFileUnstageRevisionEventData {
+            repository: repository.id,
+            revision: signature,
+        })
+        .send();
     }
-
-    state_staged.mark_dirty();
-    if state_staged.holds_promoted_moves() {
-        Box::pin(crate::file::stage::stage_promoted_moves_of_call(
-            &repository,
-            &state_staged,
-            None,
-        ))
-        .await
-        .forward::<UnstageError>("Failed to stage the move of a directory holding a staged link")?;
-    }
-
-    let signature = state_staged
-        .serialize(repository.clone(), token)
-        .await
-        .forward::<UnstageError>("Failed to serialize staged revision state")?;
-    crate::instance::store_staged_anchor(&repository, signature)
-        .await
-        .forward::<UnstageError>("Failed to serialize staged anchor")?;
-
-    event::LoreEvent::FileUnstageRevision(LoreFileUnstageRevisionEventData {
-        repository: repository.id,
-        revision: signature,
-    })
-    .send();
 
     Ok(())
 }

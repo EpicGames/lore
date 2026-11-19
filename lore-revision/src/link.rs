@@ -2119,7 +2119,25 @@ pub(crate) async fn realize_link_pin_change_in_operation(
     overwrite_local: bool,
 ) -> Result<(), LinkError> {
     let pin = ResolvedLinkPin::resolve(&link_context, pin_change).await?;
-    let diff = link_pin_diff(&link_context, &pin).await?;
+    realize_resolved_link_pin_in_operation(
+        operation,
+        repository,
+        link_context,
+        &pin,
+        overwrite_local,
+    )
+    .await
+}
+
+/// [`realize_link_pin_change_in_operation`] for a pin already read against both revisions.
+pub(crate) async fn realize_resolved_link_pin_in_operation(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    link_context: Arc<RepositoryContext>,
+    pin: &ResolvedLinkPin,
+    overwrite_local: bool,
+) -> Result<(), LinkError> {
+    let diff = link_pin_diff(&link_context, pin).await?;
     realize_link_pin_diff(
         operation,
         repository,

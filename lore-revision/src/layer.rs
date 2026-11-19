@@ -491,7 +491,8 @@ pub async fn add(
 
     let mount_states = layer_repository.filter.mount_states(&mount_path);
     // The mount directory and the files cloned under it are in the same filesystem, so one
-    // operation covers both.
+    // operation covers both, and the layer is saved before it finalizes: an SWFS instance serves
+    // layers from the configuration it finds then (ADR-00042).
     with_operation(layer_repository.file_system(), async |operation| {
         operation
             .create_dir_all(&mount_path)
@@ -517,11 +518,11 @@ pub async fn add(
             mount_states,
         )
         .await
-        .forward::<LayerError>("Failed cloning target layer")
+        .forward::<LayerError>("Failed cloning target layer")?;
+
+        save_config(token, &config_path, &config).await
     })
     .await?;
-
-    save_config(token, &config_path, &config).await?;
 
     Ok(())
 }
@@ -646,7 +647,9 @@ pub async fn remove(
     let mut modified: Vec<String> = Vec::new();
 
     let force = execution_context().globals().force();
-    // The walk reads the same files the removal then deletes, so one operation covers both.
+    // The walk reads the same files the removal then deletes, so one operation covers both, and
+    // the layer is taken out of the configuration before it finalizes: an SWFS instance serves
+    // layers from the configuration it finds then (ADR-00042).
     with_operation(repository.file_system(), async |operation| {
         walk_layer_subtree(
             &operation,
@@ -687,16 +690,15 @@ pub async fn remove(
             purge,
         )
         .await;
-        Ok::<(), LayerError>(())
+
+        config.layers.remove(layer_index);
+        save_config(token, &config_path, &config).await
     })
     .await?;
 
     let modified_count = modified.len() as u64;
     let file_count = tracked_files.len() as u64;
     let directory_count = tracked_directories.len() as u64;
-
-    config.layers.remove(layer_index);
-    save_config(token, &config_path, &config).await?;
 
     event::LoreEvent::LayerRemove(LoreLayerRemoveEventData {
         target_path: LoreString::from(&mount_path),

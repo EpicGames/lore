@@ -5047,8 +5047,8 @@ async fn merge_abort_link(
         &repository,
         &state_staged,
         &ResolvedAbortEntry {
-            link_path,
-            link_path_rel,
+            link_path: link_path.clone(),
+            link_path_rel: link_path_rel.clone(),
             link_node,
             link_context,
             link_reference,
@@ -5083,6 +5083,14 @@ async fn merge_abort_link(
     crate::instance::store_staged_anchor(&repository, signature)
         .await
         .forward::<MergeError>("storing staged anchor")?;
+
+    // The link pin was realized before the staged state holding it was stored, so a mount that
+    // serves from the stored state is described again now.
+    with_operation(repository.file_system(), async |operation| {
+        operation.mount_changed(&link_path_rel);
+        Ok::<(), MergeError>(())
+    })
+    .await?;
 
     Ok(())
 }

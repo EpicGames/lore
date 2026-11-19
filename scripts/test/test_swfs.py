@@ -11,9 +11,10 @@ from error_types import (
     RepositoryAlreadyExistsError,
     SwfsOutsideServiceError,
 )
-from lore_parsers import parse_jsonl
+from lore_parsers import parse_jsonl, parse_status_json
 from service_util import LORE_SERVICE_ENVIRONMENT, stop_lore_service
 from test_repository_info import get_instance_id
+from test_utils import unstaged_entries
 
 from lore import Lore, external_root, per_url_store_path
 
@@ -1523,6 +1524,379 @@ def test_swfs_a_file_changed_in_an_earlier_operation_is_still_read_from_the_snap
 
     answered, fell_back = _answered(hashed)
     assert fell_back == 0 and answered > 0, hashed
+
+
+def _swfs_instance_with_a_committed_link(new_lore_repo):
+    """An SWFS instance with a link at `lib`, committed, to a repository holding `linked.txt` and
+    `other.txt`; returns the instance and the linked repository."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    linked_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("parent", {"README.txt": "parent\n"})
+    linked_repo.write_commit_push(
+        "one", {"linked.txt": "linked one\n", "other.txt": "other one\n"}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.link_add("lib", linked_repo.get_id(), "/")
+    swfs_repo.commit(message="add the link")
+    return swfs_repo, linked_repo
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_sync_moves_a_layer(new_lore_repo, background_lore_service):
+    """A sync that moves a layer syncs it within the sync's own operation: SWFS refuses a
+    freeze while frozen, so a layer sync opening an operation of its own failed to freeze."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    layer_repo = new_lore_repo(
+        original_repo.name + "_layer",
+        environment_vars=LORE_SERVICE_ENVIRONMENT.copy(),
+    )
+    original_repo.write_commit_push("main", {"main.txt": "main contents"})
+    layer_repo.write_commit_push("layer one", {"lay/layer.txt": "layer one"})
+
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.layer_add("lay", layer_repo, "lay/")
+    with swfs_repo.open_file("lay/layer.txt") as layer_file:
+        assert layer_file.read() == "layer one"
+
+    layer_repo.write_commit_push("layer two", {"lay/layer.txt": "layer two"})
+    swfs_repo.sync(force=True)
+
+    with swfs_repo.open_file("lay/layer.txt") as layer_file:
+        assert layer_file.read() == "layer two"
+    with swfs_repo.open_file("main.txt") as main_file:
+        assert main_file.read() == "main contents"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_link_add_under_a_new_directory(new_lore_repo, background_lore_service):
+    """A link added under a directory the instance does not hold is served through the mount
+    from the linked repository: listed and read there, with nothing below it a local change,
+    either to Lore or in SWFS's own write cache (REQ-F-3)."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    linked_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("parent", {"README.txt": "parent\n"})
+    linked_repo.write_commit_push(
+        "linked", {"linked.txt": "linked content\n", "sub/deep.txt": "deep\n"}
+    )
+
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.link_add("vendor/lib", linked_repo.get_id(), "/")
+
+    mount = os.path.join(swfs_repo.path, "vendor", "lib")
+    assert sorted(os.listdir(mount)) == ["linked.txt", "sub"]
+    with swfs_repo.open_file("vendor/lib/linked.txt") as linked_file:
+        assert linked_file.read() == "linked content\n"
+    with swfs_repo.open_file("vendor/lib/sub/deep.txt") as deep_file:
+        assert deep_file.read() == "deep\n"
+    assert unstaged_entries(swfs_repo) == []
+    staged_below_the_link = [
+        entry["path"]
+        for entry in parse_status_json(swfs_repo.status(json=True))
+        if entry["path"].startswith("vendor/lib/")
+    ]
+    assert staged_below_the_link == []
+    # Written onto the mount, the linked files would be SWFS's own changes, which it freezes.
+    assert _frozen_files(swfs_repo.status(scan=True, level="debug")) == [0]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_sync_turns_a_file_into_a_link(new_lore_repo, background_lore_service):
+    """A file that becomes a link in the revision a sync moves to is served as the linked
+    directory, which takes one thaw to describe: SWFS replaces the node and its type."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    linked_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "parent", {"vendor": "a file\n", "keep.txt": "keep\n"}
+    )
+    linked_repo.write_commit_push("linked", {"linked.txt": "linked content\n"})
+    swfs_repo = _swfs_clone(original_repo)
+    with swfs_repo.open_file("vendor") as vendor_file:
+        assert vendor_file.read() == "a file\n"
+
+    original_repo.remove_file("vendor")
+    original_repo.stage("vendor")
+    original_repo.link_add("vendor", linked_repo.get_id(), "/")
+    original_repo.commit(message="replace the file with a link")
+    original_repo.push()
+
+    swfs_repo.sync()
+
+    mount = os.path.join(swfs_repo.path, "vendor")
+    assert os.path.isdir(mount)
+    assert os.listdir(mount) == ["linked.txt"]
+    with swfs_repo.open_file("vendor/linked.txt") as linked_file:
+        assert linked_file.read() == "linked content\n"
+    assert unstaged_entries(swfs_repo) == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_link_update_and_its_unstage_serve_each_pin(
+    new_lore_repo, background_lore_service
+):
+    """A repinned link reads the new pin's content through the mount, and unstaging the repin
+    reads the old pin's again, neither leaving a linked file a local change in SWFS."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    linked_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("parent", {"README.txt": "parent\n"})
+    linked_repo.write_commit_push("one", {"linked.txt": "pin one\n"})
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.link_add("vendor/lib", linked_repo.get_id(), "/")
+    swfs_repo.commit(message="add the link")
+    linked_repo.write_commit_push("two", {"linked.txt": "pin two\n"})
+
+    def linked_content():
+        with swfs_repo.open_file("vendor/lib/linked.txt") as linked_file:
+            return linked_file.read()
+
+    swfs_repo.link_update("vendor/lib")
+    assert linked_content() == "pin two\n"
+    assert _frozen_files(swfs_repo.status(scan=True, level="debug")) == [0]
+
+    swfs_repo.unstage("vendor/lib")
+    assert linked_content() == "pin one\n"
+    assert _frozen_files(swfs_repo.status(scan=True, level="debug")) == [0]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_link_remove_takes_the_link_off_the_mount(
+    new_lore_repo, background_lore_service
+):
+    """After `link remove` a top-level link's path is gone from the mount, as from a plain working
+    tree, rather than still serving the linked files."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    linked_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("parent", {"README.txt": "parent\n"})
+    linked_repo.write_commit_push("linked", {"linked.txt": "linked content\n"})
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.link_add("lib", linked_repo.get_id(), "/")
+    swfs_repo.commit(message="add the link")
+
+    swfs_repo.link_remove("lib")
+
+    assert not os.path.exists(os.path.join(swfs_repo.path, "lib", "linked.txt"))
+    assert sorted(os.listdir(swfs_repo.path)) == ["README.txt"]
+    with swfs_repo.open_file("README.txt") as readme:
+        assert readme.read() == "parent\n"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_layer_add_serves_the_layer_and_layer_remove_takes_it_off(
+    new_lore_repo, background_lore_service
+):
+    """A layer added is listed and read through the mount from the layer's repository with none
+    of its files a local change in SWFS, and after `layer remove` its files are gone."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    layer_repo = new_lore_repo(
+        original_repo.name + "_layer",
+        environment_vars=LORE_SERVICE_ENVIRONMENT.copy(),
+    )
+    original_repo.write_commit_push("main", {"main.txt": "main contents"})
+    layer_repo.write_commit_push(
+        "layer", {"lay/layer.txt": "layer contents", "lay/sub/deep.txt": "deep"}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+
+    swfs_repo.layer_add("lay", layer_repo, "lay/")
+
+    assert sorted(os.listdir(os.path.join(swfs_repo.path, "lay"))) == [
+        "layer.txt",
+        "sub",
+    ]
+    with swfs_repo.open_file("lay/layer.txt") as layer_file:
+        assert layer_file.read() == "layer contents"
+    assert _frozen_files(swfs_repo.status(scan=True, level="debug")) == [0]
+
+    swfs_repo.layer_remove("lay", layer_repo)
+
+    assert not os.path.exists(os.path.join(swfs_repo.path, "lay", "layer.txt"))
+    assert not os.path.exists(os.path.join(swfs_repo.path, "lay", "sub", "deep.txt"))
+    with swfs_repo.open_file("main.txt") as main_file:
+        assert main_file.read() == "main contents"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_link_repin_keeps_the_users_changes_below_the_link(
+    new_lore_repo, background_lore_service
+):
+    """A repin described by the link's mount path refreshes what the new pin changed and keeps
+    the user's edit and the user's own file below the link (REQ-F-5, M7, M10)."""
+    swfs_repo, linked_repo = _swfs_instance_with_a_committed_link(new_lore_repo)
+    swfs_repo.write_files({"lib/linked.txt": "edited\n", "lib/user.txt": "mine\n"})
+    linked_repo.write_commit_push("two", {"other.txt": "other two\n"})
+
+    swfs_repo.link_update("lib")
+
+    def read(path):
+        with swfs_repo.open_file(path) as file:
+            return file.read()
+
+    assert read("lib/other.txt") == "other two\n"
+    assert read("lib/linked.txt") == "edited\n"
+    assert read("lib/user.txt") == "mine\n"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_repin_over_many_files_describes_only_the_link_path(
+    new_lore_repo, background_lore_service
+):
+    """A repin is described to SWFS by the link's mount path, one entry however many files the
+    new pin changes, rather than one per file (REQ-NF-5)."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    linked_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("parent", {"README.txt": "parent\n"})
+    many = 20
+    linked_repo.write_commit_push(
+        "one", {f"d/f{i}.txt": f"one {i}\n" for i in range(many)}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.link_add("lib", linked_repo.get_id(), "/")
+    swfs_repo.commit(message="add the link")
+    linked_repo.write_commit_push(
+        "two", {f"d/f{i}.txt": f"two {i}\n" for i in range(many)}
+    )
+
+    updated = swfs_repo.link_update("lib", level="debug")
+
+    assert _described(updated) == [1]
+    for i in (0, many - 1):
+        with swfs_repo.open_file(f"lib/d/f{i}.txt") as file:
+            assert file.read() == f"two {i}\n"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_forced_link_remove_leaves_none_of_the_users_files(
+    new_lore_repo, background_lore_service
+):
+    """`link remove --force` over a user edit and a user file leaves nothing at the link's path,
+    as a plain working tree's removal does (REQ-F-6)."""
+    swfs_repo, _linked_repo = _swfs_instance_with_a_committed_link(new_lore_repo)
+    swfs_repo.write_files({"lib/linked.txt": "edited\n", "lib/user.txt": "mine\n"})
+
+    swfs_repo.link_remove("lib", force=True)
+
+    assert not os.path.exists(os.path.join(swfs_repo.path, "lib"))
+    assert sorted(os.listdir(swfs_repo.path)) == ["README.txt"]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+@pytest.mark.parametrize("purge", [False, True])
+def test_swfs_layer_remove_keeps_an_untracked_file_unless_purged(
+    new_lore_repo, background_lore_service, purge
+):
+    """`layer remove` takes the layer's files and keeps the user's untracked file, and
+    `layer remove --purge` takes that too (REQ-F-6, M11)."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    layer_repo = new_lore_repo(
+        original_repo.name + "_layer",
+        environment_vars=LORE_SERVICE_ENVIRONMENT.copy(),
+    )
+    original_repo.write_commit_push("main", {"main.txt": "main contents"})
+    layer_repo.write_commit_push("layer", {"lay/layer.txt": "layer contents"})
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.layer_add("lay", layer_repo, "lay/")
+    swfs_repo.write_files({"lay/untracked.txt": "mine"})
+
+    swfs_repo.layer_remove("lay", layer_repo, purge=purge)
+
+    assert not os.path.exists(os.path.join(swfs_repo.path, "lay", "layer.txt"))
+    assert os.path.exists(os.path.join(swfs_repo.path, "lay", "untracked.txt")) == (
+        not purge
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_scan_with_a_link_is_answered_from_the_record(
+    new_lore_repo, background_lore_service
+):
+    """A scan of an instance holding a link over many directories is answered from the
+    modified-file record, as it is with no link: a change outside the link reads nothing of the
+    link's tree, which a walk reads directory by directory through the view, and a change inside
+    it is found (REQ-F-9)."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    linked_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("parent", {"README.txt": "parent\n"})
+    many = 30
+    linked_repo.write_commit_push(
+        "linked", {f"d{i}/f{i}.txt": f"linked {i}\n" for i in range(many)}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.link_add("lib", linked_repo.get_id(), "/")
+    swfs_repo.commit(message="add the link")
+
+    swfs_repo.write_files({"README.txt": "edited\n"})
+    scanned = swfs_repo.status(scan=True, level="debug")
+
+    answered, fell_back = _answered(scanned)
+    assert fell_back == 0, scanned
+    assert answered < many // 3, (
+        f"the scan read {answered} paths, as a walk of the link's {many} directories does"
+    )
+    assert [entry["path"] for entry in unstaged_entries(swfs_repo)] == ["README.txt"]
+
+    swfs_repo.write_files({"lib/d0/f0.txt": "edited\n"})
+    assert [entry["path"] for entry in unstaged_entries(swfs_repo)] == [
+        "README.txt",
+        "lib/d0/f0.txt",
+    ]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_restarted_service_serves_the_links_and_layers_it_did(
+    new_lore_repo, lore_service_runner
+):
+    """A service restarted over an instance with a link and a layer serves both as before, and
+    the first scan after the restart reports nothing, answered by the record's rebuild rather
+    than by reads through the mount (REQ-F-8)."""
+    lore_service_runner.start()
+    env = LORE_SERVICE_ENVIRONMENT.copy()
+    original_repo = new_lore_repo(environment_vars=env)
+    linked_repo = new_lore_repo(environment_vars=env)
+    layer_repo = new_lore_repo(original_repo.name + "_layer", environment_vars=env)
+    original_repo.write_commit_push("parent", {"README.txt": "parent\n"})
+    linked_repo.write_commit_push("linked", {"linked.txt": "linked content\n"})
+    layer_repo.write_commit_push("layer", {"lay/layer.txt": "layer content\n"})
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.link_add("lib", linked_repo.get_id(), "/")
+    swfs_repo.commit(message="add the link")
+    swfs_repo.layer_add("lay", layer_repo, "lay/")
+
+    lore_service_runner.terminate()
+    lore_service_runner.start()
+
+    assert sorted(os.listdir(os.path.join(swfs_repo.path, "lib"))) == ["linked.txt"]
+    assert sorted(os.listdir(os.path.join(swfs_repo.path, "lay"))) == ["layer.txt"]
+    with swfs_repo.open_file("lib/linked.txt") as linked_file:
+        assert linked_file.read() == "linked content\n"
+    with swfs_repo.open_file("lay/layer.txt") as layer_file:
+        assert layer_file.read() == "layer content\n"
+    scanned = swfs_repo.status(scan=True, level="debug")
+    _, fell_back = _answered(scanned)
+    assert fell_back == 0, scanned
+    assert unstaged_entries(swfs_repo) == []
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")

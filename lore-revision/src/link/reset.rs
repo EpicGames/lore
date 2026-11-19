@@ -42,9 +42,6 @@ pub(crate) async fn reset_staged_add_link(
         path: link_path,
         node: link_node_id,
     } = at;
-    let absolute_path = link_path
-        .to_absolute_path(repository.require_path()?)
-        .forward::<LinkError>("placing the link below the root")?;
     let dry_run = execution_context().globals().dry_run();
 
     // If the link replaced a committed directory, `link::add` staged that
@@ -68,10 +65,10 @@ pub(crate) async fn reset_staged_add_link(
         // disk and clear the staged-delete on its node so it returns to its
         // clean committed state.
         if !dry_run {
-            lore_io::IoDriver::global()
-                .create_dir_all(absolute_path.as_path())
+            operation
+                .create_dir_all(&link_path)
                 .await
-                .internal("recreating the placeholder directory")?;
+                .forward::<LinkError>("recreating the placeholder directory")?;
         }
 
         let block = state_staged
@@ -87,20 +84,17 @@ pub(crate) async fn reset_staged_add_link(
         return Ok(());
     }
 
-    let mut current_buf = link_path.into_buf();
-    loop {
-        current_buf.pop();
-        if current_buf.as_str().is_empty() {
+    // The directories leading to the link that are left empty go with it.
+    let mut parent = link_path.parent_path();
+    while !parent.is_empty() {
+        let empty = match operation.read_directory(&parent).await {
+            Ok(mut listing) => listing.next().await.is_none(),
+            Err(_) => false,
+        };
+        if !empty || operation.remove(&parent).await.is_err() {
             break;
         }
-        let parent_abs = repository.require_path()?.join(current_buf.as_str());
-        if lore_io::IoDriver::global()
-            .remove_dir(parent_abs.as_path())
-            .await
-            .is_err()
-        {
-            break;
-        }
+        parent = parent.parent_path();
     }
 
     Ok(())

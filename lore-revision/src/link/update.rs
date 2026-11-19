@@ -10,6 +10,7 @@ use crate::errors::InvalidPath;
 use crate::errors::NotALink;
 use crate::event;
 use crate::filter::FilterMode;
+use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreFileAction;
 use crate::link;
 use crate::link::LoreLinkChangeEventData;
@@ -173,23 +174,35 @@ pub(crate) async fn update(
         .await
         .forward::<LinkError>("Failed to update link")?;
 
-    // Filesystem realize uses the full mount path.
-    link::realize_resolved_link_pin(repository.clone(), link.clone(), &pin).await?;
+    // The staged state is stored before the operation that realizes the new pin finalizes: an
+    // SWFS instance serves the link from what is stored then (ADR-00042).
+    with_operation::<_, LinkError, _>(repository.file_system(), async |operation| {
+        // Filesystem realize uses the full mount path.
+        link::realize_resolved_link_pin_in_operation(
+            &operation,
+            repository.clone(),
+            link.clone(),
+            &pin,
+            false,
+        )
+        .await?;
 
-    // Fold nested link revisions up into the top-level state (no-op if flat).
-    link::propagate_link_chain(&chain, token).await?;
+        // Fold nested link revisions up into the top-level state (no-op if flat).
+        link::propagate_link_chain(&chain, token).await?;
 
-    state_staged.reparent_onto(state_current.revision());
+        state_staged.reparent_onto(state_current.revision());
 
-    // Serialize the staged state
-    let signature = state_staged
-        .serialize(repository.clone(), token)
-        .await
-        .forward::<LinkError>("Failed to serialize state")?;
+        // Serialize the staged state
+        let signature = state_staged
+            .serialize(repository.clone(), token)
+            .await
+            .forward::<LinkError>("Failed to serialize state")?;
 
-    crate::instance::store_staged_anchor(&repository, signature)
-        .await
-        .forward::<LinkError>("Failed to serialize anchor")?;
+        crate::instance::store_staged_anchor(&repository, signature)
+            .await
+            .forward::<LinkError>("Failed to serialize anchor")
+    })
+    .await?;
 
     event::LoreEvent::LinkChange(LoreLinkChangeEventData::new(
         link_path.as_str(),

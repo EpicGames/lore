@@ -343,78 +343,79 @@ pub async fn add(
     let mut remainder_parent = remainder_path.clone();
     remainder_parent.pop();
 
-    with_operation(repository.file_system(), async |operation| {
+    // One operation covers the mount point, the staging, the clone, and storing the staged state:
+    // an SWFS instance serves the link from what is stored when the operation finalizes, so the
+    // link has to be stored by then, or its files are written onto the mount as local changes
+    // (ADR-00042).
+    with_operation::<_, LinkError, _>(repository.file_system(), async |operation| {
         create_link_mount(
             &operation,
             chain.innermost.clone(),
             remainder_parent,
             &clone_path,
         )
-        .await
-    })
-    .await?;
+        .await?;
 
-    lore_debug!("Staging link node");
-    let node = Node {
-        flags: NodeFlags::Link.bits(),
-        child: link_node_link.node,
-        address: Address {
-            hash: link_revision,
-            context: link.id.into(),
-        },
-        ..Default::default()
-    };
-    let link_node = stage::stage_single_node(
-        inner_repository.clone(),
-        inner_state.clone(),
-        remainder_path.clone().freeze(),
-        node,
-        Arc::default(),
-        None, // No link tracking when adding links
-        FilterMode::Full,
-    )
-    .await
-    .forward::<LinkError>("Failed staging the link node")?;
-
-    inner_state
-        .link_add(
+        lore_debug!("Staging link node");
+        let node = Node {
+            flags: NodeFlags::Link.bits(),
+            child: link_node_link.node,
+            address: Address {
+                hash: link_revision,
+                context: link.id.into(),
+            },
+            ..Default::default()
+        };
+        let link_node = stage::stage_single_node(
             inner_repository.clone(),
-            link.id,
-            stored_branch,
-            link_revision,
-            link_node.node,
-            link_flags,
+            inner_state.clone(),
+            remainder_path.clone().freeze(),
+            node,
+            Arc::default(),
+            None, // No link tracking when adding links
+            FilterMode::Full,
         )
         .await
-        .forward::<LinkError>("Failed to add link")?;
+        .forward::<LinkError>("Failed staging the link node")?;
 
-    // Clone the link in the path
-    lore_debug!("Connecting remote storage");
-    let correlation_id = execution_context().globals().correlation_id.to_string();
-    let storage = link_remote
-        .session(link.id, &correlation_id)
-        .await
-        .forward_with::<LinkError, _>(|| {
-            format!("Failed to open a session on linked repository {}", link.id)
-        })?;
+        inner_state
+            .link_add(
+                inner_repository.clone(),
+                link.id,
+                stored_branch,
+                link_revision,
+                link_node.node,
+                link_flags,
+            )
+            .await
+            .forward::<LinkError>("Failed to add link")?;
 
-    lore_debug!("Clone link in {}", link_path);
+        // Clone the link in the path
+        lore_debug!("Connecting remote storage");
+        let correlation_id = execution_context().globals().correlation_id.to_string();
+        let storage = link_remote
+            .session(link.id, &correlation_id)
+            .await
+            .forward_with::<LinkError, _>(|| {
+                format!("Failed to open a session on linked repository {}", link.id)
+            })?;
 
-    event::LoreEvent::RepositoryCloneBegin(LoreRepositoryCloneBeginEventData {
-        repository: link.id,
-        branch: branch_name.into(),
-        revision: link_state.revision(),
-        path: repository.require_path()?.into(),
-    })
-    .send();
+        lore_debug!("Clone link in {}", link_path);
 
-    let stats = Arc::new(CloneStats::default());
-    let clone_states = link.filter.mount_states(&clone_path);
-    with_operation(link.file_system(), async |operation| {
+        event::LoreEvent::RepositoryCloneBegin(LoreRepositoryCloneBeginEventData {
+            repository: link.id,
+            branch: branch_name.into(),
+            revision: link_state.revision(),
+            path: repository.require_path()?.into(),
+        })
+        .send();
+
+        let stats = Arc::new(CloneStats::default());
+        let clone_states = link.filter.mount_states(&clone_path);
         let clone_ctx = CloneContext {
             repository: link.clone(),
             state: link_state,
-            operation,
+            operation: operation.clone(),
             options: Arc::default(),
             stats: stats.clone(),
             modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
@@ -427,31 +428,32 @@ pub async fn add(
             clone_states,
         )
         .await
-        .forward_with::<LinkError, _>(|| format!("Failed cloning linked repository {}", link.id))
+        .forward_with::<LinkError, _>(|| format!("Failed cloning linked repository {}", link.id))?;
+
+        event::LoreEvent::RepositoryCloneEnd(LoreRepositoryCloneEndEventData {
+            branch: branch_name.into(),
+            revision: link_revision,
+            count: LoreRepositoryCloneCountData::new(&stats),
+        })
+        .send();
+
+        // Fold nested link revisions up into the top-level state (no-op if flat).
+        link::propagate_link_chain(&chain, token).await?;
+
+        state_staged.reparent_onto(state_current.revision());
+
+        // Serialize the staged state
+        let signature = state_staged
+            .serialize(repository.clone(), token)
+            .await
+            .forward::<LinkError>("Failed to serialize state")?;
+
+        crate::instance::store_staged_anchor(&repository, signature)
+            .await
+            .forward::<LinkError>("Failed to serialize anchor")?;
+        Ok(())
     })
     .await?;
-
-    event::LoreEvent::RepositoryCloneEnd(LoreRepositoryCloneEndEventData {
-        branch: branch_name.into(),
-        revision: link_revision,
-        count: LoreRepositoryCloneCountData::new(&stats),
-    })
-    .send();
-
-    // Fold nested link revisions up into the top-level state (no-op if flat).
-    link::propagate_link_chain(&chain, token).await?;
-
-    state_staged.reparent_onto(state_current.revision());
-
-    // Serialize the staged state
-    let signature = state_staged
-        .serialize(repository.clone(), token)
-        .await
-        .forward::<LinkError>("Failed to serialize state")?;
-
-    crate::instance::store_staged_anchor(&repository, signature)
-        .await
-        .forward::<LinkError>("Failed to serialize anchor")?;
 
     event::LoreEvent::LinkChange(LoreLinkChangeEventData::new(
         link_path.as_str(),

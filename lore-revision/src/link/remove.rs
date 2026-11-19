@@ -102,64 +102,65 @@ pub(crate) async fn remove(
 
     let shown = open_mounted_tree(&inner_repository, &link_node).await;
     // One operation covers the removal: the working tree read to find local changes is the one
-    // the mount is then deleted from.
-    with_operation(repository.file_system(), async |operation| {
+    // the mount is then deleted from, and the staged state is stored before it finalizes, as an
+    // SWFS instance serves links from what is stored then (ADR-00042).
+    with_operation::<_, LinkError, _>(repository.file_system(), async |operation| {
         if !execution_context().globals().force() {
             verify_no_local_changes_under_link(&operation, shown.clone(), &mount).await?;
         }
 
-        remove_link_mount(&operation, &repository, &mount, shown, is_staged_add).await
+        remove_link_mount(&operation, &repository, &mount, shown, is_staged_add).await?;
+
+        if is_staged_add {
+            // Link was added but never committed — discard the node from the staged tree
+            lore_debug!("Link node was staged for add, discarding instead of staging delete");
+            state::node_discard_fused(
+                inner_state.clone(),
+                inner_repository.clone(),
+                node_link.node,
+            )
+            .await
+            .forward::<LinkError>("Failed to discard link node")?;
+        } else {
+            // Link exists in committed state — stage as deleted
+            stage::stage_delete(
+                inner_repository.clone(),
+                inner_state.clone(),
+                link_path.clone(),
+                node_link.node,
+                NodeFlags::NoFlags,
+                Arc::default(),
+                None, // No link tracking when removing links
+            )
+            .await
+            .forward::<LinkError>("Failed to delete link")?;
+        }
+
+        inner_state
+            .link_remove(
+                inner_repository.clone(),
+                link_node.address.context.into(),
+                node_link.node,
+            )
+            .await
+            .forward::<LinkError>("Failed to remove link")?;
+
+        // Fold nested link revisions up into the top-level state (no-op if flat).
+        crate::link::propagate_link_chain(&chain, token).await?;
+
+        state_staged.reparent_onto(state_current.revision());
+
+        // Serialize the staged state
+        let signature = state_staged
+            .serialize(repository.clone(), token)
+            .await
+            .forward::<LinkError>("Failed to serialize state")?;
+
+        crate::instance::store_staged_anchor(&repository, signature)
+            .await
+            .forward::<LinkError>("Failed to serialize anchor")
     })
     .await?;
-
-    if is_staged_add {
-        // Link was added but never committed — discard the node from the staged tree
-        lore_debug!("Link node was staged for add, discarding instead of staging delete");
-        state::node_discard_fused(
-            inner_state.clone(),
-            inner_repository.clone(),
-            node_link.node,
-        )
-        .await
-        .forward::<LinkError>("Failed to discard link node")?;
-    } else {
-        // Link exists in committed state — stage as deleted
-        stage::stage_delete(
-            inner_repository.clone(),
-            inner_state.clone(),
-            link_path.clone(),
-            node_link.node,
-            NodeFlags::NoFlags,
-            Arc::default(),
-            None, // No link tracking when removing links
-        )
-        .await
-        .forward::<LinkError>("Failed to delete link")?;
-    }
-
-    inner_state
-        .link_remove(
-            inner_repository.clone(),
-            link_node.address.context.into(),
-            node_link.node,
-        )
-        .await
-        .forward::<LinkError>("Failed to remove link")?;
-
-    // Fold nested link revisions up into the top-level state (no-op if flat).
-    crate::link::propagate_link_chain(&chain, token).await?;
-
-    state_staged.reparent_onto(state_current.revision());
-
-    // Serialize the staged state
-    let signature = state_staged
-        .serialize(repository.clone(), token)
-        .await
-        .forward::<LinkError>("Failed to serialize state")?;
-
-    crate::instance::store_staged_anchor(&repository, signature)
-        .await
-        .forward::<LinkError>("Failed to serialize anchor")?;
 
     event::LoreEvent::LinkChange(LoreLinkChangeEventData::new(
         link_path.as_str(),
