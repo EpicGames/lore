@@ -93,6 +93,7 @@ use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::interface::LoreMetadata;
 use lore_revision::interface::LoreNodeType;
 use lore_revision::interface::LoreString;
+use lore_revision::link::LinkFlags;
 use lore_revision::metadata::BRANCH;
 use lore_revision::metadata::Metadata;
 use lore_revision::node::ROOT_NODE;
@@ -103,6 +104,7 @@ use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
 use lore_revision::repository::SALT_LORE;
+use lore_revision::state::State;
 use lore_revision::test_util::register_live_instance;
 use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
@@ -1067,6 +1069,58 @@ pub(crate) async fn commit_from_another_handle(
     revision
 }
 
+/// Commits a revision on `branch` of `f`'s repository in the local store of `f`'s storage handle
+/// alone, on top of `parent`, whose metadata it takes, with an empty tree and a link to
+/// `linked_revision` of `linked_repository`, the link the revision tree API can't make. Moves the
+/// branch's local latest from `parent` to it, divergent, and returns its hash.
+pub(crate) async fn commit_with_link(
+    f: &Fixture,
+    branch: BranchId,
+    parent: Hash,
+    linked_repository: RepositoryId,
+    linked_revision: Hash,
+) -> Hash {
+    let context = local_writer(f);
+    in_client(async {
+        let parent_state = State::deserialize(context.clone(), parent)
+            .await
+            .expect("reads the parent");
+        let state = State::new();
+        state.set_parent_self(parent);
+        state.set_revision_number(parent_state.revision_number() + 1);
+        state.set_metadata_hash(parent_state.metadata_hash());
+        state
+            .link_add(
+                context.clone(),
+                linked_repository,
+                BranchId::default(),
+                linked_revision,
+                ROOT_NODE,
+                LinkFlags::NoFlags,
+            )
+            .await
+            .expect("links the revision");
+        let token = context
+            .try_write_token()
+            .expect("a write context carries a write token");
+        let revision = state
+            .serialize(context.clone(), token)
+            .await
+            .expect("writes the revision");
+        branch::store_latest(
+            context.clone(),
+            branch,
+            parent,
+            revision,
+            BranchLatestStatus::Divergent,
+        )
+        .await
+        .expect("moves the local latest");
+        revision
+    })
+    .await
+}
+
 /// Commits a revision with [`commit_from_another_handle`], publishes it, and returns its hash.
 pub(crate) async fn publish_from_another_handle(
     f: &Fixture,
@@ -1098,6 +1152,22 @@ pub(crate) async fn archive_locally(f: &Fixture, branch: BranchId) {
 /// the branch.
 pub(crate) async fn server_latest(f: &Fixture, branch: BranchId) -> Hash {
     server_record(f, branch).await.latest
+}
+
+/// Whether the server's immutable store holds the revision `revision` of `repository`.
+pub(crate) async fn server_holds_revision(
+    f: &Fixture,
+    repository: Partition,
+    revision: Hash,
+) -> bool {
+    let held = in_client(query_one(
+        &f.server_immutable,
+        repository,
+        Address::zero_context_hash(revision),
+    ))
+    .await
+    .expect("the server's store answers");
+    held.match_made != StoreMatch::MatchNone
 }
 
 /// The record of `branch` the server answers a branch query with. Panics unless the server holds

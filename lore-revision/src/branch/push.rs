@@ -12,6 +12,7 @@ use futures::FutureExt;
 use futures::StreamExt;
 use futures::stream;
 use futures::stream::FuturesUnordered;
+use lore_base::error::RevisionNotFound;
 use lore_base::lore_spawn;
 use lore_base::types::BranchMetadata;
 use lore_error_set::prelude::*;
@@ -38,6 +39,7 @@ use crate::fragment;
 use crate::history;
 use crate::immutable;
 use crate::interface::LoreError;
+use crate::interface::LoreGlobalArgs;
 use crate::interface::LoreString;
 use crate::layer;
 use crate::lore::Address;
@@ -333,6 +335,107 @@ pub struct PushOptions {
     pub fast_forward_merge: bool,
 }
 
+/// What a push does where the call, not the globals, decides: whether it forces its offers,
+/// whether it is a dry run, whether the remote may merge onto a remote latest that has moved, what
+/// it does with the repositories the branch mounts, and how it writes the local latest.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PushRun {
+    /// Offer each revision even where the remote latest has moved, without refusing a diverged
+    /// branch first, and offer a local latest the remote latest has moved past.
+    pub force: bool,
+    /// Ask the remote what it holds, and write and offer nothing.
+    pub dry_run: bool,
+    /// Let the remote merge onto a remote latest that has moved, where the merge has no conflicts.
+    pub fast_forward_merge: bool,
+    /// What the push does with the repositories the branch mounts.
+    pub mounts: MountPolicy,
+    /// With `Some(expected)`, the closing write of the branch's local latest writes the last
+    /// revision the remote accepted, a fast-forward merge's included, with a compare-and-swap from
+    /// `expected`, and leaves a local latest another writer moved meanwhile in place. With `None`,
+    /// it writes over the local latest it reads just before, and leaves the local latest to the
+    /// next sync after a fast-forward merge.
+    pub expected_local_latest: Option<Hash>,
+}
+
+/// What a push does with the repositories the branch it pushes mounts: its layers, and the
+/// repositories its revisions link.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum MountPolicy {
+    /// Push each layer, and each branch of a linked repository a revision of the push links, as
+    /// a target of its own.
+    #[default]
+    Push,
+    /// Push the branch alone. Layers are left out, and not checked. Each revision of another
+    /// repository that a revision of the push links must be on the remote already: it is checked
+    /// there before anything is pushed, and not pushed.
+    RequireOnRemote,
+}
+
+/// What a push read of the remote and published for the branch it pushes, as far as it got. It
+/// covers the pushing repository's branch alone, never a layer or a linked repository.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PushReport {
+    /// Whether the push planned the branch against the remote's view of it, the remote's answer
+    /// that it holds no such branch included. A plan that fails leaves the report empty.
+    pub remote_read: bool,
+    /// The remote latest of the branch, as the push last knew it: the revision it read, the branch
+    /// point it created the branch at, or the last revision the remote accepted.
+    pub remote_latest: Hash,
+    /// Whether the remote held no record of the branch when the push read it.
+    pub remote_absent_before: bool,
+    /// Whether the remote held the branch archived when the push read it.
+    pub remote_deleted_before: bool,
+    /// The revision the push builds on, once the push knows it: where the local history leaves
+    /// the remote's history line for the branch, which is the remote latest where the local
+    /// history holds it, or the branch point a branch the remote doesn't hold starts from; then the
+    /// last revision the remote accepted.
+    pub base: Option<Hash>,
+    /// The last revision the remote accepted, zero where it accepted none.
+    pub published: Hash,
+    /// The revision number of `published` on the remote.
+    pub revision_number: u64,
+    /// Whether the remote published `published` as a fast-forward merge.
+    pub fast_forward_merged: bool,
+    /// The local latest the closing write left, zero where the push made none: the revision it
+    /// wrote, or the one another writer moved the local latest to meanwhile
+    /// ([`PushRun::expected_local_latest`]).
+    pub local_latest: Hash,
+}
+
+impl PushReport {
+    /// Takes the peer's view of the branch that `plan` read.
+    fn planned(&mut self, plan: &TargetPlan) {
+        self.remote_read = true;
+        self.remote_latest = plan.remote_latest;
+        self.remote_absent_before = plan.remote_metadata.is_zero();
+        self.remote_deleted_before = plan.remote_deleted;
+        self.base = Some(plan.base);
+    }
+}
+
+/// Records in `report` that the peer accepted the offer it answered with `response`, which the
+/// push builds on from then on.
+#[lore_macro::test_pub]
+fn record_offer(report: &mut PushReport, response: &BranchPushResponse) {
+    report.published = response.revision;
+    report.revision_number = response.revision_number;
+    report.fast_forward_merged = response.fast_forward_merged;
+    report.base = Some(response.revision);
+    report.remote_latest = response.revision;
+}
+
+/// The run of a file-system push: `force` and `dry_run` from `globals`, and the merge from
+/// `options`.
+fn push_run_from(globals: &LoreGlobalArgs, options: &PushOptions) -> PushRun {
+    PushRun {
+        force: globals.force(),
+        dry_run: globals.dry_run(),
+        fast_forward_merge: options.fast_forward_merge,
+        mounts: MountPolicy::Push,
+        expected_local_latest: None,
+    }
+}
+
 impl EventError for PushError {
     fn translated(&self) -> LoreError {
         match self {
@@ -575,9 +678,93 @@ pub(crate) async fn push(
             .forward::<PushError>("loading current anchor")?;
     }
 
+    let run = push_run_from(execution_context().globals(), &options);
+    let (targets, orders) = collect_targets(repository, branch, local_latest, &run, None).await?;
+    push_targets(&targets, &orders, token, &run, None).await
+}
+
+/// Push `branch` of `repository` at `local_latest` as `run` says, recording in `report` what the
+/// push read of the remote and published. Reports what the push cost when it ends, as the
+/// file-system push does.
+///
+/// It plans and pushes itself, as the file-system push does, rather than through a future both
+/// share: that future would hold `branch` and `local_latest` across the push, in each one's.
+pub async fn push_branch(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    run: &PushRun,
+    branch: BranchId,
+    local_latest: Hash,
+    report: &mut PushReport,
+) -> Result<(), PushError> {
+    let _stats_report = PushStatsReport::start();
     let (targets, orders) =
-        collect_targets(repository, branch, local_latest, options.fast_forward_merge).await?;
-    push_targets(&targets, &orders, token, options.fast_forward_merge).await
+        collect_targets(repository, branch, local_latest, run, Some(report)).await?;
+    if run.mounts == MountPolicy::RequireOnRemote
+        && let Some(root) = targets.first()
+    {
+        check_links_on_remote(root).await?;
+    }
+    push_targets(&targets, &orders, token, run, Some(report)).await
+}
+
+/// Fails the push where the remote lacks a revision of another repository that a revision `target`
+/// pushes links, or refuses the caller that repository, before anything is pushed.
+///
+/// The linked revisions are asked about a linked repository at a time, each repository's once,
+/// through the storage sessions of its context, in queries of the remote's batch size. A revision
+/// links few repositories, so they are asked one after another.
+#[lore_macro::test_pub]
+async fn check_links_on_remote(target: &PushTarget) -> Result<(), PushError> {
+    let mut linked: Vec<(RepositoryId, Hash)> = target
+        .plan
+        .revisions
+        .iter()
+        .flat_map(|pushed| &pushed.links)
+        .filter(|link| !link.signature.is_zero())
+        .map(|link| (link.repository, link.signature))
+        .collect();
+    linked.sort_unstable();
+    linked.dedup();
+    let max_query_batch = target.plan.remote.environment.max_query_batch();
+    for revisions in linked.chunk_by(|left, right| left.0 == right.0) {
+        let repository = revisions[0].0;
+        let link_repository = target.repository.to_link_context(repository).await;
+        let session = immutable::pooled_session(
+            &link_repository,
+            execution_context().globals().correlation_id.as_str(),
+        )
+        .await
+        .forward_with::<PushError, _>(|| {
+            format!("opening a storage session on linked repository {repository}")
+        })?;
+        let addresses = revisions
+            .iter()
+            .map(|&(_, signature)| Address::zero_context_hash(signature))
+            .collect();
+        let queried = push_query(session, addresses, max_query_batch, &PushStats::new(false))
+            .await
+            .forward_with::<PushError, _>(|| {
+                format!("querying linked repository {repository} for the revisions linked")
+            })?;
+        if let Some(missing) = absent_linked_revision(&queried) {
+            return Err(PushError::from(RevisionNotFound {
+                revision: format!("{repository}@{missing}"),
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// A linked revision the remote's answer `queried` says it doesn't hold as one, at the address of a
+/// revision: one it holds nothing for, or holds only under another context.
+#[lore_macro::test_pub]
+fn absent_linked_revision(queried: &PushQueryResult) -> Option<Hash> {
+    queried
+        .absent
+        .first()
+        .or(queried.copyable.first())
+        .map(|address| address.hash)
 }
 
 /// Most targets one push plans or pushes at once. A few at once overlap their round trips, and each
@@ -643,6 +830,8 @@ struct TargetPlan {
     remote_deleted: bool,
     /// The peer's latest revision the history walk reached, if it reached one.
     remote_revision: Option<Hash>,
+    /// The revision the push builds on ([`UnpushedHistory::base`]).
+    base: Hash,
     remote_history: usize,
     local_history: usize,
     /// Whether the peer holds revisions on the branch that the local history does not.
@@ -703,16 +892,20 @@ struct TargetCollection {
 
 /// The targets a push of `branch` of `repository` at `local_latest` reaches, with the order each
 /// pushes in: the repository, each of its layers at its current revision, and each branch a
-/// revision of theirs links, at any depth, at the newest revision linked.
+/// revision of theirs links, at any depth, at the newest revision linked. With
+/// [`MountPolicy::RequireOnRemote`] it reaches the repository's branch alone.
 ///
 /// Targets are planned a level of links at a time, [`MAX_CONCURRENT_TARGETS`] at once. Nothing is
 /// pushed yet, so a push that would fail at a diverged repository or layer, or at a link list it
-/// can't read, fails before it starts.
+/// can't read, fails before it starts. `report` takes the pushing repository's view of the peer
+/// once its target is planned, so a push refused while planning reports it.
+#[lore_macro::test_pub]
 async fn collect_targets(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
     local_latest: Hash,
-    fast_forward_merge: bool,
+    run: &PushRun,
+    report: Option<&mut PushReport>,
 ) -> Result<(Vec<PushTarget>, Vec<TargetOrder>), PushError> {
     let mut requests = vec![TargetRequest {
         repository: repository.clone(),
@@ -721,9 +914,12 @@ async fn collect_targets(
         mount: None,
         pending: vec![],
     }];
-    let layers = layer::list_with_context(repository)
-        .await
-        .unwrap_or_default();
+    let layers = match run.mounts {
+        MountPolicy::Push => layer::list_with_context(repository)
+            .await
+            .unwrap_or_default(),
+        MountPolicy::RequireOnRemote => vec![],
+    };
     for (layer, layer_repository) in layers {
         requests.push(TargetRequest {
             repository: layer_repository,
@@ -744,11 +940,17 @@ async fn collect_targets(
         index,
     };
 
-    plan_requests(&mut collection).await?;
-    refuse_diverged_targets(&mut collection.targets, fast_forward_merge).await?;
+    plan_requests(&mut collection, run.force).await?;
+    if let (Some(report), Some(root)) = (report, collection.targets.first()) {
+        report.planned(&root.plan);
+    }
+    refuse_diverged_targets(&mut collection.targets, run).await?;
+    if run.mounts == MountPolicy::RequireOnRemote {
+        return Ok(order_targets(collection.targets));
+    }
     join_latest_links(&mut collection).await?;
     loop {
-        let placed = place_all_pending(&mut collection.targets).await?;
+        let placed = place_all_pending(&mut collection.targets, run.force).await?;
         let mut scanned = false;
         for target in 0..collection.targets.len() {
             if collection.targets[target].scanned < collection.targets[target].plan.revisions.len()
@@ -760,7 +962,7 @@ async fn collect_targets(
         if collection.requests.is_empty() && !placed && !scanned {
             break;
         }
-        plan_requests(&mut collection).await?;
+        plan_requests(&mut collection, run.force).await?;
     }
 
     Ok(order_targets(collection.targets))
@@ -768,12 +970,12 @@ async fn collect_targets(
 
 /// Plan every requested target, [`MAX_CONCURRENT_TARGETS`] at once, failing with every request that
 /// fails.
-async fn plan_requests(collection: &mut TargetCollection) -> Result<(), PushError> {
+async fn plan_requests(collection: &mut TargetCollection, force: bool) -> Result<(), PushError> {
     let requests = std::mem::take(&mut collection.requests);
     let mut planned: Vec<(usize, Result<TargetPlan, PushError>)> = stream::iter(0..requests.len())
         .map(|position| {
             let request = &requests[position];
-            plan_target(&request.repository, request.branch, request.latest)
+            plan_target(&request.repository, request.branch, request.latest, force)
                 .map(move |plan| (position, plan))
         })
         .buffer_unordered(MAX_CONCURRENT_TARGETS)
@@ -857,7 +1059,7 @@ async fn join_latest_links(collection: &mut TargetCollection) -> Result<(), Push
 
 /// Place the revisions other targets link in each of `targets`, [`MAX_CONCURRENT_TARGETS`] targets at
 /// once, failing with every target that fails. Returns whether any target had revisions to place.
-async fn place_all_pending(targets: &mut [PushTarget]) -> Result<bool, PushError> {
+async fn place_all_pending(targets: &mut [PushTarget], force: bool) -> Result<bool, PushError> {
     let mut placing = FuturesUnordered::new();
     let mut failures = vec![];
     let pending: Vec<(usize, &mut PushTarget)> = targets
@@ -871,7 +1073,7 @@ async fn place_all_pending(targets: &mut [PushTarget]) -> Result<bool, PushError
         while placing.len() < MAX_CONCURRENT_TARGETS
             && let Some((position, target)) = pending.next()
         {
-            placing.push(place_pending(target).map(move |placed| (position, placed)));
+            placing.push(place_pending(target, force).map(move |placed| (position, placed)));
         }
         let Some((position, placed)) = placing.next().await else {
             break;
@@ -904,7 +1106,7 @@ async fn place_all_pending(targets: &mut [PushTarget]) -> Result<bool, PushError
 /// Uploading a line, extending and planning again are boxed: linked revisions are mostly ones the
 /// plan pushes already, and inline those cold paths would set the size of every push.
 #[lore_macro::test_pub]
-async fn place_pending(target: &mut PushTarget) -> Result<(), PushError> {
+async fn place_pending(target: &mut PushTarget, force: bool) -> Result<(), PushError> {
     let pending = std::mem::take(&mut target.pending);
     let repository = target.repository.clone();
     let branch = target.branch;
@@ -937,7 +1139,7 @@ async fn place_pending(target: &mut PushTarget) -> Result<(), PushError> {
             continue;
         }
 
-        let candidate = Box::pin(plan_target(&repository, branch, revision)).await?;
+        let candidate = Box::pin(plan_target(&repository, branch, revision, force)).await?;
         if !candidate.pushes(latest) && target.plan.revisions.iter().any(|known| known.local) {
             return Err(PushError::from(Divergent)).forward_with::<PushError, _>(|| {
                 format!("pushing revisions {latest} and {revision}, which are on diverged lines")
@@ -1223,9 +1425,9 @@ fn order_targets(targets: Vec<PushTarget>) -> (Vec<PushTarget>, Vec<TargetOrder>
 #[lore_macro::test_pub]
 async fn refuse_diverged_targets(
     targets: &mut [PushTarget],
-    fast_forward_merge: bool,
+    run: &PushRun,
 ) -> Result<(), PushError> {
-    if fast_forward_merge || execution_context().globals().force() {
+    if run.fast_forward_merge || run.force {
         return Ok(());
     }
     let mut failures = vec![];
@@ -1280,10 +1482,12 @@ async fn push_targets(
     targets: &[PushTarget],
     orders: &[TargetOrder],
     token: &RepositoryWriteToken,
-    fast_forward_merge: bool,
+    run: &PushRun,
+    mut report: Option<&mut PushReport>,
 ) -> Result<(), PushError> {
     let mut failures = schedule_targets(orders, |target| {
-        push_target(&targets[target], token, fast_forward_merge)
+        let report = if target == 0 { report.take() } else { None };
+        push_target(&targets[target], token, run, report)
     })
     .await;
     if failures.is_empty() {
@@ -1557,12 +1761,17 @@ struct UnpushedHistory {
     branch_remote: Vec<Hash>,
     /// The peer's latest revision the walk reached, if it reached one.
     remote_revision: Option<Hash>,
+    /// The revision the push builds on: where the local history of the branch leaves the peer's
+    /// history line for it, which is the peer's latest where the local history holds it; the
+    /// parent of a single revision to push; or the branch point of a branch the peer doesn't hold.
+    base: Hash,
     branch_metadata: BranchMetadata,
 }
 
 /// Walk the history of `branch` back from `local_latest`, through the branches it was created
 /// from, until it reaches a revision the peer holds, a parent branch known to be pushed, or the
-/// root of the default branch.
+/// root of the default branch. A read of a parent branch at the peer that fails, other than with
+/// the answer that the peer holds no such branch, fails the walk.
 ///
 /// Its own future: inline, what the walk holds across its awaits would be reserved in every
 /// state of [`plan_target`].
@@ -1585,6 +1794,7 @@ fn collect_unpushed_history(
         let mut full_remote_history = vec![];
         let mut current_branch_remote_history = vec![];
         let mut remote_revision = None;
+        let mut base = Hash::default();
         let mut current_branch = branch;
         let mut current_revision = local_latest;
 
@@ -1594,10 +1804,9 @@ fn collect_unpushed_history(
                     Ok(status) => status.latest,
                     Err(err) if err.is_branch_not_found() => Hash::default(),
                     Err(err) => {
-                        lore_debug!(
-                            "Failed to load remote branch info for {current_branch}, assuming branch does not exist on remote: {err}"
-                        );
-                        Hash::default()
+                        return Err(err).forward_with::<PushError, _>(|| {
+                            format!("loading the remote branch {current_branch}")
+                        });
                     }
                 }
             } else {
@@ -1624,6 +1833,9 @@ fn collect_unpushed_history(
                     return Err(PushError::internal(
                         "Invalid branch data, unknown branch point",
                     ));
+                }
+                if current_branch == branch {
+                    base = branch_point.revision;
                 }
 
                 let branch_point_state =
@@ -1666,19 +1878,21 @@ fn collect_unpushed_history(
             {
                 lore_debug!("Found remote latest or reached initial branch");
 
-                let (_branch_point, remote_history, local_history) = history::find_branch_point(
-                    repository.clone(),
-                    current_remote_latest,
-                    current_revision,
-                )
-                .await
-                .forward::<PushError>("reconciling branch history")?;
+                let (walk_branch_point, remote_history, local_history) =
+                    history::find_branch_point(
+                        repository.clone(),
+                        current_remote_latest,
+                        current_revision,
+                    )
+                    .await
+                    .forward::<PushError>("reconciling branch history")?;
 
                 full_local_history.extend(local_history.clone());
                 full_remote_history.extend(remote_history.clone());
 
                 if current_branch == branch {
                     current_branch_remote_history = remote_history;
+                    base = walk_branch_point;
                 }
 
                 // Either the remote latest was found or there is none
@@ -1694,6 +1908,9 @@ fn collect_unpushed_history(
 
                 full_local_history.push(current_revision);
                 remote_revision = Some(current_remote_latest);
+                if current_branch == branch {
+                    base = current_remote_latest;
+                }
             }
         }
 
@@ -1702,6 +1919,7 @@ fn collect_unpushed_history(
             remote: full_remote_history,
             branch_remote: current_branch_remote_history,
             remote_revision,
+            base,
             branch_metadata,
         })
     }
@@ -1709,11 +1927,15 @@ fn collect_unpushed_history(
 
 /// What pushing `branch` of `repository` at `latest` takes: the peer's view of the branch, and the
 /// revisions the peer is missing, with their links. Reads the peer and the local history, and
-/// changes neither. A branch the peer holds already at `latest` pushes nothing.
+/// changes neither. A branch the peer holds already at `latest` pushes nothing, and with `force`
+/// a `latest` the peer's latest has moved past is pushed. A read of the peer's branch that fails,
+/// other than with the answer that the peer holds no such branch, fails the plan.
+#[lore_macro::test_pub]
 async fn plan_target(
     repository: &Arc<RepositoryContext>,
     branch: BranchId,
     latest: Hash,
+    force: bool,
 ) -> Result<TargetPlan, PushError> {
     let remote = repository
         .remote()
@@ -1728,22 +1950,12 @@ async fn plan_target(
         .forward::<PushError>("loading repository metadata")?
         .default_branch;
 
-    let (remote_latest, remote_metadata, remote_deleted) = match branch::load_remote(
-        remote.clone(),
-        repository.id,
-        branch,
-    )
-    .await
-    {
-        Ok(status) => (status.latest, status.metadata, status.deleted),
-        Err(err) if err.is_branch_not_found() => (Hash::default(), Hash::default(), false),
-        Err(err) => {
-            lore_debug!(
-                "Failed to load remote branch info, assuming branch does not exist on remote: {err}"
-            );
-            (Hash::default(), Hash::default(), false)
-        }
-    };
+    let (remote_latest, remote_metadata, remote_deleted) =
+        match branch::load_remote(remote.clone(), repository.id, branch).await {
+            Ok(status) => (status.latest, status.metadata, status.deleted),
+            Err(err) if err.is_branch_not_found() => (Hash::default(), Hash::default(), false),
+            Err(err) => return Err(err).forward::<PushError>("loading the remote branch"),
+        };
 
     let state = State::deserialize(repository.clone(), latest)
         .await
@@ -1753,6 +1965,7 @@ async fn plan_target(
         remote: remote_history,
         branch_remote,
         remote_revision,
+        base,
         branch_metadata,
     } = collect_unpushed_history(
         repository,
@@ -1783,6 +1996,7 @@ async fn plan_target(
         remote_metadata,
         remote_deleted,
         remote_revision,
+        base,
         remote_history: remote_history.len(),
         local_history: local_history.len(),
         diverged: !branch_remote.is_empty(),
@@ -1795,7 +2009,7 @@ async fn plan_target(
         return Ok(plan);
     }
 
-    if local_history.is_empty() && !latest.is_zero() && execution_context().globals().force() {
+    if local_history.is_empty() && !latest.is_zero() && force {
         local_history.push(latest);
     }
     let (local, merges) = read_history(repository, &local_history).await?;
@@ -1871,15 +2085,23 @@ async fn create_branch(
 async fn push_target(
     target: &PushTarget,
     token: &RepositoryWriteToken,
-    fast_forward_merge: bool,
+    run: &PushRun,
+    mut report: Option<&mut PushReport>,
 ) -> Result<(), PushError> {
-    let Some(mut run) = start_target(target).await? else {
+    let Some(mut started) = start_target(target, run.dry_run, report.as_deref_mut()).await? else {
         return Ok(());
     };
     for pushed in &target.plan.revisions {
         if pushed.local {
-            push_local_revision(target, &mut run, pushed.revision, token, fast_forward_merge)
-                .await?;
+            push_local_revision(
+                target,
+                &mut started,
+                pushed.revision,
+                token,
+                run,
+                report.as_deref_mut(),
+            )
+            .await?;
         } else {
             let state = State::deserialize(target.repository.clone(), pushed.revision)
                 .await
@@ -1887,24 +2109,29 @@ async fn push_target(
             upload_revision_fragments(
                 &target.repository,
                 target.branch,
-                &run.storage,
+                &started.storage,
                 target.plan.remote.environment.max_query_batch(),
                 &state,
-                execution_context().globals().dry_run(),
+                run.dry_run,
                 Collection::New,
             )
             .await?;
         }
     }
-    finish_target(target, &run).await
+    finish_target(target, &started, run, report).await
 }
 
 /// Start the push of `target`: announce it, and create its branch on the peer where the peer holds
 /// none, or holds it deleted. Returns what pushing its revisions keeps, or `None` when it has none.
 /// A target recovered from a killed push writes its record where the peer's branch still holds
 /// the recorded revision ([`remote_holds_recorded`]), and fails as diverged where it does not.
+/// `report`, the pushing repository's, takes the branch point a branch the peer creates starts at.
 #[lore_macro::test_pub]
-async fn start_target(target: &PushTarget) -> Result<Option<TargetRun>, PushError> {
+async fn start_target(
+    target: &PushTarget,
+    dry_run: bool,
+    report: Option<&mut PushReport>,
+) -> Result<Option<TargetRun>, PushError> {
     let repository = &target.repository;
     let branch = target.branch;
     let plan = &target.plan;
@@ -1916,7 +2143,6 @@ async fn start_target(target: &PushTarget) -> Result<Option<TargetRun>, PushErro
 
     send_branch_push_event(target);
 
-    let dry_run = execution_context().globals().dry_run();
     if plan.remote_deleted && !dry_run {
         lore_debug!("Branch deleted on server, restoring via branch_create");
         create_branch(revision_protocol.as_ref(), branch, &plan.branch_metadata).await?;
@@ -1973,6 +2199,9 @@ async fn start_target(target: &PushTarget) -> Result<Option<TargetRun>, PushErro
             }
 
             branch::store_last_sync(repository.clone(), branch, plan.branch_point).await;
+            if let Some(report) = report {
+                report.remote_latest = remote_latest;
+            }
         } else {
             remote_latest = plan.branch_point;
         }
@@ -1989,14 +2218,12 @@ async fn start_target(target: &PushTarget) -> Result<Option<TargetRun>, PushErro
         return Ok(None);
     }
 
-    let storage = plan
-        .remote
-        .session(
-            repository.id,
-            execution_context().globals().correlation_id.as_ref(),
-        )
-        .await
-        .forward::<PushError>("opening storage session")?;
+    let storage = immutable::pooled_session(
+        repository,
+        execution_context().globals().correlation_id.as_str(),
+    )
+    .await
+    .forward::<PushError>("opening storage session")?;
 
     Ok(Some(TargetRun {
         revision_protocol,
@@ -2014,16 +2241,16 @@ async fn start_target(target: &PushTarget) -> Result<Option<TargetRun>, PushErro
 /// history does not hold fails as [`Divergent`].
 async fn push_local_revision(
     target: &PushTarget,
-    run: &mut TargetRun,
+    started: &mut TargetRun,
     revision: Hash,
     token: &RepositoryWriteToken,
-    fast_forward_merge: bool,
+    run: &PushRun,
+    report: Option<&mut PushReport>,
 ) -> Result<(), PushError> {
     let repository = &target.repository;
     let branch = target.branch;
     let plan = &target.plan;
-    let force = execution_context().globals().force();
-    let dry_run = execution_context().globals().dry_run();
+    let dry_run = run.dry_run;
     let mut current_revision = revision;
 
     let state = State::deserialize(repository.clone(), current_revision)
@@ -2032,9 +2259,9 @@ async fn push_local_revision(
 
     // A rewrite changes the first parent alone and keeps the revision's tree, which lacks what a
     // merge by the peer brought in.
-    if !run.current_latest.is_zero()
-        && !run.fast_forward_merged
-        && state.parent_self() != run.current_latest
+    if !started.current_latest.is_zero()
+        && !started.fast_forward_merged
+        && state.parent_self() != started.current_latest
     {
         // TODO(mjansson): This only handles the peer renumbering the revision before, implement
         //                 proper automatic rebase if the push resulted in a clean rebase
@@ -2045,12 +2272,12 @@ async fn push_local_revision(
                 branch,
                 revision: state.revision(),
                 old_parent: state.parent_self(),
-                new_parent: run.current_latest,
+                new_parent: started.current_latest,
             },
         )
         .send();
 
-        state.set_parent_self(run.current_latest);
+        state.set_parent_self(started.current_latest);
         current_revision = state
             .serialize(repository.clone(), token)
             .await
@@ -2067,7 +2294,7 @@ async fn push_local_revision(
     upload_revision_fragments(
         repository,
         branch,
-        &run.storage,
+        &started.storage,
         plan.remote.environment.max_query_batch(),
         &state,
         dry_run,
@@ -2084,29 +2311,29 @@ async fn push_local_revision(
     event::LoreEvent::BranchPushRevisionPushBegin(LoreBranchPushRevisionPushBeginEventData {
         repository: repository.id,
         branch,
-        remote_revision: run.remote_latest,
+        remote_revision: started.remote_latest,
         local_revision: current_revision,
     })
     .send();
 
-    let current_remote = run.remote_latest;
+    let current_remote = started.remote_latest;
     let mut response_message = None;
 
-    if !dry_run && run.remote_latest != current_revision {
+    if !dry_run && started.remote_latest != current_revision {
         let response = offer_revision(
-            run.revision_protocol.as_ref(),
+            started.revision_protocol.as_ref(),
             repository.id,
             branch,
             &plan.branch_metadata,
-            run.remote_latest,
+            started.remote_latest,
             current_revision,
-            force,
-            fast_forward_merge,
+            run.force,
+            run.fast_forward_merge,
             || {
                 Box::pin(upload_revision_fragments(
                     repository,
                     branch,
-                    &run.storage,
+                    &started.storage,
                     plan.remote.environment.max_query_batch(),
                     &state,
                     false,
@@ -2117,19 +2344,22 @@ async fn push_local_revision(
         .await
         .map_err(|err| refused_offer(err, repository.is_link() && plan.diverged))?;
         if response.fast_forward_merged {
+            if let Some(report) = report {
+                record_offer(report, &response);
+            }
             // The peer merged the revision into its latest. The local latest and the last
             // synchronized revision stay where they are until every revision is pushed
             // (`finish_target`): a later revision the peer refuses stays on the local latest, and
             // the last synchronized revision on its history.
 
-            run.remote_latest = response.revision;
-            run.current_latest = response.revision;
+            started.remote_latest = response.revision;
+            started.current_latest = response.revision;
 
             event::LoreEvent::BranchPushRevisionPushEnd(LoreBranchPushRevisionPushEndEventData {
                 repository: repository.id,
                 branch,
                 old_remote_revision: current_remote,
-                new_remote_revision: run.current_latest,
+                new_remote_revision: started.current_latest,
                 new_remote_revision_number: response.revision_number,
                 message: response.message.unwrap_or_default().into(),
                 fast_forward_merged: 1,
@@ -2137,11 +2367,11 @@ async fn push_local_revision(
             .send();
 
             // The working directory still holds the merged revision; `lore sync` updates it.
-            run.fast_forward_merged = true;
+            started.fast_forward_merged = true;
             return Ok(());
         }
         if response.revision_number == 0 {
-            if fast_forward_merge {
+            if run.fast_forward_merge {
                 return Err(PushError::internal(
                     "Fast-forward merge failed due to conflicts, sync and merge locally to resolve",
                 ));
@@ -2163,15 +2393,18 @@ async fn push_local_revision(
             )
             .send();
         }
+        if let Some(report) = report {
+            record_offer(report, &response);
+        }
         response_message = response.message;
 
-        run.remote_latest = response.revision;
-        run.current_latest = response.revision;
+        started.remote_latest = response.revision;
+        started.current_latest = response.revision;
     } else {
-        run.current_latest = current_revision;
+        started.current_latest = current_revision;
     }
 
-    let current_number = State::deserialize(repository.clone(), run.current_latest)
+    let current_number = State::deserialize(repository.clone(), started.current_latest)
         .await
         .forward::<PushError>("deserializing current latest state")?
         .revision_number();
@@ -2180,7 +2413,7 @@ async fn push_local_revision(
         repository: repository.id,
         branch,
         old_remote_revision: current_remote,
-        new_remote_revision: run.current_latest,
+        new_remote_revision: started.current_latest,
         new_remote_revision_number: current_number,
         message: response_message.unwrap_or_default().into(),
         fast_forward_merged: 0,
@@ -2188,48 +2421,103 @@ async fn push_local_revision(
     .send();
 
     if !dry_run {
-        branch::store_last_sync(repository.clone(), branch, run.current_latest).await;
+        branch::store_last_sync(repository.clone(), branch, started.current_latest).await;
     }
     Ok(())
 }
 
-/// Record the last revision the peer accepted for `target` as its branch's local latest revision.
-/// Only the pushing repository keeps one. One the peer merged is recorded divergent: the working
-/// tree holds the revision pushed, and the next sync carries it to the merge.
-async fn finish_target(target: &PushTarget, run: &TargetRun) -> Result<(), PushError> {
-    let repository = &target.repository;
-    lore_debug!(
-        "All revisions pushed, updating current local latest to {}",
-        run.current_latest
-    );
-    if run.current_latest.is_zero() || execution_context().globals().dry_run() {
-        return Ok(());
+/// Record the last revision the peer accepted for `target` as its branch's local latest revision,
+/// and, after a fast-forward merge, as its last synchronized revision. Only the pushing repository
+/// keeps a local latest.
+///
+/// With [`PushRun::expected_local_latest`] the revision is written over that local latest,
+/// convergent, after a fast-forward merge too. A local latest another writer moved from it
+/// meanwhile stays in place ([`local_latest_left`]), and `report` takes the local latest left.
+/// Without it, the revision is written over the local latest read just before, and one the peer
+/// merged is recorded divergent: the working tree holds the revision pushed, and the next sync
+/// carries it to the merge.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
+#[allow(clippy::manual_async_fn)]
+fn finish_target<'a>(
+    target: &'a PushTarget,
+    started: &'a TargetRun,
+    run: &'a PushRun,
+    report: Option<&'a mut PushReport>,
+) -> impl Future<Output = Result<(), PushError>> + 'a {
+    async move {
+        lore_debug!(
+            "All revisions pushed, updating current local latest to {}",
+            started.current_latest
+        );
+        if started.current_latest.is_zero() || run.dry_run {
+            return Ok(());
+        }
+        if started.fast_forward_merged {
+            branch::store_last_sync(
+                target.repository.clone(),
+                target.branch,
+                started.current_latest,
+            )
+            .await;
+        }
+        if !records_branch_latest(&target.repository) {
+            return Ok(());
+        }
+        let previous = match run.expected_local_latest {
+            Some(expected) => expected,
+            None => branch::load_latest(target.repository.clone(), target.branch)
+                .await
+                .unwrap_or_default(),
+        };
+        let stored = if started.fast_forward_merged && run.expected_local_latest.is_none() {
+            branch::store_latest(
+                target.repository.clone(),
+                target.branch,
+                previous,
+                started.current_latest,
+                BranchLatestStatus::Divergent,
+            )
+            .await
+        } else {
+            branch::store_synced_latest(
+                &target.repository,
+                target.branch,
+                previous,
+                started.current_latest,
+            )
+            .await
+        };
+        let left = match stored {
+            Ok(()) => started.current_latest,
+            Err(err) if run.expected_local_latest.is_some() && err.is_branch_advanced() => {
+                Box::pin(local_latest_left(&target.repository, target.branch)).await?
+            }
+            Err(err) => {
+                return Err(err).forward::<PushError>("setting new latest revision for branch");
+            }
+        };
+        if let Some(report) = report {
+            report.local_latest = left;
+        }
+        Ok(())
     }
-    if run.fast_forward_merged {
-        branch::store_last_sync(repository.clone(), target.branch, run.current_latest).await;
-    }
-    if !records_branch_latest(repository) {
-        return Ok(());
-    }
+}
 
-    let local_latest = branch::load_latest(repository.clone(), target.branch)
+/// The local latest of `branch` that another writer moved while the push ran, which the push leaves
+/// in place.
+///
+/// Boxed by its caller as the cold path: it runs only where a commit lands during the push.
+async fn local_latest_left(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+) -> Result<Hash, PushError> {
+    lore_debug!("Not recording the pushed revision, the local latest moved on");
+    branch::mutable_value(repository.clone(), branch::LATEST, branch)
         .await
-        .unwrap_or_default();
-    if run.fast_forward_merged {
-        return branch::store_latest(
-            repository.clone(),
-            target.branch,
-            local_latest,
-            run.current_latest,
-            BranchLatestStatus::Divergent,
-        )
-        .await
-        .forward::<PushError>("setting new latest revision for branch");
-    }
-    branch::store_synced_latest(repository, target.branch, local_latest, run.current_latest)
-        .await
-        .forward::<PushError>("setting new latest revision for branch")?;
-    Ok(())
+        .map(Option::unwrap_or_default)
+        .forward::<PushError>("reading the local latest another writer left")
 }
 
 /// What a target that would fail as diverged does instead.

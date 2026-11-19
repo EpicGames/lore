@@ -24,6 +24,9 @@ use lore_base::types::TypedBytes;
 use lore_error_set::prelude::*;
 use lore_revision::branch;
 use lore_revision::branch::merge::MergeIntoOptions;
+use lore_revision::branch::push::MountPolicy;
+use lore_revision::branch::push::PushRun;
+use lore_revision::branch::push::collect_targets;
 use lore_revision::commit;
 use lore_revision::commit::CommitOptions;
 use lore_revision::file::audit::AuditError;
@@ -870,6 +873,59 @@ async fn creating_a_branch_a_layer_refuses_reports_the_refusal() {
         branch::load_name_to_id_local(instance, "feature")
             .await
             .expect("the instance holds the branch");
+    }))
+    .await;
+}
+
+/// A push of the branch alone leaves the instance's layers out: it never reaches the layer's
+/// repository, which a push of its layers connects to as it plans the layer.
+#[tokio::test]
+async fn a_push_of_the_branch_alone_leaves_the_layers_out() {
+    #[derive(Serialize)]
+    struct LayerConfig {
+        layers: Vec<Layer>,
+    }
+
+    Box::pin(with_execution(async {
+        let (instance, _linked, _tempdir, protocol, _remote) = served_committed_instance().await;
+        let (revision, current_branch) =
+            lore_revision::instance::load_current_anchor_boxed(&instance)
+                .await
+                .expect("loading the current anchor");
+        let layer_id = RepositoryId::from([8; 16]);
+        lore_revision::util::config::save(
+            &LayerConfig {
+                layers: vec![Layer {
+                    target_path: "layer".to_string(),
+                    source_path: String::new(),
+                    repository: layer_id,
+                    metadata: None,
+                    current: revision,
+                    staged: Hash::default(),
+                }],
+            },
+            layer::layer_config_path(&instance).expect("layer config path"),
+        )
+        .await
+        .expect("writing the layer set");
+        let planned = |mounts| {
+            let instance = instance.clone();
+            let protocol = protocol.clone();
+            async move {
+                let run = PushRun {
+                    mounts,
+                    ..PushRun::default()
+                };
+                let _planned =
+                    collect_targets(instance, current_branch, revision, &run, None).await;
+                protocol.revision_connects.lock().contains(&layer_id)
+            }
+        };
+
+        let alone = planned(MountPolicy::RequireOnRemote).await;
+        let layered = planned(MountPolicy::Push).await;
+
+        assert_eq!((alone, layered), (false, true));
     }))
     .await;
 }

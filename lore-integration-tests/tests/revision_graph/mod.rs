@@ -10,6 +10,7 @@ mod isolation;
 mod list;
 mod metadata;
 mod perf;
+mod push_core;
 mod read_costs;
 mod resolve;
 mod session_reuse;
