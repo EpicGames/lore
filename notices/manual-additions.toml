@@ -24,10 +24,9 @@
 
 [[entry]]
 name = "rpmalloc"
-version = "1.4.5"
-# rpmalloc is dedicated to the public domain by its author; its LICENSE file is
-# verbatim 0BSD (the public-domain-equivalent grant).
-spdx = "0BSD"
+version = "2.1.0"
+# rpmalloc is offered under Unlicense OR MIT; the vendored LICENSE is its MIT text.
+spdx = "MIT"
 license = "lore-base/native/thirdparty/rpmalloc/LICENSE"
 binaries = "all"
 

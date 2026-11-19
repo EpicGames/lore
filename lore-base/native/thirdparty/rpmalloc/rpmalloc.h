@@ -19,10 +19,10 @@
 //! rpmalloc version. RPMALLOC_VERSION is a human-readable string and may carry a pre-release
 //  suffix such as "-rc1". RPMALLOC_VERSION_NUMBER is a monotonic integer for comparisons,
 //  computed as major*10000 + minor*100 + patch (pre-release suffixes are not encoded).
-#define RPMALLOC_VERSION "2.0.1"
+#define RPMALLOC_VERSION "2.1.0"
 #define RPMALLOC_VERSION_MAJOR 2
-#define RPMALLOC_VERSION_MINOR 0
-#define RPMALLOC_VERSION_PATCH 1
+#define RPMALLOC_VERSION_MINOR 1
+#define RPMALLOC_VERSION_PATCH 0
 #define RPMALLOC_VERSION_NUMBER \
 	(RPMALLOC_VERSION_MAJOR * 10000 + RPMALLOC_VERSION_MINOR * 100 + RPMALLOC_VERSION_PATCH)
 
@@ -38,7 +38,9 @@ extern "C" {
 #define RPMALLOC_RESTRICT __restrict
 #define RPMALLOC_ALLOCATOR
 #define RPMALLOC_CACHE_ALIGNED __attribute__((aligned(RPMALLOC_CACHE_LINE_SIZE)))
-#if (defined(__clang_major__) && (__clang_major__ < 4)) || (!defined(__clang_major__) && defined(__GNUC__))
+// GCC has supported __malloc__ and alloc_size since 4.3, older compilers get no attributes
+#if (defined(__clang_major__) && (__clang_major__ < 4)) || \
+    (!defined(__clang_major__) && defined(__GNUC__) && ((__GNUC__ < 4) || ((__GNUC__ == 4) && (__GNUC_MINOR__ < 3))))
 #define RPMALLOC_ATTRIB_MALLOC
 #define RPMALLOC_ATTRIB_ALLOC_SIZE(size)
 #define RPMALLOC_ATTRIB_ALLOC_SIZE2(count, size)
@@ -140,15 +142,21 @@ typedef struct rpmalloc_interface_t {
 	//! Map memory pages for the given number of bytes. The returned address MUST be aligned to the given alignment,
 	//! which will always be either 0 or the span size. The function can store an alignment offset in the offset
 	//! variable in case it performs alignment and the returned pointer is offset from the actual start of the memory
-	//! region due to this alignment. This alignment offset will be passed to the memory unmap function. The mapped size
-	//! can be stored in the mapped_size variable, which will also be passed to the memory unmap function as the release
-	//! parameter once the entire mapped region is ready to be released. If you set a memory_map function, you must also
+	//! region due to this alignment. This alignment offset will be passed to the memory unmap function. The function
+	//! must store the size of the mapped region in the mapped_size variable: the region starts offset bytes before the
+	//! returned pointer and spans at least offset plus size bytes. The whole region must be usable, as huge block
+	//! mappings are reused and grown in place within it, committing pages with the memory commit function. The mapped
+	//! size will also be passed to the memory unmap function as the release parameter once the entire mapped region is
+	//! ready to be released. The mapped memory must read as zero, as freshly mapped pages do, since the library keeps
+	//! its own structures in it. If you set a memory_map function, you must also
 	//! set a memory_unmap function or else the default implementation will be used for both. This function must be
 	//! thread safe, it can be called by multiple threads simultaneously.
 	void* (*memory_map)(size_t size, size_t alignment, size_t* offset, size_t* mapped_size);
 	//! Commit a range of memory pages. Return non-zero if the operation failed and the address range could not be committed.
 	int (*memory_commit)(void* address, size_t size);
 	//! Decommit a range of memory pages. Return non-zero if the operation failed and the address range could not be decommitted.
+	//! The pages may keep their content, zeroed allocations take recommitted pages as zero only with the default
+	//! implementation.
 	int (*memory_decommit)(void* address, size_t size);
 	//! Unmap the memory pages starting at address and spanning the given number of bytes. If you set a memory_unmap
 	//! function, you must also set a memory_map function or else the default implementation will be used for both. This
@@ -176,13 +184,16 @@ typedef struct rpmalloc_config_t {
 	//  For Windows, see https://docs.microsoft.com/en-us/windows/desktop/memory/large-page-support
 	//  For Linux, see https://www.kernel.org/doc/Documentation/vm/hugetlbpage.txt
 	int enable_huge_pages;
-	//! Enable use of transparent huge pages, advising the kernel to back large memory
-	//  mappings with huge pages without requiring a preallocated huge page pool. Unlike
-	//  enable_huge_pages this does not affect page size or accounting, and unused memory
-	//  ranges can still be decommitted. Ignored if enable_huge_pages is in effect or if
-	//  the platform has no transparent huge page support (currently implemented for
-	//  Linux and Android only). After initialization the config value reflects if
-	//  transparent huge pages are actually used.
+	//! Enable use of transparent huge pages when the system only backs memory mappings
+	//  advised to be by huge pages (transparent huge page mode "madvise"), without
+	//  requiring a preallocated huge page pool. Unlike enable_huge_pages this does not
+	//  affect page size or accounting, and unused memory ranges can still be decommitted.
+	//  When the system backs every mapping by huge pages (mode "always") they are used
+	//  regardless, and the allocator advises the mappings where huge pages would keep
+	//  partially used memory resident not to be backed by them. Use disable_thp to opt
+	//  out. Ignored if enable_huge_pages is in effect or if the platform has no
+	//  transparent huge page support (currently implemented for Linux and Android only).
+	//  After initialization the config value reflects if transparent huge pages are used.
 	int enable_thp;
 	//! Disable decommitting unused pages when allocator determines the memory pressure
 	//  is low and there is enough active pages cached. If set to 1, keep all pages committed.
@@ -200,10 +211,10 @@ typedef struct rpmalloc_config_t {
 	//  running would unmap memory the runtime still uses. Only honored without the override.
 	int unmap_on_finalize;
 #if defined(__linux__) || defined(__ANDROID__)
-	///! Allows to disable the Transparent Huge Page feature on Linux on a process basis,
-	///  rather than enabling/disabling system-wise (done via /sys/kernel/mm/transparent_hugepage/enabled).
-	///  It can possibly improve performance and reduced allocation overhead in some contexts, albeit
-	///  THP is usually enabled by default.
+	///! Disable transparent huge pages for the process on Linux, rather than system wide (done
+	///  via /sys/kernel/mm/transparent_hugepage/enabled), including in mode "always" where the
+	///  allocator otherwise uses and manages them. Huge pages trade memory, as partially used
+	///  huge pages stay resident, and page fault latency for fewer page faults and TLB misses.
 	int disable_thp;
 #endif
 } rpmalloc_config_t;
@@ -256,24 +267,26 @@ rpmalloc_dump_statistics(void* file);
 RPMALLOC_EXPORT RPMALLOC_ALLOCATOR void*
 rpmalloc(size_t size) RPMALLOC_ATTRIB_MALLOC RPMALLOC_ATTRIB_ALLOC_SIZE(1);
 
-//! Allocate a zero initialized memory block of at least the given size
+//! Allocate a memory block of at least the given size with the requested size zero initialized, the bytes beyond it
+//  up to the usable size of the block are not
 RPMALLOC_EXPORT RPMALLOC_ALLOCATOR void*
 rpzalloc(size_t size) RPMALLOC_ATTRIB_MALLOC RPMALLOC_ATTRIB_ALLOC_SIZE(1);
 
-//! Allocate a memory block of at least the given size and zero initialize it
+//! Allocate a memory block of at least num times size bytes with the requested size zero initialized, the bytes
+//  beyond it up to the usable size of the block are not
 RPMALLOC_EXPORT RPMALLOC_ALLOCATOR void*
 rpcalloc(size_t num, size_t size) RPMALLOC_ATTRIB_MALLOC RPMALLOC_ATTRIB_ALLOC_SIZE2(1, 2);
 
 //! Reallocate the given block to at least the given size
 RPMALLOC_EXPORT RPMALLOC_ALLOCATOR void*
-rprealloc(void* ptr, size_t size) RPMALLOC_ATTRIB_MALLOC RPMALLOC_ATTRIB_ALLOC_SIZE(2);
+rprealloc(void* ptr, size_t size) RPMALLOC_ATTRIB_ALLOC_SIZE(2);
 
 //! Reallocate the given block to at least the given size and alignment,
 //  with optional control flags (see RPMALLOC_NO_PRESERVE).
 //  Alignment must be a power of two and a multiple of sizeof(void*),
 //  and should ideally be less than memory page size.
 RPMALLOC_EXPORT RPMALLOC_ALLOCATOR void*
-rpaligned_realloc(void* ptr, size_t alignment, size_t size, size_t oldsize, unsigned int flags) RPMALLOC_ATTRIB_MALLOC
+rpaligned_realloc(void* ptr, size_t alignment, size_t size, size_t oldsize, unsigned int flags)
     RPMALLOC_ATTRIB_ALLOC_SIZE(3);
 
 //! Allocate a memory block of at least the given size and alignment.
@@ -282,13 +295,15 @@ rpaligned_realloc(void* ptr, size_t alignment, size_t size, size_t oldsize, unsi
 RPMALLOC_EXPORT RPMALLOC_ALLOCATOR void*
 rpaligned_alloc(size_t alignment, size_t size) RPMALLOC_ATTRIB_MALLOC RPMALLOC_ATTRIB_ALLOC_SIZE(2);
 
-//! Allocate a memory block of at least the given size and alignment.
+//! Allocate a memory block of at least the given size and alignment with the requested size zero initialized, the
+//  bytes beyond it up to the usable size of the block are not.
 //  Alignment must be a power of two and a multiple of sizeof(void*),
 //  and should ideally be less than memory page size.
 RPMALLOC_EXPORT RPMALLOC_ALLOCATOR void*
 rpaligned_zalloc(size_t alignment, size_t size) RPMALLOC_ATTRIB_MALLOC RPMALLOC_ATTRIB_ALLOC_SIZE(2);
 
-//! Allocate a memory block of at least the given size and alignment, and zero initialize it.
+//! Allocate a memory block of at least num times size bytes and the given alignment with the requested size zero
+//  initialized, the bytes beyond it up to the usable size of the block are not.
 //  Alignment must be a power of two and a multiple of sizeof(void*),
 //  and should ideally be less than memory page size.
 RPMALLOC_EXPORT RPMALLOC_ALLOCATOR void*
@@ -346,21 +361,24 @@ RPMALLOC_EXPORT RPMALLOC_ALLOCATOR void*
 rpmalloc_heap_aligned_alloc(rpmalloc_heap_t* heap, size_t alignment, size_t size) RPMALLOC_ATTRIB_MALLOC
     RPMALLOC_ATTRIB_ALLOC_SIZE(3);
 
-//! Allocate a zero initialized memory block of at least the given size using the given heap. The returned
-//  block will have the requested alignment. Alignment must be a power of two and a multiple of sizeof(void*),
-//  and should ideally be less than memory page size.
+//! Allocate a memory block of at least the given size using the given heap with the requested size zero initialized,
+//  the bytes beyond it up to the usable size of the block are not. The returned block will have the requested
+//  alignment. Alignment must be a power of two and a multiple of sizeof(void*), and should ideally be less than
+//  memory page size.
 RPMALLOC_EXPORT RPMALLOC_ALLOCATOR void*
 rpmalloc_heap_aligned_zalloc(rpmalloc_heap_t* heap, size_t alignment, size_t size) RPMALLOC_ATTRIB_MALLOC
     RPMALLOC_ATTRIB_ALLOC_SIZE(3);
 
-//! Allocate a memory block of at least the given size using the given heap and zero initialize it.
+//! Allocate a memory block of at least num times size bytes using the given heap with the requested size zero
+//  initialized, the bytes beyond it up to the usable size of the block are not.
 RPMALLOC_EXPORT RPMALLOC_ALLOCATOR void*
 rpmalloc_heap_calloc(rpmalloc_heap_t* heap, size_t num, size_t size) RPMALLOC_ATTRIB_MALLOC
     RPMALLOC_ATTRIB_ALLOC_SIZE2(2, 3);
 
-//! Allocate a memory block of at least the given size using the given heap and zero initialize it. The returned
-//  block will have the requested alignment. Alignment must either be zero, or a power of two and a multiple of
-//  sizeof(void*), and should ideally be less than memory page size.
+//! Allocate a memory block of at least num times size bytes using the given heap with the requested size zero
+//  initialized, the bytes beyond it up to the usable size of the block are not. The returned block will have the
+//  requested alignment. Alignment must either be zero, or a power of two and a multiple of sizeof(void*), and
+//  should ideally be less than memory page size.
 RPMALLOC_EXPORT RPMALLOC_ALLOCATOR void*
 rpmalloc_heap_aligned_calloc(rpmalloc_heap_t* heap, size_t alignment, size_t num, size_t size) RPMALLOC_ATTRIB_MALLOC
     RPMALLOC_ATTRIB_ALLOC_SIZE2(3, 4);
@@ -368,7 +386,7 @@ rpmalloc_heap_aligned_calloc(rpmalloc_heap_t* heap, size_t alignment, size_t num
 //! Reallocate the given block to at least the given size. The memory block MUST be allocated
 //  by the same heap given to this function.
 RPMALLOC_EXPORT RPMALLOC_ALLOCATOR void*
-rpmalloc_heap_realloc(rpmalloc_heap_t* heap, void* ptr, size_t size, unsigned int flags) RPMALLOC_ATTRIB_MALLOC
+rpmalloc_heap_realloc(rpmalloc_heap_t* heap, void* ptr, size_t size, unsigned int flags)
     RPMALLOC_ATTRIB_ALLOC_SIZE(3);
 
 //! Reallocate the given block to at least the given size. The memory block MUST be allocated
@@ -377,7 +395,7 @@ rpmalloc_heap_realloc(rpmalloc_heap_t* heap, void* ptr, size_t size, unsigned in
 //  less than memory page size.
 RPMALLOC_EXPORT RPMALLOC_ALLOCATOR void*
 rpmalloc_heap_aligned_realloc(rpmalloc_heap_t* heap, void* ptr, size_t alignment, size_t size,
-                              unsigned int flags) RPMALLOC_ATTRIB_MALLOC RPMALLOC_ATTRIB_ALLOC_SIZE(4);
+                              unsigned int flags) RPMALLOC_ATTRIB_ALLOC_SIZE(4);
 
 //! Free the given memory block from the given heap. The memory block MUST be allocated
 //  by the same heap given to this function.

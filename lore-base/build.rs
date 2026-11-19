@@ -31,17 +31,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cc_builder.flag("/std:c11");
     }
 
-    let rpmalloc_source = native_dir
-        .join("thirdparty")
-        .join("rpmalloc")
-        .join("rpmalloc.c");
-    let rpmalloc_header = native_dir
-        .join("thirdparty")
-        .join("rpmalloc")
-        .join("rpmalloc.h");
-    println!("cargo:rerun-if-changed={}", rpmalloc_source.display());
-    println!("cargo:rerun-if-changed={}", rpmalloc_header.display());
-    cc_builder.clone().file(rpmalloc_source).compile("rpmalloc");
+    let rpmalloc_dir = native_dir.join("thirdparty").join("rpmalloc");
+    println!("cargo:rerun-if-changed={}", rpmalloc_dir.display());
+    cc_builder
+        .clone()
+        .file(rpmalloc_dir.join("rpmalloc.c"))
+        .compile("rpmalloc");
 
     Ok(())
 }

@@ -71,7 +71,7 @@ typedef struct rp_nothrow_t { int __dummy; } rp_nothrow_t;
 static void* rpmalloc_nothrow(size_t size, rp_nothrow_t t) { (void)sizeof(t); return rpmalloc(size); }
 static void* rpaligned_alloc_reverse(size_t size, size_t align) { return rpaligned_alloc(align, size); }
 static void* rpaligned_alloc_reverse_nothrow(size_t size, size_t align, rp_nothrow_t t) { (void)sizeof(t); return rpaligned_alloc(align, size); }
-static void rpfree_size(void* p, size_t size) { (void)sizeof(size); rpfree(p); }
+static ENTRY_ALIGNED void rpfree_size(void* p, size_t size) { (void)sizeof(size); rpfree(p); }
 static void rpfree_aligned(void* p, size_t align) { (void)sizeof(align); rpfree(p); }
 static void rpfree_size_aligned(void* p, size_t size, size_t align) { (void)sizeof(size); (void)sizeof(align); rpfree(p); }
 static void rpfree_nothrow(void* p, rp_nothrow_t t) { (void)sizeof(t); rpfree(p); }
@@ -99,22 +99,15 @@ rppvalloc(size_t size) {
 extern inline void* RPMALLOC_CDECL
 rpreallocarray(void* ptr, size_t count, size_t size) {
 	size_t total;
+	if (size_mul_overflow(count, size, &total)) {
+		errno = ENOMEM;
+		return 0;
+	}
 #if ENABLE_VALIDATE_ARGS
-#ifdef _MSC_VER
-	int err = SizeTMult(count, size, &total);
-	if ((err != S_OK) || (total >= MAX_ALLOC_SIZE)) {
+	if (total >= MAX_ALLOC_SIZE) {
 		errno = EINVAL;
 		return 0;
 	}
-#else
-	int err = __builtin_umull_overflow(count, size, &total);
-	if (err || (total >= MAX_ALLOC_SIZE)) {
-		errno = EINVAL;
-		return 0;
-	}
-#endif
-#else
-	total = count * size;
 #endif
 	return rprealloc(ptr, total);
 }
@@ -124,7 +117,7 @@ rpmalloc_good_size(size_t size) {
 	uint32_t size_class = get_size_class(size);
 	if (size_class < SIZE_CLASS_COUNT)
 		return global_size_class[size_class].block_size;
-	return get_page_aligned_size(size + SPAN_HEADER_SIZE) - SPAN_HEADER_SIZE;
+	return get_page_aligned_size(size + HUGE_HEADER_SIZE) - HUGE_HEADER_SIZE;
 }
 
 extern inline int RPMALLOC_CDECL
@@ -292,7 +285,13 @@ __attribute__ ((section("__DATA, __interpose"))) = {
 
 #if USE_ALIAS
 
+#if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ >= 9)
+// Copy the target attributes (malloc, alloc_size) to the alias, GCC 9+ rejects aliases declared with
+// less restrictive attributes than their target (-Wmissing-attributes)
+#define RPALIAS(fn) __attribute__((alias(#fn), copy(fn), used, visibility("default")));
+#else
 #define RPALIAS(fn) __attribute__((alias(#fn), used, visibility("default")));
+#endif
 
 // Alias the C++ operators using the mangled names (https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling)
 
@@ -411,16 +410,19 @@ DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved);
 
 extern __declspec(dllexport) BOOL WINAPI
 DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
-	(void)sizeof(reserved);
 	(void)sizeof(instance);
-	if (reason == DLL_PROCESS_ATTACH)
+	if (reason == DLL_PROCESS_ATTACH) {
 		rpmalloc_initialize(0);
-	else if (reason == DLL_PROCESS_DETACH)
-		rpmalloc_finalize();
-	else if (reason == DLL_THREAD_ATTACH)
+	} else if (reason == DLL_PROCESS_DETACH) {
+		// The C runtime can allocate later in the unload, and threads are already terminated if reserved is set
+		global_module_detached = 1;
+		if (!reserved)
+			rpmalloc_finalize();
+	} else if (reason == DLL_THREAD_ATTACH) {
 		rpmalloc_thread_initialize();
-	else if (reason == DLL_THREAD_DETACH)
+	} else if (reason == DLL_THREAD_DETACH) {
 		rpmalloc_thread_finalize();
+	}
 	return TRUE;
 }
 
