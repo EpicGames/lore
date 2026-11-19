@@ -16,7 +16,9 @@ use lore_base::types::Hash;
 use lore_revision::MAX_CONCURRENT_TREE_TASKS;
 use lore_revision::change;
 use lore_revision::change::NodeChangeState;
+use lore_revision::filter;
 use lore_revision::filter::Filter;
+use lore_revision::filter::FilterInstance;
 use lore_revision::filter::FilterMode;
 use lore_revision::filter::FilterStates;
 use lore_revision::lore::RepositoryId;
@@ -26,9 +28,11 @@ use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::ChangeStream;
+use lore_revision::state::GraftOracle;
 use lore_revision::state::NodeMapping;
 use lore_revision::state::State;
 use lore_revision::state::diff::*;
+use lore_revision::state::may_warm_differing_blocks;
 use lore_revision::util::path::RelativePath;
 use lore_storage::hash::hash_slice;
 use lore_storage::hash::hash_string;
@@ -828,6 +832,64 @@ async fn a_walk_leaving_link_pins_reports_a_link_only_where_its_mount_changes() 
                 "a walk that descends reports the file the two pins hold differently: \
                  {descended:?}"
             );
+        })
+        .await;
+}
+
+/// A whole-tree diff warms the node blocks its two trees differ in where both sides are of one
+/// repository, the filter of each takes in the whole tree for the walk's mode, and a graft adopts
+/// nothing. A view leaving a path out, on either side, prunes the walk, unless the mode leaves the
+/// view out; a mode taking in the ignore rules a repository loads, which match at any depth, never
+/// covers the whole tree; a side of another repository numbers its nodes apart; a graft whose view
+/// leaves a path out adopts the subtree rather than entering it.
+#[tokio::test]
+async fn a_diff_warms_the_blocks_its_trees_differ_in_only_where_its_walk_reads_them() {
+    let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let full = in_memory::repository(immutable, mutable);
+            let narrowed = full.to_filter_context(stepping());
+            let other = full
+                .to_link_context(Context::from(uuid::Uuid::now_v7()).into())
+                .await;
+            let graft = |view: Arc<Filter>| GraftOracle::new(full.clone(), State::new(), view);
+            let warms = |from: &RepositoryContext, to: &RepositoryContext| {
+                may_warm_differing_blocks(from, to, None, FilterMode::View)
+            };
+
+            assert!(warms(&full, &full));
+            assert!(!warms(&full, &narrowed));
+            assert!(!warms(&narrowed, &full));
+            assert!(may_warm_differing_blocks(
+                &narrowed,
+                &narrowed,
+                None,
+                FilterMode::Ignore
+            ));
+            let loaded = full.to_filter_context(Arc::new(
+                filter::from_instances(FilterInstance::default(), FilterInstance::default())
+                    .expect("the repository filter"),
+            ));
+            assert!(warms(&loaded, &loaded));
+            assert!(!may_warm_differing_blocks(
+                &loaded,
+                &loaded,
+                None,
+                FilterMode::CHANGES
+            ));
+            assert!(!warms(&full, &other));
+            assert!(may_warm_differing_blocks(
+                &full,
+                &full,
+                Some(&graft(Arc::default())),
+                FilterMode::View
+            ));
+            assert!(!may_warm_differing_blocks(
+                &full,
+                &full,
+                Some(&graft(stepping())),
+                FilterMode::View
+            ));
         })
         .await;
 }

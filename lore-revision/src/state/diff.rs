@@ -115,6 +115,13 @@ impl GraftOracle {
         }
     }
 
+    /// Whether the oracle adopts no subtree: its view excludes nothing, and only a subtree the view
+    /// excludes whole is adopted.
+    pub(crate) fn adopts_nothing(&self) -> bool {
+        self.view
+            .view_covers_subtree(FilterStates::ROOT, &RelativePath::new())
+    }
+
     /// True when `path` in the target tree still matches `base`, the base's directory there, and
     /// holds no uncommitted work. A staged `base` matches nothing: its address can predate the
     /// changes staged below it.

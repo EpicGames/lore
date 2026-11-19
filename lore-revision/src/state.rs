@@ -192,6 +192,7 @@ use crate::repository::DOT_LORE;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::repository::is_reserved_node_name;
+use crate::repository::prefetch;
 use crate::revision::RevisionMetadata;
 use crate::stage::stage_delete;
 use crate::store::KeyType;
@@ -3841,6 +3842,24 @@ impl State {
             self.node_block_addresses(&repository, hash_node, block_count),
             self.file_metadata_addresses(&repository, hash_file_metadata, block_count),
         )
+    }
+
+    /// Every node block's address hash, by block index, read once per state: the node block list
+    /// of [`Self::block_address_lists`], without the file-metadata one. For a state changed since
+    /// it was read, the list holds the addresses as last stored: a block changed since keeps its
+    /// stored address, and one added since is zero or past the list's end.
+    #[lore_macro::test_pub]
+    pub(crate) async fn node_block_address_list(
+        &self,
+        repository: Arc<RepositoryContext>,
+    ) -> Result<Bytes, StateError> {
+        let Tree {
+            block_count,
+            hash_node,
+            ..
+        } = self.tree(repository.clone()).await?;
+        self.node_block_addresses(&repository, hash_node, block_count as usize)
+            .await
     }
 
     /// Reads the node block address list `hash_node` names, padded with zero addresses to
@@ -9008,6 +9027,10 @@ async fn scoped_roots(
 /// Answers with what the walk did rather than what it found, for a caller
 /// measuring it; the changes are the `changes` channel's. `diff_collect`
 /// discards it.
+///
+/// A diff of the whole trees fetches the node blocks they differ in ahead of
+/// its walk where the walk reads them (`may_warm_differing_blocks`), and
+/// answers once the fetches in flight when its walk ended have ended.
 #[allow(clippy::too_many_arguments)]
 pub async fn diff(
     repository_from: Arc<RepositoryContext>,
@@ -9052,38 +9075,107 @@ pub async fn diff(
 
         diff::diff_subtree(from, to, path, graft, changes, filter_mode).await
     } else {
-        diff::diff_subtree(
-            NodeChangeState {
-                mapping: NodeMapping {
-                    repository: repository_from,
-                    state: state_from,
-                    path: RelativePath::new(),
-                    node: ROOT_NODE,
-                },
-                observed: None,
-                flags: NodeFlags::NoFlags,
-                address: Address::default(),
-                mode: 0,
-            },
-            NodeChangeState {
-                mapping: NodeMapping {
-                    repository: repository_to,
-                    state: state_to,
-                    path: RelativePath::new(),
-                    node: ROOT_NODE,
-                },
-                observed: None,
-                flags: NodeFlags::NoFlags,
-                address: Address::default(),
-                mode: 0,
-            },
-            RelativePath::new(),
+        diff_whole_trees(
+            repository_from,
+            state_from,
+            repository_to,
+            state_to,
             graft,
             changes,
             filter_mode,
         )
         .await
     }
+}
+
+/// The walk of a whole-tree diff from the two roots, beside the warm-up of the node blocks the
+/// trees differ in where the walk reads them ([`may_warm_differing_blocks`]) and the context can
+/// fetch. The warm-up is started before the walk, so that the blocks deep in the trees are on their
+/// way while the walk still lists the directories above them, rather than each fetched as it is
+/// reached, and is finished once the walk ends.
+///
+/// Not an `async fn`, and the walk's future carries the warm-up, so that [`diff`]'s future holds
+/// the walk's alone: held in its body, the warm-up through the walk and the walk's answer through
+/// the warm-up's end would each take a place of their own in it.
+fn diff_whole_trees<'a>(
+    repository_from: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    repository_to: Arc<RepositoryContext>,
+    state_to: Arc<State>,
+    graft: Option<Arc<GraftOracle>>,
+    changes: &'a ChangeSender,
+    filter_mode: FilterMode,
+) -> impl Future<Output = Result<DiffWalkStats, StateError>> + 'a {
+    let warm_up = (immutable::may_cache(&repository_from)
+        && may_warm_differing_blocks(
+            &repository_from,
+            &repository_to,
+            graft.as_deref(),
+            filter_mode,
+        ))
+    .then(|| {
+        prefetch::DifferingBlocksWarmUp::start(
+            repository_from.clone(),
+            state_from.clone(),
+            state_to.clone(),
+        )
+    });
+    let side = |repository, state| NodeChangeState {
+        mapping: NodeMapping {
+            repository,
+            state,
+            path: RelativePath::new(),
+            node: ROOT_NODE,
+        },
+        observed: None,
+        flags: NodeFlags::NoFlags,
+        address: Address::default(),
+        mode: 0,
+    };
+    futures::FutureExt::then(
+        diff::diff_subtree(
+            side(repository_from, state_from),
+            side(repository_to, state_to),
+            RelativePath::new(),
+            graft,
+            changes,
+            filter_mode,
+        ),
+        |walked| async move {
+            if let Some(warm_up) = warm_up {
+                warm_up.finish().await;
+            }
+            walked
+        },
+    )
+}
+
+/// Whether a whole-tree diff between the two sides reads the node blocks whose addresses differ
+/// between their trees, so that those fetched ahead of its walk are blocks it reads: the trees are
+/// in one repository, whose commits keep a node at the block index it had in the revision before;
+/// the filter of each side takes in the whole tree for `filter_mode`, so the walk prunes no subtree;
+/// and `graft`, if any, adopts no subtree whole. Between two revisions of one line of commits the
+/// walk then reads nearly every such block, as it lists each directory holding a changed node; a
+/// block that only freed nodes may go unread. Between revisions of two lines that merged, the nodes
+/// one line took from the other sit at other block indices, and the blocks holding them differ
+/// though the walk passes over them.
+#[lore_macro::test_pub]
+fn may_warm_differing_blocks(
+    repository_from: &RepositoryContext,
+    repository_to: &RepositoryContext,
+    graft: Option<&GraftOracle>,
+    filter_mode: FilterMode,
+) -> bool {
+    repository_from.id == repository_to.id
+        && graft.is_none_or(GraftOracle::adopts_nothing)
+        && [repository_from, repository_to].iter().all(|repository| {
+            repository.filter.covers_subtree(
+                FilterStates::ROOT,
+                &RelativePath::new(),
+                0,
+                filter_mode,
+            )
+        })
 }
 
 /// The node `node_id` of `state` at `path`, as one side of a change, carrying the flags and

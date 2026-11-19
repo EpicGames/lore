@@ -17,6 +17,8 @@ use lore_error_set::prelude::*;
 use lore_storage::ReadOptions;
 use lore_transport::StorageSession;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use zerocopy::FromBytes;
 
 use crate::immutable;
@@ -267,17 +269,9 @@ pub async fn warm_blocks(
     }
     let start = Instant::now();
     let (nodes, file_metadata) = state.block_address_lists(repository.clone()).await?;
-    let (session, permits) = immutable::cache_session(&repository)
-        .await
-        .forward::<StateError>("Connecting for a block warm-up")?;
+    let fetch = WarmFetch::connect(repository).await?;
     let nodes = nodes.as_type_slice::<Hash>();
     let file_metadata = file_metadata.as_type_slice::<Hash>();
-    let fetch = WarmFetch {
-        options: immutable::read_options_from_repository(&repository).with_cache(),
-        repository,
-        session,
-        permits,
-    };
     let warmed = match blocks {
         Some(blocks) => {
             warm_block_indices(&fetch, nodes, file_metadata, blocks.iter().copied(), &stop).await
@@ -295,6 +289,208 @@ pub async fn warm_blocks(
     Ok(warmed)
 }
 
+/// Fetches into the local store the node blocks of `from`'s tree and of `to`'s whose addresses
+/// differ at the same block index, both sides', in index order, each with the name table it names.
+/// Both states are of `repository`. A commit keeps each node at the block index it had in the
+/// revision before, so between two revisions of one line of commits a block holding no changed
+/// node has the same address on both sides. A merge adds the nodes the other line added at block
+/// indices of its own, so between revisions of two lines that merged, a block can differ while
+/// the nodes it holds are alike. The blocks are compared [`BLOCKS_IN_FLIGHT`] at a time: those the
+/// local store holds are left out, in one query of the store for each, and the remote is connected
+/// to only for a block the store lacks. They are fetched as [`warm_blocks`] fetches them, without
+/// their file-metadata blocks.
+///
+/// It reads nothing where `repository` cannot fetch, as a context without a remote or one reading
+/// the remote alone cannot ([`immutable::may_cache`]), or where `stopped` is cancelled at the
+/// start. Once `stopped` is cancelled it compares and starts no more blocks and gives up a connect
+/// in progress, and the fetches in flight leave their name tables unfetched. A warm-up that fails
+/// has its fetches in flight aborted, and one that does not logs what it warmed in one line.
+#[lore_macro::test_pub]
+pub(crate) fn warm_differing_blocks(
+    repository: Arc<RepositoryContext>,
+    from: Arc<State>,
+    to: Arc<State>,
+    stopped: CancellationToken,
+) -> impl Future<Output = Result<WarmedBlocks, StateError>> {
+    warm_differing_blocks_in_chunks(repository, from, to, stopped, BLOCKS_IN_FLIGHT)
+}
+
+/// [`warm_differing_blocks`], comparing the blocks with the local store `chunk` at a time.
+#[lore_macro::test_pub]
+async fn warm_differing_blocks_in_chunks(
+    repository: Arc<RepositoryContext>,
+    from: Arc<State>,
+    to: Arc<State>,
+    stopped: CancellationToken,
+    chunk: usize,
+) -> Result<WarmedBlocks, StateError> {
+    if stopped.is_cancelled() || !immutable::may_cache(&repository) {
+        return Ok(WarmedBlocks::default());
+    }
+    let start = Instant::now();
+    let lists = tokio::try_join!(
+        from.node_block_address_list(repository.clone()),
+        to.node_block_address_list(repository.clone()),
+    );
+    let revisions = (from.revision(), to.revision());
+    drop((from, to));
+    let (from_blocks, to_blocks) = lists?;
+    let differing = differing_blocks(
+        from_blocks.as_type_slice::<Hash>(),
+        to_blocks.as_type_slice::<Hash>(),
+    );
+    let mut in_flight = InFlight::default();
+    let started =
+        start_lacking_blocks(&repository, differing, chunk, &stopped, &mut in_flight).await;
+    let ((compared, lacking), warmed) = in_flight.end(started).await?;
+    lore_debug!(
+        "Warmed {} node blocks of the {compared} compared that revisions {} and {} differ in, \
+         {lacking} lacking locally, with {} name tables, {} failed, in {:.3}s",
+        warmed.blocks,
+        revisions.0,
+        revisions.1,
+        warmed.name_tables,
+        warmed.failures,
+        start.elapsed().as_secs_f64()
+    );
+    Ok(warmed)
+}
+
+/// Starts in `in_flight` the fetch of each block of `differing` that the local store lacks, asking
+/// the store about `chunk` blocks at a time and connecting once, for the first block it lacks, and
+/// answers how many blocks it compared and how many of those the store lacked. Once `stopped` is
+/// cancelled it compares no more blocks, and gives up a connect in progress.
+async fn start_lacking_blocks(
+    repository: &Arc<RepositoryContext>,
+    mut differing: impl Iterator<Item = Address>,
+    chunk: usize,
+    stopped: &CancellationToken,
+    in_flight: &mut InFlight,
+) -> Result<(usize, usize), StateError> {
+    let stop: StopWhen = {
+        let stopped = stopped.clone();
+        Arc::new(move || stopped.is_cancelled())
+    };
+    let mut fetch = None;
+    // Grown as far as the first chunk needs, which for trees that differ in a few blocks is far
+    // short of `chunk`, and reused for the rest.
+    let mut blocks = Vec::new();
+    let (mut compared, mut lacking) = (0, 0);
+    while !stopped.is_cancelled() {
+        blocks.clear();
+        blocks.extend(differing.by_ref().take(chunk));
+        if blocks.is_empty() {
+            break;
+        }
+        compared += blocks.len();
+        let lacking_blocks = immutable::not_held_locally(repository, &blocks)
+            .await
+            .forward::<StateError>("Querying the local store for the blocks two trees differ in")?;
+        if lacking_blocks.is_empty() {
+            continue;
+        }
+        lacking += lacking_blocks.len();
+        let fetch = match &mut fetch {
+            Some(fetch) => &*fetch,
+            unconnected @ None => {
+                let connected = tokio::select! {
+                    biased;
+                    () = stopped.cancelled() => None,
+                    connected = WarmFetch::connect(repository.clone()) => Some(connected?),
+                };
+                let Some(connected) = connected else {
+                    break;
+                };
+                &*unconnected.insert(connected)
+            }
+        };
+        let lacking_blocks = lacking_blocks.into_iter().map(|block| (block, None));
+        in_flight.start(fetch, lacking_blocks, &stop).await?;
+    }
+    Ok((compared, lacking))
+}
+
+/// Fetches the node blocks the list `nodes` holds at `indices`, each with the file-metadata block
+/// `file_metadata` holds at its index, as [`warm_blocks`] does, and waits for every fetch to end.
+/// An index the lists do not hold is skipped.
+///
+/// A function of its own because the fetches in flight are held across two awaits: in
+/// [`warm_blocks`]' body they would take space in every state of its future.
+async fn warm_block_indices(
+    fetch: &WarmFetch,
+    nodes: &[Hash],
+    file_metadata: &[Hash],
+    indices: impl Iterator<Item = usize>,
+    stop: &StopWhen,
+) -> Result<WarmedBlocks, StateError> {
+    let blocks = indices.filter_map(|index| {
+        block_address(nodes, index).map(|block| (block, block_address(file_metadata, index)))
+    });
+    let mut in_flight = InFlight::default();
+    let started = in_flight.start(fetch, blocks, stop).await;
+    let ((), warmed) = in_flight.end(started).await?;
+    Ok(warmed)
+}
+
+/// The addresses of the node blocks the lists `from` and `to` hold differently at the same index,
+/// in index order, the one `from` holds first. A zero hash, or an index past a list's end, is a
+/// block with nothing stored, which differs from any stored block and is not named.
+#[lore_macro::test_pub]
+fn differing_blocks<'a>(from: &'a [Hash], to: &'a [Hash]) -> impl Iterator<Item = Address> + 'a {
+    (0..from.len().max(to.len()))
+        .filter(move |&index| from.get(index) != to.get(index))
+        .flat_map(move |index| [block_address(from, index), block_address(to, index)])
+        .flatten()
+}
+
+/// [`warm_differing_blocks`] in a task of its own.
+#[must_use = "dropping the warm-up aborts it"]
+#[lore_macro::test_pub]
+pub(crate) struct DifferingBlocksWarmUp {
+    stopped: CancellationToken,
+    task: AbortOnDropHandle<()>,
+}
+
+impl DifferingBlocksWarmUp {
+    /// Starts warming the blocks `from` and `to` differ in. A warm-up that fails is logged, and
+    /// leaves the blocks it did not fetch to be fetched as they are read. Dropped rather than
+    /// finished, it is aborted.
+    pub fn start(repository: Arc<RepositoryContext>, from: Arc<State>, to: Arc<State>) -> Self {
+        let stopped = CancellationToken::new();
+        let warm_up = warm_differing_blocks(repository, from, to, stopped.clone());
+        let task = lore_spawn!(crate::subtask!(futures::FutureExt::map(
+            warm_up,
+            |warmed| {
+                if let Err(error) = warmed {
+                    lore_debug!("The warm-up of the blocks two trees differ in stopped: {error}");
+                }
+            }
+        )));
+        Self {
+            stopped,
+            task: AbortOnDropHandle::new(task),
+        }
+    }
+
+    /// Stops the warm-up, as [`warm_differing_blocks`] stops once cancelled, and waits for the
+    /// node block fetches it has in flight to end, so that nothing it holds outlives the caller.
+    pub async fn finish(self) {
+        self.stopped.cancel();
+        if let Err(error) = self.task.await {
+            lore_warn!("The warm-up of the blocks two trees differ in failed: {error}");
+        }
+    }
+}
+
+/// The address of the block `hashes` holds at `index`: `None` for a zero hash, or an index past
+/// the end, a block with nothing stored.
+fn block_address(hashes: &[Hash], index: usize) -> Option<Address> {
+    hashes
+        .get(index)
+        .filter(|hash| !hash.is_zero())
+        .map(|hash| Address::zero_context_hash(*hash))
+}
+
 /// What every block fetch of a block warm-up goes through: one session, the connection's cache get
 /// permits, and the options a node block is read with.
 #[derive(Clone)]
@@ -306,6 +502,20 @@ struct WarmFetch {
 }
 
 impl WarmFetch {
+    /// The fetch of a block warm-up through `repository`'s cache session
+    /// ([`immutable::cache_session`]).
+    async fn connect(repository: Arc<RepositoryContext>) -> Result<Self, StateError> {
+        let (session, permits) = immutable::cache_session(&repository)
+            .await
+            .forward::<StateError>("Connecting for a block warm-up")?;
+        Ok(Self {
+            options: immutable::read_options_from_repository(&repository).with_cache(),
+            repository,
+            session,
+            permits,
+        })
+    }
+
     /// Fetches the fragment at `address` the local store lacks, as [`immutable::cache`] does.
     fn cache(
         &self,
@@ -322,42 +532,81 @@ impl WarmFetch {
     }
 }
 
-async fn warm_block_indices(
-    fetch: &WarmFetch,
-    nodes: &[Hash],
-    file_metadata: &[Hash],
-    indices: impl Iterator<Item = usize>,
-    stop: &StopWhen,
-) -> Result<WarmedBlocks, StateError> {
-    let address = |hashes: &[Hash], index: usize| {
-        hashes
-            .get(index)
-            .filter(|hash| !hash.is_zero())
-            .map(|hash| Address::zero_context_hash(*hash))
-    };
-    let mut warmed = WarmedBlocks::default();
-    let mut blocks: JoinSet<WarmedBlocks> = JoinSet::new();
-    for index in indices {
-        let Some(block) = address(nodes, index) else {
-            continue;
-        };
-        while blocks.len() >= BLOCKS_IN_FLIGHT
-            && let Some(done) = blocks.join_next().await
-        {
-            warmed += done.internal("Block warm-up task failed")?;
+/// The node block fetches of a block warm-up in flight, at most [`BLOCKS_IN_FLIGHT`], and what
+/// those that ended warmed.
+#[derive(Default)]
+struct InFlight {
+    blocks: JoinSet<WarmedBlocks>,
+    warmed: WarmedBlocks,
+}
+
+impl InFlight {
+    /// Starts fetching each node block of `blocks` with its file-metadata block beside it
+    /// ([`warm_block`]), waiting for a fetch to end while [`BLOCKS_IN_FLIGHT`] are in flight, and
+    /// starting none once `stop` answers true.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
+    #[allow(clippy::manual_async_fn)]
+    fn start<'a>(
+        &'a mut self,
+        fetch: &'a WarmFetch,
+        blocks: impl Iterator<Item = (Address, Option<Address>)> + 'a,
+        stop: &'a StopWhen,
+    ) -> impl Future<Output = Result<(), StateError>> + 'a {
+        async move {
+            for (block, metadata) in blocks {
+                while self.blocks.len() >= BLOCKS_IN_FLIGHT
+                    && let Some(done) = self.blocks.join_next().await
+                {
+                    self.warmed += done.internal("Block warm-up task failed")?;
+                }
+                if stop() {
+                    break;
+                }
+                let spawned = &mut self.blocks;
+                lore_spawn!(
+                    spawned,
+                    warm_block(fetch.clone(), block, metadata, stop.clone())
+                );
+            }
+            Ok(())
         }
-        if stop() {
-            break;
+    }
+
+    /// Ends the fetches in flight, so that no fetch task outlives the warm-up: where `started`
+    /// holds, waits for every one to end and answers it with what every fetch warmed, or the first
+    /// fetch task that failed; where `started` failed, aborts them and waits for their tasks to end
+    /// before answering its error.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
+    #[allow(clippy::manual_async_fn)]
+    fn end<T>(
+        mut self,
+        started: Result<T, StateError>,
+    ) -> impl Future<Output = Result<(T, WarmedBlocks), StateError>> {
+        async move {
+            let started = match started {
+                Ok(started) => started,
+                Err(error) => {
+                    self.blocks.shutdown().await;
+                    return Err(error);
+                }
+            };
+            let mut failed = None;
+            while let Some(done) = self.blocks.join_next().await {
+                match done {
+                    Ok(warmed) => self.warmed += warmed,
+                    Err(error) => {
+                        failed.get_or_insert(error);
+                    }
+                }
+            }
+            if let Some(error) = failed {
+                Err(error).internal("Block warm-up task failed")?;
+            }
+            Ok((started, self.warmed))
         }
-        lore_spawn!(
-            blocks,
-            warm_block(fetch.clone(), block, address(file_metadata, index))
-        );
     }
-    while let Some(done) = blocks.join_next().await {
-        warmed += done.internal("Block warm-up task failed")?;
-    }
-    Ok(warmed)
 }
 
 /// Fetches the node block at `block` and then the name table it names, beside the file-metadata
@@ -366,7 +615,7 @@ async fn warm_block_indices(
 /// one of the cache get permits, by a read that looks locally again and then fetches and stores it;
 /// a failure to store is not counted, as a read's is not. Its content names the name table, so it
 /// is expanded once and released before the name table is fetched. A node block that fails leaves
-/// its name table unfetched.
+/// its name table unfetched, as does one fetched once `stop` answers true.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
@@ -374,6 +623,7 @@ fn warm_block(
     fetch: WarmFetch,
     block: Address,
     metadata: Option<Address>,
+    stop: StopWhen,
 ) -> impl Future<Output = WarmedBlocks> {
     async move {
         let node_block = async {
@@ -410,7 +660,9 @@ fn warm_block(
                 block_bytes,
                 ..WarmedBlocks::default()
             };
-            if let Some(address) = name_table {
+            if let Some(address) = name_table
+                && !stop()
+            {
                 let cached = fetch.cache(address, true).await;
                 warmed.name_tables = 1;
                 warmed.name_table_bytes = cached.bytes;

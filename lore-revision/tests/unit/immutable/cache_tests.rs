@@ -26,15 +26,9 @@ use super::serving::Serving;
 use super::serving::remote_copy;
 use super::serving::serving_remote;
 use super::serving::serving_session;
+use super::serving::until;
 use super::session_tests::under_execution_context;
 use super::session_tests::under_globals;
-
-/// Yields until `condition` holds.
-async fn until(condition: impl Fn() -> bool) {
-    while !condition() {
-        tokio::task::yield_now().await;
-    }
-}
 
 /// A repository holding 1 MiB of content, unique to `seed`, stored as a fragment list, and that
 /// list's address. Read flights join on content across tests, so each test writes its own.

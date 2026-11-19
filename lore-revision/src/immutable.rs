@@ -1077,6 +1077,14 @@ pub async fn cache_counted(
     Ok(cached)
 }
 
+/// Whether `repository` can cache what its local store lacks: it reads the local store, and is not
+/// known to hold no remote. A `false` answer stands for the life of the context; a `true` one says
+/// nothing of whether a connect succeeds.
+#[lore_macro::test_pub]
+pub(crate) fn may_cache(repository: &RepositoryContext) -> bool {
+    repository.local_reads != LocalReads::Skip && !repository.is_offline()
+}
+
 /// The session `repository`'s cache fetches go through, its lazy one ([`resolve_session`]), which
 /// starts its server-side sessions again once a fetch invalidates them, and the connection's cache
 /// get permits they take ([`cache_through`]).
@@ -1410,33 +1418,60 @@ fn keep_store_failure(
     }
 }
 
-/// The first of `addresses` whose payload the local store of `repository` lacks, from one query
-/// of the store, and `None` where it holds every payload. No addresses make no query. An entry
-/// without its payload, as eviction leaves one, lacks it. A failed query is the error, where
-/// [`is_stored_local`] reads one as lacking.
+/// `answer` to what the local store of `repository` resolves each of `addresses` to, in order,
+/// from one query of the store; [`held_locally`] tells whether it holds the payload. No addresses
+/// make no query. A failed query is the error, where [`is_stored_local`] reads one as lacking.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
+fn resolved_locally<'a, T>(
+    repository: &'a RepositoryContext,
+    addresses: &'a [Address],
+    answer: impl FnOnce(&'a [Address], &[StoreMatchResult]) -> T + 'a,
+) -> impl Future<Output = Result<T, ImmutableError>> + 'a {
+    async move {
+        let mut resolved = vec![StoreMatchResult::default(); addresses.len()];
+        if !addresses.is_empty() {
+            repository
+                .immutable_store()
+                .query(repository.id, addresses, &mut resolved)
+                .await
+                .forward::<ImmutableError>("querying the local store for the payloads it holds")?;
+        }
+        Ok(answer(addresses, &resolved))
+    }
+}
+
+/// The first of `addresses` whose payload the local store of `repository` lacks
+/// ([`resolved_locally`]), and `None` where it holds every payload. An entry without its payload,
+/// as eviction leaves one, lacks it.
 pub fn first_not_held_locally<'a>(
     repository: &'a RepositoryContext,
     addresses: &'a [Address],
 ) -> impl Future<Output = Result<Option<Address>, ImmutableError>> + 'a {
-    async move {
-        if addresses.is_empty() {
-            return Ok(None);
-        }
-        let mut resolved = vec![StoreMatchResult::default(); addresses.len()];
-        repository
-            .immutable_store()
-            .query(repository.id, addresses, &mut resolved)
-            .await
-            .forward::<ImmutableError>("querying the local store for the payloads it holds")?;
-        Ok(addresses
+    resolved_locally(repository, addresses, |addresses, resolved| {
+        addresses
             .iter()
-            .zip(&resolved)
+            .zip(resolved)
             .find(|(_, resolved)| !held_locally(resolved))
-            .map(|(address, _)| *address))
-    }
+            .map(|(address, _)| *address)
+    })
+}
+
+/// The addresses of `addresses` whose payloads the local store of `repository` lacks, in order
+/// ([`resolved_locally`]). An entry without its payload, as eviction leaves one, lacks it.
+pub(crate) fn not_held_locally<'a>(
+    repository: &'a RepositoryContext,
+    addresses: &'a [Address],
+) -> impl Future<Output = Result<Vec<Address>, ImmutableError>> + 'a {
+    resolved_locally(repository, addresses, |addresses, resolved| {
+        addresses
+            .iter()
+            .zip(resolved)
+            .filter(|(_, resolved)| !held_locally(resolved))
+            .map(|(address, _)| *address)
+            .collect()
+    })
 }
 
 /// The addresses of `addresses` the remote lacks, in order, from one existence query on

@@ -52,6 +52,24 @@ pub(crate) struct Serving {
     pub(super) refusal: Option<ProtocolError>,
 }
 
+impl Serving {
+    /// Serving everything, holding the first get of the content `hash` until `released` is
+    /// notified.
+    pub(crate) fn holding(hash: Hash, released: Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            hold: Some((hash, released)),
+            ..Self::default()
+        }
+    }
+}
+
+/// Yields until `condition` holds.
+pub(crate) async fn until(condition: impl Fn() -> bool) {
+    while !condition() {
+        tokio::task::yield_now().await;
+    }
+}
+
 /// A remote serving what `source` stores as `serving` says, recording each address asked of it, the
 /// sessions started on it, numbered from 1, the sessions stopped, the verifies asked of it and the
 /// most gets it held at once.
@@ -232,12 +250,12 @@ impl ServingStorage {
     }
 
     /// The distinct addresses asked of the remote.
-    pub(super) fn asked(&self) -> BTreeSet<Address> {
+    pub(crate) fn asked(&self) -> BTreeSet<Address> {
         self.asked.lock().expect("asked").iter().copied().collect()
     }
 
     /// How many gets the remote was asked.
-    pub(super) fn gets(&self) -> usize {
+    pub(crate) fn gets(&self) -> usize {
         self.asked.lock().expect("asked").len()
     }
 
