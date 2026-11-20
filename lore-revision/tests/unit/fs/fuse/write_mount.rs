@@ -18747,6 +18747,7 @@ async fn merge_through(
                     no_commit: true,
                     scope: merge::MergeScope::MainOnly,
                     inherit_metadata: Default::default(),
+                    metadata: Default::default(),
                 },
             )),
         )
