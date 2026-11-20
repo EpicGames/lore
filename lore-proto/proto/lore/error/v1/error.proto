@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package lore.error.v1;
+
+// The `google.rpc.ErrorInfo.reason` values (AIP-193) that Lore, and the
+// services Lore calls, put in a rejection's status details. The `ErrorInfo`
+// sets `domain` to `lore.error.v1`, `reason` to the name of a value below,
+// and `metadata["field"]` to the proto field name of the request field the
+// reason is about. Callers decide from the status code, the reason and the
+// field, and ignore an `ErrorInfo` in any other domain. The status message is
+// for humans.
+enum ErrorReason {
+  // No more specific reason applies.
+  ERROR_REASON_UNSPECIFIED = 0;
+  // The field is set, but its value does not have the format the service requires.
+  ERROR_REASON_INVALID_FORMAT = 1;
+  // The field is required but not set.
+  ERROR_REASON_MISSING_REQUIRED_FIELD = 2;
+}

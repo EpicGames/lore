@@ -21,9 +21,10 @@ service UserService {
 //
 // The registry answers each rejection with the status code the RPC
 // documents. A rejection the RPC documents with a reason carries a
-// `google.rpc.ErrorInfo` (AIP-193) in the status details, with `domain` set
-// to `lore.user.v1.RepositoryRegistryService` and `reason` set to the name
-// of a `RepositoryRegistryErrorReason` value.
+// `google.rpc.ErrorInfo` (AIP-193) in the status details, as
+// `lore/error/v1/error.proto` defines it: `domain` `lore.error.v1`, `reason`
+// the name of a `lore.error.v1.ErrorReason` value, and `metadata["field"]`
+// the request field the reason is about.
 service RepositoryRegistryService {
   // Stream the repositories the bearer holds permissions on, one per
   // message, with the permissions held on each. Repositories the bearer
@@ -39,7 +40,7 @@ service RepositoryRegistryService {
   // - `PERMISSION_DENIED` when the caller may not create the repository.
   // - `UNAUTHENTICATED` when the token is missing, invalid or expired.
   // - `NOT_FOUND` when an entity the registry requires for the registration does not exist. The registry defines which entities it requires.
-  // - `INVALID_ARGUMENT` with an `ErrorInfo` reason of `REPOSITORY_REGISTRY_ERROR_REASON_UNSPECIFIED` or `REPOSITORY_REGISTRY_ERROR_REASON_INVALID_NAME` when the registry rejects the name.
+  // - `INVALID_ARGUMENT` with an `ErrorInfo` field of `name` and a reason of `ERROR_REASON_INVALID_FORMAT`, `ERROR_REASON_MISSING_REQUIRED_FIELD` or `ERROR_REASON_UNSPECIFIED` when the registry rejects the name.
   rpc RepositoryRegister(RepositoryRegisterRequest) returns (RepositoryRegisterResponse);
   // Unregister a repository the Lore server is deleting. The Lore server
   // refuses the delete when this fails, so the registry authorizes the
@@ -47,15 +48,6 @@ service RepositoryRegistryService {
   // not delete the repository, and with `UNAUTHENTICATED` when the token is
   // missing, invalid or expired.
   rpc RepositoryUnregister(RepositoryUnregisterRequest) returns (RepositoryUnregisterResponse);
-}
-
-// The `google.rpc.ErrorInfo.reason` values a `RepositoryRegistryService`
-// rejection carries, in the domain `lore.user.v1.RepositoryRegistryService`.
-enum RepositoryRegistryErrorReason {
-  // Unspecified error.
-  REPOSITORY_REGISTRY_ERROR_REASON_UNSPECIFIED = 0;
-  // Repository name does not match the format the registry requires.
-  REPOSITORY_REGISTRY_ERROR_REASON_INVALID_NAME = 1;
 }
 
 // A user as the directory knows them.

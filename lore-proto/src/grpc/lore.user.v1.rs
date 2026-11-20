@@ -225,36 +225,6 @@ impl ::prost::Name for RepositoryUnregisterResponse {
         "/lore.user.v1.RepositoryUnregisterResponse".into()
     }
 }
-/// The `google.rpc.ErrorInfo.reason` values a `RepositoryRegistryService`
-/// rejection carries, in the domain `lore.user.v1.RepositoryRegistryService`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum RepositoryRegistryErrorReason {
-    /// Unspecified error.
-    Unspecified = 0,
-    /// Repository name does not match the format the registry requires.
-    InvalidName = 1,
-}
-impl RepositoryRegistryErrorReason {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "REPOSITORY_REGISTRY_ERROR_REASON_UNSPECIFIED",
-            Self::InvalidName => "REPOSITORY_REGISTRY_ERROR_REASON_INVALID_NAME",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "REPOSITORY_REGISTRY_ERROR_REASON_UNSPECIFIED" => Some(Self::Unspecified),
-            "REPOSITORY_REGISTRY_ERROR_REASON_INVALID_NAME" => Some(Self::InvalidName),
-            _ => None,
-        }
-    }
-}
 /// Generated client implementations.
 pub mod user_service_client {
     #![allow(
@@ -658,9 +628,10 @@ pub mod repository_registry_service_client {
     ///
     /// The registry answers each rejection with the status code the RPC
     /// documents. A rejection the RPC documents with a reason carries a
-    /// `google.rpc.ErrorInfo` (AIP-193) in the status details, with `domain` set
-    /// to `lore.user.v1.RepositoryRegistryService` and `reason` set to the name
-    /// of a `RepositoryRegistryErrorReason` value.
+    /// `google.rpc.ErrorInfo` (AIP-193) in the status details, as
+    /// `lore/error/v1/error.proto` defines it: `domain` `lore.error.v1`, `reason`
+    /// the name of a `lore.error.v1.ErrorReason` value, and `metadata["field"]`
+    /// the request field the reason is about.
     #[derive(Debug, Clone)]
     pub struct RepositoryRegistryServiceClient<T> {
         inner: tonic::client::Grpc<T>,
@@ -786,7 +757,7 @@ pub mod repository_registry_service_client {
         /// * `PERMISSION_DENIED` when the caller may not create the repository.
         /// * `UNAUTHENTICATED` when the token is missing, invalid or expired.
         /// * `NOT_FOUND` when an entity the registry requires for the registration does not exist. The registry defines which entities it requires.
-        /// * `INVALID_ARGUMENT` with an `ErrorInfo` reason of `REPOSITORY_REGISTRY_ERROR_REASON_UNSPECIFIED` or `REPOSITORY_REGISTRY_ERROR_REASON_INVALID_NAME` when the registry rejects the name.
+        /// * `INVALID_ARGUMENT` with an `ErrorInfo` field of `name` and a reason of `ERROR_REASON_INVALID_FORMAT`, `ERROR_REASON_MISSING_REQUIRED_FIELD` or `ERROR_REASON_UNSPECIFIED` when the registry rejects the name.
         pub async fn repository_register(
             &mut self,
             request: impl tonic::IntoRequest<super::RepositoryRegisterRequest>,
@@ -892,7 +863,7 @@ pub mod repository_registry_service_server {
         /// * `PERMISSION_DENIED` when the caller may not create the repository.
         /// * `UNAUTHENTICATED` when the token is missing, invalid or expired.
         /// * `NOT_FOUND` when an entity the registry requires for the registration does not exist. The registry defines which entities it requires.
-        /// * `INVALID_ARGUMENT` with an `ErrorInfo` reason of `REPOSITORY_REGISTRY_ERROR_REASON_UNSPECIFIED` or `REPOSITORY_REGISTRY_ERROR_REASON_INVALID_NAME` when the registry rejects the name.
+        /// * `INVALID_ARGUMENT` with an `ErrorInfo` field of `name` and a reason of `ERROR_REASON_INVALID_FORMAT`, `ERROR_REASON_MISSING_REQUIRED_FIELD` or `ERROR_REASON_UNSPECIFIED` when the registry rejects the name.
         async fn repository_register(
             &self,
             request: tonic::Request<super::RepositoryRegisterRequest>,
@@ -921,9 +892,10 @@ pub mod repository_registry_service_server {
     ///
     /// The registry answers each rejection with the status code the RPC
     /// documents. A rejection the RPC documents with a reason carries a
-    /// `google.rpc.ErrorInfo` (AIP-193) in the status details, with `domain` set
-    /// to `lore.user.v1.RepositoryRegistryService` and `reason` set to the name
-    /// of a `RepositoryRegistryErrorReason` value.
+    /// `google.rpc.ErrorInfo` (AIP-193) in the status details, as
+    /// `lore/error/v1/error.proto` defines it: `domain` `lore.error.v1`, `reason`
+    /// the name of a `lore.error.v1.ErrorReason` value, and `metadata["field"]`
+    /// the request field the reason is about.
     #[derive(Debug)]
     pub struct RepositoryRegistryServiceServer<T> {
         inner: Arc<T>,

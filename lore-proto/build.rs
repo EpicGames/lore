@@ -181,6 +181,11 @@ fn main() -> Result<()> {
         .protoc_arg("--experimental_allow_proto3_optional")
         .compile_with_config(config, &["./proto/lore/user/v1/user.proto"], &["./proto"])?;
 
+    // lore.error.v1 — the ErrorInfo reasons of Lore's rejections.
+    tonic_prost_build::configure()
+        .out_dir(&output_dir)
+        .compile_protos(&["./proto/lore/error/v1/error.proto"], &["./proto"])?;
+
     let mut config = tonic_prost_build::Config::new();
     // Use Bytes for buffers instead of Vec
     config.bytes(["."]);

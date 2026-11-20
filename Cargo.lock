@@ -2723,7 +2723,7 @@ dependencies = [
 
 [[package]]
 name = "lore-proto"
-version = "0.1.68"
+version = "0.1.69"
 dependencies = [
  "lore-base",
  "prost",
