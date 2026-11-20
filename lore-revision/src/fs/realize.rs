@@ -2315,11 +2315,33 @@ async fn holds_content_of(
 }
 
 /// What a realize reads its moves against: the revision a merge applies to, where the realize is
-/// a merge's ([`tracked_source`]), and the listing of each directory it reads for another spelling
-/// of a move's source, held for the rest of the realize.
+/// a merge's ([`tracked_source`]), the listing of each directory it reads for another spelling of
+/// a move's source, held for the rest of the realize, and the directories it has moved.
 struct RealizeMoves {
     merge_current: Option<MergeCurrent>,
     listings: HeldSpellings,
+    /// Each directory the realize has moved, from its source as the changes name it, read through
+    /// the directory moves before it, to its destination, in the order moved.
+    directories: Vec<(RelativePath, RelativePath)>,
+}
+
+impl RealizeMoves {
+    /// Where the directory moves realized before it carried `source`, the source of a move, the
+    /// path the working tree holds it at; `None` where none of them did. A change names its source
+    /// as the revision it starts from spells it, and a directory renamed only in case is one change
+    /// that carries its children, so a source below it names a path the working tree no longer
+    /// holds once the rename is realized.
+    fn moved_source(&self, source: &RelativePath) -> Option<RelativePath> {
+        let mut moved: Option<RelativePath> = None;
+        for (from, to) in &self.directories {
+            if let Some(below) = moved.as_ref().unwrap_or(source).below(from)
+                && !below.is_empty()
+            {
+                moved = Some(to.join(below));
+            }
+        }
+        moved
+    }
 }
 
 /// The listing of each directory a realize reads for the spellings its entries hold
@@ -2392,6 +2414,7 @@ async fn rename_held_spelling(
     let RealizeMoves {
         merge_current,
         listings,
+        ..
     } = moves;
     let Some(listed) = listings.of(operation, from).await else {
         return false;
@@ -4066,6 +4089,7 @@ fn sync_execute_modify_add(
     let mut moves = RealizeMoves {
         merge_current,
         listings: HeldSpellings::default(),
+        directories: Vec::new(),
     };
     async move {
         let mut tasks = JoinSet::new();
@@ -4275,32 +4299,39 @@ fn content_is_in_place(change: &NodeChange, renamed: bool) -> bool {
     (renamed && change.from.address.hash == change.to.address.hash) || change.flags.holds_content()
 }
 
-/// `node` with the executable bit the working file carries, where [`change::Flags::LocalMode`]
-/// states that the bit is the working tree's own. Writing a node applies the mode it holds, which
-/// would revert the one local change a chmod is.
+/// `mode`, the mode of the node `change` writes, with the executable bit the working file carries,
+/// where [`change::Flags::LocalMode`] states that the bit is the working tree's own. Writing a node
+/// applies the mode it holds, which would revert the one local change a chmod is.
 ///
-/// The file stands at the path the change names, or at the source a move carries it from: a move
-/// yet to be realized holds it at the source, and one realized over its own result at the
-/// destination. Only a change holding a local bit pays for the read.
-async fn node_with_a_local_mode(
+/// The file stands at the path the change names, or at the source a move carries it from, as
+/// `moves` reads it ([`RealizeMoves::moved_source`]): a move yet to be realized holds it at the
+/// source, and one realized over its own result at the destination. Only a change holding a local
+/// bit pays for the read.
+async fn local_mode(
     operation: &InstanceOperationImpl,
     change: &NodeChange,
-    mut node: Node,
-) -> Result<Node, SyncError> {
+    moves: &RealizeMoves,
+    mode: u16,
+) -> Result<u16, SyncError> {
     if !change.flags.is_local_mode() {
-        return Ok(node);
+        return Ok(mode);
     }
 
-    let mut info = operation.file_info(change.path()).await?;
-    if !info.is_file()
-        && let Some(source) = change.move_source()
-    {
-        info = operation.file_info(source).await?;
-    }
-    if info.is_file() {
-        node.mode = info.mode(node.mode);
-    }
-    Ok(node)
+    let held = {
+        let info = operation.file_info(change.path()).await?;
+        info.is_file().then(|| info.mode(mode))
+    };
+    let held = match (held, change.move_source()) {
+        (None, Some(source)) => {
+            let moved = moves.moved_source(source);
+            let info = operation
+                .file_info(moved.as_ref().unwrap_or(source))
+                .await?;
+            info.is_file().then(|| info.mode(mode))
+        }
+        (held, _) => held,
+    };
+    Ok(held.unwrap_or(mode))
 }
 
 /// Rewrites a mount whose link node moved to another subtree of the repository it points at.
@@ -4311,7 +4342,7 @@ async fn node_with_a_local_mode(
 async fn realize_moved_mount(
     operation: &Arc<InstanceOperationImpl>,
     change: &NodeChange,
-    node: Node,
+    node: &Node,
     merge_current: Option<&MergeCurrent>,
 ) -> Result<(), SyncError> {
     if !change.from.is_link() {
@@ -4343,7 +4374,7 @@ async fn realize_moved_mount(
             .create_dir_all(path)
             .await
             .forward::<SyncError>("Failed recreating the link directory")?;
-        return Box::pin(clone_added_link(&repository, operation, &node, path)).await;
+        return Box::pin(clone_added_link(&repository, operation, node, path)).await;
     }
 
     let from_node = change
@@ -4353,7 +4384,7 @@ async fn realize_moved_mount(
         .node(repository.clone(), change.from.mapping.node)
         .await
         .forward::<SyncError>("Failed reading the link node the mount stands at")?;
-    if from_node.mounts_same_source(&node) && change.from.address == node.address {
+    if from_node.mounts_same_source(node) && change.from.address == node.address {
         return Ok(());
     }
 
@@ -4416,6 +4447,46 @@ async fn recover_refused_move(
     Ok(())
 }
 
+/// Renames `from`, the source of `change`, a move, to `to`, from the path the directory moves
+/// realized before it carried it to ([`RealizeMoves::moved_source`]), and adds a directory it moves
+/// to them. Where the rename fails, it takes the entry the working tree holds the source in under
+/// another spelling, where `view_filter` holds the source ([`rename_held_spelling`]), and otherwise
+/// recovers as [`recover_refused_move`] describes, counting a rename left undone in `kept`.
+/// Answers whether a rename carried the source to `to`.
+///
+/// A function of its own, so that the source is not reserved in every state of
+/// [`realize_change_modify_add`].
+async fn rename_move_source(
+    operation: &InstanceOperationImpl,
+    change: &NodeChange,
+    moves: &mut RealizeMoves,
+    from: &RelativePath,
+    to: &RelativePath,
+    view_filter: &crate::filter::Filter,
+    kept: &KeptRenames,
+) -> Result<bool, SyncError> {
+    let moved = moves.moved_source(from);
+    let source = moved.as_ref().unwrap_or(from);
+    let renamed = match operation.rename(source, to).await {
+        Ok(()) => true,
+        Err(refused) => {
+            let respelled = !view_filter.excludes(
+                from,
+                !change.from.flags.contains(NodeFlags::File),
+                FilterMode::View,
+            ) && rename_held_spelling(operation, change, moves, source, to).await;
+            if !respelled {
+                recover_refused_move(operation, source, to, refused, kept).await?;
+            }
+            respelled
+        }
+    };
+    if renamed && change.to.flags.is_directory() {
+        moves.directories.push((source.clone(), to.clone()));
+    }
+    Ok(renamed)
+}
+
 /// Warns once for the renames left undone, `kept`, with how many and the first, which is all
 /// reported of them.
 pub(crate) fn report_kept_renames(kept: &KeptRenames) {
@@ -4432,10 +4503,8 @@ pub(crate) fn report_kept_renames(kept: &KeptRenames) {
 /// Realizes on disk a node a change adds, modifies or moves, and stages it in `state_stage` when
 /// given.
 ///
-/// A move whose rename fails takes the entry the working tree holds its source in under another
-/// spelling, where the view holds the source ([`rename_held_spelling`]), against what `moves`
-/// holds for the realize, and otherwise recovers as [`recover_refused_move`] describes. The change
-/// is staged as [`stage_realized_change`] describes.
+/// A move is renamed as [`rename_move_source`] describes, against what `moves` holds for the
+/// realize. The change is staged as [`stage_realized_change`] describes.
 ///
 /// Cloning an added link is boxed. Only a link reaches it, and inline it would make the future of
 /// every change realized as large as its own.
@@ -4490,35 +4559,25 @@ fn realize_change_modify_add<'a>(
 
         // Read ahead of the rename below, which carries a move's file away from the source it stands
         // at, and of the recovery from a rename that failed, which removes the destination.
-        let realized = node_with_a_local_mode(&operation, &change, node).await?;
+        let realized = Node {
+            mode: local_mode(&operation, &change, moves, node.mode).await?,
+            ..node
+        };
 
         let renamed = if !dry_run
             && change.action == change::FileAction::Move
             && let Some(from_path) = change.move_source()
         {
-            match operation.rename(from_path, &to_path).await {
-                Ok(()) => true,
-                Err(refused) => {
-                    let respelled =
-                        !view_filter.excludes(
-                            from_path,
-                            !change.from.flags.contains(NodeFlags::File),
-                            FilterMode::View,
-                        ) && rename_held_spelling(&operation, &change, moves, from_path, &to_path)
-                            .await;
-                    if !respelled {
-                        recover_refused_move(
-                            &operation,
-                            from_path,
-                            &to_path,
-                            refused,
-                            &stats.kept_renames,
-                        )
-                        .await?;
-                    }
-                    respelled
-                }
-            }
+            rename_move_source(
+                &operation,
+                &change,
+                moves,
+                from_path,
+                &to_path,
+                &view_filter,
+                &stats.kept_renames,
+            )
+            .await?
         } else {
             false
         };
@@ -4541,7 +4600,7 @@ fn realize_change_modify_add<'a>(
             if node.is_link() && change.action == change::FileAction::Add {
                 Box::pin(clone_added_link(&repository, &operation, &node, path)).await?;
             } else if node.is_link() && !dry_run {
-                realize_moved_mount(&operation, &change, node, moves.merge_current.as_ref())
+                realize_moved_mount(&operation, &change, &node, moves.merge_current.as_ref())
                     .await?;
             }
         } else if node.is_file() && !dry_run && write_to_disk {

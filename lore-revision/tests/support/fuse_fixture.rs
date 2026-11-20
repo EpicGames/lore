@@ -110,7 +110,17 @@ pub async fn released_deleting(
     revisions: &[&[(&str, &[u8])]],
     deleted: &[&str],
 ) -> ReleasedFixture {
-    Box::pin(released_with(revisions, deleted, &[])).await
+    Box::pin(released_with(revisions, deleted, &[], &[])).await
+}
+
+/// As [`released_revisions`], with each of `moved`, a source and its destination, renamed one
+/// after another and staged as a move before the last commit, a name differing only in case as a
+/// rename.
+pub async fn released_moving(
+    revisions: &[&[(&str, &[u8])]],
+    moved: &[(&str, &str)],
+) -> ReleasedFixture {
+    Box::pin(released_with(revisions, &[], &[], moved)).await
 }
 
 /// As [`released_revisions`], with the files `executable` made executable before the last
@@ -119,15 +129,16 @@ pub async fn released_executable(
     revisions: &[&[(&str, &[u8])]],
     executable: &[&str],
 ) -> ReleasedFixture {
-    Box::pin(released_with(revisions, &[], executable)).await
+    Box::pin(released_with(revisions, &[], executable, &[])).await
 }
 
-/// As [`released_revisions`], with `deleted` removed ([`released_deleting`]) and `executable`
-/// made executable before the last commit.
+/// As [`released_revisions`], with `deleted` removed ([`released_deleting`]), `executable` made
+/// executable and `moved` staged as moves ([`released_moving`]) before the last commit.
 async fn released_with(
     revisions: &[&[(&str, &[u8])]],
     deleted: &[&str],
     executable: &[&str],
+    moved: &[(&str, &str)],
 ) -> ReleasedFixture {
     let (immutable, mutable, execution) = test_store_create()
         .await
@@ -176,7 +187,12 @@ async fn released_with(
                     }
                     test_file_write(&full_path, contents);
                 }
-                state = Some(test_commit_tree(&instance, "released fuse fixture").await);
+                state = Some(if index + 1 == revisions.len() && !moved.is_empty() {
+                    stage_moves(&instance, moved).await;
+                    test_commit(&instance, "released fuse fixture").await
+                } else {
+                    test_commit_tree(&instance, "released fuse fixture").await
+                });
             }
             let TestRepository {
                 repository,
@@ -200,6 +216,29 @@ async fn released_with(
         path,
         state,
         directory,
+    }
+}
+
+/// Renames each of `moved`, a source and its destination, one after another in `instance`'s
+/// working tree, and stages it as a move, a name differing only in case as a rename.
+async fn stage_moves(instance: &TestRepository, moved: &[(&str, &str)]) {
+    for (from, to) in moved {
+        let (from, to) = (instance.path.join(from), instance.path.join(to));
+        // Test fixture writes; not subject to repository write-token discipline.
+        #[allow(clippy::disallowed_methods)]
+        std::fs::rename(&from, &to).expect("rename");
+        lore_revision::file::stage::stage_move(
+            instance.repository.clone(),
+            &instance.write_token,
+            from.to_string_lossy().into_owned(),
+            to.to_string_lossy().into_owned(),
+            lore_revision::stage::StageOptions {
+                case_change: lore_revision::stage::StageCaseChange::Rename,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to stage the move");
     }
 }
 

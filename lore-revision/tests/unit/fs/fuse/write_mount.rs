@@ -113,6 +113,15 @@ impl Instance {
         }
     }
 
+    /// An instance at a revision that makes `moved` on `files` ([`fuse_fixture::released_moving`]),
+    /// whose parent holds `files`.
+    async fn with_moves(files: &[(&str, &[u8])], moved: &[(&str, &str)]) -> Self {
+        Self {
+            fixture: fuse_fixture::released_moving(&[files, &[]], moved).await,
+            external: TempDir::new("lore-fuse-write-mount-instance-"),
+        }
+    }
+
     /// An instance whose tree records file metadata and whose unused chain is many blocks with a
     /// few free slots each, none of them held by a listing: `a/` and `b/` hold two files each,
     /// and `c/` fills [`HOLED_BLOCKS`] blocks, less every [`HOLE_SPACING`]th file.

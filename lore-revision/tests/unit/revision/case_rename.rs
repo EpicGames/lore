@@ -5,20 +5,26 @@
 //! A rename that changes only the case of a name, carried by a commit to every working tree that
 //! syncs, switches or merges across it.
 
+use std::collections::BTreeMap;
+
 use lore_base::types::Hash;
 use lore_revision::branch;
 use lore_revision::branch::BranchLatestStatus;
 use lore_revision::filter::FilterMode;
 use lore_revision::state;
 
+use super::instance::Edit;
 use super::instance::Instance;
+use super::instance::RENAMES_BELOW;
 use super::instance::commit;
+use super::instance::commit_edits;
 use super::instance::create_branch;
 use super::instance::current;
 use super::instance::merge_branch;
 use super::instance::names_along;
 use super::instance::node_at;
 use super::instance::renamed;
+use super::instance::renamed_all;
 use super::instance::revision_state;
 use super::instance::run;
 use super::instance::stage;
@@ -74,22 +80,55 @@ async fn sync_and_switch_across(name: &str, from: &'static str, to: &'static str
             reported(&instance, first, second).await,
             vec![("V".to_string(), to.to_string())]
         );
-
-        sync_to(&instance, first).await.expect("Failed to sync");
-        assert_eq!(working_tree(&instance.path), before, "synced back");
-        sync_to(&instance, second).await.expect("Failed to sync");
-        assert_eq!(working_tree(&instance.path), after, "synced forward");
-
-        switch_to(&instance, branch::DEFAULT_DEFAULT_NAME).await;
-        assert_eq!(working_tree(&instance.path), before, "switched to main");
-        switch_to(&instance, "feature").await;
-        assert_eq!(
-            working_tree(&instance.path),
-            after,
-            "switched to the feature branch"
-        );
+        assert_synced_and_switched_across(&instance, (first, second), &before, &after).await;
     })
     .await;
+}
+
+/// Syncs the instance, on the feature branch at `second`, back to `first` and forward again, then
+/// switches it to main, at `first`, and back to the feature branch, and checks that each leaves
+/// the working tree holding `before` at `first` and `after` at `second`.
+async fn assert_synced_and_switched_across(
+    instance: &Instance,
+    (first, second): (Hash, Hash),
+    before: &BTreeMap<String, Vec<u8>>,
+    after: &BTreeMap<String, Vec<u8>>,
+) {
+    sync_to(instance, first).await.expect("Failed to sync");
+    assert_eq!(&working_tree(&instance.path), before, "synced back");
+    sync_to(instance, second).await.expect("Failed to sync");
+    assert_eq!(&working_tree(&instance.path), after, "synced forward");
+
+    switch_to(instance, branch::DEFAULT_DEFAULT_NAME).await;
+    assert_eq!(&working_tree(&instance.path), before, "switched to main");
+    switch_to(instance, "feature").await;
+    assert_eq!(
+        &working_tree(&instance.path),
+        after,
+        "switched to the feature branch"
+    );
+}
+
+/// A revision making each of [`RENAMES_BELOW`] reaches a sync and a branch switch across it in
+/// either direction: neither leaves a path below a directory's other spelling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_below_a_case_only_rename_of_a_directory_reaches_sync_and_switch() {
+    for (edits, renames) in &RENAMES_BELOW {
+        run(
+            "a_move_below_a_case_only_rename_of_a_directory_reaches_sync_and_switch",
+            &TREE,
+            move |instance| async move {
+                let first = current(&instance).await;
+                let before = working_tree(&instance.path);
+                create_branch(&instance, "feature").await;
+                let second = commit_edits(&instance, edits, "Rename").await;
+                let after = renamed_all(&before, renames);
+                assert_synced_and_switched_across(&instance, (first, second), &before, &after)
+                    .await;
+            },
+        )
+        .await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -328,6 +367,44 @@ async fn a_tree_hashed_folding_case_commits_an_unchanged_file_once() {
                     .is_err_and(|error| error.is_nothing_staged()),
                 "{refused:?}"
             );
+        },
+    )
+    .await;
+}
+
+/// A sync back across a revision renaming a directory only in case and moving and editing a file
+/// below it keeps the executable bit the working tree alone gave the file: the file is written at
+/// the path it moves back to with the bit, and nothing stays below the directory's new spelling.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sync_back_across_a_move_below_a_case_only_rename_keeps_a_local_bit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    run(
+        "a_sync_back_across_a_move_below_a_case_only_rename_keeps_a_local_bit",
+        &TREE,
+        |instance| async move {
+            let first = current(&instance).await;
+            let before = working_tree(&instance.path);
+            let edits = [
+                Edit::Move("Dir", "dir"),
+                Edit::Move("dir/Sub/c.txt", "dir/Sub/d.txt"),
+                Edit::Write("dir/Sub/d.txt", "edited"),
+            ];
+            commit_edits(&instance, &edits, "Rename").await;
+            std::fs::set_permissions(
+                instance.path.join("dir/Sub/d.txt"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("Failed to change the mode");
+
+            sync_to(&instance, first).await.expect("Failed to sync");
+            assert_eq!(working_tree(&instance.path), before);
+            let mode = std::fs::metadata(instance.path.join("Dir/Sub/c.txt"))
+                .expect("Failed to read the file")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "{mode:o}");
         },
     )
     .await;

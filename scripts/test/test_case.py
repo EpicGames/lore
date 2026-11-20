@@ -227,6 +227,12 @@ def test_case_directory_rename(new_lore_repo):
     assert str(renamed_dir) not in files, "Renamed directory not reverted by sync"
     for file_name in [case_file, ignored_file, deleted_file]:
         assert os.path.isfile(repo.path / original_dir / file_name)
+    assert set(os.listdir(repo.path / original_dir)) == {
+        nested_dir,
+        case_file,
+        ignored_file,
+        deleted_file,
+    }
 
 
 @pytest.mark.own_vfs(

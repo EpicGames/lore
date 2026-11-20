@@ -23,7 +23,7 @@ mod case_rename;
 mod deletion_walk;
 mod diff;
 mod fast_forward_merge;
-mod instance;
+pub(crate) mod instance;
 mod interrupted_commit;
 mod interrupted_push;
 mod last_merged;

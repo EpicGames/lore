@@ -152,6 +152,44 @@ pub(super) fn renamed(
         .collect()
 }
 
+/// `files` with `renames` made one after another, as [`renamed`] makes each.
+pub(crate) fn renamed_all(
+    files: &BTreeMap<String, Vec<u8>>,
+    renames: &[(&str, &str)],
+) -> BTreeMap<String, Vec<u8>> {
+    renames
+        .iter()
+        .fold(files.clone(), |files, (from, to)| renamed(&files, from, to))
+}
+
+/// The edits of a branch renaming a directory only in case together with a move or a case-only
+/// rename below it, or a move into it, and the renames that carry the tree it starts from to what
+/// the branch holds.
+pub(crate) type RenamingBelow = ([Edit; 2], [(&'static str, &'static str); 2]);
+
+/// The [`RenamingBelow`]s of a tree holding `Dir/Sub/c.txt` and `Top.txt`, which the merge, sync
+/// and FUSE merge tests start from.
+pub(crate) const RENAMES_BELOW: [RenamingBelow; 3] = [
+    (
+        [
+            Edit::Move("Dir", "dir"),
+            Edit::Move("dir/Sub/c.txt", "dir/Sub/d.txt"),
+        ],
+        [("Dir", "dir"), ("dir/Sub/c.txt", "dir/Sub/d.txt")],
+    ),
+    (
+        [
+            Edit::Move("Dir/Sub", "Dir/sub"),
+            Edit::Move("Top.txt", "Dir/sub/Top.txt"),
+        ],
+        [("Dir/Sub", "Dir/sub"), ("Top.txt", "Dir/sub/Top.txt")],
+    ),
+    (
+        [Edit::Move("Dir", "dir"), Edit::Move("dir/Sub", "dir/sub")],
+        [("Dir", "dir"), ("dir/Sub", "dir/sub")],
+    ),
+];
+
 /// Stages `path` and everything below it, taking a name that differs from the tree's only in case
 /// as a rename.
 pub(super) async fn stage(instance: &Instance, path: &Path) {
@@ -189,7 +227,7 @@ pub(super) async fn stage_and_commit(instance: &Instance, path: &Path, message: 
 
 /// An edit to the working tree.
 #[derive(Clone, Copy, Debug)]
-pub(super) enum Edit {
+pub(crate) enum Edit {
     /// Renames the first path to the second.
     Move(&'static str, &'static str),
     /// Writes the content to the file at the path.

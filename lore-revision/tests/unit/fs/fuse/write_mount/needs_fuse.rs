@@ -1578,3 +1578,87 @@ async fn a_forced_sync_adding_a_file_over_a_local_one_drops_what_the_kernel_cach
     .await;
     m.unmount().await;
 }
+
+/// `files` by path, with each directory above them, as [`walked`] holds a tree.
+fn tree_holding(files: &std::collections::BTreeMap<String, Vec<u8>>) -> Tree {
+    let mut tree = Tree::new();
+    for (path, content) in files {
+        let mut parent = path.as_str();
+        while let Some((above, _)) = parent.rsplit_once('/') {
+            tree.insert(above.to_string(), None);
+            parent = above;
+        }
+        tree.insert(path.clone(), Some(content.clone()));
+    }
+    tree
+}
+
+/// A merge onto a FUSE instance of the branch whose latest revision makes each of
+/// [`RENAMES_BELOW`], into a branch from its parent that added a file, serves the tree the merged
+/// revision holds: only the spellings it holds, each file with its content, and nothing below a
+/// directory's other spelling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_across_a_move_below_a_case_only_rename_serves_only_the_merged_spellings() {
+    use crate::revision::instance::Edit;
+    use crate::revision::instance::RENAMES_BELOW;
+    use crate::revision::instance::renamed_all;
+
+    skip_without_fuse!();
+    const TREE: [&str; 4] = ["Dir/a.txt", "Dir/b.txt", "Dir/Sub/c.txt", "Top.txt"];
+    let files: Vec<(&str, &[u8])> = TREE.iter().map(|path| (*path, path.as_bytes())).collect();
+    for (edits, renames) in &RENAMES_BELOW {
+        let moved: Vec<(&str, &str)> = edits
+            .iter()
+            .map(|edit| match *edit {
+                Edit::Move(from, to) => (from, to),
+                other => panic!("{other:?} is not a move"),
+            })
+            .collect();
+        let instance = Instance::with_moves(&files, &moved).await;
+        let (_, main) =
+            lore_revision::instance::load_current_anchor_boxed(&instance.fixture.repository)
+                .await
+                .expect("the current anchor");
+        let m = instance.mount().await;
+        LORE_CONTEXT
+            .scope(fuse_fixture::setup_test_execution(), async {
+                let parent = instance.fixture.state.parent_self();
+                sync_through(&instance, &m.fs, parent, Default::default())
+                    .await
+                    .expect("sync to the parent");
+                create_branch_id_through(&instance, &m.fs, "target").await;
+                switch_through(&instance, &m.fs, "target")
+                    .await
+                    .expect("switch to target");
+                let root = m.root.clone();
+                blocking(move || std::fs::write(root.join("main.txt"), b"main").expect("write"))
+                    .await;
+                commit_through(&instance, &m.fs, false)
+                    .await
+                    .expect("commit on target");
+            })
+            .await;
+
+        merge_through(&instance, &m.fs, main)
+            .await
+            .expect("the merge");
+        let merged = commit_through(&instance, &m.fs, false)
+            .await
+            .expect("the merge commit");
+
+        let files: std::collections::BTreeMap<String, Vec<u8>> = TREE
+            .iter()
+            .map(|path| (path.to_string(), path.as_bytes().to_vec()))
+            .collect();
+        let mut expected = renamed_all(&files, renames);
+        expected.insert("main.txt".to_string(), b"main".to_vec());
+        let expected = tree_holding(&expected);
+        assert_eq!(walked(&m.root).await, expected, "{edits:?}: served");
+        assert_eq!(
+            revision_tree(&instance, merged).await,
+            expected,
+            "{edits:?}: merged"
+        );
+        m.unmount().await;
+    }
+}

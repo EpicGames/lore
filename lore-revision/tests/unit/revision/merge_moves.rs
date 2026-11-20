@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 //! `lore branch merge` of a move on one branch against changes to the moved node on the other,
-//! as the working tree and the merge revision hold it, and `lore branch merge into` and
-//! `lore revision restore` of a move that edits the moved file.
+//! as the working tree and the merge revision hold it, `lore revision cherry-pick` and
+//! `lore revision revert` of a move below a directory renamed only in case, and
+//! `lore branch merge into` and `lore revision restore` of a move that edits the moved file.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -13,19 +14,26 @@ use lore_base::types::Hash;
 use lore_revision::branch;
 use lore_revision::change;
 use lore_revision::filter::FilterMode;
+use lore_revision::metadata::MetadataInherit;
 use lore_revision::node::ROOT_NODE;
+use lore_revision::revision::cherry_pick::CherryPickOptions;
+use lore_revision::revision::cherry_pick::cherry_pick_boxed;
+use lore_revision::revision::revert::RevertOptions;
+use lore_revision::revision::revert::revert_boxed;
 use lore_revision::revision::sync;
 use lore_revision::state::State;
 use lore_revision::state::diff_collect;
 
 use super::instance::Edit;
 use super::instance::Instance;
+use super::instance::RENAMES_BELOW;
 use super::instance::commit_edits;
 use super::instance::create_branch;
 use super::instance::current;
 use super::instance::merge_branch;
 use super::instance::names_along;
 use super::instance::renamed;
+use super::instance::renamed_all;
 use super::instance::revision_state;
 use super::instance::run;
 use super::instance::switch_to;
@@ -281,14 +289,11 @@ fn renamed_and_edited(
     edited: &str,
     merged_at: &str,
 ) -> BTreeMap<String, Vec<u8>> {
-    let mut files: BTreeMap<String, Vec<u8>> = tree
+    let files: BTreeMap<String, Vec<u8>> = tree
         .iter()
         .map(|path| (path.to_string(), path.as_bytes().to_vec()))
         .collect();
-    for (from, to) in renames {
-        files = renamed(&files, from, to);
-    }
-    files = renamed(&files, edited, merged_at);
+    let mut files = renamed(&renamed_all(&files, renames), edited, merged_at);
     files.insert(merged_at.to_string(), b"edited".to_vec());
     files
 }
@@ -317,12 +322,10 @@ async fn assert_merges_spelled(
     assert_eq!(names.join("/"), merged_at, "{context}");
 }
 
-/// A branch editing a file merges into one moving the file into `Dir/Sub` or within it, where one
-/// branch renames `Dir` only in case and the other `Dir/Sub`, whichever branch renames which: the
-/// working tree and the merge revision hold the file below both new spellings, with the content
-/// the edit gave it, and no path spells either old one. The other directions are left out: a
-/// realize in them, the switch back from the merged branch included, moves or renames a child from
-/// below a directory it renames only in case in the same pass, which it does not handle yet.
+/// A branch editing a file merges with one moving the file into `Dir/Sub` or within it, where one
+/// branch renames `Dir` only in case and the other `Dir/Sub`, whichever branch renames which and
+/// whichever is merged into the other: the working tree and the merge revision hold the file below
+/// both new spellings, with the content the edit gave it, and no path spells either old one.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_edit_against_a_move_across_nested_case_only_renames_merges_all() {
     type Case = ([Edit; 2], [Edit; 2], &'static str, &'static str);
@@ -353,18 +356,19 @@ async fn an_edit_against_a_move_across_nested_case_only_renames_merges_all() {
         ),
     ];
     for (editing, moving, edited, merged_at) in &CASES {
-        run(
-            "an_edit_against_a_move_across_nested_case_only_renames_merges_all",
-            &TREE,
-            move |instance| async move {
-                let renames = [("Dir", "dir"), ("dir/Sub", "dir/sub")];
-                let expected = renamed_and_edited(&TREE, &renames, edited, merged_at);
-                let branches = (&editing[..], &moving[..]);
-                assert_merges_spelled(&instance, branches, &expected, merged_at, &["Dir", "Sub"])
-                    .await;
-            },
-        )
-        .await;
+        for branches in [(&editing[..], &moving[..]), (&moving[..], &editing[..])] {
+            run(
+                "an_edit_against_a_move_across_nested_case_only_renames_merges_all",
+                &TREE,
+                move |instance| async move {
+                    let renames = [("Dir", "dir"), ("dir/Sub", "dir/sub")];
+                    let expected = renamed_and_edited(&TREE, &renames, edited, merged_at);
+                    let stale = ["Dir", "Sub"];
+                    assert_merges_spelled(&instance, branches, &expected, merged_at, &stale).await;
+                },
+            )
+            .await;
+        }
     }
 }
 
@@ -400,12 +404,10 @@ const DEEP_TREE: [&str; 5] = [
 ];
 
 /// Three directories, one inside the next, renamed only in case on alternating branches: one
-/// branch renames `Dir` and `Dir/Sub/Deep`, the other `Dir/Sub`. The branch renaming `Dir/Sub`
-/// merges into the other, where one of the two edits a file in `Deep` and the other leaves it or
-/// moves it within `Deep`: the working tree and the merge revision hold the file below the three
-/// new spellings, with the content the edit gave it. The other directions are left out: a realize
-/// in them, the switch back from the merged branch included, moves or renames a child from below a
-/// directory it renames only in case in the same pass, which it does not handle yet.
+/// branch renames `Dir` and `Dir/Sub/Deep`, the other `Dir/Sub`. Either merges into the other,
+/// where one of the two edits a file in `Deep` and the other leaves it or moves it within `Deep`:
+/// the working tree and the merge revision hold the file below the three new spellings, with the
+/// content the edit gave it.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_edit_below_case_only_renames_alternating_over_three_levels_merges_all() {
     const RENAME_DEEP: Edit = Edit::Move("dir/Sub/Deep", "dir/Sub/deep");
@@ -435,21 +437,107 @@ async fn an_edit_below_case_only_renames_alternating_over_three_levels_merges_al
             "dir/sub/deep/f.txt",
         ),
     ];
-    for (feature, main, merged_at) in &CASES {
+    for (renaming_sub, renaming_dir, merged_at) in &CASES {
+        for branches in [
+            (*renaming_sub, *renaming_dir),
+            (*renaming_dir, *renaming_sub),
+        ] {
+            run(
+                "an_edit_below_case_only_renames_alternating_over_three_levels_merges_all",
+                &DEEP_TREE,
+                move |instance| async move {
+                    let renames = [
+                        ("Dir", "dir"),
+                        ("dir/Sub", "dir/sub"),
+                        ("dir/sub/Deep", "dir/sub/deep"),
+                    ];
+                    let expected =
+                        renamed_and_edited(&DEEP_TREE, &renames, "dir/sub/deep/e.txt", merged_at);
+                    let stale = ["Dir", "Sub", "Deep"];
+                    assert_merges_spelled(&instance, branches, &expected, merged_at, &stale).await;
+                },
+            )
+            .await;
+        }
+    }
+}
+
+/// A branch making each of [`RENAMES_BELOW`] reaches the switch back to main, which leaves the
+/// working tree as main holds it, and the merge into main after an edit there, which leaves it as
+/// the two branches hold it: neither leaves a path below a directory's other spelling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_below_a_case_only_rename_reaches_the_switch_back_and_the_merge() {
+    for (edits, renames) in &RENAMES_BELOW {
         run(
-            "an_edit_below_case_only_renames_alternating_over_three_levels_merges_all",
-            &DEEP_TREE,
+            "a_move_below_a_case_only_rename_reaches_the_switch_back_and_the_merge",
+            &TREE,
             move |instance| async move {
-                let renames = [
-                    ("Dir", "dir"),
-                    ("dir/Sub", "dir/sub"),
-                    ("dir/sub/Deep", "dir/sub/deep"),
-                ];
-                let expected =
-                    renamed_and_edited(&DEEP_TREE, &renames, "dir/sub/deep/e.txt", merged_at);
-                let stale = ["Dir", "Sub", "Deep"];
-                assert_merges_spelled(&instance, (feature, main), &expected, merged_at, &stale)
-                    .await;
+                let before = working_tree(&instance.path);
+                create_branch(&instance, "feature").await;
+                commit_edits(&instance, edits, "Feature").await;
+                switch_to(&instance, branch::DEFAULT_DEFAULT_NAME).await;
+                assert_eq!(working_tree(&instance.path), before, "{edits:?}: switched");
+                commit_edits(&instance, &[Edit::Write("Dir/b.txt", "main")], "Main").await;
+                assert!(
+                    merge_branch(&instance, "feature").await,
+                    "{edits:?}: the merge did not commit"
+                );
+                let mut expected = before.clone();
+                expected.insert("Dir/b.txt".to_string(), b"main".to_vec());
+                assert_eq!(
+                    working_tree(&instance.path),
+                    renamed_all(&expected, renames),
+                    "{edits:?}: merged"
+                );
+            },
+        )
+        .await;
+    }
+}
+
+/// A revision making each of [`RENAMES_BELOW`], cherry-picked onto main and reverted there, carries
+/// the working tree to what the revision holds and back: neither leaves a path below a directory's
+/// other spelling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_below_a_case_only_rename_reaches_a_cherry_pick_and_a_revert() {
+    for (edits, renames) in &RENAMES_BELOW {
+        run(
+            "a_move_below_a_case_only_rename_reaches_a_cherry_pick_and_a_revert",
+            &TREE,
+            move |instance| async move {
+                let before = working_tree(&instance.path);
+                create_branch(&instance, "feature").await;
+                let picked = commit_edits(&instance, edits, "Feature").await;
+                switch_to(&instance, branch::DEFAULT_DEFAULT_NAME).await;
+                cherry_pick_boxed(
+                    instance.repository.clone(),
+                    &instance.write_token,
+                    picked,
+                    CherryPickOptions {
+                        message: "Cherry-pick".to_string(),
+                        no_commit: false,
+                        inherit_metadata: MetadataInherit::default(),
+                    },
+                )
+                .await
+                .expect("Failed to cherry-pick");
+                assert_eq!(
+                    working_tree(&instance.path),
+                    renamed_all(&before, renames),
+                    "{edits:?}: cherry-picked"
+                );
+                revert_boxed(
+                    instance.repository.clone(),
+                    &instance.write_token,
+                    current(&instance).await,
+                    RevertOptions {
+                        message: "Revert".to_string(),
+                        no_commit: false,
+                    },
+                )
+                .await
+                .expect("Failed to revert");
+                assert_eq!(working_tree(&instance.path), before, "{edits:?}: reverted");
             },
         )
         .await;
@@ -502,13 +590,11 @@ async fn the_same_case_only_rename_below_another_rename_merges() {
             "the_same_case_only_rename_below_another_rename_merges",
             &TREE,
             move |instance| async move {
-                let mut expected: BTreeMap<String, Vec<u8>> = TREE
+                let tree: BTreeMap<String, Vec<u8>> = TREE
                     .iter()
                     .map(|path| (path.to_string(), path.as_bytes().to_vec()))
                     .collect();
-                for (from, to) in *renames {
-                    expected = renamed(&expected, from, to);
-                }
+                let mut expected = renamed_all(&tree, renames);
                 if let Some(content) = content {
                     expected.insert(checked.to_string(), content.as_bytes().to_vec());
                 }
@@ -1048,13 +1134,11 @@ async fn a_move_or_delete_below_a_rename_both_branches_make_reaches_the_working_
                 switch_to(&instance, "feature").await;
                 commit_edits(&instance, &[rename, change], "Feature").await;
                 switch_to(&instance, branch::DEFAULT_DEFAULT_NAME).await;
-                let mut expected: BTreeMap<String, Vec<u8>> = TREE
+                let tree: BTreeMap<String, Vec<u8>> = TREE
                     .iter()
                     .map(|path| (path.to_string(), path.as_bytes().to_vec()))
                     .collect();
-                for (from, to) in renames {
-                    expected = renamed(&expected, from, to);
-                }
+                let mut expected = renamed_all(&tree, renames);
                 if let Some(deleted) = deleted {
                     expected.remove(deleted);
                 }
