@@ -437,6 +437,19 @@ pub struct LoreBranchMergeAbortArgs {
 /// | [`LoreEvent::BranchMergeAbortBegin`](crate::interface::LoreEvent::BranchMergeAbortBegin) | Emitted when aborting a branch merge, includes staged and current revision hashes |
 /// | [`LoreEvent::BranchMergeAbortEnd`](crate::interface::LoreEvent::BranchMergeAbortEnd) | Emitted after the merge abort has been completed |
 /// | [`LoreEvent::RevisionSyncProgress`](crate::interface::LoreEvent::RevisionSyncProgress) | Emitted during file realization while reverting merge changes |
+///
+/// ## Unstage Events
+///
+/// A link the abort restores to the pin the current revision holds is unstaged, with the events
+/// of an unstage of its path.
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::FileUnstageBegin`](crate::interface::LoreEvent::FileUnstageBegin) | Emitted when unstaging the link begins |
+/// | [`LoreEvent::FileUnstageProgress`](crate::interface::LoreEvent::FileUnstageProgress) | Emitted periodically during unstaging |
+/// | [`LoreEvent::FileUnstageFile`](crate::interface::LoreEvent::FileUnstageFile) | Emitted for each file that was unstaged |
+/// | [`LoreEvent::FileUnstageEnd`](crate::interface::LoreEvent::FileUnstageEnd) | Emitted when unstaging the link completes |
+/// | [`LoreEvent::FileUnstageRevision`](crate::interface::LoreEvent::FileUnstageRevision) | Emitted with the resulting staged revision, where one remains |
 pub async fn merge_abort(
     globals: LoreGlobalArgs,
     args: LoreBranchMergeAbortArgs,

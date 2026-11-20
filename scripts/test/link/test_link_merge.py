@@ -12,6 +12,7 @@ from error_types import (
     ImproperArgumentsError,
     LocalChanges,
     LoreException,
+    NotInProgress,
     NotSupportedError,
     UnresolvedConflictError,
 )
@@ -1264,7 +1265,8 @@ def test_link_conflict_abort_keeps_to_the_view(
 ):
     """Aborting a merge, or only its link's merge, that conflicts inside a link restores the
     files of the link the view keeps and the pin, and writes none the view excludes, as the
-    merge start did. Widening the view then realizes the pre-merge content."""
+    merge start did, leaving nothing staged and the merge ended. Widening the view then realizes
+    the pre-merge content."""
     repo, source = _parent_linking_at(new_lore_repo, mount)
     conflicted = f"{mount}/conflicted.txt"
     repo.branch_create("feature-branch")
@@ -1289,13 +1291,11 @@ def test_link_conflict_abort_keeps_to_the_view(
         "aborting the merge must restore only what the view keeps"
     )
     staged = [entry["path"] for entry in parse_status_json(repo.status(json=True))]
-    assert staged == (["linked/repo"] if link_only else []), (
-        "aborting the merge must leave staged only the open merge's link row"
-    )
+    assert staged == [], "aborting the merge must leave nothing staged"
     assert link_pin(repo, source.get_id()) == pin_before, (
         "aborting the merge must restore the link's pin"
     )
-    if link_only:
+    with pytest.raises(NotInProgress):
         repo.branch_merge_abort()
     repo.sync(view=view_file(scratch_dir, "wide", []))
     fail_unless_holds(repo, conflicted, "mine\n")

@@ -14,5 +14,4 @@ type: fix
   when it also settled a link row nested in that link, and a link row both branches changed inside
   a link stopping the main repository's merge. `commit` and `commit --link` refuse a conflict left
   in a nested link. These are refused as not supported: resolving a file inside a nested link to
-  one side, a merge that conflicts inside a nested link the working tree doesn't hold, and
-  `branch merge start --link` naming a link nested in another.
+  one side, and a merge that conflicts inside a nested link the working tree doesn't hold.

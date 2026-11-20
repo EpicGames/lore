@@ -6,8 +6,6 @@ use lore_error_set::prelude::*;
 
 use super::LinkError;
 use crate::branch;
-use crate::errors::InvalidPath;
-use crate::errors::NotALink;
 use crate::event;
 use crate::event::LoreLinkEntryEventData;
 use crate::event::LoreLinkInfoEventData;
@@ -49,33 +47,7 @@ pub(crate) async fn info(
     let owner_state = chain.innermost.state.clone();
     let owner_branch = chain.owner_branch(parent_branch);
 
-    let node_link = owner_state
-        .find_relative_node_link(
-            owner_repository.clone(),
-            chain.innermost.node,
-            chain.remainder_path.as_str(),
-        )
-        .await
-        .forward::<LinkError>("Invalid path")?;
-
-    if !node_link.is_valid() {
-        return Err(InvalidPath {
-            path: link_path.to_string(),
-        }
-        .into());
-    }
-
-    let link_node = owner_state
-        .node(owner_repository.clone(), node_link.node)
-        .await
-        .forward::<LinkError>("Failed deserializing state")?;
-
-    if !link_node.is_link() {
-        return Err(NotALink {
-            path: link_path.to_string(),
-        }
-        .into());
-    }
+    let (link_node_id, link_node) = chain.innermost_link(&link_path).await?;
 
     let link_context = owner_repository
         .to_link_context(link_node.address.context.into())
@@ -85,13 +57,13 @@ pub(crate) async fn info(
     // tree, so fall back to the committed registry to describe a link on its
     // way out.
     let link_reference = match owner_state
-        .link_find(owner_repository.clone(), link_context.id, node_link.node)
+        .link_find(owner_repository.clone(), link_context.id, link_node_id)
         .await
     {
         Ok(reference) => reference,
         Err(_) => chain
             .innermost_current_state
-            .link_find(owner_repository.clone(), link_context.id, node_link.node)
+            .link_find(owner_repository.clone(), link_context.id, link_node_id)
             .await
             .forward::<LinkError>("Failed to find link")?,
     };
@@ -134,7 +106,7 @@ pub(crate) async fn info(
     event::LoreEvent::LinkInfo(LoreLinkInfoEventData {
         entry: LoreLinkEntryEventData {
             link: link_context.id,
-            link_node: node_link.node,
+            link_node: link_node_id,
             link_path: LoreString::from(link_path.as_str()),
             source_node: link_node.child,
             source_path: LoreString::from(described.source_path.as_str()),

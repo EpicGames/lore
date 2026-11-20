@@ -4628,6 +4628,35 @@ fn only_a_state_holding_link_merge_state_is_written_in_a_format_earlier_builds_r
     assert_eq!(staged.format_to_write(), StateFormat::LinkMergeState as u32);
 }
 
+/// Writing no link merge rows clears the link merge state, so the state holds no merge rather than
+/// an empty list of rows.
+#[tokio::test]
+async fn writing_no_link_merge_rows_clears_the_link_merge_state() {
+    let repository = null_repository().await;
+    let state = State::new();
+    state
+        .serialize_link_merge_state(repository.clone(), &[LinkMergeEntry::default()])
+        .await
+        .expect("a row is written");
+    assert!(!state.link_merge_hash().is_zero());
+
+    state
+        .serialize_link_merge_state(repository.clone(), &[])
+        .await
+        .expect("no rows are written");
+    assert!(
+        state.link_merge_hash().is_zero(),
+        "no rows leave no link merge state"
+    );
+    assert!(
+        state
+            .deserialize_link_merge_state(repository)
+            .await
+            .expect("the rows read")
+            .is_empty()
+    );
+}
+
 /// A row is compared and carried by the branch it resolves to, read under its own parent's branch:
 /// an auto-following row on its parent's branch names that branch whether it stores it or zero,
 /// and a fixed row names its branch on any parent.

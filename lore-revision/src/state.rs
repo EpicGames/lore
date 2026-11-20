@@ -6678,11 +6678,16 @@ impl State {
         }
     }
 
+    /// Stores `entries` as the state's link merge state, clearing it where there are none.
     pub async fn serialize_link_merge_state(
         &self,
         repository: Arc<RepositoryContext>,
         entries: &[LinkMergeEntry],
     ) -> Result<Hash, StateError> {
+        if entries.is_empty() {
+            self.clear_link_merge_state();
+            return Ok(Hash::default());
+        }
         let header = LinkMergeState {
             count: entries.len() as u32,
             version: LINK_MERGE_STATE_VERSION,

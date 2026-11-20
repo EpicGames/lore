@@ -5,9 +5,7 @@ use std::sync::Arc;
 use lore_error_set::prelude::*;
 
 use super::LinkError;
-use crate::errors::InvalidPath;
 use crate::errors::LocalModifications;
-use crate::errors::NotALink;
 use crate::event;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
@@ -55,45 +53,15 @@ pub(crate) async fn remove(
     let inner_repository = chain.innermost.repository.clone();
     let inner_state = chain.innermost.state.clone();
 
-    let node_link = inner_state
-        .find_relative_node_link(
-            inner_repository.clone(),
-            chain.innermost.node,
-            chain.remainder_path.as_str(),
-        )
-        .await
-        .forward::<LinkError>("Invalid path")?;
-
-    lore_debug!("Link node is {node_link:?}");
-    if !node_link.is_valid() {
-        return Err(InvalidPath {
-            path: link_path.to_string(),
-        }
-        .into());
-    }
-
-    let link_node = inner_state
-        .node(inner_repository.clone(), node_link.node)
-        .await
-        .forward::<LinkError>("Failed deserializing state")?;
-
-    if !link_node.is_link() {
-        return Err(NotALink {
-            path: link_path.to_string(),
-        }
-        .into());
-    }
+    let (link_node_id, link_node) = chain.innermost_link(&link_path).await?;
+    lore_debug!("Link node is {link_node_id}");
 
     let link_id: RepositoryId = link_node.address.context.into();
     let is_staged_add = link_node.is_staged_add();
     // The tree's spelling, which the working tree holds the mount under however the caller
     // spelled it.
     let mount = match inner_state
-        .node_path_below(
-            inner_repository.clone(),
-            node_link.node,
-            chain.innermost.node,
-        )
+        .node_path_below(inner_repository.clone(), link_node_id, chain.innermost.node)
         .await
     {
         Ok(Some(below)) => chain.innermost.path.join(below.as_str()),
@@ -114,20 +82,16 @@ pub(crate) async fn remove(
         if is_staged_add {
             // Link was added but never committed — discard the node from the staged tree
             lore_debug!("Link node was staged for add, discarding instead of staging delete");
-            state::node_discard_fused(
-                inner_state.clone(),
-                inner_repository.clone(),
-                node_link.node,
-            )
-            .await
-            .forward::<LinkError>("Failed to discard link node")?;
+            state::node_discard_fused(inner_state.clone(), inner_repository.clone(), link_node_id)
+                .await
+                .forward::<LinkError>("Failed to discard link node")?;
         } else {
             // Link exists in committed state — stage as deleted
             stage::stage_delete(
                 inner_repository.clone(),
                 inner_state.clone(),
                 link_path.clone(),
-                node_link.node,
+                link_node_id,
                 NodeFlags::NoFlags,
                 Arc::default(),
                 None, // No link tracking when removing links
@@ -140,13 +104,14 @@ pub(crate) async fn remove(
             .link_remove(
                 inner_repository.clone(),
                 link_node.address.context.into(),
-                node_link.node,
+                link_node_id,
             )
             .await
             .forward::<LinkError>("Failed to remove link")?;
 
         // Fold nested link revisions up into the top-level state (no-op if flat).
-        crate::link::propagate_link_chain(&chain, token).await?;
+        crate::link::propagate_link_chain(&chain, token, crate::link::LinkPinRealize::StateOnly)
+            .await?;
 
         state_staged.reparent_onto(state_current.revision());
 

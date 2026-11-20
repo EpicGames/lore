@@ -200,6 +200,8 @@ pub struct UnstageOptions {
     /// Discard the work a staged link add or removal would delete or overwrite at its mount,
     /// which unstaging otherwise refuses to.
     pub discard_local: bool,
+    /// Unstage past the ignore rules and the view, which leave out what they exclude.
+    pub past_filter: bool,
 }
 
 pub async fn unstage(
@@ -1108,7 +1110,7 @@ async fn unstage_node(
 
     // Past the ignore rules where the staged tree tracks a change at or below the node, which it
     // is asked only where the rules would leave the node out.
-    let force = execution_context().globals().force();
+    let force = execution_context().globals().force() || options.past_filter;
     let (child_states, reason) = if force {
         (FilterStates::ROOT, None)
     } else {

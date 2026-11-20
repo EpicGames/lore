@@ -6,8 +6,6 @@ use lore_error_set::prelude::*;
 
 use super::LinkError;
 use crate::branch;
-use crate::errors::InvalidPath;
-use crate::errors::NotALink;
 use crate::event;
 use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::with_operation;
@@ -48,35 +46,8 @@ pub(crate) async fn update(
     .await?;
     let inner_repository = chain.innermost.repository.clone();
     let inner_state = chain.innermost.state.clone();
-
-    let node_link = inner_state
-        .find_relative_node_link(
-            inner_repository.clone(),
-            chain.innermost.node,
-            chain.remainder_path.as_str(),
-        )
-        .await
-        .forward::<LinkError>("Invalid path")?;
-
-    lore_debug!("Link node is {node_link:?}");
-    if !node_link.is_valid() {
-        return Err(InvalidPath {
-            path: link_path.to_string(),
-        }
-        .into());
-    }
-
-    let link_node = inner_state
-        .node(inner_repository.clone(), node_link.node)
-        .await
-        .forward::<LinkError>("Failed deserializing state")?;
-
-    if !link_node.is_link() {
-        return Err(NotALink {
-            path: link_path.to_string(),
-        }
-        .into());
-    }
+    let (link_node_id, link_node) = chain.innermost_link(&link_path).await?;
+    lore_debug!("Link node is {link_node_id}");
 
     if link_node.is_staged() {
         return Err(LinkError::internal("Link has staged changes"));
@@ -93,7 +64,7 @@ pub(crate) async fn update(
         .await
         .forward_with::<LinkError, _>(unreachable)?;
     let link_reference = inner_state
-        .link_find(inner_repository.clone(), link.id, node_link.node)
+        .link_find(inner_repository.clone(), link.id, link_node_id)
         .await
         .forward::<LinkError>("Failed to find link")?;
 
@@ -188,7 +159,7 @@ pub(crate) async fn update(
         .await?;
 
         // Fold nested link revisions up into the top-level state (no-op if flat).
-        link::propagate_link_chain(&chain, token).await?;
+        link::propagate_link_chain(&chain, token, link::LinkPinRealize::StateOnly).await?;
 
         state_staged.reparent_onto(state_current.revision());
 

@@ -2693,8 +2693,16 @@ repositories that have changes. Two operations are scoped to a single link:
 - *Single-link merging.* `branch merge start <branch> --link <path>` runs a merge
   operation through one link's mounted repository and the links nested in it, leaving
   the parent and its other links untouched. Conflicts are resolved at the link's mount
-  path; the parent's link pin updates to the resulting merged revision when the merge
-  operation completes.
+  path; the link's pin in the repository holding it updates to the resulting merged
+  revision when the merge operation completes. For a link nested in other links, each
+  repository on the way pins the next one's staged state, and changes nothing else.
+  `branch merge abort --link <path>` rolls the link back, the links nested in it whose
+  merges it holds first, and each repository on the way that holds nothing else of the
+  merge goes back to its pin from before it. One that holds work of its own keeps it, and
+  the links above it stay staged. `commit --link` of a link commits it and each repository on
+  the way to it whole, the merges they hold included, and an abort of the link after it leaves the pin the
+  commit made. A merge of links alone ends with its last link, aborted or committed, and
+  leaves the parent's own staged changes in place.
 
 Both operations exist because the cascading default isn't always what the user wants.
 Working on a single linked repository at a time, with the parent quiet, matches the

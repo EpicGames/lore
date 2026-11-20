@@ -438,7 +438,7 @@ pub async fn add(
         .send();
 
         // Fold nested link revisions up into the top-level state (no-op if flat).
-        link::propagate_link_chain(&chain, token).await?;
+        link::propagate_link_chain(&chain, token, link::LinkPinRealize::StateOnly).await?;
 
         state_staged.reparent_onto(state_current.revision());
 

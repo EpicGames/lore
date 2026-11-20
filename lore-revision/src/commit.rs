@@ -87,6 +87,7 @@ use crate::repository::RepositoryWriteToken;
 use crate::repository::verify::verify_state_for_commit;
 use crate::revision::sync;
 use crate::state;
+use crate::state::LinkMergeEntry;
 use crate::state::LinkReference;
 use crate::state::Mark;
 use crate::state::NodeMapping;
@@ -1301,14 +1302,46 @@ async fn commit_link_only(
                 })
             })?;
 
-    // The parent is written with its link rows, so only the link committed has to be settled.
+    // `resolve_link_chain` gives one shared mutable state per level so the pin write and the
+    // propagation that follow the link's commit see the same objects.
+    let link_path_rel = RelativePath::from_str(&link_path).unwrap_or_default();
+    let chain = link::resolve_link_chain(
+        NodeMapping::root(repository.clone(), state_parent_staged.clone()),
+        state_parent_current.clone(),
+        link_path_rel.clone(),
+        current_branch,
+    )
+    .await
+    .forward::<CommitError>("Failed to resolve link chain")?;
+
+    let owner_repository = chain.innermost.repository.clone();
+    let owner_state = chain.innermost.state.clone();
+
+    // Locate the link node within the owning repo's staged state.
+    let (link_local_node, _) = chain
+        .innermost_link(&link_path_rel)
+        .await
+        .forward::<CommitError>("Failed to resolve link node in owning repository")?;
+    // The link of the instance's own repository the commit goes through, whose rows it settles,
+    // and the repository it links.
+    let outermost = chain.levels.first().map_or(
+        (link_local_node, resolved_staged.link_context.id),
+        |level| (level.link_node_id, level.child_repository_id),
+    );
+
+    // The parent is written with its link rows, so only the link committed has to be settled
+    // there. Each repository on the way to a nested link is committed whole, so what it holds
+    // unresolved is refused before the link's commit.
     reject_unresolved_link_pins(
         &repository,
         &state_parent_staged,
-        Some(resolved_staged.link_reference.local_node),
+        Some(outermost.0),
         &link::Mount::root(),
     )
     .await?;
+    if !chain.levels.is_empty() {
+        reject_unresolved_link_holders(&chain).await?;
+    }
 
     let resolved_current =
         link::resolve_link_at_path(&state_parent_current, repository.clone(), &link_path)
@@ -1326,9 +1359,10 @@ async fn commit_link_only(
 
     let link_staged_revision = resolved_staged.link_node.linked_node().revision;
     let link_current_revision = resolved_current.link_node.linked_node().revision;
+    // A link follows the branch of the repository holding it.
     let link_branch = resolved_staged
         .link_reference
-        .resolve_branch(current_branch);
+        .resolve_branch(chain.owner_branch(current_branch));
 
     if link_current_revision == link_staged_revision {
         return Err(NothingStaged.into());
@@ -1445,30 +1479,7 @@ async fn commit_link_only(
     // Update the link pin in the OWNING repository's registry (the innermost
     // containing repo for a nested link, the top-level repo otherwise), then
     // fold any intermediate linked revisions up into the top-level staged
-    // state. `resolve_link_chain` gives one shared mutable state per level so
-    // the pin write and the propagation see the same objects.
-    let chain = link::resolve_link_chain(
-        NodeMapping::root(repository.clone(), state_parent_staged.clone()),
-        state_parent_current.clone(),
-        RelativePath::from_str(&link_path).unwrap_or_default(),
-        current_branch,
-    )
-    .await
-    .forward::<CommitError>("Failed to resolve link chain")?;
-
-    let owner_repository = chain.innermost.repository.clone();
-    let owner_state = chain.innermost.state.clone();
-
-    // Locate the link node within the owning repo's staged state.
-    let link_local_node = owner_state
-        .find_relative_node_link(
-            owner_repository.clone(),
-            chain.innermost.node,
-            chain.remainder_path.as_str(),
-        )
-        .await
-        .forward::<CommitError>("Failed to resolve link node in owning repository")?
-        .node;
+    // state.
 
     link::repin_link_node(
         &owner_state,
@@ -1491,9 +1502,7 @@ async fn commit_link_only(
         let level = &chain.levels[i];
         let (child_state, child_repository) = chain.child_at(i);
 
-        let child_current = State::deserialize(child_repository.clone(), level.old_signature)
-            .await
-            .forward::<CommitError>("Failed to deserialize intermediate link current state")?;
+        let child_current = level.current_child.clone();
         let child_built_on = child_state.committed_revision();
         child_state.reparent_onto(level.old_signature);
 
@@ -1567,6 +1576,14 @@ async fn commit_link_only(
             .forward::<CommitError>("Failed to mark intermediate link node staged")?;
     }
 
+    // The commit holds the merges of the link and of the links on the way to it, so the rows the
+    // instance's own repository keeps for the outermost of them, which would roll it back behind
+    // the commit, go.
+    let dry_run = execution_context().globals().dry_run();
+    let ended = !dry_run
+        && !state_parent_staged.link_merge_hash().is_zero()
+        && settle_committed_link_rows(&repository, &state_parent_staged, outermost).await?;
+
     if state_parent_staged.holds_promoted_moves() {
         Box::pin(crate::file::stage::stage_promoted_moves_of_call(
             &repository,
@@ -1576,7 +1593,7 @@ async fn commit_link_only(
         .await
         .forward::<CommitError>("Failed to stage the move of a directory holding the link")?;
     }
-    if !execution_context().globals().dry_run() {
+    if !dry_run {
         let parent_signature = state_parent_staged
             .serialize(repository.clone(), &token)
             .await
@@ -1586,8 +1603,71 @@ async fn commit_link_only(
             .await
             .forward::<CommitError>("Failed to store staged anchor")?;
     }
+    // Only a commit that ends a merge restores its carry, so that is boxed rather than held by
+    // every link's commit.
+    if ended {
+        Box::pin(branch::merge::drop_merge_carry(&repository)).await;
+    }
 
     Ok(link_signature)
+}
+
+/// Settles the link merge rows `state_staged` keeps for the link `local_node`, linking
+/// `link_repository`, whose merge a link's commit committed: an abort is to leave the pin the
+/// commit made. Where the main repository is merged, whose abort but for the links restages each
+/// link with a row, one row rolls the link back to that pin. Otherwise the rows go, and a merge
+/// of links alone ends with its last row, which it says.
+async fn settle_committed_link_rows(
+    repository: &Arc<RepositoryContext>,
+    state_staged: &State,
+    (local_node, link_repository): (NodeID, RepositoryId),
+) -> Result<bool, CommitError> {
+    let rows = state_staged
+        .deserialize_link_merge_state(repository.clone())
+        .await
+        .forward::<CommitError>("Failed to deserialize link merge state")?;
+    let mut remaining: Vec<_> = rows
+        .iter()
+        .filter(|row| row.local_node != local_node)
+        .copied()
+        .collect();
+    if remaining.len() == rows.len() {
+        return Ok(false);
+    }
+    if !state_staged.parent_other().is_zero() {
+        let committed = state_staged
+            .link_find(repository.clone(), link_repository, local_node)
+            .await
+            .forward::<CommitError>("Failed to read the committed link's row")?;
+        remaining.push(LinkMergeEntry::rollback(committed));
+    }
+    state_staged
+        .serialize_link_merge_state(repository.clone(), &remaining)
+        .await
+        .forward::<CommitError>("Failed to serialize link merge state")?;
+    Ok(branch::merge::end_merge_of_links_alone(state_staged))
+}
+
+/// Refuses the commit of the link `chain` leads to where a repository on the way to it, which
+/// the commit commits whole, holds a conflict or a row awaiting the user's choice.
+async fn reject_unresolved_link_holders(
+    chain: &link::ResolvedLinkChain,
+) -> Result<(), CommitError> {
+    for (i, level) in chain.levels.iter().enumerate() {
+        let (holder_state, holder) = chain.child_at(i);
+        let node = level
+            .state
+            .node(level.repository.clone(), level.link_node_id)
+            .await
+            .forward::<CommitError>("Failed to read a link holding the link")?
+            .linked_node()
+            .node;
+        let mount = link::Mount::of_link(&holder, &holder_state, node, level.mount.clone())
+            .await
+            .forward::<CommitError>("Failed resolving the path a link holding the link exposes")?;
+        reject_unresolved_link_tree(&holder, &holder_state, &mount, node).await?;
+    }
+    Ok(())
 }
 
 /// Converts interface metadata args and prepares the commit metadata object.

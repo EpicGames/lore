@@ -1354,6 +1354,10 @@ pub struct LinkChainLevel {
     pub stored_branch: BranchId,
     /// Child's committed pin; used as parent-self when reserializing.
     pub old_signature: Hash,
+    /// Where the instance's working tree mounts the child.
+    pub mount: RelativePath,
+    /// The child's committed state, at `old_signature`.
+    pub current_child: Arc<State>,
 }
 
 /// A link path resolved through zero or more link boundaries. `levels` is empty
@@ -1471,6 +1475,7 @@ pub async fn resolve_link_chain(
                 .await
                 .forward::<LinkError>("Failed deserializing state")?;
 
+            mount_path.push(below_mount.as_str());
             levels.push(LinkChainLevel {
                 repository: cur_repository.clone(),
                 state: cur_state.clone(),
@@ -1479,6 +1484,8 @@ pub async fn resolve_link_chain(
                 branch: resolved_branch,
                 stored_branch: link_reference.branch_to_store(resolved_branch, cur_branch),
                 old_signature,
+                mount: mount_path.clone().freeze(),
+                current_child: child_current_state.clone(),
             });
 
             cur_repository = child_repository;
@@ -1487,7 +1494,6 @@ pub async fn resolve_link_chain(
             cur_branch = resolved_branch;
             cur_node = link.node;
             base_node = link.node;
-            mount_path.push(below_mount.as_str());
             below_mount.clear();
         }
     }
@@ -1512,6 +1518,61 @@ impl ResolvedLinkChain {
         self.levels
             .last()
             .map_or(parent_branch, |level| level.branch)
+    }
+
+    /// The repository and state of each level, outer -> inner, ending with `innermost`'s.
+    pub fn holders(&self) -> impl Iterator<Item = (&Arc<RepositoryContext>, &Arc<State>)> {
+        self.levels
+            .iter()
+            .map(|level| (&level.repository, &level.state))
+            .chain([(&self.innermost.repository, &self.innermost.state)])
+    }
+
+    /// How a pin change staged in `innermost` realizes: in the working tree where `innermost` is
+    /// the instance's repository, and otherwise with the outermost link's pin change
+    /// ([`propagate_link_chain`]).
+    pub fn innermost_realize(&self) -> LinkPinRealize {
+        if self.levels.is_empty() {
+            LinkPinRealize::WorkingTree
+        } else {
+            LinkPinRealize::StateOnly
+        }
+    }
+
+    /// The link `remainder_path` names below `innermost`, with its node ID there. `link_path` is
+    /// the path the chain was resolved from, which an error names.
+    pub async fn innermost_link(
+        &self,
+        link_path: &RelativePath,
+    ) -> Result<(NodeID, Node), LinkError> {
+        let NodeMapping {
+            repository, state, ..
+        } = &self.innermost;
+        let node_link = state
+            .find_relative_node_link(
+                repository.clone(),
+                self.innermost.node,
+                self.remainder_path.as_str(),
+            )
+            .await
+            .forward::<LinkError>("Invalid path")?;
+        if !node_link.is_valid() {
+            return Err(InvalidPath {
+                path: link_path.to_string(),
+            }
+            .into());
+        }
+        let link_node = state
+            .node(repository.clone(), node_link.node)
+            .await
+            .forward::<LinkError>("Failed deserializing state")?;
+        if !link_node.is_link() {
+            return Err(NotALink {
+                path: link_path.to_string(),
+            }
+            .into());
+        }
+        Ok((node_link.node, link_node))
     }
 
     /// The child (state, repository) mounted by level `index`: the next level's
@@ -1563,22 +1624,42 @@ impl ResolvedLinkChain {
 /// Each state stages first the moves its staged climbs promoted ([`drain_promoted_moves`]), the
 /// top-level one included. The caller is responsible for serializing + anchoring the top-level
 /// state afterwards.
+///
+/// `realize` applies to the outermost link's pin, whose change realizes the whole chain's at the
+/// link's path in the repository the chain starts from, which is the working tree's path for a
+/// chain resolved from the instance's root.
 pub async fn propagate_link_chain(
     chain: &ResolvedLinkChain,
     token: &RepositoryWriteToken,
+    realize: LinkPinRealize,
+) -> Result<(), LinkError> {
+    propagate_link_levels(chain, chain.levels.len(), token, realize).await
+}
+
+/// [`propagate_link_chain`] through the outermost `levels` of `chain` alone, where the levels
+/// below them already pin what they should.
+pub async fn propagate_link_levels(
+    chain: &ResolvedLinkChain,
+    levels: usize,
+    token: &RepositoryWriteToken,
+    realize: LinkPinRealize,
 ) -> Result<(), LinkError> {
     // Inner -> outer: serialize each child before repinning its parent.
-    for i in (0..chain.levels.len()).rev() {
+    for i in (0..levels).rev() {
         let level = &chain.levels[i];
         let (child_state, child_repository) = chain.child_at(i);
 
         child_state.reparent_onto(level.old_signature);
         drain_promoted_moves(&child_repository, &child_state).await?;
         let new_signature = child_state
-            .serialize(child_repository, token)
+            .serialize(child_repository.clone(), token)
             .await
             .forward::<LinkError>("Failed to serialize linked state")?;
 
+        if i == 0 && matches!(realize, LinkPinRealize::WorkingTree) {
+            Box::pin(stage_level_pin(level, &child_repository, new_signature)).await?;
+            continue;
+        }
         repin_link_node(
             &level.state,
             level.repository.clone(),
@@ -1596,6 +1677,44 @@ pub async fn propagate_link_chain(
         None => (&chain.innermost.repository, &chain.innermost.state),
     };
     drain_promoted_moves(top_repository, top_state).await
+}
+
+/// Stages `new_signature` as the pin of `level`'s link, a link of the instance's own repository,
+/// realizing the change at its mount. Boxed by its caller, which takes it only for a merge or its
+/// abort.
+async fn stage_level_pin(
+    level: &LinkChainLevel,
+    child_repository: &Arc<RepositoryContext>,
+    new_signature: Hash,
+) -> Result<(), LinkError> {
+    let repository = &level.repository;
+    let (path, link_node, reference) = tokio::try_join!(
+        level
+            .state
+            .node_path_below(repository.clone(), level.link_node_id, ROOT_NODE),
+        level.state.node(repository.clone(), level.link_node_id),
+        level.state.link_find(
+            repository.clone(),
+            level.child_repository_id,
+            level.link_node_id
+        ),
+    )
+    .forward::<LinkError>("Failed reading the link")?;
+    let path = path.ok_or_else(|| LinkError::internal("Failed reading the link"))?;
+    stage_link_pin(
+        repository.clone(),
+        &level.state,
+        child_repository,
+        path,
+        link_node,
+        reference.signature,
+        new_signature,
+        level.stored_branch,
+        LinkMountSource::SamePath,
+        LinkPinRealize::WorkingTree,
+    )
+    .await
+    .map(drop)
 }
 
 /// Stages each whole move a staged climb in `state` promoted, a link's repin or its add among
@@ -2171,7 +2290,8 @@ pub(crate) fn realize_link_pin_change_boxed(
     ))
 }
 
-/// Diffs the pinned subtree between the two pins, spelled from the mount path.
+/// Diffs the pinned subtree between the two pins, spelled from the mount path, leaving out each
+/// node both hold as it is, which only marks of a side's set it apart.
 ///
 /// Reads state alone, so it runs outside the filesystem operation the realize needs.
 async fn link_pin_diff(
@@ -2186,7 +2306,7 @@ async fn link_pin_diff(
         node: pin.node_current,
     };
 
-    let changes = state::diff_collect_subtree(
+    let mut changes = state::diff_collect_subtree(
         state::node_change_state(
             link_context,
             &pin.state_current,
@@ -2206,6 +2326,12 @@ async fn link_pin_diff(
     )
     .await
     .forward::<LinkError>("Failed syncing target link")?;
+    // A node both pins hold as it is, marked staged or dirty on a side, holds nothing to realize,
+    // and a staged file's content may be on disk alone, which a check against the pin refuses.
+    let marks = crate::change::Flags::Staged | crate::change::Flags::Dirty;
+    changes.retain(|change| {
+        change.action != crate::change::FileAction::Keep || !(change.flags - marks).is_empty()
+    });
     Ok(LinkPinDiff {
         changes: Arc::new(changes),
         current: current_tree,
