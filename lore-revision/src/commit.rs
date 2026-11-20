@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
@@ -663,6 +664,15 @@ async fn commit_with_metadata_in_operation(
         )
         .await
         .forward::<CommitError>("validating link message paths")?;
+    }
+
+    if options.layer.is_none() {
+        Box::pin(refuse_link_commits_losing_work(
+            &repository,
+            options.link.as_deref(),
+            &options.link_messages,
+        ))
+        .await?;
     }
 
     if let Some(ref link_path) = options.link {
@@ -2952,6 +2962,241 @@ struct CommitWalk {
     dir_semaphore: Arc<Semaphore>,
     /// The node the walk starts at, set by [`commit_walks`].
     root: NodeID,
+    link_commits: Arc<LinkCommits>,
+}
+
+/// The revision each staged revision of a linked repository commits as on a branch, shared by
+/// every walk of one commit, so that the links pinning one staged revision commit it once.
+type LinkCommits =
+    parking_lot::Mutex<HashMap<(RepositoryId, BranchId, Hash), Arc<tokio::sync::OnceCell<Hash>>>>;
+
+/// A link, at any depth below a staged state, pinning a revision of its repository that is not
+/// committed yet.
+#[lore_macro::test_pub]
+struct UncommittedPin {
+    repository: RepositoryId,
+    /// The branch the link resolves to.
+    branch: BranchId,
+    pin: Hash,
+    mount_path: RelativePath,
+}
+
+/// Refuses, before it writes anything, a commit of the staged state of `repository`, or of the
+/// link at `scope` alone, that would lose work in a repository several of its links reach on one
+/// branch.
+///
+/// The links pinning one staged revision commit it once, through one of them, which reads only its
+/// own mount from the working tree: a file staged from the working tree under another mount would
+/// be committed at its old content. A revision only a merge staged holds the content of each file
+/// it changed, so it commits once.
+async fn refuse_link_commits_losing_work(
+    repository: &Arc<RepositoryContext>,
+    scope: Option<&str>,
+    link_messages: &HashMap<String, String>,
+) -> Result<(), CommitError> {
+    let (_, state_staged, branch) = State::deserialize_current_and_staged(repository.clone())
+        .await
+        .forward::<CommitError>("Failed to deserialize current and staged state")?;
+    let Some(state) = state_staged else {
+        return Ok(());
+    };
+    let pins = uncommitted_link_pins(repository, &state, branch).await?;
+    if let Some(scope) = scope {
+        let Ok(scope) = RelativePath::from_str(scope);
+        let pins: Vec<UncommittedPin> = pins.into_iter().map(|(pin, ..)| pin).collect();
+        return refuse_scoped_link_commit(&pins, &scope);
+    }
+    let mut edited = HashSet::new();
+    for (pin, mounts) in link::group_by(&pins, |(pin, ..)| pin.pin) {
+        let [(_, context, linked), _, ..] = mounts.as_slice() else {
+            continue;
+        };
+        if first_staged_node(context, linked, staged_from_the_working_tree)
+            .await?
+            .is_some()
+        {
+            edited.insert(pin);
+        }
+    }
+    let pins: Vec<UncommittedPin> = pins.into_iter().map(|(pin, ..)| pin).collect();
+    refuse_link_commits(&pins, &edited, link_messages)
+}
+
+/// Whether `node` is a file staged from the working tree, whose content a commit reads from it,
+/// rather than one only a merge staged.
+fn staged_from_the_working_tree(node: &Node) -> bool {
+    node.is_file()
+        && (node.flags & NodeFlags::MergeBits.bits() == 0
+            || node.flags & NodeFlags::Dirty.bits() != 0)
+}
+
+/// The links below `state`, a staged state of `repository` on `branch`, at any depth, that pin a
+/// revision not committed yet, each with that revision. Only a staged link pins one, so only staged
+/// links are read, and a link the working tree holds none of is left out.
+async fn uncommitted_link_pins(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    branch: BranchId,
+) -> Result<Vec<(UncommittedPin, Arc<RepositoryContext>, Arc<State>)>, CommitError> {
+    let mut found = Vec::new();
+    let mut pending = vec![(
+        repository.clone(),
+        state.clone(),
+        branch,
+        link::Mount::root(),
+        0,
+    )];
+    while let Some((holder, holder_state, holder_branch, mount, depth)) = pending.pop() {
+        if depth >= state::MAX_LINK_DEPTH {
+            continue;
+        }
+        let links = holder_state
+            .link_list(holder.clone())
+            .await
+            .forward::<CommitError>("Failed listing links")?;
+        let reads = links
+            .into_iter()
+            .map(|link| {
+                let (holder, holder_state, mount) = (&holder, &holder_state, &mount);
+                async move {
+                    let Some((node, path)) = link::staged_link_node(holder_state, holder, &link)
+                        .await
+                        .forward::<CommitError>("Failed reading a link")?
+                    else {
+                        return Ok(None);
+                    };
+                    let (context, linked) = node
+                        .linked_node()
+                        .open(holder)
+                        .await
+                        .forward::<CommitError>("Failed to deserialize link state")?;
+                    if linked.revision_number() != 0 {
+                        return Ok(None);
+                    }
+                    let Ok(path) = RelativePath::from_str(&path);
+                    let Some(mount_path) = mount.spell(&path) else {
+                        return Ok(None);
+                    };
+                    let nested = link::Mount::of_link(&context, &linked, node.child, mount_path)
+                        .await
+                        .forward::<CommitError>("Failed resolving the path a link exposes")?;
+                    Ok::<_, CommitError>(Some((link, context, linked, nested)))
+                }
+            })
+            .collect();
+        for (link, context, linked, nested) in
+            link::try_join_links(reads).await?.into_iter().flatten()
+        {
+            let branch = link.resolve_branch(holder_branch);
+            found.push((
+                UncommittedPin {
+                    repository: link.repository,
+                    branch,
+                    pin: link.signature,
+                    mount_path: nested.path.clone(),
+                },
+                context.clone(),
+                linked.clone(),
+            ));
+            pending.push((context, linked, branch, nested, depth + 1));
+        }
+    }
+    Ok(found)
+}
+
+/// Refuses a commit of `pins`, the links pinning uncommitted revisions, where two links to one
+/// repository on one branch pin different revisions, which commit apart on one branch, or pin one
+/// revision that holds a file staged from the working tree, as `edited` names them, or are given
+/// different per-link messages at or below them: the commit takes the messages of one of them.
+#[lore_macro::test_pub]
+fn refuse_link_commits(
+    pins: &[UncommittedPin],
+    edited: &HashSet<Hash>,
+    link_messages: &HashMap<String, String>,
+) -> Result<(), CommitError> {
+    for ((repository, _), mounts) in link::group_by(pins, |pin| (pin.repository, pin.branch)) {
+        let [first, rest @ ..] = mounts.as_slice() else {
+            continue;
+        };
+        let first_path = link::display_path(first.mount_path.as_str());
+        for pin in rest {
+            let path = link::display_path(pin.mount_path.as_str());
+            if first.pin != pin.pin {
+                return Err(NotSupported {
+                    operation: format!(
+                        "committing two revisions of repository {repository} on one branch, \
+                         staged under the links at {first_path} and {path}"
+                    ),
+                }
+                .into());
+            }
+            if edited.contains(&pin.pin) {
+                return Err(NotSupported {
+                    operation: format!(
+                        "committing changes made in the working tree inside repository \
+                         {repository} under the links at {first_path} and {path}, which pin one \
+                         staged revision of it"
+                    ),
+                }
+                .into());
+            }
+            if messages_below(link_messages, &first.mount_path)
+                != messages_below(link_messages, &pin.mount_path)
+            {
+                return Err(InvalidArguments {
+                    reason: format!(
+                        "the links at {first_path} and {path} commit one revision of a \
+                         repository, so they take the same per-link messages, at them and below \
+                         them"
+                    ),
+                }
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a commit of the link at `scope` alone, and the links below it, where a link outside it
+/// to one of their repositories on the same branch pins an uncommitted revision too: the commit
+/// would leave that link's revision to commit apart on the same branch.
+#[lore_macro::test_pub]
+fn refuse_scoped_link_commit(
+    pins: &[UncommittedPin],
+    scope: &RelativePath,
+) -> Result<(), CommitError> {
+    for ((repository, _), mounts) in link::group_by(pins, |pin| (pin.repository, pin.branch)) {
+        let inside = |pin: &&UncommittedPin| scope.covers(&pin.mount_path);
+        if mounts.iter().any(inside)
+            && let Some(outside) = mounts.iter().find(|pin| !inside(pin))
+        {
+            return Err(NotSupported {
+                operation: format!(
+                    "committing the link at {} alone, while the link at {} pins an uncommitted \
+                     revision of repository {repository} too. Commit them together",
+                    link::display_path(scope.as_str()),
+                    link::display_path(outside.mount_path.as_str())
+                ),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// The messages of `link_messages` at `mount` or below it, each by its path below `mount`.
+fn messages_below<'a>(
+    link_messages: &'a HashMap<String, String>,
+    mount: &RelativePath,
+) -> BTreeMap<&'a str, &'a str> {
+    link_messages
+        .iter()
+        .filter(|(path, _)| mount.covers(path))
+        .map(|(path, message)| {
+            let below = path[mount.as_str().len()..].trim_start_matches('/');
+            (below, message.as_str())
+        })
+        .collect()
 }
 
 impl CommitWalk {
@@ -2993,6 +3238,7 @@ impl CommitWalk {
             tracker,
             dir_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DIRECTORY_TASKS)),
             root: ROOT_NODE,
+            link_commits: Arc::default(),
         };
         (walk, file_rx)
     }
@@ -3341,6 +3587,7 @@ fn commit_child(
                 walk.parent_branch,
                 walk.tracker.clone(),
                 (walk.missing(), walk.replaced()),
+                walk.link_commits.clone(),
             ))
         );
     } else if child_node.is_file() {
@@ -5595,6 +5842,7 @@ async fn commit_link_node(
         MissingPaths,
         Option<Arc<parking_lot::Mutex<Vec<RelativePath>>>>,
     ),
+    link_commits: Arc<LinkCommits>,
 ) -> Result<(), CommitError> {
     let block_index = NodeBlock::index(node_id);
     let node_index = Node::index(node_id);
@@ -5647,57 +5895,71 @@ async fn commit_link_node(
         .forward::<CommitError>("Commit of link node failed")?;
 
     let branch_id = link_reference.resolve_branch(parent_branch);
-    let based_on = link_based_on(&repository, &state, &link_reference, &link_state).await?;
+    let committed = link_commits
+        .lock()
+        .entry((link.repository, branch_id, node.address.hash))
+        .or_default()
+        .clone();
+    // Boxed, so a link whose revision another link commits holds none of the commit.
+    let link_latest = *committed
+        .get_or_try_init(|| {
+            Box::pin(async {
+                let based_on =
+                    link_based_on(&repository, &state, &link_reference, &link_state).await?;
+                let link_metadata =
+                    if let Some(link_msg) = link_messages.get(relative_path.as_str()) {
+                        let mut overridden = (*metadata).clone();
+                        overridden
+                            .set_string(metadata::MESSAGE, link_msg)
+                            .forward::<CommitError>("Failed to set metadata")?;
+                        Arc::new(overridden)
+                    } else {
+                        metadata.clone()
+                    };
+                let (link_latest, link_node_id) = commit_link(
+                    operation,
+                    link_repository.clone(),
+                    token,
+                    link_state,
+                    relative_path,
+                    link_node,
+                    branch_id,
+                    based_on,
+                    link_metadata,
+                    link_messages,
+                    stats,
+                    parent_tracker,
+                    (missing, replaced),
+                    link_commits.clone(),
+                )
+                .await?;
 
-    let link_metadata = if let Some(link_msg) = link_messages.get(relative_path.as_str()) {
-        let mut overridden = (*metadata).clone();
-        overridden
-            .set_string(metadata::MESSAGE, link_msg)
-            .forward::<CommitError>("Failed to set metadata")?;
-        Arc::new(overridden)
-    } else {
-        metadata.clone()
-    };
+                if link_latest.is_zero() {
+                    lore_error!("Link head is zero");
+                    return Err(CommitError::internal("Commit of link node failed"));
+                }
 
-    let (link_latest, link_node_id) = commit_link(
-        operation,
-        link_repository.clone(),
-        token,
-        link_state,
-        relative_path,
-        link_node,
-        branch_id,
-        based_on,
-        link_metadata,
-        link_messages,
-        stats,
-        parent_tracker,
-        (missing, replaced),
-    )
-    .await?;
+                lore_debug!(
+                    "Link node revision was {} nodeId {}, new revision {} nodeId {}",
+                    node.address.hash,
+                    node.child,
+                    link_latest,
+                    link_node_id
+                );
 
-    if link_latest.is_zero() {
-        lore_error!("Link head is zero");
-        return Err(CommitError::internal("Commit of link node failed"));
-    }
+                if node.address.hash == link_latest {
+                    lore_debug!("Link hash is unchanged");
+                }
 
-    lore_debug!(
-        "Link node revision was {} nodeId {}, new revision {} nodeId {}",
-        node.address.hash,
-        node.child,
-        link_latest,
-        link_node_id
-    );
-
-    if node.address.hash == link_latest {
-        lore_debug!("Link hash is unchanged");
-    }
-
-    // TODO(vri): Implement support for changed link nodeId
-    if node.child != link_node_id {
-        lore_error!("Link nodeId has changed, which is not supported yet");
-        return Err(CommitError::internal("Commit of link node failed"));
-    }
+                // TODO(vri): Implement support for changed link nodeId
+                if node.child != link_node_id {
+                    lore_error!("Link nodeId has changed, which is not supported yet");
+                    return Err(CommitError::internal("Commit of link node failed"));
+                }
+                Ok(link_latest)
+            })
+        })
+        .await?;
 
     delta_add(delta, node_id, node.flags);
 
@@ -5790,6 +6052,7 @@ async fn commit_link(
         MissingPaths,
         Option<Arc<parking_lot::Mutex<Vec<RelativePath>>>>,
     ),
+    link_commits: Arc<LinkCommits>,
 ) -> Result<(Hash, NodeID), CommitError> {
     // Per-link tracker: a linked sub-repo is a logically independent commit
     // and must carry its own durability gate. If we reused the parent's
@@ -5863,7 +6126,10 @@ async fn commit_link(
                 gone,
             );
             let delta = commit_walks(
-                walk,
+                CommitWalk {
+                    link_commits,
+                    ..walk
+                },
                 file_rx,
                 relative_path,
                 node_id,

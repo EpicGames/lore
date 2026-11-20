@@ -757,3 +757,48 @@ LINK_MOVES = {
         ["feature.txt", "linked.txt", "main.txt"],
     ),
 }
+
+
+#: Two links reaching one repository: nested in two linked repositories, held by the main
+#: repository twice, or held by it at two folders of the repository.
+LINKS_TO_ONE_REPOSITORY = {
+    "nested": ("vendor/b/deps/d", "vendor/c/deps/d"),
+    "top-level": ("libs/d", "libs/d-again"),
+    "subtrees": ("libs/a", "libs/b"),
+}
+
+
+def links_to_one_repository(new_lore_repo, shape: str) -> tuple[Lore, Lore, list[Lore]]:
+    """Returns (urc, d, holders): `urc` links `d` at both mounts of `LINKS_TO_ONE_REPOSITORY`
+    under `shape`, at one pin, through `holders`, the repositories linked at the mounts' parents
+    where the links are nested. Each mount holds `d.txt`."""
+    mounts = LINKS_TO_ONE_REPOSITORY[shape]
+    subtrees = shape == "subtrees"
+    d = make_repo(
+        new_lore_repo,
+        {"a/d.txt": "base\n", "b/d.txt": "base\n"} if subtrees else {"d.txt": "base\n"},
+    )
+    urc = make_repo(new_lore_repo, {"a.txt": "base\n"})
+    holders = []
+    if shape == "nested":
+        for mount in mounts:
+            holder = make_repo(new_lore_repo, {"holder.txt": "base\n"})
+            urc.link_add(mount.removesuffix("/deps/d"), holder.get_id(), "/")
+            holders.append(holder)
+        urc.commit("Link the holders")
+        urc.push()
+    for mount in mounts:
+        urc.link_add(mount, d.get_id(), mount.rsplit("/", 1)[1] if subtrees else "/")
+    urc.commit("Link d twice")
+    urc.push()
+    return urc, d, holders
+
+
+def change_through_both_links(urc: Lore, shape: str, files: dict[str, str]):
+    """Commits `files` inside the repository both links of `shape` reach, through the first, and
+    pins the second at the result."""
+    first, second = LINKS_TO_ONE_REPOSITORY[shape]
+    urc.write_commit_push("Change d", {f"{first}/{path}": c for path, c in files.items()})
+    urc.link_update(second, pin=link_pin_at(urc, first))
+    urc.commit("Pin the second link of d")
+    urc.push()

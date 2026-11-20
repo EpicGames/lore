@@ -528,10 +528,9 @@ pub(crate) async fn incoming_following_links(
             .collect(),
     )
     .await?;
-    Ok(group_by_repository(
-        incoming.into_iter().flatten(),
-        |link| link.link_reference.repository,
-    ))
+    Ok(group_by(incoming.into_iter().flatten(), |link| {
+        link.link_reference.repository
+    }))
 }
 
 /// Awaits per-link work [`MAX_CONCURRENT_LINK_TASKS`] at a time, in order, starting none after the
@@ -745,7 +744,7 @@ pub struct LinkTarget {
 pub fn auto_following_mounts(
     link_list: &[LinkReference],
 ) -> Vec<(RepositoryId, Vec<LinkReference>)> {
-    group_by_repository(
+    group_by(
         link_list.iter().copied().filter(|link_reference| {
             let follows = link_reference.auto_follows();
             if !follows {
@@ -760,18 +759,20 @@ pub fn auto_following_mounts(
     )
 }
 
-/// Groups `items` by the linked repository `repository` names for each, in the order the
-/// repositories first appear.
-pub fn group_by_repository<T>(
+/// Groups `items` by the key `key` gives each, in the order the keys first appear.
+pub fn group_by<T, K: PartialEq>(
     items: impl IntoIterator<Item = T>,
-    repository: impl Fn(&T) -> RepositoryId,
-) -> Vec<(RepositoryId, Vec<T>)> {
-    let mut groups: Vec<(RepositoryId, Vec<T>)> = Vec::new();
+    key: impl Fn(&T) -> K,
+) -> Vec<(K, Vec<T>)> {
+    let mut groups: Vec<(K, Vec<T>)> = Vec::new();
     for item in items {
-        let id = repository(&item);
-        match groups.iter_mut().find(|(link_id, _items)| *link_id == id) {
-            Some((_link_id, group)) => group.push(item),
-            None => groups.push((id, vec![item])),
+        let item_key = key(&item);
+        match groups
+            .iter_mut()
+            .find(|(group_key, _items)| *group_key == item_key)
+        {
+            Some((_group_key, group)) => group.push(item),
+            None => groups.push((item_key, vec![item])),
         }
     }
     groups
@@ -1838,6 +1839,20 @@ pub(crate) async fn links_and_merged(
         .collect())
 }
 
+/// The node of `link`, a link row of `state`, with its path, or `None` where the node is not staged.
+pub(crate) async fn staged_link_node(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+    link: &LinkReference,
+) -> Result<Option<(Node, String)>, StateError> {
+    let node = state.node(repository.clone(), link.local_node).await?;
+    if !node.is_staged() {
+        return Ok(None);
+    }
+    let path = state.node_path(repository.clone(), link.local_node).await?;
+    Ok(Some((node, path)))
+}
+
 /// Returns the absolute path of every staged link node (add, delete, or
 /// update) across both states' link registries.
 pub async fn list_staged_node_paths(
@@ -1861,18 +1876,7 @@ pub async fn list_staged_node_paths(
         if !seen.insert(link_reference.local_node) {
             continue;
         }
-        let Ok(node) = state_staged
-            .node(repository.clone(), link_reference.local_node)
-            .await
-        else {
-            continue;
-        };
-        if !node.is_staged() {
-            continue;
-        }
-        let Ok(path) = state_staged
-            .node_path(repository.clone(), link_reference.local_node)
-            .await
+        let Ok(Some((_, path))) = staged_link_node(state_staged, &repository, link_reference).await
         else {
             continue;
         };

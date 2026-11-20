@@ -387,6 +387,7 @@ impl WalkFixture {
             tracker: Arc::new(WriteTracker::new()),
             dir_semaphore: Arc::new(Semaphore::new(0)),
             root: ROOT_NODE,
+            link_commits: Arc::default(),
         });
         let result = commit_directory(walk, RelativePath::new(), ROOT_NODE, None).await;
         let mut sent = Vec::new();

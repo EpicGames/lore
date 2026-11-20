@@ -2588,48 +2588,6 @@ def test_resolving_the_whole_tree_reaches_into_links(new_lore_repo, staging):
 
 
 @pytest.mark.smoke
-def test_resolving_the_whole_tree_reaches_into_each_mount_of_one_repository(
-    new_lore_repo,
-):
-    """A linked repository mounted twice, from two folders, conflicts inside
-    each mount. Resolving the whole tree resolves the conflicts of both."""
-    source = make_repo(new_lore_repo, {"a/data.txt": "base\n", "b/data.txt": "base\n"})
-    parent = make_repo(new_lore_repo, {"root.txt": "root\n"})
-    parent.link_add("first", source.get_id(), "a")
-    parent.link_add("second", source.get_id(), "b")
-    parent.commit("Mount two folders of one repository")
-    parent.push()
-    conflicted = ["first/data.txt", "second/data.txt"]
-    parent.branch_create("feature")
-    parent.push()
-
-    # Two mounts of one repository cannot both commit through the parent, so the
-    # linked repository changes on its own and each branch of the parent repins both.
-    for branch, content in (("feature", "theirs\n"), ("main", "mine\n")):
-        source.branch_switch(branch)
-        source.write_commit_push(
-            f"Change both folders on {branch}",
-            {"a/data.txt": content, "b/data.txt": content},
-        )
-        parent.branch_switch(branch)
-        for mount in ("first", "second"):
-            parent.link_update(mount)
-            parent.commit(f"Repin {mount} on {branch}")
-            parent.push()
-
-    parent.branch_merge_start("feature", message="Merge feature", check=False)
-    assert parent.unresolved_paths() == set(conflicted), (
-        "the merge must conflict inside each mount"
-    )
-
-    parent.write_files(dict.fromkeys(conflicted, "merged\n"))
-    parent.branch_merge_resolve(".")
-    assert parent.unresolved_paths() == set(), (
-        "resolving the whole tree must resolve the conflict inside each mount"
-    )
-
-
-@pytest.mark.smoke
 def test_resolving_a_file_against_a_folder_holding_a_link_is_refused(new_lore_repo):
     """A file on one branch meets a folder holding a link on the other. Taking
     the file, which would remove the link with the folder, is refused and keeps

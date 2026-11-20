@@ -2659,7 +2659,14 @@ branch's counterpart, which the target's need not hold. A link with an explicit 
 the pin it was given. A link the merged branch moves is merged where it moves to. The merge of a
 linked repository treats the links that repository holds by the same rules, so a merge reaches
 nested links up to the link depth limit of 8, and the link holding them pins the result. A link
-back to a repository the merge is already inside is left out.
+back to a repository the merge is already inside is left out. A repository several links reach
+is merged once, and every one of them pins the result. That needs the links to pin it at one
+revision on one branch, and its merge to be free of conflicts; otherwise the merge is refused
+before it writes anything. A link the merged branch adds to such a repository is still merged on
+its own. A commit commits a staged linked revision only a merge staged once for all the links
+pinning it, which therefore take one per-link message. Before it writes anything, it refuses
+changes made in the working tree under several links to one repository, two staged revisions of
+one repository on one branch, and a commit of one of the links alone.
 
 A link's row, its pin, the branch it follows, its flags and the folder it mounts, is merged
 three ways against the common ancestor. A row only the merged branch changed lands whole. A

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
 use std::str::FromStr;
@@ -1225,7 +1226,8 @@ async fn merge_start_link(
             )));
         }
     }
-    let Some(planned) = plan_link_merges(vec![eligible], branch, &[repository.id])
+    let mut reached = FirstReaches::new();
+    let Some(planned) = plan_link_merges(vec![eligible], branch, &[repository.id], &mut reached)
         .await?
         .pop()
     else {
@@ -1236,19 +1238,23 @@ async fn merge_start_link(
     let link_merge_entry = LinkMergeEntry::rollback(link_reference);
 
     let dry_run = execution_context().globals().dry_run();
-    let WrittenLink {
+    let Some(WrittenLink {
         signature: link_signature,
         outcome,
         ..
-    } = write_link_merge(
+    }) = Box::pin(write_link_merge(
         MergeWrite {
             token,
             inherit: &options.inherit_metadata,
             dry_run,
         },
         planned,
-    )
-    .await?;
+        &mut reached,
+    ))
+    .await?
+    else {
+        return Ok(state.revision());
+    };
     if dry_run {
         return Ok(state.revision());
     }
@@ -1339,6 +1345,13 @@ impl EligibleLink {
 /// A link merge checked against the working tree, waiting to be written.
 struct PlannedLinkMerge {
     eligible: EligibleLink,
+    /// `None` where a link planned before reaches the same repository, whose merge this link is
+    /// pinned at.
+    own: Option<OwnLinkMerge>,
+}
+
+/// The merge a link's repository takes in its own right.
+struct OwnLinkMerge {
     source: MergeSource,
     /// The revision the merge starts from, at the path the working tree holds it. `None` where
     /// the working tree holds none of it.
@@ -1347,9 +1360,59 @@ struct PlannedLinkMerge {
     nested: Option<NestedLinkMerges>,
 }
 
+/// Each linked repository a merge reaches, as the first link reaching it pins it, so that a
+/// repository several links reach is merged once.
+type FirstReaches = HashMap<RepositoryId, FirstReach>;
+
+/// A linked repository as the first link reaching it pins it.
+struct FirstReach {
+    /// The path the link is reported at.
+    link_path: String,
+    signature: Hash,
+    branch: BranchId,
+    /// Why the link takes no merge, where it takes none.
+    skipped: Option<LinkMergeSkipReason>,
+    /// Whether its merge can conflict: in it, in a merge nested in it, in a pin both sides moved
+    /// there, or in the merge of a link it brings in.
+    conflicts: bool,
+    /// Whether a later link reaches it too.
+    shared: bool,
+    /// The staged revision of its merge, once written.
+    merged: Option<Hash>,
+}
+
+impl FirstReach {
+    fn of(link: &EligibleLink, skipped: Option<LinkMergeSkipReason>) -> Self {
+        Self {
+            link_path: link.shown_path().to_owned(),
+            signature: link.link_reference.signature,
+            branch: link.resolved_branch,
+            skipped,
+            conflicts: false,
+            shared: false,
+            merged: None,
+        }
+    }
+
+    /// `merged`, a link merged on an earlier pass of a merge on `current_branch`.
+    fn resumed(merged: &MergedLink, current_branch: BranchId) -> Self {
+        Self {
+            link_path: merged.link_path.clone(),
+            signature: merged.link_reference.signature,
+            branch: merged.link_reference.resolve_branch(current_branch),
+            skipped: None,
+            conflicts: false,
+            shared: false,
+            merged: Some(merged.new_signature),
+        }
+    }
+}
+
 /// What a link's merge does to the links its repository holds, checked against the working tree.
 struct NestedLinkMerges {
     planned: Vec<PlannedLinkMerge>,
+    /// Whether a merge nested in the link can conflict, as [`FirstReach::conflicts`] says.
+    conflicts: bool,
     incoming: Vec<IncomingLinks>,
     /// Where the working tree materializes the link's repository.
     mount: Option<Mount>,
@@ -1899,7 +1962,17 @@ async fn merge_start_all(
         }
         kept_by_the_merge(eligible, &removed_links)
     });
-    let planned_links = plan_link_merges(eligible_links, branch, &[repository.id]).await?;
+    let mut reached: FirstReaches = merged_links
+        .iter()
+        .map(|merged| {
+            (
+                merged.link_context.id,
+                FirstReach::resumed(merged, current_branch),
+            )
+        })
+        .collect();
+    let planned_links =
+        plan_link_merges(eligible_links, branch, &[repository.id], &mut reached).await?;
 
     let mut left_out =
         links_the_diff_replaces(&repository, &state_current, &main_merge.diff).await?;
@@ -1931,11 +2004,14 @@ async fn merge_start_all(
     };
     let mut nested = LinkMergeOutcome::default();
     for planned in planned_links {
-        let WrittenLink {
+        let Some(WrittenLink {
             eligible,
             signature,
             outcome,
-        } = write_link_merge(write, planned).await?;
+        }) = Box::pin(write_link_merge(write, planned, &mut reached)).await?
+        else {
+            continue;
+        };
         nested.absorb(outcome);
 
         if !dry_run {
@@ -2056,6 +2132,10 @@ fn kept_by_the_merge(eligible: &EligibleLink, removed: &HashSet<NodeID>) -> bool
 /// of the links nested in each, leaving out each link whose merge would change nothing. `holders`
 /// are the repositories holding `eligible`, the main repository first.
 ///
+/// A link to a repository in `reached`, which a link planned before reaches, is checked at its
+/// own mount and pinned at that merge, skipped where that link is, and refused where the two pin
+/// it differently or the merge can conflict.
+///
 /// Every merge is checked before any is written, so a refused one leaves no merge started. Each
 /// link's diff is dropped once checked and worked out again from the same revisions to be
 /// written, so only one link's diff is held at a time.
@@ -2063,6 +2143,7 @@ async fn plan_link_merges(
     eligible: Vec<EligibleLink>,
     branch: BranchId,
     holders: &[RepositoryId],
+    reached: &mut FirstReaches,
 ) -> Result<Vec<PlannedLinkMerge>, MergeError> {
     // `merge into --link` may have pushed to the remote without touching the local latest.
     let latest = link::try_join_links(
@@ -2075,64 +2156,35 @@ async fn plan_link_merges(
     .forward_any::<MergeError>("loading the merged branch's latest")?;
     let mut planned_links = Vec::with_capacity(eligible.len());
     for (eligible, source_latest) in eligible.into_iter().zip(latest) {
-        if !source_latest.is_zero() && eligible.link_reference.signature == source_latest {
-            lore_debug!(
-                "Skipping link at {} — pin already matches source branch",
-                eligible.shown_path()
-            );
-            skip_link(&eligible, LinkMergeSkipReason::AlreadyAtSource);
+        let repository = eligible.link_context.id;
+        if let Some(first) = reached.get_mut(&repository) {
+            refuse_reaching_again(first, &eligible)?;
+            if let Some(reason) = first.skipped {
+                skip_link(&eligible, reason);
+                continue;
+            }
+            first.shared = true;
+            check_link_merge(&eligible, branch).await?;
+            planned_links.push(PlannedLinkMerge {
+                eligible,
+                own: None,
+            });
+            continue;
+        }
+        let skipped = link_merge_skip(&eligible, branch, source_latest).await;
+        reached.insert(repository, FirstReach::of(&eligible, skipped));
+        if let Some(reason) = skipped {
+            lore_debug!("Skipping link at {}: {reason:?}", eligible.shown_path());
+            skip_link(&eligible, reason);
             continue;
         }
 
-        // Avoid creating an unnecessary merge commit when one side is simply
-        // ahead of the other.
-        if !link::link_has_content_divergence(
-            &eligible.link_context,
-            branch,
-            source_latest,
-            eligible.resolved_branch,
-            eligible.link_reference.signature,
-        )
-        .await
-        {
-            lore_debug!(
-                "Skipping link at {} — no content divergence",
-                eligible.shown_path()
-            );
-            skip_link(&eligible, LinkMergeSkipReason::NoContentDivergence);
-            continue;
-        }
-
-        let link_state = state::State::deserialize(
-            eligible.link_context.clone(),
-            eligible.link_reference.signature,
-        )
-        .await
-        .forward::<MergeError>("deserializing eligible link state")?;
-        let source = link::link_source_path(
-            eligible.link_context.clone(),
-            &link_state,
-            eligible.link_node.child,
-        )
-        .await
-        .forward::<MergeError>("resolving the path the link exposes")?;
-        let current = eligible.mount.clone().map(|path| NodeMapping {
-            repository: eligible.link_context.clone(),
-            state: link_state.clone(),
-            path,
-            node: eligible.link_node.child,
-        });
-        let checked = check_merge(
-            &eligible.link_context,
-            branch,
-            eligible.resolved_branch,
-            eligible.link_reference.signature,
-            current.clone(),
-            None,
-        )
-        .await
-        .forward_with::<MergeError, _>(|| format!("merging link {}", eligible.shown_path()))?;
-        refuse_deleting_the_mount(&eligible, &source, &checked)?;
+        let CheckedLinkMerge {
+            link_state,
+            source,
+            current,
+            merge: checked,
+        } = check_link_merge(&eligible, branch).await?;
         if eligible.mount.is_none() && !checked.diff.conflicts.is_empty() {
             return Err(NotSupported {
                 operation: format!(
@@ -2144,6 +2196,7 @@ async fn plan_link_merges(
             .into());
         }
         let merge_source = checked.source;
+        let conflicts = !checked.diff.conflicts.is_empty();
         let nested = Box::pin(plan_nested_link_merges(
             &eligible,
             checked,
@@ -2151,16 +2204,128 @@ async fn plan_link_merges(
             source,
             branch,
             holders,
+            reached,
         ))
         .await?;
+        if let Some(first) = reached.get_mut(&repository) {
+            first.conflicts = conflicts || nested.as_ref().is_some_and(|nested| nested.conflicts);
+        }
         planned_links.push(PlannedLinkMerge {
             eligible,
-            source: merge_source,
-            current,
-            nested,
+            own: Some(OwnLinkMerge {
+                source: merge_source,
+                current,
+                nested,
+            }),
         });
     }
     Ok(planned_links)
+}
+
+/// Why `eligible` takes no merge of `branch`, whose latest is `source_latest`, where it takes none.
+async fn link_merge_skip(
+    eligible: &EligibleLink,
+    branch: BranchId,
+    source_latest: Hash,
+) -> Option<LinkMergeSkipReason> {
+    if !source_latest.is_zero() && eligible.link_reference.signature == source_latest {
+        return Some(LinkMergeSkipReason::AlreadyAtSource);
+    }
+    // Avoid creating an unnecessary merge commit when one side is simply
+    // ahead of the other.
+    (!link::link_has_content_divergence(
+        &eligible.link_context,
+        branch,
+        source_latest,
+        eligible.resolved_branch,
+        eligible.link_reference.signature,
+    )
+    .await)
+        .then_some(LinkMergeSkipReason::NoContentDivergence)
+}
+
+/// A link's merge checked against the working tree at its mount.
+struct CheckedLinkMerge {
+    link_state: Arc<State>,
+    /// The subtree the link mounts.
+    source: RelativePath,
+    current: Option<NodeMapping>,
+    merge: PreparedMerge,
+}
+
+/// Checks the merge of `branch` into `eligible`'s repository against the working tree at its
+/// mount, refusing one that deletes the subtree it mounts.
+async fn check_link_merge(
+    eligible: &EligibleLink,
+    branch: BranchId,
+) -> Result<CheckedLinkMerge, MergeError> {
+    let link_state = state::State::deserialize(
+        eligible.link_context.clone(),
+        eligible.link_reference.signature,
+    )
+    .await
+    .forward::<MergeError>("deserializing eligible link state")?;
+    let source = link::link_source_path(
+        eligible.link_context.clone(),
+        &link_state,
+        eligible.link_node.child,
+    )
+    .await
+    .forward::<MergeError>("resolving the path the link exposes")?;
+    let current = eligible.mount.clone().map(|path| NodeMapping {
+        repository: eligible.link_context.clone(),
+        state: link_state.clone(),
+        path,
+        node: eligible.link_node.child,
+    });
+    let merge = check_merge(
+        &eligible.link_context,
+        branch,
+        eligible.resolved_branch,
+        eligible.link_reference.signature,
+        current.clone(),
+        None,
+    )
+    .await
+    .forward_with::<MergeError, _>(|| format!("merging link {}", eligible.shown_path()))?;
+    refuse_deleting_the_mount(eligible, &source, &merge)?;
+    Ok(CheckedLinkMerge {
+        link_state,
+        source,
+        current,
+        merge,
+    })
+}
+
+/// Refuses `again`, a later link to the repository `first` reaches, where the two pin it at
+/// different revisions or on different branches, which would merge it twice, or where its merge
+/// can conflict: a resolve settles a conflict at one mount alone.
+fn refuse_reaching_again(first: &FirstReach, again: &EligibleLink) -> Result<(), MergeError> {
+    let (first_path, path) = (
+        link::display_path(&first.link_path),
+        link::display_path(again.shown_path()),
+    );
+    let repository = again.link_context.id;
+    if (first.signature, first.branch) != (again.link_reference.signature, again.resolved_branch) {
+        return Err(InvalidArguments {
+            reason: format!(
+                "the links at {first_path} and {path} pin repository {repository} at different \
+                 revisions or branches. Pin them alike with `lore link update <path> --pin \
+                 <revision>`, commit, and merge again"
+            ),
+        }
+        .into());
+    }
+    if first.conflicts {
+        return Err(NotSupported {
+            operation: format!(
+                "merging repository {repository}, which the links at {first_path} and {path} \
+                 reach, where its merge can conflict"
+            ),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// Checks what `checked`, the merge of `link`'s repository from `link_state`, does to the links
@@ -2176,6 +2341,7 @@ async fn plan_nested_link_merges(
     source: RelativePath,
     branch: BranchId,
     holders: &[RepositoryId],
+    reached: &mut FirstReaches,
 ) -> Result<Option<NestedLinkMerges>, MergeError> {
     let link_context = &link.link_context;
     let state_source = state::State::deserialize(link_context.clone(), checked.diff.source)
@@ -2238,7 +2404,7 @@ async fn plan_nested_link_merges(
         incoming.retain(|incoming| !chain.contains(&incoming.link_context.id));
         incoming
     };
-    let planned = plan_link_merges(eligible, branch, &chain).await?;
+    let planned = plan_link_merges(eligible, branch, &chain, reached).await?;
     left_out.extend(
         planned
             .iter()
@@ -2271,8 +2437,18 @@ async fn plan_nested_link_merges(
         }
         .into());
     }
+    let conflicts = !conflicts.is_empty()
+        || incoming
+            .iter()
+            .any(|incoming| matches!(incoming.merge, IncomingMerge::Merge(_)))
+        || planned.iter().any(|planned| {
+            reached
+                .get(&planned.eligible.link_context.id)
+                .is_some_and(|reached| reached.conflicts)
+        });
     Ok(Some(NestedLinkMerges {
         planned,
+        conflicts,
         incoming,
         mount,
         state_base,
@@ -2317,17 +2493,30 @@ struct WrittenLink {
     outcome: LinkMergeOutcome,
 }
 
-/// Writes `planned`'s merge, and in it the merges of the links its repository holds.
+/// Writes `planned`'s merge, and in it the merges of the links its repository holds, recording
+/// each in `reached`. A link pinned at the merge of a repository another link reaches takes that
+/// merge, or `None` where that link's merge wrote nothing.
 async fn write_link_merge(
     write: MergeWrite<'_>,
     planned: PlannedLinkMerge,
-) -> Result<WrittenLink, MergeError> {
-    let PlannedLinkMerge {
-        eligible,
+    reached: &mut FirstReaches,
+) -> Result<Option<WrittenLink>, MergeError> {
+    let PlannedLinkMerge { eligible, own } = planned;
+    let Some(OwnLinkMerge {
         source,
         current,
         nested,
-    } = planned;
+    }) = own
+    else {
+        return Ok(reached
+            .get(&eligible.link_context.id)
+            .and_then(|reached| reached.merged)
+            .map(|signature| WrittenLink {
+                eligible,
+                signature,
+                outcome: LinkMergeOutcome::default(),
+            }));
+    };
     let link_context = &eligible.link_context;
     let merge = prepare_merge(link_context.clone(), source, current, LinkSettlement::Rows)
         .await
@@ -2360,17 +2549,20 @@ async fn write_link_merge(
     let signature = match nested {
         Some(nested) => {
             let (signature, nested_outcome) =
-                Box::pin(stage_nested(write, &eligible, &result, nested)).await?;
+                Box::pin(stage_nested(write, &eligible, &result, nested, reached)).await?;
             outcome.absorb(nested_outcome);
             signature
         }
         None => result.signature,
     };
-    Ok(WrittenLink {
+    reached
+        .entry(eligible.link_context.id)
+        .and_modify(|reached| reached.merged = Some(signature));
+    Ok(Some(WrittenLink {
         eligible,
         signature,
         outcome,
-    })
+    }))
 }
 
 /// Stages in `merged`, the merge of `link`'s repository, what `nested` plans for the links that
@@ -2383,6 +2575,7 @@ async fn stage_nested(
     link: &EligibleLink,
     merged: &MergeRepositoryResult,
     nested: NestedLinkMerges,
+    reached: &mut FirstReaches,
 ) -> Result<(Hash, LinkMergeOutcome), MergeError> {
     let link_context = &link.link_context;
     let state_staged = &merged.state_staged;
@@ -2408,17 +2601,27 @@ async fn stage_nested(
         })?;
         let Some(link_path) = link_path else {
             lore_info!(
-                "The merge removes or replaces link {}, which leaves out the merge of its \
-                 repository",
+                "The merge removes or replaces link {}, which leaves out its pin",
                 planned.eligible.shown_path()
             );
+            // A later link reaching the same repository is pinned at this merge.
+            let shared = planned.own.is_some()
+                && reached
+                    .get(&planned.eligible.link_context.id)
+                    .is_some_and(|reached| reached.shared);
+            if shared && let Some(written) = write_link_merge(write, planned, reached).await? {
+                outcome.absorb(written.outcome);
+            }
             continue;
         };
-        let WrittenLink {
+        let Some(WrittenLink {
             eligible,
             signature,
             outcome: link_outcome,
-        } = write_link_merge(write, planned).await?;
+        }) = write_link_merge(write, planned, reached).await?
+        else {
+            continue;
+        };
         outcome.absorb(link_outcome);
         merged_nodes.push(eligible.link_reference.local_node);
         entries.push(LinkMergeEntry::rollback(eligible.link_reference));

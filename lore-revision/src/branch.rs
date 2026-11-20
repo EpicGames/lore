@@ -3315,9 +3315,7 @@ async fn cascade_mounts(
             staged: false,
         }))
         .filter(|mount| mount.link.auto_follows());
-    Ok(link::group_by_repository(mounts, |mount| {
-        mount.link.repository
-    }))
+    Ok(link::group_by(mounts, |mount| mount.link.repository))
 }
 
 /// The branch a cascade makes in linked repositories.
