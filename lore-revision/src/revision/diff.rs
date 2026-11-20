@@ -201,12 +201,7 @@ async fn send_file_changes(diff: Vec<NodeChange>) -> Result<(), DiffError> {
         if change.from.mapping.node != INVALID_NODE {
             old_is_file = change
                 .from
-                .mapping
-                .state
-                .node(
-                    change.from.mapping.repository.clone(),
-                    change.from.mapping.node,
-                )
+                .get_node()
                 .await
                 .forward::<DiffError>("deserializing source state")?
                 .is_file();
@@ -216,9 +211,7 @@ async fn send_file_changes(diff: Vec<NodeChange>) -> Result<(), DiffError> {
         if change.to.mapping.node != INVALID_NODE {
             new_is_file = change
                 .to
-                .mapping
-                .state
-                .node(change.to.mapping.repository.clone(), change.to.mapping.node)
+                .get_node()
                 .await
                 .forward::<DiffError>("deserializing target state")?
                 .is_file();

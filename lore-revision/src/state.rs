@@ -13075,12 +13075,7 @@ pub(crate) async fn apply_tree_changes(
         if !change.to.mapping.node.is_valid_node_id() {
             continue;
         }
-        let mut node = change
-            .to
-            .mapping
-            .state
-            .node(change.to.mapping.repository.clone(), change.to.mapping.node)
-            .await?;
+        let mut node = change.to.get_node().await?;
         node.mode = change.to.mode;
         stage_realized_change(&repository, &target_state, change, node, true)
             .await

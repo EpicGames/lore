@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use bytes::Bytes;
 use lore_base::error::InvalidArguments;
 use lore_error_set::ForwardAny;
 use lore_error_set::WrapInternal;
@@ -17,7 +16,6 @@ use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::FsError;
 use crate::fs::swfs::frozen_files::FrozenFile;
 use crate::fs::swfs::served_tree::Served;
-use crate::node::Node;
 use crate::repository::RepositoryContext;
 use crate::state::NodeComparison;
 use crate::state::node_comparison;
@@ -112,7 +110,7 @@ impl SwfsView {
                 if node.address.hash == previous.hash && node.size == previous_size {
                     return Ok(HoldsAnswer::Compared(NodeComparison::Matches));
                 }
-                let source = stored_content_in(&served_in, &node);
+                let source = crate::immutable::stored_content(&served_in, &node);
                 self.compare(repository, previous, previous_size, &source, established)
                     .await
             }
@@ -197,9 +195,9 @@ impl SwfsView {
             // layer is the one mounted there.
             Some(Served::Node {
                 repository, node, ..
-            }) if !node.is_directory() => {
-                Ok(ContentAnswer::Source(stored_content_in(&repository, &node)))
-            }
+            }) if !node.is_directory() => Ok(ContentAnswer::Source(
+                crate::immutable::stored_content(&repository, &node),
+            )),
             Some(_) => Err(directory_has_no_content(path)),
             // The revision holds nothing here, so the file is one SWFS froze that the record does
             // not hold, such as an ignored one, or it is not there.
@@ -264,7 +262,10 @@ impl SwfsView {
             }) = self.node(&source).await?
                 && !node.is_directory()
             {
-                return Ok(ContentAnswer::Source(stored_content_in(&repository, &node)));
+                return Ok(ContentAnswer::Source(crate::immutable::stored_content(
+                    &repository,
+                    &node,
+                )));
             }
         }
         // A read through the mount would wait on a callback that reads the store, on the pool the
@@ -281,25 +282,6 @@ fn directory_has_no_content(path: &RelativePath) -> FsError {
         reason: format!("{} is a directory, which holds no content", path.as_str()),
     }
     .into()
-}
-
-/// The content of a node, read from the store `repository` addresses it in.
-pub fn stored_content_in(
-    repository: &Arc<RepositoryContext>,
-    node: &Node,
-) -> ContentSource<'static> {
-    // The zero hash every empty file carries addresses nothing in the store.
-    if node.size == 0 {
-        return ContentSource::memory(Bytes::new());
-    }
-    ContentSource::stored(
-        repository.immutable_store(),
-        repository.id,
-        node.address,
-        node.size,
-        crate::immutable::read_options_from_repository(repository),
-        crate::immutable::resolve_session(repository),
-    )
 }
 
 /// Whether `source` holds the content `previous` addresses, `previous_size` bytes of it.

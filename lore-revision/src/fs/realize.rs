@@ -37,7 +37,6 @@ use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::ListedEntry;
 use crate::fs::filesystem_provider::MeasuredNode;
 use crate::hash;
-use crate::immutable;
 use crate::interface::LoreString;
 use crate::link::LinkFlags;
 use crate::lore::BranchId;
@@ -3207,94 +3206,6 @@ pub async fn realize_conflicts(
     Ok(())
 }
 
-/// Whether `path` names something in the tree `repository` tracks, which an operation has to
-/// mediate because the provider behind it may be virtualizing the tree.
-///
-/// A repository with no working tree has nothing for a path to be inside.
-#[lore_macro::test_pub]
-fn is_inside_repository(repository: &RepositoryContext, path: &Path) -> bool {
-    repository
-        .require_path()
-        .is_ok_and(|root| path.starts_with(root))
-}
-
-/// Writes `node`'s content to `path`, which names a file the repository does not track: the
-/// three versions an automatic merge attempt writes to the temporary directory to run a
-/// three-way merge over, and unlinks after.
-///
-/// Reaches the filesystem directly rather than through an operation, which is what the
-/// callers already do to probe and unlink these paths. An operation names paths relative to
-/// the tracked tree's root and may be virtualizing what is under it, so a path inside that
-/// tree is refused here rather than written behind the provider's back. The copies a
-/// conflicted merge leaves beside the file are in the tree and go through
-/// [`realize_sidecar_file`].
-pub async fn realize_scratch_file(
-    repository: Arc<RepositoryContext>,
-    path: impl AsRef<Path>,
-    node: Node,
-    stats: Arc<SyncRealizeStats>,
-) -> Result<(), SyncError> {
-    let path = path.as_ref();
-    if is_inside_repository(&repository, path) {
-        return Err(SyncError::internal(format!(
-            "Refusing to write scratch file {} inside the repository root",
-            path.to_string_lossy()
-        )));
-    }
-    if let Some(parent_path) = path.parent() {
-        lore_io::IoDriver::global()
-            .create_dir_all(parent_path)
-            .await
-            .map_err(|err| {
-                SyncError::internal(format!("Failed to create scratch directory: {err}"))
-            })?;
-    }
-
-    let written = if node.size > 0 {
-        let options = immutable::read_options_from_repository(&repository);
-        immutable::read_into_file(repository, node.address, path, None, options)
-            .await
-            .map_err(|err| {
-                SyncError::internal(format!(
-                    "Failed to sync file {}: {err}",
-                    path.to_string_lossy()
-                ))
-            })?
-            .1
-    } else {
-        Some(
-            lore_io::IoDriver::global()
-                .write_file_bytes(path, bytes::Bytes::new(), false)
-                .await
-                .map_err(|err| {
-                    SyncError::internal(format!(
-                        "Failed to sync file {}: {err}",
-                        path.to_string_lossy()
-                    ))
-                })?,
-        )
-    };
-
-    if node.mode & NodeFileMode::Executable == NodeFileMode::Executable {
-        util::fs::metadata_set_executable(path, written.as_ref(), true).await;
-    }
-
-    lore_trace!(
-        "Realized file {} {} bytes {}",
-        path.display(),
-        node.size,
-        node.address.hash
-    );
-
-    stats.complete.file_update.fetch_add(1, Ordering::Relaxed);
-    stats
-        .complete
-        .bytes_update
-        .fetch_add(node.size, Ordering::Relaxed);
-
-    Ok(())
-}
-
 /// Writes `node`'s content to the path `node` occupies, and records the modified time it
 /// lands with.
 ///
@@ -5113,23 +5024,13 @@ fn realize_file_merge(
                 let mut node = if change_to.to.mapping.node.is_valid_node_id() {
                     change_to
                         .to
-                        .mapping
-                        .state
-                        .node(
-                            change_to.to.mapping.repository.clone(),
-                            change_to.to.mapping.node,
-                        )
+                        .get_node()
                         .await
                         .forward::<SyncError>("Failed to resolve node in merge revisions")?
                 } else if change_from.to.mapping.node.is_valid_node_id() {
                     change_from
                         .to
-                        .mapping
-                        .state
-                        .node(
-                            change_from.to.mapping.repository.clone(),
-                            change_from.to.mapping.node,
-                        )
+                        .get_node()
                         .await
                         .forward::<SyncError>("Failed to resolve node in merge revisions")?
                 } else {
@@ -5401,10 +5302,8 @@ async fn merge_file_in_view(
     Ok((size, resolved))
 }
 
-/// Stages the node a file both sides changed at the same path resolves to, flagged with how its
-/// merge left it and with the executable bit [`change::merged_mode`] gives it, and records a
-/// conflict on `state_stage` where one is left. Removes the file where the conflict deletes it.
-/// Returns the node's size.
+/// Stages [`merged_file_node`] and records a conflict on `state_stage` where one is left. Removes
+/// the file where the conflict deletes it. Returns the node's size.
 ///
 /// A deletion at a path this branch lacks is staged as an add taken back: the node is added
 /// staged for deletion, carrying `StagedAdd` beside `StagedDelete`, so that staging the file the
@@ -5424,78 +5323,35 @@ async fn stage_merged_file(
     resolved: bool,
     merge_type: MergeType,
 ) -> Result<u64, SyncError> {
-    let mut node = if take_theirs && change_from.to.mapping.node.is_valid_node_id() {
-        change_from
-            .to
-            .mapping
-            .state
-            .node(
-                change_from.to.mapping.repository.clone(),
-                change_from.to.mapping.node,
-            )
-            .await
-            .forward::<SyncError>("Failed to resolve node in merge revisions")?
+    let node = if take_theirs && change_from.to.mapping.node.is_valid_node_id() {
+        change_from.to.get_node().await
     } else if change_to.to.mapping.node.is_valid_node_id() {
-        change_to
-            .to
-            .mapping
-            .state
-            .node(
-                change_to.to.mapping.repository.clone(),
-                change_to.to.mapping.node,
-            )
-            .await
-            .forward::<SyncError>("Failed to resolve node in merge revisions")?
+        change_to.to.get_node().await
     } else if change_from.to.mapping.node.is_valid_node_id() {
-        change_from
-            .to
-            .mapping
-            .state
-            .node(
-                change_from.to.mapping.repository.clone(),
-                change_from.to.mapping.node,
-            )
-            .await
-            .forward::<SyncError>("Failed to resolve node in merge revisions")?
+        change_from.to.get_node().await
     } else {
         // Should not happen
         lore_error!("Unexpected merge conflict of deleted file in both incoming revisions");
         return Err(SyncError::internal("Invalid change data"));
-    };
+    }
+    .forward::<SyncError>("Failed to resolve node in merge revisions")?;
+    let node = merged_file_node(
+        node,
+        change_from,
+        change_to,
+        take_theirs,
+        conflict,
+        resolved,
+    );
     let size = node.size;
-    if let Some(mode) = change::merged_mode(change_from, change_to) {
-        node.mode = mode;
-    }
-    node.flags = NodeFlags::from_bits_truncate(node.flags)
-        .bitand(NodeFlags::File | NodeFlags::Link)
-        .bits();
-
-    if take_theirs && !change_from.to.mapping.node.is_valid_node_id() {
-        // The incoming side deleted the path, so adopting it deletes.
-        node.flags |= NodeFlags::StagedDelete;
-    } else if conflict && !change_to.to.mapping.node.is_valid_node_id() {
-        node.flags |= NodeFlags::StagedDelete;
-
-        operation.remove(change_to.path()).await?;
-    } else if change_to.action == change::FileAction::Move {
-        node.flags |= NodeFlags::StagedMove;
-    }
-
-    node.flags |= NodeFlags::StagedMerge;
-    if take_theirs {
-        node.flags |= NodeFlags::StagedMergeTheirs;
-    }
-    if conflict {
-        node.flags |= NodeFlags::StagedMergeConflict;
-    }
-    if resolved {
-        node.flags |= NodeFlags::StagedMergeResolved;
-    }
-
     lore_trace!(
         "Staging conflict node in target state with flags {:x}",
         node.flags
     );
+    let takes_deletion = take_theirs && !change_from.to.mapping.node.is_valid_node_id();
+    if conflict && !takes_deletion && !change_to.to.mapping.node.is_valid_node_id() {
+        operation.remove(change_to.path()).await?;
+    }
 
     // The change's own context carries no view filter, so a
     // view-excluded node reaches the staged state instead of being
@@ -5528,6 +5384,45 @@ async fn stage_merged_file(
     Ok(size)
 }
 
+/// `node`, the side a merge stages of a file both sides changed at the same path, with the
+/// executable bit [`change::merged_mode`] gives it and flagged with how the merge left it.
+pub(crate) fn merged_file_node(
+    mut node: Node,
+    change_from: &NodeChange,
+    change_to: &NodeChange,
+    take_theirs: bool,
+    conflict: bool,
+    resolved: bool,
+) -> Node {
+    if let Some(mode) = change::merged_mode(change_from, change_to) {
+        node.mode = mode;
+    }
+    node.flags = NodeFlags::from_bits_truncate(node.flags)
+        .bitand(NodeFlags::File | NodeFlags::Link)
+        .bits();
+
+    if take_theirs && !change_from.to.mapping.node.is_valid_node_id() {
+        // The incoming side deleted the path, so adopting it deletes.
+        node.flags |= NodeFlags::StagedDelete;
+    } else if conflict && !change_to.to.mapping.node.is_valid_node_id() {
+        node.flags |= NodeFlags::StagedDelete;
+    } else if change_to.action == change::FileAction::Move {
+        node.flags |= NodeFlags::StagedMove;
+    }
+
+    node.flags |= NodeFlags::StagedMerge;
+    if take_theirs {
+        node.flags |= NodeFlags::StagedMergeTheirs;
+    }
+    if conflict {
+        node.flags |= NodeFlags::StagedMergeConflict;
+    }
+    if resolved {
+        node.flags |= NodeFlags::StagedMergeResolved;
+    }
+    node
+}
+
 /// Writes the file a divergent move's source side moved at the path it moved it to, outside a dry
 /// run, and stages it there as a merge conflict.
 ///
@@ -5544,12 +5439,7 @@ async fn stage_divergent_move(
     let mut node = if change_from.to.mapping.node.is_valid_node_id() {
         change_from
             .to
-            .mapping
-            .state
-            .node(
-                change_from.to.mapping.repository.clone(),
-                change_from.to.mapping.node,
-            )
+            .get_node()
             .await
             .forward::<SyncError>("Failed to resolve node in merge revisions")?
     } else {

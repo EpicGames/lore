@@ -464,9 +464,7 @@ async fn file_size_from_node_change_id(change: &NodeChange) -> Result<u64, Statu
     } else {
         let size = change
             .to
-            .mapping
-            .state
-            .node(change.to.mapping.repository.clone(), change.to.mapping.node)
+            .get_node()
             .await
             .forward::<StatusError>("accessing node path")?
             .size;

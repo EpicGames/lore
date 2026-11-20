@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -44,7 +43,6 @@ use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_info;
 use crate::lore_trace;
-use crate::node::Node;
 use crate::progress::DiscoveryStats;
 use crate::repository;
 use crate::repository::MERGE_ARTIFACT_SUFFIXES;
@@ -1501,15 +1499,6 @@ pub async fn realize_conflicts(
     })
     .await
     .map(discard_modified_times)?
-}
-
-pub async fn realize_scratch_file(
-    repository: Arc<RepositoryContext>,
-    path: impl AsRef<Path>,
-    node: Node,
-    stats: Arc<SyncRealizeStats>,
-) -> Result<(), SyncError> {
-    crate::fs::realize::realize_scratch_file(repository, path, node, stats).await
 }
 
 /// Whether the working tree holds any of the copies a conflicted merge left beside `path`.

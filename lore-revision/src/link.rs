@@ -2607,12 +2607,7 @@ pub async fn check_incoming_mount_overlaps(
             continue;
         }
 
-        let node = change
-            .to
-            .mapping
-            .state
-            .node(change.to.mapping.repository.clone(), change.to.mapping.node)
-            .await?;
+        let node = change.to.get_node().await?;
 
         if !node.is_link() {
             continue;

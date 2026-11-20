@@ -1475,6 +1475,35 @@ def test_branch_merge_utf8_bom_preserves_bom(new_lore_repo):
 
 
 @pytest.mark.smoke
+@pytest.mark.parametrize(
+    "suffix, reported",
+    [(b"", "M file.txt (automerged)"), (b"\xc3", "M file.txt (automerged)")],
+    ids=["text", "not UTF-8"],
+)
+def test_branch_diff_auto_resolve_merges_text_as_merge_start_does(
+    new_lore_repo, suffix, reported
+):
+    """`branch diff --auto-resolve` resolves a conflict whose text merges cleanly, as `merge start`
+    merges it, a side that is not UTF-8 text included."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push(
+        "Add the file", {"file.txt": b"one\ntwo\nthree\n" + suffix}, offline=True
+    )
+    repo.branch_create("feature", offline=True)
+    repo.write_commit_push(
+        "Edit on feature", {"file.txt": b"feature\ntwo\nthree\n" + suffix}, offline=True
+    )
+    repo.branch_switch("main", offline=True)
+    repo.write_commit_push(
+        "Edit on main", {"file.txt": b"one\ntwo\nmain\n" + suffix}, offline=True
+    )
+
+    output = repo.branch_diff("main", source="feature", auto_resolve=True, offline=True)
+
+    assert reported in output.splitlines(), output
+
+
+@pytest.mark.smoke
 def test_branch_diff_auto_resolve_no_write_required(new_lore_repo):
     """Regression: `branch diff --auto-resolve` must not fail with
     "Write access required but repository was opened read-only" when diff3

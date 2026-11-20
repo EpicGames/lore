@@ -128,3 +128,37 @@ async fn a_dry_run_writes_nothing() {
         "nothing must be written"
     );
 }
+
+/// By the exact rules, text both sides edited on different lines merges as it is, a byte order
+/// mark included.
+#[test]
+fn merge_sides_merges_text_as_it_is() {
+    assert_eq!(
+        merge_sides(
+            "\u{feff}one\ntwo\nthree\n".as_bytes(),
+            "\u{feff}mine\ntwo\nthree\n".as_bytes(),
+            "\u{feff}one\ntwo\ntheirs\n".as_bytes(),
+            TextRules::Exact
+        ),
+        Some("\u{feff}mine\ntwo\ntheirs\n".to_string())
+    );
+}
+
+/// By the exact rules, a side that is not UTF-8 text is left a conflict, as is text both sides
+/// edited on one line, and by the lossy rules auto-resolve has always used it merges.
+#[test]
+fn merge_sides_merges_text_that_is_not_utf8_by_the_lossy_rules_alone() {
+    let sides: [&[u8]; 3] = [b"one\n\xc3", b"mine\n\xc3", b"one\n\xc3"];
+    assert_eq!(
+        merge_sides(sides[0], sides[1], sides[2], TextRules::Exact),
+        None
+    );
+    assert_eq!(
+        merge_sides(sides[0], sides[1], sides[2], TextRules::Lossy),
+        Some("mine\n\u{fffd}".to_string())
+    );
+    assert_eq!(
+        merge_sides(b"one\n", b"mine\n", b"theirs\n", TextRules::Exact),
+        None
+    );
+}

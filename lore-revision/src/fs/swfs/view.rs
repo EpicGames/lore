@@ -21,7 +21,6 @@ mod listing;
 pub use content::ContentAnswer;
 pub use content::HoldsAnswer;
 pub use content::compare_content;
-pub use content::stored_content_in;
 pub use listing::ListingAnswer;
 
 /// The error for a read of `path`, which holds nothing.

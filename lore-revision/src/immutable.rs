@@ -9,6 +9,7 @@ use bytes::Bytes;
 use futures::FutureExt;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
+use lore_storage::ContentSource;
 use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
 use serde::Serialize;
@@ -30,6 +31,7 @@ use crate::lore::VecBytes;
 use crate::lore_debug;
 use crate::lore_trace;
 use crate::lore_warn;
+use crate::node::Node;
 use crate::repository::LocalReads;
 use crate::repository::RepositoryContext;
 use crate::store::ImmutableStore;
@@ -425,6 +427,22 @@ pub fn read(
         read.map(|(_fragment, bytes)| bytes)
             .forward::<ImmutableError>("reading immutable data")
     })
+}
+
+/// The content of `node`, read from the store `repository` addresses it in.
+pub fn stored_content(repository: &Arc<RepositoryContext>, node: &Node) -> ContentSource<'static> {
+    // The zero hash every empty file carries addresses nothing in the store.
+    if node.size == 0 {
+        return ContentSource::memory(Bytes::new());
+    }
+    ContentSource::stored(
+        repository.immutable_store(),
+        repository.id,
+        node.address,
+        node.size,
+        read_options_from_repository(repository),
+        resolve_session(repository),
+    )
 }
 
 /// Read the given data range into `slice`.

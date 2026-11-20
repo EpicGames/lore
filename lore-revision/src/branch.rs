@@ -10,7 +10,6 @@ pub mod reset;
 
 use std::cmp::PartialEq;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::str;
 use std::str::FromStr;
@@ -73,10 +72,7 @@ use crate::metadata;
 use crate::metadata::Metadata;
 use crate::metadata::MetadataError;
 use crate::metadata::MetadataType;
-use crate::node::Node;
-use crate::node::NodeBlock;
 use crate::node::NodeFlags;
-use crate::node::NodeIDExt;
 use crate::repository;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
@@ -84,7 +80,6 @@ use crate::revision;
 use crate::revision::Diff3Summary;
 use crate::revision::DiffItem;
 use crate::revision::DiffResult;
-use crate::revision::sync;
 use crate::state;
 use crate::state::State;
 use crate::state::StateData;
@@ -5107,10 +5102,7 @@ async fn relay_revision_diff3(
 }
 
 /// Per-`DiffItem` step of `branch::diff3`'s auto-resolve drain. Kept
-/// sequential: parallelising without a concurrency cap breaks the
-/// streaming pipeline's memory bound — each in-flight conflict pins
-/// two `NodeChange`s and three open temp files until the text-merge
-/// completes.
+/// sequential, so that the stream holds one conflict's sides at a time.
 ///
 /// The text merge is boxed. Only a conflict with auto-resolve on reaches it,
 /// and inline it would make the step as large as the merge for every item.
@@ -5140,208 +5132,44 @@ fn emit_diff_item_with_auto_resolve(
     }
 }
 
-/// Realises the three sides of one conflict into temp files and runs
-/// `merge3_text_by_pathbuf`. Returns `Some(resolved_change)` only when
-/// the merge produces no conflict markers — any merge failure or any
-/// markers in the output preserve the conflict (returns `None`). The
-/// resolved change carries the executable bit [`change::merged_mode`] gives
-/// the file.
+/// The change the conflict between `change_from` and `change_to` resolves to where its text merges
+/// cleanly by [`crate::merge::TextRules::Lossy`]. It carries the executable bit
+/// [`change::merged_mode`] gives the file.
+///
+/// A side whose content can't be read leaves the conflict, so that a diff still reports it.
 #[lore_macro::test_pub]
 async fn try_auto_resolve_conflict(
     change_from: &NodeChange,
     change_to: &NodeChange,
 ) -> Result<Option<NodeChange>, BranchError> {
-    if change_from.path() != change_to.path() {
+    let Some(conflict) =
+        crate::merge::text_conflict(change_from, change_to, crate::merge::TextRules::Lossy)
+            .await
+            .forward::<BranchError>("reading a conflict's nodes")?
+    else {
         return Ok(None);
-    }
-    let theirs_path: PathBuf = util::fs::generate_temppath("theirs");
-    let base_path: PathBuf = util::fs::generate_temppath("base");
-    let mine_path: PathBuf = util::fs::generate_temppath("mine");
-    let theirs_file = theirs_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
-    let base_file = base_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
-    let mine_file = mine_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
-
-    if change_from.to.mapping.node.is_valid_node_id() {
-        lore_trace!("Change from theirs has valid to node, realize theirs file {theirs_file}");
-        let node = change_from
-            .to
-            .mapping
-            .state
-            .block(
-                change_from.to.mapping.repository.clone(),
-                NodeBlock::index(change_from.to.mapping.node),
-            )
-            .await
-            .forward::<BranchError>("Failed to deserialize revisions state")?
-            .node(Node::index(change_from.to.mapping.node));
-        // TODO(vri): UCS-19228 - Links: Realize link node files during branch sync
-        if node.is_file() {
-            if sync::realize_scratch_file(
-                change_from.to.mapping.repository.clone(),
-                &theirs_path,
-                node,
-                Arc::default(),
-            )
-            .await
-            .forward::<BranchError>("Failed to auto resolve file")
-            .is_err()
-            {
-                return Ok(None);
-            }
-        } else {
-            lore_trace!("Change from theirs is not a file, ignore auto resolve");
-            return Ok(None);
-        }
-    } else {
-        lore_trace!("Change from theirs has no valid to node, empty theirs file");
-        let _ = lore_io::IoDriver::global()
-            .write_file_bytes(&theirs_path, bytes::Bytes::new(), false)
-            .await;
-    }
-
-    if !crate::infer::infer_is_diffable(&lore_storage::ContentSource::file(&theirs_path))
-        .await
-        .unwrap_or(false)
-    {
-        lore_trace!("Change is not diffable and cannot be auto resolved, continue");
-        return Ok(None);
-    }
-
-    if change_from.from.mapping.node.is_valid_node_id() {
-        lore_trace!("Change from base has valid from node, realize base file {base_file}");
-        let node = change_from
-            .from
-            .mapping
-            .state
-            .block(
-                change_from.from.mapping.repository.clone(),
-                NodeBlock::index(change_from.from.mapping.node),
-            )
-            .await
-            .forward::<BranchError>("Failed to deserialize revisions state")?
-            .node(Node::index(change_from.from.mapping.node));
-        // TODO(vri): UCS-19228 - Links: Realize link node files during branch sync
-        if node.is_file() {
-            if sync::realize_scratch_file(
-                change_from.from.mapping.repository.clone(),
-                &base_path,
-                node,
-                Arc::default(),
-            )
-            .await
-            .forward::<BranchError>("Failed to auto resolve file")
-            .is_err()
-            {
-                return Ok(None);
-            }
-        } else {
-            lore_trace!("Change from base is not a file, ignore auto resolve");
-            return Ok(None);
-        }
-    } else {
-        lore_trace!("Change from base has no valid to node, empty base file");
-        let _ = lore_io::IoDriver::global()
-            .write_file_bytes(&base_path, bytes::Bytes::new(), false)
-            .await;
-    }
-
-    if change_to.to.mapping.node.is_valid_node_id() {
-        lore_trace!("Change to mine has valid from node, realize mine file {mine_file}");
-        let node = change_to
-            .to
-            .mapping
-            .state
-            .block(
-                change_to.to.mapping.repository.clone(),
-                NodeBlock::index(change_to.to.mapping.node),
-            )
-            .await
-            .forward::<BranchError>("Failed to deserialize revisions state")?
-            .node(Node::index(change_to.to.mapping.node));
-        // TODO(vri): UCS-19228 - Links: Realize link node files during branch sync
-        if node.is_file() {
-            if sync::realize_scratch_file(
-                change_to.to.mapping.repository.clone(),
-                &mine_path,
-                node,
-                Arc::default(),
-            )
-            .await
-            .forward::<BranchError>("Failed to auto resolve file")
-            .is_err()
-            {
-                return Ok(None);
-            }
-        } else {
-            lore_trace!("Change to mine is not a file, ignore auto resolve");
-            return Ok(None);
-        }
-    } else {
-        lore_trace!("Change to mine has no valid to node, empty mine file");
-        let _ = lore_io::IoDriver::global()
-            .write_file_bytes(&mine_path, bytes::Bytes::new(), false)
-            .await;
-    }
-
-    let resolved = match crate::merge::merge3_text_by_pathbuf(
-        base_path.clone(),
-        mine_path.clone(),
-        theirs_path.clone(),
-        mine_path.clone(),
-        crate::merge::MergeTextMode::DryRun,
-    )
-    .await
-    {
+    };
+    match crate::merge::merge_conflict_as_text(&conflict).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Ok(None),
         Err(err) => {
             lore_debug!(
-                "Auto resolve failed for base {base_file}, mine {mine_file}, theirs {theirs_file} - conflict remains: {err}"
+                "Auto resolve of {} failed, the conflict remains: {err}",
+                change_to.path()
             );
-            false
+            return Ok(None);
         }
-        Ok(true) => {
-            lore_debug!(
-                "Auto resolved with conflict markers for base {base_file}, mine {mine_file}, theirs {theirs_file} - conflict remains"
-            );
-            false
-        }
-        Ok(false) => {
-            lore_trace!(
-                "Auto resolved without any line conflicts for base {base_file}, mine {mine_file}, theirs {theirs_file} - conflict resolved"
-            );
-            true
-        }
-    };
-
-    let _ = util::fs::unlink(base_path).await;
-    let _ = util::fs::unlink(theirs_path).await;
-    let _ = util::fs::unlink(mine_path).await;
-
-    if resolved {
-        let mut to = change_to.to.clone();
-        if let Some(mode) = change::merged_mode(change_from, change_to) {
-            to.mode = mode;
-        }
-        Ok(Some(NodeChange {
-            action: change_to.action,
-            flags: change_to.flags | change::Flags::ConflictAutomerged,
-            from: change_to.from.clone(),
-            to,
-        }))
-    } else {
-        Ok(None)
     }
+    let mut to = change_to.to.clone();
+    if let Some(mode) = change::merged_mode(change_from, change_to) {
+        to.mode = mode;
+    }
+    Ok(Some(NodeChange {
+        action: change_to.action,
+        flags: change_to.flags | change::Flags::ConflictAutomerged,
+        from: change_to.from.clone(),
+        to,
+    }))
 }
 
 /// The stack of `branch` from its metadata, read locally or on the remote, and empty when it can't

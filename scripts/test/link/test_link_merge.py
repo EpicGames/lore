@@ -71,15 +71,21 @@ pytestmark = pytest.mark.own_vfs(
 
 
 def _link_added_on_feature_branch(
-    new_lore_repo, link_path: str, outer: str = "", **link_add_options
+    new_lore_repo,
+    link_path: str,
+    outer: str = "",
+    link_file: str | bytes = "link source content\n",
+    link_files: dict | None = None,
+    **link_add_options,
 ) -> tuple[Lore, Lore]:
-    """Parent repo on `main`, link added and committed on `feature-branch` only. `outer` links a
-    repository there first, which `link_path` is in."""
+    """Parent repo on `main`, link added and committed on `feature-branch` only, to a repository
+    holding `link_files`, or `link_file` as `link-file.txt`. `outer` links a repository there
+    first, which `link_path` is in."""
     if outer:
         repo, _ = make_parent_with_link(new_lore_repo, outer)
     else:
         repo = make_repo(new_lore_repo, {"main-file.txt": "initial content\n"})
-    source_repo = make_repo(new_lore_repo, {"link-file.txt": "link source content\n"})
+    source_repo = make_repo(new_lore_repo, link_files or {"link-file.txt": link_file})
 
     repo.branch_create("feature-branch")
     repo.link_add(link_path, source_repo.get_id(), "/", **link_add_options)
@@ -243,15 +249,19 @@ def _assert_warns_once(output: str):
 def _link_added_on_branch_and_main_moved(
     new_lore_repo,
     link_path: str,
-    feature_edit: str | None,
+    feature_edit: str | bytes | None,
     linked_main_files: dict,
     outer: str = "",
+    link_file: str | bytes = "link source content\n",
+    link_files: dict | None = None,
 ) -> tuple[Lore, Lore]:
-    """`feature-branch` adds a following link and, given `feature_edit`, commits it to
-    `link-file.txt` through the mount. `linked_main_files` are committed to the linked
-    repository's `main` and a change to the parent's, which is left checked out. `outer` adds
-    the link in a link mounted there, which main changes."""
-    repo, source_repo = _link_added_on_feature_branch(new_lore_repo, link_path, outer)
+    """`feature-branch` adds a following link to a repository holding `link_file` and, given
+    `feature_edit`, commits it to `link-file.txt` through the mount. `linked_main_files` are
+    committed to the linked repository's `main` and a change to the parent's, which is left
+    checked out. `outer` adds the link in a link mounted there, which main changes."""
+    repo, source_repo = _link_added_on_feature_branch(
+        new_lore_repo, link_path, outer, link_file, link_files
+    )
     if feature_edit:
         repo.write_commit_push(
             "Edit inside the link", {f"{link_path}/link-file.txt": feature_edit}
@@ -387,17 +397,150 @@ def test_link_added_on_branch_with_conflicting_edits_merges_once_resolved(
     assert mounted_files(repo.clone(), link_path) == {"link-file.txt": "resolved\n"}
 
 
-@pytest.mark.smoke
-def test_link_added_on_branch_with_conflicting_edits_refuses_merge_into(new_lore_repo):
-    """`merge into` refuses a merge whose linked repository conflicts, before pushing either."""
-    link_path = "linked/repo"
+def _link_edited_on_both_sides(
+    new_lore_repo,
+    sides: dict[str, tuple[str | bytes, str | bytes, str | bytes]],
+    executable_on: tuple[str, ...] = (),
+) -> tuple[Lore, Lore]:
+    """`feature-branch` adds a following link to a repository holding each file of `sides` at its
+    base, with main merged in, as `merge into` requires, and commits each file's feature edit
+    through the mount. The linked repository's `main` then commits each file's main edit. Each
+    side `executable_on` names, `"feature"` or `"linked main"`, gives `link-file.txt` the
+    executable bit with its edit."""
     repo, source_repo = _link_added_on_branch_and_main_moved(
-        new_lore_repo, link_path, "edited on feature\n", {}
+        new_lore_repo,
+        "linked/repo",
+        None,
+        {},
+        link_files={name: base for name, (base, _, _) in sides.items()},
     )
     _merge_main_into_feature(repo)
-    source_repo.write_commit_push(
-        "Linked main moves on", {"link-file.txt": "edited on linked main\n"}
+    repo.write_files(
+        {f"linked/repo/{name}": edit for name, (_, edit, _) in sides.items()}
     )
+    if "feature" in executable_on:
+        os.chmod(os.path.join(repo.path, "linked/repo/link-file.txt"), 0o755)
+    repo.stage([f"linked/repo/{name}" for name in sides])
+    repo.commit("Edit inside the link")
+    repo.push()
+    source_repo.write_files({name: edit for name, (_, _, edit) in sides.items()})
+    if "linked main" in executable_on:
+        os.chmod(os.path.join(source_repo.path, "link-file.txt"), 0o755)
+    source_repo.stage(list(sides))
+    source_repo.commit("Linked main moves on")
+    source_repo.push()
+    return repo, source_repo
+
+
+def _is_executable(repo: Lore, path: str) -> bool:
+    return bool(os.stat(os.path.join(repo.path, path)).st_mode & stat.S_IXUSR)
+
+
+# Edits on different lines, as base, feature and linked main, and how they merge.
+_LINK_FILE = ("one\ntwo\nthree\n", "feature\ntwo\nthree\n", "one\ntwo\nmain\n")
+_OTHER_FILE = ("a\nb\nc\n", "feature\nb\nc\n", "a\nb\nmain\n")
+_MERGED = {"link-file.txt": "feature\ntwo\nmain\n", "other.txt": "feature\nb\nmain\n"}
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "executable_on",
+    [
+        (),
+        *(
+            pytest.param(
+                sides,
+                marks=pytest.mark.skipif(
+                    sys.platform == "win32", reason="Windows holds no executable bit"
+                ),
+            )
+            for sides in [("feature",), ("linked main",)]
+        ),
+    ],
+    ids=["text", "executable bit on feature", "executable bit on linked main"],
+)
+def test_link_added_on_branch_with_edits_that_merge_cleanly_merges_into(
+    new_lore_repo, executable_on
+):
+    """`merge into` merges each file both sides changed in a linked repository the merged branch
+    adds where its text merges cleanly, with the executable bit either side gives it, and pins
+    the merge on the target. A dry run of it pushes neither repository."""
+    link_path = "linked/repo"
+    repo, source_repo = _link_edited_on_both_sides(
+        new_lore_repo,
+        {"link-file.txt": _LINK_FILE, "other.txt": _OTHER_FILE},
+        executable_on,
+    )
+    feature_files = mounted_files(repo, link_path)
+    if not executable_on:
+        parent_main = repo.branch_info("main").remote_latest
+        linked_main = source_repo.branch_info("main").remote_latest
+        repo.branch_merge_into(
+            "main", message="Merge feature-branch into main", dry_run=True
+        )
+        assert repo.branch_info("main").remote_latest == parent_main
+        assert source_repo.branch_info("main").remote_latest == linked_main
+
+    repo.branch_merge_into("main", message="Merge feature-branch into main")
+
+    assert mounted_files(repo, link_path) == feature_files
+    source_repo.sync()
+    assert source_repo.revision_info().merge, "Linked main should take a merge"
+    assert mounted_files(source_repo, "") == _MERGED
+    clone = repo.clone(branch="main")
+    _assert_pinned_at_linked_main(clone, source_repo)
+    assert mounted_files(clone, link_path) == _MERGED
+    assert _is_executable(clone, f"{link_path}/link-file.txt") == bool(executable_on)
+
+    repo.branch_switch("main")
+    repo.branch_merge_start("feature-branch", message="Merge feature-branch")
+    assert parse_status_json(repo.status(json=True)) == []
+    assert mounted_files(repo, link_path) == _MERGED
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "sides",
+    [
+        {
+            "link-file.txt": (
+                "source\n",
+                "edited on feature\n",
+                "edited on linked main\n",
+            )
+        },
+        {
+            "link-file.txt": (
+                b"{\\rtf1\none\ntwo\nthree\n",
+                b"{\\rtf1\nfeature\ntwo\nthree\n",
+                b"{\\rtf1\none\ntwo\nmain\n",
+            )
+        },
+        {
+            "link-file.txt": (
+                b"{\\rtf1\none\ntwo\nthree\nfour\nfive\n",
+                b"text\none\nfeature\nthree\nfour\nfive\n",
+                b"text\none\ntwo\nthree\nmain\nfive\n",
+            )
+        },
+        {
+            "link-file.txt": _LINK_FILE,
+            "other.txt": ("a\nb\nc\n", "feature\nb\nc\n", "main\nb\nc\n"),
+        },
+    ],
+    ids=[
+        "same line",
+        "not text",
+        "base not text",
+        "one of two on the same line",
+    ],
+)
+def test_link_added_on_branch_with_conflicting_edits_refuses_merge_into(
+    new_lore_repo, sides
+):
+    """`merge into` refuses a merge whose linked repository holds a conflict it does not merge as
+    text, though another merges cleanly, before pushing either."""
+    repo, source_repo = _link_edited_on_both_sides(new_lore_repo, sides)
     parent_main = repo.branch_info("main").remote_latest
     linked_main = source_repo.branch_info("main").remote_latest
 

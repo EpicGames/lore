@@ -38,6 +38,8 @@ use crate::find;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
+use crate::fs::realize;
+use crate::immutable;
 use crate::infer::ConflictMarkers;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
@@ -54,6 +56,8 @@ use crate::lore_debug;
 use crate::lore_info;
 use crate::lore_trace;
 use crate::lore_warn;
+use crate::merge::TextConflict;
+use crate::merge::TextRules;
 use crate::metadata;
 use crate::metadata::Metadata;
 use crate::metadata::MetadataInherit;
@@ -3983,12 +3987,7 @@ async fn apply_graft_copy(
         }
         let source_node = adopted
             .to
-            .mapping
-            .state
-            .node(
-                adopted.to.mapping.repository.clone(),
-                adopted.to.mapping.node,
-            )
+            .get_node()
             .await
             .forward::<MergeError>("resolving adopted node")?;
 
@@ -7999,8 +7998,9 @@ struct LinkMergedInto {
 }
 
 /// The following links `merge into` brings into `target_branch`, each repository's merged into
-/// the branch they land on and committed there, with the revision they land at. A merge that
-/// conflicts is refused, as `merge into` has no working tree to resolve it in.
+/// the branch they land on and committed there, with the revision they land at. A merge with a
+/// conflict [`crate::merge::merge_conflict_as_text`] leaves a conflict is refused, as
+/// `merge into` has no working tree to resolve it in.
 ///
 /// Each repository's merge is boxed: it holds a diff and a commit, and the path is taken only for
 /// a link the merge brings in.
@@ -8042,27 +8042,28 @@ async fn merge_incoming_links_into(
                                 LinkSettlement::Tree,
                             )
                             .await?;
-                            if !merge.diff.conflicts.is_empty() {
-                                let link_path = &incoming.mounts[0].link_path;
-                                return Err(NotSupported {
-                                    operation: format!(
-                                        "merging into a branch whose linked repository at \
-                                     {link_path} conflicts with this one. Switch to the target \
-                                     branch and merge this one with `lore branch merge start`"
-                                    ),
-                                }
-                                .into());
-                            }
                             if merge.diff.is_empty() {
                                 (source.current_signature, None)
                             } else {
-                                let merged = commit_link_merge_into(
+                                let Some(merged) = commit_link_merge_into(
                                     &incoming.link_context,
                                     token,
                                     merge,
                                     options,
                                 )
-                                .await?;
+                                .await?
+                                else {
+                                    let link_path = &incoming.mounts[0].link_path;
+                                    return Err(NotSupported {
+                                        operation: format!(
+                                            "merging into a branch whose linked repository at \
+                                         {link_path} conflicts with this one. Switch to the \
+                                         target branch and merge this one with `lore branch \
+                                         merge start`"
+                                        ),
+                                    }
+                                    .into());
+                                };
                                 (merged.signature, Some(merged))
                             }
                         }
@@ -8079,15 +8080,103 @@ async fn merge_incoming_links_into(
     .await
 }
 
-/// Commits `merge`, a merge of a linked repository free of conflicts, on the branch it merges
-/// into, writing nothing to the working tree.
+/// The conflicts of a linked merge as [`crate::merge::merge_conflict_as_text`] merges them, `None`
+/// where any is one it leaves a conflict. Read before any content, so that a merge refused for
+/// one reads none.
+async fn text_conflicts(
+    conflicts: &[(NodeChange, NodeChange)],
+) -> Result<Option<Vec<TextConflict<'_>>>, MergeError> {
+    let read: Vec<_> = conflicts
+        .iter()
+        .map(|(source, target)| crate::merge::text_conflict(source, target, TextRules::Exact))
+        .collect();
+    let mut read = futures::stream::iter(read).buffered(MAX_CONCURRENT_TREE_TASKS);
+    let mut text_conflicts = Vec::with_capacity(conflicts.len());
+    while let Some(conflict) = read.next().await {
+        let Some(conflict) = conflict.forward::<MergeError>("reading a conflict's nodes")? else {
+            return Ok(None);
+        };
+        text_conflicts.push(conflict);
+    }
+    Ok(Some(text_conflicts))
+}
+
+/// Merges each of `conflicts` as text and stages it in `state` as `merge start` stages a merge it
+/// resolved. `false` where any is left a conflict.
+async fn stage_merged_texts(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    conflicts: &[TextConflict<'_>],
+) -> Result<bool, MergeError> {
+    let staged: Vec<_> = conflicts
+        .iter()
+        .map(|conflict| stage_merged_text(repository, state, conflict))
+        .collect();
+    let mut staged = futures::stream::iter(staged).buffer_unordered(MAX_CONCURRENT_TREE_TASKS);
+    while let Some(staged) = staged.next().await {
+        if !staged? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn stage_merged_text(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    conflict: &TextConflict<'_>,
+) -> Result<bool, MergeError> {
+    let Some(text) = crate::merge::merge_conflict_as_text(conflict)
+        .await
+        .forward::<MergeError>("merging a file's sides as text")?
+    else {
+        return Ok(false);
+    };
+    let mut node = realize::merged_file_node(
+        conflict.mine,
+        conflict.source,
+        conflict.target,
+        false,
+        false,
+        true,
+    );
+    node.size = text.len() as u64;
+    // Pushed with the linked merge, so another link refusing its merge leaves the remote as it was.
+    node.address = immutable::write(
+        repository.clone(),
+        node.address.context,
+        bytes::Bytes::from(text),
+        immutable::write_options_from_repository(repository.clone()).no_remote_write(),
+    )
+    .await
+    .forward::<MergeError>("storing a merged file")?;
+    stage::stage_single_node(
+        repository.clone(),
+        state.clone(),
+        conflict.target.path().clone(),
+        node,
+        Arc::default(),
+        None,
+        FilterMode::View,
+    )
+    .await
+    .forward::<MergeError>("staging a merged file")?;
+    Ok(true)
+}
+
+/// Commits `merge`, a merge of a linked repository, on the branch it merges into, writing nothing to
+/// the working tree. `None` where a conflict of it is one [`text_conflicts`] or
+/// [`stage_merged_texts`] leaves a conflict.
 async fn commit_link_merge_into(
     link_context: &Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     merge: PreparedMerge,
     options: &MergeIntoOptions,
-) -> Result<LinkMergedInto, MergeError> {
+) -> Result<Option<LinkMergedInto>, MergeError> {
     let PreparedMerge { source, diff, .. } = merge;
+    let Some(conflicts) = text_conflicts(&diff.conflicts).await? else {
+        return Ok(None);
+    };
     let (state_branch, state_from, state_new) = tokio::try_join!(
         state::State::deserialize(link_context.clone(), source.current_signature),
         state::State::deserialize(link_context.clone(), source.revision),
@@ -8107,6 +8196,9 @@ async fn commit_link_merge_into(
     )
     .await
     .forward::<MergeError>("realizing linked changes")?;
+    if !stage_merged_texts(link_context, &state_new, &conflicts).await? {
+        return Ok(None);
+    }
     merge_metadata(
         link_context.clone(),
         changes,
@@ -8129,12 +8221,12 @@ async fn commit_link_merge_into(
         options.message.clone(),
     )
     .await?;
-    Ok(LinkMergedInto {
+    Ok(Some(LinkMergedInto {
         link_context: link_context.clone(),
         state_branch,
         state_new,
         signature,
-    })
+    }))
 }
 
 /// Pins each link of `incoming` that `state_staged`, the merge into the target branch, holds at

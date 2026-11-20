@@ -9,8 +9,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use lore_base::lore_spawn;
-use rand::distr::Alphanumeric;
-use rand::distr::SampleString;
 use tokio::task::JoinSet;
 
 use super::path::DepthPath;
@@ -26,7 +24,6 @@ use crate::lore_trace;
 use crate::lore_warn;
 use crate::node::NodeFileMode;
 use crate::repository::DOT_LORE;
-use crate::repository::TEMP_FILE_EXTENSION;
 use crate::repository::is_reserved_node_name;
 use crate::util::time::Retry;
 use crate::util::time::RetryPolicy;
@@ -723,14 +720,4 @@ pub fn file_unlink_retry() -> Retry {
         .with_limit(10)
         .build()
         .retry()
-}
-
-pub fn generate_temppath(prefix: &str) -> std::path::PathBuf {
-    let name = format!(
-        "{prefix}-{}{TEMP_FILE_EXTENSION}",
-        Alphanumeric.sample_string(&mut rand::rng(), 16).as_str()
-    );
-    let mut path = std::env::temp_dir();
-    path.push(name);
-    path
 }

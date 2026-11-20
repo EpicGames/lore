@@ -61,8 +61,8 @@ use crate::fs::swfs::view::ReadSource;
 use crate::fs::swfs::view::SwfsView;
 use crate::fs::swfs::view::compare_content;
 use crate::fs::swfs::view::file_not_found;
-use crate::fs::swfs::view::stored_content_in;
 use crate::immutable;
+use crate::immutable::stored_content;
 use crate::lore_debug;
 use crate::lore_warn;
 use crate::node::INVALID_NODE;
@@ -2730,7 +2730,7 @@ impl InstanceOperation for SwfsOperation {
         path: &RelativePath,
     ) -> Result<lore_storage::ContentSource<'static>, FsError> {
         if let Some((repository, node)) = self.written_node(path) {
-            return Ok(stored_content_in(&repository, &node));
+            return Ok(stored_content(&repository, &node));
         }
         if self.wrote_to_disk(path) {
             return self.mounted_content(path).await;
@@ -2762,7 +2762,7 @@ impl InstanceOperation for SwfsOperation {
                 repository,
                 previous,
                 previous_size,
-                &stored_content_in(&written_in, &node),
+                &stored_content(&written_in, &node),
                 established,
             )
             .await;

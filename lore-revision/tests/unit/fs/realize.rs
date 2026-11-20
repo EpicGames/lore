@@ -387,36 +387,6 @@ async fn a_realized_move_out_of_a_moved_directory_keeps_its_move() {
     .await;
 }
 
-/// A scratch write reaches the filesystem directly, so a path in the tracked tree has to
-/// be refused: the provider may be virtualizing what is under the root, and a direct
-/// write would go behind it.
-///
-/// The node is empty so that it is written without reading the store, which leaves the
-/// refusal as the only thing that can fail the call.
-#[tokio::test]
-async fn a_scratch_path_inside_the_repository_is_refused() {
-    Box::pin(with_execution(async {
-        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
-        let repository = working_tree_repository(dir.path()).await;
-
-        let inside = dir.path().join("inside.bin");
-        assert!(
-            realize_scratch_file(repository.clone(), &inside, file_node(&[]), Arc::default())
-                .await
-                .is_err(),
-            "A path under the repository root has to go through an operation"
-        );
-        assert!(!inside.exists(), "The refused path must not be written");
-
-        let outside = util::fs::generate_temppath("outside");
-        assert!(
-            !is_inside_repository(&repository, &outside),
-            "A generated scratch path is outside the tree the repository tracks"
-        );
-    }))
-    .await;
-}
-
 /// A file the branch never touched, holding what the current revision says it should.
 /// The merge has to be free to overwrite it.
 #[tokio::test]
