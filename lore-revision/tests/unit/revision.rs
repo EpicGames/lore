@@ -33,6 +33,7 @@ mod merge_local_work;
 mod merge_modes;
 mod merge_moves;
 mod remote_comparison;
+mod replaced_mounts;
 mod resolve;
 mod stale_directory;
 mod sync;
@@ -153,8 +154,9 @@ async fn the_target_walk_holds_no_change_beside_the_join() {
                 &mut conflicting_mounts,
                 (&state, &state),
                 false,
+                LinkSettlement::Tree,
             );
-            let mut joined = Joined::new(0);
+            let mut joined = Joined::new(0, LinkSettlement::Tree);
             let join = joined.join(&[], change, Err(0), false);
 
             assert!(

@@ -16,6 +16,7 @@ use lore_revision::filter::FilterMode;
 use lore_revision::node::Node;
 use lore_revision::node::NodeFlags;
 use lore_revision::revision::DiffItem;
+use lore_revision::revision::LinkSettlement;
 use lore_revision::revision::MergesAcross;
 use lore_revision::revision::diff3_collect;
 use lore_revision::revision::diff3_with_source_cap;
@@ -283,6 +284,7 @@ async fn a_merge_does_not_graft_over_a_target_matching_a_stale_base_directory() 
                 None,
                 Some(Arc::new(view)),
                 MergesAcross::Unknown,
+                LinkSettlement::Tree,
                 tx,
             );
             let collect = async {

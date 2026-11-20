@@ -209,7 +209,7 @@ def fail_unless_holds(repo: Lore, path: str, content: str):
         pytest.fail(f"{path} must hold {content!r}, got {held!r}")
 
 
-def folder_replaced_by_a_link(new_lore_repo) -> tuple[Lore, Lore]:
+def folder_replaced_by_a_link(new_lore_repo, **link_add_options) -> tuple[Lore, Lore]:
     """Parent on `main` holding `SHARED_FOLDER`, plus a `feature` branch where a link
     replaced that folder with a repository of its own, with `feature` checked out.
 
@@ -220,13 +220,25 @@ def folder_replaced_by_a_link(new_lore_repo) -> tuple[Lore, Lore]:
     source = make_repo(new_lore_repo, _unprefixed(SHARED_FOLDER))
 
     parent.branch_create("feature")
-    parent.rmtree("shared")
-    parent.stage("shared", scan=True)
-    parent.link_add("shared", source.get_id(), "/")
-    parent.commit("Replace shared/ with a link")
-    parent.push()
+    replace_folder_with_a_link(parent, source, **link_add_options)
 
     return parent, source
+
+
+def replace_folder_with_a_link(
+    repo: Lore, source: Lore, source_path: str = "/", **link_add_options
+):
+    """Commits `shared/` replaced with a link to `source_path` of `source`, and pushes."""
+    repo.rmtree("shared")
+    repo.stage("shared", scan=True)
+    add_a_link(repo, source, source_path, **link_add_options)
+
+
+def add_a_link(repo: Lore, source: Lore, source_path: str = "/", **link_add_options):
+    """Commits a link at `shared/` to `source_path` of `source`, and pushes."""
+    repo.link_add("shared", source.get_id(), source_path, **link_add_options)
+    repo.commit("Link shared/")
+    repo.push()
 
 
 def link_replaced_by_its_folder(new_lore_repo) -> tuple[Lore, Lore]:

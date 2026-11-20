@@ -11,12 +11,14 @@ import pytest
 from error_types import (
     ImproperArgumentsError,
     LocalChanges,
+    LoreException,
     NotSupportedError,
     UnresolvedConflictError,
 )
 from link_helpers import (
     DEFAULT_PARENT_FILE,
     SHARED_FOLDER,
+    add_a_link,
     add_inside_the_folder,
     assert_crr_clean,
     assert_holds_folder,
@@ -24,10 +26,12 @@ from link_helpers import (
     assert_mount_exposes,
     assert_mount_source,
     change_inside_the_folder,
+    committed_link_pin,
     delete_inside_the_folder,
     delete_the_folder,
     fail_unless_holds,
     folder_replaced_by_a_link,
+    link_entry,
     link_field,
     link_pin,
     link_pins,
@@ -39,6 +43,7 @@ from link_helpers import (
     mounted_files,
     remote_branch_entries,
     remount,
+    replace_folder_with_a_link,
     replace_link_with_folder,
 )
 from lore_parsers import parse_jsonl, parse_status_json
@@ -2091,6 +2096,222 @@ def test_resolving_a_cherry_picked_mount_conflict_is_refused(new_lore_repo):
         "aborting the cherry-pick must leave the branch on its revision"
     )
     assert_holds_link(parent, source, pin)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("merged_branch", ["main", "feature"])
+def test_merge_of_the_same_link_replacing_a_folder_on_both_branches_lands_one_link(
+    new_lore_repo, merged_branch
+):
+    """Both branches replacing the folder with the same link merge with no
+    conflict into one link, which a clone holds and a merge after it keeps."""
+    parent, source = folder_replaced_by_a_link(new_lore_repo)
+    pin = link_pin(parent, source.get_id())
+    parent.branch_switch("main")
+    replace_folder_with_a_link(parent, source)
+    current = "main" if merged_branch == "feature" else "feature"
+    parent.branch_switch(current)
+    head_before = parent.branch_info().local_latest
+
+    output = parent.branch_merge_start(merged_branch, message=f"Merge {merged_branch}")
+    parent.push()
+
+    assert _conflicted_count(output) == 0, (
+        f"the merge must not conflict, got:\n{output}"
+    )
+    assert parent.branch_info().local_latest != head_before, "the merge must commit"
+    assert registered_links(parent) == {"shared": source.get_id()}, (
+        "the merge must hold the one link"
+    )
+    assert_holds_link(parent, source, pin)
+    assert "Verified repository state integrity" in parent.repository_verify(), (
+        "the merged revision must verify"
+    )
+    clone = parent.clone(branch=current)
+    assert registered_links(clone) == {"shared": source.get_id()}, (
+        "a fresh clone must hold the one link"
+    )
+    assert clone.compare_file(source, "shared/a.txt", "a.txt"), (
+        "a fresh clone must serve the linked repository's content at the mount"
+    )
+
+    output = parent.branch_merge_start(merged_branch, message="Merge again")
+    assert _conflicted_count(output) == 0, (
+        f"a second merge must not conflict, got:\n{output}"
+    )
+    assert registered_links(parent) == {"shared": source.get_id()}, (
+        "a second merge must keep the one link"
+    )
+    assert_holds_link(parent, source, pin)
+
+
+def _link_row(parent: Lore) -> tuple[str, int, str]:
+    """The pin, the flags and the mounted subtree of the link at `shared/`."""
+    entry = link_entry(parent, "shared")
+    return entry["revision"], entry["flags"], entry["sourcePath"]
+
+
+def _link_row_conflicts(parent: Lore) -> list[str]:
+    """The paths of the links whose rows the merge in progress lists as conflicting."""
+    return [
+        event["linkPath"]
+        for event in parse_jsonl(
+            parent.branch_merge_conflicts_list(json=True), "branchMergeLinkPinConflict"
+        )
+    ]
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("differ", "resolution"),
+    [("pin", "theirs"), ("flags", "mine"), ("mount", "theirs"), ("added", "mine")],
+)
+def test_merge_of_the_same_repository_linked_otherwise_on_both_branches_conflicts_at_its_row(
+    new_lore_repo, differ, resolution
+):
+    """Both branches putting a link to one repository in place of a folder, or
+    where nothing stood, at other pins, with other flags or mounting another
+    subtree, conflict at the link's row alone, which either side settles and the
+    commit carries."""
+    fixed = differ in ("pin", "added")
+    if differ == "added":
+        parent = make_repo(new_lore_repo, {"root.txt": "root\n"})
+        source = make_repo(new_lore_repo, {"a.txt": "a\n", "b.txt": "b\n"})
+        parent.branch_create("feature")
+        add_a_link(parent, source, disable_branching=True)
+    else:
+        parent, source = folder_replaced_by_a_link(
+            new_lore_repo, disable_branching=fixed
+        )
+    theirs = _link_row(parent)
+    parent.branch_switch("main")
+    if differ in ("pin", "added"):
+        source.write_commit_push("Second revision", {"a.txt": "a second\n"})
+    if differ == "mount":
+        source.write_commit_push("Add a subtree", {"sub/c.txt": "c\n"})
+    put_link = add_a_link if differ == "added" else replace_folder_with_a_link
+    put_link(
+        parent,
+        source,
+        source_path="/sub" if differ == "mount" else "/",
+        disable_branching=differ != "mount",
+    )
+    mine = _link_row(parent)
+    assert mine != theirs, "the branches must link the repository otherwise"
+
+    output = parent.branch_merge_start("feature", message="Merge feature")
+
+    assert _conflicted_count(output) == 0, f"the tree must not conflict, got:\n{output}"
+    assert _link_row_conflicts(parent) == ["shared"], (
+        "the merge must conflict at the row"
+    )
+    if resolution == "mine":
+        parent.branch_merge_resolve_mine("shared")
+        expected = mine
+    else:
+        parent.branch_merge_resolve_theirs("shared")
+        expected = theirs
+    assert "Commit succeeded" in parent.commit("Merge feature")
+    parent.push()
+
+    assert registered_links(parent) == {"shared": source.get_id()}, (
+        "the branch must hold the one link"
+    )
+    assert _link_row(parent) == expected, (
+        f"the link must hold the {resolution} side's row"
+    )
+    assert_holds_link(parent, source, expected[0])
+    assert "Verified repository state integrity" in parent.repository_verify(), (
+        "the revision must verify"
+    )
+
+
+@pytest.mark.smoke
+def test_merge_of_the_same_link_following_each_branch_in_place_of_a_folder_lands_the_later_pin(
+    new_lore_repo,
+):
+    """Both branches replacing the folder with a link to one repository that
+    follows the branch, at two pins, merge with no conflict, leaving the later
+    pin, which holds the other."""
+    parent, source = folder_replaced_by_a_link(new_lore_repo)
+    parent.branch_switch("main")
+    source.write_commit_push("Second revision", {"a.txt": "a second\n"})
+    replace_folder_with_a_link(parent, source)
+    later = link_pin(parent, source.get_id())
+
+    output = parent.branch_merge_start("feature", message="Merge feature")
+
+    assert _conflicted_count(output) == 0, (
+        f"the merge must not conflict, got:\n{output}"
+    )
+    assert parse_status_json(parent.status(json=True)) == [], "the merge must commit"
+    assert_holds_link(parent, source, later)
+
+
+@pytest.mark.smoke
+def test_push_of_the_same_repository_linked_at_another_pin_in_place_of_a_folder_is_refused(
+    new_lore_repo,
+):
+    """A push that replaced the folder with a link to the repository another
+    push linked there at another pin is refused rather than merged on the
+    server, which would drop its pin, and the branch keeps the first."""
+    parent = make_repo(new_lore_repo, {"root.txt": "root\n", **SHARED_FOLDER})
+    source = make_repo(new_lore_repo, {"a.txt": "a\n", "b.txt": "b\n"})
+    other = parent.clone()
+    replace_folder_with_a_link(parent, source, disable_branching=True)
+    first = link_pin(parent, source.get_id())
+    source.write_commit_push("Second revision", {"a.txt": "a second\n"})
+    other.rmtree("shared")
+    other.stage("shared", scan=True)
+    other.link_add("shared", source.get_id(), "/", disable_branching=True)
+    other.commit("Replace shared/ with a link")
+
+    with pytest.raises(LoreException) as refused:
+        other.push(fast_forward_merge=True)
+
+    assert refused.value.returncode == 41, (
+        "the server's refusal exits with BranchAdvanced"
+    )
+    assert committed_link_pin(parent, source.get_id()) == first, (
+        "the branch must keep the first push's pin"
+    )
+
+
+@pytest.mark.smoke
+def test_merge_into_refuses_the_same_repository_linked_at_two_pins_in_a_linked_repository(
+    new_lore_repo,
+):
+    """`merge into` refuses a merge whose linked repository, which the branch
+    adds, replaced a folder with a link to one repository at two pins on the
+    two branches, which it has no row conflict to settle, before pushing
+    either."""
+    parent = make_repo(new_lore_repo, {"root.txt": "root\n"})
+    linked = make_repo(new_lore_repo, SHARED_FOLDER)
+    nested = make_repo(new_lore_repo, {"a.txt": "a\n", "b.txt": "b\n"})
+    parent.branch_create("feature")
+    parent.link_add("outer", linked.get_id(), "/")
+    parent.commit("Link outer/")
+    parent.push()
+    parent.rmtree("outer/shared")
+    parent.stage("outer/shared", scan=True)
+    parent.link_add("outer/shared", nested.get_id(), "/", disable_branching=True)
+    parent.commit("Replace outer/shared/ with a link")
+    parent.push()
+    parent.branch_switch("main")
+    parent.write_commit_push("Change on main", {"root.txt": "root on main\n"})
+    parent.branch_switch("feature")
+    parent.branch_merge_start("main", message="Merge main")
+    parent.push()
+    nested.write_commit_push("Second revision", {"a.txt": "a second\n"})
+    replace_folder_with_a_link(linked, nested, disable_branching=True)
+    parent_main = parent.branch_info("main").remote_latest
+    linked_main = linked.branch_info("main").remote_latest
+
+    with pytest.raises(NotSupportedError):
+        parent.branch_merge_into("main", message="Merge feature into main")
+
+    assert parent.branch_info("main").remote_latest == parent_main
+    assert linked.branch_info("main").remote_latest == linked_main
 
 
 @pytest.mark.smoke

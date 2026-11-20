@@ -2240,6 +2240,7 @@ mod tests {
                     Some(1),
                     None, // history_walk_concurrency: default
                     None, // graft_view: no grafting
+                    lore_revision::revision::LinkSettlement::Tree,
                     tx,
                 ));
                 // Drain any items the producer emits before erroring.

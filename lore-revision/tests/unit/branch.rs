@@ -1876,6 +1876,7 @@ async fn each_relayed_diff_item_is_held_once() {
             None,
             None,
             revision::MergesAcross::Unknown,
+            revision::LinkSettlement::Tree,
             inner_tx,
         ));
         let relay = relay_revision_diff3(driver, inner_rx, true, &tx);

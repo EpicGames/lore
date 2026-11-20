@@ -19,6 +19,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::DiffItem;
+use lore_revision::revision::LinkSettlement;
 use lore_revision::state::State;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
@@ -534,6 +535,7 @@ async fn run_three_way(
             config.history_walk_concurrency,
             // The display diff reports every changed path individually.
             None,
+            LinkSettlement::Tree,
             producer_tx,
         ))
         .await

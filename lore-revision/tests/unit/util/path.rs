@@ -282,6 +282,26 @@ fn covers_any_answers_as_a_scan_for_the_path_and_the_paths_below_it() {
     }
 }
 
+/// The search of a sorted set for a path covering one answers as a scan comparing
+/// `RelativePath::covers` against every path of it, for each set of [`SEARCHED_PATHS`], and
+/// allocates nothing.
+#[test]
+fn covered_by_any_answers_as_a_scan_of_covers() {
+    for sorted in sorted_sets() {
+        for path in SEARCHED_PATHS {
+            let relative = RelativePath::from_str(path).expect("path");
+            let scanned = sorted.iter().any(|held| {
+                RelativePath::from_str(held)
+                    .expect("path")
+                    .covers(&relative)
+            });
+            let (covered, allocated) = allocations_during(|| covered_by_any(&sorted, path));
+            assert_eq!(covered, scanned, "{path:?} against {sorted:?}");
+            assert_eq!(allocated, 0, "{path:?} against {sorted:?} allocated");
+        }
+    }
+}
+
 /// The search of a sorted set answers as a scan comparing `RelativePath::overlaps` against every
 /// path of it, for each set of [`SEARCHED_PATHS`].
 #[test]

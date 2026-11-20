@@ -59,6 +59,7 @@ use crate::state::StateError;
 use crate::state::TreeWalk;
 use crate::state::gather_tree_paths;
 use crate::util::path::RelativePath;
+use crate::util::path::covered_by_any;
 use crate::util::path::covers_any;
 use crate::util::path::overlaps_any;
 use crate::util::path::sorted_paths;
@@ -312,6 +313,7 @@ pub async fn diff3(
         None,
         None,
         MergesAcross::Unknown,
+        LinkSettlement::Tree,
         tx,
     )
     .await
@@ -327,6 +329,18 @@ pub enum MergesAcross {
     /// made there since the base was merged into the other, and every conflict in it stands. A
     /// conflict below a link has the linked repository's history, which this proves nothing of.
     NoneAboveBase,
+}
+
+/// What settles two links a 3-way diff finds both sides put at one path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkSettlement {
+    /// The tree: nothing settles the links' rows, so two links that differ conflict in the tree.
+    Tree,
+    /// The links' rows, which the caller settles, as a branch merge does. Two links to one
+    /// repository put where no link stood give way to the target's in the tree, which leaves a
+    /// difference in pin, branch or flags to the row, and a mount both sides replaced so conflicts
+    /// only where a conflict stands at or below it.
+    Rows,
 }
 
 /// Default in-flight count for the history-walk parallel pass when
@@ -355,6 +369,8 @@ pub const DEFAULT_HISTORY_WALK_CONCURRENCY: usize = 24;
 /// * `merges` — what the search for `base` proved about merges between
 ///   the sides. With [`MergesAcross::NoneAboveBase`] a conflict in
 ///   `repository` stands without a history walk.
+/// * `link_settlement` — what settles two links both sides put at one path,
+///   as [`LinkSettlement`] describes.
 #[allow(clippy::too_many_arguments)]
 pub async fn diff3_with_source_cap(
     repository: Arc<RepositoryContext>,
@@ -369,6 +385,7 @@ pub async fn diff3_with_source_cap(
     // `None` disables adoption.
     graft_view: Option<Arc<crate::filter::Filter>>,
     merges: MergesAcross,
+    link_settlement: LinkSettlement,
     tx: mpsc::Sender<Result<DiffItem, StateError>>,
 ) -> Result<Diff3Summary, StateError> {
     let (state_base, state_source, state_target) = join!(
@@ -497,7 +514,9 @@ pub async fn diff3_with_source_cap(
             target_moves,
             renamed_alike,
             target_replacements,
+            mut relinked_alike,
             source_consumed,
+            link_settlement: _,
         } = Box::pin(join_target_walk(
             target_walk,
             &source_changes,
@@ -506,6 +525,7 @@ pub async fn diff3_with_source_cap(
             &mut conflicting_mounts,
             (&state_base, &state_target),
             include_same,
+            link_settlement,
         ))
         .await?;
         for (idx, consumed) in source_consumed.iter().enumerate() {
@@ -542,6 +562,23 @@ pub async fn diff3_with_source_cap(
             push_unique_path(&mut conflicting_mounts, &path);
         }
         joined_changes.append(&mut target_changes);
+        // Both sides move the subtree into one repository, so only a conflict at or below the
+        // mount, or taking its node from there, stands against it, and the links' rows settle the
+        // mount.
+        if !relinked_alike.is_empty() {
+            let conflicted = sorted_paths(joined_conflicts.iter().flat_map(|(source, target)| {
+                [
+                    source.path(),
+                    &source.from.mapping.path,
+                    target.path(),
+                    &target.from.mapping.path,
+                ]
+            }));
+            relinked_alike.retain(|mount| !covers_any(&conflicted, mount.as_str()));
+            let relinked = sorted_paths(relinked_alike.iter());
+            conflicting_mounts.retain(|mount| relinked.binary_search(&mount.as_str()).is_err());
+            joined_changes.retain(|change| !covered_by_any(&relinked, change.path().as_str()));
+        }
         (joined_changes, joined_conflicts)
     };
 
@@ -969,7 +1006,8 @@ fn mount_conflict_change(from: change::NodeChangeState, to: change::NodeChangeSt
 /// the file where the other tree holds the node with its ID, a file of the same identity; the move
 /// pairs with the source's changes once. Where the source changed both ends of the move, the delete
 /// joins where the file stood, as with no move. Records the target's mounts, and the source's
-/// mounts the target changed below, in `target_mounts` and `conflicting_mounts`.
+/// mounts the target changed below, in `target_mounts` and `conflicting_mounts`, and settles two
+/// links as `link_settlement` asks.
 #[allow(clippy::too_many_arguments)]
 #[lore_macro::test_pub]
 async fn join_target_walk<Summary: Default + Send + 'static>(
@@ -980,10 +1018,11 @@ async fn join_target_walk<Summary: Default + Send + 'static>(
     conflicting_mounts: &mut Vec<RelativePath>,
     (state_base, state_target): (&Arc<State>, &Arc<State>),
     include_same: bool,
+    link_settlement: LinkSettlement,
 ) -> Result<Joined, StateError> {
     let source_moves = relocated_indices(source_changes, |_| true);
 
-    let mut joined = Joined::new(source_changes.len());
+    let mut joined = Joined::new(source_changes.len(), link_settlement);
     loop {
         let (target_change, at) = {
             let Some(target_change) = target_walk.next().await else {
@@ -993,6 +1032,11 @@ async fn join_target_walk<Summary: Default + Send + 'static>(
                 continue;
             }
             if change::is_link_replacement(&target_change) {
+                if link_settlement == LinkSettlement::Rows
+                    && links_alike(source_changes, &target_change)
+                {
+                    joined.relinked_alike.push(target_change.path().clone());
+                }
                 push_unique_path(target_mounts, target_change.path());
             }
             if let Some(to_type) = change::file_directory_replacement(&target_change) {
@@ -1193,6 +1237,22 @@ fn won_mounts(
         }
     }
     won
+}
+
+/// Whether `target_change` puts a link where the source's change at its path puts a link to the
+/// same repository, as [`puts_links_alike`] says.
+fn links_alike(source_changes: &[NodeChange], target_change: &NodeChange) -> bool {
+    index_at(source_changes, target_change.path().as_str())
+        .is_ok_and(|index| puts_links_alike(&source_changes[index], target_change))
+}
+
+/// Whether `source` and `target` each put a link to one repository where no link stood.
+fn puts_links_alike(source: &NodeChange, target: &NodeChange) -> bool {
+    source.to.is_link()
+        && target.to.is_link()
+        && source.to.address.context == target.to.address.context
+        && !source.from.is_link()
+        && !target.from.is_link()
 }
 
 /// Whether `path` stands below one of `mounts`.
@@ -1743,13 +1803,18 @@ struct Joined {
     /// The target's replacements of a file with a directory and of a directory with a file, once
     /// for each change that walks one.
     target_replacements: Vec<Replacement>,
+    /// The mounts both sides replaced with a link to one repository, where the links' rows settle
+    /// them, once for each change that walks one.
+    relinked_alike: Vec<RelativePath>,
     /// Whether a target change stood with each source change.
     source_consumed: Vec<bool>,
+    /// What settles two links both sides put at one path.
+    link_settlement: LinkSettlement,
 }
 
 impl Joined {
     #[lore_macro::test_pub]
-    fn new(source_count: usize) -> Self {
+    fn new(source_count: usize, link_settlement: LinkSettlement) -> Self {
         Joined {
             changes: Vec::new(),
             conflicts: Vec::new(),
@@ -1757,14 +1822,17 @@ impl Joined {
             target_moves: Vec::new(),
             renamed_alike: Vec::new(),
             target_replacements: Vec::new(),
+            relinked_alike: Vec::new(),
             source_consumed: vec![false; source_count],
+            link_settlement,
         }
     }
 
     /// Joins `target_change` with the source's change at `at`, its index among `source_changes`
     /// by path. The same move on both sides conflicts only where both edit the file, and is kept
-    /// in [`Self::renamed_alike`] where it renames a directory only in case. Any other pair
-    /// settles as [`settle_at_path`] settles it.
+    /// in [`Self::renamed_alike`] where it renames a directory only in case. Where the links' rows
+    /// settle them, two links to one repository put where no link stood give way to the
+    /// target's. Any other pair settles as [`settle_at_path`] settles it.
     #[lore_macro::test_pub]
     async fn join(
         &mut self,
@@ -1794,6 +1862,10 @@ impl Joined {
             if renames_directory(&target_change) {
                 self.renamed_alike.push(target_change);
             }
+        } else if self.link_settlement == LinkSettlement::Rows
+            && puts_links_alike(source_change, &target_change)
+        {
+            // The link's row settles what differs between the two.
         } else {
             match settle_at_path(source_change, &target_change, include_same).await? {
                 AtPath::Conflict => {

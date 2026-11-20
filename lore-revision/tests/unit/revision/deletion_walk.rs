@@ -17,6 +17,7 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::node::Node;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::revision;
+use lore_revision::revision::LinkSettlement;
 use lore_revision::revision::MergesAcross;
 use lore_revision::revision::deletions::Deletions;
 use lore_revision::revision::deletions::InOrder;
@@ -736,6 +737,7 @@ async fn diff3_conflicts(
         None,
         None,
         merges,
+        LinkSettlement::Tree,
         tx,
     );
     let collect = async move {

@@ -194,6 +194,18 @@ pub(crate) fn covers_any(sorted: &[&str], path: &str) -> bool {
     })
 }
 
+/// Whether a path of `sorted` covers `path`, as [`RelativePath::covers`] answers it: the two are
+/// equal, or the path of `sorted` is a path-ancestor of `path`. `sorted` must be in byte order
+/// ([`sorted_paths`]); the answer takes one binary search for `path` and one for each of its
+/// ancestors, where a scan compares every path.
+#[lore_macro::test_pub]
+pub(crate) fn covered_by_any(sorted: &[&str], path: &str) -> bool {
+    sorted.binary_search(&path).is_ok()
+        || path
+            .match_indices('/')
+            .any(|(at, _)| sorted.binary_search(&&path[..at]).is_ok())
+}
+
 /// Whether a path of `sorted` overlaps `path`, as [`RelativePath::overlaps`] answers it: the two
 /// are equal, one is a path-ancestor of the other, or one is empty. `sorted` must be in byte order
 /// ([`sorted_paths`]); the answer takes the searches of [`covers_any`] and one binary search for

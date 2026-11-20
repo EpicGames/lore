@@ -4961,7 +4961,8 @@ pub async fn list_revisions(
 /// `DiffItem::Change` if the per-conflict text-merge succeeds —
 /// processed inline rather than buffered, so memory stays bounded at
 /// one conflict's worth of file realisation regardless of total
-/// conflict count.
+/// conflict count. `link_settlement` says what settles two links both
+/// sides put at one path.
 #[allow(clippy::too_many_arguments)]
 pub async fn diff3(
     repository: Arc<RepositoryContext>,
@@ -4973,6 +4974,7 @@ pub async fn diff3(
     include_same: bool,
     auto_resolve: bool,
     graft_view: Option<Arc<crate::filter::Filter>>,
+    link_settlement: revision::LinkSettlement,
     tx: mpsc::Sender<Result<DiffItem, BranchError>>,
 ) -> Result<Diff3Summary, BranchError> {
     Box::pin(diff3_with_source_cap(
@@ -4987,6 +4989,7 @@ pub async fn diff3(
         None,
         None,
         graft_view,
+        link_settlement,
         tx,
     ))
     .await
@@ -5005,6 +5008,7 @@ pub async fn diff3_with_source_cap(
     source_cap: Option<usize>,
     history_walk_concurrency: Option<usize>,
     graft_view: Option<Arc<crate::filter::Filter>>,
+    link_settlement: revision::LinkSettlement,
     tx: mpsc::Sender<Result<DiffItem, BranchError>>,
 ) -> Result<Diff3Summary, BranchError> {
     lore_debug!(
@@ -5054,6 +5058,7 @@ pub async fn diff3_with_source_cap(
         history_walk_concurrency,
         graft_view,
         merges,
+        link_settlement,
         inner_tx,
     ));
     relay_revision_diff3(driver, inner_rx, auto_resolve, &tx).await?;
@@ -5529,6 +5534,7 @@ pub async fn diff3_collect(
         include_same,
         auto_resolve,
         None,
+        revision::LinkSettlement::Tree,
     )
     .await
 }
@@ -5536,7 +5542,8 @@ pub async fn diff3_collect(
 /// `diff3_collect` that may adopt whole out-of-view subtrees.
 ///
 /// `graft_view` decides which subtrees the view excludes. `None` disables
-/// adoption and gives the unmodified walk.
+/// adoption and gives the unmodified walk. `link_settlement` says what
+/// settles two links both sides put at one path.
 #[allow(clippy::too_many_arguments)]
 pub async fn diff3_collect_with_graft(
     repository: Arc<RepositoryContext>,
@@ -5548,6 +5555,7 @@ pub async fn diff3_collect_with_graft(
     include_same: bool,
     auto_resolve: bool,
     graft_view: Option<Arc<crate::filter::Filter>>,
+    link_settlement: revision::LinkSettlement,
 ) -> Result<DiffResult, BranchError> {
     let (summary, items) = crate::util::collect_stream::collect_stream_with_summary(|tx| {
         diff3(
@@ -5560,6 +5568,7 @@ pub async fn diff3_collect_with_graft(
             include_same,
             auto_resolve,
             graft_view,
+            link_settlement,
             tx,
         )
     })

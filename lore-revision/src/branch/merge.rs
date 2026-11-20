@@ -69,6 +69,7 @@ use crate::path::emit_path_ignore;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::revision::DiffResult;
+use crate::revision::LinkSettlement;
 use crate::revision::cherry_pick::LoreCherryPickAbortBeginEventData;
 use crate::revision::cherry_pick::LoreCherryPickAbortEndEventData;
 use crate::revision::cherry_pick::LoreCherryPickResolveFileEventData;
@@ -562,7 +563,13 @@ async fn merge_repository(
         current_signature,
     )
     .await?;
-    let merge = prepare_merge(repository.clone(), source, Some(current)).await?;
+    let merge = prepare_merge(
+        repository.clone(),
+        source,
+        Some(current),
+        LinkSettlement::Rows,
+    )
+    .await?;
     apply_prepared_merge(repository, token, merge, inherit).await
 }
 
@@ -715,11 +722,14 @@ async fn merge_source_at(
     })
 }
 
-/// Diff `source`'s revisions for a merge that starts from `current`.
+/// Diff `source`'s revisions for a merge that starts from `current`, leaving two links both sides
+/// put at one path to `link_settlement`: [`LinkSettlement::Rows`] where the merge settles each
+/// link's row.
 async fn prepare_merge(
     repository: Arc<RepositoryContext>,
     source: MergeSource,
     current: Option<NodeMapping>,
+    link_settlement: LinkSettlement,
 ) -> Result<PreparedMerge, MergeError> {
     // Diff over the full tree. A view-scoped diff drops the other branch's
     // out-of-view changes and leaves this branch divergent from it.
@@ -735,6 +745,7 @@ async fn prepare_merge(
         // The view decides which subtrees are out of view. The walk stays
         // full-tree.
         Some(repository.filter.clone()),
+        link_settlement,
     )
     .await
     .forward::<MergeError>("running diff3 for merge")?;
@@ -761,7 +772,7 @@ async fn check_merge(
 ) -> Result<PreparedMerge, MergeError> {
     let source =
         resolve_merge_source(repository, source_branch, current_branch, current_signature).await?;
-    let mut merge = prepare_merge(repository.clone(), source, None).await?;
+    let mut merge = prepare_merge(repository.clone(), source, None, LinkSettlement::Rows).await?;
     merge.resumed = resumed;
     let Some(current) = current else {
         return Ok(merge);
@@ -2318,7 +2329,7 @@ async fn write_link_merge(
         nested,
     } = planned;
     let link_context = &eligible.link_context;
-    let merge = prepare_merge(link_context.clone(), source, current)
+    let merge = prepare_merge(link_context.clone(), source, current, LinkSettlement::Rows)
         .await
         .forward_with::<MergeError, _>(|| format!("merging link {}", eligible.shown_path()))?;
     let result = apply_prepared_merge(link_context.clone(), write.token, merge, write.inherit)
@@ -2850,7 +2861,8 @@ async fn land_incoming_links(
     let (pin, merged) = match incoming.merge {
         IncomingMerge::Latest(pin) | IncomingMerge::MissingBranch(pin) => (pin, None),
         IncomingMerge::Merge(source) => {
-            let merge = prepare_merge(link_context.clone(), source, None).await?;
+            let merge =
+                prepare_merge(link_context.clone(), source, None, LinkSettlement::Rows).await?;
             if merge.diff.is_empty() {
                 (source.current_signature, None)
             } else {
@@ -5339,7 +5351,7 @@ pub async fn merge_restart(
         .await
         .forward::<MergeError>("loading merge revision metadata")?;
 
-    let diff = Box::pin(branch::diff3_collect(
+    let diff = Box::pin(branch::diff3_collect_with_graft(
         repository.clone(),
         state_merge_metadata.branch,
         state_staged.parent_other(),
@@ -5348,6 +5360,9 @@ pub async fn merge_restart(
         None,
         true,  /* Include identical changes for merge tracking */
         false, /* Do not autoresolve, this is done later */
+        None,
+        // The merge settles each link's row, as the merge it restarts does.
+        LinkSettlement::Rows,
     ))
     .await
     .forward::<MergeError>("running diff3 for merge restart")?;
@@ -7304,8 +7319,15 @@ async fn merge_incoming_links_into(
                             (*pin, None)
                         }
                         IncomingMerge::Merge(source) => {
-                            let merge =
-                                prepare_merge(incoming.link_context.clone(), *source, None).await?;
+                            // Nothing settles the rows of the links the linked repository holds,
+                            // so two that differ conflict and refuse the merge.
+                            let merge = prepare_merge(
+                                incoming.link_context.clone(),
+                                *source,
+                                None,
+                                LinkSettlement::Tree,
+                            )
+                            .await?;
                             if !merge.diff.conflicts.is_empty() {
                                 let link_path = &incoming.mounts[0].link_path;
                                 return Err(NotSupported {
