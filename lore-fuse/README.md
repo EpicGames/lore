@@ -604,21 +604,39 @@ State is rebuilt at every mount.
   tree as a `status --scan` walk marks it: `DirtyAdd`, `DirtyModify` or `DirtyDelete` with no
   extension flags, a mark the State holds no change for cleared, and an add the State no longer
   holds discarded: held on the scans' queue where one is handed in, and discarded once every scan
-  has drained (`status::scan_paths`, `repository/status.rs`). The provider reports
-  `holds_state` (`fs/fuse/mount.rs`), so `lore status` scans without `--scan`. Unasked, the
-  scan reports what a plain status reports on an ordinary instance: a deleted directory as one
-  entry, without the entries below it, and no summary line; `--scan` adds both
-  (`TreeDiffPlan::for_status`, `ScanReport`, `repository/status.rs`). Entries stream in the
-  order the scan finds them: the text output sorts them, and `--json` keeps that order. `lore stage`
-  marks its targets through the same scan, reporting nothing, before resolving them, so
-  `lore stage .` right after a write stages it (`mark_through_provider_diff`,
-  `file/stage.rs`). Neither needs `--scan` or `lore file dirty`. `lore diff` reads the tree directly. The diff skips a symlink in the
-  filesystem State, below a directory added as a whole too, and so does the operation's directory
-  listing (`FuseDirectoryListing`), as an ordinary instance's walk does, so a symlink is never a
-  change (`versioned_on_a_working_tree`). A path naming one holds nothing for the operation's
-  reads (`FuseOperation::located`); sync and merge verification and stage ask whether one stands
-  there (`InstanceOperationImpl::unversioned_symlink_at_or_above` and `unversioned_symlink_at`,
+  has drained (`status::scan_paths`, `repository/status.rs`). A node a dirty move took to a path the
+  revision lacks, or holds by another node, keeps its mark while the tree holds it
+  (`Settling::settle_file`, `Settling::settle_directory`). The provider reports `holds_state`
+  (`fs/fuse/mount.rs`), so `lore status` scans without `--scan`. Unasked, the scan reports what a
+  plain status reports on an ordinary instance: a deleted directory as one entry, without the
+  entries below it, and no summary line; `--scan` adds both (`TreeDiffPlan::for_status`,
+  `ScanReport`, `repository/status.rs`). Entries stream in the order the scan finds them: the text
+  output sorts them, and `--json` keeps that order. `lore stage` marks its targets through the same
+  scan, reporting nothing, before resolving them, so `lore stage .` right after a write stages it
+  (`mark_through_provider_diff`, `file/stage.rs`). Neither needs `--scan` or `lore file dirty`.
+  `lore diff` reads the tree directly. The diff skips a symlink in the filesystem State, below a
+  directory added as a whole too, and so does the operation's directory listing
+  (`FuseDirectoryListing`), as an ordinary instance's walk does, so a symlink is never a change
+  (`versioned_on_a_working_tree`). A path naming one holds nothing for the operation's reads
+  (`FuseOperation::located`); sync and merge verification and stage ask whether one stands there
+  (`InstanceOperationImpl::unversioned_symlink_at_or_above` and `unversioned_symlink_at`,
   `fs/filesystem_provider.rs`).
+- **Removed nodes.** Asked to mark, the diff settles a node the tree no longer holds as
+  `lore file dirty` settles it (`Settling::settle_delete`), but for a staged add it keeps at a path
+  the revision lacks: the diff marks it `Dirty`, and `lore file dirty` leaves it as it stands. A
+  node staged for delete stays as it is. An add, or a copy not staged, at a path the revision lacks
+  is discarded (`Node::reverts_as_add`), but for one a merge staged, which a parent of the merge
+  holds. Every other removed staged node is marked `Dirty` alone, which keeps its staged change: a
+  staged add the mark finds without `Dirty` is discarded at the next mark, and an add a merge staged
+  stays staged through every mark. A directory among the adds to discard, below which the walk
+  reports a node neither added nor staged, first gives up the committed nodes a dirty move took into
+  it, as `lore file dirty` takes them out, and stays where one cannot leave yet (`Removals`). An
+  unstaged dirty move goes back to its committed path and is marked `DirtyDelete` there. One the
+  revision holds no node for at its ID is marked `DirtyDelete` where it stands. One whose committed
+  path another node holds, or that a staged node or a missing parent keeps out, keeps its move. It
+  moves once every scan has drained, after the discards, so no scan meets it twice and a directory
+  marked added that held its path is gone (`State::nodes_return_removed_moves`, `WalkDiscards`). Any
+  other removed node is marked `DirtyDelete`.
 - **Status and stage cost over written files.** A written file has the zero address until a commit
   stores it, so the diff compares it by size, from its host file's `stat`, then by content through
   the operation (`measure`, `file_holds_content`, `fs/fuse/operation.rs`). A diff under the

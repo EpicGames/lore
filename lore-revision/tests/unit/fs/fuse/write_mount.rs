@@ -48,6 +48,8 @@ use lore_revision::state::Detach;
 use lore_revision::state::Rewrite;
 use lore_storage::hash::hash_string;
 
+use crate::dirty_move_fixture::committed_paths;
+use crate::dirty_move_fixture::held_at;
 use crate::fs::fuse::bench_stats;
 use crate::fs::fuse::fuse_fixture;
 use crate::fs::fuse::fuse_test_util;
@@ -10781,6 +10783,27 @@ async fn commit_staged_holding(
     fs: &Arc<FuseFilesystem>,
     token: &lore_revision::repository::RepositoryWriteToken,
 ) -> Result<Hash, String> {
+    try_commit_staged_holding(instance, fs, token)
+        .await
+        .map_err(|error| format!("commit: {error}"))
+}
+
+/// [`commit_staged`], answering the commit's error as it is.
+async fn try_commit_staged(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+) -> Result<Hash, lore_revision::commit::CommitError> {
+    let token =
+        lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    try_commit_staged_holding(instance, fs, &token).await
+}
+
+/// [`try_commit_staged`] under `token`, which the caller holds.
+async fn try_commit_staged_holding(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+    token: &lore_revision::repository::RepositoryWriteToken,
+) -> Result<Hash, lore_revision::commit::CommitError> {
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::relay::EventDispatcher;
@@ -10800,7 +10823,6 @@ async fn commit_staged_holding(
             ),
         )
         .await
-        .map_err(|error| format!("commit: {error}"))
 }
 
 /// Gives `write/<name>` the modified time `mtime`.
@@ -10865,18 +10887,35 @@ async fn fs_node(instance: &Instance, fs: &FuseFilesystem, path: &str) -> Node {
 /// The record `revision` holds at `path`.
 async fn committed_node(instance: &Instance, revision: Hash, path: &str) -> Node {
     let state = state_at(instance, revision).await;
+    node_in(instance, &state, path)
+        .await
+        .expect("a committed node")
+}
+
+/// The record `state` holds at `path`; `None` where it holds nothing there.
+async fn node_in(
+    instance: &Instance,
+    state: &lore_revision::state::State,
+    path: &str,
+) -> Option<Node> {
     let repository = instance.fixture.repository.clone();
     let mut node = ROOT_NODE;
     for name in path.split('/').filter(|name| !name.is_empty()) {
-        node = state
+        node = match state
             .find_subnode(repository.clone(), node, hash_string(name))
             .await
-            .expect("a committed node on the path");
+        {
+            Ok(node) => node,
+            Err(error) if error.is_node_not_found() => return None,
+            Err(error) => panic!("the lookup of {path}: {error}"),
+        };
     }
-    state
-        .node(repository, node)
-        .await
-        .expect("a committed node")
+    Some(
+        state
+            .node(repository, node)
+            .await
+            .expect("the node's record"),
+    )
 }
 
 fn is_local(node: &Node) -> bool {
@@ -13273,6 +13312,961 @@ async fn an_add_staged_then_removed_leaves_the_staged_state_at_the_next_stage() 
                 "the commit: {committed:?}"
             );
             assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// Runs `case` for each of `variants` in turn, then fails naming each variant that failed with its
+/// panic, so a failing variant hides none of those after it.
+async fn each_variant<V, F>(variants: impl IntoIterator<Item = V>, case: impl Fn(V) -> F)
+where
+    V: Copy + std::fmt::Debug,
+    F: std::future::Future<Output = ()>,
+{
+    use futures::FutureExt as _;
+
+    let mut failed = Vec::new();
+    for variant in variants {
+        if let Err(panic) = std::panic::AssertUnwindSafe(case(variant))
+            .catch_unwind()
+            .await
+        {
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("a panic without a message");
+            failed.push(format!("{variant:?}: {message}"));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} variants failed:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+}
+
+/// What runs between the removal through the mount of a node holding a staged change and the
+/// commit after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterRemoval {
+    /// Nothing: the commit follows the removal.
+    Nothing,
+    /// A remount, which builds the filesystem State again from the revision, the deletion list
+    /// and `write/`.
+    Remount,
+    /// A status with `--scan`, which holds the write token and saves its marks in the staged
+    /// State.
+    Status,
+    /// A stage of the working tree.
+    Stage,
+}
+
+impl AfterRemoval {
+    const ALL: [AfterRemoval; 4] = [
+        AfterRemoval::Nothing,
+        AfterRemoval::Remount,
+        AfterRemoval::Status,
+        AfterRemoval::Stage,
+    ];
+
+    /// Each of [`Self::ALL`] beside a flag a test varies, false then true.
+    fn with_flag() -> impl Iterator<Item = (bool, AfterRemoval)> {
+        [false, true]
+            .into_iter()
+            .flat_map(|flag| Self::ALL.map(|after| (flag, after)))
+    }
+
+    /// Runs over `fs`, answering the provider the commit goes through.
+    async fn run(self, instance: &Instance, fs: Arc<FuseFilesystem>) -> Arc<FuseFilesystem> {
+        match self {
+            AfterRemoval::Nothing => fs,
+            AfterRemoval::Remount => {
+                drop(fs);
+                provider(instance).await
+            }
+            AfterRemoval::Status => {
+                let token = lore_revision::repository::RepositoryWriteToken::acquire(
+                    &instance.fixture.path,
+                )
+                .await;
+                staged_state::status_files(
+                    instance.command_context(&fs, Some(token.share())),
+                    true,
+                )
+                .await;
+                fs
+            }
+            AfterRemoval::Stage => {
+                stage_through(instance, &fs).await.expect("the stage");
+                fs
+            }
+        }
+    }
+}
+
+/// Moves `from` to `to` through the instance operation and stages the move, as `lore stage move`
+/// relayed to the service stages it.
+async fn staged_move_through(instance: &Instance, fs: &Arc<FuseFilesystem>, from: &str, to: &str) {
+    let token =
+        lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    let context = renamed_through(instance, fs, &token, from, to).await;
+    lore_revision::file::stage::stage_move(
+        context,
+        &token,
+        host_path(instance, from),
+        host_path(instance, to),
+        lore_revision::stage::StageOptions {
+            scan: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the staged move");
+}
+
+/// Moves `from` to `to` through the instance operation and marks the move dirty, not staged, as
+/// `lore file dirty move` relayed to the service marks it.
+async fn dirty_move_through(instance: &Instance, fs: &Arc<FuseFilesystem>, from: &str, to: &str) {
+    let token =
+        lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    let context = renamed_through(instance, fs, &token, from, to).await;
+    lore_revision::file::dirty::dirty_move(
+        context,
+        host_path(instance, from),
+        host_path(instance, to),
+    )
+    .await
+    .expect("the move marked dirty");
+}
+
+/// Moves `from` to `to` through the instance operation, under `token`, as a command relayed to the
+/// service moves a path; answers the command's context.
+async fn renamed_through(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+    token: &lore_revision::repository::RepositoryWriteToken,
+    from: &str,
+    to: &str,
+) -> Arc<lore_revision::repository::RepositoryContext> {
+    use lore_revision::fs::filesystem_provider::InstanceOperation as _;
+
+    let context = instance.command_context(fs, Some(token.share()));
+    let operation = context
+        .file_system()
+        .begin_operation()
+        .await
+        .expect("an operation");
+    operation
+        .rename(&relative(from), &relative(to))
+        .await
+        .expect("the move through the operation");
+    context
+}
+
+/// Marks `path` dirty, as `lore file dirty` relayed to the service marks it.
+async fn dirtied_through(instance: &Instance, fs: &Arc<FuseFilesystem>, path: &str) {
+    let token =
+        lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    lore_revision::file::dirty::dirty(
+        instance.command_context(fs, Some(token.share())),
+        lore_revision::interface::LoreArray::from_vec(vec![
+            lore_revision::interface::LoreString::from(&instance.fixture.path.join(path)),
+        ]),
+    )
+    .await
+    .expect("the path marked dirty");
+}
+
+/// The path of the instance's `path` on the host, as a command names it.
+fn host_path(instance: &Instance, path: &str) -> String {
+    instance
+        .fixture
+        .path
+        .join(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The record the instance's staged State holds at `path`; `None` where no staged State is stored
+/// or it holds nothing there.
+async fn staged_node(instance: &Instance, path: &str) -> Option<Node> {
+    let staged = lore_revision::instance::load_staged_revision(&instance.fixture.repository)
+        .await
+        .expect("the staged anchor reads")?;
+    let state =
+        lore_revision::state::State::deserialize(instance.fixture.repository.clone(), staged)
+            .await
+            .expect("the staged State loads");
+    node_in(instance, &state, path).await
+}
+
+/// What the staged State holds at a path whose staged move a removal through the mount took away.
+#[derive(Clone, Copy, Debug)]
+enum Kept {
+    /// The staged move, marked dirty where `dirty`, and not as deleted.
+    Move { dirty: bool },
+    /// The deletion a stage of the removal stages.
+    Deleted,
+}
+
+/// Asserts that the staged State holds `path` as `kept` says; `case` names the run.
+async fn assert_staged_kept(instance: &Instance, path: &str, kept: Kept, case: &str) {
+    let node = staged_node(instance, path)
+        .await
+        .unwrap_or_else(|| panic!("the staged State holds {path}: {case}"));
+    let holds = match kept {
+        Kept::Move { dirty } => {
+            node.is_staged_move() && node.is_dirty() == dirty && !node.is_deleted()
+        }
+        Kept::Deleted => node.is_staged_delete(),
+    };
+    assert!(holds, "{path} is not {kept:?}: {case}: {node:?}");
+}
+
+/// A staged file move whose file is then removed through the mount keeps the move in the staged
+/// State, marked dirty alone by a status or staged as deleted by a stage, and the commit deletes
+/// the file, as on an ordinary instance: the revision holds it at neither path.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_file_move_removed_through_the_mount_commits_the_deletion() {
+    each_variant(AfterRemoval::ALL, |after| async move {
+        let instance = Instance::new(&[("d.txt", b"d"), ("other.txt", b"o")]).await;
+        LORE_CONTEXT
+            .scope(fuse_fixture::setup_test_execution(), async {
+                let fs = provider(&instance).await;
+                staged_move_through(&instance, &fs, "d.txt", "e.txt").await;
+                fs.unlink(&request(), ROOT_INO, b"e.txt")
+                    .await
+                    .expect("unlink e.txt");
+                let fs = after.run(&instance, fs).await;
+
+                assert_eq!(lookup(&fs, ROOT_INO, "e.txt").await, Err(Errno::ENOENT));
+                assert_eq!(listed(&fs, ROOT_INO).await, ["other.txt"], "{after:?}");
+                let kept = match after {
+                    AfterRemoval::Stage => Kept::Deleted,
+                    _ => Kept::Move { dirty: true },
+                };
+                assert_staged_kept(&instance, "e.txt", kept, &format!("{after:?}")).await;
+                let revision = commit_staged(&instance, &fs).await.expect("the commit");
+                assert_eq!(revision_content(&instance, revision, "d.txt").await, None);
+                assert_eq!(revision_content(&instance, revision, "e.txt").await, None);
+                assert_eq!(
+                    revision_content(&instance, revision, "other.txt")
+                        .await
+                        .as_deref(),
+                    Some(b"o".as_slice())
+                );
+            })
+            .await;
+    })
+    .await;
+}
+
+/// A staged directory move whose directory is then removed through the mount, a directory made
+/// at its committed path or not, keeps the move in the staged State, marked dirty alone by a
+/// status, a stage staging the file's deletion, and the commit applies the rules an ordinary
+/// instance applies to a staged move gone from its path: with no directory at the committed path
+/// it deletes the directory and its file; with one there it leaves the move out, and a stage,
+/// which stages the directory made, has it commit the deletion and the directory made.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_directory_move_removed_through_the_mount_commits_as_an_ordinary_instance() {
+    each_variant(
+        AfterRemoval::with_flag(),
+        |(made_again, after)| async move {
+            let instance = Instance::new(&[("d/k.txt", b"k"), ("other.txt", b"o")]).await;
+            LORE_CONTEXT
+                .scope(fuse_fixture::setup_test_execution(), async {
+                    let fs = provider(&instance).await;
+                    staged_move_through(&instance, &fs, "d", "e").await;
+                    if made_again {
+                        fs.mkdir(&request(), ROOT_INO, b"d", libc::S_IFDIR | 0o755, 0o022)
+                            .await
+                            .expect("mkdir d");
+                    }
+                    let e = lookup(&fs, ROOT_INO, "e").await.expect("e");
+                    fs.unlink(&request(), e, b"k.txt")
+                        .await
+                        .expect("unlink e/k.txt");
+                    fs.rmdir(&request(), ROOT_INO, b"e").await.expect("rmdir e");
+                    let fs = after.run(&instance, fs).await;
+
+                    let case = format!("{after:?}, made again {made_again}");
+                    assert_eq!(lookup(&fs, ROOT_INO, "e").await, Err(Errno::ENOENT));
+                    let held: &[&str] = if made_again {
+                        &["d", "other.txt"]
+                    } else {
+                        &["other.txt"]
+                    };
+                    assert_eq!(listed(&fs, ROOT_INO).await, held, "{case}");
+                    assert_staged_kept(&instance, "e", Kept::Move { dirty: true }, &case).await;
+                    let kept = match after {
+                        AfterRemoval::Stage => Kept::Deleted,
+                        AfterRemoval::Status => Kept::Move { dirty: true },
+                        _ => Kept::Move { dirty: false },
+                    };
+                    assert_staged_kept(&instance, "e/k.txt", kept, &case).await;
+                    let made = staged_node(&instance, "d").await;
+                    let held = match after {
+                        _ if !made_again => made.is_none(),
+                        AfterRemoval::Status => {
+                            made.is_some_and(|node| node.is_dirty_add() && !node.is_staged())
+                        }
+                        AfterRemoval::Stage => made.is_some_and(|node| node.is_staged_add()),
+                        _ => made.is_none(),
+                    };
+                    assert!(held, "d: {case}: {made:?}");
+
+                    let committed = try_commit_staged(&instance, &fs).await;
+                    if made_again && after != AfterRemoval::Stage {
+                        assert!(
+                            committed
+                                .as_ref()
+                                .is_err_and(|error| error.is_nothing_staged()),
+                            "{case}: {committed:?}"
+                        );
+                        return;
+                    }
+                    let revision = committed.expect("the commit");
+                    let state = state_at(&instance, revision).await;
+                    assert_eq!(
+                        node_in(&instance, &state, "d")
+                            .await
+                            .is_some_and(|node| node.is_directory()),
+                        made_again,
+                        "{case}"
+                    );
+                    for gone in ["d/k.txt", "e"] {
+                        assert!(
+                            node_in(&instance, &state, gone).await.is_none(),
+                            "{case}: {gone}"
+                        );
+                    }
+                    assert_eq!(
+                        revision_content(&instance, revision, "other.txt")
+                            .await
+                            .as_deref(),
+                        Some(b"o".as_slice())
+                    );
+                })
+                .await;
+        },
+    )
+    .await;
+}
+
+/// A staged add removed through the mount leaves the staged State at the next mark, as a reverted
+/// add leaves it on an ordinary instance, and the commit has nothing to commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_add_removed_through_the_mount_leaves_the_staged_state_at_the_next_mark() {
+    each_variant(AfterRemoval::ALL, |after| async move {
+        let instance = Instance::new(&[("other.txt", b"o")]).await;
+        LORE_CONTEXT
+            .scope(fuse_fixture::setup_test_execution(), async {
+                let fs = provider(&instance).await;
+                create_with(&fs, ROOT_INO, "n.txt", b"new").await;
+                stage_paths_through(&instance, &fs, &["n.txt"])
+                    .await
+                    .expect("stage the add");
+                fs.unlink(&request(), ROOT_INO, b"n.txt")
+                    .await
+                    .expect("unlink n.txt");
+                let fs = after.run(&instance, fs).await;
+
+                assert_eq!(lookup(&fs, ROOT_INO, "n.txt").await, Err(Errno::ENOENT));
+                assert_eq!(listed(&fs, ROOT_INO).await, ["other.txt"], "{after:?}");
+                let staged = staged_node(&instance, "n.txt").await;
+                let marked = matches!(after, AfterRemoval::Status | AfterRemoval::Stage);
+                assert_eq!(
+                    staged.is_none(),
+                    marked,
+                    "n.txt after {after:?}: {staged:?}"
+                );
+                assert!(staged.is_none_or(|node| node.is_staged_add()), "{staged:?}");
+                let committed = try_commit_staged(&instance, &fs).await;
+                assert!(
+                    committed
+                        .as_ref()
+                        .is_err_and(|error| error.is_nothing_staged()),
+                    "{after:?}: {committed:?}"
+                );
+            })
+            .await;
+    })
+    .await;
+}
+
+/// Marks `to` dirty as a copy of `from`, as `lore file dirty copy` relayed to the service does.
+async fn dirty_copy_through(instance: &Instance, fs: &Arc<FuseFilesystem>, from: &str, to: &str) {
+    let token =
+        lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    lore_revision::file::dirty::dirty_copy(
+        instance.command_context(fs, Some(token.share())),
+        host_path(instance, from),
+        host_path(instance, to),
+    )
+    .await
+    .expect("the copy marked dirty");
+}
+
+/// A staged copy removed through the mount leaves the staged State as an ordinary instance leaves
+/// it. A copy `lore stage --scan` stages, as modified, stays staged past a status, as `lore file
+/// dirty` leaves it; one the provider's own stage stages as added leaves at the next mark, as a
+/// reverted add does. Either leaves at the next stage, and the commit has nothing to commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_copy_removed_through_the_mount_leaves_the_staged_state_as_an_ordinary_instance() {
+    each_variant(AfterRemoval::with_flag(), |(scan, after)| async move {
+        let instance = Instance::new(&[("d.txt", b"d"), ("other.txt", b"o")]).await;
+        LORE_CONTEXT
+            .scope(fuse_fixture::setup_test_execution(), async {
+                let fs = provider(&instance).await;
+                create_with(&fs, ROOT_INO, "c.txt", b"d").await;
+                dirty_copy_through(&instance, &fs, "d.txt", "c.txt").await;
+                stage_hosts_through(
+                    &instance,
+                    &fs,
+                    vec![instance.fixture.path.join("c.txt")],
+                    Default::default(),
+                    lore_revision::stage::StageOptions {
+                        scan,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("stage the copy");
+                let case = format!("{after:?}, scan {scan}");
+                let staged = staged_node(&instance, "c.txt")
+                    .await
+                    .expect("the staged copy");
+                assert!(
+                    staged.is_staged() && staged.is_staged_add() != scan,
+                    "{case}: {staged:?}"
+                );
+                fs.unlink(&request(), ROOT_INO, b"c.txt")
+                    .await
+                    .expect("unlink c.txt");
+                let fs = after.run(&instance, fs).await;
+
+                assert_eq!(lookup(&fs, ROOT_INO, "c.txt").await, Err(Errno::ENOENT));
+                let keeps = match after {
+                    AfterRemoval::Nothing | AfterRemoval::Remount => true,
+                    AfterRemoval::Status => scan,
+                    AfterRemoval::Stage => false,
+                };
+                assert_eq!(
+                    staged_node(&instance, "c.txt").await.map(|node| node.flags),
+                    keeps.then_some(staged.flags),
+                    "c.txt: {case}"
+                );
+                let committed = try_commit_staged(&instance, &fs).await;
+                assert!(
+                    committed
+                        .as_ref()
+                        .is_err_and(|error| error.is_nothing_staged()),
+                    "{case}: {committed:?}"
+                );
+            })
+            .await;
+    })
+    .await;
+}
+
+/// An add a merge staged, not marked dirty, removed through the mount stays in the staged State
+/// through every mark: each status marks it dirty alone, and a stage stages its deletion, as a
+/// scanning stage on an ordinary instance does. Whatever runs between, the commit stores the merge
+/// without it, as on an ordinary instance.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_staged_add_removed_through_the_mount_stays_in_the_staged_state_through_every_mark()
+{
+    each_variant(AfterRemoval::ALL, |after| async move {
+        let instance = Instance::new(&[("a.txt", b"alpha"), ("b.txt", b"bee")]).await;
+        LORE_CONTEXT
+            .scope(fuse_fixture::setup_test_execution(), async {
+                let fs = provider(&instance).await;
+                let (feature, theirs) = feature_branch_and_revision(&instance, &fs).await;
+                merge_through(&instance, &fs, feature)
+                    .await
+                    .expect("the merge");
+                let merged = staged_node(&instance, "new.txt")
+                    .await
+                    .expect("the merged add");
+                assert!(
+                    merged.is_staged_add() && merged.is_staged_merge() && !merged.is_dirty(),
+                    "{merged:?}"
+                );
+                lookup(&fs, ROOT_INO, "new.txt").await.expect("new.txt");
+                fs.unlink(&request(), ROOT_INO, b"new.txt")
+                    .await
+                    .expect("unlink new.txt");
+                let fs = after.run(&instance, fs).await;
+
+                assert_eq!(lookup(&fs, ROOT_INO, "new.txt").await, Err(Errno::ENOENT));
+                let node = staged_node(&instance, "new.txt")
+                    .await
+                    .unwrap_or_else(|| panic!("the staged State holds new.txt: {after:?}"));
+                let kept = match after {
+                    AfterRemoval::Nothing | AfterRemoval::Remount => node.flags == merged.flags,
+                    AfterRemoval::Status => node.flags == merged.flags | NodeFlags::Dirty.bits(),
+                    AfterRemoval::Stage => node.is_staged_delete() && node.is_staged_merge(),
+                };
+                assert!(kept, "new.txt after {after:?}: {node:?}");
+                if after == AfterRemoval::Status {
+                    for status in ["second", "third"] {
+                        changed_paths_holding_token(&instance, &fs).await;
+                        let node = staged_node(&instance, "new.txt")
+                            .await
+                            .unwrap_or_else(|| panic!("the {status} status keeps new.txt"));
+                        assert_eq!(
+                            node.flags,
+                            merged.flags | NodeFlags::Dirty.bits(),
+                            "the {status} status: {node:?}"
+                        );
+                    }
+                }
+
+                let revision = commit_staged(&instance, &fs).await.expect("the commit");
+                assert_eq!(state_at(&instance, revision).await.parent_other(), theirs);
+                assert_eq!(
+                    revision_content(&instance, revision, "a.txt")
+                        .await
+                        .as_deref(),
+                    Some(b"ALPHA".as_slice())
+                );
+                for gone in ["b.txt", "new.txt"] {
+                    assert_eq!(
+                        revision_content(&instance, revision, gone).await,
+                        None,
+                        "{after:?}: {gone}"
+                    );
+                }
+            })
+            .await;
+    })
+    .await;
+}
+
+/// A directory a merge staged as an add, removed through the mount with the file it holds, stays
+/// in the staged State through every mark with that file, each status marking both dirty alone,
+/// and the commit stores the merge without them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_staged_directory_removed_through_the_mount_stays_in_the_staged_state_through_every_mark()
+ {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let feature = create_branch_id_through(&instance, &fs, "feature").await;
+            switch_through(&instance, &fs, "feature")
+                .await
+                .expect("switch to feature");
+            let added = fs
+                .mkdir(&request(), ROOT_INO, b"added", libc::S_IFDIR | 0o755, 0o022)
+                .await
+                .expect("mkdir added")
+                .ino;
+            create_with(&fs, added, "x.txt", b"x").await;
+            let theirs = commit_through(&instance, &fs, false)
+                .await
+                .expect("commit on feature");
+            switch_through(&instance, &fs, lore_revision::branch::DEFAULT_DEFAULT_NAME)
+                .await
+                .expect("switch back");
+            merge_through(&instance, &fs, feature)
+                .await
+                .expect("the merge");
+            let mut merged = Vec::new();
+            for path in ["added", "added/x.txt"] {
+                let node = staged_node(&instance, path).await.expect("the merged add");
+                assert!(
+                    node.is_staged_add() && node.is_staged_merge() && !node.is_dirty(),
+                    "{path}: {node:?}"
+                );
+                merged.push((path, node.flags));
+            }
+            let added = lookup(&fs, ROOT_INO, "added").await.expect("added");
+            lookup(&fs, added, "x.txt").await.expect("added/x.txt");
+            fs.unlink(&request(), added, b"x.txt")
+                .await
+                .expect("unlink added/x.txt");
+            fs.rmdir(&request(), ROOT_INO, b"added")
+                .await
+                .expect("rmdir added");
+
+            for status in ["first", "second"] {
+                changed_paths_holding_token(&instance, &fs).await;
+                for (path, flags) in &merged {
+                    let node = staged_node(&instance, path)
+                        .await
+                        .unwrap_or_else(|| panic!("the {status} status keeps {path}"));
+                    assert_eq!(
+                        node.flags,
+                        flags | NodeFlags::Dirty.bits(),
+                        "the {status} status: {path}: {node:?}"
+                    );
+                }
+            }
+
+            let revision = commit_staged(&instance, &fs).await.expect("the commit");
+            assert_eq!(state_at(&instance, revision).await.parent_other(), theirs);
+            assert_eq!(
+                revision_content(&instance, revision, "added/x.txt").await,
+                None
+            );
+        })
+        .await;
+}
+
+/// An add a merge staged, removed through the mount and made again with the content the merge
+/// staged after one status or two, is the merge's add once more: the merge commit records it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_staged_add_made_again_after_statuses_is_committed_with_the_merge() {
+    for statuses in [1, 2] {
+        let instance = Instance::new(&[("a.txt", b"alpha"), ("b.txt", b"bee")]).await;
+        LORE_CONTEXT
+            .scope(fuse_fixture::setup_test_execution(), async {
+                let fs = provider(&instance).await;
+                let (feature, theirs) = feature_branch_and_revision(&instance, &fs).await;
+                merge_through(&instance, &fs, feature)
+                    .await
+                    .expect("the merge");
+                lookup(&fs, ROOT_INO, "new.txt").await.expect("new.txt");
+                fs.unlink(&request(), ROOT_INO, b"new.txt")
+                    .await
+                    .expect("unlink new.txt");
+                for _ in 0..statuses {
+                    changed_paths_holding_token(&instance, &fs).await;
+                }
+                create_with(&fs, ROOT_INO, "new.txt", b"new").await;
+                changed_paths_holding_token(&instance, &fs).await;
+                let node = staged_node(&instance, "new.txt")
+                    .await
+                    .unwrap_or_else(|| panic!("{statuses} statuses: new.txt is held"));
+                assert!(
+                    node.is_staged_add() && node.is_staged_merge(),
+                    "{statuses} statuses: {node:?}"
+                );
+
+                let revision = commit_staged(&instance, &fs).await.expect("the commit");
+                assert_eq!(state_at(&instance, revision).await.parent_other(), theirs);
+                assert_eq!(
+                    revision_content(&instance, revision, "new.txt")
+                        .await
+                        .as_deref(),
+                    Some(b"new".as_slice()),
+                    "{statuses} statuses"
+                );
+            })
+            .await;
+    }
+}
+
+/// An instance whose revision holds the files `shape` starts from, each holding its own path.
+async fn removed_move_instance(shape: crate::dirty_move_fixture::RemovedMove) -> Instance {
+    let files: Vec<(&str, &[u8])> = shape
+        .committed_files()
+        .iter()
+        .map(|file| (*file, file.as_bytes()))
+        .collect();
+    Instance::new(&files).await
+}
+
+/// Removes `path`, a file or a directory holding `k.txt`, through `fs`.
+async fn removed_through(fs: &Arc<FuseFilesystem>, path: &str, directory: bool) {
+    let (parent, name) = match path.rsplit_once('/') {
+        Some((parent, name)) => (lookup_path(fs, parent).await.expect("the parent"), name),
+        None => (ROOT_INO, path),
+    };
+    if directory {
+        let removed = lookup(fs, parent, name).await.expect("the directory");
+        fs.unlink(&request(), removed, b"k.txt")
+            .await
+            .expect("unlink k.txt");
+        fs.rmdir(&request(), parent, name.as_bytes())
+            .await
+            .expect("rmdir");
+    } else {
+        fs.unlink(&request(), parent, name.as_bytes())
+            .await
+            .expect("unlink");
+    }
+}
+
+/// An unstaged dirty move whose target is then removed through the mount, a file or a directory,
+/// moved to a path the revision lacks or to one it holds by other nodes removed first, its
+/// committed path free or taken again, settles as `lore file dirty` settles it on an ordinary
+/// instance ([`RemovedMove::held`]), whether or not a status ran between the move and the removal,
+/// which keeps the move: a status goes back to the committed path and marks it deleted there,
+/// unless that path is taken, which leaves the node its move; a stage stages those marks. The
+/// commit takes nothing until a stage, then the deletion, never the move.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unstaged_dirty_move_removed_through_the_mount_settles_as_lore_file_dirty_settles_it() {
+    use crate::dirty_move_fixture::RemovedMove;
+    use crate::dirty_move_fixture::Settled;
+    use crate::dirty_move_fixture::Target;
+
+    let variants = [Target::Free, Target::Committed]
+        .into_iter()
+        .flat_map(RemovedMove::each)
+        .flat_map(|shape| {
+            AfterRemoval::with_flag().map(move |(status_first, after)| (shape, status_first, after))
+        })
+        .filter(|(shape, _, after)| {
+            !matches!(after, AfterRemoval::Stage) || shape.settles().contains(&Settled::Staged)
+        });
+    each_variant(variants, |(shape, status_first, after)| async move {
+        let instance = removed_move_instance(shape).await;
+        LORE_CONTEXT
+            .scope(fuse_fixture::setup_test_execution(), async {
+                let fs = provider(&instance).await;
+                if shape.target == Target::Committed {
+                    removed_through(&fs, shape.to(), shape.directory).await;
+                }
+                dirty_move_through(&instance, &fs, shape.from(), shape.to()).await;
+                let fs = if status_first {
+                    let fs = AfterRemoval::Status.run(&instance, fs).await;
+                    assert_eq!(
+                        held_at(&instance.fixture.repository, shape.paths()).await,
+                        shape.held(Settled::Unmarked),
+                        "the status keeps the move"
+                    );
+                    fs
+                } else {
+                    fs
+                };
+                if shape.taken && shape.directory {
+                    fs.mkdir(&request(), ROOT_INO, b"d", libc::S_IFDIR | 0o755, 0o022)
+                        .await
+                        .expect("mkdir d");
+                } else if shape.taken {
+                    create_with(&fs, ROOT_INO, "d.txt", b"new").await;
+                }
+                removed_through(&fs, shape.to(), shape.directory).await;
+                let fs = after.run(&instance, fs).await;
+                let settled = match after {
+                    AfterRemoval::Nothing | AfterRemoval::Remount => Settled::Unmarked,
+                    AfterRemoval::Status => Settled::Marked,
+                    AfterRemoval::Stage => Settled::Staged,
+                };
+
+                assert_eq!(
+                    held_at(&instance.fixture.repository, shape.paths()).await,
+                    shape.held(settled),
+                    "{:?}",
+                    shape.paths()
+                );
+                let revision = match try_commit_staged(&instance, &fs).await {
+                    Ok(revision) => Some((revision, state_at(&instance, revision).await)),
+                    Err(error) if error.is_nothing_staged() => None,
+                    Err(error) => panic!("the commit: {error}"),
+                };
+                let paths: Vec<&str> = shape.paths().iter().copied().chain(["other.txt"]).collect();
+                let committed = match &revision {
+                    Some((_, state)) => {
+                        Some(committed_paths(&instance.fixture.repository, state, &paths).await)
+                    }
+                    None => None,
+                };
+                assert_eq!(committed, shape.committed(settled));
+                if let (Some((revision, _)), true, false) = (revision, shape.taken, shape.directory)
+                {
+                    assert_eq!(
+                        revision_content(&instance, revision, "d.txt")
+                            .await
+                            .as_deref(),
+                        Some(b"new".as_slice())
+                    );
+                }
+            })
+            .await;
+    })
+    .await;
+}
+
+/// A directory an unstaged dirty move took to a path the revision lacks keeps its move through a
+/// status that reports it, renamed through the mount to a name that differs only in case, and once
+/// removed through the mount settles as `lore file dirty` settles it ([`RemovedMove::held`]).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dirty_moved_directory_renamed_in_case_keeps_its_move_through_a_status() {
+    use crate::dirty_move_fixture::Held;
+    use crate::dirty_move_fixture::RemovedMove;
+    use crate::dirty_move_fixture::Settled;
+    use crate::dirty_move_fixture::Target;
+
+    let shape = RemovedMove {
+        target: Target::Free,
+        directory: true,
+        taken: false,
+    };
+    let instance = removed_move_instance(shape).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            dirty_move_through(&instance, &fs, shape.from(), shape.to()).await;
+            fs.rename(&request(), ROOT_INO, b"e", ROOT_INO, b"E", 0)
+                .await
+                .expect("rename e to E");
+            let fs = AfterRemoval::Status.run(&instance, fs).await;
+            assert_eq!(
+                held_at(
+                    &instance.fixture.repository,
+                    &["d", "d/k.txt", "E", "E/k.txt"]
+                )
+                .await,
+                [
+                    Held::Nothing,
+                    Held::Nothing,
+                    Held::DirtyMove,
+                    Held::DirtyMove
+                ]
+            );
+
+            removed_through(&fs, "E", true).await;
+            AfterRemoval::Status.run(&instance, fs).await;
+            assert_eq!(
+                held_at(&instance.fixture.repository, shape.paths()).await,
+                shape.held(Settled::Marked),
+                "{:?}",
+                shape.paths()
+            );
+        })
+        .await;
+}
+
+/// An unstaged dirty move into a directory made through the mount and marked dirty as added, by
+/// `lore file dirty` or a status, which is then removed through the mount with what it holds, a
+/// file or a directory moved, its committed path free or taken again, settles as `lore file dirty`
+/// settles it on an ordinary instance ([`RemovedMove::held`]): a status takes the moved node out
+/// of the directory before its discard, back to its committed path and marked deleted there,
+/// unless that path is taken, which keeps the node its move and the directory; a stage stages
+/// those marks. The commit takes nothing until a stage.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unstaged_dirty_move_into_an_added_directory_removed_through_the_mount_settles_as_lore_file_dirty_settles_it()
+ {
+    use crate::dirty_move_fixture::RemovedMove;
+    use crate::dirty_move_fixture::Settled;
+    use crate::dirty_move_fixture::Target;
+
+    let variants = RemovedMove::each(Target::Added)
+        .into_iter()
+        .flat_map(|shape| {
+            [false, true].into_iter().flat_map(move |by_status| {
+                AfterRemoval::ALL.map(move |after| (shape, by_status, after))
+            })
+        });
+    each_variant(variants, |(shape, by_status, after)| async move {
+        let instance = removed_move_instance(shape).await;
+        LORE_CONTEXT
+            .scope(fuse_fixture::setup_test_execution(), async {
+                let fs = provider(&instance).await;
+                fs.mkdir(&request(), ROOT_INO, b"n", libc::S_IFDIR | 0o755, 0o022)
+                    .await
+                    .expect("mkdir n");
+                let fs = if by_status {
+                    AfterRemoval::Status.run(&instance, fs).await
+                } else {
+                    dirtied_through(&instance, &fs, "n").await;
+                    fs
+                };
+                dirty_move_through(&instance, &fs, shape.from(), shape.to()).await;
+                if shape.taken && shape.directory {
+                    fs.mkdir(&request(), ROOT_INO, b"d", libc::S_IFDIR | 0o755, 0o022)
+                        .await
+                        .expect("mkdir d");
+                } else if shape.taken {
+                    create_with(&fs, ROOT_INO, "d.txt", b"new").await;
+                }
+                removed_through(&fs, shape.to(), shape.directory).await;
+                fs.rmdir(&request(), ROOT_INO, b"n").await.expect("rmdir n");
+                let fs = after.run(&instance, fs).await;
+                let settled = match after {
+                    AfterRemoval::Nothing | AfterRemoval::Remount => Settled::Unmarked,
+                    AfterRemoval::Status => Settled::Marked,
+                    AfterRemoval::Stage => Settled::Staged,
+                };
+
+                assert_eq!(
+                    held_at(&instance.fixture.repository, shape.paths()).await,
+                    shape.held(settled),
+                    "{:?}",
+                    shape.paths()
+                );
+                let paths: Vec<&str> = shape.paths().iter().copied().chain(["other.txt"]).collect();
+                let committed = match try_commit_staged(&instance, &fs).await {
+                    Ok(revision) => Some(
+                        committed_paths(
+                            &instance.fixture.repository,
+                            &*state_at(&instance, revision).await,
+                            &paths,
+                        )
+                        .await,
+                    ),
+                    Err(error) if error.is_nothing_staged() => None,
+                    Err(error) => panic!("the commit: {error}"),
+                };
+                assert_eq!(committed, shape.committed(settled));
+            })
+            .await;
+    })
+    .await;
+}
+
+/// An unstaged dirty move removed through the mount goes back to its committed place once a status
+/// has discarded the directory made there: the file `d/x.txt` moved to `y.txt`, the directory `d`
+/// moved to `e`, and a directory `e/x.txt` made and marked added, then `y.txt` and `e/x.txt` both
+/// removed. The status discards each add it found removed before it returns a move, as a directory
+/// marked added holds the place until its discard.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_dirty_move_goes_back_to_a_place_a_removed_added_directory_held() {
+    use crate::dirty_move_fixture::Held;
+
+    let instance = Instance::new(&[("d/x.txt", b"x"), ("other.txt", b"o")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            dirty_move_through(&instance, &fs, "d/x.txt", "y.txt").await;
+            dirty_move_through(&instance, &fs, "d", "e").await;
+            let e = lookup(&fs, ROOT_INO, "e").await.expect("e");
+            fs.mkdir(&request(), e, b"x.txt", libc::S_IFDIR | 0o755, 0o022)
+                .await
+                .expect("mkdir e/x.txt");
+            let fs = AfterRemoval::Status.run(&instance, fs).await;
+            let paths = ["d", "e", "e/x.txt", "y.txt"];
+            let mut held = Vec::new();
+            for path in paths {
+                held.push(Held::of(staged_node(&instance, path).await.as_ref()));
+            }
+            assert_eq!(
+                held,
+                [
+                    Held::Nothing,
+                    Held::DirtyMove,
+                    Held::DirtyAdd,
+                    Held::DirtyMove
+                ],
+                "before the removal: {paths:?}"
+            );
+
+            fs.rmdir(&request(), e, b"x.txt")
+                .await
+                .expect("rmdir e/x.txt");
+            fs.unlink(&request(), ROOT_INO, b"y.txt")
+                .await
+                .expect("unlink y.txt");
+            let _fs = AfterRemoval::Status.run(&instance, fs).await;
+            let mut held = Vec::new();
+            for path in paths {
+                held.push(Held::of(staged_node(&instance, path).await.as_ref()));
+            }
+            assert_eq!(
+                held,
+                [
+                    Held::Nothing,
+                    Held::DirtyMove,
+                    Held::DirtyDelete,
+                    Held::Nothing
+                ],
+                "{paths:?}"
+            );
         })
         .await;
 }

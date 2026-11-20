@@ -264,6 +264,14 @@ impl Mark {
         }
     }
 
+    /// The deletion `lore file dirty` marks on a node the working tree lacks, in place of its dirty
+    /// action, its extension flags cleared.
+    pub const DIRTY_DELETE: Self = Self::dirty(
+        NodeFlags::DirtyDelete,
+        Ext::Set(NodeExtFlags::NoFlags),
+        true,
+    );
+
     /// A staged change and the matching dirty change, both forced, as the working-tree staging
     /// path records them: a staged change recorded without its dirty counterpart leaves the two
     /// views of the tree disagreeing. The target's extension flags are cleared.

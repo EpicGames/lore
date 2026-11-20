@@ -576,6 +576,16 @@ impl Node {
         self.is_staged_add() || self.is_dirty_add()
     }
 
+    /// Whether the node, which the working tree no longer holds, leaves the staged tree as a
+    /// reverted add rather than being marked deleted: a node marked dirty as added, a staged add
+    /// marked dirty among them, and a node marked dirty as copied and not staged. No revision
+    /// holds such a node where it stands. A node a merge staged is none of them: a parent of the
+    /// merge holds it.
+    pub fn reverts_as_add(&self) -> bool {
+        !self.is_staged_merge()
+            && (self.is_dirty_add() || (self.is_dirty_copy() && !self.is_staged()))
+    }
+
     /// Check if node carries the delete action, staged or dirty
     pub fn is_deleted(&self) -> bool {
         self.is_staged_delete() || self.is_dirty_delete()

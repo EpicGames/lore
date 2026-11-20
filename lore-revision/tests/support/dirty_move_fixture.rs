@@ -21,6 +21,7 @@ use lore_revision::node::Node;
 use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
+use lore_revision::repository::RepositoryContext;
 use lore_revision::stage::StageOptions;
 use lore_revision::state::Mark;
 use lore_revision::state::State;
@@ -60,12 +61,19 @@ pub async fn node_id_at(instance: &TestRepository, state: &State, path: &str) ->
 /// Whether `state` holds a node at `path`; a lookup failing other than for a missing name fails
 /// the test.
 pub async fn holds(instance: &TestRepository, state: &State, path: &str) -> bool {
-    match state
-        .find_node_link(instance.repository.clone(), path)
-        .await
-    {
-        Ok(link) => link.is_valid(),
-        Err(error) if error.is_node_not_found() => false,
+    node_held(&instance.repository, state, path).await.is_some()
+}
+
+/// The node `state` holds at `path`, or `None` where it holds none; a lookup failing other than
+/// for a missing name fails the test.
+async fn node_held(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    path: &str,
+) -> Option<NodeID> {
+    match state.find_node_link(repository.clone(), path).await {
+        Ok(link) => link.is_valid().then_some(link.node),
+        Err(error) if error.is_node_not_found() => None,
         Err(error) => panic!("{path}: {error}"),
     }
 }
@@ -486,5 +494,282 @@ pub async fn assert_addresses(
             node_of(instance, revision, directory).await.address,
             "directory {directory} holds the address its children hash to"
         );
+    }
+}
+
+/// An unstaged dirty move whose target the working tree then lost: of the file `d.txt`, or where
+/// `directory`, of the directory `d` holding `k.txt`, to the place `target` names, with a file or
+/// directory made at the committed path before the removal where `taken`. Its tests on an
+/// ordinary instance and through a mount share what each settles to, so the two keep parity.
+#[derive(Clone, Copy, Debug)]
+pub struct RemovedMove {
+    pub target: Target,
+    pub directory: bool,
+    pub taken: bool,
+}
+
+/// Where a [`RemovedMove`] takes the node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// `e.txt`, or the directory `e`, a path the revision lacks.
+    Free,
+    /// `e.txt`, or the directory `e` holding `k.txt`, which the revision holds as other nodes that
+    /// the working tree lost before the move.
+    Committed,
+    /// `n/d.txt`, or the directory `n/d`, in `n`, a directory marked dirty as added, which the
+    /// working tree loses with what it holds.
+    Added,
+}
+
+/// How far a [`RemovedMove`] is settled before the commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Settled {
+    /// Not at all: the commit follows the removal.
+    Unmarked,
+    /// Marked, as `lore file dirty` of the committed path and the path the working tree lost
+    /// marks it, and a status with `--scan` through a mount.
+    Marked,
+    /// Marked, then staged.
+    Staged,
+}
+
+/// What a staged State holds at a path, as the tests of a [`RemovedMove`] read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    Nothing,
+    DirtyMove,
+    DirtyDelete,
+    DirtyAdd,
+    StagedMove,
+    StagedDelete,
+    StagedAdd,
+    /// A record none of the others describes, with its flags.
+    Other(u16),
+}
+
+impl Held {
+    /// What `node`, a staged State's record at a path, holds; [`Held::Nothing`] where it is none.
+    pub fn of(node: Option<&Node>) -> Self {
+        let Some(node) = node else {
+            return Held::Nothing;
+        };
+        if node.is_staged() {
+            if node.is_staged_delete() {
+                Held::StagedDelete
+            } else if node.is_staged_add() {
+                Held::StagedAdd
+            } else if node.is_staged_move() {
+                Held::StagedMove
+            } else {
+                Held::Other(node.flags)
+            }
+        } else if node.is_dirty_delete() {
+            Held::DirtyDelete
+        } else if node.is_dirty_add() {
+            Held::DirtyAdd
+        } else if node.is_dirty_move() {
+            Held::DirtyMove
+        } else {
+            Held::Other(node.flags)
+        }
+    }
+}
+
+/// What the staged State of `repository` holds at each of `paths`.
+pub async fn held_at(repository: &Arc<RepositoryContext>, paths: &[&str]) -> Vec<Held> {
+    let (_, staged, _) = State::deserialize_current_and_staged(repository.clone())
+        .await
+        .expect("the states");
+    let staged = staged.expect("a staged State");
+    let mut held = Vec::new();
+    for path in paths {
+        let node = match node_held(repository, &staged, path).await {
+            Some(node) => Some(
+                staged
+                    .node(repository.clone(), node)
+                    .await
+                    .expect("the node"),
+            ),
+            None => None,
+        };
+        held.push(Held::of(node.as_ref()));
+    }
+    held
+}
+
+/// Which of `paths` `revision`, a revision of `repository`, holds.
+pub async fn committed_paths<'a>(
+    repository: &Arc<RepositoryContext>,
+    revision: &State,
+    paths: &[&'a str],
+) -> Vec<&'a str> {
+    let mut committed = Vec::new();
+    for &path in paths {
+        if node_held(repository, revision, path).await.is_some() {
+            committed.push(path);
+        }
+    }
+    committed
+}
+
+/// Commits what `instance` has staged and answers which of `paths` the new revision holds, or
+/// `None` where nothing is staged.
+pub async fn commit_holding<'a>(
+    instance: &TestRepository,
+    paths: &[&'a str],
+) -> Option<Vec<&'a str>> {
+    match lore_revision::commit::commit_boxed(
+        instance.repository.clone(),
+        &instance.write_token,
+        lore_revision::commit::CommitOptions::new("Removed move".to_string()),
+    )
+    .await
+    {
+        Ok(_) => {
+            let (revision, _) =
+                lore_revision::instance::load_current_anchor_boxed(&instance.repository)
+                    .await
+                    .expect("the current anchor");
+            let revision = State::deserialize(instance.repository.clone(), revision)
+                .await
+                .expect("the revision");
+            Some(committed_paths(&instance.repository, &revision, paths).await)
+        }
+        Err(error) if error.is_nothing_staged() => None,
+        Err(error) => panic!("the commit: {error}"),
+    }
+}
+
+impl RemovedMove {
+    /// A file and a directory moved to `target`, each with its committed path free and taken.
+    pub fn each(target: Target) -> [RemovedMove; 4] {
+        [(false, false), (false, true), (true, false), (true, true)].map(|(directory, taken)| {
+            RemovedMove {
+                target,
+                directory,
+                taken,
+            }
+        })
+    }
+
+    /// The files the revision holds, `other.txt` among them.
+    pub fn committed_files(self) -> &'static [&'static str] {
+        match (self.target, self.directory) {
+            (Target::Committed, false) => &["d.txt", "e.txt", "other.txt"],
+            (Target::Committed, true) => &["d/k.txt", "e/k.txt", "other.txt"],
+            (_, false) => &["d.txt", "other.txt"],
+            (_, true) => &["d/k.txt", "other.txt"],
+        }
+    }
+
+    /// How far its tests settle it before the commit: every way, but for a stage where its
+    /// committed path is taken and the revision holds its target, which leaves the target's
+    /// deletion unstaged on an ordinary instance.
+    pub fn settles(self) -> &'static [Settled] {
+        if self.target == Target::Committed && self.taken {
+            &[Settled::Unmarked, Settled::Marked]
+        } else {
+            &[Settled::Unmarked, Settled::Marked, Settled::Staged]
+        }
+    }
+
+    /// The committed path.
+    pub fn from(self) -> &'static str {
+        if self.directory { "d" } else { "d.txt" }
+    }
+
+    /// The target.
+    pub fn to(self) -> &'static str {
+        match (self.target, self.directory) {
+            (Target::Added, false) => "n/d.txt",
+            (Target::Added, true) => "n/d",
+            (_, false) => "e.txt",
+            (_, true) => "e",
+        }
+    }
+
+    /// The path the working tree loses: the target, or `n`, which holds it.
+    pub fn removed(self) -> &'static str {
+        match self.target {
+            Target::Added => "n",
+            Target::Free | Target::Committed => self.to(),
+        }
+    }
+
+    /// The paths [`Self::held`] and [`Self::committed`] read, beside `other.txt`, which the
+    /// revision holds throughout.
+    pub fn paths(self) -> &'static [&'static str] {
+        match (self.target, self.directory) {
+            (Target::Added, false) => &["d.txt", "n", "n/d.txt"],
+            (Target::Added, true) => &["d", "d/k.txt", "n", "n/d", "n/d/k.txt"],
+            (_, false) => &["d.txt", "e.txt"],
+            (_, true) => &["d", "d/k.txt", "e", "e/k.txt"],
+        }
+    }
+
+    /// What the staged State holds at each of [`Self::paths`] once settled as `settled` says, as
+    /// `lore file dirty` settles it. Marking takes the node out of `n` before `n` is discarded,
+    /// back to its committed path, and marks it deleted there, and the nodes the revision holds
+    /// at the target come back to it, marked deleted; where the committed path is taken, the node
+    /// keeps its move, `n` stays, and what took the path is marked added. A file below a moved
+    /// directory is then marked deleted at the Free and Committed targets; at the Added one it
+    /// keeps its move, and a stage stages its deletion. A stage stages the other marks.
+    pub fn held(self, settled: Settled) -> Vec<Held> {
+        use Held::*;
+        let held: &[Held] = match (self.target, self.directory, self.taken, settled) {
+            (Target::Added, false, _, Settled::Unmarked) => &[Nothing, DirtyAdd, DirtyMove],
+            (Target::Added, false, false, Settled::Marked) => &[DirtyDelete, Nothing, Nothing],
+            (Target::Added, false, true, Settled::Marked) => &[DirtyAdd, DirtyAdd, DirtyMove],
+            (Target::Added, false, false, Settled::Staged) => &[StagedDelete, Nothing, Nothing],
+            (Target::Added, false, true, Settled::Staged) => &[StagedAdd, StagedAdd, StagedDelete],
+            (Target::Added, true, _, Settled::Unmarked) => {
+                &[Nothing, Nothing, DirtyAdd, DirtyMove, DirtyMove]
+            }
+            (Target::Added, true, false, Settled::Marked) => {
+                &[DirtyDelete, DirtyDelete, Nothing, Nothing, Nothing]
+            }
+            (Target::Added, true, true, Settled::Marked) => {
+                &[DirtyAdd, Nothing, DirtyAdd, DirtyMove, DirtyMove]
+            }
+            (Target::Added, true, false, Settled::Staged) => {
+                &[StagedDelete, StagedDelete, Nothing, Nothing, Nothing]
+            }
+            (Target::Added, true, true, Settled::Staged) => {
+                &[StagedAdd, Nothing, StagedAdd, StagedMove, StagedDelete]
+            }
+            (Target::Committed, false, false, Settled::Marked) => &[DirtyDelete, DirtyDelete],
+            (Target::Committed, false, false, Settled::Staged) => &[StagedDelete, StagedDelete],
+            (Target::Committed, true, false, Settled::Marked) => {
+                &[DirtyDelete, DirtyDelete, DirtyDelete, DirtyDelete]
+            }
+            (Target::Committed, true, false, Settled::Staged) => {
+                &[StagedDelete, StagedDelete, StagedDelete, StagedDelete]
+            }
+            (_, false, _, Settled::Unmarked) => &[Nothing, DirtyMove],
+            (_, false, false, Settled::Marked) => &[DirtyDelete, Nothing],
+            (_, false, true, Settled::Marked) => &[DirtyAdd, DirtyMove],
+            (_, false, false, Settled::Staged) => &[StagedDelete, Nothing],
+            (_, false, true, Settled::Staged) => &[StagedAdd, StagedDelete],
+            (_, true, _, Settled::Unmarked) => &[Nothing, Nothing, DirtyMove, DirtyMove],
+            (_, true, false, Settled::Marked) => &[DirtyDelete, DirtyDelete, Nothing, Nothing],
+            (_, true, true, Settled::Marked) => &[DirtyAdd, Nothing, DirtyMove, DirtyDelete],
+            (_, true, false, Settled::Staged) => &[StagedDelete, StagedDelete, Nothing, Nothing],
+            (_, true, true, Settled::Staged) => &[StagedAdd, Nothing, StagedMove, StagedDelete],
+        };
+        held.to_vec()
+    }
+
+    /// Which of [`Self::paths`] and `other.txt` the commit's revision holds once settled as
+    /// `settled` says, or `None` where the commit has nothing to commit: until a stage, nothing,
+    /// and after it, the deletion of the moved node, with what took its path.
+    pub fn committed(self, settled: Settled) -> Option<Vec<&'static str>> {
+        (settled == Settled::Staged).then(|| {
+            let mut held = Vec::new();
+            if self.taken {
+                held.push(self.from());
+            }
+            held.push("other.txt");
+            held
+        })
     }
 }

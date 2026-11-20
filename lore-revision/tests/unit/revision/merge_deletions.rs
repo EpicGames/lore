@@ -23,9 +23,12 @@ use lore_revision::node::Node;
 use lore_revision::node::NodeDelta;
 use lore_revision::node::NodeFileMetadata;
 use lore_revision::node::NodeFileMetadataBlock;
+use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
 use lore_revision::node::node_to_file_metadata;
 use lore_revision::relay::EventDispatcher;
+use lore_revision::repository::status::StatusOptions;
+use lore_revision::repository::status::status_boxed;
 
 use super::instance::Edit;
 use super::instance::Instance;
@@ -846,4 +849,74 @@ async fn a_merge_of_diverged_history_records_a_deletion_found_at_its_path() {
         },
     )
     .await;
+}
+
+/// An add a merge staged, modified, marked dirty by a scanning status and then removed from the
+/// working tree, stays in the staged State through `lore file dirty` of its path, marked as the
+/// scan left it. The merge commit holds no node at its path.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scanned_merge_staged_add_removed_stays_in_the_staged_state() {
+    run(
+        "a_scanned_merge_staged_add_removed_stays_in_the_staged_state",
+        &TREE,
+        |instance| async move {
+            create_branch(&instance, "feature").await;
+            let theirs = commit_edits(&instance, &[Edit::Write("New.txt", "new")], "Feature").await;
+            switch_to(&instance, branch::DEFAULT_DEFAULT_NAME).await;
+            start_merge(&instance, "feature", true)
+                .await
+                .expect("Failed to merge");
+            let merged = staged_node(&instance, "New.txt").await;
+            write(&instance, "New.txt", "changed");
+            status_boxed(
+                instance.repository.clone(),
+                None,
+                StatusOptions {
+                    staged: true,
+                    scan: true,
+                    check_dirty: false,
+                    reset: false,
+                    sync_point: false,
+                    revision_only: false,
+                    count: false,
+                },
+            )
+            .await
+            .expect("Failed to scan");
+            let scanned = staged_node(&instance, "New.txt").await;
+            assert_eq!(
+                scanned.flags,
+                merged.flags | NodeFlags::Dirty.bits(),
+                "flags {:#x}",
+                scanned.flags
+            );
+            std::fs::remove_file(instance.path.join("New.txt")).expect("Failed to remove New.txt");
+
+            marked_dirty(&instance, "New.txt").await;
+            let node = staged_node(&instance, "New.txt").await;
+            assert_eq!(node.flags, scanned.flags, "flags {:#x}", node.flags);
+
+            commit(&instance, "Merge").await.expect("Failed to commit");
+            let committed = revision_state(&instance, current(&instance).await).await;
+            assert_eq!(committed.parent_other(), theirs);
+            assert!(
+                !committed
+                    .find_node_link(instance.repository.clone(), "New.txt")
+                    .await
+                    .is_ok_and(|found| found.is_valid()),
+                "the merge commit holds New.txt"
+            );
+        },
+    )
+    .await;
+}
+
+/// Marks the working tree's `path` dirty, as `lore file dirty` does.
+async fn marked_dirty(instance: &Instance, path: &str) {
+    lore_revision::file::dirty::dirty(
+        instance.repository.clone(),
+        LoreArray::from_vec(vec![LoreString::from(&instance.path.join(path))]),
+    )
+    .await
+    .expect("Failed to mark the path dirty");
 }

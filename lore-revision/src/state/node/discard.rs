@@ -823,21 +823,66 @@ async fn discard_emptied_adds(
     Ok(directory)
 }
 
-/// Nodes walks over a tree found stale, each with the tree it belongs to, held for
-/// `apply_pending_discards` until every walk that marks the tree has drained.
+/// Nodes walks over a tree found stale, each with the tree it belongs to, and the unstaged dirty
+/// moves they found the working tree no longer holds, to return
+/// ([`State::nodes_return_removed_moves`]), held for [`Self::apply`] until every walk that marks
+/// the tree has drained.
 ///
 /// A walk crosses into linked and layer trees, so what it holds can belong to several.
 #[derive(Default)]
 pub struct WalkDiscards {
     batches: SegQueue<DiscardBatch>,
+    returns: SegQueue<ReturnBatch>,
     /// Whether a directory marked dirty as added and not staged leaves with the last node it held.
     emptied_adds: bool,
 }
 
-/// Nodes of `state` a walk found stale.
+/// Nodes of `state` a walk found stale, and the directories among the adds it found that take
+/// their committed nodes out before their discard.
 pub(in crate::state) struct DiscardBatch {
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
+    nodes: Vec<NodeID>,
+    leaving: Option<Leaving>,
+}
+
+/// Directories among the adds a walk found the working tree no longer holds, each holding a
+/// committed node, which leaves against `current`, the revision their State is staged on, as
+/// `lore file dirty` takes it out, before the directory's discard.
+struct Leaving {
+    current: Arc<State>,
+    directories: Vec<NodeID>,
+}
+
+/// What a walk settling a State found the working tree no longer holds. Only a provider diff,
+/// served on Linux alone, settles a State.
+#[lore_macro::test_pub]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Default)]
+pub struct Removals {
+    /// Adds to discard.
+    pub(crate) discards: Vec<NodeID>,
+    /// Directories among the adds, each holding a committed node, to discard once that node is
+    /// out.
+    pub(crate) leaving: Vec<NodeID>,
+    /// Unstaged dirty moves to return.
+    pub(crate) returns: Vec<NodeID>,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl Removals {
+    /// Whether it holds no node.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.discards.is_empty() && self.leaving.is_empty() && self.returns.is_empty()
+    }
+}
+
+/// Unstaged dirty moves of `state`, staged on `current`, a walk found the working tree no longer
+/// holds.
+struct ReturnBatch {
+    state: Arc<State>,
+    repository: Arc<RepositoryContext>,
+    current: Arc<State>,
     nodes: Vec<NodeID>,
 }
 
@@ -847,6 +892,7 @@ impl WalkDiscards {
     pub(crate) fn emptying_adds() -> Self {
         Self {
             batches: SegQueue::new(),
+            returns: SegQueue::new(),
             emptied_adds: true,
         }
     }
@@ -864,27 +910,137 @@ impl WalkDiscards {
                 state,
                 repository,
                 nodes,
+                leaving: None,
             });
         }
     }
 
-    /// Whether no node is held, which leaves nothing to [apply](Self::apply).
-    pub(crate) fn is_empty(&self) -> bool {
-        self.batches.is_empty()
+    /// Holds `removals`, what a walk settling `state` against `current`, the revision it is
+    /// staged on, found the working tree no longer holds.
+    #[lore_macro::test_pub]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn queue_settled(
+        &self,
+        state: &Arc<State>,
+        repository: &Arc<RepositoryContext>,
+        current: &Arc<State>,
+        removals: Removals,
+    ) {
+        let Removals {
+            discards,
+            leaving,
+            returns,
+        } = removals;
+        if !discards.is_empty() || !leaving.is_empty() {
+            self.batches.push(DiscardBatch {
+                state: state.clone(),
+                repository: repository.clone(),
+                nodes: discards,
+                leaving: (!leaving.is_empty()).then(|| Leaving {
+                    current: current.clone(),
+                    directories: leaving,
+                }),
+            });
+        }
+        if !returns.is_empty() {
+            self.returns.push(ReturnBatch {
+                state: state.clone(),
+                repository: repository.clone(),
+                current: current.clone(),
+                nodes: returns,
+            });
+        }
     }
 
-    /// Discard every node held. Call only once every walk holding nodes here has drained.
+    /// [`Self::queue_settled`] and [`Self::apply`] for a walk that holds no queue.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) async fn apply_settled(
+        state: &Arc<State>,
+        repository: &Arc<RepositoryContext>,
+        current: &Arc<State>,
+        removals: Removals,
+    ) -> Result<(), StateError> {
+        let held = Self::default();
+        held.queue_settled(state, repository, current, removals);
+        held.apply().await
+    }
+
+    /// Whether no node is held, which leaves nothing to [apply](Self::apply).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.batches.is_empty() && self.returns.is_empty()
+    }
+
+    /// Discards every node held, then returns every unstaged dirty move held
+    /// ([`State::nodes_return_removed_moves`]), as a directory marked dirty as added holds a place
+    /// until its discard ([`State::node_return_unstaged_move`]). Call once every walk holding nodes
+    /// here has ended.
+    ///
+    /// Taking committed nodes out of a directory before its discard and returning moves are cold
+    /// paths, which few statuses take, so each is boxed.
     #[lore_macro::test_pub]
     pub(crate) async fn apply(&self) -> Result<(), StateError> {
-        while let Some(batch) = self.batches.pop() {
-            discard_pending(
-                batch.state,
-                batch.repository,
-                batch.nodes,
-                self.emptied_adds,
-            )
+        loop {
+            let Some(batch) = self.batches.pop() else {
+                break;
+            };
+            let mut nodes = batch.nodes;
+            if let Some(leaving) = batch.leaving {
+                Box::pin(take_committed_out(
+                    &batch.state,
+                    &batch.repository,
+                    leaving,
+                    &mut nodes,
+                ))
+                .await?;
+            }
+            discard_pending(batch.state, batch.repository, nodes, self.emptied_adds).await?;
+        }
+        loop {
+            let Some(batch) = self.returns.pop() else {
+                break;
+            };
+            Box::pin(batch.state.nodes_return_removed_moves(
+                &batch.repository,
+                &batch.current,
+                &batch.nodes,
+            ))
             .await?;
         }
         Ok(())
     }
+}
+
+/// Takes the committed nodes out of each of `leaving`'s directories, nodes of `state`, as
+/// `lore file dirty` takes them out
+/// ([`leave_removed_added_directory`](crate::file::dirty::leave_removed_added_directory)), and adds
+/// to `nodes` each directory every one of them left, to discard. One a node cannot leave yet
+/// stays, for the commit to return the node and drop the directory. Boxed by its caller, as only
+/// a directory holding a committed node takes it.
+async fn take_committed_out(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    leaving: Leaving,
+    nodes: &mut Vec<NodeID>,
+) -> Result<(), StateError> {
+    for directory in leaving.directories {
+        let present = state
+            .node(repository.clone(), directory)
+            .await
+            .is_ok_and(|record| record.is_directory() && !record.is_discarded());
+        if present
+            && crate::file::dirty::leave_removed_added_directory(
+                repository,
+                &leaving.current,
+                state,
+                directory,
+            )
+            .await
+            .forward::<StateError>(
+                "Failed to take committed nodes out of a removed added directory",
+            )?
+        {
+            nodes.push(directory);
+        }
+    }
+    Ok(())
 }

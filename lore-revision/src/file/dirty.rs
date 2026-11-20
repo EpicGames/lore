@@ -1584,7 +1584,7 @@ async fn dirty_path(
             .forward::<DirtyError>("Failed to get staged node")
             .map(|node| {
                 (
-                    reverts_as_add(&node),
+                    node.reverts_as_add(),
                     node.is_added(),
                     node.parent,
                     node.is_directory(),
@@ -1868,7 +1868,7 @@ async fn dirty_delete_node(
         if node.is_dirty_delete() {
             return Ok(None);
         }
-        let added = (reverts_as_add(&node) && !node.is_staged()).then_some(Added {
+        let added = (node.reverts_as_add() && !node.is_staged()).then_some(Added {
             node: node_id,
             parent: node.parent,
             is_directory: node.is_directory(),
@@ -1896,32 +1896,20 @@ async fn dirty_delete_node(
     // Boxed: only a node a dirty move took from the place the current revision holds it at goes
     // back, and inline the return would sit in the future of every node the walk marks.
     let returned = if moved {
-        Box::pin(state.node_return_unstaged_move(
-            repository,
-            current.revision(),
-            node_id,
-            name,
-            ReturnOptions::default(),
-        ))
-        .await
-        .forward::<DirtyError>("Failed to return a moved node marked deleted")?
-        .0
+        Box::pin(state.node_return_removed_move(repository, current, node_id, name))
+            .await
+            .forward::<DirtyError>("Failed to return a moved node marked deleted")?
     } else {
+        state
+            .node_mark(repository, node_id, Mark::DIRTY_DELETE)
+            .await
+            .forward::<DirtyError>("Failed to mark node as dirty delete")?;
         Return::Stays
     };
     match returned {
         Return::Gone => return Ok(None),
         Return::Stays | Return::Back => {
             stats.delete_count.fetch_add(1, Ordering::Relaxed);
-            let mark = Mark::dirty(
-                NodeFlags::DirtyDelete,
-                Ext::Set(NodeExtFlags::NoFlags),
-                true,
-            );
-            state
-                .node_mark(repository, node_id, mark)
-                .await
-                .forward::<DirtyError>("Failed to mark node as dirty delete")?;
         }
         Return::Held | Return::Parked | Return::Displaced => {}
     }
@@ -2051,18 +2039,10 @@ fn leading_names(path: &str, count: usize) -> &str {
         .map_or(path, |(at, _)| &path[..at])
 }
 
-/// Whether `node`, which the working tree no longer holds, leaves the staged tree as a reverted add
-/// does ([`discard_dirty_add`]) rather than being marked deleted: a node marked dirty as added, a
-/// staged add the mark found so among them, which marking it drops as staging it does, and a node
-/// marked dirty as copied and not staged. No revision holds such a node where it stands.
-fn reverts_as_add(node: &Node) -> bool {
-    node.is_dirty_add() || (node.is_dirty_copy() && !node.is_staged())
-}
-
 /// A node the working tree no longer holds that leaves the tree as a reverted add, as
 /// [`discard_dirty_add`] takes it: one marked dirty as added or copied and not staged, and a staged
-/// add [`dirty_path`] finds so ([`reverts_as_add`]). Its ID, its parent, whether it is a directory,
-/// and its flags.
+/// add [`dirty_path`] finds so ([`Node::reverts_as_add`]). Its ID, its parent, whether it is a
+/// directory, and its flags.
 struct Added {
     node: NodeID,
     parent: NodeID,
@@ -2208,6 +2188,20 @@ async fn leave_added_directory(
         }
     }
     Ok(left)
+}
+
+/// [`leave_added_directory`] of `directory`, a directory of `staged` marked dirty as added that
+/// the working tree no longer holds, staged on `current`, through a walk marking deletions alone:
+/// a removal another walk found takes the committed nodes out as `lore file dirty` takes them.
+pub(crate) async fn leave_removed_added_directory(
+    repository: &Arc<RepositoryContext>,
+    current: &Arc<State>,
+    staged: &Arc<State>,
+    directory: NodeID,
+) -> Result<bool, DirtyError> {
+    let walk = DirtyWalk::marking_deletions(repository.clone(), current.clone(), staged.clone());
+    let mut name = String::new();
+    leave_added_directory(&walk, directory, &mut name).await
 }
 
 /// Add a new file node named `name` under `parent_staged` with Dirty+Add.
@@ -3100,7 +3094,7 @@ impl Replaced {
             staged: record.is_staged(),
             moved,
             directory,
-            may_stay: moved || (directory && reverts_as_add(record) && !record.is_staged()),
+            may_stay: moved || (directory && record.reverts_as_add() && !record.is_staged()),
         }
     }
 }

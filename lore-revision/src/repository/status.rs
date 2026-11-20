@@ -1425,12 +1425,13 @@ async fn on_first_parent_history(
 /// create exist. No scan starts after the first failure, which is the one returned once the
 /// scans in flight have finished.
 ///
-/// What the scans find stale is discarded once all of them have drained, since a discard clears
-/// marks other scans may still be carrying up through the directories they share. It is discarded
-/// whether or not a scan failed: a node a scan found stale is stale whatever stopped another scan,
-/// and left in the tree it would carry marks no file backs. A scan's failure is the error
-/// returned. Discarding is boxed as the cold path: most scans find nothing stale. Answers whether
-/// anything was discarded.
+/// What the scans find stale is discarded, and the unstaged dirty moves they find removed are
+/// returned, once all of them have drained, since a discard clears marks other scans may still be
+/// carrying up through the directories they share. It is discarded whether or not a scan failed: a
+/// node a scan found stale is stale whatever stopped another scan, and left in the tree it would
+/// carry marks no file backs. A scan's failure is the error returned. Discarding is boxed as the
+/// cold path: most scans find nothing stale. Answers whether a scan held a node to discard or
+/// return.
 pub(crate) async fn scan_paths(
     operation: Arc<InstanceOperationImpl>,
     repository: &Arc<RepositoryContext>,

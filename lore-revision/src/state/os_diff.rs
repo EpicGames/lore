@@ -878,6 +878,7 @@ async fn record_observed_size(
 /// the caller's walk recursion surfaces the children. Used to report a dirty-add
 /// directory exactly once per scan (unlike `add_change`, which walks the whole
 /// hierarchy for a directory add and would double-count against the recursion).
+/// A marking walk leaves a dirty move's mark on the node, as [`emit_unstaged_add`] leaves a file's.
 async fn emit_dirty_add_node_single(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
@@ -891,7 +892,7 @@ async fn emit_dirty_add_node_single(
         .block(repository.clone(), NodeBlock::index(node_id))
         .await?;
     let node = block.node(Node::index(node_id));
-    if intent.stage().is_some() || !node.is_dirty_add() {
+    if intent.stage().is_some() || (!node.is_dirty_add() && !node.is_dirty_move()) {
         mark_settled(&state, &repository, node_id, SettledAction::Add, intent).await?;
     }
     emit_add_node_single(repository, state, node_id, path, changes, stats).await

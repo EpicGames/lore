@@ -1645,6 +1645,64 @@ async fn the_diff_marks_the_from_state_dirty_when_asked_and_clears_a_settled_nod
     .await;
 }
 
+/// A marking diff its caller runs alone, with no queue of the caller's to hold what it settles
+/// after the walk, returns an unstaged dirty move whose target the tree no longer holds to its
+/// committed path once the walk has ended, and marks it deleted there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_marking_diff_run_alone_returns_a_removed_dirty_move_once_the_walk_has_ended() {
+    in_context(async {
+        let w = working(&[("d.txt", b"d"), ("other.txt", b"o")]).await;
+        operation_of(&w.fs)
+            .rename(&path("d.txt"), &path("e.txt"))
+            .await
+            .expect("the move");
+        let token = RepositoryWriteToken::acquire(&w.path).await;
+        let host = |at: &str| w.path.join(at).to_string_lossy().into_owned();
+        lore_revision::file::dirty::dirty_move(
+            w.command_context(&w.fs, Some(token.share())),
+            host("d.txt"),
+            host("e.txt"),
+        )
+        .await
+        .expect("the move marked dirty");
+        drop(token);
+        operation_of(&w.fs)
+            .remove(&path("e.txt"))
+            .await
+            .expect("the removal");
+        let from = w.staged().await;
+
+        let changes = w.diff(&from, FilesystemDiffIntent::MarkDirty).await;
+        assert_eq!(
+            summary(&changes),
+            vec![("e.txt".to_string(), FileAction::Delete, false)]
+        );
+        let node = |at: &'static str| {
+            let from = from.clone();
+            let repository = w.repository.clone();
+            async move {
+                let link = match from.find_node_link(repository.clone(), at).await {
+                    Ok(link) => link,
+                    Err(error) if error.is_node_not_found() => return None,
+                    Err(error) => panic!("the lookup of {at}: {error}"),
+                };
+                Some(
+                    from.node(repository, link.node)
+                        .await
+                        .expect("the node's record"),
+                )
+            }
+        };
+        let returned = node("d.txt").await.expect("d.txt, returned");
+        assert!(
+            returned.is_dirty_delete() && !returned.is_staged(),
+            "{returned:?}"
+        );
+        assert!(node("e.txt").await.is_none(), "e.txt is left");
+    })
+    .await;
+}
+
 /// A provider diff asked to stage marks as a marking one does and stages nothing: lore's stage
 /// walk stages what the diff marked.
 #[tokio::test]
@@ -1754,9 +1812,10 @@ async fn to_front(w: &Working, path: &str) {
 
 /// A status through the mount of a name `lore dirty move` took from a committed file reports that
 /// file's deletion and the move: the name the mount holds pairs with the moved file, not the one
-/// marked deleted beside it, whichever of the two the staged chain holds first. A move from another
-/// directory puts the moved file ahead, and a rename in place keeps its place, which `to_front`
-/// sets before the deletion.
+/// marked deleted beside it, whichever of the two the staged chain holds first. The mount reports
+/// the moved file as an add too, as it reports one moved to a path the revision lacks, and a
+/// second status reports the same, the move kept. A move from another directory puts the moved
+/// file ahead, and a rename in place keeps its place, which `to_front` sets before the deletion.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_status_through_the_mount_of_a_name_a_dirty_move_took_reports_the_deletion_and_the_move()
 {
@@ -1790,22 +1849,25 @@ async fn a_status_through_the_mount_of_a_name_a_dirty_move_took_reports_the_dele
                     .expect("the first child of a")
                     .is_deleted(),
             );
-            let token = RepositoryWriteToken::acquire(&w.path).await;
-            let mut reported = crate::helper::test_status_events_at(
-                w.command_context(&w.fs, Some(token)),
-                None,
-                false,
-            )
-            .await;
-            reported.sort_by_key(|(path, action, _)| (path.clone(), *action as u32));
-            assert_eq!(
-                reported,
-                vec![
-                    ("a/f".to_string(), LoreFileAction::Delete, true),
-                    ("a/f".to_string(), LoreFileAction::Move, true),
-                ],
-                "{case}"
-            );
+            for pass in ["first", "second"] {
+                let token = RepositoryWriteToken::acquire(&w.path).await;
+                let mut reported = crate::helper::test_status_events_at(
+                    w.command_context(&w.fs, Some(token)),
+                    None,
+                    false,
+                )
+                .await;
+                reported.sort_by_key(|(path, action, _)| (path.clone(), *action as u32));
+                assert_eq!(
+                    reported,
+                    vec![
+                        ("a/f".to_string(), LoreFileAction::Add, true),
+                        ("a/f".to_string(), LoreFileAction::Delete, true),
+                        ("a/f".to_string(), LoreFileAction::Move, true),
+                    ],
+                    "{case}, the {pass} status"
+                );
+            }
         }
         assert_eq!(orders.len(), 2, "both chain orders");
     })

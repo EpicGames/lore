@@ -661,7 +661,7 @@ async fn normalize_stage_path(
 
 /// Marks in `state`, the tree a stage resolves its targets against, what the provider's diff
 /// finds below each of `paths`, through a `status` scan that reports nothing
-/// ([`status::scan_paths`]), and answers whether it discarded an entry it found stale, which
+/// ([`status::scan_paths`]), and answers whether the scan held a node to discard or return, which
 /// changes `state` with no target left to stage. A path that names nothing in the repository is
 /// left to the resolution, which reports it, and a path inside a layer mount to what the layer's
 /// tree holds marked.

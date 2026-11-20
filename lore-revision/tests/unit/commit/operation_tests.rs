@@ -1188,6 +1188,167 @@ async fn a_commit_takes_a_staged_empty_directory_as_the_working_tree_holds_it() 
     }
 }
 
+/// An unstaged dirty move whose target the working tree then loses, a file or a directory, moved
+/// to a path the revision lacks or to one it holds by other nodes the working tree lost first, its
+/// committed path free or taken again, settles through `lore file dirty` of the committed path and
+/// the target as [`RemovedMove::held`] says, as a mount's provider diff settles it, whether or not
+/// a status with `--scan` ran between the move and the removal, which keeps the move: the node
+/// goes back to its committed path, marked deleted there, unless that path is taken, which leaves
+/// it its move. The commit takes nothing until a stage, then the deletion, never the move.
+#[tokio::test]
+async fn an_unstaged_dirty_move_whose_target_is_removed_settles_through_lore_file_dirty() {
+    use crate::dirty_move_fixture::RemovedMove;
+    use crate::dirty_move_fixture::Settled;
+    use crate::dirty_move_fixture::Target;
+    use crate::dirty_move_fixture::commit_holding;
+    use crate::dirty_move_fixture::dirty_moved;
+    use crate::dirty_move_fixture::held_at;
+
+    let shapes = [Target::Free, Target::Committed]
+        .into_iter()
+        .flat_map(RemovedMove::each);
+    for (shape, status_first, settled) in shapes.flat_map(|shape| {
+        [false, true].into_iter().flat_map(move |status_first| {
+            shape
+                .settles()
+                .iter()
+                .map(move |&settled| (shape, status_first, settled))
+        })
+    }) {
+        with_instance(|instance| async move {
+            let case = format!("{shape:?}, status first {status_first}, {settled:?}");
+            committed(&instance, shape.committed_files()).await;
+            let to = instance.path.join(shape.to());
+            if shape.target == Target::Committed && shape.directory {
+                std::fs::remove_dir_all(&to).expect("rm -r e");
+            } else if shape.target == Target::Committed {
+                std::fs::remove_file(&to).expect("rm e.txt");
+            }
+            dirty_moved(&instance, shape.from(), shape.to()).await;
+            if status_first {
+                crate::dirty_move_fixture::scanned(&instance).await;
+                assert_eq!(
+                    held_at(&instance.repository, shape.paths()).await,
+                    shape.held(Settled::Unmarked),
+                    "{case}: the status keeps the move"
+                );
+            }
+            if shape.directory {
+                if shape.taken {
+                    std::fs::create_dir(instance.path.join("d")).expect("mkdir d");
+                }
+                std::fs::remove_dir_all(to).expect("rm -r e");
+            } else {
+                if shape.taken {
+                    crate::helper::test_file_write(&instance.path.join("d.txt"), b"new");
+                }
+                std::fs::remove_file(to).expect("rm e.txt");
+            }
+            settle(&instance, shape, settled).await;
+
+            assert_eq!(
+                held_at(&instance.repository, shape.paths()).await,
+                shape.held(settled),
+                "{case}: {:?}",
+                shape.paths()
+            );
+            let paths: Vec<&str> = shape.paths().iter().copied().chain(["other.txt"]).collect();
+            assert_eq!(
+                commit_holding(&instance, &paths).await,
+                shape.committed(settled),
+                "{case}"
+            );
+        })
+        .await;
+    }
+}
+
+/// Settles `shape` as `settled` says, through `lore file dirty` of its committed path and the path
+/// the working tree lost, then a stage of the working tree.
+async fn settle(
+    instance: &TestRepository,
+    shape: crate::dirty_move_fixture::RemovedMove,
+    settled: crate::dirty_move_fixture::Settled,
+) {
+    use crate::dirty_move_fixture::Settled;
+
+    if settled != Settled::Unmarked {
+        lore_revision::file::dirty::dirty(
+            instance.repository.clone(),
+            LoreArray::from_vec(
+                [shape.from(), shape.removed()]
+                    .iter()
+                    .map(|path| LoreString::from(&instance.path.join(path)))
+                    .collect(),
+            ),
+        )
+        .await
+        .expect("the paths marked dirty");
+    }
+    if settled == Settled::Staged {
+        lore_revision::file::stage::stage(
+            instance.repository.clone(),
+            &instance.write_token,
+            LoreArray::from_vec(vec![LoreString::from(&instance.path)]),
+            lore_revision::stage::StageOptions::default(),
+        )
+        .await
+        .expect("the stage");
+    }
+}
+
+/// An unstaged dirty move into a directory marked dirty as added, which the working tree then loses
+/// with what it holds, a file or a directory moved, its committed path free or taken again, settles
+/// through `lore file dirty` of the committed path and the added directory as
+/// [`RemovedMove::held`] says, as a mount's provider diff settles it: the moved node leaves the
+/// directory before its discard, back to its committed path and marked deleted there, unless that
+/// path is taken, which keeps it and the directory. The commit takes nothing until a stage.
+#[tokio::test]
+async fn an_unstaged_dirty_move_into_a_removed_added_directory_settles_through_lore_file_dirty() {
+    use crate::dirty_move_fixture::RemovedMove;
+    use crate::dirty_move_fixture::Settled;
+    use crate::dirty_move_fixture::Target;
+    use crate::dirty_move_fixture::commit_holding;
+    use crate::dirty_move_fixture::dirty_moved;
+    use crate::dirty_move_fixture::held_at;
+    use crate::dirty_move_fixture::made_directory;
+
+    let settles = [Settled::Unmarked, Settled::Marked, Settled::Staged];
+    for (shape, settled) in RemovedMove::each(Target::Added)
+        .into_iter()
+        .flat_map(|shape| settles.map(|settled| (shape, settled)))
+    {
+        with_instance(|instance| async move {
+            let case = format!("{shape:?}, {settled:?}");
+            committed(&instance, shape.committed_files()).await;
+            made_directory(&instance, "n");
+            dirtied(&instance, "n").await;
+            dirty_moved(&instance, shape.from(), shape.to()).await;
+            if shape.taken && shape.directory {
+                made_directory(&instance, "d");
+            } else if shape.taken {
+                crate::helper::test_file_write(&instance.path.join("d.txt"), b"new");
+            }
+            removed_directory(&instance, shape.removed());
+            settle(&instance, shape, settled).await;
+
+            assert_eq!(
+                held_at(&instance.repository, shape.paths()).await,
+                shape.held(settled),
+                "{case}: {:?}",
+                shape.paths()
+            );
+            let paths: Vec<&str> = shape.paths().iter().copied().chain(["other.txt"]).collect();
+            assert_eq!(
+                commit_holding(&instance, &paths).await,
+                shape.committed(settled),
+                "{case}"
+            );
+        })
+        .await;
+    }
+}
+
 /// A commit of a staged move whose file the working tree no longer holds at its new path deletes
 /// the file where nothing stands at its committed path, where a directory does, and where another
 /// staged node holds that path; on a file system that folds no case, a file there in another case

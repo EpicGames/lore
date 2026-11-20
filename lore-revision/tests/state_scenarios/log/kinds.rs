@@ -28,6 +28,7 @@ use lore_revision::state::LinkPin;
 use lore_revision::state::Mark;
 use lore_revision::state::NameChange;
 use lore_revision::state::OwnFlags;
+use lore_revision::state::Removals;
 use lore_revision::state::Rewrite;
 use lore_revision::state::State;
 use lore_revision::state::StateNodeChildrenIterator;
@@ -58,6 +59,7 @@ use super::words_of;
 use crate::current_thread;
 use crate::harness::catalogue::modelled::Labels;
 use crate::harness::catalogue::ops::Settle;
+use crate::harness::catalogue::ops::directory;
 use crate::harness::catalogue::ops::file;
 use crate::harness::faults::FailingStore;
 use crate::harness::fixtures::Tree;
@@ -1559,6 +1561,117 @@ fn applied_discards_log_the_propagations_clear() {
         |effect| matches!(effect, Effect::Word { node, record, .. } if *node == d && !record.0.is_dirty()),
     );
     assert_eq!(cleared.section, Section::ClearPropagation);
+}
+
+/// A walk's settled removals applied once the walks drained: the committed node a dirty move took
+/// into a removed directory marked dirty as added goes back to its committed place before the
+/// directory's discard, and a removed dirty move goes back to its own after the discards, each
+/// marked deleted there.
+#[test]
+fn applied_settled_removals_log_the_moves_back_around_the_discard() {
+    let (records, tree) = logged(
+        || {
+            Box::pin(async {
+                let tree = Tree::new(&["d", "e"]).await;
+                tree.save().await.expect("the revision saves");
+                let repository = &tree.repository;
+                let n = tree
+                    .state
+                    .node_add(repository.clone(), ROOT_NODE, directory("n"), "n")
+                    .await
+                    .expect("'n' adds");
+                tree.state
+                    .node_mark(
+                        repository,
+                        n,
+                        Mark::dirty(NodeFlags::DirtyAdd, Ext::Keep, true),
+                    )
+                    .await
+                    .expect("'n' is marked");
+                let moved = Mark::dirty(NodeFlags::DirtyMove, Ext::Keep, true);
+                for (node, parent, name) in [
+                    (tree.id("d"), n, NameChange::Keep),
+                    (tree.id("e"), ROOT_NODE, NameChange::Rename("f")),
+                ] {
+                    tree.state
+                        .node_move(repository.clone(), node, parent, name, moved)
+                        .await
+                        .expect("the dirty move");
+                    tree.state
+                        .node_mark_destination(repository, parent, moved)
+                        .await
+                        .expect("the move's destination is marked");
+                }
+                tree
+            })
+        },
+        Box::new(|tree: Arc<Tree>| {
+            Box::pin(async move {
+                let current = tree.load(tree.state.revision()).await;
+                let n = tree
+                    .state
+                    .find_subnode(tree.repository.clone(), ROOT_NODE, hash_string("n"))
+                    .await
+                    .expect("'n' is found");
+                let discards = WalkDiscards::default();
+                discards.queue_settled(
+                    &tree.state,
+                    &tree.repository,
+                    &current,
+                    Removals {
+                        discards: Vec::new(),
+                        leaving: vec![n],
+                        returns: vec![tree.id("e")],
+                    },
+                );
+                discards.apply().await.expect("the removals apply");
+            })
+        }),
+    );
+    let records = of(&records, &tree.state);
+    let (d, e) = (tree.id("d"), tree.id("e"));
+    let back = one(
+        &records,
+        "the move of 'd' back",
+        |effect| matches!(effect, Effect::Move { node, to, .. } if *node == d && *to == ROOT_NODE),
+    );
+    let discard = one(
+        &records,
+        "the discard of 'n'",
+        |effect| matches!(effect, Effect::Detach { parent, how: How::Discard, .. } if *parent == ROOT_NODE),
+    );
+    let renamed = one(
+        &records,
+        "the rename of 'e' back",
+        |effect| matches!(effect, Effect::Rename { node, name_hash, .. } if *node == e && *name_hash == hash_string("e")),
+    );
+    assert!(
+        (back.seq, back.sub) < (discard.seq, discard.sub)
+            && (discard.seq, discard.sub) < (renamed.seq, renamed.sub),
+        "'d' goes back before the discard, and 'e' after it"
+    );
+    current_thread().block_on(in_context(async {
+        for (path, node) in [("d", d), ("e", e)] {
+            let record = tree
+                .state
+                .node(tree.repository.clone(), node)
+                .await
+                .expect("the node reads");
+            assert!(
+                record.is_dirty_delete() && !record.is_dirty_move() && !record.is_staged(),
+                "'{path}' is back, marked deleted: {:#x}",
+                record.flags
+            );
+            assert_eq!(record.parent, ROOT_NODE, "'{path}' stands under the root");
+        }
+        assert!(
+            tree.state
+                .find_subnode(tree.repository.clone(), ROOT_NODE, hash_string("n"))
+                .await
+                .is_err(),
+            "'n' is discarded"
+        );
+    }));
 }
 
 /// A settle that finds a child dirty drops its pending clear and leaves the directory as it was:

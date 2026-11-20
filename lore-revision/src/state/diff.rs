@@ -65,6 +65,8 @@ use crate::state::Mark;
 use crate::state::NodeComparison;
 use crate::state::NodeMapping;
 #[cfg(target_os = "linux")]
+use crate::state::Removals;
+#[cfg(target_os = "linux")]
 use crate::state::SettledAction;
 use crate::state::State;
 use crate::state::StateChildrenNodes;
@@ -74,8 +76,6 @@ use crate::state::StateNamedNode;
 use crate::state::WalkDiscards;
 use crate::state::add_change;
 use crate::state::add_change_where;
-#[cfg(target_os = "linux")]
-use crate::state::apply_pending_discards;
 use crate::state::compute_change_flags;
 use crate::state::emit_change;
 #[cfg(target_os = "linux")]
@@ -2212,6 +2212,7 @@ pub(crate) async fn diff_states_into(
         dropped: Vec::new(),
         unmarked: Vec::new(),
         discards: Vec::new(),
+        returns: Vec::new(),
         queue: discards,
         settled: Vec::new(),
     };
@@ -2293,34 +2294,74 @@ struct Settling {
     to: NodeMapping,
     intent: FilesystemDiffIntent,
     stats: FilesystemDiffStats,
-    /// Directories whose descendants' changes are dropped: discarded whole, staged for delete
-    /// already, or held by the filesystem after all.
-    dropped: Vec<RelativePath>,
+    /// Directories whose descendants' changes are dropped: discarded whole, once the walk has
+    /// ended, or staged for delete already.
+    dropped: Vec<Dropped>,
     /// Directories a type change replaced, reported below without marks, as a marking walk
     /// leaves a type change to staging.
     unmarked: Vec<RelativePath>,
-    /// Adds the tree no longer holds, discarded, or held on `queue`, once the walk has ended.
+    /// Files among the adds the tree no longer holds, discarded once the walk has ended.
     discards: Vec<NodeID>,
-    /// The caller's queue `discards` is held on, where given.
+    /// Unstaged dirty moves the tree no longer holds, returned once the walk has ended
+    /// ([`State::nodes_return_removed_moves`]).
+    returns: Vec<NodeID>,
+    /// The caller's queue the removals are held on, where given.
     queue: Option<Arc<WalkDiscards>>,
     /// Marked nodes the tree holds unchanged, cleared once every mark is made.
     settled: Vec<NodeID>,
 }
 
+/// A directory whose descendants' changes a provider diff drops.
+#[cfg(target_os = "linux")]
+struct Dropped {
+    path: RelativePath,
+    /// Its node, where it is an add the tree no longer holds ([`Node::reverts_as_add`]), discarded
+    /// once the walk has ended, or once its committed node is out where it holds one
+    /// ([`Removals`]).
+    removed_add: Option<RemovedAdd>,
+}
+
+/// A directory among the adds the tree no longer holds, held to discard.
+#[cfg(target_os = "linux")]
+struct RemovedAdd {
+    node: NodeID,
+    /// Whether the walk reported a node below it neither added nor staged: a committed node a
+    /// move took there, which leaves before the discard.
+    committed: bool,
+}
+
+/// Whether `path` lies below `directory`.
+#[cfg(target_os = "linux")]
+fn below(directory: &RelativePath, path: &RelativePath) -> bool {
+    path.below(directory).is_some_and(|rest| !rest.is_empty())
+}
+
 /// Whether `path` lies below one of `directories`.
 #[cfg(target_os = "linux")]
 fn below_any(directories: &[RelativePath], path: &RelativePath) -> bool {
-    directories
-        .iter()
-        .any(|directory| path.below(directory).is_some_and(|rest| !rest.is_empty()))
+    directories.iter().any(|directory| below(directory, path))
 }
 
 #[cfg(target_os = "linux")]
 impl Settling {
-    /// Settles one change the walk found, answering with the change to report, if any.
+    /// Settles one change the walk found, answering with the change to report, if any. A change
+    /// below a directory whose descendants' changes are dropped is dropped, a node neither added
+    /// nor staged below a removed add marking that add as holding a committed node.
     async fn settle(&mut self, change: NodeChange) -> Result<Option<NodeChange>, StateError> {
         let path = change.path().clone();
-        if below_any(&self.dropped, &path) {
+        if let Some(dropped) = self
+            .dropped
+            .iter_mut()
+            .find(|dropped| below(&dropped.path, &path))
+        {
+            let flags = change.from.flags;
+            if let Some(removed) = &mut dropped.removed_add
+                && change.from.mapping.node.is_valid_node_id()
+                && !flags.contains(NodeFlags::Staged)
+                && !flags.contains(NodeFlags::DirtyAdd)
+            {
+                removed.committed = true;
+            }
             return Ok(None);
         }
         let marks = self.intent.marks_dirty() && !below_any(&self.unmarked, &path);
@@ -2357,8 +2398,8 @@ impl Settling {
     }
 
     /// A directory both hold: a delete staged for it is taken back, one `from` holds as an add
-    /// not yet committed stays an add, and one reported only for the mark `from` carries is
-    /// dropped.
+    /// not yet committed stays an add, one a dirty move took to a path the current revision lacks
+    /// keeps its move, and one reported only for the mark `from` carries is dropped.
     async fn settle_directory(
         &mut self,
         mut change: NodeChange,
@@ -2372,8 +2413,12 @@ impl Settling {
                 .node_clear(&self.from.repository, node_id, Clear::Staged)
                 .await?;
         }
-        if marks && self.uncommitted(&path).await {
-            if !self.node(node_id).await?.is_dirty_add() {
+        if marks && self.uncommitted(&path, None).await {
+            let marked = self
+                .node(node_id)
+                .await
+                .map(|node| node.is_dirty_add() || node.is_dirty_move())?;
+            if !marked {
                 self.mark(node_id, SettledAction::Add).await?;
             }
             change.action = FileAction::Add;
@@ -2389,9 +2434,12 @@ impl Settling {
         Ok(Some(change))
     }
 
-    /// A node the tree no longer holds, which the walk confirmed: an add not yet committed is
-    /// discarded, a node staged for delete already is left as it is, and anything else is marked
-    /// deleted.
+    /// A node the tree no longer holds, which the walk confirmed. An add not yet committed is
+    /// discarded ([`Node::reverts_as_add`]), and a node staged for delete already is left as it
+    /// is. An unstaged dirty move goes back to where the current revision holds it once the walk
+    /// has ended, to be marked deleted there ([`State::nodes_return_removed_moves`]). Anything
+    /// else is marked deleted, a staged move to a path the revision lacks and an add a merge
+    /// staged included, the mark keeping the staged change.
     async fn settle_delete(
         &mut self,
         mut change: NodeChange,
@@ -2402,21 +2450,33 @@ impl Settling {
         let node = self.node(node_id).await?;
         if node.is_staged_delete() {
             if node.is_directory() {
-                self.dropped.push(path);
+                self.dropped.push(Dropped {
+                    path,
+                    removed_add: None,
+                });
             }
             return Ok(None);
         }
-        if marks && self.uncommitted(&path).await {
-            self.discards.push(node_id);
+        if marks && node.reverts_as_add() && self.uncommitted(&path, None).await {
             if node.is_directory() {
-                self.dropped.push(path);
+                self.dropped.push(Dropped {
+                    path,
+                    removed_add: Some(RemovedAdd {
+                        node: node_id,
+                        committed: false,
+                    }),
+                });
+            } else {
+                self.discards.push(node_id);
             }
             return Ok(None);
         }
         if node.is_file() {
             self.stats.file_delete.fetch_add(1, Ordering::Relaxed);
         }
-        if marks {
+        if marks && node.is_dirty_move() && !node.is_staged() {
+            self.returns.push(node_id);
+        } else if marks {
             self.mark(node_id, SettledAction::Delete).await?;
             change.flags = self.flags_of(node_id).await? | (change.flags & change::Flags::Modify);
         }
@@ -2518,7 +2578,9 @@ impl Settling {
     }
 
     /// A file both hold: reported where its content or mode differs, and a mark the tree holds
-    /// no change for is cleared. A file `from` holds as an add not yet committed stays an add.
+    /// no change for is cleared. A file `from` holds as an add not yet committed stays an add, and
+    /// one a dirty move took to a path the current revision lacks, or holds by another node, keeps
+    /// its move.
     async fn settle_file(
         &mut self,
         mut change: NodeChange,
@@ -2533,8 +2595,9 @@ impl Settling {
                 .node_clear(&self.from.repository, node_id, Clear::Staged)
                 .await?;
         }
-        if marks && self.uncommitted(&path).await {
-            if !from_node.is_dirty_add() {
+        let moved = from_node.is_dirty_move() && !from_node.is_staged();
+        if marks && self.uncommitted(&path, moved.then_some(node_id)).await {
+            if !from_node.is_dirty_add() && !from_node.is_dirty_move() {
                 self.mark(node_id, SettledAction::Add).await?;
             }
             self.stats.file_add.fetch_add(1, Ordering::Relaxed);
@@ -2675,11 +2738,15 @@ impl Settling {
         }
     }
 
-    /// Whether the working copy's last revision holds nothing at `path`, which makes a node
-    /// `from` holds there an add not yet committed.
-    async fn uncommitted(&self, path: &RelativePath) -> bool {
-        !Arc::ptr_eq(&self.from.state, &self.current.state)
-            && !self.current.node_at(path).await.is_valid()
+    /// Whether the current revision holds nothing at `path`, where `from` holds an add not yet
+    /// committed or a node a move took there, or holds another node than `moved`, an unstaged
+    /// dirty move `from` holds there.
+    async fn uncommitted(&self, path: &RelativePath, moved: Option<NodeID>) -> bool {
+        if Arc::ptr_eq(&self.from.state, &self.current.state) {
+            return false;
+        }
+        let link = self.current.node_at(path).await;
+        !link.is_valid() || moved.is_some_and(|node| link.node != node)
     }
 
     fn mark(
@@ -2772,9 +2839,10 @@ impl Settling {
         })
     }
 
-    /// Clears the marks of the nodes found unchanged, then discards the adds the tree no longer
-    /// holds, or holds them on `queue`, and answers with what the diff counted, the discards among
-    /// it.
+    /// Clears the marks of the nodes found unchanged, then holds on `queue` the adds the tree no
+    /// longer holds, to discard, and the unstaged dirty moves it no longer holds, to return
+    /// ([`Removals`]), and answers with what the diff counted. Without a queue it discards and
+    /// returns them itself, boxed, as only a caller running one walk on its own takes that path.
     async fn finish(self) -> Result<FilesystemDiffStats, StateError> {
         let repository = self.from.repository.clone();
         for node_id in self.settled {
@@ -2783,12 +2851,38 @@ impl Settling {
                 .node_clear(&repository, node_id, Clear::Dirty)
                 .await?;
         }
+        let mut discards = self.discards;
+        let mut leaving = Vec::new();
+        for removed in self
+            .dropped
+            .into_iter()
+            .filter_map(|dropped| dropped.removed_add)
+        {
+            if removed.committed {
+                leaving.push(removed.node);
+            } else {
+                discards.push(removed.node);
+            }
+        }
         self.stats
             .discarded
-            .fetch_add(self.discards.len() as u64, Ordering::Relaxed);
-        match self.queue {
-            Some(queue) => queue.queue(self.from.state, repository, self.discards),
-            None => apply_pending_discards(self.from.state, repository, self.discards).await?,
+            .fetch_add(discards.len() as u64, Ordering::Relaxed);
+        let (state, current) = (&self.from.state, &self.current.state);
+        let removals = Removals {
+            discards,
+            leaving,
+            returns: self.returns,
+        };
+        if let Some(queue) = &self.queue {
+            queue.queue_settled(state, &repository, current, removals);
+        } else if !removals.is_empty() {
+            Box::pin(WalkDiscards::apply_settled(
+                state,
+                &repository,
+                current,
+                removals,
+            ))
+            .await?;
         }
         Ok(self.stats)
     }

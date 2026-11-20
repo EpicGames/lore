@@ -62,6 +62,7 @@ pub use node::clear::ServedClear;
 pub use node::detach::Detach;
 pub use node::detach::IfUnchanged;
 pub use node::discard::DiscardCounts;
+pub use node::discard::Removals;
 pub use node::discard::WalkDiscards;
 pub(crate) use node::discard::apply_pending_discards;
 pub use node::discard::node_discard_free;
@@ -4304,6 +4305,62 @@ impl State {
         let returned =
             Box::pin(self.node_return_to(repository, moved, committed, (name, options))).await?;
         Ok((returned, path))
+    }
+
+    /// Returns each of `nodes`, unstaged dirty moves the working tree no longer holds, to the place
+    /// `current`, the revision this tree is staged on, holds it at, and marks it deleted there
+    /// ([`Self::node_return_removed_move`]). Call once the walks that found `nodes` have ended:
+    /// nothing else may change the tree while one returns.
+    pub(crate) async fn nodes_return_removed_moves(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        current: &Arc<State>,
+        nodes: &[NodeID],
+    ) -> Result<(), StateError> {
+        if !std::ptr::eq(self, Arc::as_ptr(current)) {
+            self.hold_base(current.clone());
+        }
+        let mut name = String::new();
+        for &node in nodes {
+            self.node_return_removed_move(repository, current, node, &mut name)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Returns `node`, an unstaged dirty move the working tree no longer holds, to the place
+    /// `current`, the revision this tree is staged on, holds it at, marks it deleted there
+    /// ([`Self::node_return_unstaged_move`]), and answers what became of it. One `current` holds
+    /// no node of its kind at is marked deleted where it stands. One whose place another node
+    /// holds keeps its move, for the commit to return it once the place frees. One that cannot go
+    /// back, as a staged node holds its place or its committed parent is gone, keeps its move too.
+    /// One no longer in the tree is passed over. `name` is a buffer the caller keeps across nodes.
+    ///
+    /// Not an `async fn`: its future chains the return's and the mark's, with no second copy of
+    /// the arguments the return takes, so a loop awaiting it holds little more than the return.
+    pub(crate) fn node_return_removed_move<'a>(
+        &'a self,
+        repository: &'a Arc<RepositoryContext>,
+        current: &State,
+        node: NodeID,
+        name: &'a mut String,
+    ) -> impl Future<Output = Result<Return, StateError>> + Send + 'a {
+        futures::FutureExt::then(
+            self.node_return_unstaged_move(
+                repository,
+                current.revision(),
+                node,
+                name,
+                ReturnOptions::default(),
+            ),
+            move |returned| async move {
+                let (returned, _) = returned?;
+                if matches!(returned, Return::Stays | Return::Back) {
+                    self.node_mark(repository, node, Mark::DIRTY_DELETE).await?;
+                }
+                Ok(returned)
+            },
+        )
     }
 
     /// Whether `id`, this tree's node `node`, stands where `base`, the revision this tree shares
@@ -9567,7 +9624,8 @@ pub struct FilesystemDiffStats {
     pub file_hash: AtomicU64,
     /// Files a recorded modified time answered for, sparing them a hash check.
     pub file_mtime_match: AtomicU64,
-    /// Adds the tree no longer holds, discarded from the tree diffed against it.
+    /// Adds the tree no longer holds, discarded from the tree diffed against it, but for a
+    /// directory holding a committed node, which leaves only once that node is out.
     pub discarded: AtomicU64,
     /// Where the provider diff met its filesystem State changed since it listed a directory, as
     /// the walk's `DiffWalkStats::moved_under_walk` counts it. For tests.
