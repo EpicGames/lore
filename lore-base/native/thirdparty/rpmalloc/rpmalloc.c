@@ -14,18 +14,12 @@
  *
  */
 
-#if defined(__linux__) && !defined(_GNU_SOURCE)
-// The processor affinity mask of the process (sched_getaffinity) is a GNU extension
-#define _GNU_SOURCE
-#endif
-
 #include "rpmalloc.h"
 
 #include <errno.h>
 #include <string.h>
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <stdint.h>
 #include <stdatomic.h>
 
@@ -113,6 +107,14 @@ madvise(caddr_t, size_t, int);
 
 #if defined(__linux__) || defined(__ANDROID__)
 #include <sys/prctl.h>
+#include <sys/syscall.h>
+#if !defined(MREMAP_MAYMOVE)
+// The C library declares mremap and its flags only with _GNU_SOURCE, the flags have the values of the kernel interface
+#define MREMAP_MAYMOVE 1
+#define MREMAP_FIXED 2
+extern void*
+mremap(void* old_address, size_t old_size, size_t new_size, int flags, ...);
+#endif
 #if !defined(PR_SET_VMA)
 #define PR_SET_VMA 0x53564d41
 #define PR_SET_VMA_ANON_NAME 0
@@ -1428,16 +1430,6 @@ os_mmap(size_t size, size_t alignment, size_t* offset, size_t* mapped_size) {
 		ptr = mmap(0, map_size, PROT_READ | PROT_WRITE, flags, (int)VM_MAKE_TAG(240U), 0);
 	}
 #elif defined(MAP_HUGETLB)
-	// Regular pages are committed when first touched, so map them without charging the
-	// commit limit. Under the default overcommit heuristic fork() charges every private
-	// writable mapping again, and refuses one larger than RAM plus swap: a process with a
-	// large rpmalloc reservation could not fork() at all, but failed with ENOMEM. Huge TLB
-	// mappings keep their reservation, without which a fault on an exhausted pool is SIGBUS.
-#if defined(MAP_NORESERVE)
-	const int page_flags = flags | MAP_NORESERVE;
-#else
-	const int page_flags = flags;
-#endif
 	int huge_flags = 0;
 	if (os_huge_pages) {
 		huge_flags = MAP_HUGETLB;
@@ -1448,13 +1440,13 @@ os_mmap(size_t size, size_t alignment, size_t* offset, size_t* mapped_size) {
 			huge_flags |= (int)(os_huge_page_shift << MAP_HUGE_SHIFT);
 #endif
 	}
-	void* ptr = mmap(0, map_size, PROT_READ | PROT_WRITE | PROT_MAX(PROT_READ | PROT_WRITE),
-	                 os_huge_pages ? (huge_flags | flags) : page_flags, -1, 0);
+	void* ptr =
+	    mmap(0, map_size, PROT_READ | PROT_WRITE | PROT_MAX(PROT_READ | PROT_WRITE), huge_flags | flags, -1, 0);
 #if defined(MADV_HUGEPAGE)
 	// In some configurations, huge pages allocations might fail thus
 	// we fallback to normal allocations and promote the region as transparent huge page
 	if ((ptr == MAP_FAILED || !ptr) && os_huge_pages) {
-		ptr = mmap(0, map_size, PROT_READ | PROT_WRITE, page_flags, -1, 0);
+		ptr = mmap(0, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);
 		if (ptr && (ptr != MAP_FAILED)) {
 			// Best-effort promotion to transparent huge pages; ignore failures (for
 			// example when THP is disabled system-wide, where madvise returns EINVAL).
@@ -5065,6 +5057,17 @@ os_read_system_file(const char* path, char* buffer, size_t capacity) {
 	buffer[total] = 0;
 	return total;
 }
+
+//! Parse the decimal number at the start of a string, after any blanks
+static size_t
+os_parse_decimal(const char* text) {
+	while ((*text == ' ') || (*text == '\t'))
+		++text;
+	size_t value = 0;
+	while ((*text >= '0') && (*text <= '9'))
+		value = (value * 10) + (size_t)(*text++ - '0');
+	return value;
+}
 #endif
 
 extern int
@@ -5167,11 +5170,15 @@ rpmalloc_initialize(rpmalloc_interface_t* memory_interface) {
 	if (!global_cpu_count)
 		global_cpu_count = (uint32_t)system_info.dwNumberOfProcessors;
 #else
-#if defined(__linux__) && defined(CPU_COUNT)
+#if defined(__linux__) && defined(SYS_sched_getaffinity)
 	{
-		cpu_set_t cpu_set;
-		if (!sched_getaffinity(0, sizeof(cpu_set), &cpu_set))
-			global_cpu_count = (uint32_t)CPU_COUNT(&cpu_set);
+		// The system call returns the bytes of the affinity mask it copied, the C library wrapper needs _GNU_SOURCE
+		unsigned long cpu_mask[1024 / (8 * sizeof(unsigned long))];
+		long mask_size = syscall(SYS_sched_getaffinity, 0, sizeof(cpu_mask), cpu_mask);
+		for (long iword = 0; iword < (mask_size / (long)sizeof(unsigned long)); ++iword) {
+			for (unsigned long word = cpu_mask[iword]; word; word &= word - 1)
+				++global_cpu_count;
+		}
 	}
 #endif
 	if (!global_cpu_count) {
@@ -5230,7 +5237,7 @@ rpmalloc_initialize(rpmalloc_interface_t* memory_interface) {
 		if (os_read_system_file("/proc/meminfo", meminfo, sizeof(meminfo))) {
 			const char* line = strstr(meminfo, "Hugepagesize:");
 			if (line)
-				huge_page_size = (size_t)strtol(line + 13, 0, 10) * 1024;
+				huge_page_size = os_parse_decimal(line + 13) * 1024;
 		}
 		// Sanity check the detected default huge page size, the builtin page geometry
 		// cannot use huge pages larger than the largest builtin page size (e.g. 1GiB
@@ -5347,7 +5354,7 @@ rpmalloc_initialize(rpmalloc_interface_t* memory_interface) {
 			thp_mode = strstr(thp_state, "[never]") ? 0 : (strstr(thp_state, "[always]") ? 2 : 1);
 		os_thp_size = 2 * 1024 * 1024;
 		if (os_read_system_file("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size", thp_state, sizeof(thp_state))) {
-			size_t thp_size = (size_t)strtoull(thp_state, 0, 10);
+			size_t thp_size = os_parse_decimal(thp_state);
 			if (thp_size && !(thp_size & (thp_size - 1)))
 				os_thp_size = thp_size;
 		}
