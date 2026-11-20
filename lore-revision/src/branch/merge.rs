@@ -21,6 +21,7 @@ use crate::branch;
 use crate::branch::push::PushProgress;
 use crate::branch::push::push_fragments;
 use crate::branch::push::push_query;
+use crate::branch::push::refusal_as_internal;
 use crate::change;
 use crate::change::FileAction;
 use crate::change::NodeChange;
@@ -7232,6 +7233,7 @@ async fn push_merged_branch(
         .forward::<MergeError>("acquiring revision protocol")?
         .branch_push(branch, signature, false, false)
         .await
+        .map_err(refusal_as_internal)
         .forward::<MergeError>("pushing branch")?;
 
     if response.fast_forward_merged {

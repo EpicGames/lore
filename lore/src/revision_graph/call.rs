@@ -19,9 +19,9 @@ use crate::storage::call::storage_call_with;
 use crate::storage::handle::LoreStore;
 use crate::storage::store::StoreInternal;
 
-/// Whether a revision graph call sends `event` to its callback: a record, location complete or
-/// synced event, or a log line. Every other event is dropped. `Complete` and `End` reach the
-/// callback past this filter.
+/// Whether a revision graph call sends `event` to its callback: a record, location complete,
+/// synced or pushed event, the push's fragment progress and statistics, or a log line. Every other
+/// event is dropped. `Complete` and `End` reach the callback past this filter.
 pub fn revision_graph_events(event: &LoreEvent) -> bool {
     matches!(
         event,
@@ -32,6 +32,9 @@ pub fn revision_graph_events(event: &LoreEvent) -> bool {
             | LoreEvent::RevisionGraphLocationComplete(_)
             | LoreEvent::RevisionGraphBranchMetadata(_)
             | LoreEvent::RevisionGraphBranchSynced(_)
+            | LoreEvent::RevisionGraphBranchPushed(_)
+            | LoreEvent::BranchPushFragmentProgress(_)
+            | LoreEvent::BranchPushStats(_)
     )
 }
 

@@ -65,3 +65,42 @@ fn traced_box_downcast() {
     let inner = tb.inner.downcast::<TestError>().expect("should downcast");
     assert_eq!(inner.0, "downcast test");
 }
+
+/// A refusal, the one variant of [`Refusals`].
+#[derive(Debug)]
+struct Refused;
+
+impl fmt::Display for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "refused")
+    }
+}
+
+impl Error for Refused {}
+
+impl lore_error_set::FfiError for Refused {
+    fn ffi_code(&self) -> i32 {
+        17
+    }
+}
+
+#[lore_error_set::error_set]
+enum Refusals {
+    Refused,
+}
+
+/// A context pushed onto a set's trace names the file and line of the call that pushed it.
+#[cfg(feature = "track-locations")]
+#[test]
+fn a_pushed_context_names_its_caller() {
+    let mut err = Refusals::from(Refused);
+    let line = line!() + 1;
+    err.push_context("refusing the request");
+
+    let trace = err.extract_inner().trace;
+    let pushed = trace.locations().last().expect("the pushed entry");
+    assert_eq!(
+        (pushed.file, pushed.line, pushed.context()),
+        (file!(), line, Some("refusing the request"))
+    );
+}

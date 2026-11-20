@@ -322,12 +322,7 @@ async fn pump_responses<R>(
             Ok(response) => response,
             Err(status) => {
                 let mut err = ProtocolError::from(Disconnected);
-                err.push_trace(lore_error_set::Location::with_context(
-                    file!(),
-                    line!(),
-                    column!(),
-                    Arc::from(format!("{} stream terminated: {status}", verb.label())),
-                ));
+                err.push_context(format!("{} stream terminated: {status}", verb.label()));
                 terminal = err;
                 break;
             }

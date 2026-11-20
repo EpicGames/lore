@@ -854,6 +854,32 @@ fn revision_graph_branch_sync_survives_the_wire() {
     }
 }
 
+/// A branch push relayed to the service carries its options.
+#[test]
+fn revision_graph_branch_push_survives_the_wire() {
+    use lore::revision_graph::branch_push::LoreRevisionGraphBranchPushArgs;
+    use lore::revision_graph::branch_push::LoreRevisionGraphBranchPushOptions;
+    use lore::storage::handle::LoreStore;
+
+    let args = LoreRevisionGraphBranchPushArgs {
+        id: 19,
+        store: LoreStore { handle_id: 4 },
+        repository: Partition::from([0x21u8; 16]),
+        branch: Context::from([0x42u8; 16]),
+        options: LoreRevisionGraphBranchPushOptions {
+            force: 1,
+            fast_forward_merge: 1,
+        },
+    };
+
+    match relayed(LoreCommand::RevisionGraphBranchPush(args.clone())) {
+        LoreCommand::RevisionGraphBranchPush(read_back) => {
+            assert_eq!(read_back, args, "must carry every field unchanged");
+        }
+        other => panic!("Unexpected command: {other:?}"),
+    }
+}
+
 /// The revision graph commands follow the commands that preceded them. Bitcode names a variant by
 /// its position, in the first byte of the encoding, so a command added ahead of another shifts the
 /// variant the other decodes as: the last of the earlier commands keeps the bytes it encodes as
@@ -908,6 +934,7 @@ fn revision_graph_commands_follow_the_last_existing_command() {
             LoreCommand::RevisionGraphBranchArchive(Default::default()),
         ),
         (8, LoreCommand::RevisionGraphBranchSync(Default::default())),
+        (11, LoreCommand::RevisionGraphBranchPush(Default::default())),
     ] {
         assert_eq!(
             bitcode::encode(&command)[0],

@@ -15,6 +15,7 @@ use lore_revision::state::allow_all_repositories;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::REVISION;
+use lore_transport::grpc::branch_advanced_status;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -52,7 +53,9 @@ use crate::util::setup_execution;
 /// Soft rejection (non-fast-forward without `force`/`fast_forward_merge`,
 /// or fast-forward merge with conflicts) is conveyed via
 /// `FailedPrecondition` with a detail message that distinguishes the
-/// two cases and embeds the current branch latest. Pushing to a branch
+/// two cases and embeds the current branch latest, and with the branch
+/// latest in the status details, which mark the rejection apart from a
+/// hook's `FailedPrecondition` ([`branch_advanced_status`]). Pushing to a branch
 /// id whose metadata is missing returns `NotFound`. Pushing to a
 /// deleted branch returns `NotFound` too, so the client restores it
 /// with a create, or `AlreadyExists` if its name is claimed by a
@@ -195,7 +198,7 @@ pub async fn handler(
                     fast_forward_merge,
                     "Branch push rejected",
                 );
-                return Err(Status::failed_precondition(detail));
+                return Err(branch_advanced_status(resulting_revision, detail));
             }
 
             lore_spawn!({

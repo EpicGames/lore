@@ -6667,12 +6667,7 @@ type ErrorCheck = fn(&StorageError) -> bool;
 fn refusals() -> [(ProtocolError, ErrorCheck); 2] {
     use lore_error_set::ErrorSet;
     let with_reason = |mut refusal: ProtocolError| {
-        refusal.push_trace(lore_error_set::Location::with_context(
-            file!(),
-            line!(),
-            column!(),
-            Arc::from("the token expired"),
-        ));
+        refusal.push_context("the token expired");
         refusal
     };
     [

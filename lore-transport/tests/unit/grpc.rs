@@ -5,7 +5,9 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use lore_base::error::AddressNotFound;
+use lore_base::types::Hash;
 use lore_transport::error::ProtocolError;
+use lore_transport::error::branch_push_error;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Status;
 use tonic::service::Routes;
@@ -192,7 +194,7 @@ async fn a_request_does_not_hold_its_rebuild() {
 
     let request = with_reconnect(
         &connection,
-        || async { Ok(()) },
+        || async { Ok::<(), ProtocolError>(()) },
         |_| async {
             let state = [0u8; 4096];
             tokio::task::yield_now().await;
@@ -320,6 +322,35 @@ fn a_failed_precondition_without_details_is_not_an_address() {
         "Branch push is not a fast-forward",
     ));
     assert!(error.is_internal(), "{error:?}");
+}
+
+/// A branch push the remote refuses as not a fast-forward, or as a fast-forward merge that
+/// conflicts, and marks so, is `BranchAdvanced`. One it refuses for a missing fragment names the
+/// fragment, and another status maps as any call's does.
+#[test]
+fn a_refused_branch_push_is_branch_advanced() {
+    let refused = branch_push_error(branch_advanced_status(
+        Hash::from([3; 32]),
+        "Branch push is not a fast-forward",
+    ));
+    let missing = branch_push_error(Status::from(ProtocolError::from(missing_address())));
+    let unavailable = branch_push_error(Status::unavailable("restarting"));
+
+    assert!(
+        refused.is_branch_advanced()
+            && missing.is_address_not_found()
+            && unavailable.is_disconnected(),
+        "{refused:?}; {missing:?}; {unavailable:?}"
+    );
+}
+
+/// A branch push refused with `FAILED_PRECONDITION` and no mark, as a pre-push hook or an older
+/// Lore Server refuses it, is no `BranchAdvanced`.
+#[test]
+fn an_unmarked_refusal_of_a_branch_push_is_internal() {
+    let refused = branch_push_error(Status::failed_precondition("refused by a hook"));
+
+    assert!(refused.is_internal(), "{refused:?}");
 }
 
 /// Details of any other length are not guessed at.

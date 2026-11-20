@@ -62,6 +62,7 @@ use lore_revision::revision::restore::RestoreOptions;
 use lore_revision::stage::StageOptions;
 use lore_revision::state::State;
 use lore_transport::BranchListResponse;
+use lore_transport::BranchPushError;
 use lore_transport::BranchPushResponse;
 use lore_transport::BranchQueryResponse;
 use lore_transport::BranchRecord;
@@ -166,8 +167,8 @@ impl Revision for RefusingRevision {
         _: Hash,
         _: bool,
         _: bool,
-    ) -> Result<BranchPushResponse, ProtocolError> {
-        Err(refusal())
+    ) -> Result<BranchPushResponse, BranchPushError> {
+        Err(refusal().into())
     }
 
     async fn branch_list(

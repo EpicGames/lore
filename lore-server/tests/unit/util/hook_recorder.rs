@@ -27,7 +27,8 @@ pub(crate) struct Seen {
 pub(crate) type SeenLog = Arc<parking_lot::Mutex<Vec<Seen>>>;
 
 struct RecordingHook {
-    reject: bool,
+    /// The status the hook rejects every operation with, if it rejects them.
+    reject: Option<StatusCode>,
     seen: SeenLog,
 }
 
@@ -52,12 +53,8 @@ impl Hook for RecordingHook {
                 .get_metadata(METADATA_IS_SERVICE_ACCOUNT)
                 .map(str::to_string),
         });
-        if self.reject {
-            return Err(HookError::rejected(
-                self.name(),
-                "rejected by test",
-                StatusCode::PermissionDenied,
-            ));
+        if let Some(status) = self.reject {
+            return Err(HookError::rejected(self.name(), "rejected by test", status));
         }
         Ok(())
     }
@@ -66,6 +63,12 @@ impl Hook for RecordingHook {
 /// A dispatcher with one recording pre-hook on the branch hook points, which
 /// rejects every operation when `reject` is set, and the log it records to.
 pub(crate) fn recording_dispatcher(reject: bool) -> (Arc<HookDispatcher>, SeenLog) {
+    rejecting_dispatcher(reject.then_some(StatusCode::PermissionDenied))
+}
+
+/// A dispatcher with one recording pre-hook on the branch hook points, which rejects every
+/// operation with `reject` where it is set, and the log it records to.
+pub(crate) fn rejecting_dispatcher(reject: Option<StatusCode>) -> (Arc<HookDispatcher>, SeenLog) {
     let seen = SeenLog::default();
     let hook = RecordingHook {
         reject,

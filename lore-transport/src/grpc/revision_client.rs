@@ -21,7 +21,9 @@ use super::GRPCAuthRef;
 use super::REVISION_LIST_STRATEGY_HEADER;
 use super::RequestScopedCounter;
 use super::grpc_retry;
+use super::handle_branch_push_error;
 use super::handle_error;
+use crate::error::BranchPushError;
 use crate::error::ProtocolError;
 use crate::types::BranchListResponse;
 use crate::types::BranchPushResponse;
@@ -238,7 +240,7 @@ impl RevisionService {
         revision: Hash,
         force: bool,
         fast_forward_merge: bool,
-    ) -> Result<BranchPushResponse, ProtocolError> {
+    ) -> Result<BranchPushResponse, BranchPushError> {
         lore_debug!("Pushing branch: {} at {}", branch, revision);
         let _ = RequestScopedCounter::new(self.request_inflight.clone());
 
@@ -256,7 +258,7 @@ impl RevisionService {
                 Ok(response) => {
                     break response.into_inner();
                 }
-                Err(status) => handle_error(&mut retry, status).await?,
+                Err(status) => handle_branch_push_error(&mut retry, status).await?,
             }
         };
 

@@ -11,6 +11,7 @@ use crate::branch::BranchLatestStatus;
 use crate::branch::push::PushProgress;
 use crate::branch::push::push_fragments;
 use crate::branch::push::push_query;
+use crate::branch::push::refusal_as_internal;
 use crate::change;
 use crate::commit;
 use crate::errors::*;
@@ -561,6 +562,7 @@ pub(crate) async fn restore(
         let response = revision_protocol
             .branch_push(current_branch, signature, false, false)
             .await
+            .map_err(refusal_as_internal)
             .forward::<RestoreError>("pushing branch head pointer")?;
 
         if response.fast_forward_merged {

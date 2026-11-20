@@ -16,15 +16,22 @@ use lore::storage::handle;
 use lore::storage::handle::LoreStore;
 use lore_base::types::BranchId;
 use lore_base::types::Hash;
+use lore_base::types::RepositoryId;
 use lore_revision::auth::LoreAuthPendingEventData;
 use lore_revision::auth::LoreAuthUrlEventData;
 use lore_revision::branch::LoreBranchCreateEventData;
+use lore_revision::branch::push::LoreBranchPushEventData;
+use lore_revision::branch::push::LoreBranchPushFragmentBeginEventData;
+use lore_revision::branch::push::LoreBranchPushFragmentProgressEventData;
+use lore_revision::branch::push::LoreBranchPushRevisionPushEndEventData;
+use lore_revision::branch::push::LoreBranchPushStatsEventData;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::LoreLogEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphBranchEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphBranchMetadataEventData;
+use lore_revision::event::revision_graph::LoreRevisionGraphBranchPushedEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphBranchSyncedEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphInstanceEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphLocationCompleteEventData;
@@ -64,6 +71,9 @@ fn kinds(events: &Mutex<Vec<LoreEvent>>) -> Vec<&'static str> {
             LoreEvent::RevisionGraphBranchMetadata(_) => Some("branch metadata"),
             LoreEvent::RevisionGraphBranchSynced(_) => Some("branch synced"),
             LoreEvent::RevisionGraphLocationComplete(_) => Some("location complete"),
+            LoreEvent::RevisionGraphBranchPushed(_) => Some("branch pushed"),
+            LoreEvent::BranchPushFragmentProgress(_) => Some("push progress"),
+            LoreEvent::BranchPushStats(_) => Some("push stats"),
             LoreEvent::Complete(_) => Some("complete"),
             LoreEvent::End(_) => Some("end"),
             _ => Some("other"),
@@ -71,14 +81,43 @@ fn kinds(events: &Mutex<Vec<LoreEvent>>) -> Vec<&'static str> {
         .collect()
 }
 
-/// One event of each kind a revision graph call passes, after the events it drops: one a core
-/// sends and those of an interactive login.
-fn events_a_verb_sends() -> [LoreEvent; 10] {
+/// One event of each kind a revision graph call passes, after the events it drops: those a core
+/// sends, a push's among them, and those of an interactive login.
+fn events_a_verb_sends() -> [LoreEvent; 16] {
     [
         LoreEvent::BranchCreate(LoreBranchCreateEventData {
             name: LoreString::from("core"),
             latest: Hash::default(),
             is_commit: 0,
+        }),
+        LoreEvent::BranchPush(LoreBranchPushEventData {
+            remote: LoreString::default(),
+            repository: RepositoryId::default(),
+            branch: BranchId::default(),
+            branch_name: LoreString::default(),
+            remote_revision: Hash::default(),
+            local_revision: Hash::default(),
+            remote_history: 0,
+            local_history: 0,
+            flag_already_pushed: 0,
+            flag_default: 0,
+            flag_link: 0,
+            flag_layer: 0,
+        }),
+        LoreEvent::BranchPushFragmentBegin(LoreBranchPushFragmentBeginEventData {
+            repository: RepositoryId::default(),
+            branch: BranchId::default(),
+            fragments: 0,
+            bytes_total: 0,
+        }),
+        LoreEvent::BranchPushRevisionPushEnd(LoreBranchPushRevisionPushEndEventData {
+            repository: RepositoryId::default(),
+            branch: BranchId::default(),
+            old_remote_revision: Hash::default(),
+            new_remote_revision: Hash::default(),
+            new_remote_revision_number: 0,
+            message: LoreString::default(),
+            fast_forward_merged: 0,
         }),
         LoreEvent::AuthUrl(LoreAuthUrlEventData {
             url: LoreString::default(),
@@ -142,11 +181,30 @@ fn events_a_verb_sends() -> [LoreEvent; 10] {
             previous_local_latest: Hash::default(),
             local_latest: Hash::default(),
         }),
+        LoreEvent::BranchPushFragmentProgress(LoreBranchPushFragmentProgressEventData {
+            repository: RepositoryId::default(),
+            branch: BranchId::default(),
+            complete: 0,
+            count: 0,
+            bytes_transferred: 0,
+            bytes_total: 0,
+        }),
+        LoreEvent::BranchPushStats(LoreBranchPushStatsEventData::default()),
+        LoreEvent::RevisionGraphBranchPushed(LoreRevisionGraphBranchPushedEventData {
+            id: 0,
+            branch: BranchId::default(),
+            revision_hash: Hash::default(),
+            revision_number: 0,
+            fast_forward_merged: 0,
+            remote_latest: Hash::default(),
+            local_latest: Hash::default(),
+        }),
     ]
 }
 
-/// The call's own events and its log lines reach the callback, and neither an event a core sends
-/// nor an interactive login's does; `Complete` and `End` follow them.
+/// The call's own events, a push's fragment progress and statistics, and its log lines reach the
+/// callback, and neither another event a core sends nor an interactive login's does; `Complete`
+/// and `End` follow them.
 #[tokio::test]
 async fn call_drops_core_events_and_passes_log_and_complete() {
     let (_store, store_handle) = registered_store("graph-call-events").await;
@@ -179,6 +237,9 @@ async fn call_drops_core_events_and_passes_log_and_complete() {
             "branch metadata",
             "location complete",
             "branch synced",
+            "push progress",
+            "push stats",
+            "branch pushed",
             "complete",
             "end",
         ]

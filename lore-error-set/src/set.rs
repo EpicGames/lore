@@ -11,6 +11,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::internal::Internal;
 use crate::traced::Trace;
@@ -131,6 +132,18 @@ pub trait ErrorSet: Error + Sized + Send + Sync + 'static {
 
     /// Pushes a trace entry onto the error set value's trace.
     fn push_trace(&mut self, location: crate::location::Location);
+
+    /// Pushes a trace entry with `context` at the location of the caller.
+    #[track_caller]
+    fn push_context(&mut self, context: impl Into<Arc<str>>) {
+        let caller = std::panic::Location::caller();
+        self.push_trace(crate::location::Location::with_context(
+            caller.file(),
+            caller.line(),
+            caller.column(),
+            context.into(),
+        ));
+    }
 
     /// Extracts the inner error and trace for cross-set mapping.
     fn extract_inner(self) -> TracedBox;

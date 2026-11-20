@@ -244,7 +244,7 @@ pub struct ServiceUnavailable {
 pub struct NothingStaged;
 
 #[derive(Debug, Clone, Error, FfiError)]
-#[error("Branch has been advanced by another instance, sync and re-stage to commit")]
+#[error("The branch's latest revision has moved on; sync to bring in its new revisions")]
 #[ffi_code(41)]
 pub struct BranchAdvanced;
 

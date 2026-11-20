@@ -25,7 +25,6 @@ use lore_base::types::Address;
 use lore_base::types::BranchId;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
-use lore_error_set::Location;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
@@ -553,11 +552,6 @@ fn set_addresses(entries: &[LoreRevisionGraphBranchMetadataEntry]) -> Vec<Addres
 /// metadata swap, since the code's message speaks of a branch's latest.
 fn overtaken() -> RevisionGraphError {
     let mut err = RevisionGraphError::from(BranchAdvanced);
-    err.push_trace(Location::with_context(
-        file!(),
-        line!(),
-        column!(),
-        Arc::from("another writer changed the branch metadata before each swap"),
-    ));
+    err.push_context("another writer changed the branch metadata before each swap");
     err
 }

@@ -20909,7 +20909,7 @@ async fn a_commit_failing_to_store_its_branch_latest_owes_no_settle() {
             assert!(moved.load(Ordering::SeqCst), "the branch did not move on");
             let error = failed.expect_err("the commit stored over a moved branch");
             assert!(
-                error.contains("advanced by another instance"),
+                error.contains("latest revision has moved on"),
                 "the commit failed otherwise: {error}"
             );
             create_with(&fs, ROOT_INO, "g.txt", b"gee").await;

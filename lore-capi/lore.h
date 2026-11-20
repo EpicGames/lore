@@ -3773,6 +3773,27 @@ typedef struct lore_storage_put_stats_event_data_t {
   struct lore_fragment_stats_data_t fragments;
 } lore_storage_put_stats_event_data_t;
 
+// A branch push's outcome: the last revision the call published, the remote latest and the local
+// latest when the call finished.
+typedef struct lore_revision_graph_branch_pushed_event_data_t {
+  // The `id` from the call's arguments.
+  uint64_t id;
+  // The branch the call pushes.
+  lore_branch_id_t branch;
+  // The last revision the call published. Where it published none, the local latest when the
+  // call succeeds, and zero when it fails.
+  struct lore_hash_t revision_hash;
+  // The revision number of `revision_hash` on the remote, zero where `revision_hash` is zero.
+  uint64_t revision_number;
+  // Set where the remote published `revision_hash` as a fast-forward merge onto a remote latest
+  // that had moved.
+  uint8_t fast_forward_merged;
+  // The remote latest when the call finished.
+  struct lore_hash_t remote_latest;
+  // The local latest when the call finished.
+  struct lore_hash_t local_latest;
+} lore_revision_graph_branch_pushed_event_data_t;
+
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
 enum lore_event_id_t {
@@ -4288,6 +4309,8 @@ enum lore_event_id_t {
   LORE_EVENT_BRANCH_MERGE_LINK_PIN_RESOLVED,
   // What one storage put or upload call cost.
   LORE_EVENT_STORAGE_PUT_STATS,
+  // A branch push's outcome.
+  LORE_EVENT_REVISION_GRAPH_BRANCH_PUSHED,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -4549,6 +4572,7 @@ typedef struct lore_event_t {
     struct lore_branch_merge_link_pin_conflict_event_data_t branch_merge_link_pin_conflict;
     struct lore_branch_merge_link_pin_resolved_event_data_t branch_merge_link_pin_resolved;
     struct lore_storage_put_stats_event_data_t storage_put_stats;
+    struct lore_revision_graph_branch_pushed_event_data_t revision_graph_branch_pushed;
   };
 } lore_event_t;
 
@@ -7104,6 +7128,31 @@ typedef struct lore_revision_graph_branch_sync_args_t {
   // How the call syncs
   struct lore_revision_graph_branch_sync_options_t options;
 } lore_revision_graph_branch_sync_args_t;
+
+// Options of `lore_revision_graph_branch_push`.
+typedef struct lore_revision_graph_branch_push_options_t {
+  // Non-zero: offer the local history even where the remote latest has moved, which overwrites
+  // it. Branch protection still applies.
+  uint8_t force;
+  // Non-zero: let the remote merge onto a remote latest that has moved, where the merge has no
+  // conflicts.
+  uint8_t fast_forward_merge;
+} lore_revision_graph_branch_push_options_t;
+
+// Arguments for `lore_revision_graph_branch_push`.
+typedef struct lore_revision_graph_branch_push_args_t {
+  // Caller-chosen id echoed back in every event this surface defines for the call. Separate
+  // from `globals.correlation_id`.
+  uint64_t id;
+  // Open storage handle the call reaches the repository through
+  struct lore_store_t store;
+  // Repository the branch is pushed in
+  struct lore_partition_t repository;
+  // Branch whose local history the call publishes. Not zero.
+  lore_branch_id_t branch;
+  // How the call pushes
+  struct lore_revision_graph_branch_push_options_t options;
+} lore_revision_graph_branch_push_args_t;
 
 // Return the tag identifying the type of an event.
 uint32_t lore_event_type(const struct lore_event_t *event);
@@ -14892,6 +14941,95 @@ int32_t lore_revision_graph_branch_sync(const struct lore_global_args_t *globals
 // Sync a branch's local latest to a target revision (async variant).
 void lore_revision_graph_branch_sync_async(const struct lore_global_args_t *globals,
                                            const struct lore_revision_graph_branch_sync_args_t *args,
+                                           struct lore_event_callback_config_t callback);
+
+// Publish the local history of `args->branch` to the remote of `args->store`.
+//
+// The call always writes to the remote: `local` and `offline`, on the call or on `args->store`,
+// fail it, and `remote` means the same as no flag. It walks the branch's local history back to
+// the revision the remote holds, uploads each revision's fragments the remote lacks, creates the
+// branch on the remote on its first push, and offers each revision as the remote latest. The
+// remote checks branch protection and verifies each revision. It publishes this repository's
+// revisions alone: each revision of a linked repository that a revision links must be on the
+// remote already, and is checked there before anything is created, uploaded or offered. The
+// repository's layers are left out. The branch's tree blocks and leaf payloads must be in the
+// local store of `args->store` or on the remote.
+//
+// The call reads the branch's local latest from the local store, and writes the local latest
+// once, as it finishes: the last revision the remote accepted, convergent, after a fast-forward
+// merge too, with a compare-and-swap from the local latest it read. A tree commit that moves the
+// local latest while the push runs stays in place, and the call still succeeds. Where the remote
+// latest is the local latest, and without `args->options.force` where the remote's history holds
+// the local latest and either `args->options.fast_forward_merge` is set or an earlier push
+// published it without recording it, the call succeeds without offering a revision.
+// `args->options.force` overwrites a remote latest that has moved, which branch protection still
+// governs, and `args->options.fast_forward_merge` lets the remote merge onto a remote latest that
+// has moved where the merge has no conflicts. The call ignores `globals.force` and
+// `globals.dry_run`, and `lore_storage_close` waits for it.
+//
+// `LORE_EVENT_REVISION_GRAPH_BRANCH_PUSHED` fires before `LORE_EVENT_COMPLETE` once the call has
+// read the remote latest, on success and on failure alike. On success its `revision_hash` is the
+// revision to build on next, which can differ from the one committed after a fast-forward merge,
+// and its `remote_latest` is the remote latest; a caller continues from `remote_latest` where it
+// differs from `revision_hash`. On failure, `remote_latest` names the remote latest the call last
+// read and `local_latest` the local latest the call left. After error code 41, `remote_latest`
+// names the revision to reload from, and a forced `lore_revision_graph_branch_sync` to it with
+// `expected_local_latest` set to `local_latest` drops the refused revisions.
+// A call that fails before that read, such as on invalid arguments or a branch without a local
+// latest, sends only `LORE_EVENT_COMPLETE`. The call sends no
+// `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE`.
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_BRANCH_PUSH_FRAGMENT_PROGRESS` | `lore_branch_push_fragment_progress_event_data_t` | The upload's progress, every `globals.event_interval_ms` while it uploads fragments and once as each upload ends; it carries no `args->id` |
+// | `LORE_EVENT_BRANCH_PUSH_STATS` | `lore_branch_push_stats_event_data_t` | What the push cost, once as it finishes, at `globals.stats` 1 and above; it carries no `args->id` |
+// | `LORE_EVENT_REVISION_GRAPH_BRANCH_PUSHED` | `lore_revision_graph_branch_pushed_event_data_t` | The revision published last, the remote latest and the local latest |
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | A log line |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` on success or the error code, with its detail in `error` |
+//
+// Fails with:
+// - error code 3 (invalid arguments) for a zero `args->branch`, an unknown or closed
+//   `args->store`, `local` or `offline` on the call or on `args->store`, and location flags that
+//   contradict each other or those `args->store` was opened with;
+// - error code 111 (no remote) where `args->store` has no remote;
+// - error code 87 (branch not found) where the local store holds no local latest of the branch;
+// - error code 41 (branch advanced) where, without `args->options.force`, the remote latest isn't
+//   the revision the push builds on, and no fast-forward merge applies, because
+//   `args->options.fast_forward_merge` isn't set or the merge would conflict. A Lore Server older
+//   than this version doesn't mark its refusal of such a push, which then fails with -1;
+// - error code 57 (branch already exists) where the branch's first push, or a push that restores
+//   the branch the remote archived, finds another remote branch holding its name;
+// - error code 88 (revision not found) where a revision the push would offer links a revision of
+//   another repository that the remote lacks;
+// - error code 80 (address not found) where the remote still lacks a fragment a revision names;
+// - error code 118 (oversized) where a blob the push reads or sends is larger than the remote or
+//   the local store allows;
+// - error code 16 (not authenticated) where the call has no login or tokens the remote accepts.
+//   The call starts no login: the caller logs in, with `lore_auth_login_interactive` or
+//   `lore_auth_login_with_token`, and calls again, and a storage handle's open connection picks
+//   up the new login within a minute. A caller that passes its own tokens in `globals` opens a
+//   new storage handle with fresh ones, since an open connection keeps the tokens it connected
+//   with;
+// - error code 17 (not authorized) where the remote refuses the caller, including a forced push
+//   to a protected branch and a linked repository the caller can't read;
+// - error codes 28 (disconnected), 29 (not connected), 30 (maintenance) and 31 (slow down) where
+//   the remote can't be reached or declines work;
+// - error code -1 (internal) for any other failure, with the remote's message for a refusal of
+//   the remote.
+//
+// An event's strings, arrays and error detail are valid only during the callback invocation that
+// delivers it. This call and `lore_revision_graph_branch_push_async` copy `args` before they
+// return, so an `_async` caller can free `args` once the call returns. A caller that passes the
+// same `globals.correlation_id` on every call over one storage handle reuses one storage session
+// per connection, as with the `lore_storage_*` calls. `args->id`, which every
+// `LORE_EVENT_REVISION_GRAPH_*` event echoes, is separate from it.
+int32_t lore_revision_graph_branch_push(const struct lore_global_args_t *globals,
+                                        const struct lore_revision_graph_branch_push_args_t *args,
+                                        struct lore_event_callback_config_t callback);
+
+// Publish a branch's local history to the remote (async variant).
+void lore_revision_graph_branch_push_async(const struct lore_global_args_t *globals,
+                                           const struct lore_revision_graph_branch_push_args_t *args,
                                            struct lore_event_callback_config_t callback);
 
 // Select how payloads are compressed before they are stored, over

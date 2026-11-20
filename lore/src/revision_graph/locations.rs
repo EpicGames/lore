@@ -302,15 +302,25 @@ pub fn remote_revision_service<'a>(
 {
     async move {
         let ctx = remote_read_context(store, repository, remote).await?;
-        let service = ctx
-            .remote()
-            .await
-            .forward_any::<RevisionGraphError>("reaching the remote")?
-            .revision(repository)
-            .await
-            .forward_any::<RevisionGraphError>("reaching the remote's revision service")?;
+        let service = revision_service(&ctx).await?;
         Ok((ctx, service))
     }
+}
+
+/// The remote's revision service for the repository of `ctx`, reached over `ctx`'s connection.
+///
+/// # Errors
+///
+/// A context without a remote, and a failed request for the service.
+pub(crate) async fn revision_service(
+    ctx: &RepositoryContext,
+) -> Result<Arc<dyn Revision>, RevisionGraphError> {
+    ctx.remote()
+        .await
+        .forward_any::<RevisionGraphError>("reaching the remote")?
+        .revision(ctx.id)
+        .await
+        .forward_any::<RevisionGraphError>("reaching the remote's revision service")
 }
 
 /// A context with the in-memory write token over the local store and, given `remote`, connected

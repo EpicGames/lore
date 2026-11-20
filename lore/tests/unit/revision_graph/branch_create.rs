@@ -62,6 +62,7 @@ use lore_revision::test_util::step_branch_writes;
 use lore_revision::test_util::write_state_revision;
 use lore_storage::local::store_lock::StoreHold;
 use lore_transport::BranchListResponse;
+use lore_transport::BranchPushError;
 use lore_transport::BranchPushResponse;
 use lore_transport::BranchRecord;
 use lore_transport::MetadataSetResult;
@@ -1622,8 +1623,8 @@ impl Revision for CreatingRevision {
         _: Hash,
         _: bool,
         _: bool,
-    ) -> Result<BranchPushResponse, ProtocolError> {
-        Err(ProtocolError::internal("not served"))
+    ) -> Result<BranchPushResponse, BranchPushError> {
+        Err(BranchPushError::internal("not served"))
     }
 
     async fn branch_list(

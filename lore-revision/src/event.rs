@@ -84,6 +84,7 @@ use crate::dependency::LoreFileDependencyRemoveEndEventData;
 use crate::dependency::LoreFileDependencyRemoveEntryEventData;
 use crate::event::revision_graph::LoreRevisionGraphBranchEventData;
 use crate::event::revision_graph::LoreRevisionGraphBranchMetadataEventData;
+use crate::event::revision_graph::LoreRevisionGraphBranchPushedEventData;
 use crate::event::revision_graph::LoreRevisionGraphBranchSyncedEventData;
 use crate::event::revision_graph::LoreRevisionGraphInstanceEventData;
 use crate::event::revision_graph::LoreRevisionGraphLocationCompleteEventData;
@@ -1429,6 +1430,8 @@ pub enum LoreEvent {
     BranchMergeLinkPinResolved(crate::branch::merge::LoreBranchMergeLinkPinResolvedEventData),
     /// What one storage put or upload call cost.
     StoragePutStats(LoreStoragePutStatsEventData),
+    /// A branch push's outcome.
+    RevisionGraphBranchPushed(LoreRevisionGraphBranchPushedEventData),
 }
 
 /// Encodes as the event it refers to, so that a sender can encode an event it only borrows.

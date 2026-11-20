@@ -14,6 +14,7 @@ use lore_revision::event::EventError;
 use lore_revision::interface::LoreError;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::allow_all_repositories;
+use lore_transport::BranchPushError;
 use lore_transport::ProtocolError;
 use lore_transport::quic::storage_service::QueryStatus;
 
@@ -85,20 +86,39 @@ fn a_fragment_the_peer_is_missing_keeps_its_address_on_the_way_out() {
 /// divergence. Any other failure keeps its own variant.
 #[test]
 fn a_refused_offer_is_divergent_only_onto_a_diverged_branch() {
-    let refused = || PushError::internal("remote rejected the request");
+    let refused = || PushError::from(lore_base::error::BranchAdvanced);
 
     let error = refused_offer(refused(), true);
     assert!(error.is_divergent(), "{error:?}");
 
     let error = refused_offer(refused(), false);
+    assert!(error.is_branch_advanced(), "{error:?}");
+
+    let error = refused_offer(PushError::internal("a failed upload"), true);
     assert!(error.is_internal(), "{error:?}");
 
     let error = refused_offer(PushError::from(Disconnected), true);
     assert!(error.is_disconnected(), "{error:?}");
 }
 
-/// An offer the peer accepts is what the push reports as published, and builds on from then on.
-/// The merge flag is the accepting answer's own.
+/// An answer to an offer with no revision number is the peer's refusal, `BranchAdvanced`, with a
+/// fast-forward merge and without one. An answer with a revision number is no refusal.
+#[test]
+fn an_answer_with_no_revision_number_is_branch_advanced() {
+    let answer = |revision_number| lore_transport::BranchPushResponse {
+        fast_forward_merged: false,
+        revision: Hash::from([2; 32]),
+        revision_number,
+        message: None,
+    };
+
+    assert!(refused_answer(&answer(0), false).is_err_and(|err| err.is_branch_advanced()));
+    assert!(refused_answer(&answer(0), true).is_err_and(|err| err.is_branch_advanced()));
+    assert!(refused_answer(&answer(3), false).is_ok());
+}
+
+/// An offer the peer accepts is what the push reports as published, and the remote latest from then
+/// on. The merge flag is the accepting answer's own.
 #[test]
 fn the_report_records_what_an_offer_published() {
     let mut report = PushReport::default();
@@ -123,16 +143,9 @@ fn the_report_records_what_an_offer_published() {
                 report.published,
                 report.revision_number,
                 report.fast_forward_merged,
-                report.base,
                 report.remote_latest,
             ),
-            (
-                published,
-                revision_number,
-                fast_forward_merged,
-                Some(published),
-                published
-            )
+            (published, revision_number, fast_forward_merged, published)
         );
     }
 }
@@ -357,7 +370,7 @@ mod offer {
     /// A peer that answers each branch push with the next of its answers, and counts the
     /// branches it creates.
     struct Peer {
-        answers: Mutex<VecDeque<Result<BranchPushResponse, ProtocolError>>>,
+        answers: Mutex<VecDeque<Result<BranchPushResponse, BranchPushError>>>,
         created: AtomicUsize,
     }
 
@@ -393,7 +406,7 @@ mod offer {
             _: Hash,
             _: bool,
             _: bool,
-        ) -> Result<BranchPushResponse, ProtocolError> {
+        ) -> Result<BranchPushResponse, BranchPushError> {
             self.answers
                 .lock()
                 .pop_front()
@@ -429,7 +442,7 @@ mod offer {
         }
     }
 
-    fn accepted() -> Result<BranchPushResponse, ProtocolError> {
+    fn accepted() -> Result<BranchPushResponse, BranchPushError> {
         Ok(BranchPushResponse {
             fast_forward_merged: false,
             revision: Hash::from([1; 32]),
@@ -438,12 +451,12 @@ mod offer {
         })
     }
 
-    fn deleted() -> Result<BranchPushResponse, ProtocolError> {
-        Err(ProtocolError::from(NotFound))
+    fn deleted() -> Result<BranchPushResponse, BranchPushError> {
+        Err(BranchPushError::from(NotFound))
     }
 
-    fn missing() -> Result<BranchPushResponse, ProtocolError> {
-        Err(ProtocolError::from(AddressNotFound { address: [7; 48] }))
+    fn missing() -> Result<BranchPushResponse, BranchPushError> {
+        Err(BranchPushError::from(AddressNotFound { address: [7; 48] }))
     }
 
     /// The recovery runs once if the peer refuses the first offer or the offer after a deleted
@@ -519,6 +532,19 @@ mod offer {
                 "{name}: every answer was asked for"
             );
         }
+    }
+
+    /// The remote's refusal of a push onto a latest that has moved on is `Internal` once
+    /// [`refusal_as_internal`] maps it, and every other failure keeps its variant.
+    #[test]
+    fn a_refusal_onto_a_moved_latest_is_internal_and_the_rest_keep_their_variants() {
+        let refused = refusal_as_internal(BranchPushError::from(lore_base::error::BranchAdvanced));
+        let lost = refusal_as_internal(BranchPushError::from(lore_base::error::Disconnected));
+
+        assert!(
+            refused.is_internal() && lost.is_disconnected(),
+            "{refused:?}; {lost:?}"
+        );
     }
 }
 
@@ -770,7 +796,6 @@ mod place {
             remote_metadata: Hash::default(),
             remote_deleted: false,
             remote_revision: None,
-            base: Hash::default(),
             remote_history: 0,
             local_history: local.len(),
             diverged: false,
@@ -1069,10 +1094,10 @@ mod place {
     }
 
     /// The walk against `remote` of the history of a branch the remote doesn't hold, created from
-    /// `branch()` at the second of its two revisions, with a revision of its own on top, and the
-    /// branch point, where the walk reaches the parent branch. `branch()` is divergent in the local
-    /// store, so the walk goes on into it.
-    async fn walk_from_a_child(remote: PagedRemote) -> (Result<UnpushedHistory, PushError>, Hash) {
+    /// `branch()` at the second of its two revisions, with a revision of its own on top, which
+    /// reaches the parent branch at the branch point. `branch()` is divergent in the local store, so
+    /// the walk goes on into it.
+    async fn walk_from_a_child(remote: PagedRemote) -> Result<UnpushedHistory, PushError> {
         let stores = client_stores().await;
         let writer = &stores.writer;
         store_repository_metadata(writer).await;
@@ -1111,7 +1136,7 @@ mod place {
         let state = State::deserialize(client.clone(), latest)
             .await
             .expect("reading the child's revision");
-        let walked = collect_unpushed_history(
+        collect_unpushed_history(
             &client,
             &remote,
             &state,
@@ -1120,21 +1145,7 @@ mod place {
             Hash::default(),
             branch(),
         )
-        .await;
-        (walked, base)
-    }
-
-    /// A push of a branch the remote doesn't hold builds on its branch point, whatever the walk of
-    /// its parent branch finds.
-    #[tokio::test]
-    async fn a_parent_branchs_walk_leaves_the_base() {
-        Box::pin(with_execution(async {
-            let (walked, base) =
-                walk_from_a_child(PagedRemote::new(branch(), Hash::default())).await;
-            let walked = walked.expect("walking the history");
-            assert_eq!(walked.base, base);
-        }))
-        .await;
+        .await
     }
 
     /// A read of the parent branch at the remote that fails fails the walk with the read's error,
@@ -1144,69 +1155,12 @@ mod place {
         Box::pin(with_execution(async {
             let refusing = PagedRemote::new(branch(), Hash::default())
                 .refusing(ProtocolError::from(lore_base::error::NotAuthorized));
-            let (walked, _base) = walk_from_a_child(refusing).await;
+            let walked = walk_from_a_child(refusing).await;
             assert!(
                 walked.as_ref().is_err_and(|err| err.is_not_authorized()),
                 "{:?}",
                 walked.err()
             );
-        }))
-        .await;
-    }
-
-    /// The revision the push of `latest` builds on, planned against a remote whose latest is
-    /// `remote_latest`, and whether the plan is diverged.
-    async fn planned_base(
-        stores: &ClientStores,
-        latest: Hash,
-        remote_latest: Hash,
-    ) -> (Hash, bool) {
-        let client = client_on(
-            stores,
-            Arc::new(PagedRemote::new(branch(), remote_latest).metadata(Hash::from([1; 32]))),
-        );
-        let plan = plan_target(&client, branch(), latest, false)
-            .await
-            .expect("planning the push");
-        (plan.base, plan.diverged)
-    }
-
-    /// A push whose local history holds the remote latest builds on the remote latest, whether
-    /// the walk finds it or the push has a single revision on top of it.
-    #[tokio::test]
-    async fn a_plan_builds_on_the_remote_latest_its_history_holds() {
-        Box::pin(with_execution(async {
-            let stores = client_stores().await;
-            let writer = &stores.writer;
-            store_repository_metadata(writer).await;
-            let base = write_on_branch(writer, Hash::default(), Hash::default(), 1, "base").await;
-            let middle = write_on_branch(writer, base, Hash::default(), 2, "middle").await;
-            let top = write_on_branch(writer, middle, Hash::default(), 3, "top").await;
-
-            assert_eq!(
-                (
-                    planned_base(&stores, top, base).await,
-                    planned_base(&stores, top, middle).await
-                ),
-                ((base, false), (middle, false))
-            );
-        }))
-        .await;
-    }
-
-    /// A push whose local history and the remote's line have diverged builds on the revision both
-    /// lines share, not on the remote latest.
-    #[tokio::test]
-    async fn a_diverged_plan_builds_on_the_merge_base() {
-        Box::pin(with_execution(async {
-            let stores = client_stores().await;
-            let writer = &stores.writer;
-            store_repository_metadata(writer).await;
-            let base = write_on_branch(writer, Hash::default(), Hash::default(), 1, "base").await;
-            let local = write_on_branch(writer, base, Hash::default(), 2, "local").await;
-            let remote = write_on_branch(writer, base, Hash::default(), 2, "remote").await;
-
-            assert_eq!(planned_base(&stores, local, remote).await, (base, true));
         }))
         .await;
     }
@@ -1244,10 +1198,10 @@ mod place {
         .await;
     }
 
-    /// A push refused while planning, as diverged, reports what it read of the remote and the
-    /// revision it builds on, the one both lines share.
+    /// A push refused while planning, as diverged, fails with `BranchAdvanced` and reports what it
+    /// read of the remote.
     #[tokio::test]
-    async fn a_push_refused_as_diverged_reports_the_remote_and_its_base() {
+    async fn a_push_refused_as_diverged_fails_branch_advanced_and_reports_the_remote() {
         Box::pin(with_execution(async {
             let stores = client_stores().await;
             let writer = &stores.writer;
@@ -1270,13 +1224,17 @@ mod place {
             )
             .await;
 
-            assert!(collected.is_err(), "a diverged push is refused");
+            assert!(
+                collected
+                    .as_ref()
+                    .is_err_and(|err| err.is_branch_advanced()),
+                "a diverged push is refused"
+            );
             assert_eq!(
                 report,
                 PushReport {
                     remote_read: true,
                     remote_latest: remote,
-                    base: Some(base),
                     ..PushReport::default()
                 }
             );
@@ -1693,7 +1651,7 @@ mod place {
 
         Started {
             held,
-            refused: started.is_err_and(|err| err.is_internal()),
+            refused: started.is_err_and(|err| err.is_branch_advanced()),
             records: records(writer).await,
             pushed,
         }
@@ -1798,7 +1756,7 @@ mod place {
 
             let extended = place_pending(&mut target, false).await;
 
-            assert!(extended.is_err_and(|err| err.is_internal()));
+            assert!(extended.is_err_and(|err| err.is_branch_advanced()));
         }))
         .await;
     }

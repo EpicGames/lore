@@ -12,6 +12,7 @@ pub mod branch_create;
 pub mod branch_list;
 pub mod branch_metadata_get;
 pub mod branch_metadata_set;
+pub mod branch_push;
 pub mod branch_resolve;
 pub mod branch_sync;
 #[cfg(not(feature = "test-util"))]
@@ -51,7 +52,6 @@ use lore_base::error::SlowDown;
 use lore_base::types::BranchId;
 use lore_base::types::Hash;
 use lore_error_set::prelude::*;
-use lore_transport::ProtocolError;
 
 /// The failures a revision graph verb reports.
 #[error_set]
@@ -86,20 +86,27 @@ impl RevisionGraphError {
     }
 
     /// The failure that reports `err`, a refusal of a write at the remote no confirming read
-    /// attributed: a refusal of the caller, an overloaded remote, a lost connection and a remote in
-    /// maintenance keep their codes, and any other refusal is `Internal` with the remote's message,
-    /// under `context`.
-    pub(crate) fn remote_refusal(err: ProtocolError, context: &'static str) -> Self {
-        if !(err.is_not_authorized()
-            || err.is_not_authenticated()
-            || err.is_slow_down()
-            || err.is_disconnected()
-            || err.is_maintenance())
-        {
-            return Self::internal_with_context(err, context);
-        }
+    /// attributed: a refusal of the caller, an overloaded remote, a lost connection, a remote that
+    /// can't be reached and a remote in maintenance keep their codes, and any other refusal is
+    /// `Internal` with the remote's message, under `context`.
+    pub(crate) fn remote_refusal<E: ErrorSet>(err: E, context: &'static str) -> Self {
         let Err(forwarded) = Err::<Infallible, _>(err).forward_any::<Self>(context);
-        forwarded
+        if forwarded.keeps_its_code_at_the_remote() || forwarded.is_internal() {
+            return forwarded;
+        }
+        Self::internal_with_context(forwarded, context)
+    }
+
+    /// Whether this failure keeps its code wherever the remote answers it: a refusal of the
+    /// caller, an overloaded remote, a lost connection, a remote that can't be reached and a remote
+    /// in maintenance.
+    pub(crate) fn keeps_its_code_at_the_remote(&self) -> bool {
+        self.is_not_authorized()
+            || self.is_not_authenticated()
+            || self.is_slow_down()
+            || self.is_disconnected()
+            || self.is_not_connected()
+            || self.is_maintenance()
     }
 }
 

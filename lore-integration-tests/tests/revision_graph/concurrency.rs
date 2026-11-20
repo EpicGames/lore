@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 //! Concurrent `branch_create` calls of one name, at the remote and on one local store, a create
-//! the remote's `branch_create` refuses after the pre-checks passed, and a `branch_sync` racing a
-//! tree commit on its branch. The concurrent creates
-//! reach the race window only by chance; the claim's deterministic guards are the create core's
-//! rollback test and `classify_create_refusal_maps_each_row`.
+//! the remote's `branch_create` refuses after the pre-checks passed, a `branch_sync` and a
+//! `branch_push` each racing a tree commit on its branch, and two pushes racing each other. The
+//! concurrent creates reach the race window only by chance; the claim's deterministic guards are
+//! the create core's rollback test and `classify_create_refusal_maps_each_row`.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -289,5 +289,72 @@ async fn a_sync_that_loses_its_swap_reports_the_latest_that_won() {
         local_latest(f.store, f.repository, f.default_branch).await,
         won
     );
+    f.close().await;
+}
+
+/// A tree commit that runs with a push of its branch's local latest is not overwritten: whichever
+/// lands first, both succeed, the local latest afterwards is the commit's revision, and the remote
+/// latest is the revision the push published. An integration counterpart of the push core's
+/// `a_local_write_that_misses_leaves_the_commit_and_succeeds`.
+#[tokio::test]
+async fn a_tree_commit_during_a_push_is_not_overwritten() {
+    let f = fixture().await;
+    let seeded = seed_main(&f).await;
+    let pushed_revision = commit_on(f.store, f.repository, f.default_branch, seeded).await;
+
+    let ((committed, revision), (pushed_status, events)) = tokio::join!(
+        try_commit_on(f.store, f.repository, f.default_branch, pushed_revision),
+        push_branch_call(
+            &f,
+            f.store,
+            graph_globals(),
+            f.default_branch,
+            Default::default()
+        ),
+    );
+
+    assert_eq!((committed, pushed_status), (0, 0));
+    let [event] = pushed(&events)[..] else {
+        panic!("one pushed event");
+    };
+    assert_eq!(
+        (
+            local_latest(f.store, f.repository, f.default_branch).await,
+            server_latest(&f, f.default_branch).await
+        ),
+        (revision, event.revision_hash)
+    );
+    f.close().await;
+}
+
+/// Two pushes of one revision each onto the same remote latest, through two storage handles, leave
+/// one published and the other failed with `BranchAdvanced`.
+#[tokio::test]
+async fn concurrent_single_revision_pushes_leave_one_branch_advanced() {
+    let f = fixture().await;
+    let seeded = seed_main(&f).await;
+    let other = open_handle(Some(&f.url)).await;
+    commit_on(f.store, f.repository, f.default_branch, seeded).await;
+    commit_on(other, f.repository, f.default_branch, seeded).await;
+
+    let ((first, _), (second, _)) = tokio::join!(
+        push_branch_call(
+            &f,
+            f.store,
+            graph_globals(),
+            f.default_branch,
+            Default::default()
+        ),
+        push_branch_call(
+            &f,
+            other,
+            graph_globals(),
+            f.default_branch,
+            Default::default()
+        ),
+    );
+    close_handle(other).await;
+
+    assert_eq!(sorted([first, second]), [0, BranchAdvanced::FFI_CODE]);
     f.close().await;
 }

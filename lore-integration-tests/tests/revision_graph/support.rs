@@ -33,11 +33,15 @@ use lore::revision_graph::branch_metadata_get::branch_metadata_get;
 use lore::revision_graph::branch_metadata_set::LoreRevisionGraphBranchMetadataEntry;
 use lore::revision_graph::branch_metadata_set::LoreRevisionGraphBranchMetadataSetArgs;
 use lore::revision_graph::branch_metadata_set::branch_metadata_set;
+use lore::revision_graph::branch_push::LoreRevisionGraphBranchPushArgs;
+use lore::revision_graph::branch_push::LoreRevisionGraphBranchPushOptions;
+use lore::revision_graph::branch_push::branch_push;
 use lore::revision_graph::branch_resolve::LoreRevisionGraphBranchResolveArgs;
 use lore::revision_graph::branch_resolve::branch_resolve;
 use lore::revision_graph::branch_sync::LoreRevisionGraphBranchSyncArgs;
 use lore::revision_graph::branch_sync::LoreRevisionGraphBranchSyncOptions;
 use lore::revision_graph::branch_sync::branch_sync;
+use lore::revision_graph::locations::full_context;
 use lore::revision_graph::locations::local_write_context;
 use lore::revision_graph::locations::remote_read_context;
 use lore::revision_graph::revision_resolve::LoreRevisionGraphRevisionResolveArgs;
@@ -78,6 +82,11 @@ use lore_base::types::Partition;
 use lore_base::types::RepositoryId;
 use lore_revision::branch;
 use lore_revision::branch::BranchLatestStatus;
+use lore_revision::branch::push::MountPolicy;
+use lore_revision::branch::push::PushError;
+use lore_revision::branch::push::PushReport;
+use lore_revision::branch::push::PushRun;
+use lore_revision::branch::push::push_branch;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_graph::LoreRevisionGraphBranchEventData;
 use lore_revision::event::revision_graph::LoreRevisionGraphBranchMetadataEventData;
@@ -667,6 +676,55 @@ pub(crate) async fn sync_branch(
     status_and_events_of(|callback| branch_sync(globals, args, callback)).await
 }
 
+/// The status and events of a `branch_push` call of `branch` in `f`'s repository, with `options`,
+/// on `store` under `globals`, as [`status_and_events_of`] reports them.
+pub(crate) async fn push_branch_call(
+    f: &Fixture,
+    store: LoreStore,
+    globals: LoreGlobalArgs,
+    branch: BranchId,
+    options: LoreRevisionGraphBranchPushOptions,
+) -> (i32, Vec<LoreEvent>) {
+    let args = LoreRevisionGraphBranchPushArgs {
+        id: 1,
+        store,
+        repository: f.repository,
+        branch,
+        options,
+    };
+    status_and_events_of(|callback| branch_push(globals, args, callback)).await
+}
+
+/// Pushes the local latest `latest` of `branch` of `f`'s repository with the push core, as a
+/// revision graph push runs it, on a context over `f`'s storage handle connected to the server:
+/// the branch alone, with its linked revisions checked on the remote, and the local latest
+/// written over `latest`. Returns the push's outcome and report.
+pub(crate) async fn push_branch_alone(
+    f: &Fixture,
+    branch: BranchId,
+    latest: Hash,
+) -> (Result<(), PushError>, PushReport) {
+    let store = handle_state(f);
+    let remote = store.remote.clone().expect("the handle has a remote");
+    in_client(async {
+        let context = full_context(&store, f.repository, Some(&remote))
+            .await
+            .expect("connects to the server");
+        let token = context
+            .try_write_token()
+            .expect("a write context carries a write token");
+        let run = PushRun {
+            mounts: MountPolicy::RequireOnRemote,
+            expected_local_latest: Some(latest),
+            ..PushRun::default()
+        };
+        let mut report = PushReport::default();
+        let pushed = push_branch(context.clone(), token, &run, branch, latest, &mut report).await;
+        (pushed, report)
+    })
+    .await
+}
+
 /// The status and events of a `branch_metadata_get` call of the metadata of `branch` in `f`'s
 /// repository, on `store` under `globals`, as [`status_and_events_of`] reports them: of the entry
 /// `key` names, or of every entry where it is empty.
@@ -760,6 +818,23 @@ pub(crate) async fn commit_on(
     commit_file_on(store, repository, branch, parent).await.0
 }
 
+/// Commits as [`commit_on`] does, with the new file named `name`, and returns the revision's hash.
+/// Two such commits from one parent conflict.
+pub(crate) async fn commit_named_on(
+    store: LoreStore,
+    repository: Partition,
+    branch: BranchId,
+    parent: Hash,
+    name: &str,
+) -> Hash {
+    let (handle, _) = tree_with_new_file(store, repository, branch, parent, Some(name)).await;
+    let (status, committed) = commit_tree(handle).await;
+    assert_eq!(status, 0, "committing must succeed");
+    let revision = committed_revision(&committed).expect("the commit reports its revision");
+    close_tree(handle).await;
+    revision
+}
+
 /// Commits as [`commit_on`] does. Returns the revision's hash and the address of the file it adds.
 async fn commit_file_on(
     store: LoreStore,
@@ -767,7 +842,7 @@ async fn commit_file_on(
     branch: BranchId,
     parent: Hash,
 ) -> (Hash, Address) {
-    let (handle, address) = tree_with_new_file(store, repository, branch, parent).await;
+    let (handle, address) = tree_with_new_file(store, repository, branch, parent, None).await;
     let (status, committed) = commit_tree(handle).await;
     assert_eq!(status, 0, "committing must succeed");
     let revision = committed_revision(&committed).expect("the commit reports its revision");
@@ -784,7 +859,7 @@ pub(crate) async fn try_commit_on(
     branch: BranchId,
     parent: Hash,
 ) -> (i32, Hash) {
-    let (handle, _) = tree_with_new_file(store, repository, branch, parent).await;
+    let (handle, _) = tree_with_new_file(store, repository, branch, parent, None).await;
     let (status, committed) = commit_tree(handle).await;
     close_tree(handle).await;
     (status, committed_revision(&committed).unwrap_or_default())
@@ -800,14 +875,17 @@ fn committed_revision(committed: &[LoreEvent]) -> Option<Hash> {
 
 /// A tree loaded on `store` at `parent`, with one new file under the root, whose content is stored
 /// in `store` and no other file shares, and the `branch` metadata key naming `branch`, and the
-/// address of the file's content.
+/// address of the file's content. The file is named `name`, or for its content where `name` is
+/// `None`, since adding a name the parent already holds fails.
 async fn tree_with_new_file(
     store: LoreStore,
     repository: Partition,
     branch: BranchId,
     parent: Hash,
+    name: Option<&str>,
 ) -> (LoreRevisionTree, Address) {
     let file_id = uuid::Uuid::now_v7();
+    let name = name.map_or_else(|| file_id.simple().to_string(), str::to_string);
     let content = file_id.as_bytes();
     let address = put_content(store, repository, Context::from(file_id), content, 1, 0).await;
     let loaded = events_of("loading the parent", |callback| {
@@ -838,11 +916,7 @@ async fn tree_with_new_file(
             LoreRevisionTreeAddArgs {
                 batch_id: 1,
                 handle,
-                entries: LoreArray::from_vec(vec![new_file(
-                    file_id,
-                    address,
-                    content.len() as u64,
-                )]),
+                entries: LoreArray::from_vec(vec![new_file(&name, address, content.len() as u64)]),
             },
             callback,
         )
@@ -900,14 +974,13 @@ async fn close_tree(handle: LoreRevisionTree) {
     .await;
 }
 
-/// A file of `size` bytes under the root, with the content `address` names. It is named for
-/// `file_id`, since adding a name the parent already holds fails.
-fn new_file(file_id: uuid::Uuid, address: Address, size: u64) -> LoreRevisionTreeAddEntry {
+/// A file named `name` of `size` bytes under the root, with the content `address` names.
+fn new_file(name: &str, address: Address, size: u64) -> LoreRevisionTreeAddEntry {
     LoreRevisionTreeAddEntry {
         entry_id: 1,
         parent_node_id: ROOT_NODE,
         parent_entry_index: 0,
-        name: LoreString::from(file_id.simple().to_string().as_str()),
+        name: LoreString::from(name),
         kind: LoreNodeType::File as u32,
         mode: 0o644,
         size,
@@ -1154,6 +1227,23 @@ pub(crate) async fn archive_locally(f: &Fixture, branch: BranchId) {
 /// the branch.
 pub(crate) async fn server_latest(f: &Fixture, branch: BranchId) -> Hash {
     server_record(f, branch).await.latest
+}
+
+/// Commits a revision on the default branch of `f`'s repository on top of `parent` with
+/// [`commit_with_link`], linking a revision of a new repository that the local store of `f`'s
+/// handle holds and the server doesn't, and returns its hash.
+pub(crate) async fn commit_linking_an_unpublished_revision(f: &Fixture, parent: Hash) -> Hash {
+    let linked = Partition::from(uuid::Uuid::now_v7());
+    let local_only = handle_over_local_stores(f, None);
+    let linked_revision = commit_on(
+        local_only,
+        linked,
+        BranchId::from(uuid::Uuid::now_v7()),
+        Hash::default(),
+    )
+    .await;
+    close_handle(local_only).await;
+    commit_with_link(f, f.default_branch, parent, linked, linked_revision).await
 }
 
 /// Whether the server's immutable store holds the revision `revision` of `repository`.
@@ -1474,6 +1564,48 @@ pub(crate) fn event_order(events: &[LoreEvent]) -> Vec<(LoreBranchLocation, bool
             })
         })
         .collect()
+}
+
+/// The pushed events among `events`, each echoing the call's `id`, 1.
+pub(crate) fn pushed(events: &[LoreEvent]) -> Vec<Pushed> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            LoreEvent::RevisionGraphBranchPushed(data) => {
+                assert_eq!(data.id, 1, "a pushed event echoes the call's id");
+                Some(Pushed {
+                    revision_hash: data.revision_hash,
+                    revision_number: data.revision_number,
+                    fast_forward_merged: data.fast_forward_merged != 0,
+                    remote_latest: data.remote_latest,
+                    local_latest: data.local_latest,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// What a pushed event reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Pushed {
+    pub revision_hash: Hash,
+    pub revision_number: u64,
+    pub fast_forward_merged: bool,
+    pub remote_latest: Hash,
+    pub local_latest: Hash,
+}
+
+/// The local latest, remote latest and published revision a pushed event reports for a push that
+/// published `revision`, numbered `revision_number`, without a fast-forward merge.
+pub(crate) fn published(revision: Hash, revision_number: u64) -> Pushed {
+    Pushed {
+        revision_hash: revision,
+        revision_number,
+        fast_forward_merged: false,
+        remote_latest: revision,
+        local_latest: revision,
+    }
 }
 
 /// The synced events among `events` as (previous local latest, local latest), each echoing the

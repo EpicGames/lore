@@ -125,6 +125,8 @@ include = [
     "LoreRevisionGraphBranchArchiveArgs",
     "LoreRevisionGraphBranchSyncOptions",
     "LoreRevisionGraphBranchSyncArgs",
+    "LoreRevisionGraphBranchPushOptions",
+    "LoreRevisionGraphBranchPushArgs",
 ]
 
 [export.rename]
@@ -604,6 +606,7 @@ include = [
 "LoreRevisionGraphLocationCompleteEventData" = "lore_revision_graph_location_complete_event_data_t"
 "LoreRevisionGraphBranchMetadataEventData" = "lore_revision_graph_branch_metadata_event_data_t"
 "LoreRevisionGraphBranchSyncedEventData" = "lore_revision_graph_branch_synced_event_data_t"
+"LoreRevisionGraphBranchPushedEventData" = "lore_revision_graph_branch_pushed_event_data_t"
 "LoreRevisionTree" = "lore_revision_tree_t"
 "LoreRevisionTreeLoadArgs" = "lore_revision_tree_load_args_t"
 "LoreRevisionTreeCloseArgs" = "lore_revision_tree_close_args_t"
@@ -647,6 +650,8 @@ include = [
 "LoreRevisionGraphBranchArchiveArgs" = "lore_revision_graph_branch_archive_args_t"
 "LoreRevisionGraphBranchSyncOptions" = "lore_revision_graph_branch_sync_options_t"
 "LoreRevisionGraphBranchSyncArgs" = "lore_revision_graph_branch_sync_args_t"
+"LoreRevisionGraphBranchPushOptions" = "lore_revision_graph_branch_push_options_t"
+"LoreRevisionGraphBranchPushArgs" = "lore_revision_graph_branch_push_args_t"
 "LoreString" = "lore_string_t"
 "LoreArray_instance_id" = "lore_instance_id_array_t"
 "LoreStringArray" = "lore_string_array_t"

@@ -275,7 +275,7 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
         "local mutable store but is configured to use a shared store",
         LocalMutableStoreWithSharedStore,
     ),
-    ("Branch has been advanced by another instance", BranchAdvanced),
+    ("The branch's latest revision has moved on", BranchAdvanced),
     ("Nothing staged for commit", NothingStagedError),
     ("Path is not a link", NotALinkError),
     ("Link not found", LinkNotFoundError),

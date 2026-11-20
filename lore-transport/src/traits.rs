@@ -10,6 +10,7 @@ use lore_base::types::*;
 use crate::auth::AuthEndpoint;
 use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
+use crate::error::BranchPushError;
 use crate::error::ProtocolError;
 use crate::quic::client::CongestionAlgorithm;
 use crate::types::*;
@@ -316,16 +317,17 @@ pub trait Revision: Send + Sync {
         name: Option<&str>,
     ) -> Result<BranchQueryResponse, ProtocolError>;
 
-    /// Push a new LATEST pointer for branch. Returns the (new) current LATEST pointer for the branch,
-    /// if this is different from the given LATEST pointer the operation failed due to the
-    /// LATEST pointer having moved.
+    /// Offer `latest` as the latest revision of `branch`, and return the latest the remote holds
+    /// after it. A remote that refuses the offer because its latest has moved on, or because a
+    /// fast-forward merge onto it conflicts, and marks that refusal, fails it with
+    /// `BranchAdvanced`, and one that lacks a fragment the revision names with `AddressNotFound`.
     async fn branch_push(
         &self,
         branch: BranchId,
         latest: Hash,
         force: bool,
         fast_forward_merge: bool,
-    ) -> Result<BranchPushResponse, ProtocolError>;
+    ) -> Result<BranchPushResponse, BranchPushError>;
 
     /// List the live branches, and the archived ones too with `include_deleted`; with `creator`,
     /// only those it created.

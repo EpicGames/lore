@@ -141,3 +141,28 @@ pub struct LoreRevisionGraphBranchSyncedEventData {
     /// observed, as `previous_local_latest` holds it.
     pub local_latest: Hash,
 }
+
+/// A branch push's outcome: the last revision the call published, the remote latest and the local
+/// latest when the call finished.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreRevisionGraphBranchPushedEventData {
+    /// The `id` from the call's arguments.
+    pub id: u64,
+    /// The branch the call pushes.
+    pub branch: BranchId,
+    /// The last revision the call published. Where it published none, the local latest when the
+    /// call succeeds, and zero when it fails.
+    pub revision_hash: Hash,
+    /// The revision number of `revision_hash` on the remote, zero where `revision_hash` is zero.
+    pub revision_number: u64,
+    /// Set where the remote published `revision_hash` as a fast-forward merge onto a remote latest
+    /// that had moved.
+    #[serde(with = "u8_as_bool")]
+    pub fast_forward_merged: u8,
+    /// The remote latest when the call finished.
+    pub remote_latest: Hash,
+    /// The local latest when the call finished.
+    pub local_latest: Hash,
+}

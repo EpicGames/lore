@@ -17,6 +17,7 @@ use lore_base::lore_spawn;
 use lore_base::types::BranchMetadata;
 use lore_error_set::prelude::*;
 use lore_storage::CopyOutcome;
+use lore_transport::BranchPushError;
 use lore_transport::BranchPushResponse;
 use lore_transport::Connection;
 use lore_transport::ProtocolError;
@@ -385,11 +386,6 @@ pub struct PushReport {
     pub remote_absent_before: bool,
     /// Whether the remote held the branch archived when the push read it.
     pub remote_deleted_before: bool,
-    /// The revision the push builds on, once the push knows it: where the local history leaves
-    /// the remote's history line for the branch, which is the remote latest where the local
-    /// history holds it, or the branch point a branch the remote doesn't hold starts from; then the
-    /// last revision the remote accepted.
-    pub base: Option<Hash>,
     /// The last revision the remote accepted, zero where it accepted none.
     pub published: Hash,
     /// The revision number of `published` on the remote.
@@ -409,18 +405,15 @@ impl PushReport {
         self.remote_latest = plan.remote_latest;
         self.remote_absent_before = plan.remote_metadata.is_zero();
         self.remote_deleted_before = plan.remote_deleted;
-        self.base = Some(plan.base);
     }
 }
 
-/// Records in `report` that the peer accepted the offer it answered with `response`, which the
-/// push builds on from then on.
+/// Records in `report` that the peer accepted the offer it answered with `response`.
 #[lore_macro::test_pub]
 fn record_offer(report: &mut PushReport, response: &BranchPushResponse) {
     report.published = response.revision;
     report.revision_number = response.revision_number;
     report.fast_forward_merged = response.fast_forward_merged;
-    report.base = Some(response.revision);
     report.remote_latest = response.revision;
 }
 
@@ -830,8 +823,6 @@ struct TargetPlan {
     remote_deleted: bool,
     /// The peer's latest revision the history walk reached, if it reached one.
     remote_revision: Option<Hash>,
-    /// The revision the push builds on ([`UnpushedHistory::base`]).
-    base: Hash,
     remote_history: usize,
     local_history: usize,
     /// Whether the peer holds revisions on the branch that the local history does not.
@@ -1761,10 +1752,6 @@ struct UnpushedHistory {
     branch_remote: Vec<Hash>,
     /// The peer's latest revision the walk reached, if it reached one.
     remote_revision: Option<Hash>,
-    /// The revision the push builds on: where the local history of the branch leaves the peer's
-    /// history line for it, which is the peer's latest where the local history holds it; the
-    /// parent of a single revision to push; or the branch point of a branch the peer doesn't hold.
-    base: Hash,
     branch_metadata: BranchMetadata,
 }
 
@@ -1794,7 +1781,6 @@ fn collect_unpushed_history(
         let mut full_remote_history = vec![];
         let mut current_branch_remote_history = vec![];
         let mut remote_revision = None;
-        let mut base = Hash::default();
         let mut current_branch = branch;
         let mut current_revision = local_latest;
 
@@ -1833,9 +1819,6 @@ fn collect_unpushed_history(
                     return Err(PushError::internal(
                         "Invalid branch data, unknown branch point",
                     ));
-                }
-                if current_branch == branch {
-                    base = branch_point.revision;
                 }
 
                 let branch_point_state =
@@ -1878,21 +1861,19 @@ fn collect_unpushed_history(
             {
                 lore_debug!("Found remote latest or reached initial branch");
 
-                let (walk_branch_point, remote_history, local_history) =
-                    history::find_branch_point(
-                        repository.clone(),
-                        current_remote_latest,
-                        current_revision,
-                    )
-                    .await
-                    .forward::<PushError>("reconciling branch history")?;
+                let (_branch_point, remote_history, local_history) = history::find_branch_point(
+                    repository.clone(),
+                    current_remote_latest,
+                    current_revision,
+                )
+                .await
+                .forward::<PushError>("reconciling branch history")?;
 
                 full_local_history.extend(local_history.clone());
                 full_remote_history.extend(remote_history.clone());
 
                 if current_branch == branch {
                     current_branch_remote_history = remote_history;
-                    base = walk_branch_point;
                 }
 
                 // Either the remote latest was found or there is none
@@ -1908,9 +1889,6 @@ fn collect_unpushed_history(
 
                 full_local_history.push(current_revision);
                 remote_revision = Some(current_remote_latest);
-                if current_branch == branch {
-                    base = current_remote_latest;
-                }
             }
         }
 
@@ -1919,7 +1897,6 @@ fn collect_unpushed_history(
             remote: full_remote_history,
             branch_remote: current_branch_remote_history,
             remote_revision,
-            base,
             branch_metadata,
         })
     }
@@ -1965,7 +1942,6 @@ async fn plan_target(
         remote: remote_history,
         branch_remote,
         remote_revision,
-        base,
         branch_metadata,
     } = collect_unpushed_history(
         repository,
@@ -1996,7 +1972,6 @@ async fn plan_target(
         remote_metadata,
         remote_deleted,
         remote_revision,
-        base,
         remote_history: remote_history.len(),
         local_history: local_history.len(),
         diverged: !branch_remote.is_empty(),
@@ -2370,17 +2345,7 @@ async fn push_local_revision(
             started.fast_forward_merged = true;
             return Ok(());
         }
-        if response.revision_number == 0 {
-            if run.fast_forward_merge {
-                return Err(PushError::internal(
-                    "Fast-forward merge failed due to conflicts, sync and merge locally to resolve",
-                ));
-            }
-            return Err(PushError::internal(format!(
-                "Remote latest has moved to {} and automatic rebase not possible",
-                response.revision
-            )));
-        }
+        refused_answer(&response, run.fast_forward_merge)?;
         if response.revision != current_revision {
             event::LoreEvent::BranchPushRevisionPushUpdate(
                 LoreBranchPushRevisionPushUpdateEventData {
@@ -2756,31 +2721,62 @@ async fn local_latest_on_history(
 }
 
 /// The error of a push that fails because the peer holds revisions on the branch that the local
-/// history does not.
+/// history does not: [`BranchAdvanced`] ([`advanced`]).
+#[lore_macro::test_pub]
 fn diverged_error() -> PushError {
-    PushError::internal("Branch has diverged, sync to merge remote changes")
+    advanced("Branch has diverged, sync to merge remote changes")
 }
 
-/// The error of a revision offer that failed with `err`. The peer refuses an offer as an internal
-/// error, which is [`Divergent`] when `diverged`: the peer holds revisions on the branch that the
-/// local history does not.
+/// [`BranchAdvanced`] with `context` on its trace: the peer refused the push because its latest
+/// moved on.
+#[track_caller]
+fn advanced(context: impl Into<Arc<str>>) -> PushError {
+    let mut err = PushError::from(BranchAdvanced);
+    err.push_context(context);
+    err
+}
+
+/// [`BranchAdvanced`] where the peer's `response` to an offer carries no revision number, the
+/// peer's refusal of the offer: with `fast_forward_merge`, the merge onto its latest conflicts;
+/// without, its latest moved on.
+#[lore_macro::test_pub]
+fn refused_answer(
+    response: &BranchPushResponse,
+    fast_forward_merge: bool,
+) -> Result<(), PushError> {
+    if response.revision_number != 0 {
+        return Ok(());
+    }
+    if fast_forward_merge {
+        return Err(advanced(
+            "Fast-forward merge failed due to conflicts, sync and merge locally to resolve",
+        ));
+    }
+    Err(advanced(format!(
+        "Remote latest has moved to {} and automatic rebase not possible",
+        response.revision
+    )))
+}
+
+/// The error of a revision offer that failed with `err`. The peer refuses an offer as
+/// [`BranchAdvanced`], which is [`Divergent`] when `diverged`: the peer holds revisions on the
+/// branch that the local history does not.
 #[lore_macro::test_pub]
 fn refused_offer(err: PushError, diverged: bool) -> PushError {
-    if !diverged || !err.is_internal() {
+    if !diverged || !err.is_branch_advanced() {
         return err;
     }
-    let context = format!("remote refused the revision: {err}");
-    PushError::Divergent(Divergent.chain_err_from(err, &context))
+    PushError::Divergent(Divergent.chain_err_from(err, "remote refused the revision"))
 }
 
 /// Forward what the peer answered a branch push with, naming the fragment where it refused for
 /// a missing one.
 #[track_caller]
-fn forward_branch_push<T>(result: Result<T, ProtocolError>) -> Result<T, PushError> {
+fn forward_branch_push<T>(result: Result<T, BranchPushError>) -> Result<T, PushError> {
     match result {
-        Err(ProtocolError::AddressNotFound(missing)) => {
+        Err(BranchPushError::AddressNotFound(missing)) => {
             let address = Address::from(&missing.address[..]);
-            Err(ProtocolError::AddressNotFound(missing)).forward_with::<PushError, _>(|| {
+            Err(BranchPushError::AddressNotFound(missing)).forward_with::<PushError, _>(|| {
                 format!("pushing branch to remote, missing fragment {address}")
             })
         }
@@ -3283,12 +3279,7 @@ async fn failed_mount_push(
         name.kind, name.path, name.branch
     );
     let mut err = err;
-    err.push_trace(lore_error_set::Location::with_context(
-        file!(),
-        line!(),
-        column!(),
-        Arc::from(context),
-    ));
+    err.push_context(context);
     (err, line)
 }
 
@@ -3379,7 +3370,7 @@ async fn offer_revision(
     let mut answer = revision_protocol
         .branch_push(branch, revision, force, fast_forward_merge)
         .await;
-    if let Err(ProtocolError::NotFound(_)) = answer {
+    if let Err(BranchPushError::NotFound(_)) = answer {
         lore_debug!("Branch push returned NotFound, recreating branch on server");
         event::LoreEvent::BranchPushBranchCreateBegin(LoreBranchPushBranchCreateBeginEventData {
             repository,
@@ -3398,7 +3389,7 @@ async fn offer_revision(
             .branch_push(branch, revision, force, fast_forward_merge)
             .await;
     }
-    if let Err(ProtocolError::AddressNotFound(missing)) = &answer {
+    if let Err(BranchPushError::AddressNotFound(missing)) = &answer {
         lore_debug!(
             "Branch push missing fragment {}, collecting through the remote",
             Address::from(&missing.address[..])
@@ -3409,6 +3400,16 @@ async fn offer_revision(
             .await;
     }
     forward_branch_push(answer)
+}
+
+/// `err`, a branch push's failure, with the remote's refusal of a push onto a latest that has
+/// moved on as `Internal`, the refusal on its trace. Every other failure keeps its variant.
+#[lore_macro::test_pub]
+pub(crate) fn refusal_as_internal(err: BranchPushError) -> BranchPushError {
+    if !err.is_branch_advanced() {
+        return err;
+    }
+    BranchPushError::internal_with_context(err, "the remote refused the push")
 }
 
 /// Upload those of `fragments` the peer answers that it is missing, reporting progress

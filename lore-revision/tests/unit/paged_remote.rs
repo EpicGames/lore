@@ -38,6 +38,7 @@ use lore_storage::test_util::Answered;
 use lore_storage::test_util::HookedStore;
 use lore_storage::test_util::StoreCall;
 use lore_transport::BranchListResponse;
+use lore_transport::BranchPushError;
 use lore_transport::BranchPushResponse;
 use lore_transport::BranchQueryResponse;
 use lore_transport::BranchRecord;
@@ -927,7 +928,7 @@ impl Revision for PagedRemote {
         _: Hash,
         _: bool,
         _: bool,
-    ) -> Result<BranchPushResponse, ProtocolError> {
+    ) -> Result<BranchPushResponse, BranchPushError> {
         unreachable!("no test of a paged remote pushes a branch")
     }
 

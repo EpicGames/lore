@@ -130,7 +130,7 @@ Warning: Branch 9a1c4b7d... is checked out in other instance(s):
   (01a134f3df717142...) /home/you/my-project-b
 ```
 
-Two instances on one branch share its latest revision. Once one of them commits, a commit in the other fails with `Branch has been advanced by another instance, sync and re-stage to commit`. To commit on top, take your changes off the stage with `lore unstage`, sync, and stage them again:
+Two instances on one branch share its latest revision. Once one of them commits, a commit in the other fails with `The branch's latest revision has moved on; sync to bring in its new revisions`. To commit on top, take your changes off the stage with `lore unstage`, sync, and stage them again:
 
 ```bash
 lore unstage .

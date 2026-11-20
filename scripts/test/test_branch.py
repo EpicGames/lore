@@ -143,8 +143,9 @@ def test_branch(new_lore_repo):
     urc_divergent.stage(scan=True)
     urc_divergent.commit("Test commit 3 (divergent)")
 
-    with pytest.raises(BranchDivergedError):
+    with pytest.raises(BranchDivergedError) as diverged:
         urc_divergent.push()
+    assert diverged.value.returncode == 41, "a diverged push exits with BranchAdvanced"
 
     urc_divergent.push(force=True)
 

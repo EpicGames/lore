@@ -54,6 +54,7 @@ use lore_revision::repository::LoreSharedStoreMode;
 
 use super::support::*;
 use crate::common::net_common::close_handle;
+use crate::common::net_common::open_handle;
 use crate::common::net_common::open_handle_with_args;
 
 /// Three `branch_resolve` calls under one correlation id start one session fan-out between them,
@@ -84,6 +85,44 @@ async fn branch_resolve_starts_one_session_per_correlation_id() {
         calls,
         [at_remote(1), at_remote(1), at_remote(1), at_remote(2)]
     );
+}
+
+/// A push takes its storage sessions from the storage handle's endpoint, so they end with the
+/// handle: after a push under a correlation id through a handle that is then closed, a read of a
+/// remote blob under that id through another handle starts a session fan-out, where a pool the
+/// connection pinned would serve the read.
+#[tokio::test]
+async fn a_push_session_ends_with_the_handle() {
+    let f = fixture().await;
+    let seeded = seed_main(&f).await;
+    let connection = connection_for(&f.url, f.repository).await;
+    let pushing = open_handle(Some(&f.url)).await;
+    commit_on(pushing, f.repository, f.default_branch, seeded).await;
+    let (status, _) = push_branch_call(
+        &f,
+        pushing,
+        graph_globals_under("pushed"),
+        f.default_branch,
+        Default::default(),
+    )
+    .await;
+    assert_eq!(status, 0);
+    close_handle(pushing).await;
+    let reading = open_handle(Some(&f.url)).await;
+    let before = connection.storage_session_starts();
+
+    let read = resolve_branch(
+        &f,
+        reading,
+        graph_globals_under("pushed"),
+        DEFAULT_BRANCH_NAME,
+    )
+    .await;
+
+    let starts = connection.storage_session_starts() - before;
+    close_handle(reading).await;
+    f.close().await;
+    assert_eq!((read.0, starts), (0, 1));
 }
 
 /// Calls with the `local` flag start no session, though the remote holds what they read:

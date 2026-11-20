@@ -5,6 +5,7 @@ mod branch_create;
 mod branch_list;
 mod branch_metadata_get;
 mod branch_metadata_set;
+mod branch_push;
 mod branch_resolve;
 mod branch_sync;
 mod call;

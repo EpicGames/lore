@@ -4,6 +4,7 @@ import logging
 import os
 
 import pytest
+from error_types import LoreException
 from lore_parsers import parse_jsonl, parse_push_stats_json, parse_revision_list_json
 
 from lore import Lore
@@ -287,8 +288,9 @@ def test_push_fast_forward_merge_conflict(new_lore_repo):
     clone_b.push()
 
     # Fast-forward merge push should fail due to conflict in server-side diff3
-    with pytest.raises(Exception):
+    with pytest.raises(LoreException) as refused:
         repo.push(fast_forward_merge=True)
+    assert refused.value.returncode == 41, "the server's refusal exits with BranchAdvanced"
 
 
 @pytest.mark.smoke

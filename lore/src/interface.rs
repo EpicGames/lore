@@ -9966,6 +9966,111 @@ pub extern "C" fn lore_revision_graph_branch_sync_async(
     run_asynchronously(globals, args, callback, dispatch_command);
 }
 
+pub type LoreRevisionGraphBranchPushOptions =
+    crate::revision_graph::branch_push::LoreRevisionGraphBranchPushOptions;
+
+pub type LoreRevisionGraphBranchPushArgs =
+    crate::revision_graph::branch_push::LoreRevisionGraphBranchPushArgs;
+
+/// Publish the local history of `args->branch` to the remote of `args->store`.
+///
+/// The call always writes to the remote: `local` and `offline`, on the call or on `args->store`,
+/// fail it, and `remote` means the same as no flag. It walks the branch's local history back to
+/// the revision the remote holds, uploads each revision's fragments the remote lacks, creates the
+/// branch on the remote on its first push, and offers each revision as the remote latest. The
+/// remote checks branch protection and verifies each revision. It publishes this repository's
+/// revisions alone: each revision of a linked repository that a revision links must be on the
+/// remote already, and is checked there before anything is created, uploaded or offered. The
+/// repository's layers are left out. The branch's tree blocks and leaf payloads must be in the
+/// local store of `args->store` or on the remote.
+///
+/// The call reads the branch's local latest from the local store, and writes the local latest
+/// once, as it finishes: the last revision the remote accepted, convergent, after a fast-forward
+/// merge too, with a compare-and-swap from the local latest it read. A tree commit that moves the
+/// local latest while the push runs stays in place, and the call still succeeds. Where the remote
+/// latest is the local latest, and without `args->options.force` where the remote's history holds
+/// the local latest and either `args->options.fast_forward_merge` is set or an earlier push
+/// published it without recording it, the call succeeds without offering a revision.
+/// `args->options.force` overwrites a remote latest that has moved, which branch protection still
+/// governs, and `args->options.fast_forward_merge` lets the remote merge onto a remote latest that
+/// has moved where the merge has no conflicts. The call ignores `globals.force` and
+/// `globals.dry_run`, and `lore_storage_close` waits for it.
+///
+/// `LORE_EVENT_REVISION_GRAPH_BRANCH_PUSHED` fires before `LORE_EVENT_COMPLETE` once the call has
+/// read the remote latest, on success and on failure alike. On success its `revision_hash` is the
+/// revision to build on next, which can differ from the one committed after a fast-forward merge,
+/// and its `remote_latest` is the remote latest; a caller continues from `remote_latest` where it
+/// differs from `revision_hash`. On failure, `remote_latest` names the remote latest the call last
+/// read and `local_latest` the local latest the call left. After error code 41, `remote_latest`
+/// names the revision to reload from, and a forced `lore_revision_graph_branch_sync` to it with
+/// `expected_local_latest` set to `local_latest` drops the refused revisions.
+/// A call that fails before that read, such as on invalid arguments or a branch without a local
+/// latest, sends only `LORE_EVENT_COMPLETE`. The call sends no
+/// `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE`.
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_BRANCH_PUSH_FRAGMENT_PROGRESS` | `lore_branch_push_fragment_progress_event_data_t` | The upload's progress, every `globals.event_interval_ms` while it uploads fragments and once as each upload ends; it carries no `args->id` |
+/// | `LORE_EVENT_BRANCH_PUSH_STATS` | `lore_branch_push_stats_event_data_t` | What the push cost, once as it finishes, at `globals.stats` 1 and above; it carries no `args->id` |
+/// | `LORE_EVENT_REVISION_GRAPH_BRANCH_PUSHED` | `lore_revision_graph_branch_pushed_event_data_t` | The revision published last, the remote latest and the local latest |
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | A log line |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` on success or the error code, with its detail in `error` |
+///
+/// Fails with:
+/// - error code 3 (invalid arguments) for a zero `args->branch`, an unknown or closed
+///   `args->store`, `local` or `offline` on the call or on `args->store`, and location flags that
+///   contradict each other or those `args->store` was opened with;
+/// - error code 111 (no remote) where `args->store` has no remote;
+/// - error code 87 (branch not found) where the local store holds no local latest of the branch;
+/// - error code 41 (branch advanced) where, without `args->options.force`, the remote latest isn't
+///   the revision the push builds on, and no fast-forward merge applies, because
+///   `args->options.fast_forward_merge` isn't set or the merge would conflict. A Lore Server older
+///   than this version doesn't mark its refusal of such a push, which then fails with -1;
+/// - error code 57 (branch already exists) where the branch's first push, or a push that restores
+///   the branch the remote archived, finds another remote branch holding its name;
+/// - error code 88 (revision not found) where a revision the push would offer links a revision of
+///   another repository that the remote lacks;
+/// - error code 80 (address not found) where the remote still lacks a fragment a revision names;
+/// - error code 118 (oversized) where a blob the push reads or sends is larger than the remote or
+///   the local store allows;
+/// - error code 16 (not authenticated) where the call has no login or tokens the remote accepts.
+///   The call starts no login: the caller logs in, with `lore_auth_login_interactive` or
+///   `lore_auth_login_with_token`, and calls again, and a storage handle's open connection picks
+///   up the new login within a minute. A caller that passes its own tokens in `globals` opens a
+///   new storage handle with fresh ones, since an open connection keeps the tokens it connected
+///   with;
+/// - error code 17 (not authorized) where the remote refuses the caller, including a forced push
+///   to a protected branch and a linked repository the caller can't read;
+/// - error codes 28 (disconnected), 29 (not connected), 30 (maintenance) and 31 (slow down) where
+///   the remote can't be reached or declines work;
+/// - error code -1 (internal) for any other failure, with the remote's message for a refusal of
+///   the remote.
+///
+/// An event's strings, arrays and error detail are valid only during the callback invocation that
+/// delivers it. This call and `lore_revision_graph_branch_push_async` copy `args` before they
+/// return, so an `_async` caller can free `args` once the call returns. A caller that passes the
+/// same `globals.correlation_id` on every call over one storage handle reuses one storage session
+/// per connection, as with the `lore_storage_*` calls. `args->id`, which every
+/// `LORE_EVENT_REVISION_GRAPH_*` event echoes, is separate from it.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_graph_branch_push(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionGraphBranchPushArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, run_command)
+}
+
+/// Publish a branch's local history to the remote (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_graph_branch_push_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionGraphBranchPushArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, dispatch_command);
+}
+
 /// Select how payloads are compressed before they are stored, over
 /// `lore_storage::COMPRESSION_MODE`.
 ///
