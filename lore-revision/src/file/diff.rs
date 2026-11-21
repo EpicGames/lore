@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use futures::TryFutureExt;
 use lore_error_set::prelude::*;
 use serde::Serialize;
 
@@ -17,7 +18,6 @@ use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::immutable;
-use crate::immutable::read_options_from_repository;
 use crate::infer::infer_is_diffable_by_slice;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
@@ -136,7 +136,7 @@ pub struct DiffOptions {
 /// opened for the output of such a diff alone and not around the whole of it: calculating the
 /// changes against the filesystem opens one of its own, and a filesystem holds one at a time.
 #[derive(Clone, Copy)]
-enum DiffSide<'a> {
+pub(crate) enum DiffSide<'a> {
     Revision(&'a Arc<State>),
     Working(&'a Arc<InstanceOperationImpl>),
 }
@@ -151,14 +151,45 @@ impl<'a> DiffSide<'a> {
     }
 }
 
-pub async fn diff(
+/// Compare selected paths between revisions or against the working tree.
+pub fn diff(
     repository: Arc<RepositoryContext>,
     source_revision: Option<String>,
     target_revision: Option<String>,
     paths: Vec<RelativePath>,
     diff3: bool,
     options: DiffOptions,
-) -> Result<(), DiffError> {
+) -> impl Future<Output = Result<(), DiffError>> {
+    resolve_diff_states(repository.clone(), source_revision, target_revision).and_then(
+        move |(state_source, state_target)| async move {
+            if diff3 {
+                let revision_source = state_source.revision();
+                let revision_target = state_target.as_ref().map(|state| state.revision());
+                Box::pin(file_diff3(
+                    repository,
+                    state_source,
+                    state_target,
+                    revision_source,
+                    revision_target,
+                    paths,
+                    options,
+                ))
+                .await
+            } else {
+                file_diff2(repository, state_source, state_target, paths, options).await
+            }
+        },
+    )
+}
+
+/// Resolve the comparison states, defaulting to the current revision and working tree.
+///
+/// Requires a working-tree path when no target revision is supplied.
+pub(crate) async fn resolve_diff_states(
+    repository: Arc<RepositoryContext>,
+    source_revision: Option<String>,
+    target_revision: Option<String>,
+) -> Result<(Arc<State>, Option<Arc<State>>), DiffError> {
     // Resolve the source revision
     let revision_source = if let Some(signature) = source_revision {
         revision::resolve(
@@ -224,20 +255,7 @@ pub async fn diff(
 
     require_working_tree_target(&repository, state_target.as_ref())?;
 
-    if diff3 {
-        Box::pin(file_diff3(
-            repository,
-            state_source,
-            state_target,
-            revision_source,
-            revision_target,
-            paths,
-            options,
-        ))
-        .await
-    } else {
-        file_diff2(repository, state_source, state_target, paths, options).await
-    }
+    Ok((state_source, state_target))
 }
 
 /// Refuses a diff against the working tree from a context holding no path to one.
@@ -262,7 +280,45 @@ async fn file_diff2(
     paths: Vec<RelativePath>,
     options: DiffOptions,
 ) -> Result<(), DiffError> {
-    let changes = if let Some(state_target) = state_target.as_ref() {
+    let changes = collect_diff_changes(
+        repository.clone(),
+        &state_source,
+        state_target.as_ref(),
+        paths,
+    )
+    .await?;
+
+    let emit = async |target: DiffSide<'_>| {
+        emit_unified_diffs(
+            repository.clone(),
+            &state_source,
+            target,
+            &changes,
+            &[],
+            options,
+        )
+        .await
+    };
+
+    match state_target {
+        Some(state_target) => emit(DiffSide::Revision(&state_target)).await,
+        None => {
+            with_operation(repository.file_system(), async |operation| {
+                emit(DiffSide::Working(&operation)).await
+            })
+            .await
+        }
+    }
+}
+
+/// Collect changes for selected paths, including staged and committed moves.
+pub(crate) async fn collect_diff_changes(
+    repository: Arc<RepositoryContext>,
+    state_source: &Arc<State>,
+    state_target: Option<&Arc<State>>,
+    paths: Vec<RelativePath>,
+) -> Result<Vec<NodeChange>, DiffError> {
+    let changes = if let Some(state_target) = state_target {
         let (_, mut changes) = collect_stream_with_summary(|tx| {
             diff::diff_revision_paths(
                 repository.clone(),
@@ -303,27 +359,7 @@ async fn file_diff2(
         changes
     };
 
-    let emit = async |target: DiffSide<'_>| {
-        emit_unified_diffs(
-            repository.clone(),
-            &state_source,
-            target,
-            &changes,
-            &[],
-            options,
-        )
-        .await
-    };
-
-    match state_target {
-        Some(state_target) => emit(DiffSide::Revision(&state_target)).await,
-        None => {
-            with_operation(repository.file_system(), async |operation| {
-                emit(DiffSide::Working(&operation)).await
-            })
-            .await
-        }
-    }
+    Ok(changes)
 }
 
 async fn coalesce_staged_moves(
@@ -1229,11 +1265,32 @@ fn make_diff_content(bytes: &[u8]) -> DiffContent {
     }
 }
 
-async fn diff_read_file(
+fn diff_read_file<'a>(
+    repository: Arc<RepositoryContext>,
+    side: DiffSide<'a>,
+    relative_path: &'a RelativePath,
+) -> impl Future<Output = Result<DiffContent, DiffError>> {
+    read_diff_bytes(repository, side, relative_path).map_ok(|bytes| make_diff_content(&bytes))
+}
+
+/// Read exact file bytes from a revision or an open working-tree operation.
+pub(crate) async fn read_diff_bytes(
     repository: Arc<RepositoryContext>,
     side: DiffSide<'_>,
     relative_path: &RelativePath,
-) -> Result<DiffContent, DiffError> {
+) -> Result<bytes::Bytes, DiffError> {
+    let (repository, source) = diff_content_source(repository, side, relative_path).await?;
+    immutable::read_source(&repository, &source)
+        .await
+        .forward_any::<DiffError>("Reading file for diff")
+}
+
+/// Names exact file content without reading it, resolving linked revisions in their own store.
+pub(crate) async fn diff_content_source(
+    repository: Arc<RepositoryContext>,
+    side: DiffSide<'_>,
+    relative_path: &RelativePath,
+) -> Result<(Arc<RepositoryContext>, lore_storage::ContentSource<'static>), DiffError> {
     let state = match side {
         DiffSide::Revision(state) => state,
         DiffSide::Working(operation) => {
@@ -1241,10 +1298,7 @@ async fn diff_read_file(
                 .content_source(relative_path)
                 .await
                 .forward::<DiffError>("naming the content of the file to diff")?;
-            let content = immutable::read_source(&repository, &source)
-                .await
-                .forward_any::<DiffError>("Failed reading file for diff")?;
-            return Ok(make_diff_content(&content));
+            return Ok((repository, source));
         }
     };
 
@@ -1259,6 +1313,13 @@ async fn diff_read_file(
             })
         })?;
 
+    if !node_link.is_valid() {
+        return Err(FileNotFound {
+            resource: relative_path.to_string(),
+        }
+        .into());
+    }
+
     let (repository, state) = if node_link.repository != repository.id {
         let repository = repository.to_link_context(node_link.repository).await;
         let state = state::State::deserialize(repository.clone(), node_link.revision)
@@ -1269,19 +1330,44 @@ async fn diff_read_file(
         (repository, state.clone())
     };
 
-    read_node_content(repository, &state, node_link.node, relative_path).await
+    let source = node_content_source(&repository, &state, node_link.node, relative_path).await?;
+    Ok((repository, source))
 }
 
 /// Read and classify the content of one file node in a revision.
+pub(crate) fn read_node_content<'a>(
+    repository: Arc<RepositoryContext>,
+    state: &'a Arc<State>,
+    node_id: NodeID,
+    relative_path: &'a RelativePath,
+) -> impl Future<Output = Result<DiffContent, DiffError>> {
+    read_node_bytes(repository, state, node_id, relative_path)
+        .map_ok(|bytes| make_diff_content(&bytes))
+}
+
+/// Read the exact content of one file node in a revision.
 ///
 /// The read falls through to the remote, so a sparse instance holding no local
 /// payload still answers. `relative_path` names the file in the errors alone.
-pub(crate) async fn read_node_content(
+async fn read_node_bytes(
     repository: Arc<RepositoryContext>,
     state: &Arc<State>,
     node_id: NodeID,
     relative_path: &RelativePath,
-) -> Result<DiffContent, DiffError> {
+) -> Result<bytes::Bytes, DiffError> {
+    let source = node_content_source(&repository, state, node_id, relative_path).await?;
+    immutable::read_source(&repository, &source)
+        .await
+        .forward_any::<DiffError>("Reading data for diff")
+}
+
+/// Names a file node's immutable content without reading its payload.
+pub(crate) async fn node_content_source(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    node_id: NodeID,
+    relative_path: &RelativePath,
+) -> Result<lore_storage::ContentSource<'static>, DiffError> {
     let node = state
         .node(repository.clone(), node_id)
         .await
@@ -1293,16 +1379,10 @@ pub(crate) async fn read_node_content(
         )));
     }
 
-    let content = immutable::read(
-        repository.clone(),
+    Ok(lore_storage::ContentSource::virtual_immutable(
         node.address,
-        None,
-        read_options_from_repository(&repository).with_decompress(),
-    )
-    .await
-    .forward::<DiffError>("Failed reading data for diff")?;
-
-    Ok(make_diff_content(&content))
+        node.size,
+    ))
 }
 
 /// Read and classify the content of one file as the working tree holds it, and
