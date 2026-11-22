@@ -47,7 +47,6 @@ pub(crate) use diff::diff_states_into;
 pub(crate) use diff::diff_subtree_flagged;
 use futures::future::Either;
 use lore_base::error::InvalidPath;
-use lore_base::lore_drain_tasks;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 pub use node::ServedNodes;
@@ -914,6 +913,7 @@ pub struct StateNodeChildrenWithNameIterator {
 impl StateNodeChildrenWithNameIterator {
     /// Live children the walk passed over because their block could not give back their name.
     #[lore_macro::test_pub]
+    #[cfg(any(target_os = "linux", feature = "test-util"))]
     pub(crate) fn skipped_invalid(&self) -> u32 {
         self.skipped_invalid
     }
@@ -1101,6 +1101,7 @@ pub struct StateNodeChildrenIterator {
 /// sibling chain may leave a block and come back to it, and the one just seen is the likeliest
 /// match.
 #[lore_macro::test_pub]
+#[cfg(any(target_os = "linux", feature = "test-util"))]
 fn push_distinct(blocks: &mut Vec<Arc<NodeBlock>>, block: &Arc<NodeBlock>) -> bool {
     if blocks.iter().rev().any(|seen| Arc::ptr_eq(seen, block)) {
         return false;
@@ -1112,6 +1113,7 @@ fn push_distinct(blocks: &mut Vec<Arc<NodeBlock>>, block: &Arc<NodeBlock>) -> bo
 impl StateNodeChildrenIterator {
     /// The node block holding the child [`Self::next`] returned last.
     #[lore_macro::test_pub]
+    #[cfg(any(target_os = "linux", feature = "test-util"))]
     pub(crate) fn block(&self) -> Option<&Arc<NodeBlock>> {
         self.current_block.as_ref()
     }
@@ -3564,6 +3566,7 @@ impl State {
     /// before it is loaded: the blocks load in turn, and each name table loads while the walk
     /// goes on.
     #[lore_macro::test_pub]
+    #[cfg(any(target_os = "linux", feature = "test-util"))]
     pub(crate) async fn load_children_with_nametables(
         self: &Arc<Self>,
         repository: Arc<RepositoryContext>,
@@ -3589,7 +3592,7 @@ impl State {
                 );
             }
         }
-        lore_drain_tasks!(
+        lore_base::lore_drain_tasks!(
             nametables,
             StateError::internal("Failed to load a node name table")
         )?;
@@ -11614,6 +11617,7 @@ pub(crate) async fn read_clock_floor_in(dir: &std::path::Path) -> u64 {
 
 /// A probe path in `dir` no other stamp in this process takes, so stamps made there at once each
 /// read their own probe.
+#[cfg(any(target_os = "linux", feature = "test-util"))]
 fn probe_of_its_own(dir: &std::path::Path) -> std::path::PathBuf {
     static PROBES: AtomicU64 = AtomicU64::new(0);
     let probe = PROBES.fetch_add(1, Ordering::Relaxed);
@@ -11651,6 +11655,7 @@ async fn stamp_and_remove_probe(path: &std::path::Path) -> Option<u64> {
 /// The process clock where `dir` is `None` or cannot be stamped. A file written within the
 /// filesystem's clock tick can then carry the time returned.
 #[lore_macro::test_pub]
+#[cfg(any(target_os = "linux", feature = "test-util"))]
 pub(crate) async fn time_before_next_write(dir: Option<&std::path::Path>) -> u64 {
     let stamp = match dir {
         Some(dir) => stamp_and_remove_probe(&probe_of_its_own(dir)).await,

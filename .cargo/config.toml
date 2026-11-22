@@ -27,6 +27,9 @@ rustflags = [
     # link time, so each rebuilt proc-macro DLL differs and every crate using it
     # misses sccache, which hashes the DLL's bytes, on every build.
     "-C", "link-arg=/Brepro",
+    # The prebuilt SWFS library's objects name a swfs.pdb the linker doesn't look
+    # for beside the rlib that bundles them, so they link without debug info.
+    "-C", "link-arg=/IGNORE:4099",
     # allows uuid IntoBytes/FromBytes unstable feature
     "--cfg", "uuid_unstable"
 ]

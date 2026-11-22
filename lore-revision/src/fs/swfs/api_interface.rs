@@ -700,6 +700,7 @@ mod swfs_impl {
 
         /// Whether SWFS holds the mount frozen.
         #[lore_macro::test_pub]
+        #[cfg(feature = "test-util")]
         fn is_frozen(&self) -> Result<bool, SwfsInterfaceError> {
             Ok(unsafe { swfsIsFrozen(self.handle()?.handle()) })
         }

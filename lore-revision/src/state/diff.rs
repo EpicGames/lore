@@ -31,6 +31,7 @@ use crate::fs::filesystem_provider::FilesystemDiffIntent;
 #[cfg(target_os = "linux")]
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::interface::LoreNodeType;
+#[cfg(target_os = "linux")]
 use crate::lore::Address;
 use crate::lore::RepositoryId;
 use crate::lore_debug;

@@ -254,6 +254,7 @@ pub fn run<J: Send>(root: J, threads: usize, list: &ListFn<'_, J>) -> io::Result
 
 /// [`run`] on the calling thread alone, with no queue, so that every directory it finds is
 /// listed depth-first.
+#[cfg(any(target_family = "unix", feature = "test-util"))]
 fn run_alone<J: Send>(root: J, progress: &Progress, list: &ListFn<'_, J>) -> io::Result<()> {
     run_with(root, (0, 0), progress, &|_| 0, &|| {}, list)
 }
@@ -859,6 +860,7 @@ struct Cloning<'a, const FAITHFUL: bool> {
 #[derive(Clone, Copy)]
 pub(super) enum Threads<'a> {
     /// The calling thread alone.
+    #[cfg(any(target_family = "unix", feature = "test-util"))]
     Alone,
     /// The calling thread and the threads it lends.
     Lent(&'a LendFn<'a>),
@@ -994,6 +996,7 @@ impl<const FAITHFUL: bool> Cloning<'_, FAITHFUL> {
         };
         match threads {
             Threads::Lent(lend) => run_lending(lend, root, self.progress, &list),
+            #[cfg(any(target_family = "unix", feature = "test-util"))]
             Threads::Alone => run_alone(root, self.progress, &list),
         }
     }

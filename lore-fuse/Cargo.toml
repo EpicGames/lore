@@ -8,7 +8,8 @@ publish = false
 name = "lore_fuse"
 test = false
 
-[dependencies]
+# Linux only, as the crate is: elsewhere it is empty.
+[target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
 zerocopy = { workspace = true }
 tokio = { workspace = true, features = ["net", "sync", "time", "rt"] }

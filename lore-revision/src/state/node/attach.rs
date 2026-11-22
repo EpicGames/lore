@@ -74,6 +74,7 @@ impl Absent {
     /// `dir`'s block in `state`, at `at`, as `state` stands now: the VFS provider's listing, or a
     /// test or the stress suite standing in for one.
     #[lore_macro::test_pub]
+    #[cfg(any(target_os = "linux", feature = "test-util"))]
     pub(crate) fn new(
         state: &State,
         at: u32,
