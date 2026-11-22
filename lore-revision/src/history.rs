@@ -136,6 +136,25 @@ impl Line {
         matches!(self.step, Step::Store) && !self.cursor.is_zero()
     }
 
+    /// Whether [`meet`] waits on the line, `passed` being the index of its first revision not
+    /// passed: each of its revisions is passed, and it can go further.
+    fn waits(&self, passed: usize) -> bool {
+        passed == self.history.len() && self.advances()
+    }
+
+    /// Whether the line can still meet `asking`, a line that asks the remote, in the local store:
+    /// [`meet`] waits on it, as [`Self::waits`] describes, and its oldest revision is numbered above
+    /// the lowest numbered revision of `asking`. Below that number `asking` holds only the revision
+    /// it asks for, which the store lacks.
+    fn can_meet_in_store(&self, passed: usize, asking: &Line) -> bool {
+        let (Some(&oldest), Some(&lowest)) =
+            (self.numbers.last(), asking.numbers.iter().rev().nth(1))
+        else {
+            return false;
+        };
+        self.waits(passed) && oldest > lowest
+    }
+
     /// Walk up to ten revisions of the line in the local store, as far as the store holds them,
     /// reading each state with a [`find::local_line_step`]. The first revision the store lacks is
     /// added to the line, numbered zero, and the line asks the remote for the page holding it. A
@@ -344,13 +363,20 @@ pub(crate) fn meet(
 /// once its revisions are needed. Where no line `meet` waits on can go further, the round walks
 /// every line that can, so a line that ended or stopped still has the other walked to its end.
 fn advancing(left: &Line, right: &Line, passed: (usize, usize)) -> (bool, bool) {
-    let left_waits = passed.0 == left.history.len() && left.advances();
-    let right_waits = passed.1 == right.history.len() && right.advances();
+    let left_waits = left.waits(passed.0);
+    let right_waits = right.waits(passed.1);
     if left_waits || right_waits {
         (left_waits, right_waits)
     } else {
         (left.advances(), right.advances())
     }
+}
+
+/// Whether the round defers its remote request: one line asks, and the other can still meet it in
+/// the local store, as [`Line::can_meet_in_store`] describes, given `passed` as [`meet`] left it.
+fn defers(left: &Line, right: &Line, passed: (usize, usize)) -> bool {
+    (left.asks() && right.can_meet_in_store(passed.1, left))
+        || (right.asks() && left.can_meet_in_store(passed.0, right))
 }
 
 /// Ask the remote for the page holding the cursor of each line the round asks for, take the
@@ -468,13 +494,16 @@ fn stall<T>(left: Line, right: Line) -> Result<T, HistoryError> {
 /// Each round walks up to ten revisions of a line in the local store. It walks the lines
 /// [`advancing`] names. Where a line reaches a revision the store lacks, the round asks the remote
 /// for the page holding that revision only where the lines have not met among the numbered
-/// revisions they hold. Lines that have not met there, but both reach the same revision the store
-/// lacks in the same round, meet at that revision without asking: it is the newest they share,
-/// since [`meet`] found none above it. A line the page moves is walked in the store again from its
-/// new cursor, and a line ends where the remote does not hold the revision asked for. A request
-/// that fails stops the line where it is, and the remote is not asked for it again. A page that
-/// does not continue the line fails the walk, as [`Line::extend`] describes, and so does a blob in
-/// the local store that is not a revision state, as [`Line::walk_store`] describes.
+/// revisions they hold, and the other line cannot meet it in the store, as [`defers`] describes. A
+/// round that defers ends there, before the lines are met against the revision the store lacks,
+/// and the next round walks the other line. Lines that have not met among the numbered revisions,
+/// but both reach the same revision the store lacks, meet at that revision without asking: it is
+/// the newest they share, since [`meet`] found none above it. A line the page moves is walked in
+/// the store again from its new cursor, and a line ends where the remote does not hold the
+/// revision asked for. A request that fails stops the line where it is, and the remote is not
+/// asked for it again. A page that does not continue the line fails the walk, as [`Line::extend`]
+/// describes, and so does a blob in the local store that is not a revision state, as
+/// [`Line::walk_store`] describes.
 ///
 /// Each round takes the lines on to where they meet as [`meet`] describes, from where the round
 /// before left them: before the remote is asked, short of the revisions the page will number, as
@@ -520,6 +549,9 @@ pub fn find_branch_point(
                 if left.asks() && right.asks() && left.cursor == right.cursor {
                     let shared = (left.history.len() - 1, right.history.len() - 1);
                     return Ok(branch_point(left, right, shared));
+                }
+                if defers(&left, &right, passed) {
+                    continue;
                 }
                 ask_remote(&repository, &mut left, &mut right).await?;
             }

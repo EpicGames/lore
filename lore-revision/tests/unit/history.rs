@@ -23,6 +23,7 @@ mod find_branch_point {
     use crate::helper::setup_test_execution;
     use crate::paged_remote::Anchor;
     use crate::paged_remote::BranchedFromRemoteLine;
+    use crate::paged_remote::ClientStores;
     use crate::paged_remote::PagedRemote;
     use crate::paged_remote::Reads;
     use crate::paged_remote::RemoteRevision;
@@ -607,6 +608,230 @@ mod find_branch_point {
 
         assert_eq!(walked, (left, vec![], vec![right]));
         assert_eq!(remote.lists(), 0);
+    }
+
+    /// A line that reaches a revision the store lacks does not ask the remote for it while the
+    /// other line can still meet it in the store: here the left line reaches revision 11, which
+    /// only the remote holds, below revisions 20 to 12, while the right line's first round reads
+    /// 30 to 21, or 40 to 31. The right line meets the left line at 15 in the store one round
+    /// later, or two, and the walk asks for no page, on either side. Each revision walked costs
+    /// one state read, and so does each read of revision 11.
+    #[tokio::test]
+    async fn lines_meeting_in_the_store_a_round_after_one_reaches_a_missing_revision_ask_nothing() {
+        for (latest, reads) in [(30, 30), (40, 40)] {
+            for left_asks in [true, false] {
+                let case = format!("right latest {latest}, left line asking: {left_asks}");
+                let (stores, counting) = counted_client_stores().await;
+                let gap = remote_only(11, Hash::default()).await;
+                let shared = write_line(&stores.writer, gap.signature, 12, 4).await;
+                let mut asking = write_line(&stores.writer, shared[3], 16, 5).await;
+                let branched = write_branch_revision(&stores.writer, shared[3], 16, 1).await;
+                let mut other = write_line(&stores.writer, branched, 17, latest - 16).await;
+                other.insert(0, branched);
+                let remote = Arc::new(
+                    PagedRemote::new(BranchId::from([7; 16]), asking[4])
+                        .holding([&gap])
+                        .page(
+                            Anchor::Signature(gap.signature),
+                            vec![(11, gap.signature)],
+                            Hash::default(),
+                        ),
+                );
+                let client = client_on(&stores, remote.clone());
+                let other_latest = other[other.len() - 1];
+                counting.take_reads();
+
+                let walked = if left_asks {
+                    walk(client, asking[4], other_latest).await
+                } else {
+                    walk(client, other_latest, asking[4]).await
+                }
+                .expect("the lines meet in the store");
+
+                asking.reverse();
+                other.reverse();
+                let expected = if left_asks {
+                    (shared[3], asking, other)
+                } else {
+                    (shared[3], other, asking)
+                };
+                assert_eq!(walked, expected, "{case}");
+                assert_eq!(remote.lists(), 0, "{case}");
+                assert_eq!(
+                    counting.take_reads(),
+                    Reads {
+                        payloads: reads,
+                        queries: 0
+                    },
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// Lines of revisions 12 to 20 above `left_gap` and 12 to 30 above `right_gap`, written to
+    /// the store of `stores`, newest first. The right line's revision 12 sets it apart from the
+    /// left line's where the gaps are the same revision.
+    async fn lines_above_gaps(
+        stores: &ClientStores,
+        left_gap: Hash,
+        right_gap: Hash,
+    ) -> (Vec<Hash>, Vec<Hash>) {
+        let mut left = write_line(&stores.writer, left_gap, 12, 9).await;
+        let branched = write_branch_revision(&stores.writer, right_gap, 12, 1).await;
+        let mut right = write_line(&stores.writer, branched, 13, 18).await;
+        right.insert(0, branched);
+        left.reverse();
+        right.reverse();
+        (left, right)
+    }
+
+    /// A line that reaches a revision the store lacks while the other line can still meet it in
+    /// the store meets the other line at that revision without a remote request, where the other
+    /// line reaches it a round later: here the left line reaches revision 11 below 20 to 12, and
+    /// the right line below 30 to 12. Each revision walked costs one state read, and so does each
+    /// read of revision 11.
+    #[tokio::test]
+    async fn lines_reaching_the_same_missing_revision_rounds_apart_meet_there_without_asking() {
+        for left_asks in [true, false] {
+            let (stores, counting) = counted_client_stores().await;
+            let gap = remote_only(11, Hash::default()).await;
+            let (asking, other) = lines_above_gaps(&stores, gap.signature, gap.signature).await;
+            let remote = Arc::new(
+                PagedRemote::new(BranchId::from([7; 16]), asking[0])
+                    .holding([&gap])
+                    .page(
+                        Anchor::Signature(gap.signature),
+                        vec![(11, gap.signature)],
+                        Hash::default(),
+                    ),
+            );
+            let client = client_on(&stores, remote.clone());
+            let (left, right) = if left_asks {
+                (asking, other)
+            } else {
+                (other, asking)
+            };
+            counting.take_reads();
+
+            let walked = walk(client, left[0], right[0])
+                .await
+                .expect("the lines meet at the revision both reach");
+
+            assert_eq!(
+                walked,
+                (gap.signature, left, right),
+                "left line asking: {left_asks}"
+            );
+            assert_eq!(remote.lists(), 0, "left line asking: {left_asks}");
+            assert_eq!(
+                counting.take_reads(),
+                Reads {
+                    payloads: 30,
+                    queries: 0
+                },
+                "left line asking: {left_asks}"
+            );
+        }
+    }
+
+    /// A line that reaches a revision the store lacks while the other line can still meet it in
+    /// the store is asked for in the round the other line reaches a revision the store lacks as
+    /// well, so the remote is asked for both lines at once: here the left line reaches revision 11
+    /// below 20 to 12, and the right line another revision 11 below 30 to 12. The remote leaves
+    /// both requests unanswered.
+    #[tokio::test]
+    async fn lines_reaching_missing_revisions_rounds_apart_are_asked_for_at_once() {
+        for left_asks in [true, false] {
+            let stores = client_stores().await;
+            let left_gap = remote_only(11, Hash::default()).await.signature;
+            let right_gap = remote_revision(11, Hash::default(), Hash::from([0xB0; 32]))
+                .await
+                .signature;
+            let (asking, other) = lines_above_gaps(&stores, left_gap, right_gap).await;
+            let remote = Arc::new(
+                PagedRemote::new(BranchId::from([7; 16]), asking[0])
+                    .stalling(Anchor::Signature(left_gap))
+                    .stalling(Anchor::Signature(right_gap)),
+            );
+            let client = client_on(&stores, remote.clone());
+            let walk = if left_asks {
+                find_branch_point(client, asking[0], other[0])
+            } else {
+                find_branch_point(client, other[0], asking[0])
+            };
+
+            let asked = tokio::time::timeout(
+                Duration::from_secs(1),
+                LORE_CONTEXT.scope(setup_test_execution(), async {
+                    tokio::select! {
+                        walked = walk => panic!("both requests are left unanswered: {walked:?}"),
+                        () = remote.unanswered(2) => {}
+                    }
+                }),
+            )
+            .await;
+
+            assert!(
+                asked.is_ok(),
+                "left line asking: {left_asks}: the remote is asked for both lines at once"
+            );
+            assert_eq!(remote.lists(), 2, "left line asking: {left_asks}");
+        }
+    }
+
+    /// A line that reaches a revision the store lacks asks the remote for it once the other line
+    /// walks below the lowest numbered revision it holds without meeting it, and the store reads of
+    /// the walk are those of a walk that asks at once: one per revision walked, and one for
+    /// revision 11, which only the remote holds. Here the lines meet at revision 10, below 11.
+    #[tokio::test]
+    async fn a_deferred_walk_that_still_asks_reads_the_store_as_a_walk_that_asks_at_once() {
+        for left_asks in [true, false] {
+            let (stores, counting) = counted_client_stores().await;
+            let base = write_line(&stores.writer, Hash::default(), 1, 10).await;
+            let gap = remote_only(11, base[9]).await;
+            let mut asking = write_line(&stores.writer, gap.signature, 12, 9).await;
+            let branched = write_branch_revision(&stores.writer, base[9], 11, 1).await;
+            let mut other = write_line(&stores.writer, branched, 12, 19).await;
+            other.insert(0, branched);
+            let remote = Arc::new(
+                PagedRemote::new(BranchId::from([7; 16]), asking[8])
+                    .holding([&gap])
+                    .page(
+                        Anchor::Signature(gap.signature),
+                        vec![(11, gap.signature)],
+                        base[9],
+                    ),
+            );
+            let client = client_on(&stores, remote.clone());
+            counting.take_reads();
+
+            let walked = if left_asks {
+                walk(client, asking[8], other[19]).await
+            } else {
+                walk(client, other[19], asking[8]).await
+            }
+            .expect("the lines meet below the revision the store lacks");
+
+            asking.insert(0, gap.signature);
+            asking.reverse();
+            other.reverse();
+            let expected = if left_asks {
+                (base[9], asking, other)
+            } else {
+                (base[9], other, asking)
+            };
+            assert_eq!(walked, expected, "left line asking: {left_asks}");
+            assert_eq!(remote.lists(), 1, "left line asking: {left_asks}");
+            assert_eq!(
+                counting.take_reads(),
+                Reads {
+                    payloads: 50,
+                    queries: 1
+                },
+                "left line asking: {left_asks}"
+            );
+        }
     }
 
     /// A line that reaches a revision the store lacks waits on the remote's page to number it, so
