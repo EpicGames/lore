@@ -18,6 +18,7 @@ use std::sync::atomic::AtomicUsize;
 
 use dashmap::DashMap;
 use dashmap::Entry;
+use futures::FutureExt;
 use futures::StreamExt;
 use lore_base::lore_spawn;
 use lore_base::text::fold_eq;
@@ -1321,15 +1322,9 @@ pub async fn store_latest(
         BranchLatestStatus::Divergent => {
             mutable_store(repository.clone(), LATEST_STATUS, branch, latest).await
         }
-        BranchLatestStatus::Convergent => mutable_try_store(
-            repository.clone(),
-            LATEST_STATUS,
-            branch,
-            previous,
-            Hash::default(),
-        )
-        .await
-        .map(drop),
+        BranchLatestStatus::Convergent => {
+            clear_divergent_status(repository.clone(), branch, previous).await
+        }
     };
     store_latest_history(repository, branch, latest).await
 }
@@ -1373,6 +1368,39 @@ pub fn store_synced_latest(
         )
         .await?;
         store_last_sync(repository.clone(), branch, latest).await;
+        Ok(())
+    }
+}
+
+/// Clears the divergent latest status of `branch` with a compare-and-swap from `latest`, the local
+/// latest the caller read, so a status another writer stores for its own latest after that read
+/// stays.
+pub fn clear_divergent_status(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+) -> impl Future<Output = Result<(), BranchError>> + use<> {
+    mutable_try_store(repository, LATEST_STATUS, branch, latest, Hash::default())
+        .map(|stored| stored.map(drop))
+}
+
+/// Records `branch`, whose local latest the caller read as `latest`, the remote latest, in sync
+/// with the remote: stores `latest` as its last synchronized revision and, where its latest status
+/// is `divergent`, clears the status ([`clear_divergent_status`]).
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn record_in_sync(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+    divergent: bool,
+) -> impl Future<Output = Result<(), BranchError>> + '_ {
+    async move {
+        store_last_sync(repository.clone(), branch, latest).await;
+        if divergent {
+            clear_divergent_status(repository.clone(), branch, latest).await?;
+        }
         Ok(())
     }
 }

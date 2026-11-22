@@ -337,12 +337,13 @@ fn validate(args: &LoreRevisionGraphBranchSyncArgs) -> Result<RevisionForm, Revi
 /// its first read on.
 ///
 /// The target equal to the local latest writes no local latest; where it is the remote latest, the
-/// branch is recorded in sync with the remote ([`record_in_sync`]). Otherwise the local latest
-/// moves where it is zero, with `force`, or where the target descends from it
-/// ([`fast_forwards`]), with a compare-and-swap from the value read: convergent with the last
-/// synchronized revision stored where the target is the remote latest, convergent where the
-/// remote's history line for the branch is known to hold the target ([`SyncTarget`]), and
-/// divergent otherwise.
+/// branch is recorded in sync with the remote ([`branch::record_in_sync`]), and where the remote's
+/// history line for the branch is otherwise known to hold it ([`SyncTarget`]), a divergent latest
+/// status is cleared ([`branch::clear_divergent_status`]). Otherwise the local latest moves where
+/// it is zero, with `force`, or where the target descends from it ([`fast_forwards`]), with a
+/// compare-and-swap from the value read: convergent with the last synchronized revision stored
+/// where the target is the remote latest, convergent where the remote's history line for the branch
+/// is known to hold the target ([`SyncTarget`]), and divergent otherwise.
 ///
 /// A local sync with no target, the latest of a branch looked up in the local store, writes
 /// nothing: it sends the instance records of the instances on the branch, the local current, and
@@ -388,7 +389,13 @@ fn sync<'a>(
         };
         if target == previous {
             if remote_latest == Some(target) {
-                record_in_sync(ctx, branch, target, divergent).await?;
+                branch::record_in_sync(ctx, branch, target, divergent)
+                    .await
+                    .forward_any::<RevisionGraphError>("clearing the latest status")?;
+            } else if on_remote_line && divergent {
+                branch::clear_divergent_status(ctx.clone(), branch, target)
+                    .await
+                    .forward_any::<RevisionGraphError>("clearing the latest status")?;
             }
             return Ok(previous);
         }
@@ -606,35 +613,6 @@ async fn bring_in(
     )
     .await
     .forward_any::<RevisionGraphError>("bringing the branch in")
-}
-
-/// Records `branch`, whose local latest is `latest`, the remote latest, in sync with the remote
-/// through `ctx`: stores `latest` as its last synchronized revision and, where its latest status
-/// is `divergent`, clears the status with a compare-and-swap from the one recorded for `latest`, so
-/// a status a commit stores for its revision after the sync's read stays.
-///
-/// # Errors
-///
-/// A failed write of the latest status.
-async fn record_in_sync(
-    ctx: &Arc<RepositoryContext>,
-    branch: BranchId,
-    latest: Hash,
-    divergent: bool,
-) -> Result<(), RevisionGraphError> {
-    branch::store_last_sync(ctx.clone(), branch, latest).await;
-    if divergent {
-        branch::mutable_try_store(
-            ctx.clone(),
-            branch::LATEST_STATUS,
-            branch,
-            latest,
-            Hash::default(),
-        )
-        .await
-        .forward_any::<RevisionGraphError>("clearing the latest status")?;
-    }
-    Ok(())
 }
 
 /// Whether `target` descends from `previous` along first parents, as the ancestry walk through

@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use futures::FutureExt;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use serde::Serialize;
@@ -356,6 +357,7 @@ async fn sync_store_branch_latest(
 }
 
 /// Where the branch being synced stands, for the branch latest decision.
+#[lore_macro::test_pub]
 struct SyncBranchLatest {
     /// The branch's latest on the remote, zero where the remote did not answer for it.
     remote_latest: Hash,
@@ -369,14 +371,39 @@ struct SyncBranchLatest {
     anchor: BranchId,
 }
 
+/// Whether the remote can answer for the history line of the branch being synced: it holds the
+/// branch's latest, the revision being synced to is taken on the branch the instance is on, and the
+/// search reads the remote, which `--local` and `--offline` don't.
+fn remote_answers_for(branch: &SyncBranchLatest) -> bool {
+    !branch.remote_latest.is_zero()
+        && branch.target == branch.anchor
+        && !matches!(
+            execution_context().globals().search_location(),
+            ResolveSearchLocation::Local
+        )
+}
+
+/// The revision the remote numbers `revision_number` on `branch`: it reads the remote latest of
+/// `branch` and the remote's revision list at the number, and walks the line from the remote latest
+/// where the list doesn't answer. Zero where the remote numbers none, and `None` where a request
+/// fails.
+fn remote_numbered(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    revision_number: u64,
+) -> impl Future<Output = Option<Hash>> {
+    super::resolve_revision_number(repository, branch, revision_number, true, false).map(Result::ok)
+}
+
 /// Whether the branch latest advances to `revision`, numbered `revision_number` on the
 /// branch it was created on.
 ///
 /// The latest advances only to a revision numbered above the one the branch stands at,
 /// and only where the remote holds that revision at that number: its own tip answers for
-/// itself, anything else is asked for. It is recorded convergent, which only the remote
-/// answers for: a revision named by its whole hash is parsed rather than looked up, so a
-/// search that reads no remote — `--local` or `--offline` — advances nothing.
+/// itself, anything else is asked for ([`remote_numbered`]). It is recorded convergent,
+/// which only the remote answers for: a revision named by its whole hash is parsed rather
+/// than looked up, so a search that reads no remote — `--local` or `--offline` — advances
+/// nothing ([`remote_answers_for`]).
 ///
 /// A remote carried back to an earlier revision leaves a tip numbered at or below the
 /// latest, which the branch keeps: the revisions it already tracks are not the remote's
@@ -396,14 +423,7 @@ async fn revision_advances_branch_latest(
     revision_number: u64,
     branch: &SyncBranchLatest,
 ) -> bool {
-    if branch.remote_latest.is_zero()
-        || branch.diverged
-        || branch.target != branch.anchor
-        || matches!(
-            execution_context().globals().search_location(),
-            ResolveSearchLocation::Local
-        )
-    {
+    if branch.diverged || !remote_answers_for(branch) {
         return false;
     }
 
@@ -417,15 +437,94 @@ async fn revision_advances_branch_latest(
         }
     }
 
-    if revision == branch.remote_latest {
-        return true;
-    }
+    revision == branch.remote_latest
+        || remote_numbered(repository, branch.anchor, revision_number).await == Some(revision)
+}
 
-    matches!(
-        super::resolve_revision_number(repository, branch.anchor, revision_number, true, false)
-            .await,
-        Ok(remote_revision) if remote_revision == revision
-    )
+/// What a sync records for the latest of the branch it syncs.
+#[lore_macro::test_pub]
+#[derive(Clone, Copy)]
+enum LatestRecord {
+    /// Nothing.
+    Unchanged,
+    /// The revision synced to, as the latest, convergent, and as the last synchronized revision
+    /// ([`revision_advances_branch_latest`]).
+    Advanced,
+    /// The divergent latest, the remote latest, in sync with the remote
+    /// ([`branch::record_in_sync`]).
+    InSync,
+    /// The divergent latest, on the remote's history line below the remote latest, convergent
+    /// ([`branch::clear_divergent_status`]).
+    Convergent,
+}
+
+/// What a sync to `revision`, numbered `revision_number`, records for the latest `branch`
+/// describes: a sync given a revision, `requested`, advances a convergent latest
+/// ([`revision_advances_branch_latest`]), and any sync records the divergent latest in sync or
+/// convergent where `revision` is that latest and the remote confirms it on its history line for
+/// the branch.
+///
+/// The remote latest is confirmed by the branch query the sync made. A sync given a revision
+/// confirms it only where the remote answers for the branch ([`remote_answers_for`]), and confirms
+/// a revision below the remote latest by asking the remote for its number ([`remote_numbered`]). A
+/// sync given no revision asks nothing more. A branch point isn't confirmed: it is taken on the
+/// branch the branch being synced was created from.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
+#[allow(clippy::manual_async_fn)]
+fn branch_latest_record(
+    repository: Arc<RepositoryContext>,
+    revision: Hash,
+    revision_number: u64,
+    requested: bool,
+    branch: SyncBranchLatest,
+) -> impl Future<Output = LatestRecord> {
+    async move {
+        if !branch.diverged {
+            let advances = requested
+                && revision_advances_branch_latest(repository, revision, revision_number, &branch)
+                    .await;
+            return if advances {
+                LatestRecord::Advanced
+            } else {
+                LatestRecord::Unchanged
+            };
+        }
+        if revision != branch.local_latest
+            || branch.remote_latest.is_zero()
+            || (requested && !remote_answers_for(&branch))
+        {
+            return LatestRecord::Unchanged;
+        }
+        if revision == branch.remote_latest {
+            return LatestRecord::InSync;
+        }
+        if requested
+            && remote_numbered(repository, branch.anchor, revision_number).await == Some(revision)
+        {
+            return LatestRecord::Convergent;
+        }
+        LatestRecord::Unchanged
+    }
+}
+
+/// Records `latest`, the divergent local latest of `branch` the sync read, as `record` says: in
+/// sync or convergent. Writes nothing for any other record.
+async fn store_confirmed_latest(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+    record: LatestRecord,
+) -> Result<(), SyncError> {
+    match record {
+        LatestRecord::InSync => branch::record_in_sync(repository, branch, latest, true).await,
+        LatestRecord::Convergent => {
+            branch::clear_divergent_status(repository.clone(), branch, latest).await
+        }
+        LatestRecord::Unchanged | LatestRecord::Advanced => Ok(()),
+    }
+    .forward::<SyncError>("Failed to clear the branch latest status")
 }
 
 /// Carries the working tree to the revision, and the view, a sync resolves.
@@ -743,21 +842,21 @@ pub(crate) async fn sync(
 
     // Decided here because layer matching above settles which revision the sync carries
     // the working tree to, and the latest records that one.
-    if options.revision.is_some()
-        && revision_advances_branch_latest(
-            repository.clone(),
-            revision,
-            revision_number,
-            &SyncBranchLatest {
-                remote_latest,
-                local_latest,
-                diverged: local_latest_diverged,
-                target: target_branch,
-                anchor: anchor_branch,
-            },
-        )
-        .await
-    {
+    let record = branch_latest_record(
+        repository.clone(),
+        revision,
+        revision_number,
+        options.revision.is_some(),
+        SyncBranchLatest {
+            remote_latest,
+            local_latest,
+            diverged: local_latest_diverged,
+            target: target_branch,
+            anchor: anchor_branch,
+        },
+    )
+    .await;
+    if matches!(record, LatestRecord::Advanced) {
         location = LoreBranchLocation::Remote;
     }
 
@@ -791,14 +890,13 @@ pub(crate) async fn sync(
     // A view change has work to do at a standing revision, which is the shape of it a user asks
     // for most: the tree is materialized from the same revision through a different view.
     if revision == current_revision && !force && !options.reset && !moves_branch && !view_change {
-        // A working tree already at the revision is not the latest recording it. Only a
-        // sync given a revision reaches this, the divergence a sync given none resolves
-        // being carried by the merge below rather than recorded here.
-        if options.revision.is_some()
-            && location == LoreBranchLocation::Remote
-            && !execution_context().globals().dry_run()
-        {
-            sync_store_branch_latest(repository.clone(), target_branch, revision).await?;
+        // A working tree already at the revision is not the latest recording it.
+        if !execution_context().globals().dry_run() {
+            if options.revision.is_some() && location == LoreBranchLocation::Remote {
+                sync_store_branch_latest(repository.clone(), target_branch, revision).await?;
+            } else {
+                store_confirmed_latest(&repository, anchor_branch, local_latest, record).await?;
+            }
         }
         return Ok(());
     }
@@ -994,6 +1092,10 @@ pub(crate) async fn sync(
         Ok(())
     })
     .await?;
+
+    if !execution_context().globals().dry_run() {
+        store_confirmed_latest(&repository, anchor_branch, local_latest, record).await?;
+    }
 
     LoreEvent::RevisionSyncRevision(LoreRevisionSyncRevisionEventData {
         branch: target_branch,

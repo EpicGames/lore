@@ -313,6 +313,127 @@ async fn a_forced_sync_to_the_branch_point_records_the_latest_convergent() {
     f.close().await;
 }
 
+/// A forced sync to a revision number looked up in the local store records the local latest
+/// divergent. The same sync at the remote, whose revision list numbers the local latest so, clears
+/// the status, and stores no last synchronized revision and no local latest.
+#[tokio::test]
+async fn a_number_target_at_the_local_latest_clears_a_divergent_status_at_the_remote() {
+    let f = fixture().await;
+    let seeded = seed_main(&f).await;
+    let published = publish_from_another_handle(&f, f.default_branch, seeded).await;
+    let (status, _) = sync(&f, f.default_branch, no_target(), plain()).await;
+    assert_eq!(status, 0);
+    let (status, _) = sync_branch(
+        &f,
+        f.store,
+        graph_globals_at(LoreBranchLocation::Local),
+        f.default_branch,
+        numbered(f.default_branch, 1),
+        forced(),
+    )
+    .await;
+    assert_eq!(status, 0);
+    assert_eq!(
+        local_value(&f, branch::LATEST_STATUS, f.default_branch).await,
+        Some(seeded)
+    );
+
+    let (status, events) = sync(&f, f.default_branch, numbered(f.default_branch, 1), plain()).await;
+
+    assert_eq!(status, 0);
+    assert_eq!(synced(&events), [(seeded, seeded)]);
+    assert_eq!(
+        local_value(&f, branch::LATEST_STATUS, f.default_branch).await,
+        None
+    );
+    assert_eq!(
+        local_value(&f, branch::LAST_SYNC, f.default_branch).await,
+        Some(published)
+    );
+    f.close().await;
+}
+
+/// A hash target at a divergent local latest that the remote's revision list numbers so clears the
+/// status, and stores no last synchronized revision.
+#[tokio::test]
+async fn a_hash_target_at_the_local_latest_the_remote_numbers_so_clears_a_divergent_status() {
+    let f = fixture().await;
+    let seeded = seed_main(&f).await;
+    publish_from_another_handle(&f, f.default_branch, seeded).await;
+    record_divergent(&f, f.default_branch, seeded).await;
+    let last_sync = local_value(&f, branch::LAST_SYNC, f.default_branch).await;
+
+    let (status, events) = sync(&f, f.default_branch, by_hash(seeded), plain()).await;
+
+    assert_eq!(status, 0);
+    assert_eq!(synced(&events), [(seeded, seeded)]);
+    assert_eq!(
+        local_value(&f, branch::LATEST_STATUS, f.default_branch).await,
+        None
+    );
+    assert_eq!(
+        local_value(&f, branch::LAST_SYNC, f.default_branch).await,
+        last_sync
+    );
+    f.close().await;
+}
+
+/// A target at a divergent local latest that is the branch point the remote's record of the branch
+/// starts from clears the status.
+#[tokio::test]
+async fn a_branch_point_target_at_the_local_latest_clears_a_divergent_status() {
+    let f = fixture().await;
+    let seeded = seed_main(&f).await;
+    let feature = create_branch_at_both_locations(
+        &f,
+        "feature",
+        branch::default_category(),
+        f.default_branch,
+        CREATOR,
+    )
+    .await;
+    publish_from_another_handle(&f, feature, seeded).await;
+    record_divergent(&f, feature, seeded).await;
+
+    let (status, events) = sync(&f, feature, by_hash(seeded), plain()).await;
+
+    assert_eq!(status, 0);
+    assert_eq!(synced(&events), [(seeded, seeded)]);
+    assert_eq!(local_value(&f, branch::LATEST_STATUS, feature).await, None);
+    f.close().await;
+}
+
+/// A target at a divergent local latest that the remote doesn't confirm on its history line for
+/// the branch, a hash its revision list numbers with another revision, or a number looked up in the
+/// local store, leaves the status divergent.
+#[tokio::test]
+async fn a_target_at_the_local_latest_off_the_remotes_line_keeps_a_divergent_status() {
+    let f = fixture().await;
+    let seeded = seed_main(&f).await;
+    publish_from_another_handle(&f, f.default_branch, seeded).await;
+    let off_line = commit_from_another_handle(&f, f.default_branch, seeded).await;
+    let (status, _) = sync(&f, f.default_branch, by_hash(off_line), plain()).await;
+    assert_eq!(status, 0);
+
+    let (by_hash_status, _) = sync(&f, f.default_branch, by_hash(off_line), plain()).await;
+    let (local_status, _) = sync_branch(
+        &f,
+        f.store,
+        graph_globals_at(LoreBranchLocation::Local),
+        f.default_branch,
+        numbered(f.default_branch, 2),
+        plain(),
+    )
+    .await;
+
+    assert_eq!((by_hash_status, local_status), (0, 0));
+    assert_eq!(
+        local_value(&f, branch::LATEST_STATUS, f.default_branch).await,
+        Some(off_line)
+    );
+    f.close().await;
+}
+
 /// A branch the remote alone holds is brought in: its metadata key, its name's mapping and its
 /// latest are set in the local store, and a local branch resolve finds it.
 #[tokio::test]
@@ -632,15 +753,7 @@ async fn a_local_sync_reads_nothing_from_the_remote() {
 async fn a_sync_to_an_equal_remote_latest_clears_a_divergent_status() {
     let f = fixture().await;
     let seeded = seed_main(&f).await;
-    in_client(branch::mutable_try_store(
-        local_writer(&f),
-        branch::LATEST_STATUS,
-        f.default_branch,
-        Hash::default(),
-        seeded,
-    ))
-    .await
-    .expect("records the latest divergent");
+    record_divergent(&f, f.default_branch, seeded).await;
 
     let (status, events) = sync(&f, f.default_branch, no_target(), plain()).await;
 

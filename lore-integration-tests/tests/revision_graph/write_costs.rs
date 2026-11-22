@@ -145,6 +145,45 @@ async fn branch_sync_writes_only_the_branchs_keys() {
     f.close().await;
 }
 
+/// A sync at the remote to a number target at the local latest, which the remote's revision list
+/// numbers so, of a branch the local store holds, writes nothing where the latest status is
+/// convergent, and only the latest status, cleared with a compare-and-swap, where it is divergent.
+/// A first sync brings the branch in, which the counts leave out.
+#[tokio::test]
+async fn branch_sync_to_the_local_latest_writes_only_a_divergent_status() {
+    let f = fixture().await;
+    let seeded = seed_main(&f).await;
+    publish_from_another_handle(&f, f.default_branch, seeded).await;
+    let sync_to_local_latest = async |store| {
+        let (status, _) = sync_branch(
+            &f,
+            store,
+            graph_globals(),
+            f.default_branch,
+            numbered(f.default_branch, 1),
+            LoreRevisionGraphBranchSyncOptions::default(),
+        )
+        .await;
+        assert_eq!(status, 0);
+    };
+    let counted_sync = async || {
+        let (store, mutable, _) = open_counted_handle(&f, None, None);
+        sync_to_local_latest(store).await;
+        close_handle(store).await;
+        mutable.written()
+    };
+    sync_to_local_latest(f.store).await;
+
+    let convergent = counted_sync().await;
+    record_divergent(&f, f.default_branch, seeded).await;
+    let divergent = counted_sync().await;
+
+    let key = |function| branch::mutable_key(SALT_LORE, function, f.repository, f.default_branch);
+    assert_eq!(convergent, []);
+    assert_eq!(divergent, [key(branch::LATEST_STATUS)]);
+    f.close().await;
+}
+
 /// A create whose `from` names both a hash and a branch, and a sync whose target names both a hash
 /// and a revision number, fail with `InvalidArguments` before any store access, the connect to the
 /// remote included.

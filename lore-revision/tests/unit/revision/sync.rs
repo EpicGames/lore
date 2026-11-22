@@ -250,15 +250,19 @@ async fn a_sync_that_cannot_begin_its_operation_leaves_the_repository_unheld() {
 mod branch_point {
     use std::time::Duration;
 
+    use bytes::Bytes;
     use lore_base::error::NotAuthorized;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::BranchId;
     use lore_base::types::Hash;
+    use lore_revision::branch;
     use lore_revision::instance::load_current_anchor_boxed;
     use lore_revision::lore::RepositoryId;
     use lore_revision::repository::RepositoryContext;
+    use lore_revision::state::State;
     use lore_transport::Connection;
     use lore_transport::ProtocolError;
+    use zerocopy::IntoBytes;
 
     use super::*;
     use crate::fs::filesystem_provider::test_store_create;
@@ -269,12 +273,19 @@ mod branch_point {
     use crate::helper::test_repository_create;
     use crate::paged_remote::Anchor;
     use crate::paged_remote::PagedRemote;
+    use crate::paged_remote::RemoteRevision;
     use crate::paged_remote::remote_revision;
 
-    /// The result of a sync of an instance whose branch holds a local commit the remote lacks,
-    /// from the remote that `remote` builds for the branch. The sync is bounded by five seconds,
-    /// so that a walk that loops fails the test.
-    async fn sync_from(remote: impl FnOnce(BranchId) -> PagedRemote) -> Result<(), SyncError> {
+    /// The result of a sync of an instance whose branch holds one local commit, from the remote
+    /// that `remote` builds for the branch and that commit's state, with the options `options`
+    /// builds for the commit's revision, and what `read` answers from the instance's repository
+    /// once the sync ends, given the branch and the commit's revision. The sync is bounded by five
+    /// seconds, so that a walk that loops fails the test.
+    async fn sync_from<T>(
+        remote: impl FnOnce(BranchId, &State) -> PagedRemote,
+        options: impl FnOnce(Hash) -> SyncOptions,
+        read: impl AsyncFnOnce(Arc<RepositoryContext>, BranchId, Hash) -> T,
+    ) -> (Result<(), SyncError>, T) {
         let (immutable, mutable, execution) =
             test_store_create().await.expect("creating the stores");
         LORE_CONTEXT
@@ -286,7 +297,7 @@ mod branch_point {
                 )
                 .await;
                 test_file_write(&instance.path.join("local.txt"), b"local");
-                test_commit_tree(&instance, "Local").await;
+                let local = test_commit_tree(&instance, "Local").await;
                 let (_, branch) = load_current_anchor_boxed(&instance.repository)
                     .await
                     .expect("reading the current anchor");
@@ -294,7 +305,7 @@ mod branch_point {
                     Vec::new(),
                     Ok(()),
                     instance.repository.id,
-                    Arc::new(remote(branch)),
+                    Arc::new(remote(branch, &local)),
                 );
                 let repository = Arc::new(
                     RepositoryContext::new(
@@ -306,12 +317,30 @@ mod branch_point {
                     )
                     .with_write_token(instance.write_token.share()),
                 );
-                let synced = sync_boxed(repository, &instance.write_token, SyncOptions::default());
-                tokio::time::timeout(Duration::from_secs(5), synced)
+                let synced = sync_boxed(
+                    repository.clone(),
+                    &instance.write_token,
+                    options(local.revision()),
+                );
+                let synced = tokio::time::timeout(Duration::from_secs(5), synced)
                     .await
-                    .expect("the sync ends within five seconds")
+                    .expect("the sync ends within five seconds");
+                (synced, read(repository, branch, local.revision()).await)
             })
             .await
+    }
+
+    /// The result of a sync given no revision from the remote that `remote` builds for the branch.
+    async fn sync_with_no_revision_from(
+        remote: impl FnOnce(BranchId) -> PagedRemote,
+    ) -> Result<(), SyncError> {
+        sync_from(
+            |branch, _| remote(branch),
+            |_| SyncOptions::default(),
+            async |_, _, _| (),
+        )
+        .await
+        .0
     }
 
     /// A sync whose walk between the remote's latest revision and the local one stops fails with
@@ -323,13 +352,13 @@ mod branch_point {
         let remote_latest = remote_revision(3, Hash::default(), Hash::from([0xA0; 32])).await;
         let top = remote_latest.signature;
 
-        let stopped = sync_from(|branch| {
+        let stopped = sync_with_no_revision_from(|branch| {
             PagedRemote::new(branch, top)
                 .holding([&remote_latest])
                 .page(Anchor::Signature(top), vec![(3, top)], top)
         })
         .await;
-        let refused = sync_from(|branch| {
+        let refused = sync_with_no_revision_from(|branch| {
             PagedRemote::new(branch, top)
                 .failing(Anchor::Signature(top), ProtocolError::from(NotAuthorized))
         })
@@ -345,5 +374,109 @@ mod branch_point {
             (true, true),
             "{stopped:?}; {refused:?}"
         );
+    }
+
+    /// Whether the latest of `branch` in `repository` is divergent, and its stored last
+    /// synchronized revision, zero where none is stored.
+    async fn latest_records(repository: Arc<RepositoryContext>, branch: BranchId) -> (bool, Hash) {
+        let divergent = branch::load_latest_divergent(repository.clone(), branch)
+            .await
+            .expect("reading the latest status");
+        (
+            divergent,
+            branch::load_stored_last_sync(repository, branch).await,
+        )
+    }
+
+    /// A sync to a local latest a commit records divergent, which the remote's history line for
+    /// the branch holds, records it convergent. At the remote latest, a sync given no revision and
+    /// one given the revision store it as the last synchronized revision and clear the status.
+    /// Below the remote latest, a sync given the revision the remote's revision list numbers so
+    /// clears the status and stores no last synchronized revision.
+    #[tokio::test]
+    async fn a_sync_to_a_divergent_latest_the_remote_holds_records_it_convergent() {
+        let at_latest = |branch, local: &State| PagedRemote::new(branch, local.revision());
+        let below_latest = |branch, local: &State| {
+            let held = RemoteRevision {
+                signature: local.revision(),
+                state: Bytes::copy_from_slice(local.state_data().as_bytes()),
+            };
+            let number = local.revision_number();
+            PagedRemote::new(branch, Hash::from([0xB0; 32]))
+                .holding([&held])
+                .page(
+                    Anchor::Number(number),
+                    vec![(number, local.revision())],
+                    Hash::default(),
+                )
+        };
+        let given = |local: Hash| SyncOptions {
+            revision: Some(local.to_string()),
+            ..Default::default()
+        };
+        let records =
+            async |repository, branch, local| (latest_records(repository, branch).await, local);
+
+        let (no_revision, (no_revision_records, local)) =
+            sync_from(at_latest, |_| SyncOptions::default(), records).await;
+        let (at_tip, (at_tip_records, tip)) = sync_from(at_latest, given, records).await;
+        let (below, (below_records, _)) = sync_from(below_latest, given, records).await;
+
+        assert!(
+            no_revision.is_ok() && at_tip.is_ok() && below.is_ok(),
+            "{no_revision:?}; {at_tip:?}; {below:?}"
+        );
+        assert_eq!(
+            (no_revision_records, at_tip_records, below_records),
+            ((false, local), (false, tip), (false, Hash::default()))
+        );
+    }
+
+    /// A sync given a revision that is both the divergent local latest and the remote latest of
+    /// the branch the instance is on records that branch in sync only where the revision is taken
+    /// on it. Taken on another branch, as a branch point named through the branch created at it
+    /// is, it records nothing.
+    #[tokio::test]
+    async fn a_sync_given_a_revision_taken_on_another_branch_records_no_latest() {
+        let (immutable, mutable, execution) =
+            test_store_create().await.expect("creating the stores");
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let instance = test_repository_create(
+                    immutable,
+                    mutable,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                let (anchor, feature) = (BranchId::from([1; 16]), BranchId::from([2; 16]));
+                let shared = Hash::from([0xC0; 32]);
+                let record = |target| {
+                    branch_latest_record(
+                        instance.repository.clone(),
+                        shared,
+                        1,
+                        true,
+                        SyncBranchLatest {
+                            remote_latest: shared,
+                            local_latest: shared,
+                            diverged: true,
+                            target,
+                            anchor,
+                        },
+                    )
+                };
+
+                let on_anchor = record(anchor).await;
+                let on_feature = record(feature).await;
+
+                assert_eq!(
+                    (
+                        matches!(on_anchor, LatestRecord::InSync),
+                        matches!(on_feature, LatestRecord::Unchanged),
+                    ),
+                    (true, true)
+                );
+            })
+            .await;
     }
 }

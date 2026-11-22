@@ -1384,6 +1384,20 @@ pub(crate) async fn local_value(f: &Fixture, function: &str, branch: BranchId) -
         .expect("loads the value in the local store")
 }
 
+/// Stores `latest`, the local latest of `branch`, as its latest status in the local store of `f`'s
+/// handle, which records the local latest divergent.
+pub(crate) async fn record_divergent(f: &Fixture, branch: BranchId, latest: Hash) {
+    in_client(branch::mutable_try_store(
+        local_writer(f),
+        branch::LATEST_STATUS,
+        branch,
+        Hash::default(),
+        latest,
+    ))
+    .await
+    .expect("records the latest divergent");
+}
+
 /// The latest of `branch` of `repository` that a [`mutable_load`] of its latest key reads, through
 /// the storage handle `store` under `globals`: zero where the store answers `AddressNotFound`, as
 /// the local store does for a key it doesn't hold. Panics on any other failure.

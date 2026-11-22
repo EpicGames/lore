@@ -1106,6 +1106,93 @@ def test_sync_remote_tip_keeps_divergent_latest(new_lore_repo):
 
 
 @pytest.mark.smoke
+@pytest.mark.parametrize(
+    "reset_to, sync_to",
+    [("base", "@1"), ("tip", "tip"), ("tip", None)],
+    ids=["number-below-tip", "tip", "no-revision-at-tip"],
+)
+def test_sync_to_a_divergent_latest_the_remote_holds_records_it_convergent(
+    new_lore_repo, reset_to, sync_to
+):
+    """
+    A sync to the branch latest, recorded divergent by a reset, where the remote's history line
+    for the branch holds that latest, records it convergent and keeps it: once the remote moves on,
+    the branch is reported behind the remote and not ahead of it. A reset to the latest it stands
+    at records nothing, so the clone, cloned at the tip, is reset to the base first.
+    """
+    repo = new_lore_repo()
+    base_revision, tip_revision = _two_pushed_revisions(repo)
+    revisions = {"base": base_revision, "tip": tip_revision}
+    clone = repo.clone()
+    clone.branch_reset(base_revision)
+    if reset_to == "tip":
+        clone.branch_reset(tip_revision)
+
+    clone.sync(revisions.get(sync_to, sync_to))
+
+    with repo.open_file("file1.txt", "w") as f:
+        f.write("v3")
+    repo.stage("file1.txt")
+    repo.commit("Commit 3")
+    repo.push()
+    [status] = parse_jsonl(clone.status(json=True), "repositoryStatusRevision")
+    assert status["isLocalAhead"] == 0
+    assert status["isRemoteAhead"] == 1
+    assert clone.branch_info("main").local_latest == revisions[reset_to]
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("flag", ["local", "dry_run"], ids=["local", "dry-run"])
+def test_sync_to_a_divergent_latest_keeps_it_divergent_with_local_or_dry_run(
+    new_lore_repo, flag
+):
+    """
+    A sync to the branch latest, recorded divergent by a reset, keeps it divergent where it reads
+    no remote to confirm it, with `--local`, or writes nothing, with `--dry-run`: once the remote
+    moves on, the branch is reported both ahead of and behind the remote.
+    """
+    repo = new_lore_repo()
+    base_revision, _tip_revision = _two_pushed_revisions(repo)
+    clone = repo.clone()
+    clone.branch_reset(base_revision)
+
+    clone.sync("@1", **{flag: True})
+
+    with repo.open_file("file1.txt", "w") as f:
+        f.write("v3")
+    repo.stage("file1.txt")
+    repo.commit("Commit 3")
+    repo.push()
+    [status] = parse_jsonl(clone.status(json=True), "repositoryStatusRevision")
+    assert status["isLocalAhead"] == 1
+    assert status["isRemoteAhead"] == 1
+
+
+@pytest.mark.smoke
+def test_sync_to_an_unpushed_latest_the_remote_numbers_otherwise_keeps_it_divergent(
+    new_lore_repo,
+):
+    """
+    A sync to the branch latest, a revision the clone committed and didn't push, keeps it
+    divergent where the remote holds another revision at its number.
+    """
+    repo = new_lore_repo()
+    _base_revision, tip_revision = _two_pushed_revisions(repo)
+    clone, local_revision = _clone_with_unpushed_commit(repo, tip_revision)
+    with repo.open_file("file1.txt", "w") as f:
+        f.write("v3")
+    repo.stage("file1.txt")
+    repo.commit("Commit 3")
+    repo.push()
+
+    clone.sync(local_revision)
+
+    [status] = parse_jsonl(clone.status(json=True), "repositoryStatusRevision")
+    assert status["isLocalAhead"] == 1
+    assert clone.branch_info("main").local_latest == local_revision
+
+
+@pytest.mark.smoke
 def test_sync_layer_matched_revision_keeps_latest(new_lore_repo):
     """
     Where a layer carries the sync target back to the nearest main revision it matches,
