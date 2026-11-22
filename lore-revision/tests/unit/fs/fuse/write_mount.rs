@@ -13563,6 +13563,47 @@ async fn a_staged_file_move_removed_through_the_mount_commits_the_deletion() {
     .await;
 }
 
+/// A stage naming a file staged as modified, then removed through the mount, stages its deletion,
+/// and the commit deletes the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_file_edit_removed_through_the_mount_commits_the_deletion() {
+    let instance = Instance::new(&[("a.txt", b"alpha"), ("b.txt", b"bee")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let a = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            fs.write(&request(), a, 0, 0, b"ALPHA", 0)
+                .await
+                .expect("write");
+            stage_paths_through(&instance, &fs, &["a.txt"])
+                .await
+                .expect("stage the edit");
+            assert!(
+                staged_node(&instance, "a.txt")
+                    .await
+                    .is_some_and(|node| node.is_staged_modify())
+            );
+
+            fs.unlink(&request(), ROOT_INO, b"a.txt")
+                .await
+                .expect("unlink a.txt");
+            stage_paths_through(&instance, &fs, &["a.txt"])
+                .await
+                .expect("stage the removal");
+            let a = staged_node(&instance, "a.txt").await.expect("a.txt");
+            assert!(a.is_staged_delete(), "a.txt: {a:?}");
+            let revision = commit_staged(&instance, &fs).await.expect("the commit");
+            assert_eq!(revision_content(&instance, revision, "a.txt").await, None);
+            assert_eq!(
+                revision_content(&instance, revision, "b.txt")
+                    .await
+                    .as_deref(),
+                Some(b"bee".as_slice())
+            );
+        })
+        .await;
+}
+
 /// A staged directory move whose directory is then removed through the mount, a directory made
 /// at its committed path or not, keeps the move in the staged State, marked dirty alone by a
 /// status, a stage staging the file's deletion, and the commit applies the rules an ordinary
@@ -13958,6 +13999,52 @@ async fn a_merge_staged_add_made_again_after_statuses_is_committed_with_the_merg
             })
             .await;
     }
+}
+
+/// A stage naming a file a merge left in conflict, removed through the mount, stages its deletion
+/// and leaves the conflict unresolved, and the commit refuses it, as on an ordinary instance. A
+/// stage of its own naming a tracked file the merge left alone, removed beside it, stages its
+/// deletion.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_conflicted_file_removed_through_the_mount_is_staged_deleted_and_stays_unresolved() {
+    let instance = Instance::new(&[("a.txt", b"base\n"), ("b.txt", b"bee\n")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let feature = conflicting_feature_branch(&instance, &fs).await;
+            let merged = merge_through(&instance, &fs, feature).await;
+            assert!(
+                staged_node(&instance, "a.txt")
+                    .await
+                    .is_some_and(|node| node.is_staged_merge_unresolved()),
+                "a.txt in conflict: {merged:?}"
+            );
+
+            for name in ["a.txt", "b.txt"] {
+                fs.unlink(&request(), ROOT_INO, name.as_bytes())
+                    .await
+                    .unwrap_or_else(|errno| panic!("unlink {name}: {errno:?}"));
+            }
+            stage_paths_through(&instance, &fs, &["a.txt"])
+                .await
+                .expect("stage a.txt");
+            let a = staged_node(&instance, "a.txt").await.expect("a.txt");
+            assert!(
+                a.is_staged_delete() && a.is_staged_merge_unresolved(),
+                "a.txt: {a:?}"
+            );
+            stage_paths_through(&instance, &fs, &["b.txt"])
+                .await
+                .expect("stage b.txt");
+            let b = staged_node(&instance, "b.txt").await.expect("b.txt");
+            assert!(b.is_staged_delete(), "b.txt: {b:?}");
+            let committed = try_commit_staged(&instance, &fs).await;
+            assert!(
+                committed.as_ref().is_err_and(|error| error.is_conflict()),
+                "{committed:?}"
+            );
+        })
+        .await;
 }
 
 /// An instance whose revision holds the files `shape` starts from, each holding its own path.
@@ -20215,6 +20302,37 @@ async fn feature_branch_and_revision(
     (feature, revision)
 }
 
+/// A branch `feature` off `instance`'s revision whose commit rewrites `a.txt` as the line
+/// `theirs`, and a commit on the default branch that rewrites it as the line `mine`, with the
+/// mount back on the default branch; answers the branch.
+async fn conflicting_feature_branch(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+) -> lore_revision::lore::BranchId {
+    let feature = create_branch_id_through(instance, fs, "feature").await;
+    switch_through(instance, fs, "feature")
+        .await
+        .expect("switch to feature");
+    let a = lookup(fs, ROOT_INO, "a.txt").await.expect("a.txt");
+    fs.write(&request(), a, 0, 0, b"theirs\n", 0)
+        .await
+        .expect("write");
+    commit_through(instance, fs, false)
+        .await
+        .expect("commit on feature");
+    switch_through(instance, fs, lore_revision::branch::DEFAULT_DEFAULT_NAME)
+        .await
+        .expect("switch back");
+    let a = lookup(fs, ROOT_INO, "a.txt").await.expect("a.txt");
+    fs.write(&request(), a, 0, 0, b"mine\n", 0)
+        .await
+        .expect("write");
+    commit_through(instance, fs, false)
+        .await
+        .expect("commit on main");
+    feature
+}
+
 /// A merge serves the incoming changes through the mount, and status shows them staged with no
 /// change in the working tree past that.
 #[tokio::test(flavor = "multi_thread")]
@@ -20307,27 +20425,7 @@ async fn a_conflicting_merge_serves_the_file_with_markers_and_its_side_files() {
     LORE_CONTEXT
         .scope(fuse_fixture::setup_test_execution(), async {
             let fs = provider(&instance).await;
-            let feature = create_branch_id_through(&instance, &fs, "feature").await;
-            switch_through(&instance, &fs, "feature")
-                .await
-                .expect("switch to feature");
-            let a = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
-            fs.write(&request(), a, 0, 0, b"theirs\n", 0)
-                .await
-                .expect("write");
-            commit_through(&instance, &fs, false)
-                .await
-                .expect("commit on feature");
-            switch_through(&instance, &fs, lore_revision::branch::DEFAULT_DEFAULT_NAME)
-                .await
-                .expect("switch back");
-            let a = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
-            fs.write(&request(), a, 0, 0, b"mine\n", 0)
-                .await
-                .expect("write");
-            commit_through(&instance, &fs, false)
-                .await
-                .expect("commit on main");
+            let feature = conflicting_feature_branch(&instance, &fs).await;
 
             let _ = merge_through(&instance, &fs, feature).await;
 

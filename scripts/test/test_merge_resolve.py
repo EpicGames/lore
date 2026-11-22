@@ -739,9 +739,6 @@ def test_stage_merge_and_resolve_of_a_deleted_file_find_no_markers(new_lore_repo
     repo.branch_merge_abort(offline=True)
 
 
-@pytest.mark.own_vfs(
-    "stages the deletion of a conflicted file it removes, which a stage on a virtual clone does not see"
-)
 @pytest.mark.smoke
 def test_commit_refuses_an_unresolved_conflict_staged_for_deletion(new_lore_repo):
     """A conflicted file the user deleted and staged for deletion is still an unresolved
