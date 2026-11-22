@@ -109,6 +109,11 @@ pub(super) fn write(instance: &Instance, path: &str, content: &str) {
     test_file_write(&absolute, content.as_bytes());
 }
 
+/// `path` in the working tree, as a command names it.
+pub(super) fn named(instance: &Instance, path: &str) -> LoreArray<LoreString> {
+    LoreArray::from_vec(vec![LoreString::from(instance.path.join(path).as_path())])
+}
+
 /// Every file under `root` by its path, spelled as the file system holds it, with its content.
 pub(super) fn working_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut files = BTreeMap::new();

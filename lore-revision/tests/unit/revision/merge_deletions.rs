@@ -37,6 +37,7 @@ use super::instance::commit;
 use super::instance::commit_edits;
 use super::instance::create_branch;
 use super::instance::current;
+use super::instance::named;
 use super::instance::revision_state;
 use super::instance::run;
 use super::instance::stage;
@@ -113,14 +114,12 @@ async fn staged_node(instance: &Instance, path: &str) -> Node {
         .expect("Failed to read the node")
 }
 
-/// `path` in the working tree, as a resolve names it.
-fn named(instance: &Instance, path: &str) -> LoreArray<LoreString> {
-    LoreArray::from_vec(vec![LoreString::from(instance.path.join(path).as_path())])
-}
-
 /// Each entry the delta of `revision` records, as its action, path, flags and whether its node is a
 /// file: a deleted node's path read from the first parent, the tree that holds it.
-async fn delta_entries(instance: &Instance, revision: Hash) -> Vec<(u16, String, u16, bool)> {
+pub(super) async fn delta_entries(
+    instance: &Instance,
+    revision: Hash,
+) -> Vec<(u16, String, u16, bool)> {
     let state = revision_state(instance, revision).await;
     let parent = revision_state(instance, state.parent_self()).await;
     let delta = state

@@ -119,7 +119,7 @@ async fn merged_changes(
 }
 
 /// The changes of the 2-way diff from `from` to `to`.
-async fn changes_between(instance: &Instance, from: Hash, to: Hash) -> Vec<NodeChange> {
+pub(super) async fn changes_between(instance: &Instance, from: Hash, to: Hash) -> Vec<NodeChange> {
     diff_collect(
         instance.repository.clone(),
         revision_state(instance, from).await,
@@ -174,7 +174,7 @@ pub(super) async fn revisions(instance: &Instance) -> Revisions {
 }
 
 /// Each change by its action and the path it stands at.
-fn actions(changes: &[NodeChange]) -> Vec<(FileAction, String)> {
+pub(super) fn actions(changes: &[NodeChange]) -> Vec<(FileAction, String)> {
     changes
         .iter()
         .map(|change| (change.action, change.path().to_string()))

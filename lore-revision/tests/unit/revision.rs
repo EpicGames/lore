@@ -32,6 +32,7 @@ mod merge_local_work;
 #[cfg(unix)]
 mod merge_modes;
 mod merge_moves;
+mod moved_out;
 mod remote_comparison;
 mod replaced_mounts;
 mod resolve;

@@ -66,7 +66,7 @@ pub async fn holds(instance: &TestRepository, state: &State, path: &str) -> bool
 
 /// The node `state` holds at `path`, or `None` where it holds none; a lookup failing other than
 /// for a missing name fails the test.
-async fn node_held(
+pub async fn node_held(
     repository: &Arc<RepositoryContext>,
     state: &State,
     path: &str,
