@@ -1160,6 +1160,187 @@ mod line_pager {
             .await;
     }
 
+    /// A page ahead that lists the line only part way down to the next page, as where the remote
+    /// fails the request for the rest, leaves the walk to wait for every page requested and read
+    /// its own page below the part listed. The pages go on below the last page requested: none is
+    /// requested twice.
+    #[tokio::test]
+    async fn pages_ahead_go_on_below_a_page_that_lists_the_line_part_way() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                let mut remote = PagedRemote::new(branch(), line[999].signature)
+                    .holding(&line)
+                    .page(
+                        signature_of(&line, 1000),
+                        span(&line, 1000, 901),
+                        Hash::default(),
+                    )
+                    .page(
+                        signature_of(&line, 900),
+                        span(&line, 900, 801),
+                        Hash::default(),
+                    )
+                    .page(Anchor::Number(700), span(&line, 700, 651), Hash::default())
+                    .page(
+                        signature_of(&line, 650),
+                        span(&line, 650, 601),
+                        Hash::default(),
+                    );
+                for top in [800, 600, 500, 400, 300, 200, 100] {
+                    remote = remote.page(
+                        Anchor::Number(top),
+                        span(&line, top, top - 99),
+                        Hash::default(),
+                    );
+                }
+                let remote = Arc::new(remote);
+                let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client.clone(), permits());
+
+                let walked = walk(&mut pager, &client, line[999].signature, 0).await;
+                pager.finish().await;
+
+                assert_eq!(walked, (1..=1000).rev().collect::<Vec<u64>>());
+                assert_eq!(
+                    anchors(&remote),
+                    (
+                        vec![
+                            signature_of(&line, 1000),
+                            signature_of(&line, 900),
+                            signature_of(&line, 650)
+                        ],
+                        vec![800, 700, 650, 600, 500, 400, 300, 200, 100],
+                    )
+                );
+            })
+            .await;
+    }
+
+    /// Where the last page requested ahead lists nothing, and the walk's own page read in its place
+    /// ends above the bottom of that page's numbers, the pages go on below the walk's page: the
+    /// rest of the numbers of the page that listed nothing is requested ahead, not read by hash
+    /// signature.
+    #[tokio::test]
+    async fn the_rest_of_a_page_ahead_that_listed_nothing_is_requested_ahead() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = remote_line(1000, branch_metadata(&stores, branch()).await).await;
+                let remote = Arc::new(
+                    PagedRemote::new(branch(), line[999].signature)
+                        .holding(&line)
+                        .page(
+                            signature_of(&line, 1000),
+                            span(&line, 1000, 901),
+                            Hash::default(),
+                        )
+                        .page(
+                            signature_of(&line, 900),
+                            span(&line, 900, 801),
+                            Hash::default(),
+                        )
+                        .page(Anchor::Number(800), span(&line, 800, 701), Hash::default())
+                        .page(Anchor::Number(700), span(&line, 700, 601), Hash::default())
+                        .page(
+                            signature_of(&line, 600),
+                            span(&line, 600, 551),
+                            Hash::default(),
+                        )
+                        .page(Anchor::Number(550), span(&line, 550, 501), Hash::default()),
+                );
+                let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client.clone(), permits());
+
+                let walked = walk(&mut pager, &client, line[999].signature, 501).await;
+                pager.finish().await;
+
+                assert_eq!(walked.last(), Some(&501));
+                assert_eq!(
+                    anchors(&remote),
+                    (
+                        vec![
+                            signature_of(&line, 1000),
+                            signature_of(&line, 900),
+                            signature_of(&line, 600)
+                        ],
+                        vec![800, 700, 600, 550],
+                    )
+                );
+            })
+            .await;
+    }
+
+    /// Where two pages of one window list the line only part way down to the next page, the walk
+    /// reads its own page below each part listed, and each time the pages go on below the last
+    /// page requested: none is requested twice, and the walk reads no other page of its own.
+    #[tokio::test]
+    async fn pages_ahead_go_on_below_two_pages_of_a_window_that_list_the_line_part_way() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = remote_line(1500, branch_metadata(&stores, branch()).await).await;
+                let mut remote = PagedRemote::new(branch(), line[1499].signature)
+                    .holding(&line)
+                    .page(
+                        signature_of(&line, 1500),
+                        span(&line, 1500, 1401),
+                        Hash::default(),
+                    )
+                    .page(
+                        signature_of(&line, 1400),
+                        span(&line, 1400, 1301),
+                        Hash::default(),
+                    )
+                    .page(
+                        Anchor::Number(1200),
+                        span(&line, 1200, 1151),
+                        Hash::default(),
+                    )
+                    .page(
+                        Anchor::Number(1000),
+                        span(&line, 1000, 951),
+                        Hash::default(),
+                    )
+                    .page(
+                        signature_of(&line, 1150),
+                        span(&line, 1150, 1101),
+                        Hash::default(),
+                    )
+                    .page(
+                        signature_of(&line, 950),
+                        span(&line, 950, 901),
+                        Hash::default(),
+                    );
+                for top in [1300, 1100, 900, 800, 700, 600, 500, 400, 300, 200, 100] {
+                    remote = remote.page(
+                        Anchor::Number(top),
+                        span(&line, top, top - 99),
+                        Hash::default(),
+                    );
+                }
+                let remote = Arc::new(remote);
+                let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client.clone(), permits());
+
+                let walked = walk(&mut pager, &client, line[1499].signature, 0).await;
+                pager.finish().await;
+
+                assert_eq!(walked, (1..=1500).rev().collect::<Vec<u64>>());
+                let (signatures, numbers) = anchors(&remote);
+                assert_eq!(numbers_of(&line, &signatures), [1500, 1400, 1150, 950]);
+                assert_eq!(
+                    numbers,
+                    [
+                        1300, 1200, 1150, 1100, 1000, 950, 900, 800, 700, 600, 500, 400, 300, 200,
+                        100
+                    ]
+                );
+            })
+            .await;
+    }
+
     /// The pages requested run ahead of where the walk reads, not of where the pages land: a walk
     /// that reads into the second page requested ahead has one more page requested than the first
     /// window, though every page lands at once.

@@ -571,19 +571,19 @@ enum Ahead {
 ///
 /// A page the walk has read below is retired, and the next requested, so the pages requested run
 /// [`PAGES_AHEAD`] ahead of the walk ([`Self::pass`]). A revision the store lacks is waited for in
-/// the pages in the order requested, up to a page that lists nothing ([`Self::wait_for`]). Where
-/// none of them holds it, the walk reads its page by hash signature, which retires the pages it
-/// covers. The pages go on where that page's revisions are numbered below the number a page that
-/// listed nothing was requested from, so the line skips that number, or where [`Self::held`] holds.
-/// Otherwise the pages are ended, as where the remote's line of the branch isn't the walk's, or
-/// the remote lists no pages by number.
+/// the pages in the order requested, up to a page that lists nothing, which is removed
+/// ([`Self::wait_for`]). Where none of them holds it, the walk reads its page by hash signature,
+/// which retires the pages it covers. The pages go on where that page's revisions are numbered
+/// below the number a page that listed nothing was requested from, so the line skips that number,
+/// or where [`Self::held`] holds. Otherwise the pages are ended, as where the remote's line of the
+/// branch isn't the walk's, or the remote lists no pages by number.
 struct PagesAhead {
     branch: BranchId,
     /// The revision number to request the next page from.
     next: u64,
-    /// The pages requested and not retired, newest first, each with the revision number it was
-    /// requested from. Each task answers whether its page listed any of the line.
-    pages: VecDeque<(u64, AbortOnDropHandle<bool>)>,
+    /// The pages requested and neither retired nor removed, newest first, each with the revision
+    /// number it was requested from.
+    pages: VecDeque<(u64, PageAhead)>,
     /// Whether, since the walk last read a page of its own, a page the walk read below listed any
     /// of the line, or a page waited for held the revision the walk lacked.
     held: bool,
@@ -591,14 +591,42 @@ struct PagesAhead {
     _permit: OwnedSemaphorePermit,
 }
 
+/// A page requested ahead of a walk. Its task can be awaited only once, so the page keeps the
+/// task's answer once waited for.
+enum PageAhead {
+    /// The task, which answers whether the page listed any of the line.
+    Requested(AbortOnDropHandle<bool>),
+    /// Whether the page listed any of the line.
+    Answered(bool),
+}
+
+impl PageAhead {
+    /// Waits for the page, and answers whether it listed any of the line.
+    async fn listed(&mut self) -> bool {
+        if let Self::Requested(task) = self {
+            *self = Self::Answered(matches!(task.await, Ok(true)));
+        }
+        matches!(self, Self::Answered(true))
+    }
+
+    /// Aborts the page's task where it is still in flight.
+    fn abort(&self) {
+        if let Self::Requested(task) = self
+            && !task.is_finished()
+        {
+            task.abort();
+        }
+    }
+}
+
 /// What waiting for the pages requested ahead found for a revision the local store lacks.
 enum Waited {
     /// A page held the revision.
     Held,
-    /// The page requested from this revision number listed none of the line. The pages after it
-    /// are still requested.
+    /// The page requested from this revision number listed none of the line. The other pages are
+    /// still requested.
     ListedNothing(u64),
-    /// No page left holds the revision.
+    /// No page requested holds the revision.
     NotHeld,
 }
 
@@ -755,8 +783,10 @@ impl PagesAhead {
         while self.pages.len() < PAGES_AHEAD && self.next > floor {
             let bottom = page_floor(self.next);
             let page = page_by_number(repository.clone(), self.branch, self.next, bottom, floor);
-            self.pages
-                .push_back((self.next, AbortOnDropHandle::new(lore_spawn!(page))));
+            self.pages.push_back((
+                self.next,
+                PageAhead::Requested(AbortOnDropHandle::new(lore_spawn!(page))),
+            ));
             self.next = bottom.saturating_sub(1);
         }
     }
@@ -766,21 +796,26 @@ impl PagesAhead {
     /// aborted, and each has ended once retired. A retired page that listed any of the line sets
     /// [`Self::held`].
     async fn pass(&mut self, below: u64) {
-        while let Some(&(number, _)) = self.pages.front()
-            && page_floor(number) >= below
-            && let Some((_, page)) = self.pages.pop_front()
-        {
-            if !page.is_finished() {
-                page.abort();
+        loop {
+            let Some((number, page)) = self.pages.front_mut() else {
+                return;
+            };
+            if page_floor(*number) < below {
+                return;
             }
-            if matches!(page.await, Ok(true)) {
+            page.abort();
+            if page.listed().await {
                 self.held = true;
             }
+            self.pages.pop_front();
         }
     }
 
-    /// Waits for the pages in the order requested until the local store holds the state of
-    /// `revision`, or a page lists none of the line, which stops the wait.
+    /// Waits for the pages not waited for before, in the order requested, until the local store
+    /// holds the state of `revision`, or a page lists none of the line, which stops the wait and is
+    /// removed. A page waited for before listed the line, and had ended when the walk found the
+    /// store lacked `revision`. The pages that list the line stay requested until [`Self::pass`]
+    /// retires them or [`Self::end`] ends them.
     ///
     /// Not an `async fn`, which would hold a second copy of its arguments.
     #[allow(clippy::manual_async_fn)]
@@ -791,11 +826,20 @@ impl PagesAhead {
     ) -> impl Future<Output = Waited> + Send + 'a {
         async move {
             loop {
-                let Some((number, page)) = self.pages.pop_front() else {
-                    return Waited::NotHeld;
-                };
-                if !matches!(page.await, Ok(true)) {
-                    return Waited::ListedNothing(number);
+                {
+                    let Some((index, (number, page))) = self
+                        .pages
+                        .iter_mut()
+                        .enumerate()
+                        .find(|(_, (_, page))| matches!(page, PageAhead::Requested(_)))
+                    else {
+                        return Waited::NotHeld;
+                    };
+                    if !page.listed().await {
+                        let number = *number;
+                        self.pages.remove(index);
+                        return Waited::ListedNothing(number);
+                    }
                 }
                 if stored_local(repository, revision).await {
                     self.held = true;
@@ -810,8 +854,12 @@ impl PagesAhead {
         for (_, page) in &self.pages {
             page.abort();
         }
-        while let Some((_, page)) = self.pages.pop_front() {
-            let _ended = page.await;
+        loop {
+            let Some((_, page)) = self.pages.front_mut() else {
+                return;
+            };
+            page.listed().await;
+            self.pages.pop_front();
         }
     }
 }
