@@ -6947,6 +6947,12 @@ typedef struct lore_revision_tree_metadata_clear_args_t {
 typedef struct lore_revision_tree_commit_options_t {
   // Also upload the new revision to remote (local-only by default)
   uint8_t remote_write;
+  // The second parent, the merged revision; zero commits a revision with one parent. The
+  // revision the handle was loaded from is always the first parent, so a caller that records a
+  // merge revision loads the handle at the revision the branch continues and names the merged
+  // revision here. A merge revision needs a first parent: a handle loaded from the zero
+  // revision takes no second parent.
+  struct lore_hash_t parent_other;
 } lore_revision_tree_commit_options_t;
 
 // Arguments for `lore_revision_tree_commit`.
@@ -6955,7 +6961,7 @@ typedef struct lore_revision_tree_commit_args_t {
   uint64_t id;
   // Loaded revision-tree handle to freeze and commit
   struct lore_revision_tree_t handle;
-  // Commit tuneables (local-only vs remote-uploading)
+  // Commit tuneables: the upload and a merge revision's second parent
   struct lore_revision_tree_commit_options_t options;
 } lore_revision_tree_commit_args_t;
 
@@ -14339,6 +14345,18 @@ void lore_revision_tree_metadata_clear_async(const struct lore_global_args_t *gl
 // that failure apart: neither a tip collision nor an empty commit has a
 // `lore_error_code_t` of its own, so both report `INTERNAL` with the reason in the
 // completion detail — the same codes the file-system commit returns.
+//
+// **A merge revision.** `options.parent_other` names a second parent, the merged
+// revision; zero commits a revision with one parent. The loaded revision is always the
+// first parent: load the handle at the revision the branch continues, apply the result of
+// merging as edits, and name the merged revision. The revision is numbered one above the
+// higher of its parents' numbers, every change it records is marked as merged, and it
+// commits even with no edits and no metadata set. A second parent that is the loaded
+// revision, that the handle's store doesn't hold, or that is given to a handle loaded from
+// the zero revision, is refused with `LORE_ERROR_CODE_INVALID_ARGUMENTS` before anything is
+// written, naming its hash; another failure to read it reports `LORE_ERROR_CODE_INTERNAL`,
+// as the call's other reads do. A second parent claims that the revision holds that revision's
+// history: name one only where merging brought in the whole of the merged line.
 //
 // `options.remote_write = 1` uploads within the call. It is a request, not a
 // guarantee: a store bound offline or local-only, or a call passing

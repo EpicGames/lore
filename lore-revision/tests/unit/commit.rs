@@ -5,6 +5,7 @@ mod link_commit_tests;
 mod operation_tests;
 mod rehash_bench;
 mod rehash_tests;
+mod second_parent_tests;
 mod statistics_level_tests;
 mod sweep_tests;
 mod walk_tests;

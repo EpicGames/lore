@@ -5,8 +5,8 @@ authors:
   - mattias.jansson
 status: Accepted
 created: 2026-05-14
-updated: 2026-08-17
-discussion: https://crowd.urc.internal.epicgames.net/epic/Lore/change-request/360
+updated: 2026-11-20
+discussion: change-request/360
 ---
 
 # Low-Level Memory-Based Revision Control API
@@ -126,11 +126,13 @@ Every write operation has sync and async variants. Write operations mutate the h
 
 The terminal write operation to close the open work.
 
-`lore_revision_tree_commit(handle, branch, options) → revision_hash_event` — performs the full commit revision logic, freezing the merkle tree, calculating the delta blocks, weaving history and setting the revision hash this revision was loaded from as the parent. Serializes any unflushed tree blocks and fragment payloads through the storage system API path (local always, remote when `remote_write` is set in `options`), writes the 320-byte revision record carrying `(parent revision, tree root hash, metadata root)`, and emits the resulting revision hash. Then atomically advances `branch`'s local tip to the resulting hash via the same path the file-system-based commit uses. Honors branch protection, tip-collision detection, and the existing remote-write contract — a `commit` against a protected branch fails for the same reasons a working-tree commit would. Pipelines build chains of revisions by repeatedly committing on a branch, closing the handle, and reloading against the newly-committed revision.
+`lore_revision_tree_commit(handle, branch, options) → revision_hash_event` — performs the full commit revision logic, freezing the merkle tree, calculating the delta blocks, weaving history and setting the revision hash this revision was loaded from as the first parent. Serializes any unflushed tree blocks and fragment payloads through the storage system API path (local always, remote when `remote_write` is set in `options`), writes the 320-byte revision record carrying `(parent revisions, tree root hash, metadata root)`, and emits the resulting revision hash. Then atomically advances `branch`'s local tip to the resulting hash via the same path the file-system-based commit uses. Honors branch protection, tip-collision detection, and the existing remote-write contract — a `commit` against a protected branch fails for the same reasons a working-tree commit would. Pipelines build chains of revisions by repeatedly committing on a branch, closing the handle, and reloading against the newly-committed revision.
 
 The `lore_revision_tree_*` sub-namespace keeps `commit` visually distinct from the existing `lore_revision_commit_async`, which is the file-system-based "commit the staged working-tree" verb. The two are semantically distinct and live at different entry points (`lore_revision_tree_commit_async` vs `lore_revision_commit_async`).
 
 After a successful `commit`, the handle behaves as if freshly loaded from the newly-published revision: it has no pending edits, and read operations reflect the new revision. The handle remains valid until explicitly closed via `lore_revision_tree_close`.
+
+**Second parent.** `options` takes an optional second parent: the merged revision, which merging brings in. Committing without one records a revision with one parent. A second parent claims that the new revision holds the merged line's history up to it. Only the caller can know that the claim holds, so a caller whose merging brought in less commits with one parent. The revision the handle was loaded from is always the first parent, so a caller that records a merge revision loads the handle at the revision its branch continues, applies the result of merging as edits, and names the merged revision as the second parent. A merge revision needs a first parent, so a handle loaded from no revision takes no second parent. A second parent alone is something to commit, so a merge revision that changes no file commits. A second parent that's the loaded revision, that the handle's store doesn't hold, or that's given to a handle loaded from no revision fails the call with `LORE_ERROR_CODE_INVALID_ARGUMENTS`, and the call writes nothing.
 
 ### Address-level interop (Goal 3)
 
@@ -221,7 +223,7 @@ The example walks the full lifecycle in one place: load (step 1) is the only ent
 
 - **On-disk format** — N/A. The 320-byte revision record, the 64KiB tree block layout, the BLAKE3-hashed content-addressed fragments, and the partition / context plumbing all stay as-is. The new surface only writes data that the file-system-based path already writes today.
 
-- **CLI and public API** — Additive. New `lore_revision_*` entry points appear in `lore-capi/lore.h`: `lore_revision_tree_load_async`, `lore_revision_tree_resolve_path_async`, `lore_revision_tree_list_children_async`, `lore_revision_tree_node_info_async`, `lore_revision_tree_info_async`, `lore_revision_tree_node_path_async`, `lore_revision_tree_add_async`, `lore_revision_tree_delete_async`, `lore_revision_tree_modify_async`, `lore_revision_tree_move_async`, `lore_revision_tree_metadata_set_async`, `lore_revision_tree_commit_async`, `lore_revision_tree_close_async`, plus the sync variants of each. One new type alias is introduced (`lore_repository_id_t = lore_partition_t`); the underlying partition type is unchanged. New event tags are appended to `lore_event_type_t`. No existing entry point's signature, semantics, or event tag changes. The `lore` CLI gains no new subcommands in this proposal (a future LEP could add a low-level CLI surface; out of scope here). Existing scripts and integrations are unaffected.
+- **CLI and public API** — Additive in the first version. The amendment of 2026-11-20 is a breaking change: source-compatible, not binary-compatible. New `lore_revision_*` entry points appear in `lore-capi/lore.h`: `lore_revision_tree_load_async`, `lore_revision_tree_resolve_path_async`, `lore_revision_tree_list_children_async`, `lore_revision_tree_node_info_async`, `lore_revision_tree_info_async`, `lore_revision_tree_node_path_async`, `lore_revision_tree_add_async`, `lore_revision_tree_delete_async`, `lore_revision_tree_modify_async`, `lore_revision_tree_move_async`, `lore_revision_tree_metadata_set_async`, `lore_revision_tree_commit_async`, `lore_revision_tree_close_async`, plus the sync variants of each. One new type alias is introduced (`lore_repository_id_t = lore_partition_t`); the underlying partition type is unchanged. New event tags are appended to `lore_event_type_t`. The first version changes no existing entry point's signature, semantics, or event tag. The amendment adds the second parent as a field of the commit options. A C caller's source keeps compiling, and an options value that leaves the second parent zero still records one parent. A caller built against an earlier `lore-capi/lore.h` must be rebuilt against the new one. The `lore` CLI gains no new subcommands in this proposal (a future LEP could add a low-level CLI surface; out of scope here). Existing scripts are unaffected.
 
 ## Non-Functional Considerations
 
@@ -231,11 +233,11 @@ The example walks the full lifecycle in one place: load (step 1) is the only ent
 
 - **Statelessness** — The handle is intentionally stateful for the lifetime between load and close; that statefulness is the whole point of the surface. The library-level state outside the handle (the handle registry, the underlying `Arc<Store>` for flushes) is the same state the storage system API holds. No new process-global state is introduced.
 
-- **Determinism** — A revision's signature is a deterministic function of its parent, tree content, and metadata, unchanged by this proposal. The same parent revision, the same sequence of edits applied in the same order, and the same caller-supplied metadata produce identical revision signatures. Revision metadata typically embeds caller-controlled context (timestamps, author identity), so two pipelines that record different metadata produce different signatures from the same edits — matching the file-system-based commit path. Concurrent edits on the same handle can interleave in implementation-defined order; the handle's intermediate state is not exposed and is not part of any contract.
+- **Determinism** — A revision's signature is a deterministic function of its parents, tree content, and metadata, unchanged by this proposal. The same parents, the same sequence of edits applied in the same order, and the same caller-supplied metadata produce identical revision signatures. Revision metadata typically embeds caller-controlled context (timestamps, author identity), so two pipelines that record different metadata produce different signatures from the same edits — matching the file-system-based commit path. Concurrent edits on the same handle can interleave in implementation-defined order; the handle's intermediate state is not exposed and is not part of any contract.
 
 ## Migration Plan
 
-N/A — no breaking changes, no migration required. The new API surface is additive; the existing file-system-based revision control API and the storage system API continue to work unchanged. Pipelines opt into the new surface by calling its entry points; nothing forces or blocks the move.
+The first version needs no migration. The new API surface is additive; the existing file-system-based revision control API and the storage system API continue to work unchanged. Pipelines opt into the new surface by calling its entry points; nothing forces or blocks the move. The amendment of 2026-11-20 changes no stored data: a caller built against an earlier `lore-capi/lore.h`, and each language binding, must be rebuilt against the new commit options. A language binding that declares its own copy of the commit options adds the second parent in the same release, as a rebuild alone leaves its copy without it. Rolling back means downgrading the library and its language bindings together. Revisions with two parents stay readable to an earlier Lore.
 
 ## Security Considerations
 
@@ -363,3 +365,11 @@ Narrowing the poison to "only once the freeze has begun" was tried and rejected 
 The claim model in the Implementation Notes above is what replaced it. A commit takes the handle exclusively, snapshots the staged tree just before the freeze, and on any failure discards the part-frozen tree and rebuilds from that snapshot. Discarding rather than repairing is deliberate: a part-frozen tree has no invariant to repair *toward*, whereas the snapshot is a state the caller already had. The exclusive claim is what makes the swap sound — nothing can be reading the tree being replaced — and it is also what closes the window where an edit or a metadata change lands inside a commit. Poisoning survives only where the restore itself fails, which is genuinely unrecoverable rather than a choice.
 
 The costs were weighed and accepted: a commit blocks every other call on its handle for its duration, and the snapshot roughly doubles a commit's write volume. Both are paid per commit, which is the coarsest operation on the surface and already the one a pipeline batches into. Two caller obligations disappear in exchange — "do not call `metadata_set` during a commit" and "two in-flight commits on one handle must agree on `remote_write`" — neither of which was a rule a caller could reasonably be asked to keep, and both of which existed only because commit had no exclusive claim.
+
+## Amendments
+
+### Amendment (2026-11-20): Committing with a second parent
+
+**Status:** Accepted. Proposed and accepted in change-request/1400, which implements it.
+
+**Why.** A mirror of a Subversion repository built on this API records each revision in which Subversion merged one line into another as a revision with two parents. It holds the merged tree already, so it needs `lore_revision_tree_commit` to take a second parent rather than a verb that merges, which would also have to report conflicts.

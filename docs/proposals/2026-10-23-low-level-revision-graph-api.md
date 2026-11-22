@@ -5,7 +5,7 @@ authors:
   - mattias.jansson
 status: Accepted
 created: 2026-10-23
-updated: 2026-11-19
+updated: 2026-11-20
 discussion: change-request/994
 ---
 
@@ -89,7 +89,7 @@ Together, these gaps leave a caller that wants nothing on disk cloning an instan
 - **The string form of [revision identifiers](../glossary.md#revision-identifier):** This surface takes a revision identifier only in its structured form (see "Revision identifier" under "Conventions"), never as a string such as `main@latest`, `main@25`, or `main@25~2`. Converting a string is the caller's job.
 - **A merging sync:** `branch_sync` doesn't merge a divergent local latest with its target the way `lore sync` does when it produces a [merge revision](../glossary.md#merge). A merging sync is a candidate for a later verb.
 - **Cascading to [layers](../glossary.md#layer) and [links](../glossary.md#link):** The file-system push always pushes linked repositories' revisions, and the file-system create and archive can act on layers and links. Each verb here acts on the one repository it names. `branch_create` creates no layer or link branches, `branch_archive` archives none, and `branch_push` publishes no linked repository's revision.
-- **Changing the revision tree API:** `lore_revision_tree_commit` stays local-only, and publishing is a separate call on this surface.
+- **Changing the revision tree API:** `lore_revision_tree_commit` stays local-only, and publishing is a separate call on this surface. The revision tree proposal's own amendment of 2026-11-20 gives `lore_revision_tree_commit` a second parent ([Amendment (2026-11-20): Committing with a second parent](2026-05-14-low-level-revision-api.md#amendment-2026-11-20-committing-with-a-second-parent)), and `branch_push` publishes such a merge revision as "Branch push" describes.
 - **Separating event emission from the cores:** The cores keep sending the file-system verbs' events, and the verbs drop all but log lines and the push's progress and statistics (see "Changes beneath the verbs"). A later refactor makes the cores pure: each returns its outcome and sends no events, and the API layer sends the events. The file-system verbs then send theirs, and this surface becomes one more API over the same cores that sends only the events this proposal names. That refactor changes every file-system verb, so it's a change of its own.
 - **History walks, diffs, revision listing, branch metadata or protection edits, and repository metadata such as the default branch, in the first version:** These are candidates for later verbs under "Extending the surface."
 - **CLI commands:** The `lore` [CLI](../glossary.md#cli) gains nothing.
@@ -439,6 +439,7 @@ The verb reuses the history walk and upload of the file-system push (`lore-revis
 - It uploads each revision's [fragments](../glossary.md#fragment) against its parent, querying the remote for the fragments it already holds.
 - It creates the branch on the remote on its first push. When a different remote branch holds the name, the push fails with `BranchAlreadyExists`.
 - It offers each revision through the `branch_push` RPC (`lore-transport/src/traits.rs:278-284`). Lore Server checks branch protection (`lore-server/src/grpc/handlers/branch_push.rs:1031-1043`), verifies the revision, and moves the remote latest with a compare-and-swap (`lore-server/src/grpc/handlers/branch_push.rs:1286-1335`).
+- It publishes the second-parent line of each merge revision with that revision. It uploads the revisions on that line that the remote lacks, and never offers them, so no other branch's remote latest moves.
 
 The verb has two options:
 
@@ -824,7 +825,7 @@ None.
 
 ## Extensions
 
-Verbs that amendments add under "Extending the surface" land here.
+Amendments land here. An amendment that adds a verb follows "Extending the surface."
 
 ### Amendment (2026-11-13): Branch metadata get and set
 
@@ -944,3 +945,9 @@ No release has shipped the read verbs: they joined `main` after v0.14.0, the lat
 - **Refusing `protect`:** A pipeline couldn't protect a branch it creates without an instance.
 - **Refusing address values:** Get still reports the address entries other tools write, and a pipeline can put a payload at each location and reference it.
 - **Failing a location on an entry the verbs can't report:** The branch would be unusable there through this surface, with no way to remove the entry.
+
+### Amendment (2026-11-20): Publishing merge revisions
+
+**Status:** Accepted. Proposed and accepted in change-request/1400, with the revision tree proposal's amendment that gives `lore_revision_tree_commit` a second parent.
+
+This amendment adds no verb. "Branch push" states that a push publishes the second-parent line of a merge revision, and the Non-Goal "Changing the revision tree API" points at the revision tree proposal's amendment.

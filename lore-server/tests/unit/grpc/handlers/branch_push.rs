@@ -350,6 +350,7 @@ async fn commit_files(
         state,
         metadata,
         parent,
+        Hash::default(),
         branch,
     )
     .await

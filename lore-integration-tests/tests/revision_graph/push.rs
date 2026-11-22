@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT
 //! `branch_push` against an in-process Lore Server: publishing a local latest, a first push, a
 //! remote latest that moved, fast-forward merges, force, the flags, nothing to publish, a killed
-//! push's revision the remote moved past, and the events a push sends.
+//! push's revision the remote moved past, a merge revision whose second parent the remote lacks,
+//! and the
+//! events a push sends.
 
 use lore::revision_graph::branch_push::LoreRevisionGraphBranchPushOptions;
 use lore::revision_graph::branch_sync::LoreRevisionGraphBranchSyncOptions;
@@ -76,6 +78,44 @@ async fn a_push_publishes_the_local_latest_and_the_event_precedes_complete() {
         local_value(&f, branch::LATEST_STATUS, f.default_branch).await,
         None
     );
+    f.close().await;
+}
+
+/// A push of a merge revision the revision tree API committed, whose second parent is on a branch
+/// the remote doesn't hold, publishes it and the line of its second parent, and leaves that branch
+/// off the remote.
+#[tokio::test]
+async fn a_push_of_a_merge_publishes_its_second_parents_line() {
+    let f = fixture().await;
+    let seeded = seed_main(&f).await;
+    let feature = create_local_branch(&f, "feature", f.default_branch, CREATOR).await;
+    let local_only = handle_over_local_stores(&f, None);
+    let merged = commit_on(local_only, f.repository, feature, seeded).await;
+    close_handle(local_only).await;
+    assert!(!server_holds_revision(&f, f.repository, merged).await);
+    let merge = commit_merge_on(f.store, f.repository, f.default_branch, seeded, merged).await;
+
+    let (status, events) = push(&f, f.default_branch, plain()).await;
+
+    assert_eq!(status, 0);
+    assert_eq!(server_latest(&f, f.default_branch).await, merge);
+    assert_eq!(pushed(&events), [published(merge, 3)]);
+    assert!(server_holds_revision(&f, f.repository, merged).await);
+    let parents = on_server(&f, async |context| {
+        lore_revision::state::State::deserialize(context, merge)
+            .await
+            .expect("the server holds the merge")
+            .parents()
+    })
+    .await;
+    assert_eq!(parents, [seeded, merged]);
+    let feature_at_server = on_server(&f, async |context| {
+        branch::load_latest(context, feature)
+            .await
+            .unwrap_or_default()
+    })
+    .await;
+    assert!(feature_at_server.is_zero());
     f.close().await;
 }
 

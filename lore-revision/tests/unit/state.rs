@@ -517,7 +517,7 @@ impl HoldingStore {
 
     /// Answers the next `count` gets of `hash` with `error`, and those after them as the store it
     /// wraps does.
-    fn fail_next(&self, hash: Hash, count: usize, error: lore_storage::StoreError) {
+    pub(crate) fn fail_next(&self, hash: Hash, count: usize, error: lore_storage::StoreError) {
         (self.failing.lock().expect("failing hashes")).push((hash, count, error));
     }
 

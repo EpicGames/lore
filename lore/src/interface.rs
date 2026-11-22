@@ -9243,6 +9243,18 @@ pub type LoreRevisionTreeCommitOptions =
 /// `lore_error_code_t` of its own, so both report `INTERNAL` with the reason in the
 /// completion detail — the same codes the file-system commit returns.
 ///
+/// **A merge revision.** `options.parent_other` names a second parent, the merged
+/// revision; zero commits a revision with one parent. The loaded revision is always the
+/// first parent: load the handle at the revision the branch continues, apply the result of
+/// merging as edits, and name the merged revision. The revision is numbered one above the
+/// higher of its parents' numbers, every change it records is marked as merged, and it
+/// commits even with no edits and no metadata set. A second parent that is the loaded
+/// revision, that the handle's store doesn't hold, or that is given to a handle loaded from
+/// the zero revision, is refused with `LORE_ERROR_CODE_INVALID_ARGUMENTS` before anything is
+/// written, naming its hash; another failure to read it reports `LORE_ERROR_CODE_INTERNAL`,
+/// as the call's other reads do. A second parent claims that the revision holds that revision's
+/// history: name one only where merging brought in the whole of the merged line.
+///
 /// `options.remote_write = 1` uploads within the call. It is a request, not a
 /// guarantee: a store bound offline or local-only, or a call passing
 /// `globals.local`, silently commits local-only. So does a store opened without a

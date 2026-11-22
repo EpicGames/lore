@@ -827,8 +827,41 @@ pub(crate) async fn commit_named_on(
     parent: Hash,
     name: &str,
 ) -> Hash {
-    let (handle, _) = tree_with_new_file(store, repository, branch, parent, Some(name)).await;
-    let (status, committed) = commit_tree(handle).await;
+    commit_new_file_on(
+        store,
+        repository,
+        branch,
+        parent,
+        Some(name),
+        Hash::default(),
+    )
+    .await
+}
+
+/// Commits on `parent` as [`commit_on`] does, with `parent_other` as the second parent, and returns
+/// the merge revision's hash.
+pub(crate) async fn commit_merge_on(
+    store: LoreStore,
+    repository: Partition,
+    branch: BranchId,
+    parent: Hash,
+    parent_other: Hash,
+) -> Hash {
+    commit_new_file_on(store, repository, branch, parent, None, parent_other).await
+}
+
+/// Commits a tree [`tree_with_new_file`] builds, with `parent_other` as the second parent where it
+/// isn't zero, and returns the revision's hash.
+async fn commit_new_file_on(
+    store: LoreStore,
+    repository: Partition,
+    branch: BranchId,
+    parent: Hash,
+    name: Option<&str>,
+    parent_other: Hash,
+) -> Hash {
+    let (handle, _) = tree_with_new_file(store, repository, branch, parent, name).await;
+    let (status, committed) = commit_tree_merging(handle, parent_other).await;
     assert_eq!(status, 0, "committing must succeed");
     let revision = committed_revision(&committed).expect("the commit reports its revision");
     close_tree(handle).await;
@@ -944,13 +977,24 @@ async fn tree_with_new_file(
 /// The status and events of a commit of `handle`, which writes the revision to the remote of the
 /// tree's storage handle, if it has one.
 async fn commit_tree(handle: LoreRevisionTree) -> (i32, Vec<LoreEvent>) {
+    commit_tree_merging(handle, Hash::default()).await
+}
+
+/// [`commit_tree`] with `parent_other` as the second parent, zero for none.
+async fn commit_tree_merging(
+    handle: LoreRevisionTree,
+    parent_other: Hash,
+) -> (i32, Vec<LoreEvent>) {
     status_and_events_of(|callback| {
         commit(
             LoreGlobalArgs::default(),
             LoreRevisionTreeCommitArgs {
                 id: 1,
                 handle,
-                options: LoreRevisionTreeCommitOptions { remote_write: 1 },
+                options: LoreRevisionTreeCommitOptions {
+                    remote_write: 1,
+                    parent_other,
+                },
             },
             callback,
         )

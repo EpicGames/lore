@@ -1408,6 +1408,7 @@ pub mod in_memory {
             state.clone(),
             metadata_on(branch),
             current,
+            Hash::default(),
             branch,
         )
         .await

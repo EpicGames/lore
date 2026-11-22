@@ -471,7 +471,10 @@ async fn revision_tree_commit_survives_the_wire() {
     let args = LoreRevisionTreeCommitArgs {
         id: 4242,
         handle: LoreRevisionTree { handle_id: 9 },
-        options: LoreRevisionTreeCommitOptions { remote_write: 1 },
+        options: LoreRevisionTreeCommitOptions {
+            remote_write: 1,
+            parent_other: Hash::from_u64(0x2a),
+        },
     };
 
     match relayed(LoreCommand::RevisionTreeCommit(args)) {

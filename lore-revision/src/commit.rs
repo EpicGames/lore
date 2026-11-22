@@ -8272,10 +8272,16 @@ fn string_key_is_unset(metadata: &Metadata, key: &str) -> bool {
 /// deletions discarded, change flags cleared, directories rehashed, and the node
 /// delta recorded for the next revision to weave history against.
 ///
-/// `current_revision` becomes the new revision's parent, and the branch tip must
-/// still be on it: the check runs before any work so a caller fails fast, and the
-/// pointer write compares against the same observed value so a tip that advances
-/// during the freeze fails too.
+/// `parent_self`, the revision the tree was loaded from, becomes the new revision's first
+/// parent, and the branch tip must still be on it: the check runs before anything is written
+/// so a caller fails fast, and the pointer write compares against the same observed value so a
+/// tip that advances during the freeze fails too.
+///
+/// A non-zero `parent_other` becomes the second parent of a merge revision, whose tree holds the
+/// result of merging ([`reject_unusable_second_parent`]). Every change the delta records is then
+/// marked as merged, as `lore branch merge` marks the changes it brings in, and the revision is
+/// committed even with nothing staged and no metadata, as a merge revision that changes no file
+/// still records its second parent.
 ///
 /// The freeze cannot be undone, so it is snapshotted instead: the staged state is
 /// serialized just before it begins, and an error from there on returns that
@@ -8303,15 +8309,20 @@ pub async fn commit_in_memory_revision(
     token: &RepositoryWriteToken,
     state_staged: Arc<State>,
     metadata: Metadata,
-    current_revision: Hash,
+    parent_self: Hash,
+    parent_other: Hash,
     branch: BranchId,
 ) -> Result<Hash, InMemoryCommitFailure> {
+    reject_unusable_second_parent(&repository, parent_self, parent_other)
+        .await
+        .map_err(InMemoryCommitFailure::rejected)?;
+
     let observed_tip = branch::load_latest(repository.clone(), branch)
         .await
         .unwrap_or_default();
-    if !observed_tip.is_zero() && observed_tip != current_revision {
+    if !observed_tip.is_zero() && observed_tip != parent_self {
         lore_debug!(
-            "Branch {branch} is at {observed_tip}, not at the loaded revision {current_revision}"
+            "Branch {branch} is at {observed_tip}, not at the loaded revision {parent_self}"
         );
         return Err(InMemoryCommitFailure::rejected(BranchAdvanced));
     }
@@ -8319,7 +8330,7 @@ pub async fn commit_in_memory_revision(
     let has_staged = has_staged_children(repository.clone(), &state_staged)
         .await
         .map_err(InMemoryCommitFailure::rejected)?;
-    if !has_staged && metadata_is_empty(&metadata) {
+    if !has_staged && metadata_is_empty(&metadata) && parent_other.is_zero() {
         return Err(InMemoryCommitFailure::rejected(NothingStaged));
     }
 
@@ -8361,8 +8372,8 @@ pub async fn commit_in_memory_revision(
     );
     state_staged.mark_dirty();
 
-    state_staged.set_parent_self(current_revision);
-    state_staged.set_parent_other(Hash::default());
+    state_staged.set_parent_self(parent_self);
+    state_staged.set_parent_other(parent_other);
 
     let stats = CommitStats::new();
     let tracker = immutable::commit_write_tracker(false);
@@ -8372,7 +8383,7 @@ pub async fn commit_in_memory_revision(
         freeze_in_memory_tree(
             work_repository.clone(),
             state_staged.clone(),
-            current_revision,
+            parent_self,
             stats.clone(),
             work_tracker.clone(),
         )
@@ -8532,7 +8543,8 @@ async fn first_staged_node(
 }
 
 /// Freeze the staged tree into the shape a revision records, as [`freeze_tree`] does against
-/// `base`, the revision the tree was loaded from, and write the node delta.
+/// `base`, the revision the tree was loaded from, and write the node delta, each change marked as
+/// merged where the state has a second parent.
 async fn freeze_in_memory_tree(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
@@ -8541,7 +8553,58 @@ async fn freeze_in_memory_tree(
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
 ) -> Result<(), CommitError> {
     let delta = freeze_tree(repository.clone(), state.clone(), base, stats).await?;
+    if !state.parent_other().is_zero() {
+        mark_merged(&mut delta.write());
+    }
     generate_delta_block(repository, state, delta, Some(tracker)).await
+}
+
+/// Marks every entry of `delta` as a change merging made.
+fn mark_merged(delta: &mut BytesMut) {
+    for entry in delta.as_chunks_mut::<{ size_of::<NodeDelta>() }>().0 {
+        if let Ok(mut change) = NodeDelta::read_from_bytes(entry.as_slice()) {
+            change.flags |= change::Flags::Merge.bits();
+            entry.copy_from_slice(change.as_bytes());
+        }
+    }
+}
+
+/// Refuses `parent_other`, the second parent of a tree loaded from `parent_self`, naming it: where
+/// it is `parent_self`, where `parent_self` is zero, as a merge revision needs a first parent, and
+/// where `repository` doesn't hold it. Any other failure to read it is the read's own. Zero is no
+/// second parent.
+async fn reject_unusable_second_parent(
+    repository: &Arc<RepositoryContext>,
+    parent_self: Hash,
+    parent_other: Hash,
+) -> Result<(), CommitError> {
+    if parent_other.is_zero() {
+        return Ok(());
+    }
+    if parent_other == parent_self {
+        return Err(InvalidArguments {
+            reason: format!("the second parent {parent_other} is the loaded revision"),
+        }
+        .into());
+    }
+    if parent_self.is_zero() {
+        return Err(InvalidArguments {
+            reason: format!(
+                "a tree loaded from no revision takes no second parent, given {parent_other}"
+            ),
+        }
+        .into());
+    }
+    match State::deserialize(repository.clone(), parent_other).await {
+        Ok(_) => Ok(()),
+        Err(error) if error.is_not_found() => Err(CommitError::InvalidArguments(
+            InvalidArguments {
+                reason: format!("the store doesn't hold the second parent {parent_other}"),
+            }
+            .chain_err_from(error, "reading the second parent"),
+        )),
+        Err(error) => Err(error).forward_any("reading the second parent"),
+    }
 }
 
 /// Applies `changes`, the conflict-free changes of a 3-way diff, to `state`, the tree of the

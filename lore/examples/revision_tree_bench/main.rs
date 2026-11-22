@@ -444,7 +444,7 @@ async fn commit_tree(tree: LoreRevisionTree) {
         LoreRevisionTreeCommitArgs {
             id: 1,
             handle: tree,
-            options: LoreRevisionTreeCommitOptions { remote_write: 0 },
+            options: LoreRevisionTreeCommitOptions::default(),
         },
         callback(&events),
     )

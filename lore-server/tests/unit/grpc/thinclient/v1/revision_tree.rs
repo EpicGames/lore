@@ -1592,6 +1592,7 @@ async fn commit_files(repository: &Arc<RepositoryContext>, names: &[&str]) -> Ha
         state,
         metadata,
         Hash::default(),
+        Hash::default(),
         branch_id,
     )
     .await

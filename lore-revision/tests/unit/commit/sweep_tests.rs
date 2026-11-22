@@ -92,6 +92,7 @@ async fn a_c_api_commit_frees_a_slot_left_in_flight_before_it_saves() {
             state.clone(),
             in_memory::metadata_on(branch),
             Hash::default(),
+            Hash::default(),
             branch,
         )
         .await

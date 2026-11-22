@@ -37,8 +37,10 @@ type: feature
   history to the remote, creating the branch there on its first push, with `force` and a
   fast-forward merge onto a moved remote latest as options. It publishes the branch alone: each
   revision of a linked repository a revision links must be on the remote already, and is checked
-  there before anything is pushed. It moves the local latest only from the value it pushed, so a
-  commit made during the push stays, and reports the revision published, the remote latest and
+  there before anything is pushed. It also uploads the revisions the remote lacks on the
+  second-parent line of each merge revision, and moves no other branch's remote latest. It moves
+  the local latest only from the value it pushed, so a revision committed during the push stays,
+  and reports the revision published, the remote latest and
   the local latest, also when it fails once it has read the remote latest. After a
   `BranchAdvanced` failure, a forced sync to that remote latest recovers.
 - `lore`: `lore_revision_graph_branch_metadata_get` reports a branch's metadata entries, or the

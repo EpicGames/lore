@@ -80,6 +80,7 @@ mod tests {
                     state.clone(),
                     metadata_on(branch),
                     Hash::default(),
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -170,6 +171,7 @@ mod tests {
                     state,
                     metadata_on(branch),
                     Hash::default(),
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -237,6 +239,7 @@ mod tests {
                     state,
                     metadata_on(branch),
                     Hash::default(),
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -301,6 +304,7 @@ mod tests {
                     state,
                     metadata_on(branch),
                     Hash::default(),
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -363,6 +367,7 @@ mod tests {
                     State::new(),
                     Metadata::new(),
                     Hash::default(),
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -396,6 +401,7 @@ mod tests {
                     &token(),
                     State::new(),
                     metadata_on(branch),
+                    Hash::default(),
                     Hash::default(),
                     branch,
                 )
@@ -439,6 +445,7 @@ mod tests {
                     &token(),
                     state,
                     metadata_on(branch),
+                    Hash::default(),
                     Hash::default(),
                     branch,
                 )
@@ -491,6 +498,7 @@ mod tests {
                     state.clone(),
                     metadata_on(branch),
                     Hash::default(),
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -512,6 +520,7 @@ mod tests {
                     state,
                     metadata_on(branch),
                     first,
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -561,6 +570,7 @@ mod tests {
                     state.clone(),
                     metadata_on(branch),
                     Hash::default(),
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -593,6 +603,7 @@ mod tests {
                     state,
                     metadata_on(branch),
                     first,
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -638,6 +649,7 @@ mod tests {
                     state.clone(),
                     metadata_on(branch),
                     Hash::default(),
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -664,6 +676,7 @@ mod tests {
                     state,
                     metadata_on(branch),
                     first,
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -726,6 +739,7 @@ mod tests {
                     state.clone(),
                     metadata_on(branch),
                     Hash::default(),
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -741,6 +755,7 @@ mod tests {
                     state,
                     metadata_on(branch),
                     first,
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -793,6 +808,7 @@ mod tests {
                     state.clone(),
                     metadata_on(branch),
                     Hash::default(),
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -813,6 +829,7 @@ mod tests {
                     state.clone(),
                     metadata_on(branch),
                     first,
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -863,6 +880,7 @@ mod tests {
                     state.clone(),
                     metadata_on(branch),
                     Hash::default(),
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -911,6 +929,7 @@ mod tests {
                     &token(),
                     state.clone(),
                     metadata_on(branch),
+                    Hash::default(),
                     Hash::default(),
                     branch,
                 )
@@ -975,6 +994,7 @@ mod tests {
                     state.clone(),
                     metadata_on(branch),
                     Hash::default(),
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -992,6 +1012,7 @@ mod tests {
                     state.clone(),
                     metadata_on(branch),
                     published,
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -1044,6 +1065,7 @@ mod tests {
                     &token(),
                     state,
                     metadata_on(branch),
+                    Hash::default(),
                     Hash::default(),
                     branch,
                 )
@@ -1101,6 +1123,7 @@ mod tests {
                     &token(),
                     state,
                     supplied,
+                    Hash::default(),
                     Hash::default(),
                     branch,
                 )
@@ -1160,6 +1183,7 @@ mod tests {
                     state,
                     supplied,
                     Hash::default(),
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -1203,6 +1227,7 @@ mod tests {
                     &token(),
                     state.clone(),
                     metadata_on(branch),
+                    Hash::default(),
                     Hash::default(),
                     branch,
                 )
@@ -1301,6 +1326,7 @@ mod tests {
                     state.clone(),
                     metadata_on(parent_branch),
                     Hash::default(),
+                    Hash::default(),
                     parent_branch,
                 )
                 .await
@@ -1362,6 +1388,7 @@ mod tests {
                     &token(),
                     state.clone(),
                     metadata_on(parent_branch),
+                    Hash::default(),
                     Hash::default(),
                     parent_branch,
                 )
@@ -1449,6 +1476,7 @@ mod tests {
                         state,
                         metadata_on(branch),
                         Hash::default(),
+                        Hash::default(),
                         branch,
                     )
                     .await
@@ -1493,6 +1521,7 @@ mod tests {
                     state,
                     metadata_on(branch),
                     Hash::default(),
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -1533,6 +1562,7 @@ mod tests {
                     handle,
                     metadata_on(branch),
                     first,
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -1577,6 +1607,7 @@ mod tests {
                     state,
                     metadata_on(branch),
                     Hash::default(),
+                    Hash::default(),
                     branch,
                 )
                 .await
@@ -1616,6 +1647,7 @@ mod tests {
                     handle,
                     metadata_on(branch),
                     first,
+                    Hash::default(),
                     branch,
                 )
                 .await
