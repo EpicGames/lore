@@ -1336,6 +1336,10 @@ def test_status_unstaged_after_layer_add(new_lore_repo):
         "Expected `status --unstaged` to be empty immediately after "
         f"`layer add`, got: {status_entries}"
     )
+    summary = parse_status_summary_json(status_output)
+    assert summary["hashChecks"] == 0, (
+        f"`layer add` must record the times of the files it writes, got {summary}"
+    )
 
 
 @pytest.mark.smoke

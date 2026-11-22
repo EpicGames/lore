@@ -493,7 +493,7 @@ pub async fn add(
     // The mount directory and the files cloned under it are in the same filesystem, so one
     // operation covers both, and the layer is saved before it finalizes: an SWFS instance serves
     // layers from the configuration it finds then (ADR-00042).
-    with_operation(layer_repository.file_system(), async |operation| {
+    with_operation::<_, LayerError, _>(layer_repository.file_system(), async |operation| {
         operation
             .create_dir_all(&mount_path)
             .await
@@ -502,13 +502,13 @@ pub async fn add(
         let clone_ctx = CloneContext {
             repository: layer_repository.clone(),
             state: layer_state,
-            operation,
+            operation: operation.clone(),
             options: Arc::new(clone::CloneOptions {
                 ignore_existing: false,
                 ..Default::default()
             }),
             stats: Arc::default(),
-            modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
+            modified_times: operation.modified_times(),
         };
         clone::clone_node(
             clone_ctx,
@@ -520,7 +520,12 @@ pub async fn add(
         .await
         .forward::<LayerError>("Failed cloning target layer")?;
 
-        save_config(token, &config_path, &config).await
+        save_config(token, &config_path, &config).await?;
+        operation
+            .modified_times()
+            .store(layer_repository.clone())
+            .await;
+        Ok(())
     })
     .await?;
 

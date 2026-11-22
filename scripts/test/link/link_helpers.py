@@ -7,7 +7,7 @@ import re
 
 import pytest
 from error_types import OverlappingLinkError
-from lore_parsers import parse_jsonl, parse_status_json
+from lore_parsers import parse_jsonl, parse_status_json, parse_status_summary_json
 from test_utils import staged_revision, unstaged_entries, working_tree_files
 
 from lore import Lore
@@ -802,3 +802,19 @@ def change_through_both_links(urc: Lore, shape: str, files: dict[str, str]):
     urc.link_update(second, pin=link_pin_at(urc, first))
     urc.commit("Pin the second link of d")
     urc.push()
+
+
+SAME_SIZE_LINK_FILES = {
+    f"data/file{index}.bin": str(index) * 4096 for index in range(4)
+}
+
+
+def assert_scan_matches_linked_files_by_time(repo: Lore):
+    summary = parse_status_summary_json(repo.status(scan=True, json=True, offline=True))
+    assert summary is not None, "scan must emit a repositoryStatusSummary event"
+    assert summary["hashChecks"] == 0, (
+        f"the scan must measure no file the command wrote, got {summary}"
+    )
+    assert summary["mtimeMatches"] >= len(SAME_SIZE_LINK_FILES), (
+        f"the scan must match every linked file by its recorded time, got {summary}"
+    )

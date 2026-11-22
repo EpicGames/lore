@@ -418,7 +418,7 @@ pub async fn add(
             operation: operation.clone(),
             options: Arc::default(),
             stats: stats.clone(),
-            modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
+            modified_times: operation.modified_times(),
         };
         clone::clone_node(
             clone_ctx,
@@ -451,6 +451,7 @@ pub async fn add(
         crate::instance::store_staged_anchor(&repository, signature)
             .await
             .forward::<LinkError>("Failed to serialize anchor")?;
+        operation.modified_times().store(repository.clone()).await;
         Ok(())
     })
     .await?;

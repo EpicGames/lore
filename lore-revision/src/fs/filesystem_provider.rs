@@ -1192,7 +1192,7 @@ pub struct InstanceOperationImpl {
     /// Whether the work the operation was opened for failed, which a provider that holds what it was
     /// told a commit stored until the work is known to have succeeded drops.
     failed: AtomicBool,
-    modified_times: RecordedModifiedTimes,
+    modified_times: Arc<RecordedModifiedTimes>,
     /// The filesystem clock, read once, the first time [`Self::clock_floor`] is asked.
     clock_floor: tokio::sync::OnceCell<u64>,
     /// Whether a walk of the tree lists directories and probes names through this operation's own
@@ -1218,7 +1218,7 @@ impl InstanceOperationImpl {
             finalized: AtomicBool::new(false),
             changed: AtomicBool::new(false),
             failed: AtomicBool::new(false),
-            modified_times: RecordedModifiedTimes::default(),
+            modified_times: Arc::default(),
             clock_floor: tokio::sync::OnceCell::new(),
         }
     }
@@ -1275,6 +1275,11 @@ impl InstanceOperationImpl {
     /// Collects an entry keyed by the caller, stored and discarded with the recorded times.
     pub fn record_modified_entry(&self, entry: crate::state::ModifiedTimeEntry) {
         self.modified_times.push(entry);
+    }
+
+    /// The operation's collector, for a clone whose files are stored and discarded with the rest.
+    pub fn modified_times(&self) -> Arc<RecordedModifiedTimes> {
+        self.modified_times.clone()
     }
 
     /// Takes the times collected so far. Times left behind are dropped with the operation,

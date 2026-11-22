@@ -4679,7 +4679,7 @@ async fn clone_added_link(
         operation: operation.clone(),
         options: Arc::default(),
         stats: Arc::default(),
-        modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
+        modified_times: operation.modified_times(),
     };
     let clone_states = link.filter.mount_states(&clone_path);
     clone::clone_node(
