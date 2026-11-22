@@ -4564,7 +4564,7 @@ async fn stage_from_parent_revision_in_operation(
         .flatten()
         .unwrap_or(current_revision);
 
-    let state = State::deserialize(repository.clone(), staged_revision)
+    let state = State::deserialize_staged(repository.clone(), staged_revision, current_revision)
         .await
         .forward::<StageError>("Failed to deserialize revision state")?;
 

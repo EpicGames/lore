@@ -513,9 +513,10 @@ pub(crate) async fn sync(
             .flatten()
         && !staged_revision.is_zero()
     {
-        let state_staged = state::State::deserialize(repository.clone(), staged_revision)
-            .await
-            .forward::<SyncError>("Failed to deserialize staged state")?;
+        let state_staged =
+            state::State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+                .await
+                .forward::<SyncError>("Failed to deserialize staged state")?;
         if state_staged
             .node_has_staged_children(repository.clone(), crate::node::ROOT_NODE)
             .await

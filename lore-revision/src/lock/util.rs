@@ -32,7 +32,7 @@ pub async fn lock_tree(
         .flatten()
         .unwrap_or(current_revision);
     Ok((
-        State::deserialize(repository.clone(), staged_revision).await?,
+        State::deserialize_staged(repository.clone(), staged_revision, current_revision).await?,
         branch,
     ))
 }

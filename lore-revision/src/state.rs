@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 pub(crate) mod block;
+mod counterpart;
 #[cfg(not(feature = "test-util"))]
 mod diff;
 #[cfg(feature = "test-util")]
@@ -35,6 +36,9 @@ use std::sync::atomic::Ordering;
 
 use bitflags::bitflags;
 use bytes::Bytes;
+pub(crate) use counterpart::find_counterpart_node;
+pub(crate) use counterpart::node_at_path;
+pub(crate) use counterpart::same_file_counterpart;
 pub(crate) use diff::DiffFlags;
 pub use diff::DiffWalkStats;
 pub use diff::GraftOracle;
@@ -1372,6 +1376,9 @@ pub struct State {
     /// The revision this tree was built on, with its signature, read apart from this tree the
     /// first time [`State::tracks`] asks about it.
     base: parking_lot::Mutex<Option<(Hash, Arc<State>)>>,
+    /// The revision a staged merge revision was built on where that is its second parent
+    /// ([`State::note_staged_on`]).
+    staged_on: std::sync::OnceLock<Hash>,
 }
 
 impl std::fmt::Debug for State {
@@ -2274,6 +2281,7 @@ impl State {
                 #[cfg(feature = "state-hooks")]
                     hooks: _,
                 base: _,
+                staged_on: _,
             } = state;
         };
         let state = Arc::<Self>::new_uninit();
@@ -2309,6 +2317,7 @@ impl State {
             #[cfg(feature = "state-hooks")]
             (&raw mut (*fields).hooks).write(crate::state::node::hooks::StateHooks::new());
             (&raw mut (*fields).base).write(parking_lot::Mutex::new(None));
+            (&raw mut (*fields).staged_on).write(std::sync::OnceLock::new());
             state.assume_init()
         }
     }
@@ -2329,7 +2338,8 @@ impl State {
     /// Load current and optionally staged states, plus the current branch.
     ///
     /// Returns `(current_state, staged_state, branch)` where `staged_state`
-    /// is `None` when nothing is staged.
+    /// is `None` when nothing is staged. A staged state built on the current revision holds it as
+    /// its base ([`Self::hold_current_where_staged_on`]).
     pub async fn deserialize_current_and_staged(
         repository: Arc<RepositoryContext>,
     ) -> Result<(Arc<Self>, Option<Arc<Self>>, BranchId), StateError> {
@@ -2343,13 +2353,31 @@ impl State {
             .ok()
             .flatten()
         {
-            Some(staged_revision) if staged_revision != current_revision => {
-                Some(State::deserialize(repository.clone(), staged_revision).await?)
-            }
+            Some(staged_revision) if staged_revision != current_revision => Some(
+                State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+                    .await?,
+            ),
             _ => None,
         };
+        if let Some(staged) = &state_staged {
+            staged.hold_current_where_staged_on(&state_current);
+        }
 
         Ok((state_current, state_staged, branch))
+    }
+
+    /// The state of `staged`, the staged revision of an instance whose current revision is
+    /// `current`, or of `current` itself where nothing is staged. A merge revision staged on
+    /// `current`, as a sync of divergent history stages one, is built on it ([`Self::built_on`]),
+    /// which only its signature tells.
+    pub async fn deserialize_staged(
+        repository: Arc<RepositoryContext>,
+        staged: Hash,
+        current: Hash,
+    ) -> Result<Arc<Self>, StateError> {
+        let state = Self::deserialize(repository, staged).await?;
+        state.note_staged_on(current);
+        Ok(state)
     }
 
     /// The state of revision `signature`, empty for a zero signature.
@@ -3216,23 +3244,47 @@ impl State {
         .forward::<StateError>("Failed to deserialize delta block")
     }
 
-    pub async fn node_delta(
+    /// The entry the delta of this revision records for `node`, a node it holds: one that isn't a
+    /// deletion. A revision whose tree was started from another revision records a deletion under
+    /// its first parent's node ID and every other change under its own, so one ID can carry both.
+    pub async fn node_change(
         &self,
         repository: Arc<RepositoryContext>,
         node: NodeID,
+    ) -> Result<Option<NodeDelta>, StateError> {
+        self.node_delta(repository, node, false).await
+    }
+
+    /// The deletion the delta of this revision records for `node`, a node of its first parent
+    /// ([`Self::node_change`]).
+    pub async fn node_deletion(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<Option<NodeDelta>, StateError> {
+        self.node_delta(repository, node, true).await
+    }
+
+    /// The entry the delta of this revision records for `node` that is a deletion where `deletion`
+    /// says, and one that isn't otherwise.
+    async fn node_delta(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+        deletion: bool,
     ) -> Result<Option<NodeDelta>, StateError> {
         let delta_block = self
             .delta_block(repository.clone())
             .await?
             .to_aligned::<NodeDelta>();
 
-        for node_delta in delta_block.as_type_slice::<NodeDelta>().iter() {
-            if node_delta.node == node {
-                return Ok(Some(*node_delta));
-            }
-        }
-
-        Ok(None)
+        Ok(delta_block
+            .as_type_slice::<NodeDelta>()
+            .iter()
+            .find(|entry| {
+                entry.node == node && (entry.action == FileAction::Delete as u16) == deletion
+            })
+            .copied())
     }
 
     /// Node blocks the tree has, whether or not any of them is in memory.
@@ -3964,10 +4016,10 @@ impl State {
     /// holds is only marked, as an add or a copy is, and the ignore rules apply to it
     /// ([ADR-00027](../../docs/developing/decisions/00027-ignore-filter-applies-to-untracked-paths-only.md)).
     ///
-    /// A tree shares its node IDs with the revision it was built on, so a node that revision
-    /// holds sits at the same ID, with the same type, in the revision's tree. The revision is read
-    /// apart from this tree, which a walk may be adding nodes to, the first time it is asked, and
-    /// kept for as long as this tree is built on it.
+    /// A tree shares its node IDs with the revision it was built on ([`Self::built_on`]), so a node
+    /// that revision holds sits at the same ID, with the same type, in the revision's tree. The
+    /// revision is read apart from this tree, which a walk may be adding nodes to, the first time
+    /// it is asked, and kept for as long as this tree is built on it.
     pub async fn tracks(
         &self,
         repository: &Arc<RepositoryContext>,
@@ -3979,8 +4031,17 @@ impl State {
         }
         // Boxed: a walk reaches this only where the ignore rules would leave a node out, and
         // unboxed the revision's read would sit in every walk future that asks.
-        Box::pin(self.base_holds(repository, self.committed_revision(), id, flags.node_type()))
-            .await
+        Box::pin(self.base_holds(repository, self.built_on(), id, flags.node_type())).await
+    }
+
+    /// The revision this tree was built on, which it shares its node IDs with: for a staged merge
+    /// revision built on its second parent, as a sync of divergent history stages one, that
+    /// revision ([`Self::note_staged_on`]), and its committed revision otherwise.
+    pub(crate) fn built_on(&self) -> Hash {
+        match self.staged_on.get() {
+            Some(&revision) if self.revision_number() == 0 => revision,
+            _ => self.committed_revision(),
+        }
     }
 
     /// Whether `base`, a revision this tree shares its node IDs with, holds a node of `node_type`
@@ -4106,10 +4167,29 @@ impl State {
             || (flags.contains(NodeFlags::Dirty) && self.tracks(repository, id, flags).await?))
     }
 
+    /// Holds `current`, the state of the revision the working tree holds, as the base this tree
+    /// shares its node IDs with where this tree is built on it ([`Self::built_on`]).
+    pub(crate) fn hold_current_where_staged_on(&self, current: &Arc<State>) {
+        if self.built_on() == current.revision() {
+            self.hold_base(current.clone());
+        }
+    }
+
     /// Holds `base`, the State of a revision this tree shares its node IDs with, as the one
-    /// [`Self::base`] answers for that revision, for a caller that has read it already.
+    /// [`Self::base`] answers for that revision, for a caller that has read it already, and notes
+    /// a merge revision staged on it ([`Self::note_staged_on`]).
     pub(crate) fn hold_base(&self, base: Arc<State>) {
+        self.note_staged_on(base.revision());
         *self.base.lock() = Some((base.revision(), base));
+    }
+
+    /// Notes `current`, the revision the working tree holds, as the revision this tree was built
+    /// on where this tree is a merge revision staged on it, as a sync of divergent history stages
+    /// one ([`Self::built_on`]).
+    fn note_staged_on(&self, current: Hash) {
+        if self.reconciles_divergent_history(current) {
+            let _ = self.staged_on.set(current);
+        }
     }
 
     /// Notes `directory`, marked dirty as moved, whose move a staged climb from a node below it
@@ -7939,9 +8019,11 @@ impl TreeAttribution {
 
     /// Attributes each listed entry the walked revision changed to it, merges included, so a merge
     /// stands for what it merged in. Matches the walked revision's delta against a set built from
-    /// the smaller of the two: the listed entries, or the delta. A delta that fails to read leaves
-    /// every listed entry unattributed, as which of them it changed is unknown. A read refused as
-    /// `SlowDown` fails the walk.
+    /// the smaller of the two: the listed entries, or the delta. A deletion in the delta changes no
+    /// listed entry: it names a node of the first parent ([`State::node_deletion`]), whose ID the
+    /// walked tree can hold for another node. A delta that fails to read leaves every listed entry
+    /// unattributed, as which of them it changed is unknown. A read refused as `SlowDown` fails the
+    /// walk.
     async fn finish(self, walk: &mut TreeWalk) -> Result<(), StateError> {
         if self.listed.is_empty() {
             return Ok(());
@@ -7963,7 +8045,10 @@ impl TreeAttribution {
                 return walk.attribution_failures.failed_unless_refused(err);
             }
         };
-        let deltas = delta.as_type_slice::<NodeDelta>();
+        let deltas = delta
+            .as_type_slice::<NodeDelta>()
+            .iter()
+            .filter(|delta| delta.action != FileAction::Delete as u16);
         let walked = self.state.revision();
         let mut index = 0;
         let mut attribute = |walk: &mut TreeWalk, entry: u32| {
@@ -7986,7 +8071,7 @@ impl TreeAttribution {
                 }
             }
         } else {
-            let changed: HashSet<NodeID> = deltas.iter().map(|delta| delta.node).collect();
+            let changed: HashSet<NodeID> = deltas.map(|delta| delta.node).collect();
             for &(entry, node) in &self.listed {
                 if changed.contains(&node) {
                     attribute(walk, entry);
@@ -9143,6 +9228,7 @@ pub async fn diff(
             repository_to,
             state_to,
             graft,
+            DiffFlags::empty(),
             changes,
             filter_mode,
         )
@@ -9150,21 +9236,46 @@ pub async fn diff(
     }
 }
 
-/// The walk of a whole-tree diff from the two roots, beside the warm-up of the node blocks the
-/// trees differ in where the walk reads them ([`may_warm_differing_blocks`]) and the context can
-/// fetch. The warm-up is started before the walk, so that the blocks deep in the trees are on their
-/// way while the walk still lists the directories above them, rather than each fetched as it is
-/// reached, and is finished once the walk ends.
+/// The diff of the whole of `state_to` against the whole of `state_from`, two trees of
+/// `repository`, as a revision's delta records it: through no filter, with a link whose pin
+/// differs reported as a change of the link node, the walk not descending into the linked
+/// repository.
+pub(crate) fn diff_for_delta<'a>(
+    repository: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    state_to: Arc<State>,
+    changes: &'a ChangeSender,
+) -> impl Future<Output = Result<DiffWalkStats, StateError>> + 'a {
+    diff_whole_trees(
+        repository.clone(),
+        state_from,
+        repository,
+        state_to,
+        None,
+        DiffFlags::ReportsLinkNodes,
+        changes,
+        FilterMode::empty(),
+    )
+}
+
+/// The walk of a whole-tree diff from the two roots, with `flags` joined to the flags the sides
+/// derive, beside the warm-up of the node blocks the trees differ in where the walk reads them
+/// ([`may_warm_differing_blocks`]) and the context can fetch. The warm-up is started before the
+/// walk, so that the blocks deep in the trees are on their way while the walk still lists the
+/// directories above them, rather than each fetched as it is reached, and is finished once the
+/// walk ends.
 ///
 /// Not an `async fn`, and the walk's future carries the warm-up, so that [`diff`]'s future holds
 /// the walk's alone: held in its body, the warm-up through the walk and the walk's answer through
 /// the warm-up's end would each take a place of their own in it.
+#[allow(clippy::too_many_arguments)]
 fn diff_whole_trees<'a>(
     repository_from: Arc<RepositoryContext>,
     state_from: Arc<State>,
     repository_to: Arc<RepositoryContext>,
     state_to: Arc<State>,
     graft: Option<Arc<GraftOracle>>,
+    flags: DiffFlags,
     changes: &'a ChangeSender,
     filter_mode: FilterMode,
 ) -> impl Future<Output = Result<DiffWalkStats, StateError>> + 'a {
@@ -9195,11 +9306,12 @@ fn diff_whole_trees<'a>(
         mode: 0,
     };
     futures::FutureExt::then(
-        diff::diff_subtree(
+        diff::diff_subtree_flagged(
             side(repository_from, state_from),
             side(repository_to, state_to),
             RelativePath::new(),
             graft,
+            flags,
             changes,
             filter_mode,
         ),
@@ -10047,7 +10159,7 @@ async fn left_by_staged_move(
     repository: &Arc<RepositoryContext>,
     directory: NodeID,
 ) -> Result<bool, StateError> {
-    let revision = state.committed_revision();
+    let revision = state.built_on();
     if revision.is_zero() {
         return Ok(false);
     }

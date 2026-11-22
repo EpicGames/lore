@@ -151,3 +151,43 @@ def test_tree_attribution_crosses_a_link(new_lore_repo, lore_grpc_target):
     assert nodes["vendor/inner.txt"].last_revision.signature == linked_signature, (
         "an entry under a link must carry the linked repository's revision signature"
     )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "deleted", [1, 4], ids=["more-entries-than-changes", "more-changes-than-entries"]
+)
+def test_tree_attribution_of_a_sync_merge_passes_over_a_deletion_under_a_reused_node_id(
+    new_lore_repo, lore_grpc_target, deleted
+):
+    """The local history deletes files the remote latest holds, and a sync merges the remote
+    latest into it. The merge revision records each deletion under the remote latest's node ID.
+    `remote.txt`, which the merge brings in unchanged from the remote latest, takes a node slot a
+    deletion freed in the local tree, so it shares its node ID with a deleted file. It is
+    attributed to the remote revision that added it, not to the merge, whether the walk matches
+    the merge's delta against its entries or its entries against the delta."""
+    repo: Lore = new_lore_repo()
+    gone = [f"gone-{index}.txt" for index in range(deleted)]
+    repo.write_commit_push("Base", {"base.txt": "base\n"} | {path: f"{path}\n" for path in gone})
+    clone = repo.clone()
+    repo.write_commit_push("Add a remote file", {"remote.txt": "remote\n"})
+
+    for path in gone:
+        clone.remove_file(path)
+    clone.stage(gone)
+    clone.commit("Delete files", local=True)
+    clone.sync()
+    clone.push()
+
+    repository_id, signature = wire_identity(clone)
+    nodes = _by_path(
+        revision_tree(
+            lore_grpc_target, repository_id, signature, include_last_revision=True
+        ).nodes
+    )
+    named = nodes["remote.txt"].last_revision
+    assert named is not None, "remote.txt must be attributed"
+    assert named.commit_message == "Add a remote file", (
+        f"remote.txt must be attributed to the revision that added it, "
+        f"got {named.commit_message!r}"
+    )

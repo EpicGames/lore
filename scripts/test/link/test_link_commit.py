@@ -820,10 +820,10 @@ def test_link_scoped_commit_consecutive(new_lore_repo):
 def test_link_scoped_commit_onto_an_advanced_link_branch_records_its_deletions(
     new_lore_repo,
 ):
-    """A link-scoped commit through one mount of a linked repository, after commits through
-    another mount advanced the link branch, records a deletion only where the branch's latest
-    holds the deleted file: not that of a file the latest deleted already, whose slot it reuses
-    for a file it adds."""
+    """Committing a link's changes through one mount of a linked repository, after revisions
+    committed through another mount advanced the link branch, records the revision's change from
+    the branch's latest: no deletion of a file the latest deleted already, whose slot it reuses for
+    a file it adds."""
     parent = make_repo(new_lore_repo, {"parent-file.txt": "parent content\n"})
     link_repo = make_repo(new_lore_repo, {"g.txt": "g\n", "keep.txt": "keep\n"})
     for mount in ("a", "b"):
@@ -847,7 +847,9 @@ def test_link_scoped_commit_onto_an_advanced_link_branch_records_its_deletions(
     deltas = parse_jsonl(
         link_repo.revision_info(delta=True, json=True), "revisionInfoDelta"
     )
-    assert [delta for delta in deltas if delta["action"] == "delete"] == [], deltas
+    deleted = [delta["path"] for delta in deltas if delta["action"] == "delete"]
+    assert "g.txt" not in deleted, deltas
+    assert link_repo.file_exists("h.txt") == ("h.txt" not in deleted), deltas
 
 
 @pytest.mark.smoke

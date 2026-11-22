@@ -836,6 +836,49 @@ async fn a_walk_leaving_link_pins_reports_a_link_only_where_its_mount_changes() 
         .await;
 }
 
+/// A walk reporting link nodes reports a link whose pin changed as a change of the link node and
+/// reads nothing of the linked repository: the pins here name revisions the store doesn't hold,
+/// which a walk that descends fails to read.
+#[tokio::test]
+async fn a_walk_reporting_link_nodes_reports_a_repinned_link_on_its_node_unread() {
+    let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let repository = in_memory::repository(immutable, mutable);
+            let target_id: RepositoryId = Context::from(uuid::Uuid::now_v7()).into();
+            let parent = async |pin: Hash| {
+                let state = State::new();
+                in_memory::add(
+                    &state,
+                    repository.clone(),
+                    ROOT_NODE,
+                    link_node("lib", target_id, pin, ROOT_NODE),
+                    "lib",
+                )
+                .await;
+                let revision =
+                    in_memory::commit(&repository, &state, Hash::default(), in_memory::branch_id())
+                        .await;
+                in_memory::revision_state(&repository, revision).await
+            };
+            let from = parent(Hash::from_u64(1)).await;
+            let to = parent(Hash::from_u64(2)).await;
+
+            assert_eq!(
+                walk_flagged(
+                    &repository,
+                    &from,
+                    &to,
+                    DiffFlags::ReportsLinkNodes,
+                    FilterMode::empty(),
+                )
+                .await,
+                vec![("M".to_string(), "lib".to_string())]
+            );
+        })
+        .await;
+}
+
 /// A whole-tree diff warms the node blocks its two trees differ in where both sides are of one
 /// repository, the filter of each takes in the whole tree for the walk's mode, and a graft adopts
 /// nothing. A view leaving a path out, on either side, prunes the walk, unless the mode leaves the

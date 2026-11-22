@@ -6262,20 +6262,24 @@ mod tests {
             .await
             .expect("Deserialize failed");
         let link = state.find_node_link(repository.clone(), path).await.ok();
-        let change = match link.as_ref().map(|link| link.node).or(held) {
-            Some(node) => state
-                .node_delta(repository.clone(), node)
+        let delta = match (link.as_ref(), held) {
+            (Some(link), _) => state
+                .node_change(repository.clone(), link.node)
                 .await
-                .expect("The delta reads")
-                .map(|delta| {
-                    (
-                        action_letter(delta.action),
-                        lore_revision::change::Flags::from_bits_retain(delta.flags)
-                            .contains(lore_revision::change::Flags::Merge),
-                    )
-                }),
-            None => None,
+                .expect("The delta reads"),
+            (None, Some(node)) => state
+                .node_deletion(repository.clone(), node)
+                .await
+                .expect("The delta reads"),
+            (None, None) => None,
         };
+        let change = delta.map(|delta| {
+            (
+                action_letter(delta.action),
+                lore_revision::change::Flags::from_bits_retain(delta.flags)
+                    .contains(lore_revision::change::Flags::Merge),
+            )
+        });
         let file = match link {
             Some(link) => Some((
                 String::from_utf8_lossy(&committed_content(repository, revision, path).await)

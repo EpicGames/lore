@@ -450,7 +450,7 @@ pub(crate) async fn restore(
     .await
     .forward::<RestoreError>("pruning dirty nodes before rehash")?;
 
-    let modified_times = commit::rehash_tree_in_operation(
+    let (modified_times, _) = commit::rehash_tree_in_operation(
         repository.clone(),
         token.share(),
         state_staged.clone(),
@@ -473,10 +473,12 @@ pub(crate) async fn restore(
             .forward::<RestoreError>("serializing metadata")?,
     );
 
-    commit::weave_history(
+    commit::weave_changes(
         repository.clone(),
         new_state.clone(),
         commit::BasedOn::FirstParent,
+        &[],
+        None,
     )
     .await
     .forward::<RestoreError>("weaving history")?;

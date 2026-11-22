@@ -12,6 +12,7 @@ use super::DependencyError;
 use super::add::resolve_path;
 use super::load_dependency_data;
 use super::resolve::transitive_closure;
+use crate::lore::Hash;
 use crate::lore::execution_context;
 use crate::node::NodeID;
 use crate::repository::RepositoryContext;
@@ -63,26 +64,28 @@ pub async fn list_file_dependencies(
     depth_limit: u32,
     revision_specifier: Option<String>,
 ) -> Result<Vec<ListFileResult>, DependencyError> {
-    let signature = if let Some(rev) = revision_specifier {
-        revision::resolve(
+    let (signature, current_revision) = if let Some(rev) = revision_specifier {
+        let resolved = revision::resolve(
             repository.clone(),
             rev,
             execution_context().globals().search_location(),
         )
         .await
-        .forward::<DependencyError>("resolving revision")?
+        .forward::<DependencyError>("resolving revision")?;
+        (resolved, Hash::default())
     } else {
         let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
             .await
             .forward::<DependencyError>("deserializing current anchor")?;
-        crate::instance::load_staged_revision(&repository)
+        let staged_revision = crate::instance::load_staged_revision(&repository)
             .await
             .ok()
             .flatten()
-            .unwrap_or(current_revision)
+            .unwrap_or(current_revision);
+        (staged_revision, current_revision)
     };
 
-    let state = state::State::deserialize(repository.clone(), signature)
+    let state = state::State::deserialize_staged(repository.clone(), signature, current_revision)
         .await
         .forward::<DependencyError>("deserializing state")?;
 

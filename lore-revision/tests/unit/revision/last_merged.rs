@@ -11,7 +11,6 @@ use lore_revision::change::FileAction;
 use lore_revision::change::NodeChange;
 use lore_revision::change::NodeChangeState;
 use lore_revision::commit::BasedOn;
-use lore_revision::commit::weave_history;
 use lore_revision::lore::BranchId;
 use lore_revision::node::*;
 use lore_revision::repository::RepositoryContext;
@@ -375,7 +374,7 @@ async fn the_walk_stops_at_the_revision_the_target_added_the_file_in() {
 }
 
 /// The remote side merges `shared.txt` from the source branch at another node ID than the merge
-/// of divergent history after it gives the file, and `weave_history` records both. The walk from
+/// of divergent history after it gives the file, and the history weave records both. The walk from
 /// that merge follows the node ID the history records and finds the merge from the source branch.
 #[tokio::test]
 async fn the_last_merged_revision_is_found_past_a_woven_merge_of_divergent_history() {
@@ -439,9 +438,7 @@ async fn the_last_merged_revision_is_found_past_a_woven_merge_of_divergent_histo
         let remote_commit = commit(&repository, &remote, branch_point, target).await;
         let remote = revision_state(&repository, remote_commit).await;
         remote.set_parent_other(merged_from_source);
-        weave_history(repository.clone(), remote.clone(), BasedOn::FirstParent)
-            .await
-            .expect("weaving the merge from the source branch");
+        in_memory::weave_recorded_delta(&repository, &remote, BasedOn::FirstParent).await;
         let remote_latest = remote
             .serialize(repository.clone(), &token())
             .await
@@ -474,9 +471,7 @@ async fn the_last_merged_revision_is_found_past_a_woven_merge_of_divergent_histo
         let merge = revision_state(&repository, merged).await;
         merge.set_parent_self(remote_latest);
         merge.set_parent_other(local_latest);
-        weave_history(repository.clone(), merge.clone(), BasedOn::Other)
-            .await
-            .expect("weaving the merge of divergent history");
+        in_memory::weave_recorded_delta(&repository, &merge, BasedOn::Other).await;
 
         let found = find_last_merged_revision(
             &change_at(&repository, &merge, shared_in_merge, "shared.txt"),

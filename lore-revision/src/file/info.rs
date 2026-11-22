@@ -255,9 +255,10 @@ async fn info_trees(
     else {
         return Ok((state.clone(), InfoTree::committed(state)));
     };
-    let tree = State::deserialize(repository.clone(), staged)
+    let tree = State::deserialize_staged(repository.clone(), staged, current_revision)
         .await
         .forward::<InfoError>("Failed deserializing the staged state")?;
+    tree.hold_current_where_staged_on(&state);
     Ok((
         state,
         InfoTree {

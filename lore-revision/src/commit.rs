@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
@@ -10,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use bytes::Bytes;
 use bytes::BytesMut;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
@@ -793,11 +795,12 @@ async fn commit_staged_with_layers(
         return Err(BranchAdvanced.into());
     }
 
-    let state_staged = State::deserialize(repository.clone(), staged_revision)
-        .await
-        .forward_with::<CommitError, _>(|| {
-            format!("Failed to deserialize revision state {staged_revision}")
-        })?;
+    let state_staged =
+        State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+            .await
+            .forward_with::<CommitError, _>(|| {
+                format!("Failed to deserialize revision state {staged_revision}")
+            })?;
     let state_current = State::deserialize(repository.clone(), current_revision)
         .await
         .forward_with::<CommitError, _>(|| {
@@ -1272,11 +1275,12 @@ async fn commit_link_only(
         Ok(Some(revision)) if revision != current_revision => revision,
         _ => return Err(NothingStaged.into()),
     };
-    let state_parent_staged = State::deserialize(repository.clone(), parent_staged_revision)
-        .await
-        .forward_with::<CommitError, _>(|| {
-            format!("Failed to deserialize revision state {parent_staged_revision}")
-        })?;
+    let state_parent_staged =
+        State::deserialize_staged(repository.clone(), parent_staged_revision, current_revision)
+            .await
+            .forward_with::<CommitError, _>(|| {
+                format!("Failed to deserialize revision state {parent_staged_revision}")
+            })?;
 
     // Resolve the link in both staged and current parent states
     let resolved_staged =
@@ -1983,7 +1987,10 @@ async fn commit_staged_revision(
         // root hash.
         // A clone: the block's own reference serves the serialize below, so no second slot holds
         // one across the walk's await.
-        commit_files_and_rehash(
+        let StagedChanges {
+            delta: staged,
+            first_parent,
+        } = commit_files_and_rehash(
             operation.clone(),
             repository.clone(),
             token.share(),
@@ -2001,6 +2008,7 @@ async fn commit_staged_revision(
             gone,
         )
         .await?;
+        let changes = staged.to_aligned::<NodeDelta>();
 
         let metadata_hash = metadata
             .serialize_with_tracker(repository.clone(), Some(work_tracker.clone()))
@@ -2038,7 +2046,14 @@ async fn commit_staged_revision(
             lore_debug!("Force commit of identical merkle tree");
         }
 
-        weave_history(repository.clone(), state_staged.clone(), based_on).await?;
+        weave_changes(
+            repository.clone(),
+            state_staged.clone(),
+            based_on,
+            changes.as_type_slice::<NodeDelta>(),
+            first_parent,
+        )
+        .await?;
 
         // Before the save, with the discards done, as nothing else frees a slot left detached or
         // in flight (C15).
@@ -2547,11 +2562,12 @@ async fn made_over(
 
 /// Fragments every file the state holds and rehashes the directories the changes reach.
 ///
-/// `based_on` says whether the tree was built on its self parent, sharing its node IDs, or on
+/// `based_on` says whether the tree was built on its first parent, sharing its node IDs, or on
 /// another revision ([`DeletionBase`]). Where it was, the delta's deletions are recorded against
 /// the revision the state is staged on or was loaded from, read before the walk, as a caller
-/// rebuilding a committed revision's tree sets its parents after; where it was not, under the IDs
-/// of their counterparts in the self parent.
+/// rebuilding a committed revision's tree sets its parents after; where it was not, the walk
+/// records no deletion, and the revision records its diff from the first parent
+/// ([`rehash_and_record_delta`]). Answers the changes staged on the tree ([`StagedChanges`]).
 ///
 /// The walk starts at `node_id`, which `relative_path` is the working-tree path of: the root of
 /// the repository for a commit that covers the whole of one, and the path a link or layer is
@@ -2585,7 +2601,7 @@ pub(crate) async fn commit_files_and_rehash(
     stats: Arc<CommitStats>,
     progress_interval: std::time::Duration,
     gone: Option<Arc<Gone>>,
-) -> Result<(), CommitError> {
+) -> Result<StagedChanges, CommitError> {
     lore_info!("Fragmenting files and updating tree hashes");
 
     event::LoreEvent::RevisionCommitBegin(LoreRevisionCommitBeginEventData::default()).send();
@@ -2628,7 +2644,7 @@ pub(crate) async fn commit_files_and_rehash(
     })
     .send();
 
-    rehash_and_record_delta(repository, state, delta, tracker).await
+    rehash_and_record_delta(repository, state, based_on, delta, tracker).await
 }
 
 /// Commits the staged nodes of `walk`'s state from `node_id`, the node at `relative_path` in the
@@ -2666,7 +2682,7 @@ async fn commit_walks(
     let subnodes_to_discard = walk.subnodes_to_discard.clone();
     let handed = walk.handed.clone();
     let gone = walk.gone.clone();
-    let base = DeletionBase::of(state.committed_revision(), state.parent_self(), based_on);
+    let base = DeletionBase::of(state.committed_revision(), based_on);
 
     if node_id != ROOT_NODE {
         if staged_for_deletion(&repository, &state, node_id).await? {
@@ -2782,13 +2798,20 @@ pub(crate) async fn staged_for_deletion(
     Ok(false)
 }
 
-/// Rehashes the directories the commit of `state` changed and records `delta`, its changes.
+/// Rehashes the directories the staged changes of `state` reach and records its node delta,
+/// answering `delta`, the changes staged on its tree, for the history weave ([`weave_changes`]).
+///
+/// A tree [based on](BasedOn) its first parent records `delta`. A tree based on another revision
+/// records its change from the first parent ([`self_parent_delta`]), as every reader of a delta
+/// takes it: the staged changes are its change from the revision it was built on. The first
+/// parent's tree, read for that diff, is answered for the weave to read it once.
 async fn rehash_and_record_delta(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
+    based_on: BasedOn,
     delta: Arc<parking_lot::RwLock<BytesMut>>,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
-) -> Result<(), CommitError> {
+) -> Result<StagedChanges, CommitError> {
     rehash_directory(repository.clone(), state.clone(), ROOT_NODE).await?;
 
     state
@@ -2797,11 +2820,142 @@ async fn rehash_and_record_delta(
         .forward::<CommitError>("Failed to update tree root hash")?;
     lore_debug!("Rehashed merkle tree");
 
-    generate_delta_block(repository, state, delta, Some(tracker)).await
+    let staged = delta.write().split().freeze();
+    let (recorded, first_parent) = match based_on {
+        BasedOn::FirstParent => (staged.clone(), None),
+        BasedOn::Other => {
+            let parent = State::deserialize(repository.clone(), state.parent_self())
+                .await
+                .forward_any::<CommitError>("Failed reading the first parent's tree")?;
+            let recorded = Box::pin(self_parent_delta(&repository, &state, parent.clone())).await?;
+            (recorded, Some(parent))
+        }
+    };
+    generate_delta_block(repository, state, recorded, Some(tracker)).await?;
+    Ok(StagedChanges {
+        delta: staged,
+        first_parent,
+    })
+}
+
+/// The changes staged on the tree of a revision being committed, for the history weave
+/// ([`weave_changes`]), and the first parent's tree where it was read to record the delta.
+pub(crate) struct StagedChanges {
+    pub(crate) delta: Bytes,
+    pub(crate) first_parent: Option<Arc<State>>,
+}
+
+/// The node delta of `state`, a tree built on another revision than its first parent
+/// ([`BasedOn::Other`]), as its change from `parent`, the first parent's tree: the diff of it
+/// against this one ([`state::diff_for_delta`]), with adds and deletes of one file paired into
+/// moves. A node the tree holds is named by its ID here and a deleted node by its ID in the first
+/// parent, where a reader looks each up. A link whose pin changed is recorded on its node, and each
+/// directory the tree holds above a change is recorded as kept ([`directories_above`]), as the
+/// delta of a revision committed on its first parent records each directory its staged changes
+/// reach. Every change of a revision with a second parent is marked as merged.
+///
+/// Boxed by its caller: only a revision whose tree was started from another revision reaches it.
+async fn self_parent_delta(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    parent: Arc<State>,
+) -> Result<Bytes, CommitError> {
+    let walk_repository = repository.clone();
+    let to = state.clone();
+    let mut changes = state::ChangeStream::spawn(async move |changes| {
+        state::diff_for_delta(walk_repository, parent, to, &changes).await
+    })
+    .collect()
+    .await
+    .forward_any::<CommitError>("Failed diffing the tree against its first parent")?;
+    state::detect_and_coalesce_moves(&mut changes);
+    let directories = directories_above(repository, state, &changes).await?;
+
+    let merged = if state.parent_other().is_zero() {
+        change::Flags::None
+    } else {
+        change::Flags::Merge
+    };
+    let mut delta =
+        BytesMut::with_capacity((changes.len() + directories.len()) * size_of::<NodeDelta>());
+    for change in &changes {
+        let node = if change.action == FileAction::Delete {
+            change.from.mapping.node
+        } else {
+            change.to.mapping.node
+        };
+        let entry = NodeDelta {
+            node,
+            _unused: 0,
+            action: change.action as u16,
+            flags: ((change.flags & change::Flags::Modify) | merged).bits(),
+        };
+        delta.extend_from_slice(entry.as_bytes());
+    }
+    for &node in &directories {
+        let entry = NodeDelta {
+            node,
+            _unused: 0,
+            action: FileAction::Keep as u16,
+            flags: merged.bits(),
+        };
+        delta.extend_from_slice(entry.as_bytes());
+    }
+    Ok(delta.freeze())
+}
+
+/// The directories of `state` above the paths `changes` reach, a move's source included, below the
+/// root and each once, that `changes` doesn't name itself. Each is found below the one above it, as
+/// the sorted paths list a directory before those below it.
+async fn directories_above(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    changes: &[change::NodeChange],
+) -> Result<Vec<NodeID>, CommitError> {
+    let mut paths = BTreeSet::new();
+    for change in changes {
+        for path in std::iter::once(change.path()).chain(change.move_source()) {
+            let mut path = path.as_str();
+            while let Some((parent, _)) = path.rsplit_once('/') {
+                if !paths.insert(parent) {
+                    break;
+                }
+                path = parent;
+            }
+        }
+    }
+    let named: HashSet<NodeID> = changes
+        .iter()
+        .filter(|change| change.action != FileAction::Delete)
+        .map(|change| change.to.mapping.node)
+        .collect();
+    let mut found = HashMap::with_capacity(paths.len());
+    let mut directories = Vec::with_capacity(paths.len());
+    for path in paths {
+        let (root, name) = match path.rsplit_once('/') {
+            Some((parent, name)) => match found.get(parent) {
+                Some(&parent) => (parent, name),
+                None => continue,
+            },
+            None => (ROOT_NODE, path),
+        };
+        let Some(node) = state::node_at_path(repository, state, root, name)
+            .await
+            .forward::<CommitError>("Failed reading a directory above a change in the tree")?
+        else {
+            continue;
+        };
+        found.insert(path, node);
+        if !named.contains(&node) {
+            directories.push(node);
+        }
+    }
+    Ok(directories)
 }
 
 /// Rehashes the whole of `state` under one filesystem operation, answering with the modified
-/// times the fragmenting recorded.
+/// times the fragmenting recorded and the node delta it records, for the history weave
+/// ([`weave_changes`]).
 ///
 /// For a caller rebuilding a tree it assembled itself -- a merge, a restore -- rather than one
 /// committing what a working tree holds staged. The times are the caller's to store against the
@@ -2816,7 +2970,7 @@ pub(crate) async fn rehash_tree_in_operation(
     state: Arc<State>,
     metadata: Arc<Metadata>,
     branch: BranchId,
-) -> Result<Arc<RecordedModifiedTimes>, CommitError> {
+) -> Result<(Arc<RecordedModifiedTimes>, Bytes), CommitError> {
     let tracker = Arc::new(lore_storage::write_tracker::WriteTracker::new());
     let modified_times = Arc::new(RecordedModifiedTimes::below(
         crate::state::read_clock_floor(&repository).await,
@@ -2843,9 +2997,9 @@ pub(crate) async fn rehash_tree_in_operation(
     })
     .await;
     let drained = tracker.await_all().await;
-    rehashed?;
+    let delta = rehashed?.delta;
     drained.forward::<CommitError>("Background fragment upload task failed during rehash")?;
-    Ok(modified_times)
+    Ok((modified_times, delta))
 }
 
 #[lore_macro::test_pub]
@@ -4249,7 +4403,7 @@ fn count_totals(stats: &CommitStats, flags: impl Iterator<Item = u16>) {
 }
 
 /// `flags`, of a node the commit removes from the revision, staged for deletion, whatever change
-/// it carried. The deletion of a node staged as added is recorded as [`recorded_deletions`]
+/// it carried. The deletion of a node staged as added is recorded as [`unrecorded_deletions`]
 /// answers: as nothing where the revision the tree was built on lacks it.
 fn deleted_flags(flags: u16) -> u16 {
     (flags & !NodeFlags::ActionBits.bits()) | NodeFlags::StagedDelete.bits()
@@ -5210,7 +5364,7 @@ fn hand_directories(
 
 /// Frees the nodes staged for deletion, `discard`, and the nodes below them a walk collected,
 /// `subnodes_to_discard`, each with its flags, recording each deletion in the delta as `base` says
-/// ([`recorded_deletions`]): a root under the flags it is listed with, and a node below one as a
+/// ([`unrecorded_deletions`]): a root under the flags it is listed with, and a node below one as a
 /// deletion whatever change it is listed with ([`deleted_flags`]). Each root is detached before
 /// anything below it is freed (H6).
 ///
@@ -5227,7 +5381,7 @@ async fn commit_discard(
     subnodes_to_discard: &parking_lot::RwLock<Vec<(NodeID, u16)>>,
     stats: Arc<CommitStats>,
 ) -> Result<(), CommitError> {
-    let (roots, below, recorded, records, mut dropped) = {
+    let (roots, below, unrecorded, records, mut dropped) = {
         let roots = std::mem::take(&mut *discard.write());
         if roots.is_empty() {
             return Ok(());
@@ -5251,28 +5405,32 @@ async fn commit_discard(
         }
 
         let records = !matches!(base, DeletionBase::Unrecorded);
-        let recorded = recorded_deletions(&state, &repository, base, &roots, &collected).await?;
+        let unrecorded =
+            unrecorded_deletions(&state, &repository, base, &roots, &collected).await?;
         let mut dropped = Dropped::default();
         if records {
             let mut delta = delta.write();
             delta.reserve(collected.len() * size_of::<NodeDelta>());
             for &(node, flags) in &collected {
-                match recorded_as(&recorded, records, node) {
-                    Some(recorded) => delta_push(&mut delta, recorded, deleted_flags(flags)),
-                    None => dropped.count(flags),
+                if unrecorded.binary_search(&node).is_err() {
+                    delta_push(&mut delta, node, deleted_flags(flags));
+                } else {
+                    dropped.count(flags);
                 }
             }
         }
         let below: Vec<NodeID> = collected.into_iter().map(|(node, _)| node).collect();
-        (roots, below, recorded, records, dropped)
+        (roots, below, unrecorded, records, dropped)
     };
 
     let counts = state::node_discard_free(&state, &repository, &roots, below, |root, flags| {
         lore_trace!("Committing deletion of node {root}");
-        match recorded_as(&recorded, records, root) {
-            Some(recorded) => delta_add(delta.clone(), recorded, flags),
-            None if records => dropped.count(flags),
-            None => {}
+        if records {
+            if unrecorded.binary_search(&root).is_err() {
+                delta_add(delta.clone(), root, flags);
+            } else {
+                dropped.count(flags);
+            }
         }
     })
     .await
@@ -5298,7 +5456,7 @@ async fn commit_discard(
 }
 
 /// The nodes a commit discards that it records no deletion of, as the revision it was built on
-/// lacks them ([`recorded_deletions`]): an add dropped, which the counts of deletions leave out.
+/// lacks them ([`unrecorded_deletions`]): an add dropped, which the counts of deletions leave out.
 #[derive(Default)]
 struct Dropped {
     files: u32,
@@ -5316,72 +5474,46 @@ impl Dropped {
     }
 }
 
-/// The ID a commit records the deletion of `node` under, from `recorded`, the exceptions
-/// [`recorded_deletions`] answers: its own where it is none of them and the commit `records`
-/// deletions.
-fn recorded_as(
-    recorded: &[(NodeID, Option<NodeID>)],
-    records: bool,
-    node: NodeID,
-) -> Option<NodeID> {
-    match recorded.binary_search_by_key(&node, |&(looked_up, _)| looked_up) {
-        Ok(index) => recorded[index].1,
-        Err(_) => records.then_some(node),
-    }
-}
-
 /// What a commit records the deletions of the nodes it discards against.
 #[derive(Clone, Copy, Debug)]
 enum DeletionBase {
     /// The revision the tree was built on, sharing its node IDs: a deletion is recorded where that
     /// revision holds the node.
     Shared(Hash),
-    /// The self parent of a tree built on another revision, whose node IDs the tree may not share:
-    /// a deletion is recorded under the ID of the node's counterpart there
-    /// ([`find_counterpart_node`]), and none where it has none. A directory the self parent holds
-    /// at another path has none, and neither has a file it holds at another path under another
-    /// ID.
-    Counterparts(Hash),
-    /// None: no deletion is recorded, for a tree with no revision before it or a delta not kept.
+    /// None: no deletion is recorded, for a tree with no revision before it, and for a tree built
+    /// on another revision than its first parent, whose delta is its diff from the first parent
+    /// ([`self_parent_delta`]).
     Unrecorded,
 }
 
 impl DeletionBase {
     /// The base of a tree `committed`, the revision it was staged on or loaded from, as `based_on`
-    /// says, with the self parent `parent_self`.
-    fn of(committed: Hash, parent_self: Hash, based_on: BasedOn) -> Self {
+    /// says.
+    fn of(committed: Hash, based_on: BasedOn) -> Self {
         match based_on {
             BasedOn::FirstParent if !committed.is_zero() => DeletionBase::Shared(committed),
-            BasedOn::Other if !parent_self.is_zero() => DeletionBase::Counterparts(parent_self),
             _ => DeletionBase::Unrecorded,
         }
     }
 }
 
-/// The exceptions to recording the deletion of each node among `roots`, the nodes of `state` a
-/// commit staged for deletion, and `collected`, the nodes below them, each with its flags, under
-/// its own ID: each with the ID it records its deletion under, or `None` where it records none,
-/// sorted by node. A node none of them records its deletion under its own ID, unless `base` is
-/// [`DeletionBase::Unrecorded`]. The delta names a deleted node by its ID in the self parent, where
-/// a reader looks it up.
+/// The nodes among `roots`, the nodes of `state` a commit staged for deletion, and `collected`,
+/// the nodes below them, each with its flags, whose deletion the commit records no entry for,
+/// sorted. Every other node records its deletion under its own ID, unless `base` is
+/// [`DeletionBase::Unrecorded`].
 ///
 /// [`DeletionBase::Shared`] looks up only a node carrying a staged or dirty mark, in the revision
 /// the tree was built on. The tree shares its node IDs with that revision and frees no slot it
 /// holds before the commit: it stages the deletion of such a node rather than detaching it. So a
 /// node with neither mark is held there as it is here, and a node added since takes a slot that
 /// revision holds no live node in, which [`State::base_lacks`] answers lacking.
-///
-/// [`DeletionBase::Counterparts`] looks up every node, marked or not, as the tree may not share
-/// its node IDs with the self parent: each is recorded under its counterpart there where it holds
-/// one of the same type, and not at all where it holds none, as for a deletion the self parent
-/// made itself ([`counterpart_deletions`]).
-async fn recorded_deletions(
+async fn unrecorded_deletions(
     state: &State,
     repository: &Arc<RepositoryContext>,
     base: DeletionBase,
     roots: &[(NodeID, u16)],
     collected: &[(NodeID, u16)],
-) -> Result<Vec<(NodeID, Option<NodeID>)>, CommitError> {
+) -> Result<Vec<NodeID>, CommitError> {
     match base {
         DeletionBase::Unrecorded => Ok(Vec::new()),
         DeletionBase::Shared(base) => {
@@ -5393,76 +5525,12 @@ async fn recorded_deletions(
                     flags & (NodeFlags::Staged.bits() | NodeFlags::Dirty.bits()) != 0
                 })
                 .map(|(node, flags)| (node, NodeFlags::from_bits_retain(flags)));
-            Ok(state
+            state
                 .base_lacks(repository, base, nodes)
                 .await
-                .forward::<CommitError>("Failed reading the tree the commit was built on")?
-                .into_iter()
-                .map(|node| (node, None))
-                .collect())
-        }
-        DeletionBase::Counterparts(parent) => {
-            Box::pin(counterpart_deletions(
-                state, repository, parent, roots, collected,
-            ))
-            .await
+                .forward::<CommitError>("Failed reading the tree the revision was built on")
         }
     }
-}
-
-/// [`recorded_deletions`] for [`DeletionBase::Counterparts`], the self parent `parent`. A node is
-/// first taken as the same file at the same ID ([`same_file_counterpart`]), and else looked up at
-/// its path, unless its directory has no counterpart at its own path, which leaves none at any
-/// path below it: the nodes come a directory before those below it, roots first. Boxed, as only a
-/// merge reconciling divergent history and a state moved onto another revision reach it.
-async fn counterpart_deletions(
-    state: &State,
-    repository: &Arc<RepositoryContext>,
-    parent: Hash,
-    roots: &[(NodeID, u16)],
-    collected: &[(NodeID, u16)],
-) -> Result<Vec<(NodeID, Option<NodeID>)>, CommitError> {
-    let parent = State::deserialize(repository.clone(), parent)
-        .await
-        .forward_any::<CommitError>("Failed reading the self parent's tree")?;
-    let block_count = parent
-        .tree(repository.clone())
-        .await
-        .forward::<CommitError>("Failed reading the self parent's tree")?
-        .block_count;
-    let mut pathless = HashSet::new();
-    let mut recorded = Vec::new();
-    for &(node_id, flags) in roots.iter().chain(collected) {
-        let node = state
-            .node(repository.clone(), node_id)
-            .await
-            .forward::<CommitError>("Failed reading a deleted node")?;
-        let mut counterpart =
-            same_file_counterpart(repository, &node, node_id, &parent, block_count).await?;
-        if counterpart.is_none() && !pathless.contains(&node.parent) {
-            counterpart = match path_counterpart(repository, state, node_id, &parent).await? {
-                Some(found)
-                    if parent
-                        .node(repository.clone(), found)
-                        .await
-                        .forward::<CommitError>("Failed reading a deleted node's counterpart")?
-                        .node_type()
-                        == NodeFlags::from_bits_retain(flags).node_type() =>
-                {
-                    Some(found)
-                }
-                _ => None,
-            };
-        }
-        if counterpart.is_none() && node.is_directory() {
-            pathless.insert(node_id);
-        }
-        if counterpart != Some(node_id) {
-            recorded.push((node_id, counterpart));
-        }
-    }
-    recorded.sort_unstable_by_key(|&(node, _)| node);
-    Ok(recorded)
 }
 
 async fn collect_file(
@@ -6226,13 +6294,18 @@ async fn commit_link(
                 return Ok(None);
             }
 
-            rehash_and_record_delta(
+            let StagedChanges {
+                delta: staged,
+                first_parent,
+            } = rehash_and_record_delta(
                 repository.clone(),
                 state.clone(),
+                based_on,
                 delta,
                 work_tracker.clone(),
             )
             .await?;
+            let changes = staged.to_aligned::<NodeDelta>();
 
             state.set_metadata_hash(
                 metadata
@@ -6241,7 +6314,14 @@ async fn commit_link(
                     .forward::<CommitError>("Failed to write commit metadata")?,
             );
 
-            weave_history(repository.clone(), state.clone(), based_on).await?;
+            weave_changes(
+                repository.clone(),
+                state.clone(),
+                based_on,
+                changes.as_type_slice::<NodeDelta>(),
+                first_parent,
+            )
+            .await?;
 
             let signature = state
                 .serialize_committed(repository.clone(), &token)
@@ -6597,13 +6677,9 @@ fn delta_retain(delta: &mut BytesMut, keeps: impl Fn(NodeID) -> bool) {
 async fn generate_delta_block(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
-    delta: Arc<parking_lot::RwLock<BytesMut>>,
+    delta: Bytes,
     tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
 ) -> Result<(), CommitError> {
-    let delta = {
-        let mut lock = delta.write();
-        lock.split().freeze()
-    };
     let delta_count = delta.count::<NodeDelta>();
 
     let address = if !delta.is_empty() {
@@ -6653,16 +6729,24 @@ pub(crate) enum BasedOn {
 /// parent's own delta changed records the second parent on the second-parent line. Every other
 /// node keeps the history of the tree `state` was built from.
 ///
-/// The first parent's delta is recorded by node ID when the tree of `state` is
-/// [based on](BasedOn) the first parent. Otherwise it is recorded on the
-/// [counterpart](find_counterpart_node) of each node, and a node the merge changed first takes
-/// the first parent's history of its counterpart. The second parent's history is recorded on the
-/// node at the same path.
+/// `changes` are the changes staged on the tree of `state`, in its node IDs, which
+/// name the nodes merging changed. They are the delta `state` records where its tree is
+/// [based on](BasedOn) the first parent; a tree based on another revision records its change from
+/// the first parent instead ([`self_parent_delta`]). They are read only for a tree based on
+/// another revision and for a revision with a second parent. `first_parent` is the first parent's
+/// tree where it was read to record the delta ([`StagedChanges`]); the weave reads it otherwise.
+///
+/// The first parent's delta is recorded by node ID when the tree of `state` is based on the first
+/// parent. Otherwise it is recorded on the [counterpart](state::find_counterpart_node) of each
+/// node, and a node merging changed first takes the first parent's history of its counterpart.
+/// The second parent's history is recorded on the node at the same path.
 #[lore_macro::test_pub]
-pub(crate) async fn weave_history(
+pub(crate) async fn weave_changes(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     based_on: BasedOn,
+    changes: &[NodeDelta],
+    first_parent: Option<Arc<State>>,
 ) -> Result<(), CommitError> {
     let [parent_self, parent_other] = state.parents();
     let mut history_count = 0;
@@ -6670,11 +6754,14 @@ pub(crate) async fn weave_history(
 
     if !parent_self.is_zero() {
         lore_debug!("Weave branch history");
-        let state_parent = State::deserialize(repository.clone(), parent_self)
-            .await
-            .forward_with::<CommitError, _>(|| {
-                format!("Failed deserializing parent state {parent_self} when weaving history")
-            })?;
+        let state_parent = match first_parent.filter(|parent| parent.revision() == parent_self) {
+            Some(parent) => parent,
+            None => State::deserialize(repository.clone(), parent_self)
+                .await
+                .forward_with::<CommitError, _>(|| {
+                    format!("Failed deserializing parent state {parent_self} when weaving history")
+                })?,
+        };
 
         revision_number = std::cmp::max(state_parent.revision_number(), revision_number);
 
@@ -6694,6 +6781,7 @@ pub(crate) async fn weave_history(
                 &repository,
                 &state,
                 &state_parent,
+                changes,
                 delta_slice,
             ))
             .await?;
@@ -6733,20 +6821,10 @@ pub(crate) async fn weave_history(
 
         revision_number = std::cmp::max(state_parent.revision_number(), revision_number);
 
-        // First get the file history as seen by the branch being merged in (the other parent) state
-        // for all nodes affected by the merge (which is the set of nodes in this revision delta block)
-        let delta_buffer = state
-            .delta_block(repository.clone())
-            .await
-            .forward::<CommitError>(
-                "Failed deserializing parent state delta block when weaving history",
-            )?
-            .to_aligned::<NodeDelta>();
-        let delta_slice = delta_buffer.as_type_slice::<NodeDelta>();
         // The last block read is held into the next entry, so that entries sharing a block of the
         // parent read it once: nothing else holds the parent's blocks.
         let mut held = None;
-        for (idelta, delta) in delta_slice.iter().enumerate() {
+        for (idelta, delta) in changes.iter().enumerate() {
             if delta.flags & change::Flags::Merge != 0 {
                 if delta.action == FileAction::Delete as u16 {
                     // Deleted files no longer exist in the tree node
@@ -6760,7 +6838,7 @@ pub(crate) async fn weave_history(
                     .forward::<CommitError>("Failed constructing node path when weaving history")?;
 
                 let Some(node_parent) =
-                    node_at_path(&repository, &state_parent, node_path.as_str())
+                    state::node_at_path(&repository, &state_parent, ROOT_NODE, node_path.as_str())
                         .await
                         .unwrap_or_default()
                 else {
@@ -6800,7 +6878,7 @@ pub(crate) async fn weave_history(
                     lore_trace!(
                         "History {}/{}: node {} {:?}",
                         idelta,
-                        delta_slice.len(),
+                        changes.len(),
                         node_id,
                         node
                     );
@@ -6844,9 +6922,10 @@ pub(crate) async fn weave_history(
                 continue;
             };
 
-            let Some(current_node_id) = node_at_path(&repository, &state, node_path.as_str())
-                .await
-                .unwrap_or_default()
+            let Some(current_node_id) =
+                state::node_at_path(&repository, &state, ROOT_NODE, node_path.as_str())
+                    .await
+                    .unwrap_or_default()
             else {
                 // This node does not exist in the current state, it was deleted as part of the
                 // merge conflict resolution, or deleted in the incoming branch revision.
@@ -6910,9 +6989,9 @@ pub(crate) async fn weave_history(
 }
 
 /// Records the first parent's history on a tree of `state` built from another revision. A node the
-/// merge changed takes the history the first parent `state_parent` holds for its
-/// [counterpart](find_counterpart_node), and a node `delta_slice`, the first parent's own delta,
-/// changed records the first parent on its counterpart. A node either delta deletes is skipped.
+/// merging changed, among `changes`, takes the history the first parent `state_parent` holds for its
+/// [counterpart](state::find_counterpart_node), and a node `delta_slice`, the first parent's own
+/// delta, changed records the first parent on its counterpart. A node either deletes is skipped.
 /// Returns the count of nodes recorded.
 ///
 /// Boxed by the caller: a tree is built from another revision than its first parent only for a
@@ -6922,6 +7001,7 @@ async fn weave_first_parent_counterparts(
     repository: &Arc<RepositoryContext>,
     state: &State,
     state_parent: &State,
+    changes: &[NodeDelta],
     delta_slice: &[NodeDelta],
 ) -> Result<u32, CommitError> {
     let block_count = state
@@ -6936,24 +7016,20 @@ async fn weave_first_parent_counterparts(
         .block_count;
     let mut history_count = 0;
 
-    let merge_buffer = state
-        .delta_block(repository.clone())
-        .await
-        .forward::<CommitError>("Failed deserializing state delta block when weaving history")?
-        .to_aligned::<NodeDelta>();
-    for delta in merge_buffer.as_type_slice::<NodeDelta>() {
+    for delta in changes {
         if delta.flags & change::Flags::Merge == 0 || delta.action == FileAction::Delete as u16 {
             continue;
         }
 
-        let Some(parent_node) = find_counterpart_node(
+        let Some(parent_node) = state::find_counterpart_node(
             repository,
             state,
             delta.node,
             state_parent,
             parent_block_count,
         )
-        .await?
+        .await
+        .forward::<CommitError>("Failed finding a node's counterpart in the first parent")?
         else {
             continue;
         };
@@ -6967,7 +7043,9 @@ async fn weave_first_parent_counterparts(
         }
 
         let Some(node_id) =
-            find_counterpart_node(repository, state_parent, delta.node, state, block_count).await?
+            state::find_counterpart_node(repository, state_parent, delta.node, state, block_count)
+                .await
+                .forward::<CommitError>("Failed finding a node's counterpart in the tree")?
         else {
             continue;
         };
@@ -7063,91 +7141,6 @@ fn record_first_parent_change(
     if dirtied {
         state.block_file_metadata_modified(block, block_index);
     }
-}
-
-/// Finds the node of `to`, whose tree has `block_count` blocks, that is node `node_id` of `from`,
-/// for trees that may not share node IDs.
-///
-/// The node with the same ID is the counterpart when both are the same file
-/// ([`same_file_counterpart`]), which keeps a file renamed since the two trees diverged. Any other
-/// node is found at the path `from` holds it at ([`path_counterpart`]).
-async fn find_counterpart_node(
-    repository: &Arc<RepositoryContext>,
-    from: &State,
-    node_id: NodeID,
-    to: &State,
-    block_count: u32,
-) -> Result<Option<NodeID>, CommitError> {
-    let from_node = from
-        .node(repository.clone(), node_id)
-        .await
-        .forward::<CommitError>("Failed reading a node to find its counterpart")?;
-    if let Some(same) =
-        same_file_counterpart(repository, &from_node, node_id, to, block_count).await?
-    {
-        return Ok(Some(same));
-    }
-    path_counterpart(repository, from, node_id, to).await
-}
-
-/// `node_id` where node `node_id` of `to`, whose tree has `block_count` blocks, is the same file as
-/// `from_node`, the node of that ID in another tree: both files with the same file ID. A slot `to`
-/// freed holds no file, as its flags are exactly `Discarded`.
-async fn same_file_counterpart(
-    repository: &Arc<RepositoryContext>,
-    from_node: &Node,
-    node_id: NodeID,
-    to: &State,
-    block_count: u32,
-) -> Result<Option<NodeID>, CommitError> {
-    if NodeBlock::index(node_id) >= block_count as usize
-        || !from_node.is_file()
-        || from_node.address.context.is_zero()
-    {
-        return Ok(None);
-    }
-    let to_node = to
-        .node(repository.clone(), node_id)
-        .await
-        .forward::<CommitError>("Failed reading the node of the same ID in the other tree")?;
-    Ok(
-        (to_node.is_file() && from_node.address.context == to_node.address.context)
-            .then_some(node_id),
-    )
-}
-
-/// The node of `to` at the path `from` holds node `node_id` at ([`node_at_path`]).
-async fn path_counterpart(
-    repository: &Arc<RepositoryContext>,
-    from: &State,
-    node_id: NodeID,
-    to: &State,
-) -> Result<Option<NodeID>, CommitError> {
-    let path = from
-        .node_path(repository.clone(), node_id)
-        .await
-        .forward::<CommitError>("Failed reading the path of a node to find its counterpart")?;
-    node_at_path(repository, to, path.as_str())
-        .await
-        .forward::<CommitError>("Failed reading the node at a path in the other tree")
-}
-
-/// The node of `state` at `path`. `None` where `state` holds nothing at `path`, or holds it in a
-/// linked repository, whose history belongs to that repository's revisions.
-async fn node_at_path(
-    repository: &Arc<RepositoryContext>,
-    state: &State,
-    path: &str,
-) -> Result<Option<NodeID>, state::StateError> {
-    let node_link = match state.find_node_link(repository.clone(), path).await {
-        Ok(node_link) => node_link,
-        Err(state::StateError::NodeNotFound(_)) => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    if !node_link.is_valid() || node_link.crosses_link(repository, state) {
-        return Ok(None);
-    }
-    Ok(Some(node_link.node))
 }
 
 pub async fn prepare_commit_metadata(
@@ -8380,14 +8373,15 @@ pub async fn commit_in_memory_revision(
     let work_tracker = tracker.clone();
     let work_repository = repository.clone();
     let work_result: Result<Hash, CommitError> = async move {
-        freeze_in_memory_tree(
+        let delta = freeze_in_memory_tree(
             work_repository.clone(),
             state_staged.clone(),
             parent_self,
             stats.clone(),
             work_tracker.clone(),
         )
-        .await?;
+        .await?
+        .to_aligned::<NodeDelta>();
 
         state_staged.set_metadata_hash(
             metadata
@@ -8396,10 +8390,12 @@ pub async fn commit_in_memory_revision(
                 .forward::<CommitError>("Failed to write commit metadata")?,
         );
 
-        weave_history(
+        weave_changes(
             work_repository.clone(),
             state_staged.clone(),
             BasedOn::FirstParent,
+            delta.as_type_slice::<NodeDelta>(),
+            None,
         )
         .await?;
 
@@ -8544,19 +8540,25 @@ async fn first_staged_node(
 
 /// Freeze the staged tree into the shape a revision records, as [`freeze_tree`] does against
 /// `base`, the revision the tree was loaded from, and write the node delta, each change marked as
-/// merged where the state has a second parent.
+/// merged where the state has a second parent. It answers the delta it wrote for the history weave
+/// ([`weave_changes`]), whose second-parent pass reads those marks.
 async fn freeze_in_memory_tree(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     base: Hash,
     stats: Arc<CommitStats>,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
-) -> Result<(), CommitError> {
+) -> Result<Bytes, CommitError> {
     let delta = freeze_tree(repository.clone(), state.clone(), base, stats).await?;
-    if !state.parent_other().is_zero() {
-        mark_merged(&mut delta.write());
-    }
-    generate_delta_block(repository, state, delta, Some(tracker)).await
+    let delta = {
+        let mut changes = delta.write();
+        if !state.parent_other().is_zero() {
+            mark_merged(&mut changes);
+        }
+        changes.split().freeze()
+    };
+    generate_delta_block(repository, state, delta.clone(), Some(tracker)).await?;
+    Ok(delta)
 }
 
 /// Marks every entry of `delta` as a change merging made.
@@ -8631,8 +8633,17 @@ pub async fn merge_tree_changes(
         CommitStats::new(),
     )
     .await?;
-    generate_delta_block(repository.clone(), state.clone(), delta, None).await?;
-    weave_history(repository, state, BasedOn::FirstParent).await
+    let delta = delta.write().split().freeze();
+    generate_delta_block(repository.clone(), state.clone(), delta.clone(), None).await?;
+    let delta = delta.to_aligned::<NodeDelta>();
+    weave_changes(
+        repository,
+        state,
+        BasedOn::FirstParent,
+        delta.as_type_slice::<NodeDelta>(),
+        None,
+    )
+    .await
 }
 
 /// Freeze a staged tree whose every leaf carries its address into the shape a revision records:
@@ -8685,7 +8696,7 @@ async fn freeze_tree(
     commit_discard(
         repository.clone(),
         state.clone(),
-        DeletionBase::of(base, Hash::default(), BasedOn::FirstParent),
+        DeletionBase::of(base, BasedOn::FirstParent),
         (&RelativePath::new(), ROOT_NODE),
         delta.clone(),
         &discard,

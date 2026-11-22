@@ -55,9 +55,10 @@ pub async fn add_file_dependencies(
         .flatten()
         .unwrap_or(current_revision);
 
-    let state = state::State::deserialize(repository.clone(), staged_revision)
-        .await
-        .forward::<DependencyError>("deserializing state")?;
+    let state =
+        state::State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+            .await
+            .forward::<DependencyError>("deserializing state")?;
 
     // Resolve all paths to NodeIDs upfront
     type ResolvedDep<'a> = (NodeID, Vec<&'a str>);

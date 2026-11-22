@@ -2657,7 +2657,7 @@ mod tests {
                         .expect("The committed state must hold the file");
                     assert!(
                         state
-                            .node_delta(repository.clone(), link.node)
+                            .node_change(repository.clone(), link.node)
                             .await
                             .expect("The delta must read back")
                             .is_some(),

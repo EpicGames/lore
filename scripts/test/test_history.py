@@ -373,3 +373,113 @@ def test_file_history_move_entry_carries_the_source_path(new_lore_repo):
     assert f"A {original_path}" in lines, (
         f"File history did not print the add entry, got:\n{output}"
     )
+
+
+@pytest.mark.smoke
+def test_file_history_of_a_file_a_merge_brings_in_shows_the_merged_branch(new_lore_repo):
+    """A file another branch added and `lore branch merge` brings in has its history on that
+    branch: the revision that added it, and not the merge revision, which records the file as
+    merged. A revision committed on the merge revision keeps that history."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"base.txt": "base\n"}, offline=True)
+    repo.branch_create("feature", offline=True)
+    repo.write_commit_push("Add a file", {"feature.txt": "feature\n"}, offline=True)
+    added = repo.branch_info("feature").local_latest
+    repo.write_commit_push("Edit the file", {"feature.txt": "edited\n"}, offline=True)
+    edited = repo.branch_info("feature").local_latest
+    repo.branch_switch("main", offline=True)
+    repo.write_commit_push("Change main", {"base.txt": "main\n"}, offline=True)
+    repo.branch_merge("feature", message="Merge the feature", offline=True)
+
+    expected = [(edited, "keep"), (added, "add")]
+    entries = parse_jsonl(
+        repo.file_history("feature.txt", json=True, offline=True), "fileHistory"
+    )
+    assert [(entry["revision"], entry["action"]) for entry in entries] == expected, entries
+    repo.write_commit_push("Change main again", {"base.txt": "next\n"}, offline=True)
+    entries = parse_jsonl(
+        repo.file_history("feature.txt", json=True, offline=True), "fileHistory"
+    )
+    assert [(entry["revision"], entry["action"]) for entry in entries] == expected, entries
+
+
+@pytest.mark.smoke
+def test_file_history_of_a_file_a_cherry_pick_adds_starts_at_the_cherry_pick(new_lore_repo):
+    """A file `lore revision cherry-pick` adds has no history before the revision it commits,
+    though the revision records the add as merged: its history is that revision's add."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"base.txt": "base\n"}, offline=True)
+    repo.branch_create("feature", offline=True)
+    repo.write_commit_push("Add a file", {"picked.txt": "picked\n"}, offline=True)
+    picked = repo.branch_info("feature").local_latest
+    repo.branch_switch("main", offline=True)
+    repo.revision_cherry_pick(picked, message="Pick the file", offline=True)
+    revision = repo.branch_info("main").local_latest
+    assert revision != picked
+
+    entries = parse_jsonl(
+        repo.file_history("picked.txt", json=True, offline=True), "fileHistory"
+    )
+    assert [(entry["revision"], entry["action"]) for entry in entries] == [
+        (revision, "add")
+    ], entries
+
+
+def _delete_a_file_with_history(repo: Lore) -> None:
+    """Commits the add, an edit and the deletion of `old.txt`, which frees its node's slot for the
+    next file the tree adds, with the history of `old.txt` left in it."""
+    repo.write_commit_push("Add old", {"old.txt": "old\n"}, offline=True)
+    repo.write_commit_push("Edit old", {"old.txt": "edited\n"}, offline=True)
+    repo.remove_file("old.txt")
+    repo.stage(["old.txt"], offline=True)
+    repo.commit("Delete old", offline=True)
+
+
+@pytest.mark.smoke
+def test_file_history_of_a_merged_file_in_a_reused_slot_shows_its_own_history(new_lore_repo):
+    """A file `lore branch merge` brings in, in a node slot a deleted file freed, has the history of
+    the merged branch, and none of the deleted file's, at the merge revision and at a revision
+    committed on it."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"base.txt": "base\n"}, offline=True)
+    _delete_a_file_with_history(repo)
+    repo.branch_create("feature", offline=True)
+    repo.write_commit_push("Add a file", {"feature.txt": "feature\n"}, offline=True)
+    added = repo.branch_info("feature").local_latest
+    repo.branch_switch("main", offline=True)
+    repo.write_commit_push("Change main", {"base.txt": "main\n"}, offline=True)
+    repo.branch_merge("feature", message="Merge the feature", offline=True)
+
+    for next_content in ("next\n", None):
+        entries = parse_jsonl(
+            repo.file_history("feature.txt", json=True, offline=True), "fileHistory"
+        )
+        assert [(entry["revision"], entry["action"]) for entry in entries] == [
+            (added, "add")
+        ], entries
+        if next_content:
+            repo.write_commit_push("Change main again", {"base.txt": next_content}, offline=True)
+
+
+@pytest.mark.smoke
+def test_file_history_of_a_cherry_picked_file_in_a_reused_slot_starts_at_the_cherry_pick(
+    new_lore_repo,
+):
+    """A file `lore revision cherry-pick` adds, in a node slot a deleted file freed, has the add of
+    the revision it commits as its history, and none of the deleted file's."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"base.txt": "base\n"}, offline=True)
+    repo.branch_create("feature", offline=True)
+    repo.write_commit_push("Add a file", {"picked.txt": "picked\n"}, offline=True)
+    picked = repo.branch_info("feature").local_latest
+    repo.branch_switch("main", offline=True)
+    _delete_a_file_with_history(repo)
+    repo.revision_cherry_pick(picked, message="Pick the file", offline=True)
+    revision = repo.branch_info("main").local_latest
+
+    entries = parse_jsonl(
+        repo.file_history("picked.txt", json=True, offline=True), "fileHistory"
+    )
+    assert [(entry["revision"], entry["action"]) for entry in entries] == [
+        (revision, "add")
+    ], entries

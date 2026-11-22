@@ -19,6 +19,7 @@ use crate::immutable;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lore::Address;
+use crate::lore::Hash;
 use crate::lore::execution_context;
 use crate::node::NodeFileMode;
 use crate::repository::RepositoryContext;
@@ -199,8 +200,8 @@ pub(crate) async fn write_file(
     let relative_path = RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
         .forward::<WriteError>("resolving user path")?;
 
-    let signature = if let Some(revision) = options.revision {
-        revision::resolve(
+    let (signature, current_revision) = if let Some(revision) = options.revision {
+        let resolved = revision::resolve(
             repository.clone(),
             revision.as_str(),
             execution_context().globals().search_location(),
@@ -212,21 +213,23 @@ pub(crate) async fn write_file(
                     revision: revision.clone(),
                 })
             })
-        })?
+        })?;
+        (resolved, Hash::default())
     } else {
         let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
             .await
             .forward::<WriteError>("Failed to deserialize current revision anchor")?;
-        crate::instance::load_staged_revision(&repository)
+        let staged_revision = crate::instance::load_staged_revision(&repository)
             .await
             .ok()
             .flatten()
-            .unwrap_or(current_revision)
+            .unwrap_or(current_revision);
+        (staged_revision, current_revision)
     };
 
     let (destination, tracked) = write_destination(repository.require_path()?, output.as_str())?;
 
-    let state = state::State::deserialize(repository.clone(), signature)
+    let state = state::State::deserialize_staged(repository.clone(), signature, current_revision)
         .await
         .forward::<WriteError>("Failed to deserialize state")?;
 

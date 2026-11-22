@@ -1240,7 +1240,7 @@ pub async fn stage_promoted_moves_of_call(
                 .forward::<StageError>("Failed to take the moves permit")?,
         ),
     };
-    stage_promoted_moves(repository, state.committed_revision(), state).await
+    stage_promoted_moves(repository, state.built_on(), state).await
 }
 
 /// Stages the move of `directory`, marked dirty as moved, whole: it and each node below it that

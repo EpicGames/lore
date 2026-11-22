@@ -199,6 +199,9 @@ bitflags! {
         /// caller can read that mounts the same subtree of the same repository on both
         /// sides, is neither descended nor reported.
         const LeavesLinkPins = 0b1000;
+        /// The walk reports a link it would descend as a change of the link node and doesn't
+        /// read the linked repository.
+        const ReportsLinkNodes = 0b10000;
     }
 }
 
@@ -1706,38 +1709,41 @@ async fn add_change_for_paired_nodes(
                     let can_read_link = to.mapping.repository.can_read_link(link_repository_id);
 
                     // If the link is staged and doesn't have staged children, it's a link update
-                    let recurse_link = if !can_read_link {
-                        false
-                    } else {
-                        let linked_repository = to
-                            .mapping
-                            .repository
-                            .to_link_context(link_repository_id)
-                            .await;
-                        let linked_state =
-                            State::deserialize(linked_repository.clone(), to_node.address.hash)
-                                .await
-                                .forward::<StateError>("Link error")?;
+                    let recurse_link =
+                        if !can_read_link || flags.contains(DiffFlags::ReportsLinkNodes) {
+                            false
+                        } else {
+                            let linked_repository = to
+                                .mapping
+                                .repository
+                                .to_link_context(link_repository_id)
+                                .await;
+                            let linked_state =
+                                State::deserialize(linked_repository.clone(), to_node.address.hash)
+                                    .await
+                                    .forward::<StateError>("Link error")?;
 
-                        let has_staged_children = linked_state
-                            .node_has_staged_children(linked_repository.clone(), to_node.child)
-                            .await?;
+                            let has_staged_children = linked_state
+                                .node_has_staged_children(linked_repository.clone(), to_node.child)
+                                .await?;
 
-                        // The two subtrees of a remount, or of a link replaced by one to another
-                        // repository, don't correspond, so the link node is reported instead.
-                        (!is_staged || has_staged_children)
-                            && !(from_node.is_link()
-                                && crate::link::link_remounted(
-                                    &linked_repository,
-                                    from_node,
-                                    &to_node,
-                                    &linked_state,
-                                )
-                                .await?)
-                    };
+                            // The two subtrees of a remount, or of a link replaced by one to another
+                            // repository, don't correspond, so the link node is reported instead.
+                            (!is_staged || has_staged_children)
+                                && !(from_node.is_link()
+                                    && crate::link::link_remounted(
+                                        &linked_repository,
+                                        from_node,
+                                        &to_node,
+                                        &linked_state,
+                                    )
+                                    .await?)
+                        };
 
                     if !recurse_link {
-                        if can_read_link {
+                        if flags.contains(DiffFlags::ReportsLinkNodes) {
+                            lore_debug!("Diff node {subpath} reported on its link node");
+                        } else if can_read_link {
                             lore_debug!("Diff node {subpath} has no linked changes");
                         } else {
                             lore_debug!(

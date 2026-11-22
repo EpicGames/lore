@@ -840,7 +840,7 @@ async fn a_committed_move_is_recorded_as_a_move_in_the_revision_delta() {
         .scope(execution, async move {
             internal
                 .state_for_tests()
-                .node_delta(internal.repository_context.clone(), node_id)
+                .node_change(internal.repository_context.clone(), node_id)
                 .await
         })
         .await
@@ -878,7 +878,7 @@ async fn a_moved_file_modified_before_the_commit_is_recorded_as_a_move() {
         .scope(execution, async move {
             internal
                 .state_for_tests()
-                .node_delta(internal.repository_context.clone(), node_id)
+                .node_change(internal.repository_context.clone(), node_id)
                 .await
         })
         .await
@@ -1166,10 +1166,17 @@ async fn move_takes_a_name_only_a_deleted_child_holds() {
             let state = internal.state_for_tests();
             let mut actions = Vec::new();
             for node in [occupant, node_id] {
-                let delta = state
-                    .node_delta(internal.repository_context.clone(), node)
+                let change = state
+                    .node_change(internal.repository_context.clone(), node)
                     .await
                     .expect("the published revision must carry a delta");
+                let delta = match change {
+                    Some(change) => Some(change),
+                    None => state
+                        .node_deletion(internal.repository_context.clone(), node)
+                        .await
+                        .expect("the published revision must carry a delta"),
+                };
                 actions.push(delta.map(|delta| delta.action));
             }
             actions

@@ -123,9 +123,10 @@ pub(crate) async fn obliterate_file(
         .flatten()
         .unwrap_or(current_revision);
 
-    let state = state::State::deserialize(repository.clone(), staged_revision)
-        .await
-        .forward::<ObliterateError>("Failed to deserialize state")?;
+    let state =
+        state::State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+            .await
+            .forward::<ObliterateError>("Failed to deserialize state")?;
 
     let node_link = state
         .find_node_link(repository.clone(), relative_path.as_str())

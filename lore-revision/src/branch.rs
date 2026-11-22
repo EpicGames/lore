@@ -3892,7 +3892,8 @@ async fn store_repinned_states(
     Ok((head, staged))
 }
 
-/// Writes the repins `state` holds as a revision on top of `current_latest`.
+/// Writes the repins `state` holds as a revision on top of `current_latest`. The revision has one
+/// parent, so the history weave reads no changes of its own ([`commit::weave_changes`]).
 async fn store_repin_revision(
     cascade: &LinkCascade<'_>,
     repository: &Arc<RepositoryContext>,
@@ -3921,10 +3922,12 @@ async fn store_repin_revision(
             .forward::<BranchError>("Failed to write revision metadata")?,
     );
 
-    commit::weave_history(
+    commit::weave_changes(
         repository.clone(),
         state.clone(),
         commit::BasedOn::FirstParent,
+        &[],
+        None,
     )
     .await
     .forward::<BranchError>("Failed to weave history")?;

@@ -3,8 +3,8 @@
 #![allow(clippy::disallowed_methods)] // The tests delete files from the working tree directly.
 
 //! `lore branch merge` of a file one branch deletes and the other changes: what the merge stages,
-//! what a resolution and the commit make of it, and what an abort leaves; and the deletions a
-//! commit's delta records.
+//! what a resolution and committing make of it, and what an abort leaves; and the changes a
+//! revision's delta records, from its first parent.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use lore_base::types::Hash;
 use lore_base::types::TypedBytes as _;
 use lore_revision::branch;
 use lore_revision::branch::BranchLatestStatus;
+use lore_revision::change;
 use lore_revision::change::FileAction;
 use lore_revision::interface::ExecutionContext;
 use lore_revision::interface::LoreArray;
@@ -117,33 +118,45 @@ fn named(instance: &Instance, path: &str) -> LoreArray<LoreString> {
     LoreArray::from_vec(vec![LoreString::from(instance.path.join(path).as_path())])
 }
 
-/// The adds, deletes and moves the delta of the current revision records, as the action and the
-/// path: a deleted node's path read from the first parent, the tree that holds it.
-async fn delta(instance: &Instance) -> Vec<(u16, String)> {
-    let merged = revision_state(instance, current(instance).await).await;
-    let parent = revision_state(instance, merged.parent_self()).await;
-    let delta = merged
+/// Each entry the delta of `revision` records, as its action, path, flags and whether its node is a
+/// file: a deleted node's path read from the first parent, the tree that holds it.
+async fn delta_entries(instance: &Instance, revision: Hash) -> Vec<(u16, String, u16, bool)> {
+    let state = revision_state(instance, revision).await;
+    let parent = revision_state(instance, state.parent_self()).await;
+    let delta = state
         .delta_block(instance.repository.clone())
         .await
         .expect("Failed to read the delta")
         .to_aligned::<NodeDelta>();
-    let mut changes = Vec::new();
+    let mut entries = Vec::new();
     for entry in delta.as_type_slice::<NodeDelta>() {
-        if entry.action == FileAction::Keep as u16 {
-            continue;
-        }
         let tree = if entry.action == FileAction::Delete as u16 {
             &parent
         } else {
-            &merged
+            &state
         };
+        let node = tree
+            .node(instance.repository.clone(), entry.node)
+            .await
+            .expect("Failed to read a delta node");
         let path = tree
             .node_path(instance.repository.clone(), entry.node)
             .await
             .expect("Failed to read a delta path");
-        changes.push((entry.action, path));
+        entries.push((entry.action, path, entry.flags, node.is_file()));
     }
-    changes
+    entries
+}
+
+/// The adds, deletes and moves the delta of the current revision records, as the action and the
+/// path ([`delta_entries`]).
+async fn delta(instance: &Instance) -> Vec<(u16, String)> {
+    delta_entries(instance, current(instance).await)
+        .await
+        .into_iter()
+        .filter(|(action, ..)| *action != FileAction::Keep as u16)
+        .map(|(action, path, ..)| (action, path))
+        .collect()
 }
 
 /// The paths of the deletions the [`delta`] of the current revision records.
@@ -503,7 +516,9 @@ async fn an_incoming_deletion_out_of_view_is_taken() {
             assert!(node.is_staged_merge_theirs(), "flags {:#x}", node.flags);
             assert!(!node.is_staged_merge_conflict(), "flags {:#x}", node.flags);
 
-            commit(&instance, "Merge").await.expect("The merge commits");
+            commit(&instance, "Merge")
+                .await
+                .expect("The merge revision commits");
             let merged = revision_state(&instance, current(&instance).await).await;
             assert!(
                 !merged
@@ -702,16 +717,17 @@ async fn a_merge_of_diverged_history_records_the_deletions_its_first_parent_hold
     .await;
 }
 
-/// A forced commit of a stage left on an earlier revision records the deletion of a file staged on
-/// it that the revision it commits on holds, and no deletion of a file that revision lacks, whose
-/// slot its tree reuses for a file it adds. A file the stage keeps in that slot keeps its history,
-/// which the add does not take.
+/// Changes staged on an earlier revision, committed by force, record the revision's change from the
+/// revision they're committed on: the deletion of a file staged for deletion, and of the file that
+/// revision added, which the staged tree lacks, and no deletion of a file that revision lacks, whose
+/// slot its tree reuses for that add. A file the staged tree keeps in that slot is recorded as
+/// added, and keeps its history, which the add does not take.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_forced_commit_of_a_stale_stage_records_the_deletions_its_parent_holds() {
+async fn stale_staged_changes_committed_by_force_record_their_change_from_the_parent() {
     const TREE: [&str; 3] = ["K.txt", "Top.txt", "gone.txt"];
     for keep_gone in [false, true] {
         run(
-            "a_forced_commit_of_a_stale_stage_records_the_deletions_its_parent_holds",
+            "stale_staged_changes_committed_by_force_record_their_change_from_the_parent",
             &TREE,
             move |instance| async move {
                 let first = current(&instance).await;
@@ -740,9 +756,16 @@ async fn a_forced_commit_of_a_stale_stage_records_the_deletions_its_parent_holds
                 .expect("The forced commit succeeds");
                 let state = revision_state(&instance, committed).await;
                 assert_eq!(state.parent_self(), latest, "keep gone {keep_gone}");
+                let mut expected = vec![
+                    (FileAction::Delete as u16, "K.txt".to_string(), false),
+                    (FileAction::Delete as u16, "added.txt".to_string(), false),
+                ];
+                if keep_gone {
+                    expected.push((FileAction::Add as u16, "gone.txt".to_string(), false));
+                }
                 assert_eq!(
-                    deletions(&instance).await,
-                    ["K.txt"],
+                    file_changes(&instance, committed).await,
+                    expected,
                     "keep gone {keep_gone}"
                 );
                 if keep_gone {
@@ -846,6 +869,182 @@ async fn a_merge_of_diverged_history_records_a_deletion_found_at_its_path() {
             let merged = revision_state(&instance, current(&instance).await).await;
             assert_eq!(merged.parent_self(), latest);
             assert_eq!(deletions(&instance).await, ["F.txt"]);
+        },
+    )
+    .await;
+}
+
+/// The file changes the delta of `revision` records ([`delta_entries`]), each as the action, the
+/// path and whether its content changed, sorted by path. Every entry of a revision with a second
+/// parent is checked to be marked merged.
+async fn file_changes(instance: &Instance, revision: Hash) -> Vec<(u16, String, bool)> {
+    let merge = !revision_state(instance, revision)
+        .await
+        .parent_other()
+        .is_zero();
+    let mut changes: Vec<(u16, String, bool)> = delta_entries(instance, revision)
+        .await
+        .into_iter()
+        .filter(|&(.., is_file)| is_file)
+        .map(|(action, path, flags, _)| {
+            assert_eq!(
+                flags & change::Flags::Merge.bits() != 0,
+                merge,
+                "{action} {path} {flags:#x}"
+            );
+            (action, path, flags & change::Flags::Modify.bits() != 0)
+        })
+        .collect();
+    changes.sort_by(|a, b| a.1.cmp(&b.1));
+    changes
+}
+
+/// The files [`merge_divergent_changes`] starts from.
+const DIVERGENT: [&str; 4] = ["K.txt", "Top.txt", "gone.txt", "moved.txt"];
+
+/// Commits, on an upstream branch, the deletion of `gone.txt` and then the add of `added.txt`, its
+/// tree reusing the deleted file's slot, and on main the add of `local.txt`, an edit of `K.txt` and
+/// the move of `moved.txt`. Merges the upstream latest, which a remote would answer as the branch
+/// latest, into the local revision, as a sync of divergent history does, and commits the merge
+/// revision. Answers the upstream latest and the merge revision.
+async fn merge_divergent_changes(instance: &Instance) -> (Hash, Hash) {
+    create_branch(instance, "upstream").await;
+    commit_edits(instance, &[Edit::Delete("gone.txt")], "Delete").await;
+    let latest = commit_edits(instance, &[Edit::Write("added.txt", "added")], "Add").await;
+    switch_to(instance, branch::DEFAULT_DEFAULT_NAME).await;
+    let local = commit_edits(
+        instance,
+        &[
+            Edit::Write("local.txt", "local"),
+            Edit::Write("K.txt", "local"),
+            Edit::Move("moved.txt", "moved-locally.txt"),
+        ],
+        "Local",
+    )
+    .await;
+    merge_diverged(instance, local, latest).await;
+    let merged = commit(instance, "Merge")
+        .await
+        .expect("The merge revision commits");
+    (latest, merged)
+}
+
+/// A merge revision reconciling divergent history records its change from its first parent, the
+/// branch latest: this side's changes, each marked merged, under the IDs the merge revision holds
+/// them at and, for the move, its source in the latest's tree. It records none of the latest's own
+/// changes, which the latest holds already.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_of_divergent_history_records_its_change_from_its_first_parent() {
+    run(
+        "a_merge_of_divergent_history_records_its_change_from_its_first_parent",
+        &DIVERGENT,
+        |instance| async move {
+            let (latest, merged) = merge_divergent_changes(&instance).await;
+            assert_eq!(
+                revision_state(&instance, merged).await.parent_self(),
+                latest
+            );
+            assert_eq!(
+                file_changes(&instance, merged).await,
+                [
+                    (FileAction::Keep as u16, "K.txt".to_string(), true),
+                    (FileAction::Add as u16, "local.txt".to_string(), false),
+                    (
+                        FileAction::Move as u16,
+                        "moved-locally.txt".to_string(),
+                        false
+                    ),
+                ]
+            );
+        },
+    )
+    .await;
+}
+
+/// A revision committed on a merge revision reconciling divergent history records the merge
+/// revision as the last change, on its first-parent line, of the files it changed from its first
+/// parent, this side's, and the branch latest as that of the file the latest added.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revision_committed_on_a_merge_of_divergent_history_records_the_merge_as_the_change_of_this_sides_files()
+ {
+    run(
+        "a_revision_committed_on_a_merge_of_divergent_history_records_the_merge_as_the_change_of_this_sides_files",
+        &DIVERGENT,
+        |instance| async move {
+            let (latest, merged) = merge_divergent_changes(&instance).await;
+            let next = commit_edits(&instance, &[Edit::Write("Top.txt", "next")], "Next").await;
+
+            assert_eq!(
+                first_parent_history(&instance, next, "local.txt").await.0,
+                merged
+            );
+            assert_eq!(first_parent_history(&instance, next, "K.txt").await.0, merged);
+            assert_eq!(
+                first_parent_history(&instance, next, "added.txt").await.0,
+                latest
+            );
+        },
+    )
+    .await;
+}
+
+/// A merge revision reconciling divergent history records, directories included, the entries a
+/// revision with the same local changes committed on the branch latest records, each marked
+/// merged: this side's edit of a file in one directory, an add in another, an edit two directories
+/// down, a deletion, and a move into a directory it adds, and none of the latest's change in
+/// another directory.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_of_divergent_history_records_the_entries_a_linear_revision_records() {
+    const NESTED: [&str; 6] = [
+        "A/a.txt",
+        "B/b.txt",
+        "C/c.txt",
+        "D/E/e.txt",
+        "F/f.txt",
+        "F/g.txt",
+    ];
+    run(
+        "a_merge_of_divergent_history_records_the_entries_a_linear_revision_records",
+        &NESTED,
+        |instance| async move {
+            let local_edits = [
+                Edit::Write("A/a.txt", "local"),
+                Edit::Write("B/new.txt", "local"),
+                Edit::Write("D/E/e.txt", "local"),
+                Edit::Delete("F/f.txt"),
+                Edit::Write("G/h.txt", "local"),
+                Edit::Move("C/c.txt", "G/c.txt"),
+            ];
+            create_branch(&instance, "upstream").await;
+            let latest =
+                commit_edits(&instance, &[Edit::Write("F/g.txt", "upstream")], "Upstream").await;
+            create_branch(&instance, "linear").await;
+            let linear = commit_edits(&instance, &local_edits, "Linear").await;
+            switch_to(&instance, branch::DEFAULT_DEFAULT_NAME).await;
+            let local = commit_edits(&instance, &local_edits, "Local").await;
+            merge_diverged(&instance, local, latest).await;
+            let merged = commit(&instance, "Merge")
+                .await
+                .expect("The merge revision commits");
+
+            let entries = async |revision: Hash| {
+                let mut entries: Vec<(u16, String, u16, bool)> = delta_entries(&instance, revision)
+                    .await
+                    .into_iter()
+                    .map(|(action, path, flags, is_file)| {
+                        (action, path, flags & !change::Flags::Merge.bits(), is_file)
+                    })
+                    .collect();
+                entries.sort();
+                entries
+            };
+            assert_eq!(entries(merged).await, entries(linear).await);
+            assert!(
+                delta_entries(&instance, merged)
+                    .await
+                    .iter()
+                    .all(|&(_, _, flags, _)| flags & change::Flags::Merge.bits() != 0)
+            );
         },
     )
     .await;

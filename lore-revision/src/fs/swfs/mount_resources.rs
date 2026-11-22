@@ -467,10 +467,14 @@ impl MountResources {
         }
         let deserialize = |revision: Option<Hash>, failure: &'static str| async move {
             match revision {
-                Some(revision) => State::deserialize(self.repository.clone(), revision)
-                    .await
-                    .map(Some)
-                    .forward::<SwfsWorkError>(failure),
+                Some(revision) => State::deserialize_staged(
+                    self.repository.clone(),
+                    revision,
+                    current_revision.unwrap_or_default(),
+                )
+                .await
+                .map(Some)
+                .forward::<SwfsWorkError>(failure),
                 None => Ok(None),
             }
         };

@@ -20,6 +20,7 @@ use crate::node;
 use crate::node::NodeDelta;
 use crate::node::NodeFileMetadata;
 use crate::node::NodeFileMetadataBlock;
+use crate::node::NodeID;
 use crate::repository::RepositoryContext;
 use crate::revision;
 use crate::runtime::execution_context;
@@ -234,8 +235,6 @@ pub(crate) async fn info(
 
                 let node_id = delta.node;
 
-                // TODO: Take merges into account when looking up information in the parent.
-
                 let path;
                 let file;
                 let size;
@@ -271,13 +270,9 @@ pub(crate) async fn info(
                 }
 
                 let from_path = match parent_state.as_ref() {
-                    Some(parent_state) if is_move => parent_state
-                        .node_path(repository.clone(), node_id)
-                        .await
-                        .inspect_err(|err| {
-                            lore_debug!("Node {node_id} has no path in the parent revision: {err}");
-                        })
-                        .unwrap_or_default(),
+                    Some(parent_state) if is_move => {
+                        move_source(&repository, &state, parent_state, node_id, file).await
+                    }
                     _ => String::new(),
                 };
 
@@ -339,4 +334,49 @@ pub fn info_boxed(
     options: InfoOptions,
 ) -> crate::BoxFuture<'static, Result<(), InfoError>> {
     Box::pin(info(repository, options))
+}
+
+/// The path `parent`, the first parent of `state`, holds node `node_id` of `state` at, the source
+/// of the move the delta of `state` records: the path of its counterpart in `parent`
+/// ([`state::find_counterpart_node`]), as a tree built on another revision than its first parent
+/// does not share its node IDs. A directory's move is recorded only by a tree that shares them, so
+/// its own ID names it there. Empty where `parent` holds no counterpart or its path can't be read.
+async fn move_source(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    parent: &State,
+    node_id: NodeID,
+    is_file: bool,
+) -> String {
+    let counterpart = if is_file {
+        match parent.tree(repository.clone()).await {
+            Ok(tree) => {
+                state::find_counterpart_node(repository, state, node_id, parent, tree.block_count)
+                    .await
+                    .inspect_err(|err| {
+                        lore_debug!(
+                            "Node {node_id} has no counterpart in the parent revision: {err}"
+                        );
+                    })
+                    .ok()
+                    .flatten()
+            }
+            Err(err) => {
+                lore_debug!("Failed reading the parent revision's tree: {err}");
+                None
+            }
+        }
+    } else {
+        Some(node_id)
+    };
+    let Some(counterpart) = counterpart else {
+        return String::new();
+    };
+    parent
+        .node_path(repository.clone(), counterpart)
+        .await
+        .inspect_err(|err| {
+            lore_debug!("Node {counterpart} has no path in the parent revision: {err}");
+        })
+        .unwrap_or_default()
 }

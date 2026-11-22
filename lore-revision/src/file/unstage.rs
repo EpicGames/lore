@@ -300,11 +300,13 @@ async fn unstage_parent(
             format!("Failed to deserialize revision state {current_revision}")
         })?;
 
-    let state_staged = State::deserialize(repository.clone(), staged_revision)
-        .await
-        .forward_with::<UnstageError, _>(|| {
-            format!("Failed to deserialize revision state {staged_revision}")
-        })?;
+    let state_staged =
+        State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+            .await
+            .forward_with::<UnstageError, _>(|| {
+                format!("Failed to deserialize revision state {staged_revision}")
+            })?;
+    state_staged.hold_current_where_staged_on(&state_current);
 
     let discard = Arc::new(DashMap::<RepositoryId, Vec<u32>>::new());
     let link_tracker = LinkTracker::new();

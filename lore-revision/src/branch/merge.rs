@@ -51,6 +51,7 @@ use crate::link::Mount;
 use crate::lore::BranchId;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
+use crate::lore::TypedBytes;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_info;
@@ -64,6 +65,7 @@ use crate::metadata::MetadataInherit;
 use crate::node;
 use crate::node::Node;
 use crate::node::NodeBlock;
+use crate::node::NodeDelta;
 use crate::node::NodeFileMetadata;
 use crate::node::NodeFileMetadataBlock;
 use crate::node::NodeFlags;
@@ -4810,7 +4812,7 @@ pub async fn validate_merge_type(
             .flatten()
             .unwrap_or(current_revision);
 
-        State::deserialize(repository.clone(), staged_revision)
+        State::deserialize_staged(repository.clone(), staged_revision, current_revision)
             .await
             .forward::<MergeError>("deserializing staged state")?
     };
@@ -5927,9 +5929,10 @@ pub async fn merge_abort(
         .flatten()
         .unwrap_or(current_revision);
 
-    let state_staged = State::deserialize(repository.clone(), staged_revision)
-        .await
-        .forward::<MergeError>("deserializing staged state")?;
+    let state_staged =
+        State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+            .await
+            .forward::<MergeError>("deserializing staged state")?;
 
     validate_merge_type(repository.clone(), state_staged.clone(), merge_type).await?;
 
@@ -7867,7 +7870,7 @@ async fn commit_merge_into(
     .await
     .forward::<MergeError>("preparing commit metadata")?;
 
-    commit::rehash_tree_in_operation(
+    let (modified_times, delta) = commit::rehash_tree_in_operation(
         repository.clone(),
         token.share(),
         state_staged.clone(),
@@ -7875,8 +7878,8 @@ async fn commit_merge_into(
         rehash_branch,
     )
     .await
-    .forward::<MergeError>("rehashing commit")?
-    .discard();
+    .forward::<MergeError>("rehashing the merge revision")?;
+    modified_times.discard();
 
     state_staged.reset_merge_conflict_flags();
     state_staged.set_parent_self(parents[0]);
@@ -7888,10 +7891,13 @@ async fn commit_merge_into(
             .forward::<MergeError>("serializing metadata")?,
     );
 
-    commit::weave_history(
+    let delta = delta.to_aligned::<NodeDelta>();
+    commit::weave_changes(
         repository.clone(),
         state_staged.clone(),
         commit::BasedOn::FirstParent,
+        delta.as_type_slice::<NodeDelta>(),
+        None,
     )
     .await
     .forward::<MergeError>("weaving history")?;

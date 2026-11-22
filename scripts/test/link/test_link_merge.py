@@ -2913,6 +2913,73 @@ def test_link_merge_of_divergent_history_keeps_the_remote_history_off_a_local_fi
     ]
 
 
+@pytest.mark.smoke
+def test_sync_of_divergent_history_records_a_link_the_local_history_repins(new_lore_repo):
+    """
+    A sync merging the remote latest into divergent local history that repins a link records the
+    link's new pin, its change from the first parent, as a change of the link node.
+    """
+    link_path = "linked/repo"
+    repo, link_repo = make_parent_with_link(
+        new_lore_repo, link_path, {"a.txt": "a\n"}, {"p.txt": "p\n"}
+    )
+    clone = repo.clone()
+    link_clone = link_repo.clone()
+    link_clone.write_commit_push("Advance the linked repository", {"b.txt": "b\n"})
+    repo.write_commit_push("Add a remote file", {"remote.txt": "remote\n"})
+
+    clone.link_update(link_path, pin=link_clone.branch_info().local_latest)
+    clone.commit("Repin the link", non_interactive=True, local=True)
+    clone.sync()
+
+    deltas = parse_jsonl(
+        clone.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
+    )
+    assert [
+        (delta["action"], delta["path"], delta["flagModify"])
+        for delta in deltas
+        if delta["path"] == link_path
+    ] == [("keep", link_path, True)], deltas
+
+
+@pytest.mark.smoke
+def test_link_merge_of_divergent_history_records_the_change_from_the_remote_pin(
+    new_lore_repo,
+):
+    """
+    Merging a branch's divergent history with links builds the link's merge revision from the
+    local pin, and the link's merge revision records, as its delta, its change from its first
+    parent, the pin the remote holds: the local addition, and not the remote's, which that pin
+    holds.
+    """
+    link_path = "linked/repo"
+    repo, link_repo = make_parent_with_link(
+        new_lore_repo, link_path, {"a.txt": "a\n"}, {"p.txt": "p\n"}
+    )
+    clone = repo.clone()
+
+    repo.write_files({f"{link_path}/remote.txt": "remote\n"})
+    repo.stage(f"{link_path}/remote.txt")
+    repo.commit("Add a remote file in the link", non_interactive=True)
+    repo.push()
+
+    clone.write_files({f"{link_path}/local.txt": "local\n"})
+    clone.stage(f"{link_path}/local.txt")
+    clone.commit("Add a local file in the link", non_interactive=True, local=True)
+    clone.branch_merge(
+        "main", message="Merge divergent history with links", non_interactive=True
+    )
+    clone.push()
+
+    link_repo.sync()
+    deltas = parse_jsonl(
+        link_repo.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
+    )
+    assert [
+        (delta["action"], delta["path"]) for delta in deltas if delta["flagFile"]
+    ] == [("add", "local.txt")], deltas
+
+
 # ---------------------------------------------------------------------------
 # Local work inside a link: a link merge verifies each path where the mount
 # materializes it, and refuses to overwrite it as a plain merge does.

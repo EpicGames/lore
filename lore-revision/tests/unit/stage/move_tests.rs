@@ -360,13 +360,22 @@ async fn a_staged_move_over_a_committed_file_replaces_it() {
             node_at(&instance, &revision, "b.txt").await.address,
             content
         );
-        for (node, action) in [(b, FileAction::Delete), (a, FileAction::Move)] {
-            let delta = revision
-                .node_delta(instance.repository.clone(), node)
-                .await
-                .expect("the revision's delta");
-            assert_eq!(delta.map(|delta| delta.action), Some(action as u16));
-        }
+        let deletion = revision
+            .node_deletion(instance.repository.clone(), b)
+            .await
+            .expect("the revision's delta");
+        assert_eq!(
+            deletion.map(|delta| delta.action),
+            Some(FileAction::Delete as u16)
+        );
+        let change = revision
+            .node_change(instance.repository.clone(), a)
+            .await
+            .expect("the revision's delta");
+        assert_eq!(
+            change.map(|delta| delta.action),
+            Some(FileAction::Move as u16)
+        );
     })
     .await;
 }
@@ -974,7 +983,7 @@ async fn a_dirty_move_onto_a_node_holding_a_staged_change_stages_its_deletion() 
                 "{occupant:?}: the moved node's content"
             );
             let delta = revision
-                .node_delta(instance.repository.clone(), replaced)
+                .node_deletion(instance.repository.clone(), replaced)
                 .await
                 .expect("the revision's delta");
             let deletion = match occupant {
@@ -1074,7 +1083,7 @@ async fn a_dirty_move_onto_a_moved_file_whose_place_another_holds_marks_it_delet
             assert_eq!(paths.len(), expected.len() + 1, "{held:?}: {paths:?}");
             if matches!(held, PlaceHeld::StagedMove) {
                 let delta = revision
-                    .node_delta(instance.repository.clone(), c)
+                    .node_deletion(instance.repository.clone(), c)
                     .await
                     .expect("the revision's delta");
                 assert_eq!(

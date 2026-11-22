@@ -117,7 +117,7 @@ pub async fn reset(
     let context = execution_context();
     let global = context.globals();
 
-    let (_current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
+    let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
         .await
         .forward::<ResetError>("loading current anchor")?;
 
@@ -130,9 +130,10 @@ pub async fn reset(
         .flatten()
         && !staged_revision.is_zero()
     {
-        let state_staged = state::State::deserialize(repository.clone(), staged_revision)
-            .await
-            .forward::<ResetError>("deserializing staged state")?;
+        let state_staged =
+            state::State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+                .await
+                .forward::<ResetError>("deserializing staged state")?;
         let has_staged = state_staged
             .node_has_staged_children(repository.clone(), crate::node::ROOT_NODE)
             .await

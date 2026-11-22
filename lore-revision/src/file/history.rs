@@ -16,7 +16,6 @@ use crate::interface::LoreString;
 use crate::lore::Address;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
-use crate::lore::TypedBytes;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::metadata::Metadata;
@@ -202,14 +201,19 @@ async fn node_path_in_revision(
     }
 }
 
+/// Reports `state` as a change of `action` of the file at `node_id` of `nodes`, the tree that
+/// holds it: `state` itself, or for a deletion the parent the file was found in, as a revision
+/// whose tree was started from another revision records a deletion under its first parent's node
+/// ID. A deletion reports no content.
 async fn history_state(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
+    nodes: &State,
     node_id: NodeID,
     action: u16,
 ) -> Result<(), FileHistoryError> {
     let path = if node_id != INVALID_NODE {
-        state
+        nodes
             .node_path(repository.clone(), node_id)
             .await
             .forward::<FileHistoryError>("Invalid node")?
@@ -217,9 +221,9 @@ async fn history_state(
         String::new()
     };
 
-    let node = if node_id != INVALID_NODE {
+    let node = if node_id != INVALID_NODE && action != FileAction::Delete as u16 {
         Some(
-            state
+            nodes
                 .node(repository.clone(), node_id)
                 .await
                 .forward::<FileHistoryError>("Invalid node")?,
@@ -235,7 +239,7 @@ async fn history_state(
             let file_metadata_block_index = NodeFileMetadataBlock::index(file_metadata_node_id);
             let file_metadata_node_index = NodeFileMetadata::index(file_metadata_node_id);
 
-            let file_metadata_block = state
+            let file_metadata_block = nodes
                 .block_file_metadata(repository.clone(), file_metadata_block_index)
                 .await
                 .forward::<FileHistoryError>("Failed to deserialize metadata block")?;
@@ -331,24 +335,21 @@ async fn history_parent(
             // Node exists in 'state_parent' but not in 'state'.
             // What happened to it?
 
-            let node_delta = state
-                .node_delta(repository.clone(), node_link.node)
+            let (nodes, node_id, action) = if state
+                .node_deletion(repository.clone(), node_link.node)
                 .await
-                .forward::<FileHistoryError>("Invalid node")?;
-
-            let action = if let Some(node_delta) = node_delta {
-                node_delta.action
+                .forward::<FileHistoryError>("Invalid node")?
+                .is_some()
+            {
+                (&state_parent, node_link.node, FileAction::Delete as u16)
+            } else if let Some(change) =
+                counterpart_change(&repository, &state_parent, node_link.node, &state).await?
+            {
+                (&state, change.node, change.action)
             } else {
-                FileAction::Delete as u16
+                (&state_parent, INVALID_NODE, FileAction::Delete as u16)
             };
-
-            let node_id = if let Some(node_delta) = node_delta {
-                node_delta.node
-            } else {
-                INVALID_NODE
-            };
-
-            history_state(repository.clone(), state.clone(), node_id, action).await?;
+            history_state(repository.clone(), state.clone(), nodes, node_id, action).await?;
 
             break;
         }
@@ -359,6 +360,33 @@ async fn history_parent(
     }
 
     Ok(node_link)
+}
+
+/// The change `state` records for the counterpart in its tree ([`state::find_counterpart_node`]) of
+/// node `node` of `parent`, a parent revision; `None` where `state` holds no counterpart or records
+/// no change of it.
+async fn counterpart_change(
+    repository: &Arc<RepositoryContext>,
+    parent: &State,
+    node: NodeID,
+    state: &State,
+) -> Result<Option<NodeDelta>, FileHistoryError> {
+    let block_count = state
+        .tree(repository.clone())
+        .await
+        .forward::<FileHistoryError>("Failed reading the revision's tree")?
+        .block_count;
+    let Some(counterpart) =
+        state::find_counterpart_node(repository, parent, node, state, block_count)
+            .await
+            .forward::<FileHistoryError>("Failed finding the file in the revision")?
+    else {
+        return Ok(None);
+    };
+    state
+        .node_change(repository.clone(), counterpart)
+        .await
+        .forward::<FileHistoryError>("Invalid node")
 }
 
 async fn find_start_revision(
@@ -493,11 +521,15 @@ pub(crate) async fn resolve_revision(
     })
 }
 
+/// Reports the change of the revision the history of the file at `path` starts from, and answers
+/// the node the walk goes on from, in the revision it names, invalid where that change is the
+/// file's add, with the change to follow past an add marked as merged that it doesn't report and
+/// the state of that change's revision ([`merged_add_history`]).
 async fn history_start(
     repository: Arc<RepositoryContext>,
     path: String,
     options: HistoryOptions,
-) -> Result<NodeLink, FileHistoryError> {
+) -> Result<(NodeLink, Option<(HistoryRecord, Arc<State>)>), FileHistoryError> {
     let path_for_error = path.clone();
     let relative_path = RelativePath::new_from_user_path(repository.require_path()?, &path)
         .forward::<FileHistoryError>("resolving user path")?;
@@ -551,38 +583,42 @@ async fn history_start(
         .await
         .forward::<FileHistoryError>("Failed to deserialize state")?;
 
-    let delta_block = state_node
-        .delta_block(repository.clone())
+    if let Some(node_delta) = state_node
+        .node_change(repository.clone(), node_link.node)
         .await
         .forward::<FileHistoryError>("Deserialize delta block failed")?
-        .to_aligned::<NodeDelta>();
+    {
+        if is_merged_add(&node_delta)
+            && let Some(record) =
+                merged_add_history(&repository, &state_node, node_link.node).await?
+        {
+            return Ok((node_link, Some(record)));
+        }
+        history_state(
+            repository.clone(),
+            state_node.clone(),
+            &state_node,
+            node_link.node,
+            node_delta.action,
+        )
+        .await?;
 
-    for node_delta in delta_block.as_type_slice::<NodeDelta>().iter() {
-        if node_delta.node == node_link.node {
-            history_state(
-                repository.clone(),
-                state_node.clone(),
-                node_link.node,
-                node_delta.action,
-            )
-            .await?;
-
-            if node_delta.action == FileAction::Add as u16 {
-                // Should not iterate history, added in this revision
-                node_link = NodeLink::invalid();
-            }
-
-            break;
+        if node_delta.action == FileAction::Add as u16 {
+            // Should not iterate history, added in this revision
+            node_link = NodeLink::invalid();
         }
     }
 
-    Ok(node_link)
+    Ok((node_link, None))
 }
 
 /// Reports the history of the file at `path` along the first-parent line, reading and reporting
 /// each earlier revision at the node ID the history records for the file there. Where the file has
 /// no first-parent history before a revision, as for a file the second parent of a merge of
-/// divergent history added, the walk takes the second-parent line.
+/// divergent history added, the walk takes the second-parent line. An add marked as merged
+/// ([`is_merged_add`]) of a file whose recorded history holds the same file
+/// ([`merged_add_history`]) is not reported, and the walk goes on along that history to the
+/// revision that added the file.
 pub async fn history(
     repository: Arc<RepositoryContext>,
     path: String,
@@ -594,7 +630,7 @@ pub async fn history(
         100
     };
 
-    let node_link = history_start(repository.clone(), path, options).await?;
+    let (node_link, mut next) = history_start(repository.clone(), path, options).await?;
 
     if !node_link.is_valid() {
         return Ok(());
@@ -606,46 +642,39 @@ pub async fn history(
         .forward::<FileHistoryError>("Failed to deserialize state")?;
 
     while limit > 0 {
-        // File metadata
-        let metadata_node_id = node::node_to_file_metadata(node_id);
-        let metadata_block_index = NodeFileMetadataBlock::index(metadata_node_id);
-        let metadata_node_index = NodeFileMetadata::index(metadata_node_id);
-
-        let metadata_block = state
-            .block_file_metadata(repository.clone(), metadata_block_index)
-            .await
-            .forward::<FileHistoryError>("Failed to deserialize metadata block")?;
-
-        let (action, signature_next, node_id_next) = {
-            let metadata_block_reader = metadata_block.read();
-            let metadata_node = metadata_block_reader.node(metadata_node_index);
-
-            lore_debug!(
-                "Revision {} -> {} node {} file metadata {:?}",
-                state.revision(),
-                state.revision_number(),
-                node_id,
-                metadata_node
-            );
-            let slot = metadata_node.history_slot();
-            (
-                metadata_node.action[slot],
-                metadata_node.revision[slot],
-                metadata_node.node[slot],
-            )
+        let HistoryRecord {
+            action,
+            node: node_id_next,
+            ..
+        } = if let Some((record, earlier)) = next.take() {
+            state = earlier;
+            record
+        } else {
+            let record = history_record(&repository, &state, node_id).await?;
+            if record.revision.is_zero() {
+                lore_debug!("Reached end of file history without ADD");
+                break;
+            }
+            state = state::State::deserialize(repository.clone(), record.revision)
+                .await
+                .forward::<FileHistoryError>("Failed to deserialize state")?;
+            record
         };
-
-        if signature_next.is_zero() {
-            lore_debug!("Reached end of file history without ADD");
-            break;
-        }
-
-        state = state::State::deserialize(repository.clone(), signature_next)
-            .await
-            .forward::<FileHistoryError>("Failed to deserialize state")?;
         node_id = node_id_next;
 
-        history_state(repository.clone(), state.clone(), node_id, action).await?;
+        if action == FileAction::Add as u16
+            && state
+                .node_change(repository.clone(), node_id)
+                .await
+                .forward::<FileHistoryError>("Failed to read the delta block")?
+                .is_some_and(|delta| is_merged_add(&delta))
+            && let Some(record) = merged_add_history(&repository, &state, node_id).await?
+        {
+            next = Some(record);
+            continue;
+        }
+
+        history_state(repository.clone(), state.clone(), &state, node_id, action).await?;
 
         // Last?
         if action == FileAction::Add as u16 {
@@ -656,4 +685,110 @@ pub async fn history(
     }
 
     Ok(())
+}
+
+/// Whether `delta` records an add marked as merged.
+fn is_merged_add(delta: &NodeDelta) -> bool {
+    delta.action == FileAction::Add as u16 && delta.flags & crate::change::Flags::Merge != 0
+}
+
+/// The change before a revision that the history of a file records: its action, the revision and
+/// the file's node there.
+#[derive(Clone, Copy)]
+struct HistoryRecord {
+    action: u16,
+    revision: Hash,
+    node: NodeID,
+}
+
+impl HistoryRecord {
+    /// The change `metadata`, a file's history, records in `slot`.
+    fn at(metadata: &NodeFileMetadata, slot: usize) -> Self {
+        Self {
+            action: metadata.action[slot],
+            revision: metadata.revision[slot],
+            node: metadata.node[slot],
+        }
+    }
+}
+
+/// The change before `state` that the history of the file at `node` records, in the slot `lore
+/// file history` follows ([`NodeFileMetadata::history_slot`]).
+async fn history_record(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    node: NodeID,
+) -> Result<HistoryRecord, FileHistoryError> {
+    let metadata_node = node::node_to_file_metadata(node);
+    let block = state
+        .block_file_metadata(
+            repository.clone(),
+            NodeFileMetadataBlock::index(metadata_node),
+        )
+        .await
+        .forward::<FileHistoryError>("Failed to deserialize metadata block")?;
+    let reader = block.read();
+    let metadata = reader.node(NodeFileMetadata::index(metadata_node));
+    lore_debug!(
+        "Revision {} -> {} node {} file metadata {:?}",
+        state.revision(),
+        state.revision_number(),
+        node,
+        metadata
+    );
+    Ok(HistoryRecord::at(metadata, metadata.history_slot()))
+}
+
+/// The change before `state`, among the two the history of the file at `node` records, whose
+/// revision holds the same file, one with its file ID, at the recorded node, with that revision's
+/// state. `None` for a revision with one parent and where neither does.
+async fn merged_add_history(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    node: NodeID,
+) -> Result<Option<(HistoryRecord, Arc<State>)>, FileHistoryError> {
+    if state.parent_other().is_zero() {
+        return Ok(None);
+    }
+    let file = state
+        .node(repository.clone(), node)
+        .await
+        .forward::<FileHistoryError>("Failed reading the added file")?;
+    if file.address.context.is_zero() {
+        return Ok(None);
+    }
+    let metadata_node = node::node_to_file_metadata(node);
+    let records = {
+        let block = state
+            .block_file_metadata(
+                repository.clone(),
+                NodeFileMetadataBlock::index(metadata_node),
+            )
+            .await
+            .forward::<FileHistoryError>("Failed to deserialize metadata block")?;
+        let reader = block.read();
+        let metadata = reader.node(NodeFileMetadata::index(metadata_node));
+        [0, 1].map(|slot| HistoryRecord::at(metadata, slot))
+    };
+    for record in records {
+        if record.revision.is_zero() {
+            continue;
+        }
+        let earlier = state::State::deserialize(repository.clone(), record.revision)
+            .await
+            .forward::<FileHistoryError>("Failed to deserialize state")?;
+        let block_count = earlier
+            .tree(repository.clone())
+            .await
+            .forward::<FileHistoryError>("Failed reading the earlier revision's tree")?
+            .block_count;
+        if state::same_file_counterpart(repository, &file, record.node, &earlier, block_count)
+            .await
+            .forward::<FileHistoryError>("Failed reading the file in the earlier revision")?
+            .is_some()
+        {
+            return Ok(Some((record, earlier)));
+        }
+    }
+    Ok(None)
 }

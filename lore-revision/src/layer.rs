@@ -292,7 +292,7 @@ impl Layer {
             .forward::<LayerError>("Failed deserializing state")?;
 
         let state_staged = match self.staged_revision() {
-            Some(staged) => State::deserialize(repository.clone(), staged)
+            Some(staged) => State::deserialize_staged(repository.clone(), staged, self.current)
                 .await
                 .forward::<LayerError>("Failed deserializing state")?,
             None => state_current.clone(),

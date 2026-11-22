@@ -1678,7 +1678,8 @@ def test_sync_merge_of_divergent_history_keeps_the_remote_change_before_its_late
 ):
     """
     A sync merges divergent history where the remote changed a file in a revision before
-    its latest. The history of the file names that revision, as it does on the remote.
+    its latest. The history of the file names that revision, as it does on the remote, and
+    not the merge revision, which changes nothing in the file against its first parent.
     """
     repo = new_lore_repo()
 
@@ -1710,14 +1711,9 @@ def test_sync_merge_of_divergent_history_keeps_the_remote_change_before_its_late
 
     # Neither side changed what the other did, so the sync commits the merge.
     clone.sync()
-    merge_revision = clone.branch_info("main").local_latest
 
     history = _file_history(clone, "changed.txt")
-    assert [entry["revision"] for entry in history] == [
-        merge_revision,
-        remote_change,
-        base,
-    ]
+    assert [entry["revision"] for entry in history] == [remote_change, base]
 
 
 @pytest.mark.smoke
@@ -1744,3 +1740,208 @@ def test_sync_of_diverged_history_records_no_deletion_the_remote_made(new_lore_r
     )
     assert [delta for delta in deltas if delta["action"] == "delete"] == [], deltas
     assert clone.file_exists("added.txt") and not clone.file_exists("gone.txt")
+
+
+@pytest.mark.smoke
+def test_sync_of_divergent_history_records_the_change_from_the_remote_latest(new_lore_repo):
+    """A sync merging the remote latest into divergent local history records, as the merge
+    revision's delta, what it changes from its first parent, the remote latest: the local
+    history's changes. The remote's tree reuses the slot of a file it deleted for a file it adds,
+    so the remote and local trees hold different files under one node ID."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push(
+        "Base",
+        {"gone.txt": "gone\n", "kept.txt": "kept\n", "edited.txt": "base\n", "moved.txt": "moved\n"},
+    )
+    clone = repo.clone()
+
+    repo.remove_file("gone.txt")
+    repo.stage(["gone.txt"])
+    repo.commit("Delete a file")
+    repo.write_commit_push("Add a file", {"added.txt": "added\n"})
+
+    clone.write_files({"local.txt": "local\n", "edited.txt": "local\n"})
+    clone.move("moved.txt", "moved-locally.txt")
+    clone.file_stage_move("moved.txt", "moved-locally.txt")
+    clone.stage(["local.txt", "edited.txt"])
+    clone.commit("Change local files")
+    clone.sync()
+
+    deltas = parse_jsonl(
+        clone.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
+    )
+    changes = sorted(
+        (delta["action"], delta["path"], delta["fromPath"], delta["flagModify"])
+        for delta in deltas
+        if delta["flagFile"]
+    )
+    assert changes == [
+        ("add", "local.txt", "", False),
+        ("keep", "edited.txt", "", True),
+        ("move", "moved-locally.txt", "moved.txt", False),
+    ], deltas
+
+
+def _sync_of_divergent_history_waiting_on_a_conflict(new_lore_repo) -> Lore:
+    """A clone whose sync, merging the remote latest into divergent local history, waits on a
+    conflict, with `build.log`, a file the local history added, matched by an ignore rule the
+    local history added after it. The merge revision is staged on the local revision, which holds
+    the file, and not on its first parent, the remote latest, which holds no node at the file's
+    ID."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"conflict.txt": "base\n"})
+    clone = repo.clone()
+    repo.write_commit_push("Remote", {"conflict.txt": "remote\n"})
+
+    clone.write_files({"build.log": "log\n"})
+    clone.stage(["build.log"])
+    clone.commit("Add a log")
+    clone.write_files({".loreignore": "*.log\n", "conflict.txt": "local\n"})
+    clone.stage([".loreignore", "conflict.txt"])
+    clone.commit("Ignore logs")
+    clone.sync()
+    return clone
+
+
+@pytest.mark.smoke
+def test_sync_of_divergent_history_waiting_on_a_conflict_keeps_a_local_file_tracked(
+    new_lore_repo,
+):
+    """While a sync merging the remote latest into divergent local history waits on a conflict,
+    a file the local history added stays tracked though an ignore rule matches it. A scan stages
+    an edit of the file."""
+    clone = _sync_of_divergent_history_waiting_on_a_conflict(new_lore_repo)
+
+    clone.write_files({"build.log": "edited\n"})
+    clone.stage(scan=True)
+    entries = parse_status_json(clone.status(json=True))
+    assert any(
+        entry["path"] == "build.log" and entry.get("flagStaged", False) for entry in entries
+    ), entries
+
+
+@pytest.mark.smoke
+def test_sync_of_divergent_history_waiting_on_a_conflict_scans_a_local_file_as_tracked(
+    new_lore_repo,
+):
+    """While a sync merging the remote latest into divergent local history waits on a conflict,
+    `lore status --scan` reports an edit of a file the local history added as dirty, though an
+    ignore rule matches it."""
+    clone = _sync_of_divergent_history_waiting_on_a_conflict(new_lore_repo)
+
+    clone.write_files({"build.log": "edited\n"})
+    output = clone.status("build.log", scan=True, json=True)
+    entry = find_status_entry(parse_status_json(output), "build.log")
+    assert entry is not None and entry["flagDirty"], output
+
+
+@pytest.mark.smoke
+def test_sync_of_divergent_history_waiting_on_a_conflict_locks_a_local_file(new_lore_repo):
+    """While a sync merging the remote latest into divergent local history waits on a conflict,
+    `lore lock acquire` locks a file the local history added, though an ignore rule matches it."""
+    clone = _sync_of_divergent_history_waiting_on_a_conflict(new_lore_repo)
+
+    assert clone.lock_acquire("build.log").acquired == ["build.log"]
+
+
+@pytest.mark.smoke
+def test_sync_of_divergent_history_resolved_with_a_new_file_starts_its_history_at_the_merge(
+    new_lore_repo,
+):
+    """A file added while a sync merging the remote latest into divergent local history waits on
+    a conflict has no history before the merge revision, though the merge revision records every
+    change it makes as merged: its history is the merge revision's add."""
+    clone = _sync_of_divergent_history_waiting_on_a_conflict(new_lore_repo)
+    clone.write_files({"conflict.txt": "resolved\n", "new.txt": "new\n"})
+    clone.branch_merge_resolve("conflict.txt")
+    clone.stage(["new.txt"])
+    clone.commit("Merge")
+    merge = clone.branch_info().local_latest
+
+    history = _file_history(clone, "new.txt")
+    assert [(entry["revision"], entry["action"]) for entry in history] == [
+        (merge, "add")
+    ], history
+
+
+@pytest.mark.smoke
+def test_sync_merge_of_divergent_history_keeps_a_reused_slots_history_off_a_local_file(
+    new_lore_repo,
+):
+    """A file the local side adds in a node slot a file it deleted freed has, once a sync merges
+    the remote latest into the local history, its own addition as its history, and none of the
+    deleted file's, at the merge revision and at a revision committed on it."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"base.txt": "base\n"})
+    clone = repo.clone()
+    repo.write_commit_push("Add a remote file", {"remote.txt": "remote\n"})
+
+    clone.write_files({"old.txt": "old\n"})
+    clone.stage(["old.txt"])
+    clone.commit("Add old", local=True)
+    clone.write_files({"old.txt": "edited\n"})
+    clone.stage(["old.txt"])
+    clone.commit("Edit old", local=True)
+    clone.remove_file("old.txt")
+    clone.stage(["old.txt"])
+    clone.commit("Delete old", local=True)
+    clone.write_files({"local.txt": "local\n"})
+    clone.stage(["local.txt"])
+    clone.commit("Add a local file", local=True)
+    local_latest = clone.branch_info("main").local_latest
+    clone.sync()
+
+    for next_content in ("next\n", None):
+        history = _file_history(clone, "local.txt")
+        assert [
+            (entry["revision"], entry["path"], entry["action"]) for entry in history
+        ] == [(local_latest, "local.txt", "add")], history
+        if next_content:
+            clone.write_files({"base.txt": next_content})
+            clone.stage(["base.txt"])
+            clone.commit("Next", local=True)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "deleted, added", [("x.txt", "y.txt"), ("z.txt", "a.txt")], ids=["delete-first", "add-first"]
+)
+def test_sync_merge_of_divergent_history_tells_a_deleted_file_from_a_file_in_its_slot(
+    new_lore_repo, deleted, added
+):
+    """The local side deletes a file the remote latest holds and adds another, which takes the
+    deleted file's node slot. The merge revision of a sync records the deletion under the remote
+    latest's node ID and the add under its own, the same number, in either order of their paths,
+    and the history of each file names its own change: the add of the new file at the local
+    revision, and the deletion of the other at the merge revision, before and after a revision is
+    committed on it."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"base.txt": "base\n", deleted: "deleted\n"})
+    clone = repo.clone()
+    repo.write_commit_push("Add a remote file", {"remote.txt": "remote\n"})
+
+    clone.remove_file(deleted)
+    clone.stage([deleted])
+    clone.commit("Delete a file", local=True)
+    clone.write_files({added: "added\n"})
+    clone.stage([added])
+    clone.commit("Add a file", local=True)
+    add = clone.branch_info("main").local_latest
+    clone.sync()
+    merge = clone.branch_info("main").local_latest
+
+    for next_content in ("next\n", None):
+        history = _file_history(clone, added)
+        assert [
+            (entry["revision"], entry["path"], entry["action"]) for entry in history
+        ] == [(add, added, "add")], history
+        history = _file_history(clone, deleted)
+        assert (history[0]["revision"], history[0]["path"], history[0]["action"]) == (
+            merge,
+            deleted,
+            "delete",
+        ), history
+        if next_content:
+            clone.write_files({"base.txt": next_content})
+            clone.stage(["base.txt"])
+            clone.commit("Next", local=True)

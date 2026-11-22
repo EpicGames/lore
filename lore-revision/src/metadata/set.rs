@@ -105,9 +105,10 @@ pub(crate) async fn set_revision(
         .flatten()
         .unwrap_or(current_revision);
 
-    let state = state::State::deserialize(repository.clone(), staged_revision)
-        .await
-        .forward_any::<SetError>("Failed to deserialize state")?;
+    let state =
+        state::State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+            .await
+            .forward_any::<SetError>("Failed to deserialize state")?;
 
     let metadata_hash = if current_revision == staged_revision {
         Hash::default()
@@ -329,9 +330,10 @@ pub async fn set_file(
         .flatten()
         .unwrap_or(current_revision);
 
-    let state = state::State::deserialize(repository.clone(), staged_revision)
-        .await
-        .forward_any::<SetError>("Failed to deserialize state")?;
+    let state =
+        state::State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+            .await
+            .forward_any::<SetError>("Failed to deserialize state")?;
 
     let addresses = binary_payload_addresses(&repository, values, formats).await?;
 

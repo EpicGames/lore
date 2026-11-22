@@ -2602,7 +2602,7 @@ async fn find_last_modified_revision(
     let mut last_modified_revision_number = state.revision_number();
 
     // Check if node was modified in the LATEST revision
-    if let Ok(Some(_node_delta)) = state.node_delta(repository.clone(), node_id).await {
+    if let Ok(Some(_node_delta)) = state.node_change(repository.clone(), node_id).await {
         lore_debug!(
             "{} found last modified revision {} -> {} (HEAD)",
             change.path().as_str(),
@@ -2701,9 +2701,15 @@ async fn find_last_merged_revision(
     // is later than the last modified revision we identified from the source branch file history
     let repository = change.to.mapping.repository.clone();
     if node_current.is_valid_node_id()
-        && let Some(delta) = state_start
-            .node_delta(repository.clone(), node_current)
-            .await?
+        && let Some(delta) = if change.to.mapping.node.is_valid_node_id() {
+            state_start
+                .node_change(repository.clone(), node_current)
+                .await?
+        } else {
+            state_start
+                .node_deletion(repository.clone(), node_current)
+                .await?
+        }
         && added_without_merge(delta.action, delta.flags)
     {
         return Ok(None);

@@ -3338,13 +3338,21 @@ async fn a_status_of_a_directory_name_a_dirty_move_took_reports_the_deletion_and
     assert_eq!(orders.lock().len(), 2, "both chain orders");
 }
 
-/// The action the delta of `revision` records for `node`, `None` where it names none.
+/// The action the delta of `revision` records for `node`, its change or else its deletion, `None`
+/// where it names none.
 async fn delta_action(instance: &TestRepository, revision: &State, node: NodeID) -> Option<u16> {
-    revision
-        .node_delta(instance.repository.clone(), node)
+    let change = revision
+        .node_change(instance.repository.clone(), node)
         .await
-        .expect("the revision's delta")
-        .map(|delta| delta.action)
+        .expect("the revision's delta");
+    match change {
+        Some(change) => Some(change.action),
+        None => revision
+            .node_deletion(instance.repository.clone(), node)
+            .await
+            .expect("the revision's delta")
+            .map(|delta| delta.action),
+    }
 }
 
 /// A commit of a file staged edited, then moved with `lore dirty move` onto a path a committed file

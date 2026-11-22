@@ -1246,12 +1246,14 @@ pub mod in_memory {
     use lore_base::types::BranchId;
     use lore_base::types::Context;
     use lore_base::types::Hash;
+    use lore_base::types::TypedBytes as _;
     use lore_revision::commit::BasedOn;
     use lore_revision::commit::commit_in_memory_revision;
-    use lore_revision::commit::weave_history;
+    use lore_revision::commit::weave_changes;
     use lore_revision::lore::RepositoryId;
     use lore_revision::metadata::Metadata;
     use lore_revision::node::Node;
+    use lore_revision::node::NodeDelta;
     use lore_revision::node::NodeFlags;
     use lore_revision::node::NodeID;
     use lore_revision::node::ROOT_NODE;
@@ -1463,10 +1465,30 @@ pub mod in_memory {
         let state = revision_state(repository, merged).await;
         state.set_parent_self(remote_latest);
         state.set_parent_other(local_latest);
-        weave_history(repository.clone(), state.clone(), BasedOn::Other)
-            .await
-            .expect("weaving the merge history");
+        weave_recorded_delta(repository, &state, BasedOn::Other).await;
         state
+    }
+
+    /// Weaves the history of `state` as committing it does, from the node delta it records.
+    pub async fn weave_recorded_delta(
+        repository: &Arc<RepositoryContext>,
+        state: &Arc<State>,
+        based_on: BasedOn,
+    ) {
+        let delta = state
+            .delta_block(repository.clone())
+            .await
+            .expect("reading the delta")
+            .to_aligned::<NodeDelta>();
+        weave_changes(
+            repository.clone(),
+            state.clone(),
+            based_on,
+            delta.as_type_slice::<NodeDelta>(),
+            None,
+        )
+        .await
+        .expect("weaving the history");
     }
 }
 
