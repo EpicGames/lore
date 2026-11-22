@@ -25,7 +25,6 @@ use lore_base::types::Address;
 use lore_base::types::Fragment;
 use lore_error_set::prelude::*;
 use lore_io::StatKind;
-use lore_io::clone::CloneStats;
 
 use super::filesystem_provider::CaseLookup;
 use super::filesystem_provider::CloneAnswer;
@@ -42,6 +41,7 @@ use super::filesystem_provider::InstanceOperationImpl;
 use super::filesystem_provider::ListedEntry;
 use super::filesystem_provider::StaticDispatchDirectoryListing;
 use super::filesystem_provider::StaticDispatchInstanceOperation;
+use crate::fs::walk::CloneStats;
 use crate::hash::hash_string;
 use crate::immutable;
 use crate::lore_debug;

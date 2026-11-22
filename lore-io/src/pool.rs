@@ -139,6 +139,17 @@ enum TaskState<T, F> {
     Taken,
 }
 
+/// The jobs every pool of the process has run, on its threads or on the threads that submitted
+/// them, which only a test build counts.
+#[cfg(feature = "test-util")]
+static JOBS_RUN: AtomicUsize = AtomicUsize::new(0);
+
+/// The jobs every pool of the process has run so far.
+#[cfg(feature = "test-util")]
+pub fn jobs_run() -> usize {
+    JOBS_RUN.load(Ordering::Relaxed)
+}
+
 /// The runnable view of a [`Task`], which is what the queue holds.
 #[lore_macro::test_pub]
 trait Job: Send + Sync {
@@ -165,6 +176,8 @@ where
         let Some(work) = work else {
             return;
         };
+        #[cfg(feature = "test-util")]
+        JOBS_RUN.fetch_add(1, Ordering::Relaxed);
 
         // Deliberately not under the lock: the work is a blocking syscall, and the awaiter polls
         // while it runs.
@@ -313,24 +326,27 @@ pub fn run_file_operations_on_this_thread<T>(call: impl FnOnce() -> T) -> T {
     call()
 }
 
+/// Lends up to `wanted` threads of the cap of the process's syscall pool, the one every file
+/// operation runs on, to work that runs them itself, as [`SyscallPool::lend`] does.
+pub fn lend_threads(wanted: usize) -> Lent<'static> {
+    SyscallPool::global().lend(wanted)
+}
+
 /// Threads of a [`SyscallPool`]'s cap that [`SyscallPool::lend`] lent, given back when dropped.
-#[lore_macro::test_pub]
-pub(crate) struct Lent<'a> {
+pub struct Lent<'a> {
     pool: &'a SyscallPool,
     count: usize,
 }
 
 impl Lent<'_> {
     /// How many threads were lent.
-    #[lore_macro::test_pub]
-    pub(crate) fn count(&self) -> usize {
+    pub fn count(&self) -> usize {
         self.count
     }
 
     /// Takes over the threads `other` holds, which the same pool lent, so they are given back with
     /// these.
-    #[lore_macro::test_pub]
-    pub(crate) fn absorb(&mut self, mut other: Lent<'_>) {
+    pub fn absorb(&mut self, mut other: Lent<'_>) {
         debug_assert!(std::ptr::eq(self.pool, other.pool), "lent by another pool");
         self.count += std::mem::take(&mut other.count);
     }
@@ -339,8 +355,7 @@ impl Lent<'_> {
     /// could not start them, and starts a thread in each slot given back for a job that queued
     /// while they were lent and that no idle thread will take, so the queue drains at the full
     /// cap again rather than waiting for a later submission to start one.
-    #[lore_macro::test_pub]
-    pub(crate) fn give_back(&mut self, count: usize) {
+    pub fn give_back(&mut self, count: usize) {
         let count = count.min(self.count);
         if count == 0 {
             return;

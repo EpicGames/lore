@@ -1389,7 +1389,7 @@ mod tests {
             answer: &CloneAnswer,
             copy_unclonable: bool,
             run: &CloneRun,
-        ) -> Result<lore_io::clone::CloneStats, InstanceCloneError> {
+        ) -> Result<lore_revision::fs::walk::CloneStats, InstanceCloneError> {
             if self.fails {
                 return Err(NotSupported {
                     operation: "cloning an entry".to_string(),
@@ -1415,7 +1415,7 @@ mod tests {
     fn copies(root: &Path, size: u64, available: u64) -> CloneAnswer {
         CloneAnswer::CopiesBytes {
             reason: "the volume does not clone files".to_string(),
-            size: lore_io::clone::TreeSize {
+            size: lore_revision::fs::walk::TreeSize {
                 size,
                 file_count: 1,
                 entry_count: 1,
@@ -2144,7 +2144,7 @@ mod tests {
             answer: &CloneAnswer,
             copy_unclonable: bool,
             run: &CloneRun,
-        ) -> Result<lore_io::clone::CloneStats, InstanceCloneError> {
+        ) -> Result<lore_revision::fs::walk::CloneStats, InstanceCloneError> {
             instance::store_instance_registration(&self.repository, self.other, &self.target)
                 .await
                 .expect("register the other instance");
@@ -2344,7 +2344,7 @@ mod tests {
             answer: &CloneAnswer,
             copy_unclonable: bool,
             run: &CloneRun,
-        ) -> Result<lore_io::clone::CloneStats, InstanceCloneError> {
+        ) -> Result<lore_revision::fs::walk::CloneStats, InstanceCloneError> {
             let stats = self
                 .os
                 .clone_instance(source, dot_path, destination, answer, copy_unclonable, run)
@@ -2561,7 +2561,7 @@ mod tests {
             _answer: &CloneAnswer,
             _copy_unclonable: bool,
             run: &CloneRun,
-        ) -> Result<lore_io::clone::CloneStats, InstanceCloneError> {
+        ) -> Result<lore_revision::fs::walk::CloneStats, InstanceCloneError> {
             let hold = Arc::clone(&run.hold);
             let release = Arc::clone(&self.release);
             self.started

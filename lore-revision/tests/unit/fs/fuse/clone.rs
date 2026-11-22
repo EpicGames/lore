@@ -8,13 +8,13 @@ use std::sync::Arc;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::test_util::TempDir;
 use lore_io::clone::Kind;
-use lore_io::clone::Progress;
-use lore_io::clone::Visit;
 use lore_revision::fs::filesystem_provider::CloneAnswer;
 use lore_revision::fs::filesystem_provider::CloneRun;
 use lore_revision::fs::fuse::clone::answer;
 use lore_revision::fs::fuse::clone::clone;
 use lore_revision::fs::fuse::clone::visit;
+use lore_revision::fs::walk::Progress;
+use lore_revision::fs::walk::Visit;
 
 use super::fuse_fixture::setup_test_execution;
 use super::fuse_fixture::test_file_write;
@@ -91,7 +91,7 @@ async fn clone_external(
     external: &Path,
     destination: &Path,
     files: u64,
-) -> lore_io::clone::CloneStats {
+) -> lore_revision::fs::walk::CloneStats {
     std::fs::create_dir_all(destination.join(".lore")).expect("the new instance's Lore directory");
     test_file_write(&destination.join(".lore/instance"), b"fedcba9876543210");
     let answer = answer(external).await.expect("answer");

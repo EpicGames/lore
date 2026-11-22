@@ -86,7 +86,7 @@ use windows_sys::Win32::Storage::FileSystem::WRITE_OWNER;
 use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
 
 use super::COPY_BUFFER;
-use super::Progress;
+use super::TestPoints;
 use super::refused;
 use super::source::Source;
 
@@ -132,7 +132,7 @@ thread_local! {
 /// ranges, alternate data streams, security, attributes and times, and flushes the copy before
 /// its handle closes. Refuses a file [`refusal`] names, and one whose owner the caller may not
 /// assign. A copy that fails is marked deleted.
-pub(super) fn file(source: Source<'_>, destination: &Path, progress: &Progress) -> io::Result<()> {
+pub fn file(source: Source<'_>, destination: &Path, points: &TestPoints) -> io::Result<()> {
     let input = std::fs::OpenOptions::new()
         .access_mode(SOURCE_ACCESS)
         .custom_flags(
@@ -166,18 +166,17 @@ pub(super) fn file(source: Source<'_>, destination: &Path, progress: &Progress) 
         }
         backup(&input, &output)?;
         #[cfg(feature = "test-util")]
-        progress.failure_after_data(destination)?;
+        points.failure_after_data(destination)?;
         finish(&input, &output)?;
         output.sync_all()?;
         #[cfg(feature = "test-util")]
-        progress
-            .counters
+        points
             .flushed_files
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     })();
     #[cfg(not(feature = "test-util"))]
-    let _ = progress;
+    let _ = points;
     if copied.is_err() {
         discard(&output);
     }
@@ -187,7 +186,7 @@ pub(super) fn file(source: Source<'_>, destination: &Path, progress: &Progress) 
 /// Gives the directory `destination` the alternate data streams, security, attributes and times
 /// of the directory at `source`, which the walk holds open, once every entry is in place. Refuses
 /// a source [`refusal`] names, as one replaced since it was listed may be.
-pub(super) fn finish_directory(source: &Path, destination: &Path) -> io::Result<()> {
+pub fn finish_directory(source: &Path, destination: &Path) -> io::Result<()> {
     let input = std::fs::OpenOptions::new()
         .access_mode(SOURCE_ACCESS)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
@@ -218,7 +217,7 @@ fn refusal(attributes: u32, links: u32) -> Option<&'static str> {
 }
 
 /// Refuses an entry with `attributes` and `links`, as [`refusal`] says.
-pub(super) fn refuse(attributes: u32, links: u32) -> io::Result<()> {
+pub fn refuse(attributes: u32, links: u32) -> io::Result<()> {
     refusal(attributes, links).map_or(Ok(()), |what| Err(refused(what)))
 }
 

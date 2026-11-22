@@ -62,7 +62,7 @@ use std::path::Path;
 
 use super::COPY_BUFFER;
 use super::Kept;
-use super::Progress;
+use super::TestPoints;
 use super::entry;
 use super::entry::OpenedSource;
 use super::failed_call;
@@ -78,23 +78,23 @@ thread_local! {
 }
 
 /// What the entries of one faithful copy share: the count of what the target kept, and the copy's
-/// progress.
+/// test points.
 #[derive(Clone, Copy)]
-pub(super) struct Copying<'a> {
-    pub(super) kept: &'a Kept,
-    pub(super) progress: &'a Progress,
+pub struct Copying<'a> {
+    pub kept: &'a Kept,
+    pub points: &'a TestPoints,
 }
 
 /// Copies the file `source` names to `destination`, which must not exist, with its holes, owner,
 /// extended attributes, ACL, permission bits and times, and copies a link found there as
 /// [`link`] does. Refuses a file with more than one link.
-pub(super) fn file(source: Source<'_>, destination: &Path, copying: Copying<'_>) -> io::Result<()> {
+pub fn file(source: Source<'_>, destination: &Path, copying: Copying<'_>) -> io::Result<()> {
     let input = match open_source(source)? {
         OpenedSource::File(input) => input,
         OpenedSource::Link => return link(source, destination, copying),
     };
     let status = Status::of(Entry::Fd(input.as_raw_fd()))?;
-    status.refuse_links_and_flags(&source, copying.progress)?;
+    status.refuse_links_and_flags(&source, copying.points)?;
     let output = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -111,7 +111,7 @@ pub(super) fn file(source: Source<'_>, destination: &Path, copying: Copying<'_>)
             &after,
             copying,
         )?;
-        flush_file(&output, copying.progress)
+        flush_file(&output, copying.points)
     });
     if copied.is_err() {
         drop(output);
@@ -134,32 +134,31 @@ fn open_source(source: Source<'_>) -> io::Result<OpenedSource> {
 
 /// Flushes the copied file `output` on macOS, as the module describes.
 #[cfg(target_os = "macos")]
-fn flush_file(output: &File, progress: &Progress) -> io::Result<()> {
+fn flush_file(output: &File, points: &TestPoints) -> io::Result<()> {
     // SAFETY: the descriptor is open for the call.
     check(unsafe { libc::fsync(output.as_raw_fd()) })?;
     #[cfg(feature = "test-util")]
-    progress
-        .counters
+    points
         .flushed_files
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(not(feature = "test-util"))]
-    let _ = progress;
+    let _ = points;
     Ok(())
 }
 
 /// Nothing on Linux, where the copy's one `syncfs` flushes every file.
 #[cfg(target_os = "linux")]
 #[allow(clippy::unnecessary_wraps)]
-fn flush_file(_output: &File, _progress: &Progress) -> io::Result<()> {
+fn flush_file(_output: &File, _points: &TestPoints) -> io::Result<()> {
     Ok(())
 }
 
 /// Copies the symbolic link `source` names to `destination` as a link, with its owner, extended
 /// attributes, ACL and times. Refuses a link with more than one name.
-pub(super) fn link(source: Source<'_>, destination: &Path, copying: Copying<'_>) -> io::Result<()> {
+pub fn link(source: Source<'_>, destination: &Path, copying: Copying<'_>) -> io::Result<()> {
     let name = source.name_for_call()?;
     let status = Status::of(Entry::Named(source.parent_fd(), &name))?;
-    status.refuse_links_and_flags(&source, copying.progress)?;
+    status.refuse_links_and_flags(&source, copying.points)?;
     entry::link(source, destination)?;
     let from = CString::new(source.as_os_str().as_bytes())?;
     let to = CString::new(destination.as_os_str().as_bytes())?;
@@ -206,7 +205,7 @@ fn set_link_mode(path: &CStr, mode: u32) -> io::Result<()> {
 
 /// Gives the directory `destination` the owner, extended attributes, ACL, permission bits and
 /// times of `source`, the directory it copies, once every entry is in place.
-pub(super) fn finish_directory(
+pub fn finish_directory(
     source: &OpenDirectory,
     destination: &Path,
     copying: Copying<'_>,
@@ -216,7 +215,7 @@ pub(super) fn finish_directory(
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(destination)?;
     let mut status = Status::of(Entry::Fd(source.fd().as_raw_fd()))?;
-    status.refuse_links_and_flags(destination, copying.progress)?;
+    status.refuse_links_and_flags(destination, copying.points)?;
     if let Some(atime) = source.atime() {
         status.atime = atime;
     }
@@ -230,14 +229,14 @@ pub(super) fn finish_directory(
 
 /// Refuses the root of a copy, `source`, where [`refuses_flags`] refuses its flags, before the
 /// copy starts rather than once its last entry is in place.
-pub(super) fn refuse_root(source: &Path, progress: &Progress) -> io::Result<()> {
+pub fn refuse_root(source: &Path, points: &TestPoints) -> io::Result<()> {
     let root = File::open(source)?;
-    Status::of(Entry::Fd(root.as_raw_fd()))?.refuse_links_and_flags(source, progress)
+    Status::of(Entry::Fd(root.as_raw_fd()))?.refuse_links_and_flags(source, points)
 }
 
 /// Clears the ACL that `destination`, the empty root of a copy, inherited from its parent, so that
 /// no entry the copy creates in it inherits one. A file system that holds no ACLs has none.
-pub(super) fn clear_inherited_acl(destination: &Path) -> io::Result<()> {
+pub fn clear_inherited_acl(destination: &Path) -> io::Result<()> {
     let root = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -259,7 +258,7 @@ pub(super) fn clear_inherited_acl(destination: &Path) -> io::Result<()> {
 /// Flushes the file system that holds `destination` to its device: with one `syncfs` on Linux,
 /// and on macOS with one `F_FULLFSYNC`, which empties the drive's cache of the files each copying
 /// thread flushed.
-pub(super) fn flush_file_system(destination: &Path, progress: &Progress) -> io::Result<()> {
+pub fn flush_file_system(destination: &Path, points: &TestPoints) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let directory = File::open(destination)?;
@@ -269,12 +268,11 @@ pub(super) fn flush_file_system(destination: &Path, progress: &Progress) -> io::
     #[cfg(target_os = "macos")]
     crate::psync::sync_dir(destination)?;
     #[cfg(feature = "test-util")]
-    progress
-        .counters
+    points
         .flushed
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(not(feature = "test-util"))]
-    let _ = progress;
+    let _ = points;
     Ok(())
 }
 
@@ -372,15 +370,15 @@ impl Status {
 
     /// Refuses the entry at `path`, a path of the source or of its copy, where it isn't a
     /// directory and has more than one link, or [`refuses_flags`] refuses its flags. A test build
-    /// adds the flags `progress` stands in for an entry of its name.
-    fn refuse_links_and_flags(&self, path: &Path, progress: &Progress) -> io::Result<()> {
+    /// adds the flags `points` stands in for an entry of its name.
+    fn refuse_links_and_flags(&self, path: &Path, points: &TestPoints) -> io::Result<()> {
         if self.links > 1 && !self.is_directory {
             return Err(refused(&format!("has {} links", self.links)));
         }
         #[cfg(feature = "test-util")]
-        let flags = self.flags | progress.flags_standing_in(path);
+        let flags = self.flags | points.flags_standing_in(path);
         #[cfg(not(feature = "test-util"))]
-        let (flags, _) = (self.flags, (path, progress));
+        let (flags, _) = (self.flags, (path, points));
         if refuses_flags(flags) {
             return Err(refused("is immutable or append-only"));
         }
@@ -446,8 +444,8 @@ fn set_owner(node: Node<'_>, status: &Status, copying: Copying<'_>) -> io::Resul
 }
 
 /// Gives `node` the owner `uid` and the group `gid`, or leaves its group where `gid` is
-/// `gid_t::MAX`, which the calls read as -1. A test build stands in for the refusals `progress`
-/// names.
+/// `gid_t::MAX`, which the calls read as -1. A test build stands in for the refusals the copy's
+/// test points name.
 fn chown(
     node: Node<'_>,
     uid: libc::uid_t,
@@ -455,7 +453,7 @@ fn chown(
     #[cfg_attr(not(feature = "test-util"), allow(unused_variables))] copying: Copying<'_>,
 ) -> io::Result<()> {
     #[cfg(feature = "test-util")]
-    if let Some(refusal) = copying.progress.owner_refusal(gid != libc::gid_t::MAX) {
+    if let Some(refusal) = copying.points.owner_refusal(gid != libc::gid_t::MAX) {
         return Err(refusal);
     }
     // SAFETY: the descriptor is open, or the path NUL-terminated, for the call, which doesn't
@@ -499,12 +497,11 @@ fn copy_attributes(from: Node<'_>, to: Node<'_>, copying: Copying<'_>) -> io::Re
             }
             #[cfg(feature = "test-util")]
             copying
-                .progress
-                .counters
+                .points
                 .value_held
                 .fetch_max(value.len(), std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "test-util")]
-            let set = match copying.progress.attribute_refusal(name.to_bytes()) {
+            let set = match copying.points.attribute_refusal(name.to_bytes()) {
                 Some(refusal) => Err(refusal),
                 None => set(to, name, &value),
             };
@@ -603,8 +600,7 @@ fn copy_resource_fork(
         };
         #[cfg(feature = "test-util")]
         copying
-            .progress
-            .counters
+            .points
             .value_held
             .fetch_max(read, std::sync::atomic::Ordering::Relaxed);
         if read == 0 {
@@ -634,7 +630,7 @@ fn assigned_by_system(to: Node<'_>, name: &CStr, err: &io::Error, copying: Copyi
         return false;
     }
     #[cfg(feature = "test-util")]
-    if copying.progress.target_holds_refused(name.to_bytes()) {
+    if copying.points.target_holds_refused(name.to_bytes()) {
         return true;
     }
     #[cfg(not(feature = "test-util"))]

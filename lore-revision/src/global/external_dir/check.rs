@@ -18,10 +18,7 @@ use std::time::Instant;
 use lore_error_set::error_set;
 use lore_error_set::prelude::*;
 use lore_io::clone::Locality;
-use lore_io::clone::Progress;
 use lore_io::clone::Space;
-use lore_io::clone::TreeSize;
-use lore_io::clone::Visit;
 use lore_io::clone::Volume;
 
 use super::EXTERNAL;
@@ -32,6 +29,9 @@ use super::resolve::Availability;
 use super::resolve::RootState;
 use super::setting::Setting;
 use crate::errors::InvalidArguments;
+use crate::fs::walk::Progress;
+use crate::fs::walk::TreeSize;
+use crate::fs::walk::Visit;
 
 #[error_set]
 pub enum CheckError {
@@ -497,7 +497,7 @@ fn move_kind(
 /// `block` bytes, leaving out what each external directory's `write-staging/` holds, which FUSE
 /// empties at mount. Fails as internal once `progress` is stopped. Blocking.
 pub fn measure_root(root: &Path, block: u64, progress: &Progress) -> Result<TreeSize, CheckError> {
-    lore_io::clone::measure(
+    crate::fs::walk::measure(
         root,
         &|_path, relative, _kind| {
             if in_write_staging(relative) {

@@ -1,25 +1,25 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 
-//! The walk [`super::clone_into`], [`super::measure`] and [`super::find_directories`] share.
-//! Each directory is listed by one of the calling thread and the threads the syscall pool lends
-//! it, and the directories it holds are queued for the next free thread, the last found first.
-//! The queue holds at most 4,096 directories, and a thread lists at most 256 entries of a directory
-//! at a time before handing the rest of it on as a continuation. A continuation holds its directory
-//! open, through one descriptor on Unix, and the queue holds 64 of them at most: with that many
-//! queued, a thread lists the rest of its directory itself. A thread that finds a directory the
-//! queue has no room for lists it itself, depth-first. So the walk holds the queue's cap, the
-//! continuations' cap with each continuation's open directory and, for each thread, one open
-//! directory for each level it has descended and one batch of the directories it found, whatever
-//! the number of files or the width of a directory.
+//! The walk [`super::clone_into`], [`super::copy_faithfully`], [`super::measure`] and
+//! [`super::find_directories`] share. Each directory is listed by one of the calling thread and the
+//! threads the syscall pool lends it, and the directories it holds are queued for the next free
+//! thread, the last found first. The queue holds at most 4,096 directories, and a thread lists at
+//! most 256 entries of a directory at a time before handing the rest of it on as a continuation. A
+//! continuation holds its directory open, through one descriptor on Unix, and the queue holds 64 of
+//! them at most: with that many queued, a thread lists the rest of its directory itself. A thread
+//! that finds a directory the queue has no room for lists it itself, depth-first. So the walk holds
+//! the queue's cap, the continuations' cap with each continuation's open directory and, for each
+//! thread, one open directory for each level it has descended and one batch of the directories it
+//! found, whatever the number of files or the width of a directory.
 //!
-//! The walk benchmark (`lore-io/BENCHMARKS.md`, *The walk's bounds*) chose the bounds: with them,
-//! the copy is no slower than the unbounded walk on its four trees, and batches of 1,024 or 4,096
-//! and queues of 2,048 to 65,536 are no faster. A step is granted room for a whole batch, so the
-//! cap leaves room for the batches of the up to nine threads a default pool runs a walk on. A
-//! continuation goes back on the queue only once its batch is done: threads that create entries
-//! in one directory at once wait for each other on its lock, which measured a third slower over a
-//! tree of wide directories.
+//! The walk benchmark (`lore-revision/BENCHMARKS.md`, *The walk's bounds*) chose the bounds: with
+//! them, the copy is no slower than the unbounded walk on its four trees, and batches of 1,024 or
+//! 4,096 and queues of 2,048 to 65,536 are no faster. A step is granted room for a whole batch, so
+//! the cap leaves room for the batches of the up to nine threads a default pool runs a walk on. A
+//! continuation goes back on the queue only once its batch is done: threads that create entries in
+//! one directory at once wait for each other on its lock, which measured a third slower over a tree
+//! of wide directories.
 //!
 //! A continuation keeps its directory open. On Unix it holds the `readdir` stream, which owns the
 //! directory's only descriptor, so the thread that takes the continuation lists on without
@@ -28,7 +28,6 @@
 //! entries.
 
 use std::cell::Cell;
-use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
@@ -38,39 +37,25 @@ use std::thread::Scope;
 use std::time::Duration;
 use std::time::Instant;
 
+use lore_io::clone::Backend;
+use lore_io::clone::Kept;
+use lore_io::clone::Kind;
+use lore_io::clone::Listed;
+use lore_io::clone::OpenDirectory;
+use lore_io::clone::Source;
+use lore_io::clone::entry;
+use lore_io::clone::is_gone_kind;
 use parking_lot::Condvar;
 use parking_lot::Mutex;
 use parking_lot::MutexGuard;
 
-use super::Backend;
 use super::CloneStats;
 #[cfg(any(target_os = "linux", target_os = "macos", target_family = "windows"))]
 use super::FaithfulCopy;
-use super::Kept;
 use super::Progress;
 use super::TreeSize;
 use super::Visit;
-use super::apfs;
-use super::copy;
-use super::entry;
-use super::source::OpenDirectory;
-use super::source::Source;
-use super::source::is_gone_kind;
-
-/// What a listing says an entry is, a symbolic link not followed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    Directory,
-    File,
-    /// A symbolic link, or on Windows a junction or another name-surrogate reparse point.
-    Symlink,
-    /// A socket, a pipe or a device.
-    Other,
-}
-
-/// What a walk decides for each entry, given its path, its path relative to the root walked, and
-/// its kind.
-pub type VisitFn<'a> = dyn Fn(&Path, &Path, Kind) -> Visit + Sync + 'a;
+use super::VisitFn;
 
 /// What lists one step of a directory of a walk, handing the directories it finds to [`Found`].
 type ListFn<'a, J> = dyn Fn(J, &mut Found<'_, J>) -> io::Result<()> + Sync + 'a;
@@ -86,7 +71,8 @@ pub(super) struct Bounds {
     batch: usize,
 }
 
-/// The bounds of every walk, chosen by the walk benchmark that `lore-io/BENCHMARKS.md` reports.
+/// The bounds of every walk, chosen by the walk benchmark that `lore-revision/BENCHMARKS.md`
+/// reports.
 pub(super) const BOUNDS: Bounds = Bounds {
     queue: 4096,
     continuations: 64,
@@ -101,7 +87,7 @@ impl Default for Bounds {
 }
 
 /// What a test build counts of a walk, in the [`Progress`] it was given: the most it held at once,
-/// its continuations, and the flushes of its file system and of its files.
+/// and its continuations.
 #[cfg(feature = "test-util")]
 #[derive(Debug, Default)]
 pub(super) struct Counters {
@@ -110,12 +96,9 @@ pub(super) struct Counters {
     kept: std::sync::atomic::AtomicUsize,
     handed: std::sync::atomic::AtomicUsize,
     continued: std::sync::atomic::AtomicUsize,
-    pub(super) flushed: std::sync::atomic::AtomicUsize,
-    pub(super) flushed_files: std::sync::atomic::AtomicUsize,
-    pub(super) value_held: std::sync::atomic::AtomicUsize,
 }
 
-/// What [`Counters`] counted.
+/// What [`Counters`] and the test points of a [`Progress`] counted.
 #[cfg(feature = "test-util")]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Counts {
@@ -141,17 +124,17 @@ pub struct Counts {
 
 #[cfg(feature = "test-util")]
 impl Counters {
-    /// What was counted.
-    pub(super) fn stats(&self) -> Counts {
+    /// What was counted, with what `points` counted.
+    pub(super) fn stats(&self, points: &lore_io::clone::TestPoints) -> Counts {
         Counts {
             queued: self.queued.load(Ordering::Relaxed),
             continuations: self.continuations.load(Ordering::Relaxed),
             kept: self.kept.load(Ordering::Relaxed),
             handed: self.handed.load(Ordering::Relaxed),
             continued: self.continued.load(Ordering::Relaxed),
-            flushed: self.flushed.load(Ordering::Relaxed),
-            flushed_files: self.flushed_files.load(Ordering::Relaxed),
-            value_held: self.value_held.load(Ordering::Relaxed),
+            flushed: points.flushed(),
+            flushed_files: points.flushed_files(),
+            value_held: points.value_held(),
         }
     }
 }
@@ -457,33 +440,40 @@ fn end<J>(state: &mut Queue<J>, ready: &Condvar, failure: Option<io::Error>) {
     ready.notify_all();
 }
 
-/// [`run`] on the calling thread and on the threads the syscall pool lends, within `progress`'s
-/// bounds, as [`run_lent_on`] describes.
-fn run_lent<J: Send>(root: J, progress: &Progress, list: &ListFn<'_, J>) -> io::Result<()> {
-    run_lent_on(crate::pool::SyscallPool::global(), root, progress, list)
-}
+/// What lends a walk threads of a syscall pool's cap: up to the number it is asked for.
+type LendFn<'a> = dyn Fn(usize) -> lore_io::Lent<'a> + Sync + 'a;
 
-/// [`run`] within `progress`'s bounds, on the calling thread and on threads of `pool`'s cap it
-/// lends: as many as it lends when the walk starts, and more as it lends them while the walk has
-/// more directories waiting than threads free, so a walk that starts while the pool is busy takes
-/// the threads the pool frees later. The pool lends at most half its cap, so the walk never takes
-/// the threads every other file operation in the process runs on, and the threads lent and the
-/// pool's own stay within the pool's cap; the walk's calling thread is its caller's. A thread the
-/// system refuses to start is given back at once.
-#[lore_macro::test_pub]
-fn run_lent_on<J: Send>(
-    pool: &crate::pool::SyscallPool,
+/// [`run_lending`] on the threads `pool` lends.
+#[cfg(feature = "test-util")]
+pub fn run_lent_on<J: Send>(
+    pool: &lore_io::pool::SyscallPool,
     root: J,
     progress: &Progress,
     list: &ListFn<'_, J>,
 ) -> io::Result<()> {
-    let lent = Mutex::new(pool.lend(0));
+    run_lending(&|wanted| pool.lend(wanted), root, progress, list)
+}
+
+/// [`run`] within `progress`'s bounds, on the calling thread and on threads of a pool's cap that
+/// `lend` lends: as many as it lends when the walk starts, and more as it lends them while the
+/// walk has more directories waiting than threads free, so a walk that starts while the pool is
+/// busy takes the threads the pool frees later. The pool lends at most half its cap, so the walk
+/// never takes the threads every other file operation in the process runs on, and the threads
+/// lent and the pool's own stay within the pool's cap; the walk's calling thread is its caller's.
+/// A thread the system refuses to start is given back at once.
+fn run_lending<J: Send>(
+    lend: &LendFn<'_>,
+    root: J,
+    progress: &Progress,
+    list: &ListFn<'_, J>,
+) -> io::Result<()> {
+    let lent = Mutex::new(lend(0));
     run_with(
         root,
         (progress.bounds().queue, progress.bounds().continuations),
         progress,
         &|wanted| {
-            let more = pool.lend(wanted);
+            let more = lend(wanted);
             let count = more.count();
             lent.lock().absorb(more);
             count
@@ -491,149 +481,6 @@ fn run_lent_on<J: Send>(
         &|| lent.lock().give_back(1),
         list,
     )
-}
-
-/// An entry a listing found.
-struct Listed {
-    name: OsString,
-    kind: Kind,
-    #[cfg(target_family = "windows")]
-    len: Option<u64>,
-}
-
-/// The length of the file `listed` names, which `source` reaches.
-#[cfg(target_family = "unix")]
-fn len_of(_listed: &Listed, source: Source<'_>) -> io::Result<u64> {
-    source.len()
-}
-
-/// The length of the file `listed` names, which its listing gave.
-#[cfg(target_family = "windows")]
-fn len_of(listed: &Listed, _source: Source<'_>) -> io::Result<u64> {
-    listed
-        .len
-        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
-}
-
-/// The entries of an open directory that a walk has not listed yet: on Unix nothing of its own,
-/// since the open directory reads its entries itself.
-#[cfg(target_family = "unix")]
-struct Listing;
-
-#[cfg(target_family = "unix")]
-impl Listing {
-    /// The listing of `directory`.
-    #[allow(clippy::unnecessary_wraps)]
-    fn open(_directory: &OpenDirectory, _path: &Path) -> io::Result<Self> {
-        Ok(Self)
-    }
-
-    /// The next entry of `directory`, the directory listed, `None` at the end.
-    #[allow(clippy::unused_self)]
-    fn next(&mut self, directory: &mut OpenDirectory) -> Option<io::Result<Listed>> {
-        Some(directory.next()?.map(|(name, kind)| Listed { name, kind }))
-    }
-}
-
-/// The entries of a directory that a walk has not listed yet, from a search that queries the
-/// directory with a larger buffer where the search takes its path, and from `std` otherwise.
-#[cfg(target_family = "windows")]
-enum Listing {
-    Search {
-        search: crate::find::Search,
-        chunk: std::vec::IntoIter<io::Result<crate::DirEntry>>,
-        more: bool,
-    },
-    /// Boxed, as `std`'s listing holds a whole search record, and serves only the paths the
-    /// search declines.
-    Std(Box<std::fs::ReadDir>),
-    Empty,
-}
-
-#[cfg(target_family = "windows")]
-impl Listing {
-    /// Opens the listing of the directory at `path`.
-    fn open(_directory: &OpenDirectory, path: &Path) -> io::Result<Self> {
-        let mut first = windows_sys::Win32::Storage::FileSystem::WIN32_FIND_DATAW::default();
-        Ok(match crate::find::open(path.to_path_buf(), &mut first)? {
-            crate::find::Opened::Search(mut search) => {
-                let mut chunk = Vec::new();
-                let more = search.fill(Some(&first), &mut chunk, SEARCH_CHUNK);
-                Self::Search {
-                    search,
-                    chunk: chunk.into_iter(),
-                    more,
-                }
-            }
-            crate::find::Opened::Empty => Self::Empty,
-            crate::find::Opened::Declined(path) => Self::Std(Box::new(std::fs::read_dir(path)?)),
-        })
-    }
-
-    /// The next entry, `None` at the end.
-    fn next(&mut self, _directory: &mut OpenDirectory) -> Option<io::Result<Listed>> {
-        match self {
-            Self::Search {
-                search,
-                chunk,
-                more,
-            } => loop {
-                if let Some(entry) = chunk.next() {
-                    return Some(entry.map(found_entry));
-                }
-                if !*more {
-                    return None;
-                }
-                let mut next = Vec::new();
-                *more = search.fill(None, &mut next, SEARCH_CHUNK);
-                *chunk = next.into_iter();
-            },
-            Self::Std(entries) => Some(entries.next()?.and_then(|entry| {
-                let metadata = entry.metadata()?;
-                Ok(Listed {
-                    name: entry.file_name(),
-                    kind: kind_of(metadata.file_type()),
-                    len: Some(metadata.len()),
-                })
-            })),
-            Self::Empty => None,
-        }
-    }
-}
-
-/// Entries a search lists into memory at a time.
-#[cfg(target_family = "windows")]
-const SEARCH_CHUNK: usize = 256;
-
-#[cfg(target_family = "windows")]
-fn found_entry(entry: crate::DirEntry) -> Listed {
-    let kind = if entry.is_symlink {
-        Kind::Symlink
-    } else {
-        match entry.metadata.as_ref().map(|stat| stat.kind) {
-            Some(crate::StatKind::Directory) => Kind::Directory,
-            Some(crate::StatKind::File) => Kind::File,
-            Some(crate::StatKind::Other) | None => Kind::Other,
-        }
-    };
-    Listed {
-        name: entry.file_name,
-        kind,
-        len: entry.metadata.map(|stat| stat.len),
-    }
-}
-
-#[cfg(target_family = "windows")]
-fn kind_of(file_type: std::fs::FileType) -> Kind {
-    if file_type.is_symlink() {
-        Kind::Symlink
-    } else if file_type.is_dir() {
-        Kind::Directory
-    } else if file_type.is_file() {
-        Kind::File
-    } else {
-        Kind::Other
-    }
 }
 
 /// `err` with `path` in its message, of the same kind.
@@ -667,22 +514,16 @@ fn set_below(buffer: &mut PathBuf, root: &Path, relative: &Path) {
 
 /// A directory of a walk: its path relative to the root walked, the identity it had when its
 /// parent listed it, which the root has none of, what the walk knows of it beside, `of`, and,
-/// once a step has listed part of it, the rest.
-struct Directory<D> {
+/// once a step has listed part of it, the directory held open with the rest of its listing, so a
+/// later step on any thread lists it on without opening it again.
+struct WalkDirectory<D> {
     relative: PathBuf,
     identity: Option<entry::Identity>,
-    rest: Option<Rest>,
+    rest: Option<OpenDirectory>,
     of: D,
 }
 
-/// A directory a step has opened and listed part of: the directory, held open, and the rest of
-/// its listing, so a later step on any thread lists it on without opening it again.
-struct Rest {
-    directory: OpenDirectory,
-    listing: Listing,
-}
-
-impl<D: Copy> Directory<D> {
+impl<D: Copy> WalkDirectory<D> {
     /// The root of a walk.
     fn root(of: D) -> Self {
         Self {
@@ -709,7 +550,7 @@ impl<D: Copy> Directory<D> {
     }
 
     /// The rest of this directory, at `relative`, for a later step.
-    fn continued(relative: PathBuf, rest: Rest, of: D, progress: &Progress) -> Self {
+    fn continued(relative: PathBuf, rest: OpenDirectory, of: D, progress: &Progress) -> Self {
         #[cfg(feature = "test-util")]
         progress.counters.continued.fetch_add(1, Ordering::Relaxed);
         #[cfg(not(feature = "test-util"))]
@@ -726,7 +567,7 @@ impl<D: Copy> Directory<D> {
 /// What a step does with an entry of the directory it lists, given the entry, its source, its
 /// path relative to the walk's root and the visit: a directory it answers is listed below it.
 type EachFn<'a, D> =
-    dyn FnMut(&Listed, Source<'_>, &Path, Visit) -> io::Result<Option<Directory<D>>> + 'a;
+    dyn FnMut(&Listed, Source<'_>, &Path, Visit) -> io::Result<Option<WalkDirectory<D>>> + 'a;
 
 /// What one step of a directory found of it.
 enum Step {
@@ -755,35 +596,31 @@ enum Step {
 /// found that the queue has no room for, it keeps the rest of its directory for its thread,
 /// beneath that one, so a thread holds one open directory for each level it has descended.
 fn each_entry<D: Copy>(
-    directory: Directory<D>,
+    directory: WalkDirectory<D>,
     path: &mut PathBuf,
     visit: &VisitFn<'_>,
-    found: &mut Found<'_, Directory<D>>,
+    found: &mut Found<'_, WalkDirectory<D>>,
     keeps_atime: bool,
     each: &mut EachFn<'_, D>,
 ) -> io::Result<Step> {
-    let Directory {
+    let WalkDirectory {
         mut relative,
         identity,
         rest,
         of,
     } = directory;
     let progress = found.progress;
-    let rest = if let Some(rest) = rest {
+    let mut open = if let Some(rest) = rest {
         rest
     } else {
         let root = relative.as_os_str().is_empty();
         match open_listing(path, identity.as_ref(), root, keeps_atime)? {
-            Some(rest) => rest,
+            Some(open) => open,
             None => return Ok(Step::Gone),
         }
     };
-    let Rest {
-        directory: mut open,
-        mut listing,
-    } = rest;
     for _ in 0..progress.bounds().batch {
-        let listed = match listing.next(&mut open) {
+        let listed = match open.next() {
             None => return Ok(Step::Done(open)),
             Some(Ok(listed)) => listed,
             Some(Err(err)) if is_gone_kind(err.kind()) => continue,
@@ -793,20 +630,12 @@ fn each_entry<D: Copy>(
             continue;
         };
         if let Err(below) = found.offer(below) {
-            let rest = Rest {
-                directory: open,
-                listing,
-            };
-            found.keep(Directory::continued(relative, rest, of, progress));
+            found.keep(WalkDirectory::continued(relative, open, of, progress));
             found.keep(below);
             return Ok(Step::Continued);
         }
     }
-    let rest = Rest {
-        directory: open,
-        listing,
-    };
-    if let Err(rest) = found.offer_rest(Directory::continued(relative, rest, of, progress)) {
+    if let Err(rest) = found.offer_rest(WalkDirectory::continued(relative, open, of, progress)) {
         found.keep(rest);
     }
     Ok(Step::Continued)
@@ -820,22 +649,15 @@ fn open_listing(
     identity: Option<&entry::Identity>,
     root: bool,
     keeps_atime: bool,
-) -> io::Result<Option<Rest>> {
-    let directory = match OpenDirectory::open(path, identity, keeps_atime) {
-        Ok(Some(directory)) => directory,
-        Ok(None) if !root => return Ok(None),
-        Ok(None) => {
-            return Err(with_path(
-                io::Error::new(io::ErrorKind::NotFound, "no longer a directory"),
-                path,
-            ));
-        }
+) -> io::Result<Option<OpenDirectory>> {
+    match OpenDirectory::open(path, identity, keeps_atime) {
+        Ok(Some(directory)) => Ok(Some(directory)),
+        Ok(None) if !root => Ok(None),
+        Ok(None) => Err(with_path(
+            io::Error::new(io::ErrorKind::NotFound, "no longer a directory"),
+            path,
+        )),
         // Gone, or, on Unix, a link at the path, which fails the open as not a directory.
-        Err(err) if !root && is_gone_kind(err.kind()) => return Ok(None),
-        Err(err) => return Err(with_path(err, path)),
-    };
-    match Listing::open(&directory, path) {
-        Ok(listing) => Ok(Some(Rest { directory, listing })),
         Err(err) if !root && is_gone_kind(err.kind()) => Ok(None),
         Err(err) => Err(with_path(err, path)),
     }
@@ -850,7 +672,7 @@ fn visit_entry<D>(
     relative: &mut PathBuf,
     visit: &VisitFn<'_>,
     each: &mut EachFn<'_, D>,
-) -> io::Result<Option<Directory<D>>> {
+) -> io::Result<Option<WalkDirectory<D>>> {
     path.push(&listed.name);
     relative.push(&listed.name);
     let visit = visit(path, relative, listed.kind);
@@ -874,7 +696,7 @@ fn hold(most: &std::sync::atomic::AtomicUsize, now: usize) {
 }
 
 /// A directory [`super::measure`] or [`super::find_directories`] has found.
-type Walked = Directory<()>;
+type Walked = WalkDirectory<()>;
 
 /// [`super::measure`].
 pub(super) fn measure(
@@ -887,47 +709,52 @@ pub(super) fn measure(
     let size = AtomicU64::new(0);
     let file_count = AtomicU64::new(0);
     let entry_count = AtomicU64::new(0);
-    run_lent(Walked::root(()), progress, &|directory: Walked, found| {
-        if progress.is_stopped() {
-            return Err(stopped());
-        }
-        with_paths(|path, _| {
-            set_below(path, source, &directory.relative);
-            each_entry(
-                directory,
-                path,
-                visit,
-                found,
-                false,
-                &mut |listed, source, relative, _visit| {
-                    let mut below = None;
-                    let taken = match listed.kind {
-                        Kind::File => match len_of(listed, source) {
-                            Ok(len) => {
-                                file_count.fetch_add(1, Ordering::Relaxed);
-                                len.div_ceil(block).max(1) * block
+    run_lending(
+        &lore_io::lend_threads,
+        Walked::root(()),
+        progress,
+        &|directory: Walked, found| {
+            if progress.is_stopped() {
+                return Err(stopped());
+            }
+            with_paths(|path, _| {
+                set_below(path, source, &directory.relative);
+                each_entry(
+                    directory,
+                    path,
+                    visit,
+                    found,
+                    false,
+                    &mut |listed, source, relative, _visit| {
+                        let mut below = None;
+                        let taken = match listed.kind {
+                            Kind::File => match listed.len(source) {
+                                Ok(len) => {
+                                    file_count.fetch_add(1, Ordering::Relaxed);
+                                    len.div_ceil(block).max(1) * block
+                                }
+                                Err(err) if is_gone_kind(err.kind()) => return Ok(None),
+                                Err(err) => return Err(with_path(err, &source)),
+                            },
+                            Kind::Directory => {
+                                below = Walked::below(source, relative, ())?;
+                                if below.is_none() {
+                                    return Ok(None);
+                                }
+                                block
                             }
-                            Err(err) if is_gone_kind(err.kind()) => return Ok(None),
-                            Err(err) => return Err(with_path(err, &source)),
-                        },
-                        Kind::Directory => {
-                            below = Walked::below(source, relative, ())?;
-                            if below.is_none() {
-                                return Ok(None);
-                            }
-                            block
-                        }
-                        Kind::Symlink => block,
-                        Kind::Other => return Ok(None),
-                    };
-                    entry_count.fetch_add(1, Ordering::Relaxed);
-                    size.fetch_add(taken, Ordering::Relaxed);
-                    Ok(below)
-                },
-            )
-            .map(drop)
-        })
-    })?;
+                            Kind::Symlink => block,
+                            Kind::Other => return Ok(None),
+                        };
+                        entry_count.fetch_add(1, Ordering::Relaxed);
+                        size.fetch_add(taken, Ordering::Relaxed);
+                        Ok(below)
+                    },
+                )
+                .map(drop)
+            })
+        },
+    )?;
     Ok(TreeSize {
         size: size.into_inner(),
         file_count: file_count.into_inner(),
@@ -946,30 +773,35 @@ pub(super) fn find_directories(
         Kind::Directory => Visit::EachEntry,
         _ => Visit::Skip,
     };
-    run_lent(Walked::root(()), progress, &|directory: Walked, found| {
-        if progress.is_stopped() {
-            return Err(stopped());
-        }
-        with_paths(|path, _| {
-            set_below(path, root, &directory.relative);
-            each_entry(
-                directory,
-                path,
-                &only_directories,
-                found,
-                false,
-                &mut |_listed, source, relative, _visit| {
-                    if matches(&source) {
-                        matched.lock().push(source.to_path_buf());
-                        Ok(None)
-                    } else {
-                        Walked::below(source, relative, ())
-                    }
-                },
-            )
-            .map(drop)
-        })
-    })?;
+    run_lending(
+        &lore_io::lend_threads,
+        Walked::root(()),
+        progress,
+        &|directory: Walked, found| {
+            if progress.is_stopped() {
+                return Err(stopped());
+            }
+            with_paths(|path, _| {
+                set_below(path, root, &directory.relative);
+                each_entry(
+                    directory,
+                    path,
+                    &only_directories,
+                    found,
+                    false,
+                    &mut |_listed, source, relative, _visit| {
+                        if matches(&source) {
+                            matched.lock().push(source.to_path_buf());
+                            Ok(None)
+                        } else {
+                            Walked::below(source, relative, ())
+                        }
+                    },
+                )
+                .map(drop)
+            })
+        },
+    )?;
     Ok(matched.into_inner())
 }
 
@@ -978,8 +810,8 @@ fn stopped() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "the walk was stopped")
 }
 
-/// What a clone knows of a directory it fills: whether a directory in it can be cloned as a
-/// whole, whether the clone created the copy, which it removes again only then, and whether the
+/// What cloning knows of a directory it fills: whether a directory in it can be cloned as a
+/// whole, whether cloning created the copy, which it removes again only then, and whether the
 /// copy gives a directory created in it its set-group-ID bit, as Linux does.
 #[derive(Clone, Copy)]
 struct Fill {
@@ -989,8 +821,8 @@ struct Fill {
     gives_setgid: bool,
 }
 
-/// A directory a clone fills.
-type Filled = Directory<Fill>;
+/// A directory that cloning fills.
+type Filled = WalkDirectory<Fill>;
 
 /// A directory being cloned: its source, its copy, the source's path relative to the root, and
 /// what the directory that holds it allows: a directory in it cloned as a whole, and, as Linux
@@ -1004,8 +836,8 @@ struct Place<'a> {
     gives_setgid: bool,
 }
 
-/// What one clone works with, faithful where `FAITHFUL` is set, each mode's code compiled on its
-/// own.
+/// What one walk that clones works with, faithful where `FAITHFUL` is set, each mode's code
+/// compiled on its own.
 struct Cloning<'a, const FAITHFUL: bool> {
     backend: Backend,
     source: &'a Path,
@@ -1015,7 +847,7 @@ struct Cloning<'a, const FAITHFUL: bool> {
     progress: &'a Progress,
     clone_entry: &'a (dyn Fn(Backend, Kind, Source<'_>, &Path) -> io::Result<()> + Sync),
     /// The permission bits the process's file mode creation mask clears from a directory the
-    /// clone creates.
+    /// walk creates.
     #[cfg(target_family = "unix")]
     umask: u32,
     /// What a faithful copy left as its target set it.
@@ -1025,15 +857,15 @@ struct Cloning<'a, const FAITHFUL: bool> {
 
 /// The threads a walk runs on.
 #[derive(Clone, Copy)]
-enum Threads<'a> {
+pub(super) enum Threads<'a> {
     /// The calling thread alone.
     Alone,
-    /// The calling thread and the threads the pool lends.
-    Lent(&'a crate::pool::SyscallPool),
+    /// The calling thread and the threads it lends.
+    Lent(&'a LendFn<'a>),
 }
 
 /// [`super::clone_into`], with each file, link and whole directory cloned by `clone_entry`, which
-/// answers as [`clone_entry`] does.
+/// answers as [`lore_io::clone::clone_entry`] does.
 #[lore_macro::test_pub]
 pub(super) fn clone_into_with(
     backend: Backend,
@@ -1056,25 +888,50 @@ pub(super) fn clone_into_with(
         umask: entry::umask_in(destination).map_err(|err| with_path(err, destination))?,
         kept: &Kept::default(),
     };
-    cloning.fill_root(Threads::Lent(crate::pool::SyscallPool::global()))?;
+    cloning.fill_root(Threads::Lent(&lore_io::lend_threads))?;
     Ok(progress.stats())
 }
 
 /// [`super::copy_faithfully`], on the calling thread and the threads `pool` lends, or on the
 /// calling thread alone where `pool` is `None`.
+#[cfg(all(
+    feature = "test-util",
+    any(target_os = "linux", target_os = "macos", target_family = "windows")
+))]
+pub fn copy_faithfully_on(
+    pool: Option<&lore_io::pool::SyscallPool>,
+    source: &Path,
+    destination: &Path,
+    visit: &VisitFn<'_>,
+    progress: &Progress,
+) -> io::Result<FaithfulCopy> {
+    match pool {
+        Some(pool) => copy_faithfully_with(
+            Threads::Lent(&|wanted| pool.lend(wanted)),
+            source,
+            destination,
+            visit,
+            progress,
+        ),
+        None => copy_faithfully_with(Threads::Alone, source, destination, visit, progress),
+    }
+}
+
+/// [`super::copy_faithfully`] on `threads`.
 #[cfg(any(target_os = "linux", target_os = "macos", target_family = "windows"))]
-#[lore_macro::test_pub]
-pub(super) fn copy_faithfully_on(
-    pool: Option<&crate::pool::SyscallPool>,
+pub(super) fn copy_faithfully_with(
+    threads: Threads<'_>,
     source: &Path,
     destination: &Path,
     visit: &VisitFn<'_>,
     progress: &Progress,
 ) -> io::Result<FaithfulCopy> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    super::faithful::refuse_root(source, progress).map_err(|err| with_path(err, source))?;
+    lore_io::clone::faithful::refuse_root(source, &progress.points)
+        .map_err(|err| with_path(err, source))?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    super::faithful::clear_inherited_acl(destination).map_err(|err| with_path(err, destination))?;
+    lore_io::clone::faithful::clear_inherited_acl(destination)
+        .map_err(|err| with_path(err, destination))?;
     let kept = Kept::default();
     let cloning = Cloning::<true> {
         backend: Backend::Copy,
@@ -1083,14 +940,14 @@ pub(super) fn copy_faithfully_on(
         visit,
         copy_unclonable: false,
         progress,
-        clone_entry: &clone_entry,
+        clone_entry: &lore_io::clone::clone_entry,
         #[cfg(target_family = "unix")]
         umask: entry::umask_in(destination).map_err(|err| with_path(err, destination))?,
         kept: &kept,
     };
-    cloning.fill_root(pool.map_or(Threads::Alone, Threads::Lent))?;
+    cloning.fill_root(threads)?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    super::faithful::flush_file_system(destination, progress)
+    lore_io::clone::faithful::flush_file_system(destination, &progress.points)
         .map_err(|err| with_path(err, destination))?;
     let (relabeled, kept_groups) = kept.into_counts();
     Ok(FaithfulCopy {
@@ -1100,34 +957,13 @@ pub(super) fn copy_faithfully_on(
     })
 }
 
-/// Clones the entry of `kind` `source` names to `destination` with `backend`: a file, a link, or
-/// a directory as a whole, which only APFS clones. A link replaced by a file after it was listed
-/// is cloned as the file. Fails with [`io::ErrorKind::Unsupported`] where the backend cannot.
-#[lore_macro::test_pub]
-pub(super) fn clone_entry(
-    backend: Backend,
-    kind: Kind,
-    source: Source<'_>,
-    destination: &Path,
-) -> io::Result<()> {
-    match (backend, kind) {
-        (Backend::Apfs, Kind::Directory) => apfs::clone_directory(source, destination),
-        (_, Kind::Directory) => Err(entry::unsupported("whole directories")),
-        (_, Kind::Symlink) => match entry::link(source, destination) {
-            Err(_) if source.is_file() => backend.clone_source(source, destination),
-            linked => linked,
-        },
-        (backend, _) => backend.clone_source(source, destination),
-    }
-}
-
 impl<const FAITHFUL: bool> Cloning<'_, FAITHFUL> {
     /// What the entries of a faithful copy share.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn copying(&self) -> super::faithful::Copying<'_> {
-        super::faithful::Copying {
+    fn copying(&self) -> lore_io::clone::faithful::Copying<'_> {
+        lore_io::clone::faithful::Copying {
             kept: self.kept,
-            progress: self.progress,
+            points: &self.progress.points,
         }
     }
 
@@ -1157,7 +993,7 @@ impl<const FAITHFUL: bool> Cloning<'_, FAITHFUL> {
                 .inspect_err(|_| self.progress.stop())
         };
         match threads {
-            Threads::Lent(pool) => run_lent_on(pool, root, self.progress, &list),
+            Threads::Lent(lend) => run_lending(lend, root, self.progress, &list),
             Threads::Alone => run_alone(root, self.progress, &list),
         }
     }
@@ -1165,7 +1001,7 @@ impl<const FAITHFUL: bool> Cloning<'_, FAITHFUL> {
     /// Clones the entries of one step of `directory`, handing the directories it creates to
     /// `found`. Where the source directory is gone, or was replaced since its parent listed it,
     /// its copy is removed again. A faithful copy refuses a socket, a pipe or a device, where the
-    /// clone mode leaves it out, and on Windows a link or a junction, and finishes a directory
+    /// cloning mode leaves it out, and on Windows a link or a junction, and finishes a directory
     /// once its last entry is in place.
     fn fill_directory(&self, directory: Filled, found: &mut Found<'_, Filled>) -> io::Result<()> {
         let Fill {
@@ -1203,7 +1039,7 @@ impl<const FAITHFUL: bool> Cloning<'_, FAITHFUL> {
                             visit,
                         ),
                         Kind::Other if FAITHFUL => Err(with_path(
-                            super::refused("a socket, a pipe or a device"),
+                            lore_io::clone::refused("a socket, a pipe or a device"),
                             &from,
                         )),
                         Kind::Other => Ok(None),
@@ -1218,16 +1054,16 @@ impl<const FAITHFUL: bool> Cloning<'_, FAITHFUL> {
             )?;
             match listed {
                 Step::Gone if created => {
-                    let _ = std::fs::remove_dir(to);
+                    let _ = entry::remove_directory(to);
                 }
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 Step::Done(source) if FAITHFUL => {
-                    super::faithful::finish_directory(&source, to, self.copying())
+                    lore_io::clone::faithful::finish_directory(&source, to, self.copying())
                         .map_err(|err| with_path(err, from))?;
                 }
                 #[cfg(target_family = "windows")]
                 Step::Done(_) if FAITHFUL => {
-                    super::faithful::finish_directory(from, to)
+                    lore_io::clone::faithful::finish_directory(from, to)
                         .map_err(|err| with_path(err, from))?;
                 }
                 _ => {}
@@ -1237,26 +1073,26 @@ impl<const FAITHFUL: bool> Cloning<'_, FAITHFUL> {
     }
 
     /// Clones the file or link `from` names to `to`, copying a file that cannot be cloned where
-    /// the clone allows it. One gone from `from` is left out.
+    /// `copy_unclonable` allows it. One gone from `from` is left out.
     fn file_or_link(&self, kind: Kind, from: Source<'_>, to: &Path) -> io::Result<()> {
         #[cfg(any(target_os = "linux", target_os = "macos", target_family = "windows"))]
         if FAITHFUL {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             let (copied, counter) = match kind {
                 Kind::Symlink => (
-                    super::faithful::link(from, to, self.copying()),
+                    lore_io::clone::faithful::link(from, to, self.copying()),
                     &self.progress.cloned_entry_count,
                 ),
                 _ => (
-                    super::faithful::file(from, to, self.copying()),
+                    lore_io::clone::faithful::file(from, to, self.copying()),
                     &self.progress.copied_file_count,
                 ),
             };
             #[cfg(target_family = "windows")]
             let (copied, counter) = match kind {
-                Kind::Symlink => return Err(super::refused("a reparse point")),
+                Kind::Symlink => return Err(lore_io::clone::refused("a reparse point")),
                 _ => (
-                    super::faithful::file(from, to, self.progress),
+                    lore_io::clone::faithful::file(from, to, &self.progress.points),
                     &self.progress.copied_file_count,
                 ),
             };
@@ -1276,7 +1112,7 @@ impl<const FAITHFUL: bool> Cloning<'_, FAITHFUL> {
             Ok(()) => &self.progress.cloned_entry_count,
             Err(err) if is_gone_kind(err.kind()) && from.is_gone() => return Ok(()),
             Err(err) if err.kind() == io::ErrorKind::Unsupported && self.copy_unclonable => {
-                match copy::file(from, to) {
+                match Backend::Copy.clone_source(from, to) {
                     Err(err) if is_gone_kind(err.kind()) && from.is_gone() => {
                         return Ok(());
                     }
@@ -1292,7 +1128,7 @@ impl<const FAITHFUL: bool> Cloning<'_, FAITHFUL> {
 
     /// Clones the directory `from` names to `to`: as a whole where `whole`, the backend and
     /// `visit` allow and nothing is at `to` yet, so nothing a caller wrote there is removed with a
-    /// whole-directory clone that fails; and otherwise by creating `to` with the permissions of
+    /// directory cloned whole that fails; and otherwise by creating `to` with the permissions of
     /// `from` and answering it, to be filled. A directory whose permissions keep its
     /// owner from adding entries is filled here, owner-writable, and takes its permissions once it
     /// is full, so no more directories wait for their permissions than the tree is deep. Everything
@@ -1311,7 +1147,7 @@ impl<const FAITHFUL: bool> Cloning<'_, FAITHFUL> {
         visit: Visit,
     ) -> io::Result<Option<Filled>> {
         let mut whole_below = whole;
-        if whole && visit == Visit::Clone && std::fs::symlink_metadata(to).is_err() {
+        if whole && visit == Visit::Clone && entry::is_vacant(to) {
             match (self.clone_entry)(self.backend, Kind::Directory, from, to) {
                 Ok(()) => {
                     self.progress
@@ -1370,7 +1206,7 @@ impl<const FAITHFUL: bool> Cloning<'_, FAITHFUL> {
         #[cfg(target_family = "windows")]
         {
             if FAITHFUL {
-                super::faithful::refuse(directory.attributes, 1)
+                lore_io::clone::faithful::refuse(directory.attributes, 1)
                     .map_err(|err| with_path(err, &from))?;
             }
             let created = entry::create_directory(to).map_err(|err| with_path(err, to))?;

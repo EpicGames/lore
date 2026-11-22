@@ -83,6 +83,13 @@ name = "state_bench"
 path = "examples/state_bench/main.rs"
 required-features = ["state-bench"]
 
+# The walk benchmark, run by hand, as `lore-revision/BENCHMARKS.md` describes. Naming the feature
+# keeps `cargo test` and builds of all targets from building it.
+[[example]]
+name = "walk"
+path = "examples/walk.rs"
+required-features = ["walk-bench"]
+
 # The node operations' stress harness, run by hand through `scripts/state-stress/stress.py`, which
 # enables `state-stress`. Naming the feature keeps `cargo test` and builds of all targets from
 # building it.
@@ -124,6 +131,9 @@ bench = []
 # state_bench --features state-bench`. Naming the feature keeps `cargo test` and builds of all
 # targets from building it.
 state-bench = ["bench"]
+# The walk benchmark, run by hand: `cargo run --release -p lore-revision --example walk --features
+# walk-bench`.
+walk-bench = []
 # The node operations' scheduling points (`state::node::hooks`), which the stress harness drives:
 # enabled by `state-stress` alone, so no other build or test run carries them. Benchmarks never
 # build with it.

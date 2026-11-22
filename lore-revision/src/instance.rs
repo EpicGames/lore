@@ -13,7 +13,6 @@ use lore_base::error::MountsBusy;
 use lore_base::fs::lock::FSLock;
 use lore_base::types::Hash;
 use lore_error_set::prelude::*;
-use lore_io::clone::CloneStats;
 use lore_storage::ReadOptions;
 use lore_storage::StoreError;
 use lore_storage::store_types::KeyType;
@@ -48,6 +47,7 @@ use crate::fs::filesystem_provider::InstanceCloneError;
 use crate::fs::filesystem_provider::clone_io_failure;
 use crate::fs::filesystem_provider::lore_directory_within;
 use crate::fs::mount_manager_state::MountManagerState;
+use crate::fs::walk::CloneStats;
 use crate::global::external_dir::access::resolve_shared;
 use crate::global::external_dir::external_dir_for_instance;
 use crate::global::external_dir::resolve::Lookup;
@@ -3028,7 +3028,7 @@ async fn instance_clone_plan_with(
         CloneAnswer::SharesBlocks { volume, .. } => (
             LoreRepositoryInstanceCloneMethod::SharesBlocks,
             Some(volume),
-            lore_io::clone::TreeSize::default(),
+            crate::fs::walk::TreeSize::default(),
             0,
             "",
         ),
@@ -3047,7 +3047,7 @@ async fn instance_clone_plan_with(
         CloneAnswer::Unsupported { reason } => (
             LoreRepositoryInstanceCloneMethod::Unsupported,
             None,
-            lore_io::clone::TreeSize::default(),
+            crate::fs::walk::TreeSize::default(),
             0,
             reason.as_str(),
         ),
@@ -3651,7 +3651,7 @@ async fn copy_instance_directory(
     // The copy keeps the in-progress directory's lock and the instance's locks, through the
     // repository context, until it ends, should this future be dropped before it.
     let run = crate::fs::filesystem_provider::CloneRun {
-        progress: Arc::new(lore_io::clone::Progress::default()),
+        progress: Arc::new(crate::fs::walk::Progress::default()),
         hold: Arc::new((Arc::clone(&plan.in_progress_lock), Arc::clone(repository))),
     };
     let clone = std::pin::pin!(plan.provider.clone_instance(
@@ -3679,7 +3679,7 @@ async fn copy_instance_directory(
 /// interval the call's globals set, until it ends.
 async fn report_copy_progress<T>(
     mut clone: std::pin::Pin<&mut impl Future<Output = T>>,
-    progress: &lore_io::clone::Progress,
+    progress: &crate::fs::walk::Progress,
 ) -> T {
     let mut each_interval =
         tokio::time::interval(crate::lore::execution_context().globals().event_interval());

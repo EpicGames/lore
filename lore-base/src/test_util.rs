@@ -272,6 +272,11 @@ pub fn closed_port_url(scheme: &str) -> String {
     format!("{scheme}://127.0.0.1:{CLOSED_PORT}")
 }
 
+/// The blocking tasks the process has spawned so far through `lore_spawn_blocking!`.
+pub fn blocking_spawns() -> usize {
+    crate::runtime::BLOCKING_SPAWNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The allocations the process has made so far, as the `scripts/allocations/allocount.c`
 /// interposer counts them, or `None` where nothing counts them: the interposer isn't preloaded, or
 /// `LORE_ALLOCATOR` doesn't select the system allocator, without which the global allocator is

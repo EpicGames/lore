@@ -228,12 +228,12 @@ pub async fn move_root(
 /// stopped where a test overrides the moves of `global` with
 /// [`crate::test_util::MoveOverride::CopyHeld`].
 #[cfg_attr(not(feature = "test-util"), allow(unused_variables))]
-fn copy_progress(global: &Path) -> lore_io::clone::Progress {
+fn copy_progress(global: &Path) -> crate::fs::walk::Progress {
     #[cfg(feature = "test-util")]
     if crate::test_util::move_override(global) == Some(crate::test_util::MoveOverride::CopyHeld) {
-        return lore_io::clone::Progress::holding();
+        return crate::fs::walk::Progress::holding();
     }
-    lore_io::clone::Progress::default()
+    crate::fs::walk::Progress::default()
 }
 
 /// Undoes the move recorded in `global`, which hasn't reached its final switch.

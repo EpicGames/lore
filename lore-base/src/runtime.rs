@@ -189,6 +189,10 @@ pub fn spawned_task<F: Future>(future: F) -> ContextTask<F> {
     }
 }
 
+/// The blocking tasks [`spawned_blocking_task`] has made, which only a test build counts.
+#[cfg(feature = "test-util")]
+pub(crate) static BLOCKING_SPAWNS: AtomicUsize = AtomicUsize::new(0);
+
 /// `function`, to run within its caller's `LORE_CONTEXT`, if one is set. Both cases are one closure
 /// type, so the runtime's blocking task machinery is compiled once for each spawned closure type.
 pub fn spawned_blocking_task<F, T>(function: F) -> impl FnOnce() -> T + Send + 'static
@@ -196,6 +200,8 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: 'static,
 {
+    #[cfg(feature = "test-util")]
+    BLOCKING_SPAWNS.fetch_add(1, Ordering::Relaxed);
     let context = try_lore_context();
     move || match context {
         Some(context) => LORE_CONTEXT.sync_scope(context, function),

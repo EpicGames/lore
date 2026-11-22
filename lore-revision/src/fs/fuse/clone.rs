@@ -10,14 +10,14 @@ use std::path::Component;
 use std::path::Path;
 
 use lore_base::error::InvalidPath;
-use lore_io::clone::CloneStats;
 use lore_io::clone::Kind;
-use lore_io::clone::Visit;
 
 use crate::fs::filesystem_provider::CloneAnswer;
 use crate::fs::filesystem_provider::CloneRun;
 use crate::fs::filesystem_provider::InstanceCloneError;
 use crate::fs::fuse::deletions::DELETION_LIST;
+use crate::fs::walk::CloneStats;
+use crate::fs::walk::Visit;
 use crate::global::external_dir::WRITE_DIR;
 use crate::repository::DOT_LORE;
 
@@ -99,7 +99,7 @@ pub(crate) async fn clone(
     let external = external.to_path_buf();
     let destination = destination.to_path_buf();
     crate::fs::os::clone::clone_through(answer, run, move |backend, _, progress| {
-        lore_io::clone::clone_into(
+        crate::fs::walk::clone_into(
             backend,
             &external,
             &destination,

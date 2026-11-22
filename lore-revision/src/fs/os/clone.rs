@@ -16,17 +16,17 @@ use lore_base::error::InvalidPath;
 use lore_base::error::NotSupported;
 use lore_error_set::prelude::*;
 use lore_io::clone::Backend;
-use lore_io::clone::CloneStats;
 use lore_io::clone::Detection;
 use lore_io::clone::Kind;
-use lore_io::clone::Progress;
-use lore_io::clone::Visit;
 
 use crate::fs::filesystem_provider::CloneAnswer;
 use crate::fs::filesystem_provider::CloneRun;
 use crate::fs::filesystem_provider::InstanceCloneError;
 use crate::fs::filesystem_provider::clone_io_failure;
 use crate::fs::filesystem_provider::lore_directory_within;
+use crate::fs::walk::CloneStats;
+use crate::fs::walk::Progress;
+use crate::fs::walk::Visit;
 use crate::instance::CLONE_IN_PROGRESS_MARK;
 use crate::records::NO_STORE_RECORDS;
 use crate::records::RECORDS_DIR;
@@ -138,7 +138,7 @@ fn directories_above_nested_repositories(
     }
     let own = source.join(dot_dir);
     let device = device_of(source)?;
-    let found = lore_io::clone::find_directories(
+    let found = crate::fs::walk::find_directories(
         source,
         &|path| {
             path == own
@@ -181,7 +181,7 @@ fn device_of(_path: &Path) -> std::io::Result<u64> {
 }
 
 /// Clones the tree at `source`, whose Lore directory is at `dot_dir` relative to it, into
-/// `destination` with `backend`, as [`lore_io::clone::clone_into`] does, leaving out what
+/// `destination` with `backend`, as [`crate::fs::walk::clone_into`] does, leaving out what
 /// [`visit_tree`] skips, with the directories in `holds_nested` cloned entry by entry.
 #[lore_macro::test_pub]
 fn clone_tree(
@@ -193,7 +193,7 @@ fn clone_tree(
     copy_unclonable: bool,
     progress: &Progress,
 ) -> std::io::Result<CloneStats> {
-    lore_io::clone::clone_into(
+    crate::fs::walk::clone_into(
         backend,
         source,
         destination,
@@ -291,7 +291,7 @@ where
         }
         let space = lore_io::clone::space_of(&parent)
             .map_err(|err| clone_io_failure(err, "reading the free space for the copy"))?;
-        let size = lore_io::clone::measure(&root, &visit, space.block, &progress)
+        let size = crate::fs::walk::measure(&root, &visit, space.block, &progress)
             .map_err(|err| clone_io_failure(err, "measuring what cloning copies"))?;
         Ok(CloneAnswer::CopiesBytes {
             reason: reason_to_copy(&detection),

@@ -10,12 +10,12 @@ use std::path::Path;
 
 use lore_base::test_util::TempDir;
 use lore_io::clone::Kind;
-use lore_io::clone::Visit;
 use lore_revision::fs::filesystem_provider::clone_io_failure;
 use lore_revision::fs::os::clone::clone_tree;
 use lore_revision::fs::os::clone::directories_above_nested_repositories;
 use lore_revision::fs::os::clone::visit;
 use lore_revision::fs::os::clone::visit_tree;
+use lore_revision::fs::walk::Visit;
 
 #[test]
 fn a_clone_leaves_out_the_lore_directorys_transient_state() {
@@ -191,8 +191,8 @@ fn planned_clone_tree(
     source: &Path,
     destination: &Path,
     copy_unclonable: bool,
-) -> std::io::Result<lore_io::clone::CloneStats> {
-    let progress = lore_io::clone::Progress::default();
+) -> std::io::Result<lore_revision::fs::walk::CloneStats> {
+    let progress = lore_revision::fs::walk::Progress::default();
     let holds_nested =
         directories_above_nested_repositories(backend, source, Path::new(".lore"), &progress)?;
     clone_tree(

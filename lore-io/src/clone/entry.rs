@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 //! What the backends share: opening a source file without following a link, giving a copy the
-//! permissions and modification time the source's handle reports, copying links, and making the
-//! directories a clone fills entry by entry.
+//! permissions and modification time the source's handle reports, and copying links; and making
+//! and removing the directories of a copy filled entry by entry, and reading and setting their
+//! permission bits.
 
 use std::fs::File;
 use std::io;
@@ -19,16 +20,16 @@ pub(super) const PERMISSION_BITS: u32 = 0o7777;
 
 /// The owner's write and search bits, which adding an entry to a directory takes.
 #[cfg(target_family = "unix")]
-pub(super) const OWNER_FILLS: u32 = 0o300;
+pub const OWNER_FILLS: u32 = 0o300;
 
 /// The set-group-ID bit of a mode.
 #[cfg(target_family = "unix")]
-pub(super) const SETGID: u32 = 0o2000;
+pub const SETGID: u32 = 0o2000;
 
 /// The permission bits `mkdir` gives a directory it creates, less those the file mode creation
 /// mask clears.
 #[cfg(target_family = "unix")]
-pub(super) const CREATED_BITS: u32 = 0o777;
+pub const CREATED_BITS: u32 = 0o777;
 
 /// The error a block-cloning backend reports where it cannot clone, never copying in its place.
 pub(super) fn unsupported(call: &str) -> io::Error {
@@ -239,12 +240,12 @@ pub(super) fn names_file(path: &Path, file: &File) -> io::Result<bool> {
 /// What tells one directory from another on its volume, so a directory replaced after it was
 /// found is told from the one found: the device and inode numbers.
 #[cfg(target_family = "unix")]
-pub(super) type Identity = (u64, u64);
+pub type Identity = (u64, u64);
 
 /// What tells one directory from another on its volume, so a directory replaced after it was
 /// found is told from the one found: the volume serial number and the file ID.
 #[cfg(target_family = "windows")]
-pub(super) type Identity = (u64, [u8; 16]);
+pub type Identity = (u64, [u8; 16]);
 
 /// The identity and the attributes of the directory at `path`, or `None` where something else is
 /// there, such as a link or a junction. Every component of `path` but the last is resolved, so a
@@ -280,7 +281,7 @@ pub(super) fn file_id(file: &File) -> io::Result<(u64, [u8; 16])> {
 /// mask clears: true where it was created, false where a directory is already there, and
 /// [`io::ErrorKind::AlreadyExists`] where something else is.
 #[cfg(target_family = "unix")]
-pub(super) fn create_directory(path: &Path, mode: u32) -> io::Result<bool> {
+pub fn create_directory(path: &Path, mode: u32) -> io::Result<bool> {
     use std::os::unix::fs::DirBuilderExt;
 
     forgive_present_directory(std::fs::DirBuilder::new().mode(mode).create(path), path)
@@ -289,7 +290,7 @@ pub(super) fn create_directory(path: &Path, mode: u32) -> io::Result<bool> {
 /// Creates the directory `path`: true where it was created, false where a directory is already
 /// there, and [`io::ErrorKind::AlreadyExists`] where something else is.
 #[cfg(target_family = "windows")]
-pub(super) fn create_directory(path: &Path) -> io::Result<bool> {
+pub fn create_directory(path: &Path) -> io::Result<bool> {
     forgive_present_directory(std::fs::create_dir(path), path)
 }
 
@@ -308,8 +309,18 @@ fn forgive_present_directory(created: io::Result<()>, path: &Path) -> io::Result
     }
 }
 
+/// Removes the empty directory at `path`.
+pub fn remove_directory(path: &Path) -> io::Result<()> {
+    std::fs::remove_dir(path)
+}
+
+/// Whether nothing is at `path`, a link not followed, or what is there can't be read.
+pub fn is_vacant(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_err()
+}
+
 /// Removes what a whole-directory clone that failed left at `path`.
-pub(super) fn remove_partial(path: &Path) -> io::Result<()> {
+pub fn remove_partial(path: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(left) if left.is_dir() => std::fs::remove_dir_all(path),
         Ok(_) => std::fs::remove_file(path),
@@ -322,7 +333,7 @@ pub(super) fn remove_partial(path: &Path) -> io::Result<()> {
 /// directory `parent`, read from a directory created there with every permission bit and removed
 /// again, as the mask cannot be read without changing it for every thread of the process.
 #[cfg(target_family = "unix")]
-pub(super) fn umask_in(parent: &Path) -> io::Result<u32> {
+pub fn umask_in(parent: &Path) -> io::Result<u32> {
     use std::os::unix::fs::DirBuilderExt;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
@@ -344,7 +355,7 @@ pub(super) fn umask_in(parent: &Path) -> io::Result<u32> {
 
 /// The permission bits of the directory at `path`.
 #[cfg(target_family = "unix")]
-pub(super) fn mode_of(path: &Path) -> io::Result<u32> {
+pub fn mode_of(path: &Path) -> io::Result<u32> {
     use std::os::unix::fs::PermissionsExt;
 
     Ok(std::fs::metadata(path)?.permissions().mode() & PERMISSION_BITS)
@@ -352,7 +363,7 @@ pub(super) fn mode_of(path: &Path) -> io::Result<u32> {
 
 /// Sets the permission bits of `path` to `mode`.
 #[cfg(target_family = "unix")]
-pub(super) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))

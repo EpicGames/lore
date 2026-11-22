@@ -1084,7 +1084,7 @@ fn volume() -> lore_io::clone::Volume {
 fn copies(size: u64, available: u64) -> lore_revision::fs::filesystem_provider::CloneAnswer {
     lore_revision::fs::filesystem_provider::CloneAnswer::CopiesBytes {
         reason: "the volume does not clone files".to_string(),
-        size: lore_io::clone::TreeSize {
+        size: lore_revision::fs::walk::TreeSize {
             size,
             file_count: 1,
             entry_count: 1,

@@ -27,8 +27,9 @@
 //!   rest are completed by a single reaper. Control-plane operations run on
 //!   the syscall pool.
 //!
-//! The [`clone`] module is the exception: blocking calls that clone or copy a
-//! directory tree, which a caller on an async runtime runs on a blocking thread.
+//! The [`clone`] module is the exception: blocking calls that clone or copy the
+//! entries of a directory tree, which a caller on an async runtime runs on a
+//! blocking thread.
 
 #[cfg(target_os = "macos")]
 pub mod acl;
@@ -99,7 +100,9 @@ pub use file::lock_refused;
 pub use holes::DataCursor;
 #[cfg(target_family = "windows")]
 pub use iocp::IocpStats;
+pub use pool::Lent;
 pub use pool::PoolStats;
+pub use pool::lend_threads;
 pub use pool::requested_max_threads;
 pub use pool::run_file_operations_on_this_thread;
 pub use pool::set_max_threads;

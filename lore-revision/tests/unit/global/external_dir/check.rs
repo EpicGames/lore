@@ -10,9 +10,9 @@ use std::time::Duration;
 use lore_base::test_util::TempDir;
 #[cfg(target_family = "windows")]
 use lore_io::clone::Locality;
-use lore_io::clone::Progress;
 use lore_io::clone::Space;
 use lore_io::clone::Volume;
+use lore_revision::fs::walk::Progress;
 use lore_revision::global::external_dir::check::*;
 use lore_revision::global::external_dir::record::MoveKind;
 use lore_revision::global::external_dir::resolve::Availability;

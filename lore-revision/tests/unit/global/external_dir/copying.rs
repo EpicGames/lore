@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use lore_base::fs::lock::FSLock;
 use lore_base::runtime::LORE_CONTEXT;
-use lore_io::clone::Progress;
+use lore_revision::fs::walk::Progress;
 use lore_revision::global::external_dir::check::require_copy_space;
 use lore_revision::global::external_dir::marker::MARKER;
 use lore_revision::global::external_dir::moving::*;
@@ -429,7 +429,7 @@ fn a_full_target_volume_refuses_a_copy() {
 #[test]
 fn a_copy_of_a_root_leaves_out_its_marker_and_what_fuse_staged() {
     use lore_io::clone::Kind;
-    use lore_io::clone::Visit;
+    use lore_revision::fs::walk::Visit;
     use lore_revision::global::external_dir::recovery::copied_visit;
 
     let (reached, mut names) = tokio::sync::mpsc::unbounded_channel();

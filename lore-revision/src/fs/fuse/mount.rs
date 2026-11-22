@@ -23,7 +23,6 @@ use lore_fuse::mount::MountOptions;
 use lore_fuse::session::Session;
 use lore_fuse::session::SessionConfig;
 use lore_fuse::transport::device::DeviceTransport;
-use lore_io::clone::CloneStats;
 use lore_storage::FlushOptions;
 use parking_lot::Mutex;
 
@@ -42,6 +41,7 @@ use crate::fs::fuse::inode::ROOT_INO;
 use crate::fs::fuse::notifications::Invalidations;
 use crate::fs::fuse::operation::FuseOperation;
 use crate::fs::mount_manager::MountRecord;
+use crate::fs::walk::CloneStats;
 use crate::instance::InstanceId;
 use crate::lore_debug;
 use crate::lore_warn;

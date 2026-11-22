@@ -15,3 +15,4 @@ pub mod mount_manager_state;
 pub mod os;
 pub mod realize;
 pub mod swfs;
+pub mod walk;

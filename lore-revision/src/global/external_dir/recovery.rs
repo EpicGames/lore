@@ -65,8 +65,6 @@ use std::time::Duration;
 
 use lore_error_set::prelude::*;
 use lore_io::clone::Kind;
-use lore_io::clone::Progress;
-use lore_io::clone::Visit;
 
 use super::ExternalDirError;
 use super::leftovers::LEFTOVERS;
@@ -90,6 +88,8 @@ use super::resolve::root_available;
 use super::resolve::root_path;
 use super::setting::RootId;
 use super::setting::Setting;
+use crate::fs::walk::Progress;
+use crate::fs::walk::Visit;
 use crate::util::config;
 use crate::util::in_use::rename_is_retryable;
 use crate::util::in_use::retry_while_in_use;
@@ -292,6 +292,7 @@ pub async fn finish(global: &Path, record: &mut MoveRecord) -> Result<Redirect, 
 
 /// How a move's `copy` step runs: the progress that counts the copy and stops it, and what it
 /// tells the name of each external directory as the copy reaches it.
+#[lore_macro::test_pub]
 #[derive(Clone)]
 pub(super) struct CopyRun {
     /// Counts the copy, and stops it once stopped.
@@ -1151,14 +1152,15 @@ async fn copy_root(global: &Path, record: &MoveRecord) -> Result<(), ExternalDir
     .await
 }
 
-/// Copies the root `from` into the directory `copied` with [`lore_io::clone::copy_faithfully`],
+/// Copies the root `from` into the directory `copied` with [`crate::fs::walk::copy_faithfully`],
 /// leaving out its marker and the contents of each `write-staging/`, on the blocking pool, and
 /// tells `copy` the name of each external directory as the copy reaches it.
+#[lore_macro::test_pub]
 async fn copy_faithfully(
     from: &Path,
     copied: &Path,
     copy: &CopyRun,
-) -> Result<lore_io::clone::FaithfulCopy, ExternalDirError> {
+) -> Result<crate::fs::walk::FaithfulCopy, ExternalDirError> {
     let (reached, mut reports) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (source, destination, progress) = (
         from.to_path_buf(),
@@ -1166,7 +1168,7 @@ async fn copy_faithfully(
         Arc::clone(&copy.progress),
     );
     let copying = lore_base::lore_spawn_blocking!(move || {
-        lore_io::clone::copy_faithfully(
+        crate::fs::walk::copy_faithfully(
             &source,
             &destination,
             &|_path, relative, kind| copied_visit(relative, kind, &reached),
