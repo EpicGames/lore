@@ -680,6 +680,35 @@ pub enum MountKind {
     Layer,
 }
 
+impl MountKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Link => "link",
+            Self::Layer => "layer",
+        }
+    }
+
+    /// The refusal of a mount of this kind at `path` that overlaps a mount of the other kind at
+    /// `existing_path`.
+    pub(crate) fn overlap(self, path: &str, existing_path: &str) -> InvalidArguments {
+        let existing = match self {
+            Self::Link => Self::Layer,
+            Self::Layer => Self::Link,
+        }
+        .name();
+        let existing_path = crate::link::display_path(existing_path);
+        InvalidArguments {
+            reason: format!(
+                "{} mount {} overlaps the {existing} mounted at {existing_path}; pick a path that \
+                 neither contains nor sits inside it, or remove it first with `lore {existing} \
+                 remove {existing_path}`",
+                self.name(),
+                crate::link::display_path(path),
+            ),
+        }
+    }
+}
+
 /// How the reads that take their options from a [`RepositoryContext`]
 /// ([`read_options_from_repository`](crate::immutable::read_options_from_repository)) use the
 /// local store.

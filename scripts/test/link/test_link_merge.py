@@ -43,6 +43,7 @@ from link_helpers import (
     make_repo_renumbering_folder,
     mounted_files,
     remote_branch_entries,
+    remote_branch_names,
     remount,
     replace_folder_with_a_link,
     replace_link_with_folder,
@@ -218,7 +219,7 @@ def test_link_add_merged_with_ignore_links_leaves_linked_branches(new_lore_repo)
     repo.branch_switch("feature-branch")
     output = repo.branch_merge_start("main", message="Merge main", ignore_links=True)
 
-    branches = sorted(entry["name"] for entry in remote_branch_entries(source_repo))
+    branches = remote_branch_names(source_repo)
     assert branches == ["main"], (
         f"The linked repository should still hold only 'main'.\nGot: {branches}"
     )
@@ -1697,7 +1698,7 @@ def test_link_pin_conflict_creates_the_branch_for_a_merged_in_link(new_lore_repo
     assert "Link conflict: linked/repo" in listed, (
         f"The divergent row should be listed - Got:\n{listed}"
     )
-    branches = sorted(entry["name"] for entry in remote_branch_entries(other_repo))
+    branches = remote_branch_names(other_repo)
     assert branches == ["feature-branch", "main"], (
         f"The merged-in link should follow a branch of its own.\nGot: {branches}"
     )

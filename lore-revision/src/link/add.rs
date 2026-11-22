@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::str::FromStr;
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
@@ -15,6 +16,7 @@ use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreFileAction;
+use crate::layer;
 use crate::link;
 use crate::link::LinkFlags;
 use crate::link::LoreLinkChangeEventData;
@@ -25,6 +27,7 @@ use crate::lore_debug;
 use crate::node::Node;
 use crate::node::NodeFlags;
 use crate::repository;
+use crate::repository::MountKind;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::repository::clone;
@@ -56,6 +59,20 @@ pub async fn add(
     // revision holding a link, and files written below the link would land in this State.
     if repository.file_system().holds_state() {
         return Err(crate::fs::hold::refused("add a link").into());
+    }
+
+    if let Some(layer) = layer::list(repository.clone())
+        .await
+        .forward_any::<LinkError>("listing layers")?
+        .into_iter()
+        .find(|layer| {
+            let Ok(target_path) = RelativePath::from_str(&layer.target_path);
+            link_path.overlaps_ignore_case(&target_path)
+        })
+    {
+        return Err(MountKind::Link
+            .overlap(link_path.as_str(), &layer.target_path)
+            .into());
     }
 
     // The identifier is a full URL or a bare name or ID, and only a scheme tells them apart:

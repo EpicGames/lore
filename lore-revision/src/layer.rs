@@ -22,6 +22,7 @@ use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
+use crate::link;
 use crate::lore::BranchId;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
@@ -35,6 +36,7 @@ use crate::node::NodeID;
 use crate::node::NodeLink;
 use crate::node::ROOT_NODE;
 use crate::repository;
+use crate::repository::MountKind;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::repository::clone;
@@ -314,11 +316,36 @@ pub async fn add(
     source_path: RelativePath,
     metadata: Option<&str>,
 ) -> Result<(), LayerError> {
-    let (_state_current, state_staged, current_branch) =
+    let (state_current, state_staged, current_branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await
             .forward::<LayerError>("Failed deserializing state")?;
-    let state_staged = state_staged.unwrap_or_else(|| _state_current.clone());
+    let state_staged = state_staged.unwrap_or_else(|| state_current.clone());
+
+    if let Some(link_path) = link::overlapping_link_mount(
+        &state_current,
+        &state_staged,
+        repository.clone(),
+        &mount_path,
+    )
+    .await
+    .forward::<LayerError>("listing link mounts")?
+    {
+        return Err(MountKind::Layer
+            .overlap(mount_path.as_str(), link_path.as_str())
+            .into());
+    }
+
+    let config_path = layer_config_path(&repository)?;
+    let mut config = load_config(&config_path).await?;
+
+    for layer in config.layers.iter() {
+        if layer.repository == source_repository
+            && layer.target_path.as_str() == mount_path.as_str()
+        {
+            return Err(AlreadyLinked.into());
+        }
+    }
 
     lore_debug!("Resolve repository layer source {source_repository} path {source_path}");
     let layer_repository = repository.to_layer_context(source_repository).await;
@@ -447,17 +474,6 @@ pub async fn add(
         return Err(LayerError::internal(
             "Layer target path must be a directory in the layer repository",
         ));
-    }
-
-    let config_path = layer_config_path(&repository)?;
-    let mut config = load_config(&config_path).await?;
-
-    for layer in config.layers.iter() {
-        if layer.repository == layer_repository.id
-            && layer.target_path.as_str() == mount_path.as_str()
-        {
-            return Err(AlreadyLinked.into());
-        }
     }
 
     config.layers.push(Layer {

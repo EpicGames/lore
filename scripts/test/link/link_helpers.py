@@ -131,6 +131,20 @@ def remote_branch_entries(repo: Lore) -> list[dict]:
     return parse_jsonl(repo.branch_list(remote=True, json=True), "branchListEntry")
 
 
+def remote_branch_names(repo: Lore) -> list[str]:
+    """The sorted names of a repository's remote branches."""
+    return sorted(entry["name"] for entry in remote_branch_entries(repo))
+
+
+def layer_targets(repo: Lore) -> set[str]:
+    """The target paths of the layers `layer list` shows."""
+    return {
+        line.split("-> ", 1)[1].strip()
+        for line in repo.layer_list().splitlines()
+        if "-> " in line
+    }
+
+
 def link_entry(repo: Lore, link_path: str) -> dict:
     """The `link list` entry of the link at `link_path`."""
     entries = parse_jsonl(repo.link_list(json=True), "linkEntry")

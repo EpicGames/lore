@@ -2733,6 +2733,42 @@ pub async fn check_source_path_overlap(
     Ok(())
 }
 
+/// The path of the first link mounted at, inside or above `path`, in `state_staged` or
+/// `state_current`. A link staged for delete counts: unstaging the delete would bring it back over
+/// whatever was mounted there. `lore link remove` takes such a link out of the staged registry, so
+/// the current registry is read as well, each link's node placed where the staged tree, which
+/// keeps a node staged for delete, holds it.
+#[lore_macro::test_pub]
+pub(crate) async fn overlapping_link_mount(
+    state_current: &State,
+    state_staged: &State,
+    repository: Arc<RepositoryContext>,
+    path: &RelativePath,
+) -> Result<Option<RelativePath>, StateError> {
+    let mut link_references = state_staged.link_list(repository.clone()).await?;
+    link_references.extend(state_current.link_list(repository.clone()).await?);
+    for link_reference in link_references {
+        let node = link_reference.local_node;
+        let link_path = match state_staged
+            .node_path_below(repository.clone(), node, ROOT_NODE)
+            .await?
+        {
+            Some(link_path) => Some(link_path),
+            None => {
+                state_current
+                    .node_path_below(repository.clone(), node, ROOT_NODE)
+                    .await?
+            }
+        };
+        if let Some(link_path) = link_path
+            && path.overlaps_ignore_case(&link_path)
+        {
+            return Ok(Some(link_path));
+        }
+    }
+    Ok(None)
+}
+
 /// A link's node and the repository that owns the mount, without consulting the
 /// link registry.
 struct LinkNodeAtPath {

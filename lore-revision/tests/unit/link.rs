@@ -1017,3 +1017,97 @@ async fn a_link_walk_stops_at_the_depth_limit() {
         })
         .await;
 }
+
+/// Mounts a link to `link_id` at `<directory_name>/lib` in `state` and registers it.
+async fn mount_registered_link(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+    directory_name: &str,
+    link_id: RepositoryId,
+) -> NodeID {
+    let parent = add(
+        state,
+        repository.clone(),
+        ROOT_NODE,
+        directory(directory_name),
+        directory_name,
+    )
+    .await;
+    let node = add(
+        state,
+        repository.clone(),
+        parent,
+        link_node("lib", link_id, Hash::from_u64(0x11)),
+        "lib",
+    )
+    .await;
+    state
+        .link_add(
+            repository.clone(),
+            link_id,
+            tracking(),
+            Hash::from_u64(0x11),
+            node,
+            LinkFlags::NoFlags,
+        )
+        .await
+        .expect("registering the link");
+    node
+}
+
+/// A link staged for add and one staged for delete both count as mounts a path overlaps, the
+/// latter staged as `lore link remove` stages it: its node staged for delete and its row gone
+/// from the staged registry, so only the current registry still lists it.
+#[tokio::test]
+async fn overlapping_link_mount_reports_staged_links() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let removed_id = RepositoryId::from([2; 16]);
+
+            // Both states build `gone` alike, so its link node has one ID in each.
+            let state_current = State::new();
+            mount_registered_link(&state_current, &repository, "gone", removed_id).await;
+            let state_staged = State::new();
+            let removed =
+                mount_registered_link(&state_staged, &repository, "gone", removed_id).await;
+            state_staged
+                .node_mark(
+                    &repository,
+                    removed,
+                    Mark::staged(NodeFlags::StagedDelete, true),
+                )
+                .await
+                .expect("staging the delete of the link node");
+            state_staged
+                .link_remove(repository.clone(), removed_id, removed)
+                .await
+                .expect("removing the link from the staged registry");
+            mount_registered_link(&state_staged, &repository, "vendor", merged()).await;
+
+            for (path, expected) in [
+                ("vendor", Some("vendor/lib")),
+                ("gone/lib/x", Some("gone/lib")),
+                ("gone", Some("gone/lib")),
+                ("other", None),
+            ] {
+                let path = RelativePath::new_from_initial_path(path).expect("the path");
+                let found = overlapping_link_mount(
+                    &state_current,
+                    &state_staged,
+                    repository.clone(),
+                    &path,
+                )
+                .await
+                .expect("listing the link mounts");
+                assert_eq!(
+                    found.as_ref().map(RelativePath::as_str),
+                    expected,
+                    "the link mount overlapping {path}"
+                );
+            }
+        })
+        .await;
+}
