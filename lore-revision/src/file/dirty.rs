@@ -429,7 +429,7 @@ async fn delete_carried(
         };
         let path = returned.as_ref().unwrap_or(&deleted.path);
         let states = repository.filter.exclusion_states(path);
-        dirty_delete(&walk, deleted.node, path, states, &mut name).await?;
+        dirty_delete(&walk, deleted.node, path, states, &mut name, false).await?;
         any = true;
     }
     Ok(any)
@@ -1324,7 +1324,7 @@ async fn replace_file_on_chain(
         "",
     );
     lore_trace!("Dirty delete of a file a directory replaced: {file_path}");
-    dirty_delete_node(walk, file, &file_path, &mut String::new()).await?;
+    dirty_delete_node(walk, file, &file_path, None, &mut String::new()).await?;
     let directory = dirty_add_directory(walk, parent, file_path.name(), file_path.as_str()).await?;
     ensure_dirty_parent_dirs(
         &walk.repository,
@@ -1573,6 +1573,7 @@ async fn dirty_path(
             relative_path,
             states,
             &mut String::new(),
+            true,
         )
         .await?;
     } else if let Some(staged_node) = staged_node {
@@ -1605,7 +1606,15 @@ async fn dirty_path(
             discard_dirty_add(walk, added, true, &mut String::new()).await?;
         } else if !added {
             lore_trace!("Dirty delete of a moved node: {}", relative_path.as_str());
-            dirty_delete(walk, staged_node, relative_path, states, &mut String::new()).await?;
+            dirty_delete(
+                walk,
+                staged_node,
+                relative_path,
+                states,
+                &mut String::new(),
+                false,
+            )
+            .await?;
         } else {
             lore_trace!(
                 "Dirty ignore (not on disk, not in revision): {}",
@@ -1692,6 +1701,7 @@ async fn dirty_path_beside(
             relative_path,
             states,
             &mut String::new(),
+            false,
         )
         .await?;
     }
@@ -1806,16 +1816,13 @@ async fn file_matches_current(
 
 /// Mark a node as Dirty+Delete, recursing into directory children.
 ///
-/// View-filtered descendants are pruned (not marked): a dirty-delete
-/// directory whose contents are excluded — e.g. a view-only path like
-/// `Templates` where `/Templates/*` filters the contents but not the directory
-/// node itself — must not re-mark its entire filtered subtree as deleted. The
-/// directory node passed in is always marked; only the children the view
-/// excludes are skipped, forced or not: the working tree lacks what the view
-/// excludes without its having been deleted. The non-emitting
-/// `child_excludes_tree` is used so a large pruned subtree does not produce a
-/// `FilterExclude` event per node. The ignore slot is not asked: every
-/// descendant is a node the tree holds, which is past it.
+/// View-filtered descendants are pruned (not marked): a dirty-delete directory whose contents the
+/// view excludes, such as `Templates` under `!/Templates/` and `/Templates/*`, must not re-mark its
+/// filtered subtree as deleted. The children the view excludes are skipped, forced or not: the
+/// working tree lacks what the view excludes without its having been deleted. The non-emitting
+/// `child_excludes_tree` is used so a large pruned subtree does not produce a `FilterExclude` event
+/// per node. The ignore slot is not asked: every descendant is a node the tree holds, which is past
+/// it.
 ///
 /// A node below marked dirty as added or copied and not staged leaves the tree
 /// ([`discard_dirty_add`]); a staged one stays staged, marked dirty alone. A node `lore dirty move`
@@ -1823,36 +1830,71 @@ async fn file_matches_current(
 /// where that place is free, and the view filters its children at that place; where another node
 /// holds it, the node keeps its move, for the commit to return it once the place frees
 /// ([`State::node_return_unstaged_move`]). `name` is a buffer the walk keeps across nodes.
+///
+/// A directory below, and with `absent` the node itself, that the view does not create
+/// ([`FilterStates::creates_directory`]) stands in the working tree only for what is
+/// created below it, so it is marked only where something below it is.
 async fn dirty_delete(
     walk: &DirtyWalk,
     node_id: NodeID,
     path: &RelativePath,
     states: FilterStates,
     name: &mut String,
+    absent: bool,
 ) -> Result<(), DirtyError> {
-    match dirty_delete_node(walk, node_id, path, name).await? {
-        Some(below) => dirty_delete_below(walk, below, path, states, name).await,
-        None => Ok(()),
+    let creates = absent.then(|| Creation::of(states));
+    if let (_, Some(below)) = dirty_delete_node(walk, node_id, path, creates, name).await? {
+        dirty_delete_below(walk, below, path, states, name).await?;
+    }
+    Ok(())
+}
+
+/// Whether the view creates a directory ([`FilterStates::creates_directory`]) where the repository
+/// holds it empty, and where it holds children: what [`dirty_delete_node`] keeps of the view's
+/// states at a node the working tree lacks.
+#[derive(Clone, Copy)]
+struct Creation {
+    empty: bool,
+    holding: bool,
+}
+
+impl Creation {
+    fn of(states: FilterStates) -> Self {
+        Self {
+            empty: states.creates_directory(true),
+            holding: states.creates_directory(false),
+        }
+    }
+
+    /// Whether the view creates the directory, which the repository holds `empty` or not.
+    fn of_directory(self, empty: bool) -> bool {
+        if empty { self.empty } else { self.holding }
     }
 }
 
-/// A directory [`dirty_delete_node`] marked deleted, whose children its walk marks next: the
-/// directory, its first child, and its path where it went back to the place the current revision
-/// holds it at.
+/// A directory [`dirty_delete_node`] marked deleted, or left to mark once something below it is,
+/// whose children its walk marks next: the directory, its first child, its path where it went back
+/// to the place the current revision holds it at, and whether it is still to mark.
 struct DeletedDirectory {
     directory: NodeID,
     first_child: NodeID,
     returned_to: Option<RelativePath>,
+    deferred: bool,
 }
 
-/// [`dirty_delete`] of `node_id`, which stands at `path`, without its children: answers the
-/// directory to walk below where it holds children to mark.
+/// [`dirty_delete`] of `node_id`, which stands at `path`, without its children: answers whether the
+/// node is marked, or was already, and the directory to walk below where it holds children to mark.
+///
+/// With `absent`, what the view creates of a node the working tree lacks, a directory the view does
+/// not create is not marked: one holding children is answered deferred, for its walk to mark once
+/// it marks something below it.
 async fn dirty_delete_node(
     walk: &DirtyWalk,
     node_id: NodeID,
     path: &RelativePath,
+    absent: Option<Creation>,
     name: &mut String,
-) -> Result<Option<DeletedDirectory>, DirtyError> {
+) -> Result<(bool, Option<DeletedDirectory>), DirtyError> {
     let DirtyWalk {
         repository,
         state_staged: state,
@@ -1860,13 +1902,13 @@ async fn dirty_delete_node(
         stats,
         ..
     } = walk;
-    let (added, first_child, moved) = {
+    let (added, first_child, moved, is_directory) = {
         let node = state
             .node(repository.clone(), node_id)
             .await
             .forward::<DirtyError>("Failed deserializing state node block")?;
         if node.is_dirty_delete() {
-            return Ok(None);
+            return Ok((true, None));
         }
         let added = (node.reverts_as_add() && !node.is_staged()).then_some(Added {
             node: node_id,
@@ -1883,12 +1925,27 @@ async fn dirty_delete_node(
             added,
             first_child,
             node.is_dirty_move() && !node.is_staged(),
+            node.is_directory(),
         )
     };
     if let Some(added) = added {
         // Boxed: only a reverted add takes it.
         Box::pin(discard_dirty_add(walk, added, false, name)).await?;
-        return Ok(None);
+        return Ok((false, None));
+    }
+    if !moved
+        && is_directory
+        && absent.is_some_and(|creates| !creates.of_directory(first_child.is_none()))
+    {
+        return Ok((
+            false,
+            first_child.map(|first_child| DeletedDirectory {
+                directory: node_id,
+                first_child,
+                returned_to: None,
+                deferred: true,
+            }),
+        ));
     }
 
     lore_trace!("Dirty delete of node {} ({})", node_id, path.as_str());
@@ -1907,28 +1964,33 @@ async fn dirty_delete_node(
         Return::Stays
     };
     match returned {
-        Return::Gone => return Ok(None),
+        Return::Gone => return Ok((false, None)),
         Return::Stays | Return::Back => {
             stats.delete_count.fetch_add(1, Ordering::Relaxed);
         }
         Return::Held | Return::Parked | Return::Displaced => {}
     }
     let Some(first_child) = first_child else {
-        return Ok(None);
+        return Ok((true, None));
     };
     let returned_to = match returned {
         Return::Back => Box::pin(returned_path(walk, node_id)).await?,
         _ => None,
     };
-    Ok(Some(DeletedDirectory {
-        directory: node_id,
-        first_child,
-        returned_to,
-    }))
+    Ok((
+        true,
+        Some(DeletedDirectory {
+            directory: node_id,
+            first_child,
+            returned_to,
+            deferred: false,
+        }),
+    ))
 }
 
 /// Marks the children of `deleted` deleted as [`dirty_delete`] does, each the view keeps, the
-/// directory standing at `path`, where the view answers `states`, unless it went back elsewhere.
+/// directory standing at `path`, where the view answers `states`, unless it went back elsewhere,
+/// and then a deferred directory where it marked a child. Answers whether the directory is marked.
 /// Only a directory below takes another box.
 fn dirty_delete_below<'a>(
     walk: &'a DirtyWalk,
@@ -1936,7 +1998,7 @@ fn dirty_delete_below<'a>(
     path: &'a RelativePath,
     states: FilterStates,
     name: &'a mut String,
-) -> std::pin::Pin<Box<dyn Future<Output = Result<(), DirtyError>> + Send + 'a>> {
+) -> std::pin::Pin<Box<dyn Future<Output = Result<bool, DirtyError>> + Send + 'a>> {
     Box::pin(async move {
         let DirtyWalk {
             repository,
@@ -1949,6 +2011,7 @@ fn dirty_delete_below<'a>(
         };
         let mut child_node_iter = Some(deleted.first_child);
         let mut cycle = SiblingCycleGuard::new(deleted.directory);
+        let mut marked = false;
         while let Some(child_node_id) = child_node_iter {
             let child_node = state
                 .node(repository.clone(), child_node_id)
@@ -1983,11 +2046,33 @@ fn dirty_delete_below<'a>(
                 );
                 continue;
             }
-            if let Some(below) = dirty_delete_node(walk, child_node_id, &child_path, name).await? {
-                dirty_delete_below(walk, below, &child_path, child_states, name).await?;
-            }
+            marked |= match dirty_delete_node(
+                walk,
+                child_node_id,
+                &child_path,
+                Some(Creation::of(child_states)),
+                name,
+            )
+            .await?
+            {
+                (_, Some(below)) => {
+                    dirty_delete_below(walk, below, &child_path, child_states, name).await?
+                }
+                (child_marked, None) => child_marked,
+            };
         }
-        Ok(())
+        if !deleted.deferred {
+            return Ok(true);
+        }
+        if marked {
+            lore_trace!("Dirty delete of node {} ({})", deleted.directory, path);
+            state
+                .node_mark(repository, deleted.directory, Mark::DIRTY_DELETE)
+                .await
+                .forward::<DirtyError>("Failed to mark node as dirty delete")?;
+            walk.stats.delete_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(marked)
     })
 }
 
@@ -2184,7 +2269,7 @@ async fn leave_added_directory(
                 continue;
             };
             let states = repository.filter.exclusion_states(&child_path);
-            dirty_delete(walk, child, &child_path, states, name).await?;
+            dirty_delete(walk, child, &child_path, states, name, false).await?;
         }
     }
     Ok(left)
@@ -3161,7 +3246,7 @@ async fn mark_replaced_deleted(
     };
     let path = returned.as_ref().unwrap_or(to_path);
     let states = walk.repository.filter.exclusion_states(path);
-    dirty_delete(walk, replaced.node, path, states, &mut String::new()).await
+    dirty_delete(walk, replaced.node, path, states, &mut String::new(), false).await
 }
 
 /// Stages the deletion of `replaced`, which a move to `to_path` replaces, with its subtree, as one

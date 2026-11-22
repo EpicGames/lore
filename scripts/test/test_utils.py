@@ -24,6 +24,19 @@ def posix_join(*parts: str) -> str:
     return "/".join(parts)
 
 
+def commit_and_push_files(
+    repo: "Lore", files: list[str], directories: tuple[str, ...] = ()
+) -> None:
+    """Commits and pushes `files`, each holding its own path, and the empty
+    `directories`."""
+    repo.write_files({path: path for path in files})
+    for path in directories:
+        repo.make_dirs(path)
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+
+
 def working_tree_files(
     repo: "Lore", root: str = "", directories: bool = False
 ) -> list[str]:

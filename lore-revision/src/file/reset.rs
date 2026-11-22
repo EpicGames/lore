@@ -496,10 +496,41 @@ async fn reset_walk_path_to(
     .await
 }
 
+/// Clears the way for the directory a walk resets at `directory_path` ([`clear_for_directory`]),
+/// taking the spelling the working tree holds it in where the stat missed and `missed` pairs one
+/// with `node` ([`respell_missed`]), and answers whether no directory stands there.
+async fn clear_directory_path(
+    operation: &InstanceOperationImpl,
+    stats: &Arc<ResetStats>,
+    repository: &RepositoryContext,
+    missed: Option<&MissedSpellings>,
+    directory_path: &mut RelativePath,
+    node: &Node,
+) -> Result<bool, ResetError> {
+    if directory_path.is_empty() || !clear_for_directory(operation, stats, directory_path).await? {
+        return Ok(false);
+    }
+    if let Some(missed) = missed
+        && let Some((held, _)) = Box::pin(respell_missed(
+            operation,
+            stats,
+            repository,
+            missed,
+            directory_path,
+            node,
+        ))
+        .await
+    {
+        *directory_path = held;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// Deletes what stands at `path` where it is no directory, so the walk can put a directory back
 /// there, as a reset deletes a directory standing where it restores a file, and answers whether
-/// the stat of `path` missed, nothing standing there. The delete is boxed: a walk meets it only
-/// where the working tree replaced a directory.
+/// no directory stands there now: the stat of `path` missed, or found something else. The delete is
+/// boxed: a walk meets it only where the working tree replaced a directory.
 async fn clear_for_directory(
     operation: &InstanceOperationImpl,
     stats: &Arc<ResetStats>,
@@ -508,7 +539,7 @@ async fn clear_for_directory(
     match operation.file_info(path).await {
         Ok(info) if info.exists() && !info.is_dir() => {
             Box::pin(reset_delete_path(operation, stats, path, false, false)).await?;
-            Ok(false)
+            Ok(true)
         }
         Ok(info) => Ok(!info.exists()),
         Err(_) => Ok(false),
@@ -3262,14 +3293,12 @@ async fn reset_walk_link(
     .await
 }
 
-/// Walk the children of a directory node, dispatching each to
-/// `reset_walk_node`. Subdirectory walks are gated by the `directory_inflight`
-/// counter: spawn when under `RESET_DIRECTORY_MAX`, run inline (degrade to
-/// sync) once over. A file standing at the directory's path is deleted first. A
-/// directory the revision holds with no children is created
-/// here unless the view excludes it, and purge (when enabled) runs for every
-/// directory once its child walks have completed. The purge is boxed, so a walk
-/// that does not purge holds no room for it.
+/// Walk the children of a directory node, dispatching each to `reset_walk_node`. Subdirectory
+/// walks are gated by the `directory_inflight` counter: spawn when under `RESET_DIRECTORY_MAX`, run
+/// inline (degrade to sync) once over. A file standing at the directory's path is deleted first. A
+/// directory the view creates ([`FilterStates::creates_directory`]) is created here where the
+/// working tree lacks it, and purge (when enabled) runs for every directory once its child walks
+/// have completed. The purge is boxed, so a walk that does not purge holds no room for it.
 ///
 /// A child the working tree holds in another spelling, of its kind, is walked from the entry
 /// paired with it, and every other child from its name in the revision. The directory's entries
@@ -3323,28 +3352,22 @@ fn reset_walk_directory(
     async move {
         lore_trace!("Resetting directory: {}", directory_path.as_str());
 
-        if !directory_path.is_empty()
-            && clear_for_directory(&operation, &stats, &directory_path).await?
-            && let Some(missed) = &missed
-            && let Some((held, _)) = Box::pin(respell_missed(
-                &operation,
-                &stats,
-                &repository,
-                missed,
-                &directory_path,
-                &node,
-            ))
-            .await
-        {
-            directory_path = held;
-        }
+        let absent = clear_directory_path(
+            &operation,
+            &stats,
+            &repository,
+            missed.as_deref(),
+            &mut directory_path,
+            &node,
+        )
+        .await?;
 
         let mut child_node_iter = node.child();
 
+        if absent && states.creates_directory(child_node_iter.is_none()) {
+            create_empty_directory::<ResetError>(&operation, &directory_path).await?;
+        }
         if child_node_iter.is_none() {
-            if !directory_path.is_empty() && !states.excluded(FilterMode::View) {
-                create_empty_directory::<ResetError>(&operation, &directory_path).await?;
-            }
             if !options.purge {
                 return Ok(());
             }

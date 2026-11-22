@@ -269,6 +269,7 @@ impl FilesystemProvider for TestFilesystemProvider {
                 identity: self.identity,
                 case_lookup: self.case_lookup,
                 directory_reads: self.directory_reads.clone(),
+                directory_creates: Arc::default(),
             }),
             self.holds_state,
         )))

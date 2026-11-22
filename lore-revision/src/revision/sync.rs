@@ -1462,6 +1462,7 @@ pub async fn realize_changes(
             state_stage,
             dry_run,
             merge_current.map(crate::fs::realize::MergeCurrent::new),
+            None, /* No view change */
             stats,
         )
         .await

@@ -41,10 +41,12 @@ FILE_BYTES = 256
 
 # Excludes the dropped directory and everything below it.
 NARROW_VIEW = ["/assets/drop"]
-# Excludes what the directory holds while leaving the directory node itself in
-# view, which has to stay materialized and empty -- the same shape `lore clone`
-# carries a regression test for.
+# Excludes what the directory holds while leaving the directory itself in view by
+# its parent's verdict, so neither a clone nor a sync creates it.
 EMPTIED_VIEW = ["/assets/drop/**"]
+# Excludes what the directory holds while a line names the directory, so a clone
+# and a sync create it empty.
+NAMED_EMPTIED_VIEW = ["!/assets/drop/", "/assets/drop/**"]
 # The canonical shape of an authored view: drop everything at the top, re-include
 # the one tree wanted, then narrow within it. `*` cannot match below depth one, so
 # the re-included subtree's own children were never excluded.
@@ -265,33 +267,39 @@ def test_sync_view_narrows_to_a_re_including_view(new_lore_repo, scratch_dir):
 
 
 @pytest.mark.smoke
-def test_sync_view_keeps_a_directory_its_children_leave(new_lore_repo, scratch_dir):
-    """A view that drops what a directory holds while keeping the directory node
-    leaves it materialized and empty, which is what a clone with that view does.
+def test_sync_view_removes_a_directory_its_children_leave_unless_a_line_names_it(
+    new_lore_repo, scratch_dir
+):
+    """A view that drops what a directory holds removes the directory once its
+    children leave, unless a line of the view names it, and the tree then holds
+    what a clone with that view does.
 
-    The status that follows is what makes it matter: the node is in view, so an
-    instance missing the directory would report a phantom local delete of it.
+    Under `/assets/drop/**` the view includes `assets/drop` by its parent's
+    verdict alone, so the sync deletes the two files and the directory they leave
+    empty. Under `!/assets/drop/` and `/assets/drop/**` a line names it, so the
+    sync deletes the two files and keeps it empty. A scan reports no changes.
     """
     repo = committed_repository(new_lore_repo)
-    instance = repo.clone()
-    emptied = view_file(scratch_dir, "emptied", EMPTIED_VIEW)
+    for name, rules, deleted, kept in [
+        ("emptied", EMPTIED_VIEW, 3, False),
+        ("named", NAMED_EMPTIED_VIEW, 2, True),
+    ]:
+        instance = repo.clone()
+        view = view_file(scratch_dir, name, rules)
 
-    _output, realized = sync_view(instance, emptied)
+        _output, realized = sync_view(instance, view)
 
-    directory = os.path.join(instance.path, DROPPED_DIRECTORY)
-    assert os.path.isdir(directory), (
-        "a directory node in view stays materialized once its children leave"
-    )
-    assert os.listdir(directory) == [], (
-        f"every child is dropped by the view, found: {os.listdir(directory)}"
-    )
-    assert realized == Realized(files_written=0, bytes_written=0, files_deleted=2), (
-        "the two files leave and the directory the view still admits does not"
-    )
-    assert_status_clean(instance, "an emptied directory is not a phantom delete")
-    assert materialized(instance) == materialized(repo.clone(view=emptied)), (
-        "the tree holds what a clone with the same view would have"
-    )
+        directory = os.path.join(instance.path, DROPPED_DIRECTORY)
+        assert os.path.isdir(directory) == kept, f"{rules} keeps {DROPPED_DIRECTORY}"
+        assert realized == Realized(
+            files_written=0, bytes_written=0, files_deleted=deleted
+        ), (
+            f"under {rules}, the two files leave, and the directory where no line names it"
+        )
+        assert_status_clean(instance, f"{rules}: the tree agrees with the view")
+        assert materialized(instance) == materialized(repo.clone(view=view)), (
+            f"under {rules}, the tree holds what a clone with the same view would have"
+        )
 
 
 @pytest.mark.smoke
@@ -335,7 +343,9 @@ def test_sync_view_carries_a_revision_move_as_well(new_lore_repo, scratch_dir):
     assert_status_clean(instance, "the instance is coherent with revision and view")
 
 
-@pytest.mark.own_vfs("marks a file dirty without changing it, which a status on a virtual clone measures as unchanged")
+@pytest.mark.own_vfs(
+    "marks a file dirty without changing it, which a status on a virtual clone measures as unchanged"
+)
 @pytest.mark.smoke
 @pytest.mark.parametrize("force", [False, True])
 def test_sync_view_drops_dirty_flags_for_paths_leaving_the_view(

@@ -676,9 +676,7 @@ where
     with_operation(filesystem, async |operation| work(Some(operation)).await).await
 }
 
-/// Creates `path` and any missing ancestor, for a directory no file written below it creates on
-/// the way: one the revision holds with nothing in it, or one whose every child the view filter
-/// leaves out.
+/// Creates `path` and any missing ancestor.
 ///
 /// A directory already standing there is the state asked for. Anything else standing there is
 /// reported, the caller holding a directory and nothing to put in that thing's place.
@@ -2178,6 +2176,8 @@ pub mod test_util {
         pub case_lookup: CaseLookup,
         /// How many directories were read.
         pub directory_reads: Arc<AtomicUsize>,
+        /// How many directory creates were asked for.
+        pub directory_creates: Arc<AtomicUsize>,
     }
 
     /// How a [`TestOperation`] answers `names_one_entry`.
@@ -2384,8 +2384,9 @@ pub mod test_util {
 
         /// Creates the directory under the directory the provider reads from, where it reads from
         /// one, and otherwise succeeds without a tree behind it; fails where the provider was told
-        /// writes fail.
+        /// writes fail. Counts each call in `directory_creates`.
         async fn create_dir_all(&self, path: &RelativePath) -> Result<(), FsError> {
+            self.directory_creates.fetch_add(1, Ordering::Relaxed);
             if self.write_fails {
                 return Err(FsError::internal("Write failed"));
             }

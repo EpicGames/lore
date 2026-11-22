@@ -43,7 +43,6 @@ use crate::filter::FilterStates;
 use crate::fs::filesystem_provider::HoldOptions;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
-use crate::fs::filesystem_provider::create_empty_directory;
 use crate::fs::filesystem_provider::match_node_executable;
 use crate::fs::filesystem_provider::set_file_to_node;
 use crate::fs::hold;
@@ -284,7 +283,8 @@ pub struct CloneStats {
     pub file_inflight_count: AtomicU64,
     pub directory_inflight: AtomicU64,
 
-    /// Parent-dir paths already ensured to exist; skip `create_dir_all` on cache hit. Approximate — collisions/races only cause a redundant idempotent call, never a missing directory.
+    /// Path hashes of the directories the clone created, or a dry run listed, so a later
+    /// [`ensure_directory`] of one makes no call. A race only repeats an idempotent create.
     pub created_parents: DashSet<u64>,
 }
 
@@ -407,10 +407,6 @@ struct BlockDiscoverItem {
     depth: u32,
     /// Cycle detector state, carried across block boundaries.
     cycle: SiblingCycleGuard,
-    /// Whether any child the view itself includes has been visited, carried across block
-    /// boundaries. Content below such a child creates the directory; with none, the walk creates
-    /// a directory the view includes itself.
-    kept_child: bool,
 }
 
 impl BlockDiscoverItem {
@@ -432,7 +428,6 @@ impl BlockDiscoverItem {
             follow_deps: false,
             depth: depth.saturating_add(1),
             cycle: SiblingCycleGuard::new(parent),
-            kept_child: false,
         }
     }
 }
@@ -691,6 +686,12 @@ async fn block_discover_task(
     }
 }
 
+/// Walks the nodes of `block` from `item`, sending each file the view keeps to the clone's
+/// writers and dispatching each directory and link it enters.
+///
+/// The walk creates a directory itself only where the view creates it
+/// ([`FilterStates::creates_directory`]); every other directory the clone holds is created as an
+/// ancestor of a file it writes, of a link it mounts, or of a directory the walk creates.
 #[allow(clippy::too_many_arguments)]
 async fn process_block_item(
     dispatcher: &Arc<BlockDiscoverDispatcher>,
@@ -710,7 +711,6 @@ async fn process_block_item(
     let mut current_node_id = item.node_id;
     let expected_parent = item.expected_parent;
     let mut cycle = item.cycle;
-    let mut kept_child = item.kept_child;
 
     loop {
         let node_index = Node::index(current_node_id);
@@ -739,7 +739,6 @@ async fn process_block_item(
                 FilterMode::View,
             );
             if !excluded {
-                kept_child |= !node_states.excluded(FilterMode::View);
                 match &dispatcher.walk {
                     Walk::Warm(warm) => {
                         warm.directories.fetch_add(1, Ordering::Relaxed);
@@ -805,13 +804,17 @@ async fn process_block_item(
                         });
                     }
                     Walk::Clone(clone) if node.is_directory() => {
-                        let dry_run = execution_context().globals().dry_run();
-                        let kept = !node_states.excluded(FilterMode::View);
-                        if dry_run && kept {
-                            lore_info!("{}", node_path);
+                        let first_child = node.child();
+                        if node_states.creates_directory(first_child.is_none()) {
+                            ensure_directory(
+                                &node_path,
+                                &clone.operation,
+                                &clone.stats,
+                                execution_context().globals().dry_run(),
+                            )
+                            .await?;
                         }
-
-                        if let Some(first_child) = node.child() {
+                        if let Some(first_child) = first_child {
                             dispatcher.dispatch(BlockDiscoverItem::children(
                                 first_child,
                                 current_node_id,
@@ -819,9 +822,6 @@ async fn process_block_item(
                                 node_states,
                                 item.depth,
                             ));
-                        } else if !dry_run && kept {
-                            create_empty_directory::<CloneError>(&clone.operation, &node_path)
-                                .await?;
                         }
                     }
                     Walk::Clone(_) => {}
@@ -846,22 +846,10 @@ async fn process_block_item(
                     follow_deps: false,
                     depth: item.depth,
                     cycle,
-                    kept_child,
                 });
                 break;
             }
-            None => {
-                if let Walk::Clone(clone) = &dispatcher.walk
-                    && !kept_child
-                    && !item.repository_path.is_empty()
-                    && !item.states.excluded(FilterMode::View)
-                    && !execution_context().globals().dry_run()
-                {
-                    create_empty_directory::<CloneError>(&clone.operation, &item.repository_path)
-                        .await?;
-                }
-                break;
-            }
+            None => break,
         }
     }
 
@@ -984,7 +972,6 @@ async fn process_block_item_dependency(
                 follow_deps: dep_ctx.recursive,
                 depth: item.depth + 1,
                 cycle: SiblingCycleGuard::new(INVALID_NODE),
-                kept_child: false,
             });
         }
     }
@@ -1831,7 +1818,6 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
                 follow_deps: true,
                 depth: 0,
                 cycle: SiblingCycleGuard::new(INVALID_NODE),
-                kept_child: false,
             });
         }
 
@@ -1950,17 +1936,8 @@ async fn clone_discover_link(
                 .forward::<CloneError>("Failed to load revision state")?;
 
             lore_info!("Clone link {} in {}", linked_repository.id, link_path);
-            // Discovery no longer pre-creates parent dirs; create the full chain here and cache the link dir in stats so later files under it cache-hit.
-            let link_dir_hash = hash_string_bytes(link_path.as_str().as_bytes());
-            if !ctx.stats.created_parents.contains(&link_dir_hash) {
-                ctx.operation
-                    .create_dir_all(&link_path)
-                    .await
-                    .forward_with::<CloneError, _>(|| {
-                        format!("Failed to create directory {link_path}")
-                    })?;
-                ctx.stats.created_parents.insert(link_dir_hash);
-            }
+            let dry_run = execution_context().globals().dry_run();
+            ensure_directory(&link_path, &ctx.operation, &ctx.stats, dry_run).await?;
 
             // Use a link-scoped dispatcher for the link's own state/repository
             let link_dispatcher = Arc::new(BlockDiscoverDispatcher::new(
@@ -2140,6 +2117,7 @@ pub(crate) async fn clone_node(
                     child_id,
                     child_repository_path,
                     child_states,
+                    child_states.creates_directory(child_node.child().is_none()),
                 )
                 .await;
                 failure = failure.or(result
@@ -2198,37 +2176,61 @@ fn clone_child_node(
     Box::pin(clone_node(ctx, storage, repository_path, node, states))
 }
 
-/// Ensure the parent directory of `path` exists; second and later files under the same parent hit the `DashSet` cache and skip the syscall.
-/// A parent that already exists but cannot be created over — the clone root on a container bind mount, a drive root, an ACL'd share — counts as success.
+/// Creates `directory` and its ancestors, and records it in `stats`, so a later call for it makes
+/// no syscall. With `dry_run` it lists each of them not listed yet, outermost first, and creates
+/// nothing. A directory that exists but cannot be created over, such as the clone root on a
+/// container bind mount, a drive root or a share with an access list, counts as created. The
+/// check after a failed create is a cold path and boxed, so the future holds the create alone.
 #[lore_macro::test_pub]
-async fn ensure_parent_dir(
-    repository_path: &RelativePath,
+async fn ensure_directory(
+    directory: &RelativePath,
     operation: &Arc<InstanceOperationImpl>,
     stats: &CloneStats,
+    dry_run: bool,
 ) -> Result<(), CloneError> {
-    let parent = repository_path.parent_path();
-    if parent.is_empty() {
+    if directory.is_empty() {
         return Ok(());
     }
     // Hash the path's own bytes without allocation; case variants on Windows at worst trigger a redundant idempotent create_dir_all.
-    let parent_hash = hash_string_bytes(parent.as_str().as_bytes());
-    if stats.created_parents.contains(&parent_hash) {
+    let directory_hash = hash_string_bytes(directory.as_str().as_bytes());
+    if stats.created_parents.contains(&directory_hash) {
         return Ok(());
     }
-    // `create_dir_all` only forgives `AlreadyExists`, so check existence ourselves as `spawn_clone_directory` does.
-    if let Err(err) = operation.create_dir_all(&parent).await
-        && !operation
-            .file_info(&parent)
+    if dry_run {
+        list_directories(directory, stats);
+        return Ok(());
+    }
+    if let Err(err) = operation.create_dir_all(directory).await
+        && !Box::pin(operation.file_info(directory))
             .await
             .is_ok_and(|info| info.is_dir())
     {
         return Err(CloneError::internal_with_context(
             err,
-            &format!("Failed to create directory {parent} as parent of {repository_path}"),
+            &format!("Failed to create directory {directory}"),
         ));
     }
-    stats.created_parents.insert(parent_hash);
+    stats.created_parents.insert(directory_hash);
     Ok(())
+}
+
+/// Lists `directory` and each ancestor a dry run has not listed yet, outermost first, recording
+/// each in `stats` as [`ensure_directory`] records one it creates.
+#[cold]
+fn list_directories(directory: &RelativePath, stats: &CloneStats) {
+    let mut unlisted = Vec::new();
+    let mut path = directory.as_str();
+    while !path.is_empty()
+        && stats
+            .created_parents
+            .insert(hash_string_bytes(path.as_bytes()))
+    {
+        unlisted.push(path);
+        path = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+    }
+    for path in unlisted.into_iter().rev() {
+        lore_info!("{}", path);
+    }
 }
 
 /// Writes `node` to `repository_path`, or retains the file there when it holds the node.
@@ -2342,10 +2344,14 @@ fn clone_file(
             lore_trace!("Create {}", repository_path);
         }
 
+        ensure_directory(
+            &repository_path.parent_path(),
+            &operation,
+            &stats,
+            call.dry_run(),
+        )
+        .await?;
         if !call.dry_run() {
-            // Discovery no longer pre-creates dirs; create per-file parent just-in-time via the cache.
-            ensure_parent_dir(&repository_path, &operation, &stats).await?;
-
             let (fragment, file_info) = set_file_to_node::<CloneError>(
                 &operation,
                 repository.clone(),
@@ -2438,12 +2444,8 @@ fn spawn_clone_link(
                     .forward::<CloneError>("Failed to load revision state")?;
 
                 lore_info!("Clone link {} in {}", linked_repository.id, repository_path);
-                ctx.operation
-                    .create_dir_all(&repository_path)
-                    .await
-                    .forward_with::<CloneError, _>(|| {
-                        format!("Failed to create directory {repository_path}")
-                    })?;
+                let dry_run = execution_context().globals().dry_run();
+                ensure_directory(&repository_path, &ctx.operation, &ctx.stats, dry_run).await?;
 
                 let link_states = linked_repository.filter.mount_states(&repository_path);
 
@@ -2469,6 +2471,9 @@ fn spawn_clone_link(
     });
 }
 
+/// Clones the directory `node` at `repository_path`, whose view verdict is `states`, creating it
+/// first where `creates` says the view creates it ([`FilterStates::creates_directory`]); otherwise
+/// what is cloned below it creates it.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_clone_directory(
     tasks: &mut JoinSet<Result<(), CloneError>>,
@@ -2477,6 +2482,7 @@ async fn spawn_clone_directory(
     node: NodeID,
     repository_path: RelativePath,
     states: FilterStates,
+    creates: bool,
 ) -> Result<(), CloneError> {
     let stats = ctx.stats.clone();
     let inflight = stats
@@ -2484,27 +2490,19 @@ async fn spawn_clone_directory(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let future = async move {
-        if !states.excluded(FilterMode::View) {
-            if execution_context().globals().dry_run() {
-                lore_info!("{}", repository_path);
-            } else if ctx
-                .operation
-                .create_dir_all(&repository_path)
-                .await
-                .is_err()
-                && !ctx
-                    .operation
-                    .file_info(&repository_path)
-                    .await
-                    .is_ok_and(|info| info.is_dir())
-            {
-                stats
-                    .directory_inflight
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                return Err(CloneError::internal(format!(
-                    "Failed to create directory {repository_path}"
-                )));
-            }
+        if creates
+            && let Err(err) = ensure_directory(
+                &repository_path,
+                &ctx.operation,
+                &stats,
+                execution_context().globals().dry_run(),
+            )
+            .await
+        {
+            stats
+                .directory_inflight
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(err);
         }
 
         let result = clone_child_node(ctx, storage, repository_path, node, states).await;

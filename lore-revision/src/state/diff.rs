@@ -1347,28 +1347,43 @@ fn views_diverge_below(
     !(covers(from_filter, states.from) && covers(to_filter, states.to))
 }
 
-/// The add or the delete of a paired directory alone, where the two views place it on disk
-/// differently.
+/// The add or the delete of a paired directory alone, where one view creates it
+/// ([`FilterStates::creates_directory`]) and the other does not place it on disk that way.
 ///
-/// A directory a view excludes stands on disk only for content below it. The walk below reports
-/// that content, and its writes and deletes create and empty the directory. Where either revision
-/// holds the directory with no children, one side has nothing below it to answer for it, so it is
-/// reported here: added where the target view takes it in, deleted where the target view leaves it
-/// out. A delete of a directory still holding something keeps it. The change carries no hierarchy.
+/// A view places a directory it creates, and one it includes whose subtree it covers, since then
+/// everything below stands. Any other directory stands on disk only for content below it: the walk
+/// below reports that content, its writes create the directory, and the realize removes one its
+/// deletes leave empty. So a paired directory is reported added where the target view creates it
+/// and the source view does not place it, and deleted where the source view created it and the
+/// target view does not place it. A delete of a directory still holding
+/// something keeps it, and an add of one standing for its content finds it there. Two equal
+/// verdicts place it alike, as one view does. The change carries no hierarchy.
+#[allow(clippy::too_many_arguments)]
 fn presence_change(
+    from_filter: &Filter,
+    to_filter: &Filter,
+    path: &RelativePath,
+    depth: u32,
     from_node: &Node,
     to_node: &Node,
     from_states: FilterStates,
     to_states: FilterStates,
     mode: FilterMode,
 ) -> Option<change::FileAction> {
-    if from_node.child().is_some() && to_node.child().is_some() {
+    if !mode.contains(FilterMode::View) || from_states.view == to_states.view {
         return None;
     }
-    match (from_states.excluded(mode), to_states.excluded(mode)) {
-        (true, false) => Some(change::FileAction::Add),
-        (false, true) => Some(change::FileAction::Delete),
-        _ => None,
+    let from_creates = from_states.creates_directory(from_node.child().is_none());
+    let to_creates = to_states.creates_directory(to_node.child().is_none());
+    let covers = |filter: &Filter, states: FilterStates| {
+        filter.covers_subtree(states, path, depth, FilterMode::View)
+    };
+    if to_creates && !from_creates && !covers(from_filter, from_states) {
+        Some(change::FileAction::Add)
+    } else if from_creates && !to_creates && !covers(to_filter, to_states) {
+        Some(change::FileAction::Delete)
+    } else {
+        None
     }
 }
 
@@ -1627,6 +1642,10 @@ async fn add_change_for_paired_nodes(
 
             if to_type == LoreNodeType::Directory
                 && let Some(action) = presence_change(
+                    &from_nodes.repository.filter,
+                    &to_nodes.repository.filter,
+                    &subpath,
+                    child_depth,
                     from_node,
                     &to_node,
                     from_node_states,

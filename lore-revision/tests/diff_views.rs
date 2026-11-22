@@ -27,6 +27,7 @@ mod tests {
     use lore_revision::filter::Filter;
     use lore_revision::filter::FilterMode;
     use lore_revision::filter::FilterState;
+    use lore_revision::filter::FilterStates;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreEvent;
     use lore_revision::interface::LoreGlobalArgs;
@@ -126,6 +127,9 @@ mod tests {
         ("layered/x/y/z/three.tmp", Some("three"), Some("three")),
         ("layered/x/y/z/four.txt", Some("four"), Some("four")),
     ];
+    /// A directory under [`LAYERED`] whose content both revisions share, so a walk rooted there
+    /// reports only what the two views make differ.
+    const SHARED_LAYER: &str = "layered/x";
     /// View rules, each run against every one of them by a walk over [`LAYERED`]. They span anchored
     /// literals, the `/*` family, `dir/*`, brace groups, `/**` and `**/`, name rules, re-inclusions
     /// nested under exclusions, and rules whose depth bound stops short of the deepest changes.
@@ -480,9 +484,63 @@ mod tests {
         held
     }
 
+    /// The view's state at the directory `directory`, stepped from the root through each ancestor.
+    fn directory_states(filter: &Filter, directory: &str) -> FilterStates {
+        let mut states = FilterStates::ROOT;
+        for (end, _) in directory.match_indices('/').chain([(directory.len(), "")]) {
+            let path = RelativePath::new_from_initial_path(&directory[..end]).expect("Valid path");
+            states.view = filter.view.child_exclusion_state(states.view, &path, true);
+        }
+        states
+    }
+
+    /// The directories below [`LAYERED`] both views hold where one view creates the directory
+    /// (`creates_directory`) and the other does not place it on disk, as `presence_change` reports
+    /// them: added where `to` names it and `from` neither names it nor covers its subtree, deleted
+    /// the other way round. Every directory here holds children in both revisions.
+    fn presence(
+        from: &Filter,
+        to: &Filter,
+        held_by_both: &BTreeSet<&str>,
+    ) -> Vec<(String, String)> {
+        let covers = |filter: &Filter, states: FilterStates, directory: &str| {
+            let path = RelativePath::new_from_initial_path(directory).expect("Valid path");
+            filter.covers_subtree(
+                states,
+                &path,
+                directory.split('/').count() as u32,
+                FilterMode::View,
+            )
+        };
+        let directories: BTreeSet<&str> = LAYERS
+            .iter()
+            .flat_map(|(path, ..)| path.match_indices('/').map(|(end, _)| &path[..end]))
+            .filter(|directory| *directory != LAYERED && held_by_both.contains(directory))
+            .collect();
+        directories
+            .into_iter()
+            .filter_map(|directory| {
+                let (from_states, to_states) = (
+                    directory_states(from, directory),
+                    directory_states(to, directory),
+                );
+                let (from_named, to_named) = (from_states.view.named(), to_states.view.named());
+                if from_states == to_states {
+                    None
+                } else if to_named && !from_named && !covers(from, from_states, directory) {
+                    Some(("A".to_string(), directory.to_string()))
+                } else if from_named && !to_named && !covers(to, to_states, directory) {
+                    Some(("D".to_string(), directory.to_string()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// The changes a walk from `from` to `to` has to report below [`LAYERED`]: a path one side
-    /// alone has [`held`] is added or deleted, and a file both hold is modified where its content
-    /// differs.
+    /// alone has [`held`] is added or deleted, a file both hold is modified where its content
+    /// differs, and a directory both hold is added or deleted as [`presence`] has it.
     fn predicted(from: &Filter, to: &Filter) -> Vec<(String, String)> {
         let older = held(
             from,
@@ -504,11 +562,13 @@ mod tests {
                 older_content != newer_content && older.contains(path) && newer.contains(path)
             })
             .map(|(path, ..)| ("M", *path));
+        let both: BTreeSet<&str> = older.intersection(&newer).copied().collect();
         older
             .symmetric_difference(&newer)
             .map(|path| (if older.contains(path) { "D" } else { "A" }, *path))
             .chain(modified)
             .map(|(action, path)| (action.to_string(), path.to_string()))
+            .chain(presence(from, to, &both))
             .collect()
     }
 
@@ -977,6 +1037,71 @@ mod tests {
                             "from {from_rules:?} to {to_rules:?}"
                         );
                     }
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Literal cases of what [`presence`] predicts, over [`SHARED_LAYER`]. `layered/x/y/z` holds
+    /// only files `/layered/x/y/z/*` excludes, so a view naming it as well creates it empty. It is
+    /// added or deleted where the other view neither names it nor covers its subtree. Where the
+    /// other view covers its subtree, only the files in it change.
+    #[tokio::test]
+    async fn a_directory_one_view_names_changes_unless_the_other_covers_its_subtree() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_layered(immutable_store, mutable_store).await;
+                let emptied: &[&str] = &["/layered/x/y/z/*"];
+                let named: &[&str] = &["!/layered/x/y/z/", "/layered/x/y/z/*"];
+                type Case = (
+                    &'static [&'static str],
+                    &'static [&'static str],
+                    &'static [(&'static str, &'static str)],
+                );
+                let cases: &[Case] = &[
+                    (&[], &["!/layered/x/y/z/"], &[]),
+                    (emptied, named, &[("A", "layered/x/y/z")]),
+                    (named, emptied, &[("D", "layered/x/y/z")]),
+                    (
+                        &[],
+                        named,
+                        &[
+                            ("D", "layered/x/y/z/four.txt"),
+                            ("D", "layered/x/y/z/three.tmp"),
+                        ],
+                    ),
+                    (
+                        named,
+                        &[],
+                        &[
+                            ("A", "layered/x/y/z/four.txt"),
+                            ("A", "layered/x/y/z/three.tmp"),
+                        ],
+                    ),
+                ];
+
+                for (from_rules, to_rules, expected) in cases {
+                    let (changes, _) = fixture
+                        .walk(
+                            fixture.view(from_rules),
+                            fixture.view(to_rules),
+                            SHARED_LAYER,
+                        )
+                        .await;
+
+                    let expected = expected
+                        .iter()
+                        .map(|(action, path)| (action.to_string(), path.to_string()))
+                        .collect();
+                    assert_eq!(
+                        by_path_and_action(changes),
+                        by_path_and_action(expected),
+                        "from {from_rules:?} to {to_rules:?}"
+                    );
                 }
             }))
             .await

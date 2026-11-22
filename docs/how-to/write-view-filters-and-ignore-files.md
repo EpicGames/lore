@@ -57,9 +57,11 @@ A path no rule matches keeps its directory's verdict.
 | --- | --- | --- |
 | `/a` | Drops `a` and everything in it | Brings back `a` and everything in it |
 | `/a/` | The same, if `a` is a directory | The same, if `a` is a directory |
-| `/a/**` | Drops everything in `a`. Leaves `a/` empty on disk under a view, and stages it empty under an ignore file. | Brings back everything in `a` |
+| `/a/**` | Drops everything in `a`. Under a view, leaves `a/` off the disk unless a rule names it, and under an ignore file, stages it empty. | Brings back everything in `a` |
 
 Write `/a/` and `!/a/` for a directory.
+
+Under a view, Lore creates a directory where the last rule matching the directory itself re-includes it, where the directory holds something the view keeps at any depth, and where the repository holds it empty. `!/Engine/` names `Engine/`, not the directories below it. A directory the view keeps only because its parent is kept, or that Lore looks into only because a re-inclusion could match below it, stays off the disk while nothing below it is kept, and `lore status` doesn't report it missing. Cloning, sync, branch switch, `lore sync --view`, `lore reset`, `lore layer add`, and `lore link add` follow this. A virtual instance lists these directories too.
 
 ## Differences from `.gitignore`
 
@@ -187,6 +189,8 @@ Engine/
 Engine/Content/
 ```
 
+`!/Engine/Content/` names the directory, so the instance holds it though `/Engine/Content/*` excludes everything in it.
+
 ### Exclude a directory without leaving it behind
 
 ```text
@@ -201,7 +205,7 @@ Engine/Content/
 Engine/Content/a.uasset
 ```
 
-`/Engine/Content/Deep/*` would leave `Deep/` empty.
+`/Engine/Content/Deep/*` leaves `Deep/` out too, since no rule names it, but stages `Deep/` empty under an ignore file.
 
 ### Re-include one file deep inside an excluded tree
 

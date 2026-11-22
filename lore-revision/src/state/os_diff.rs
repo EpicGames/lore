@@ -1312,18 +1312,14 @@ async fn flush_pending_dir_deletes(
 /// changes for only the portion that was actually materialized on disk under the
 /// active filter, returning whether anything materialized.
 ///
-/// Materialization mirrors clone/checkout discovery: excluded children are
-/// pruned (never written), a non-excluded file or link materializes, and a
-/// directory materializes when a descendant does or — when it has no children —
-/// when the empty directory itself is not excluded.
+/// Materialization follows the view's directory rule: excluded children are pruned (never
+/// written), a non-excluded file or link materializes, and a directory materializes where the
+/// view creates it ([`FilterStates::creates_directory`]) or a descendant materializes.
 ///
-/// A directory can evaluate as "not excluded" only because the filter let the
-/// diff descend through it (a view re-inclusion's generated traversal rules, or a
-/// glob matching the directory but not content deeper inside it) while nothing
-/// under it is in view. Such a directory is never written, so its delete record
-/// is buffered in `pending` and emitted only once a materializing descendant
-/// proves it existed on disk; if none does, the buffered entry is dropped. This
-/// keeps the report from claiming a delete for a directory that was never there.
+/// Any other directory stands on disk only for what materializes below it, so its delete record
+/// is buffered in `pending` and emitted only once a materializing descendant proves it existed on
+/// disk; if none does, the buffered entry is dropped. This keeps the report from claiming a delete
+/// for a directory that was never there.
 ///
 /// When the intent marks dirty, every node a delete is emitted for — the
 /// materializing leaf and each flushed ancestor directory — is marked
@@ -1429,10 +1425,7 @@ async fn emit_filesystem_subtree_deletes(
         return Ok(true);
     }
 
-    if !had_child && !states.excluded(filter_mode) {
-        // Empty in-view directory: clone/checkout writes it, so its absence is a
-        // real deletion. It is the materializing leaf here, and its own buffered
-        // entry (pushed above) is flushed and marked along with its ancestors.
+    if !states.excluded(filter_mode) && states.creates_directory(!had_child) {
         flush_pending_dir_deletes(&state, &repository, changes, pending, intent).await?;
         return Ok(true);
     }

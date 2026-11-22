@@ -969,7 +969,8 @@ pub async fn sync(
 }
 
 /// Realizes the layer's target state over its mount, within `operation`, and removes the
-/// directories below the mount that the view excludes and the realize left empty.
+/// directories below the mount that the realize left empty and the view does not place on disk,
+/// the view a `lore sync --view` carries the tree to where `options` names one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn sync_in_operation(
     operation: Arc<InstanceOperationImpl>,
@@ -991,6 +992,12 @@ pub(crate) async fn sync_in_operation(
     .await;
     let target =
         drawn_subtree_state(&repository_target, &state_target, &source_path, &mount_path).await;
+    let view_change = options.view.is_some().then(|| NodeMapping {
+        repository: target.mapping.repository.clone(),
+        state: target.mapping.state.clone(),
+        path: mount_path.clone(),
+        node: target.mapping.node,
+    });
     let current_tree = NodeMapping {
         repository: current.mapping.repository.clone(),
         state: current.mapping.state.clone(),
@@ -1083,16 +1090,18 @@ pub(crate) async fn sync_in_operation(
         None,
         dry_run,
         None, /* Not a merge */
+        None, /* No view change */
         stats.clone(),
     )
     .await
     .forward::<LayerError>("Failed to sync layer files")?;
     if !dry_run {
-        crate::fs::realize::remove_emptied_excluded_directories(
+        crate::fs::realize::remove_emptied_directories(
             &operation,
             &repository_target,
             &changes,
             &mount_path,
+            view_change.as_ref(),
             &stats,
         )
         .await;

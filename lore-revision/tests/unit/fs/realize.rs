@@ -1259,6 +1259,7 @@ async fn realize_verified(
         None,
         false,
         None,
+        None,
         Arc::default(),
     )
     .await
@@ -1978,6 +1979,7 @@ async fn a_deleted_link_keeps_a_file_already_holding_what_replaces_it() {
             None,
             false,
             None,
+            None,
             Arc::default(),
         ))
         .await
@@ -2025,6 +2027,7 @@ async fn a_deleted_link_removes_a_wide_mount_around_the_files_it_keeps() {
             None, /* No subtrees */
             None,
             false,
+            None,
             None,
             Arc::default(),
         ))
@@ -2074,6 +2077,7 @@ async fn a_deleted_link_removes_a_deep_mount_around_the_file_it_keeps() {
             None, /* No subtrees */
             None,
             false,
+            None,
             None,
             Arc::default(),
         ))
@@ -2146,6 +2150,7 @@ async fn a_deleted_link_keeps_a_forwarded_local_edit() {
             None, /* No subtrees */
             None,
             false,
+            None,
             None,
             Arc::default(),
         ))
@@ -2434,12 +2439,75 @@ async fn a_merge_moves_the_other_spelling_of_a_source_edited_since_the_base() {
             None,
             false,
             Some(MergeCurrent::new(current)),
+            None,
             Arc::default(),
         )
         .await
         .expect("the merge realizes");
         assert!(!working_path_exists(&repository, VARIANT).await);
         assert_eq!(working_file(&repository, destination).await, merged);
+    }))
+    .await;
+}
+
+/// A move into a directory the sync adds carries the file there, though no view line names the
+/// directory and the realize of its add creates nothing: the rename creates the directory it
+/// lands in.
+#[tokio::test]
+async fn a_move_into_an_added_directory_creates_it() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(1174, 0);
+        let state = plugin_tree(&repository, &[(TRACKED, &content)]).await;
+        write_working_files(&repository, &[(TRACKED, &content)]).await;
+        let from = Staged {
+            node: state
+                .find_node_link(repository.clone(), TRACKED)
+                .await
+                .unwrap()
+                .node,
+            state,
+            address: file_node(&content).address,
+            mode: 0,
+        };
+        let destination = "Moved/Plugin.Build.cs";
+        let to = state_holding(&repository, &relative(destination), file_node(&content), 2).await;
+        let mut added = add_of(
+            &repository,
+            "Moved",
+            to.state
+                .find_node_link(repository.clone(), "Moved")
+                .await
+                .unwrap()
+                .node,
+        );
+        added.to.mapping.state = to.state.clone();
+        added.to.flags = NodeFlags::empty();
+        let moved = NodeChange {
+            action: FileAction::Move,
+            flags: change::Flags::None,
+            from: side(&repository, &from, relative(TRACKED)),
+            to: side(&repository, &to, relative(destination)),
+        };
+
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        Box::pin(realize_changes(
+            repository.clone(),
+            operation,
+            Arc::new(vec![added, moved]),
+            &[],
+            None, /* No subtrees */
+            None,
+            false,
+            None,
+            None,
+            Arc::default(),
+        ))
+        .await
+        .expect("the move realizes");
+        assert!(!working_path_exists(&repository, TRACKED).await);
+        assert_eq!(working_file(&repository, destination).await, content);
     }))
     .await;
 }
@@ -2575,6 +2643,7 @@ async fn a_merge_deleting_a_directory_keeps_an_edited_case_variant_of_an_ignored
                 None,
                 false,
                 Some(MergeCurrent::new(state.clone())),
+                None,
                 Arc::default(),
             )
             .await
@@ -2676,6 +2745,7 @@ async fn sync_continues_after_a_materialization_error() {
             None,
             false,
             None,
+            None,
             Arc::default(),
         )
         .await;
@@ -2721,6 +2791,7 @@ async fn a_subtree_change_without_its_subtrees_is_refused() {
             None,
             false,
             None, /* Not a merge */
+            None, /* No view change */
             Arc::default(),
         )
         .await;
@@ -2746,6 +2817,7 @@ async fn a_subtree_change_without_its_subtrees_is_refused() {
             Some(State::new()),
             false,
             None, /* Not a merge */
+            None, /* No view change */
             Arc::default(),
         )
         .await;
@@ -2926,6 +2998,7 @@ async fn the_deletes_of_a_realize_hold_no_whole_directory_delete() {
             state_stage: None,
             dry_run: true,
             merge_current: None,
+            view_change: None,
             stats: Arc::default(),
         });
         let changes = [change];
@@ -2962,6 +3035,7 @@ async fn a_file_delete_task_holds_its_change_once() {
             state_stage: None,
             dry_run: true,
             merge_current: None,
+            view_change: None,
             stats: Arc::default(),
         });
         let removal = size_of_val(&remove_file(&context, &change, &[]));
@@ -3034,6 +3108,7 @@ async fn a_refused_move_removes_its_destination_unless_it_is_the_source() {
                 None,
                 false,
                 None,
+                None,
                 stats.clone(),
             )
             .await
@@ -3057,6 +3132,292 @@ async fn a_refused_move_removes_its_destination_unless_it_is_the_source() {
                 "{context}"
             );
         }
+    }))
+    .await;
+}
+
+/// A state holding `files` and the empty `directories`, with every directory on their paths staged
+/// before them, unfiltered as a revision is.
+async fn tree_holding(
+    repository: &Arc<RepositoryContext>,
+    files: &[&str],
+    directories: &[&str],
+) -> Arc<State> {
+    let state = State::new();
+    state.set_revision(lore_base::types::Hash::from([2; 32]));
+    let mut staged = std::collections::BTreeSet::new();
+    for path in files.iter().chain(directories) {
+        for (end, _) in path.match_indices('/') {
+            staged.insert((path[..end].to_owned(), true));
+        }
+        staged.insert((path.to_string(), directories.contains(path)));
+    }
+    for (path, is_directory) in staged {
+        let node = if is_directory {
+            Node::new_zeroed()
+        } else {
+            file_node(path.as_bytes())
+        };
+        lore_revision::stage::stage_single_node(
+            repository.clone(),
+            state.clone(),
+            relative(&path),
+            node,
+            Arc::default(),
+            None,
+            FilterMode::empty(),
+        )
+        .await
+        .expect("stage the node");
+    }
+    state
+}
+
+/// The delete of the file at `path`, which is all [`remove_emptied_directories`] reads of it.
+fn file_delete_at(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    path: &str,
+) -> NodeChange {
+    let from = NodeChangeState {
+        mapping: NodeMapping {
+            repository: repository.clone(),
+            state: state.clone(),
+            path: relative(path),
+            node: INVALID_NODE,
+        },
+        observed: None,
+        flags: NodeFlags::File,
+        address: Default::default(),
+        mode: 0,
+    };
+    NodeChange {
+        action: FileAction::Delete,
+        flags: change::Flags::None,
+        to: from.invalid(relative(path)),
+        from,
+    }
+}
+
+/// The directories below `root`, sorted.
+fn directories_below(root: &std::path::Path) -> Vec<String> {
+    let mut directories = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() && !path.ends_with(".lore") {
+                let relative = path.strip_prefix(root).unwrap();
+                directories.push(relative.to_string_lossy().replace('\\', "/"));
+                pending.push(path);
+            }
+        }
+    }
+    directories.sort();
+    directories
+}
+
+/// One case of [`remove_emptied_directories`]: the view the working tree is under, the tree the
+/// target revision holds, the files deleted, what the working tree holds once they are, and the
+/// directories it holds after the removal.
+struct Removal {
+    view: &'static [&'static str],
+    target_files: &'static [&'static str],
+    target_empty: &'static [&'static str],
+    deleted: &'static [&'static str],
+    on_disk: &'static [&'static str],
+    local_files: &'static [&'static str],
+    /// The realize carries the tree to `view` from another, as `lore sync --view` does.
+    view_changes: bool,
+    left: &'static [&'static str],
+}
+
+/// The directories the working tree of `case` holds after [`remove_emptied_directories`] at the
+/// root.
+async fn directories_left(case: &Removal) -> Vec<String> {
+    let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+    let mut filter = Filter::default();
+    for rule in case.view {
+        match rule.strip_prefix('!') {
+            Some(included) => filter.view.add_inclusion(included).unwrap(),
+            None => filter.view.add_exclusion(rule).unwrap(),
+        }
+    }
+    let repository = working_tree_repository_filtered(dir.path(), filter).await;
+    let target = NodeMapping::root(
+        repository.clone(),
+        tree_holding(&repository, case.target_files, case.target_empty).await,
+    );
+    for directory in case.on_disk {
+        std::fs::create_dir_all(dir.path().join(directory)).unwrap();
+    }
+    for file in case.local_files {
+        write_working_files(&repository, &[(file, b"local")]).await;
+    }
+    let changes: Vec<NodeChange> = case
+        .deleted
+        .iter()
+        .map(|path| file_delete_at(&repository, &target.state, path))
+        .collect();
+    let operation = repository.file_system().begin_operation().await.unwrap();
+    remove_emptied_directories(
+        &operation,
+        &repository,
+        &changes,
+        &RelativePath::new(),
+        case.view_changes.then_some(&target),
+        &Arc::default(),
+    )
+    .await;
+    directories_below(dir.path())
+}
+
+/// A change of view removes each directory its deletes leave empty that the new view leaves off
+/// the disk, and keeps one holding a local file, one the target revision holds empty, one a line
+/// names, and one whose subtree the view covers. Without a change of view, as in a merge, a
+/// directory the view includes stays.
+#[tokio::test]
+async fn a_view_change_removes_the_directories_the_new_view_does_not_create() {
+    let cases = [
+        Removal {
+            view: &["*.txt"],
+            target_files: &["a/b/x.txt", "a/c/y.txt"],
+            target_empty: &[],
+            deleted: &["a/b/x.txt", "a/c/y.txt"],
+            on_disk: &["a/b", "a/c"],
+            local_files: &["a/c/local.dat"],
+            view_changes: true,
+            left: &["a", "a/c"],
+        },
+        Removal {
+            view: &["*.txt"],
+            target_files: &["a/x.txt"],
+            target_empty: &["a/e"],
+            deleted: &["a/e/z.txt", "a/x.txt"],
+            on_disk: &["a/e"],
+            local_files: &[],
+            view_changes: true,
+            left: &["a", "a/e"],
+        },
+        Removal {
+            view: &["**", "!/a/b/", "/a/b/*"],
+            target_files: &["a/b/x.txt"],
+            target_empty: &[],
+            deleted: &["a/b/x.txt"],
+            on_disk: &["a/b"],
+            local_files: &[],
+            view_changes: true,
+            left: &["a", "a/b"],
+        },
+        Removal {
+            view: &["/z/*.txt"],
+            target_files: &["a/b/x.txt"],
+            target_empty: &[],
+            deleted: &["a/b/x.txt"],
+            on_disk: &["a/b"],
+            local_files: &[],
+            view_changes: true,
+            left: &["a", "a/b"],
+        },
+        Removal {
+            view: &["*.bat"],
+            target_files: &["a/b/y.bat"],
+            target_empty: &[],
+            deleted: &["a/b/x.txt"],
+            on_disk: &["a/b"],
+            local_files: &[],
+            view_changes: true,
+            left: &[],
+        },
+        Removal {
+            view: &["*.bat"],
+            target_files: &["a/b/y.bat"],
+            target_empty: &[],
+            deleted: &["a/b/x.txt"],
+            on_disk: &["a/b"],
+            local_files: &[],
+            view_changes: false,
+            left: &["a", "a/b"],
+        },
+    ];
+    for (index, case) in cases.iter().enumerate() {
+        let left = Box::pin(with_execution(directories_left(case))).await;
+        assert_eq!(left, case.left, "case {index}");
+    }
+}
+
+/// Below a link's mount, a change of view finds each directory in the linked tree and removes the
+/// ones the new view leaves off the disk, but not the mount, which stands for the link.
+#[tokio::test]
+async fn a_view_change_removes_directories_below_a_link_mount_but_not_the_mount() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let mut filter = Filter::default();
+        filter.view.add_exclusion("*.txt").unwrap();
+        filter.view.add_exclusion("*.bat").unwrap();
+        let repository = working_tree_repository_filtered(dir.path(), filter).await;
+        let (state, _) =
+            linked_plugin_tree(&repository, SOURCE, &[("b/x.txt", b"x"), ("s.bat", b"s")]).await;
+        std::fs::create_dir_all(dir.path().join(SOURCE).join("b")).unwrap();
+        let target = NodeMapping::root(repository.clone(), state.clone());
+        let changes = [file_delete_at(
+            &repository,
+            &state,
+            &format!("{SOURCE}/b/x.txt"),
+        )];
+        let operation = repository.file_system().begin_operation().await.unwrap();
+
+        remove_emptied_directories(
+            &operation,
+            &repository,
+            &changes,
+            &RelativePath::new(),
+            Some(&target),
+            &Arc::default(),
+        )
+        .await;
+
+        assert_eq!(directories_below(dir.path()), [PLUGIN, SOURCE]);
+    }))
+    .await;
+}
+
+/// Below a layer's mount, a change of view looks each directory up below the layer's source
+/// path, the mount standing for the layer.
+#[tokio::test]
+async fn a_view_change_removes_directories_below_a_layer_mount_from_its_source_path() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let mut filter = Filter::default();
+        filter.view.add_exclusion("*.txt").unwrap();
+        let repository = working_tree_repository_filtered(dir.path(), filter).await;
+        let layered = tree_holding(&repository, &["src/b/x.txt", "src/c/y.txt"], &[]).await;
+        let source = layered
+            .find_node_link(repository.clone(), "src")
+            .await
+            .unwrap()
+            .node;
+        let target = NodeMapping {
+            repository: repository.clone(),
+            state: layered.clone(),
+            path: relative("layer"),
+            node: source,
+        };
+        std::fs::create_dir_all(dir.path().join("layer/b")).unwrap();
+        let changes = [file_delete_at(&repository, &layered, "layer/b/x.txt")];
+        let operation = repository.file_system().begin_operation().await.unwrap();
+
+        remove_emptied_directories(
+            &operation,
+            &repository,
+            &changes,
+            &relative("layer"),
+            Some(&target),
+            &Arc::default(),
+        )
+        .await;
+
+        assert_eq!(directories_below(dir.path()), ["layer"]);
     }))
     .await;
 }

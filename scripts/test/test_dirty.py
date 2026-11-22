@@ -2465,10 +2465,11 @@ def remove_view_filter(repo: Lore) -> None:
 def test_dirty_delete_respects_view_filter(new_lore_repo):
     """A dirty-delete of a directory must not mark view-filtered descendants.
 
-    Regression guard for the carry-forward dirty recursion: a view pattern like
-    `/Templates/*` excludes the *contents* of `Templates` but not the directory
-    node itself, so `dirty Templates` would previously recurse the whole subtree
-    and mark every (filtered) child as a dirty-delete in the staged anchor.
+    Regression guard for the carry-forward dirty recursion: the view names
+    `Templates` with `!/Templates/` and excludes its *contents* with
+    `/Templates/*`, so the directory is in view while everything below it is
+    not, and `dirty Templates` must not recurse the subtree and mark every
+    (filtered) child as a dirty-delete in the staged anchor.
 
     The marking is hidden by the view (and a fresh scan would re-derive the
     on-disk deletion regardless), so it is observed with `--check-dirty` after
@@ -2491,8 +2492,8 @@ def test_dirty_delete_respects_view_filter(new_lore_repo):
     repo.stage(scan=True, offline=True)
     repo.commit(offline=True)
 
-    # View excludes the contents of Templates but not the Templates node itself.
-    write_view_filter(repo, ["/Templates/*"])
+    # View names Templates and excludes its contents.
+    write_view_filter(repo, ["!/Templates/", "/Templates/*"])
 
     # Remove the now-filtered subtree from disk and mark the directory dirty,
     # reproducing the phantom dirty-delete of a view-only directory. With it

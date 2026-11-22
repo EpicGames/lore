@@ -4326,6 +4326,7 @@ async fn realize_with_subtrees(
         None,
         false,
         None, /* Not a merge */
+        None, /* No view change */
         Arc::default(),
     )
     .await
@@ -4380,6 +4381,7 @@ async fn a_listed_file_below_a_deleted_directory_that_no_move_pairs_is_deleted()
             state_stage: None,
             dry_run: false,
             merge_current: None,
+            view_change: None,
             stats: Arc::default(),
         });
         let deleted = lore_revision::fs::realize::realize_changes_delete(

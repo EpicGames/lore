@@ -5,7 +5,7 @@ import os
 
 import pytest
 from lore_parsers import parse_status_json
-from test_utils import to_posix, working_tree_files
+from test_utils import commit_and_push_files, to_posix, working_tree_files
 
 from lore import Lore
 
@@ -148,30 +148,17 @@ def test_view(new_lore_repo, scratch_dir):
 
 
 @pytest.mark.smoke
-def test_view_clone_materializes_directory_emptied_by_filter(
+def test_view_clone_creates_a_directory_emptied_by_filter_only_where_a_line_names_it(
     new_lore_repo, scratch_dir
 ):
-    """Cloning with a view filter that excludes every child of a directory --
-    but not the directory node itself -- still materializes the (now empty)
-    directory, and a following status agrees that nothing is missing.
+    """A clone under a view that excludes every child of a directory, but not the
+    directory itself, creates the directory only where a view line names it.
 
-    The committed tree has a directory `data` holding two files and a nested
-    subdirectory with its own file, plus an unrelated top-level file. The view
-    filter `data/**` excludes everything *under* `data` (both files, the `sub`
-    subdirectory, and `sub/nested.txt`) while leaving the `data` directory node
-    itself in view.
-
-    Expected after the clone:
-      - the unrelated in-view file `keep.txt` is materialized,
-      - none of the excluded children exist on disk, and
-      - `data` is materialized as an empty directory (this is the regression:
-        a clone that drops a directory once the view filter removes all its
-        children leaves `data` missing).
-
-    Because the `data` node is in view, `status --scan` (a.k.a. --unstaged) on
-    the fresh clone must report no changes. If the clone skipped creating the
-    emptied directory, clone and status disagree about the view and `data`
-    surfaces as a phantom delete.
+    The committed tree holds `data` with two files and a nested subdirectory, and
+    an unrelated top-level file. Under `data/**` the view includes `data` by its
+    parent's verdict alone, and the clone leaves it out with everything below it.
+    Under `!/data/` and `/data/**` a line names `data`, and the clone creates it
+    empty. Either way the clone holds `keep.txt`, and a scan reports no changes.
     """
     repo: Lore = new_lore_repo()
 
@@ -192,55 +179,19 @@ def test_view_clone_materializes_directory_emptied_by_filter(
     repo.commit()
     repo.push()
 
-    # Pure-exclusion view: `data/**` drops every descendant of `data` while the
-    # `data` directory node itself stays in view.
     view_dir = scratch_dir("view", create=True)
-    view_path = os.path.join(view_dir, "view.txt")
-    with open(view_path, "w+") as view_file:
-        view_file.write("data/**\n")
-    clone: Lore = repo.clone(view=view_path)
+    for name, rules, created in [
+        ("inherited", ["data/**"], [keep]),
+        ("named", ["!/data/", "/data/**"], [emptied_dir, keep]),
+    ]:
+        view_path = os.path.join(view_dir, f"{name}.txt")
+        with open(view_path, "w+") as view_file:
+            view_file.writelines(rule + "\n" for rule in rules)
+        clone: Lore = repo.clone(view=view_path)
 
-    # Sanity: the unrelated file is in view; every child of `data` is filtered.
-    assert clone.file_exists(keep), "in-view file should be materialized"
-    for child in filtered_children:
-        assert not clone.path_exists(child), (
-            f"view filter materialized an excluded child: {child}"
-        )
-    assert not clone.path_exists(os.path.join(emptied_dir, "sub")), (
-        "excluded subdirectory should not be materialized"
-    )
-
-    # The directory node is in view, so it must be materialized even though the
-    # filter left it empty.
-    emptied_abs = os.path.join(clone.path, emptied_dir)
-    assert os.path.isdir(emptied_abs), (
-        "clone did not materialize the directory left empty by the view filter: "
-        + emptied_dir
-    )
-    assert os.listdir(emptied_abs) == [], (
-        "directory emptied by the view filter should have no materialized "
-        f"children, got: {os.listdir(emptied_abs)}"
-    )
-
-    # status --scan must agree with the clone's view: no changes at all, and in
-    # particular no phantom delete of the in-view (empty) `data` directory.
-    entries = parse_status_json(clone.status(json=True, offline=True, scan=True))
-    by_path = {to_posix(e.get("path", "")): e for e in entries}
-    assert by_path == {}, (
-        "status --scan on a pristine view-filtered clone reported changes "
-        f"(clone/status view mismatch): {sorted(by_path)}"
-    )
-
-
-def _commit(repo: Lore, files: list[str], directories: tuple[str, ...] = ()) -> None:
-    """Commits and pushes `files`, each holding its own path, and the empty
-    `directories`."""
-    repo.write_files({path: path for path in files})
-    for path in directories:
-        repo.make_dirs(path)
-    repo.stage(scan=True)
-    repo.commit()
-    repo.push()
+        assert working_tree_files(clone, directories=True) == created, rules
+        entries = parse_status_json(clone.status(json=True, offline=True, scan=True))
+        assert entries == [], f"status --scan under {rules} reported changes: {entries}"
 
 
 @pytest.mark.own_vfs("layers a repository, which a virtual clone does not hold")
@@ -255,12 +206,14 @@ def test_view_with_a_wildcard_reinclusion_creates_no_excluded_directory(
     stages nothing."""
     repo: Lore = new_lore_repo()
     layer_repo: Lore = new_lore_repo(repo.name + "_layer")
-    _commit(
+    commit_and_push_files(
         repo,
         ["Game/Saved/Config/a.ini", "Game/Saved/Logs/l.log", "Engine/Build/b.txt"],
         ("Engine/Empty", "Game/Saved/Config/Kept"),
     )
-    _commit(layer_repo, ["Saved/Config/a.ini", "Saved/Logs/l.log"], ("Empty",))
+    commit_and_push_files(
+        layer_repo, ["Saved/Config/a.ini", "Saved/Logs/l.log"], ("Empty",)
+    )
     view = os.path.join(scratch_dir("view", create=True), "view.txt")
     with open(view, "w") as view_file:
         view_file.write("/*\n!*/Saved/Config/\n")
@@ -351,9 +304,9 @@ def test_forced_stage_scan_commits_files_the_view_excludes_below_a_link_and_a_la
     repo: Lore = new_lore_repo()
     link_repo: Lore = new_lore_repo(repo.name + "_link")
     layer_repo: Lore = new_lore_repo(repo.name + "_layer")
-    _commit(repo, ["Docs/readme.md"])
-    _commit(link_repo, ["Hidden/hidden.txt", "linked.txt"])
-    _commit(layer_repo, ["Hidden/hidden.txt", "layered.txt"])
+    commit_and_push_files(repo, ["Docs/readme.md"])
+    commit_and_push_files(link_repo, ["Hidden/hidden.txt", "linked.txt"])
+    commit_and_push_files(layer_repo, ["Hidden/hidden.txt", "layered.txt"])
     repo.link_add("Lib", link_repo.get_id(), "/")
     repo.commit("Add link")
     repo.push()
@@ -399,8 +352,8 @@ def test_unstage_of_a_directory_added_below_a_link_leaves_what_the_view_excludes
     in it, and leaves staged what a forced staging scan took past the view."""
     repo: Lore = new_lore_repo()
     link_repo: Lore = new_lore_repo(repo.name + "_link")
-    _commit(repo, ["Docs/readme.md"])
-    _commit(link_repo, ["linked.txt"])
+    commit_and_push_files(repo, ["Docs/readme.md"])
+    commit_and_push_files(link_repo, ["linked.txt"])
     repo.link_add("Lib", link_repo.get_id(), "/")
     repo.commit("Add link")
     repo.push()
@@ -438,8 +391,8 @@ def test_unstage_below_a_link_leaves_what_a_forced_stage_staged_past_the_view(
     status lists it staged, and the commit takes it into the linked repository."""
     repo: Lore = new_lore_repo()
     link_repo: Lore = new_lore_repo(repo.name + "_link")
-    _commit(repo, ["Docs/readme.md"])
-    _commit(link_repo, ["Hidden/hidden.txt", "linked.txt"])
+    commit_and_push_files(repo, ["Docs/readme.md"])
+    commit_and_push_files(link_repo, ["Hidden/hidden.txt", "linked.txt"])
     repo.link_add("Lib", link_repo.get_id(), "/")
     repo.commit("Add link")
     repo.push()

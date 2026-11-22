@@ -861,6 +861,70 @@ mod tests {
         }
     }
 
+    /// A filesystem provider whose operations read, write and remove in the working tree at `root`,
+    /// as [`RefusingRenames`]'s do, and count each directory create in `creates`.
+    struct CountingCreates {
+        root: std::path::PathBuf,
+        creates: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl FilesystemProvider for CountingCreates {
+        async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
+            Ok(Arc::new(InstanceOperationImpl::new(
+                StaticDispatchInstanceOperation::Test(TestOperation {
+                    reads: Some(OsFilesystem::new(&self.root).begin_operation()),
+                    directory_creates: self.creates.clone(),
+                    ..TestOperation::default()
+                }),
+                false,
+            )))
+        }
+    }
+
+    /// A reset of a working tree that holds every directory a view line names creates none of
+    /// them: it creates a directory the view names only where the working tree lacks it.
+    #[tokio::test]
+    async fn a_reset_creates_no_named_directory_the_working_tree_holds() {
+        with_fixture(async |fixture| {
+            test_directory_create(&fixture.path.join("a/b/c"));
+            test_file_write(&fixture.path.join("a/b/c/x.txt"), b"x");
+            test_commit_tree(&fixture, "Initial").await;
+            let creates = Arc::new(AtomicUsize::new(0));
+            let counting = Arc::new(
+                RepositoryContext::new(
+                    default_repository_creation_args(
+                        fixture.repository.immutable_store(),
+                        fixture.repository.mutable_store.clone(),
+                    )
+                    .with_path(&fixture.path)
+                    .with_id(fixture.repository.id)
+                    .with_instance_id(fixture.repository.instance_id)
+                    .with_filter(Arc::new(test_filter(&[], &["**", "!/a/", "!/a/**"])))
+                    .with_filesystem_provider(Arc::new(CountingCreates {
+                        root: fixture.path.clone(),
+                        creates: creates.clone(),
+                    })),
+                )
+                .with_write_token(fixture.write_token.share()),
+            );
+
+            reset::reset(
+                counting,
+                &fixture.write_token,
+                LoreArray::from_vec(vec![LoreString::from(&fixture.path)]),
+                LoreString::default(),
+                ResetOptions::default(),
+            )
+            .await
+            .expect("A reset must succeed");
+
+            assert_eq!(creates.load(Ordering::Relaxed), 0);
+            assert_working_files(&fixture, &[("a/b/c/x.txt", Some(b"x"))]);
+        })
+        .await;
+    }
+
     /// What [`reset_refusing_renames`] answers.
     struct RefusedReset {
         result: Result<(), ResetError>,

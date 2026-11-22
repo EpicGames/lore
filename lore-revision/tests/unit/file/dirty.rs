@@ -1211,3 +1211,105 @@ async fn a_walk_takes_a_directory_where_a_file_marked_added_stood() {
         .await;
     }
 }
+
+/// The paths a walk of the whole working tree marks deleted under the view `view`, the revision
+/// holding `files` and the working tree lacking each directory of `removed`, as a clone under the
+/// view leaves it or a user removes it.
+async fn deleted_under_view(view: &[&str], files: &[&str], removed: &[&str]) -> Vec<String> {
+    let mut marked = Vec::new();
+    let marked_out = &mut marked;
+    with_instance(|instance| async move {
+        committed(&instance, files).await;
+        for directory in removed {
+            removed_directory(&instance, directory);
+        }
+        let viewed = Arc::new(
+            instance
+                .repository
+                .to_filter_context(Arc::new(crate::helper::test_filter(&[], view))),
+        );
+        let signature = lore_revision::file::dirty::dirty(
+            viewed,
+            LoreArray::from_vec(vec![LoreString::from(&instance.path)]),
+        )
+        .await
+        .expect("the walk");
+        let state = State::deserialize(instance.repository.clone(), signature)
+            .await
+            .expect("the staged state");
+        *marked_out = crate::dirty_move_fixture::dirty_marks(&instance, &state)
+            .await
+            .into_iter()
+            .filter(|(_, _, marks)| {
+                *marks & NodeFlags::DirtyDelete.bits() == NodeFlags::DirtyDelete.bits()
+            })
+            .map(|(path, ..)| path)
+            .collect();
+    })
+    .await;
+    marked
+}
+
+/// `lore dirty .` marks nothing deleted for a directory the view does not create and the working
+/// tree lacks: one a wildcard re-inclusion only could reach below, as with `/*` and
+/// `!*/Saved/Config/` and no `Saved/Config` in the revision, and nested directories holding only
+/// files a view of extension rules excludes.
+#[tokio::test]
+async fn a_walk_marks_nothing_for_a_directory_the_view_does_not_create() {
+    assert_eq!(
+        deleted_under_view(
+            &["/*", "!*/Saved/Config/"],
+            &["Engine/Build/b.txt"],
+            &["Engine"]
+        )
+        .await,
+        Vec::<String>::new(),
+        "under a wildcard re-inclusion"
+    );
+    assert_eq!(
+        deleted_under_view(
+            &["*.bat"],
+            &["a/b/c/x.bat", "a/b/y.bat", "a/kept.txt"],
+            &["a/b"]
+        )
+        .await,
+        Vec::<String>::new(),
+        "under a view of extension rules"
+    );
+}
+
+/// A walk marks deleted a directory the working tree lacks that the view creates: one a line
+/// names, below a parent the walk removes too or one that stands, and one holding a kept file
+/// below directories no line names, with each of them.
+#[tokio::test]
+async fn a_walk_marks_deleted_a_directory_the_view_creates() {
+    assert_eq!(
+        deleted_under_view(&["**", "!/a/b/", "/a/b/*"], &["a/b/x.txt"], &["a"]).await,
+        vec!["a".to_string(), "a/b".to_string()],
+        "the directory a line names, and its parent"
+    );
+    assert_eq!(
+        deleted_under_view(
+            &["*.bat"],
+            &["a/b/kept.txt", "a/b/y.bat", "a/z.bat"],
+            &["a"]
+        )
+        .await,
+        vec![
+            "a".to_string(),
+            "a/b".to_string(),
+            "a/b/kept.txt".to_string()
+        ],
+        "the chain above a kept file"
+    );
+    assert_eq!(
+        deleted_under_view(
+            &["**", "!/a/b/", "/a/b/*"],
+            &["a/b/x.txt", "a/z.txt"],
+            &["a/b"]
+        )
+        .await,
+        vec!["a/b".to_string()],
+        "the directory a line names, below a parent that stands"
+    );
+}

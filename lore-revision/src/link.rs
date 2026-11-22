@@ -2428,6 +2428,7 @@ async fn realize_link_pin_diff(
         None,
         false, /* Not dry run */
         None,  /* Not a merge */
+        None,  /* No view change */
         stats,
     )
     .await

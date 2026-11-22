@@ -8799,7 +8799,7 @@ pub(crate) struct DiffSide {
 
 impl DiffSide {
     /// Where `path` below this side's node stops.
-    async fn stop(&self, path: &str) -> Result<PathStop, StateError> {
+    pub(crate) async fn stop(&self, path: &str) -> Result<PathStop, StateError> {
         if !self.node.is_valid_or_root_node_id() {
             return Ok(PathStop::NONE);
         }
@@ -8809,7 +8809,7 @@ impl DiffSide {
     }
 
     /// This side entering a link at `linked`, the node of the linked tree it mounts.
-    async fn enter(self, linked: &NodeLink) -> Result<DiffSide, StateError> {
+    pub(crate) async fn enter(self, linked: &NodeLink) -> Result<DiffSide, StateError> {
         let (repository, state) = linked.resolve(self.repository, self.state).await?;
         Ok(DiffSide {
             repository,
