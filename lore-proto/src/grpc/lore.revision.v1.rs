@@ -326,9 +326,8 @@ impl ::prost::Name for BranchMetadataSetResponse {
     }
 }
 /// Request to page through a branch's revision history. The start
-/// anchor selects which revision the page is anchored at; both forms
-/// resolve to the same concrete revision and walk that branch's
-/// history.
+/// anchor selects which revision the page is anchored at, and the page
+/// walks the history from that revision.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RevisionListRequest {
     /// Start anchor for the page.
@@ -340,8 +339,12 @@ pub mod revision_list_request {
     /// Start anchor for the page.
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Start {
-        /// Identifier-based anchor; `number == 0` resolves to the tip of
-        /// the branch.
+        /// Identifier-based anchor: the branch's revision with that
+        /// number, or, for a number the branch's first-parent line skips,
+        /// the line's nearest revision numbered below it. `number == 0`
+        /// resolves to the branch's latest revision. A number above the
+        /// latest revision, or with no revision of the line at or below it,
+        /// is not found.
         #[prost(message, tag = "1")]
         Identifier(crate::lore::model::v1::RevisionIdentifier),
         /// Signature-based anchor (typically a cursor returned by a
@@ -365,11 +368,12 @@ impl ::prost::Name for RevisionListRequest {
 /// direction.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RevisionListResponse {
-    /// The page of revisions, newest-to-oldest. The revision identified by
-    /// the request's `start` anchor is guaranteed to appear somewhere in
-    /// the page, but is not necessarily items\[0\] — the server may align
-    /// the page on a wider boundary (e.g. a cached segment) and return
-    /// items both newer and older than the anchor. Server picks page size.
+    /// The page of revisions, newest-to-oldest. The revision the request's
+    /// `start` anchor resolves to, as `RevisionListRequest` describes, is
+    /// guaranteed to appear somewhere in the page, but is not necessarily
+    /// items\[0\] — the server may align the page on a wider boundary (e.g.
+    /// a cached segment) and return items both newer and older than the
+    /// anchor. Server picks page size.
     #[prost(message, repeated, tag = "1")]
     pub items: ::prost::alloc::vec::Vec<crate::lore::model::v1::RevisionItem>,
     /// Cursor (signature) to feed back as `start.signature` to fetch

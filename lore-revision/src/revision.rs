@@ -3193,7 +3193,7 @@ async fn branch_latest(
 /// The remote answers from its revision list where it can, since that costs one
 /// request against a walk of every revision in between. The number the list
 /// labels an item with picks it, and the item's state, which its signature fixes,
-/// confirms it, as [`find::verified_number`] reads it. Where no item is picked or
+/// confirms it, as [`find::verified_line_step`] reads it. Where no item is picked or
 /// confirmed, whichever latest the list did not answer from anchors that walk.
 ///
 /// Numbering starts at one, so zero names no revision and is refused before any
@@ -3248,7 +3248,7 @@ async fn resolve_revision_number(
             .items
             .iter()
             .find(|item| item.number == revision_number)
-            && find::verified_number(item) == Some(revision_number)
+            && find::verified_line_step(item).is_some_and(|(number, _)| number == revision_number)
         {
             revision = item.signature;
             lore_debug!("response revision {}", revision);

@@ -72,10 +72,10 @@ enum Step {
     /// The round asks the remote for the page holding the line's cursor, a revision the store
     /// lacks.
     Remote,
-    /// The remote took the line no further, so it is not asked for the line again. Holds the error
-    /// of the request that stopped the line; a failed request is a cold path, so the error is
-    /// boxed rather than held in every state of the walk.
-    Stopped(Option<Box<ProtocolError>>),
+    /// The request for the line failed, so the remote is not asked for the line again. Holds the
+    /// request's error; a failed request is a cold path, so the error is boxed rather than held in
+    /// every state of the walk.
+    Stopped(Box<ProtocolError>),
 }
 
 /// One line of the walk: its revisions, newest first, and its cursor. The cursor is the next
@@ -178,9 +178,8 @@ impl Line {
     /// Take `listing`, the remote's answer for the page holding the line's cursor. A page extends
     /// the line and is returned so its states can be cached, with the number of items it lists
     /// above the line's cursor, whose states the line did not verify. `NotFound` ends the line, and
-    /// any other failure stops it. A line the answer moves is walked in the local store again, and
-    /// one it does not move is not asked for again. Fails where the page lists a revision on the
-    /// line without its own state.
+    /// any other failure stops it. A page moves the line, which is walked in the local store
+    /// again. Fails where the page does not continue the line, as [`Self::extend`] describes.
     fn take(
         &mut self,
         listing: Result<RevisionListResponse, ProtocolError>,
@@ -189,15 +188,8 @@ impl Line {
             Ok(page) => {
                 let listed = page.items_from(self.cursor);
                 let unverified = page.items.len() - listed.len();
-                self.step = match self.extend(listed, page.next_revision) {
-                    Ok(true) => Step::Store,
-                    Ok(false) => Step::Stopped(None),
-                    Err(revision) => {
-                        return Err(HistoryError::internal(format!(
-                            "the remote listed revision {revision} without its own state"
-                        )));
-                    }
-                };
+                self.extend(listed, page.next_revision)?;
+                self.step = Step::Store;
                 Ok(Some((page, unverified)))
             }
             Err(err) if err.is_not_found() => {
@@ -214,28 +206,40 @@ impl Line {
 
     /// Stop asking the remote for the line, keeping `err`, the error of its request.
     fn stop(&mut self, err: ProtocolError) {
-        self.step = Step::Stopped(Some(Box::new(err)));
+        self.step = Step::Stopped(Box::new(err));
     }
 
     /// Extend the line with `listed`, the items of a page from the line's cursor on, and move the
-    /// cursor to `next`, the next revision the page names. A page that does not hold the cursor is
-    /// not on the line, and neither is its next revision, so it ends the line. The local walk adds
-    /// the revision it stops at, with the number zero, before the line asks for the page holding
-    /// it, so the page numbers that revision rather than adding it again. Each number is read once
-    /// from the state the page carries, as [`find::verified_number`] describes. Returns whether the
-    /// cursor moved, or the first revision that `listed` holds without its own state.
-    fn extend(&mut self, listed: &[RevisionItem], next: Hash) -> Result<bool, Hash> {
+    /// cursor to the first parent of the page's last revision: the revision `next` names, where it
+    /// is set. The local walk adds the revision it stops at, with the number zero, before the line
+    /// asks for the page holding it, so the page numbers that revision rather than adding it
+    /// again. Each number and first parent is read once from the state the page carries, as
+    /// [`find::verified_line_step`] describes. Fails where the page does not hold the cursor,
+    /// lists a revision without its own state, or lists one that is not the first parent of the
+    /// revision above it, and where `next`, if set, is not the first parent of the page's last
+    /// revision.
+    fn extend(&mut self, listed: &[RevisionItem], next: Hash) -> Result<(), HistoryError> {
         let anchor = self.cursor;
         let Some((first, older)) = listed.split_first() else {
-            self.cursor = Hash::default();
-            return Ok(true);
+            return Err(HistoryError::internal(format!(
+                "the remote listed a page without revision {anchor}, which it was asked for"
+            )));
         };
-        let anchor_number = find::verified_number(first).ok_or(first.signature)?;
+        let (anchor_number, mut parent) =
+            find::verified_line_step(first).ok_or_else(|| unverified(first.signature))?;
         let start = self.history.len();
         for item in older {
-            let number = find::verified_number(item).ok_or(item.signature)?;
+            let (number, item_parent) =
+                find::verified_line_step(item).ok_or_else(|| unverified(item.signature))?;
+            if item.signature != parent {
+                return Err(off_the_line(item.signature, parent));
+            }
             self.numbers.push(number);
             self.history.push(item.signature);
+            parent = item_parent;
+        }
+        if !next.is_zero() && next != parent {
+            return Err(off_the_line(next, parent));
         }
         if let Some(number) = start
             .checked_sub(1)
@@ -244,8 +248,8 @@ impl Line {
             *number = anchor_number;
         }
         self.added += older.len();
-        self.cursor = next;
-        Ok(self.cursor != anchor)
+        self.cursor = parent;
+        Ok(())
     }
 
     /// Fail where a revision the round added does not descend in number from the one before it.
@@ -258,6 +262,21 @@ impl Line {
             None => Ok(()),
         }
     }
+}
+
+/// The error for a page that lists `revision` without its own state.
+fn unverified(revision: Hash) -> HistoryError {
+    HistoryError::internal(format!(
+        "the remote listed revision {revision} without its own state"
+    ))
+}
+
+/// The error for a page that names `named` where the line holds `parent`, the first parent of
+/// the revision above it.
+fn off_the_line(named: Hash, parent: Hash) -> HistoryError {
+    HistoryError::internal(format!(
+        "the remote named revision {named} where the line holds revision {parent}"
+    ))
 }
 
 /// The first revision of a line from index `from` on whose number is not below that of the
@@ -338,8 +357,8 @@ fn advancing(left: &Line, right: &Line, passed: (usize, usize)) -> (bool, bool) 
 /// answers, and cache the states the pages carry as [`find::cache_page_states`] describes. When
 /// both lines are asked, the right line's request runs as a task beside the left line's, and is
 /// aborted if the walk is dropped. A round that asks for one line spawns nothing. A remote that
-/// cannot be reached stops every line asked for, and a page listing a revision on its line without
-/// its own state fails the walk.
+/// cannot be reached stops every line asked for, and a page that does not continue its line fails
+/// the walk, as [`Line::extend`] describes.
 async fn ask_remote(
     repository: &Arc<RepositoryContext>,
     left: &mut Line,
@@ -416,28 +435,30 @@ fn branch_point(
     (branch_point, left.history, right.history)
 }
 
-/// Fail a walk that neither line can take further. Where the request for a line failed, the walk
-/// fails with the remote's error, the left line's when both failed. Otherwise, or where there was
-/// no remote to ask, it fails with [`RevisionNotFound`] naming the revision the line stopped at,
-/// the left line's when both stopped.
+/// Fail a walk that neither line can take further. A round adds no revision to either line only
+/// where each line has ended or stopped, and not both ended, so a line has stopped. The walk fails
+/// with the error of the request that stopped it, the left line's when both stopped, or, where
+/// there was no remote to ask, with [`RevisionNotFound`] naming the revision the line stopped at.
 fn stall<T>(left: Line, right: Line) -> Result<T, HistoryError> {
-    let (cursor, failure) = match (left.step, right.step) {
-        (Step::Stopped(Some(failure)), _) => (left.cursor, Some(failure)),
-        (_, Step::Stopped(Some(failure))) => (right.cursor, Some(failure)),
-        _ if left.cursor.is_zero() => (right.cursor, None),
-        _ => (left.cursor, None),
-    };
-    let stopped = RevisionNotFound {
-        revision: cursor.to_string(),
+    let (cursor, err) = match (left.step, right.step) {
+        (Step::Stopped(err), _) => (left.cursor, err),
+        (_, Step::Stopped(err)) => (right.cursor, err),
+        _ => {
+            return Err(HistoryError::internal(
+                "the walk stalled with no line stopped",
+            ));
+        }
     };
     let context = format!("listing the revisions from {cursor}");
-    match failure {
-        Some(err) if err.is_no_remote() => Err(HistoryError::RevisionNotFound(
+    if err.is_no_remote() {
+        let stopped = RevisionNotFound {
+            revision: cursor.to_string(),
+        };
+        return Err(HistoryError::RevisionNotFound(
             stopped.chain_err_from(*err, &context),
-        )),
-        Some(err) => Err(*err).forward::<HistoryError>(&context),
-        None => Err(HistoryError::from(stopped)),
+        ));
     }
+    Err(*err).forward::<HistoryError>(&context)
 }
 
 /// The newest revision both `left_latest` and `right_latest` descend from through self parents,
@@ -451,10 +472,9 @@ fn stall<T>(left: Line, right: Line) -> Result<T, HistoryError> {
 /// lacks in the same round, meet at that revision without asking: it is the newest they share,
 /// since [`meet`] found none above it. A line the page moves is walked in the store again from its
 /// new cursor, and a line ends where the remote does not hold the revision asked for. A request
-/// that fails, or a page that does not move the line, stops the line where it is, and the remote
-/// is not asked for it again. A page that lists a revision on the line without its own state fails
-/// the walk, as [`ask_remote`] describes, and so does a blob in the local store that is not a
-/// revision state, as [`Line::walk_store`] describes.
+/// that fails stops the line where it is, and the remote is not asked for it again. A page that
+/// does not continue the line fails the walk, as [`Line::extend`] describes, and so does a blob in
+/// the local store that is not a revision state, as [`Line::walk_store`] describes.
 ///
 /// Each round takes the lines on to where they meet as [`meet`] describes, from where the round
 /// before left them: before the remote is asked, short of the revisions the page will number, as

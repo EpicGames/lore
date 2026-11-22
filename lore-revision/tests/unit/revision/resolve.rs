@@ -144,6 +144,53 @@ async fn a_page_item_without_its_own_state_resolves_through_the_search() {
     }
 }
 
+/// A number the line skips names no revision, though the remote answers it with the page holding
+/// the line's nearest revision below it, so the lookup fails.
+#[tokio::test]
+async fn a_number_the_line_skips_resolves_no_revision() {
+    let branch = BranchId::from([7; 16]);
+    let first = remote_revision(1, Hash::default(), Hash::from([0xA0; 32])).await;
+    let second = remote_revision(2, first.signature, Hash::from([0xA0; 32])).await;
+    let latest = remote_revision(5, second.signature, Hash::from([0xA0; 32])).await;
+    let nearest = vec![(2, second.signature), (1, first.signature)];
+    let remote = Arc::new(
+        PagedRemote::new(branch, latest.signature)
+            .holding([&first, &second, &latest])
+            .page(Anchor::Number(3), nearest.clone(), Hash::default())
+            .page(Anchor::Number(4), nearest, Hash::default())
+            .page(
+                Anchor::Signature(latest.signature),
+                vec![
+                    (5, latest.signature),
+                    (2, second.signature),
+                    (1, first.signature),
+                ],
+                Hash::default(),
+            ),
+    );
+    let (repository, _writer) = client_and_writer(remote).await;
+
+    for number in [3, 4] {
+        let resolved = LORE_CONTEXT
+            .scope(
+                setup_test_execution(),
+                resolve_boxed(
+                    repository.clone(),
+                    format!("{branch}@{number}"),
+                    ResolveSearchLocation::Remote,
+                ),
+            )
+            .await;
+
+        assert!(
+            resolved
+                .as_ref()
+                .is_err_and(|error| error.is_revision_not_found()),
+            "{number}: {resolved:?}"
+        );
+    }
+}
+
 /// The lookup caches the states of the remote's page for the number in the local immutable store,
 /// in a context that cannot write the mutable store.
 #[tokio::test]
@@ -188,11 +235,11 @@ async fn a_lookup_without_a_write_token_caches_the_page_states_locally() {
     assert_eq!(after, [true; 3]);
 }
 
-/// A branch's latest is the local one when the walk between the two latests stops: here the
-/// remote answers each revision list with the revision asked for alone, as its own next page,
-/// so no round after the first adds a revision.
+/// A branch's latest is the local one when the walk between the two latests fails: here the
+/// remote answers each revision list with the revision asked for alone, naming it as its own next
+/// page, which does not continue the line.
 #[tokio::test]
-async fn a_lookup_whose_walk_stops_falls_back_to_the_local_latest() {
+async fn a_lookup_whose_walk_fails_falls_back_to_the_local_latest() {
     let branch = BranchId::from([7; 16]);
     let base_revision = remote_revision(1, Hash::default(), Hash::from([0xA0; 32])).await;
     let latest_revision = remote_revision(2, base_revision.signature, Hash::from([0xA0; 32])).await;

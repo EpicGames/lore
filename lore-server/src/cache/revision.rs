@@ -41,6 +41,7 @@ use lore_revision::revision::ResolveSearchLocation;
 use lore_revision::state::State;
 use lore_revision::state::StateError;
 use lore_storage::StoreError;
+use lore_telemetry::tracing::fields::BRANCH_ID;
 use tracing::debug;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
@@ -193,41 +194,40 @@ pub(crate) async fn load_cached_list(
 /// If segment B containing `revision_number` is closed (proven by the
 /// skip pointer at B + `step_size`), walk `parent_self` from that anchor to
 /// populate `List_B`. Returns the cached segment items on success, or
-/// `Ok(None)` when the segment is not provably closed.
+/// `Ok(None)` when the segment is not provably closed or holds no revision.
+/// With `seal`, the walk also seals the step boundaries it crosses under
+/// `branch`, as [`seal_crossed_boundaries`] describes.
 #[lore_macro::test_pub]
 pub(crate) async fn try_backfill_segment(
     repository: &Arc<RepositoryContext>,
     branch: BranchId,
     revision_number: u64,
     step_size: u64,
+    seal: bool,
 ) -> Result<Option<CachedRevisionList>, StateError> {
     let target_b = revision_number.div_ceil(step_size) * step_size;
     let Some(next_b) = target_b.checked_add(step_size) else {
         return Ok(None);
     };
-
-    let (next_key, next_key_type) = branch::revision_step_key(
-        repository::SALT_LORE,
-        repository.id,
-        branch,
-        next_b,
-        step_size,
-    );
-    let anchor = interpret_cache_read(
-        repository
-            .clone()
-            .read_mutable_store()
-            .load(repository.id, next_key, next_key_type)
-            .await,
-        StoreError::is_address_not_found,
-    )?;
-    let Some(anchor) = anchor.filter(|anchor| !anchor.is_zero()) else {
+    let Some(anchor) = load_step_pointer(repository, branch, next_b, step_size).await? else {
         return Ok(None);
     };
 
     let stop_below = target_b.saturating_sub(step_size);
     let max_items = (step_size as usize).saturating_mul(2).saturating_add(2);
     let walk = walk_segment_revisions(repository, anchor, stop_below, max_items).await?;
+    if seal {
+        for pair in walk.items.windows(2) {
+            seal_crossed_boundaries(
+                repository,
+                branch,
+                step_size,
+                (pair[1].number, pair[1].signature),
+                pair[0].number,
+            )
+            .await;
+        }
+    }
     if !walk.reached_terminator {
         return Ok(None);
     }
@@ -240,6 +240,35 @@ pub(crate) async fn try_backfill_segment(
     }
 
     load_cached_list(repository, branch, revision_number, step_size).await
+}
+
+/// The skip pointer of `branch` at the step boundary containing
+/// `revision_number`: the highest revision of the branch's line numbered at
+/// or below the boundary. `None` where the boundary is unsealed. A failed
+/// read is reported.
+#[lore_macro::test_pub]
+pub(crate) async fn load_step_pointer(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    revision_number: u64,
+    step_size: u64,
+) -> Result<Option<Hash>, StateError> {
+    let (key, key_type) = branch::revision_step_key(
+        repository::SALT_LORE,
+        repository.id,
+        branch,
+        revision_number,
+        step_size,
+    );
+    let pointer = interpret_cache_read(
+        repository
+            .clone()
+            .read_mutable_store()
+            .load(repository.id, key, key_type)
+            .await,
+        StoreError::is_address_not_found,
+    )?;
+    Ok(pointer.filter(|pointer| !pointer.is_zero()))
 }
 
 /// Store the cached list at the boundary containing `revision_number`.
@@ -413,36 +442,59 @@ pub fn sealed_boundaries(
     Some((lowest_b, highest_b))
 }
 
-/// A branch push with long feature branches could increase the linear revision history
-/// number beyond several boundaries. Each boundary should be sealed and point to the
-/// last valid revision less than that boundary
-pub async fn seal_boundary_revision_number(
-    repository: Arc<RepositoryContext>,
+/// Stores `revision` as the skip pointer of `branch` at `boundary`.
+async fn store_step_pointer(
+    repository: &Arc<RepositoryContext>,
     branch: BranchId,
     history_step_size: u64,
-    boundary_revision_number: u64,
-    older_state: &Arc<State>,
-    newer_state: &Arc<State>,
+    boundary: u64,
+    revision: Hash,
 ) -> Result<(), StoreError> {
-    let revision_to_point_to = if newer_state.revision_number() <= boundary_revision_number {
-        newer_state.revision()
-    } else {
-        debug_assert!(older_state.revision_number() <= boundary_revision_number);
-        older_state.revision()
-    };
-
     let (key, key_type) = branch::revision_step_key(
         repository::SALT_LORE,
         repository.id,
         branch,
-        boundary_revision_number,
+        boundary,
         history_step_size,
     );
     let write_token = get_write_token();
     repository
+        .clone()
         .write_mutable_store(&write_token)
-        .store(repository.id, key, revision_to_point_to, key_type)
+        .store(repository.id, key, revision, key_type)
         .await
+}
+
+/// Seals the skip pointer of `branch` at each step boundary B that a pair of
+/// consecutive revisions of its line crosses, `older.0 <= B < newer_number`,
+/// as [`sealed_boundaries`] picks them. `older` is the number and signature
+/// of the first parent of the revision numbered `newer_number`, and the
+/// line's highest revision at or below each such B, so each pointer holds
+/// it. Best effort: a failed write fails nothing. Answers how many pointers
+/// the store took.
+#[lore_macro::test_pub]
+pub(crate) async fn seal_crossed_boundaries(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    history_step_size: u64,
+    older: (u64, Hash),
+    newer_number: u64,
+) -> u64 {
+    let Some((lowest_b, highest_b)) = sealed_boundaries(older.0, newer_number, history_step_size)
+    else {
+        return 0;
+    };
+    let mut sealed = 0;
+    for boundary in (lowest_b..=highest_b).step_by(history_step_size as usize) {
+        if store_step_pointer(repository, branch, history_step_size, boundary, older.1)
+            .await
+            .is_ok()
+        {
+            sealed += 1;
+        }
+    }
+    debug!({BRANCH_ID} = %branch, lowest_b, highest_b, sealed, "Sealed history step keys");
+    sealed
 }
 
 /// Store the history-step skip pointer (if a boundary was crossed) and any
@@ -473,20 +525,14 @@ pub async fn store_history_step(
     };
 
     if acceleration.step_keys {
-        for boundary in (lowest_b..=highest_b).step_by(history_step_size as usize) {
-            // no filter_slow_down()? usage here: sealing is a best-effort
-            // acceleration write, so a throttled store costs the next reader a
-            // slower lookup rather than failing this push.
-            let _ = seal_boundary_revision_number(
-                repository.clone(),
-                branch,
-                history_step_size,
-                boundary,
-                &older_state,
-                &newer_state,
-            )
-            .await;
-        }
+        seal_crossed_boundaries(
+            &repository,
+            branch,
+            history_step_size,
+            (older_state.revision_number(), older_state.revision()),
+            newer_state.revision_number(),
+        )
+        .await;
     }
 
     if !acceleration.list_cache {
@@ -611,22 +657,10 @@ pub(crate) async fn resolve_via_step_key(
     revision_number: u64,
     history_step_size: u64,
 ) -> Result<Option<Hash>, StateError> {
-    let (key, key_type) = branch::revision_step_key(
-        repository::SALT_LORE,
-        repository.id,
-        branch,
-        revision_number,
-        history_step_size,
-    );
-    let anchor = acceleration_miss(interpret_cache_read(
-        repository
-            .clone()
-            .read_mutable_store()
-            .load(repository.id, key, key_type)
-            .await,
-        StoreError::is_address_not_found,
-    ))?;
-    let Some(anchor) = anchor.filter(|anchor| !anchor.is_zero()) else {
+    let anchor = acceleration_miss(
+        load_step_pointer(repository, branch, revision_number, history_step_size).await,
+    )?;
+    let Some(anchor) = anchor else {
         return Ok(None);
     };
 
@@ -659,7 +693,7 @@ pub(crate) async fn resolve_via_step_key(
 
     debug!(
         number = revision_number,
-        key = %key,
+        %anchor,
         "Resolved revision number from history step key"
     );
     Ok(Some(signature))

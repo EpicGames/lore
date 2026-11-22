@@ -31,7 +31,6 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tonic::metadata::MetadataValue;
-use tracing::debug;
 use tracing::warn;
 
 use crate::grpc::FilterSlowDownExt;
@@ -285,29 +284,26 @@ async fn walk_revisions(
         // request identifier.
         if matches!(strategy, RevisionListStrategy::FullIteration)
             && let Some(previous_state) = &prev_step_state
-            && let Some((lowest_b, highest_b)) = crate::cache::revision::sealed_boundaries(
-                state.revision_number(),
+            && crate::cache::revision::sealed_boundaries(
+                current_number,
                 previous_state.revision_number(),
                 history_step_size,
             )
+            .is_some()
             // no filter_slow_down()? usage here: this read only enables the
             // best-effort step-key backfill below.
             && let Ok(metadata) =
                 Metadata::deserialize(repository.clone(), previous_state.metadata_hash()).await
             && let Ok(branch) = metadata.get_branch()
         {
-            for boundary in (lowest_b..=highest_b).step_by(history_step_size as usize) {
-                let _ = crate::cache::revision::seal_boundary_revision_number(
-                    repository.clone(),
-                    branch,
-                    history_step_size,
-                    boundary,
-                    &state,
-                    previous_state,
-                )
-                .await;
-                debug!(boundary, "Backfilled history step key");
-            }
+            crate::cache::revision::seal_crossed_boundaries(
+                repository,
+                branch,
+                history_step_size,
+                (current_number, revision),
+                previous_state.revision_number(),
+            )
+            .await;
         }
         if matches!(strategy, RevisionListStrategy::FullIteration) {
             prev_step_state = Some(state.clone());

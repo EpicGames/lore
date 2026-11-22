@@ -24,6 +24,7 @@ mod batch_load_history {
     use crate::paged_remote::client_on;
     use crate::paged_remote::client_on_storage;
     use crate::paged_remote::client_stores;
+    use crate::paged_remote::off_the_line;
     use crate::paged_remote::remote_revision;
     use crate::paged_remote::stored_locally;
 
@@ -135,6 +136,38 @@ mod batch_load_history {
                         "{} state for {}: {history:?}",
                         case.kind,
                         case.position
+                    );
+                }
+            })
+            .await;
+    }
+
+    /// A page that does not continue the line from the revision asked for fails the batch: one
+    /// listing a revision whose state is not the first parent the revision above it names, one
+    /// whose cursor is not its last revision's first parent, and one without the revision asked
+    /// for. Each revision it lists carries its own state, numbered in order.
+    #[tokio::test]
+    async fn a_page_that_does_not_continue_the_line_fails_the_batch() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let deeper = remote_revision(2, Hash::default(), Hash::from([0xA0; 32])).await;
+                let below = remote_revision(3, deeper.signature, Hash::from([0xA0; 32])).await;
+                let stray = remote_revision(2, Hash::default(), Hash::from([0xB0; 32])).await;
+                for (kind, items, older) in
+                    off_the_line((3, below.signature), deeper.signature, stray.signature)
+                {
+                    let stores = client_stores().await;
+                    let local = write_line(&stores.writer, below.signature, 4, 1).await[0];
+                    let remote = PagedRemote::new(BranchId::from([7; 16]), local)
+                        .holding([&below, &deeper, &stray])
+                        .page(Anchor::Signature(below.signature), items, older);
+                    let client = client_on(&stores, Arc::new(remote));
+
+                    let history = batch_load_history(client, local).await;
+
+                    assert!(
+                        history.as_ref().is_err_and(|error| error.is_internal()),
+                        "{kind}: {history:?}"
                     );
                 }
             })
@@ -901,6 +934,227 @@ mod line_pager {
                 assert!(
                     !anchors(&remote).0.contains(&signature_of(&line, 759)),
                     "no cursor past the revision listed out of order is followed"
+                );
+            })
+            .await;
+    }
+
+    /// A remote holding `line` of a thousand revisions and `stray`, a revision numbered 775 off
+    /// it, which lists the line's pages of a hundred revisions: the first two by hash signature,
+    /// and those below them by revision number, but the page at 800 as `page_800` gives its items
+    /// and cursor. By hash signature, it also lists the page of `stray`, the page of revision 775
+    /// as `page_775` gives its items, and each page below from its top.
+    fn paging_remote_with_page_800(
+        line: &[RemoteRevision],
+        stray: &RemoteRevision,
+        page_800: (Vec<(u64, Hash)>, Hash),
+        page_775: Vec<(u64, Hash)>,
+    ) -> PagedRemote {
+        let mut remote = PagedRemote::new(branch(), line[999].signature)
+            .holding(line)
+            .holding([stray])
+            .page(
+                signature_of(line, 1000),
+                span(line, 1000, 901),
+                Hash::default(),
+            )
+            .page(
+                signature_of(line, 900),
+                span(line, 900, 801),
+                Hash::default(),
+            )
+            .page(Anchor::Number(800), page_800.0, page_800.1)
+            .page(
+                Anchor::Signature(stray.signature),
+                vec![(775, stray.signature)],
+                Hash::default(),
+            )
+            .page(signature_of(line, 775), page_775, Hash::default());
+        for top in (100..=700).rev().step_by(100) {
+            remote = remote
+                .page(
+                    Anchor::Number(top),
+                    span(line, top, top - 99),
+                    Hash::default(),
+                )
+                .page(
+                    signature_of(line, top),
+                    span(line, top, top - 99),
+                    Hash::default(),
+                );
+        }
+        remote
+    }
+
+    /// A page ahead lists the line down to the first revision whose state is not the first parent
+    /// the revision above it names, and caches no state from there, whether the page lists that
+    /// revision or names it as its cursor. The walk reads the line below by hash signature, from
+    /// the revision below the last the page listed.
+    #[tokio::test]
+    async fn a_page_ahead_ends_at_a_revision_off_the_line() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                for cursor in [false, true] {
+                    let stores = client_stores().await;
+                    let metadata = branch_metadata(&stores, branch()).await;
+                    let line = remote_line(1000, metadata).await;
+                    let stray = remote_revision(775, Hash::default(), metadata).await;
+                    let page_800 = if cursor {
+                        (span(&line, 800, 776), stray.signature)
+                    } else {
+                        let mut items = span(&line, 800, 776);
+                        items.push((775, stray.signature));
+                        items.extend(span(&line, 774, 701));
+                        (items, Hash::default())
+                    };
+                    let remote = Arc::new(paging_remote_with_page_800(
+                        &line,
+                        &stray,
+                        page_800,
+                        span(&line, 775, 701),
+                    ));
+                    let client = client_on(&stores, remote.clone());
+                    let mut pager = LinePager::new(client.clone(), permits());
+
+                    let walked = walk(&mut pager, &client, line[999].signature, 0).await;
+                    pager.finish().await;
+
+                    assert_eq!(
+                        walked,
+                        (1..=1000).rev().collect::<Vec<u64>>(),
+                        "cursor: {cursor}"
+                    );
+                    assert_eq!(
+                        stored_locally(&client, &[stray.signature]).await,
+                        [false],
+                        "cursor: {cursor}"
+                    );
+                    let (signatures, _) = anchors(&remote);
+                    assert!(
+                        signatures.contains(&signature_of(&line, 775))
+                            && !signatures.contains(&Anchor::Signature(stray.signature)),
+                        "cursor: {cursor}: {signatures:?}"
+                    );
+                }
+            })
+            .await;
+    }
+
+    /// A page ahead read from a cursor lists nothing where it doesn't hold the revision the cursor
+    /// names, and caches none of its states. Neither does the walk's own page of that revision, so
+    /// the walk ends above it.
+    #[tokio::test]
+    async fn a_page_ahead_from_a_cursor_without_its_revision_lists_nothing() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let metadata = branch_metadata(&stores, branch()).await;
+                let line = remote_line(1000, metadata).await;
+                let stray = remote_revision(775, Hash::default(), metadata).await;
+                let remote = Arc::new(paging_remote_with_page_800(
+                    &line,
+                    &stray,
+                    (span(&line, 800, 776), line[774].signature),
+                    span(&line, 774, 701),
+                ));
+                let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client.clone(), permits());
+
+                let walked = walk(&mut pager, &client, line[999].signature, 0).await;
+                pager.finish().await;
+
+                assert_eq!(walked, (776..=1000).rev().collect::<Vec<u64>>());
+                assert_eq!(
+                    stored_locally(&client, &[line[773].signature, line[700].signature]).await,
+                    [false, false]
+                );
+            })
+            .await;
+    }
+
+    /// A walk's own page, read by hash signature, caches the line down to the first revision whose
+    /// state is not the first parent the revision above it names, and no state from there. The
+    /// walk reads the line below by hash signature.
+    #[tokio::test]
+    async fn a_page_of_the_walks_own_ends_at_a_revision_off_the_line() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let metadata = branch_metadata(&stores, branch()).await;
+                let line = remote_line(5, metadata).await;
+                let stray = remote_revision(3, Hash::default(), metadata).await;
+                let mut items = span(&line, 5, 4);
+                items.push((3, stray.signature));
+                let remote = Arc::new(
+                    PagedRemote::new(branch(), line[4].signature)
+                        .holding(&line)
+                        .holding([&stray])
+                        .page(signature_of(&line, 5), items, Hash::default())
+                        .page(signature_of(&line, 3), span(&line, 3, 1), Hash::default()),
+                );
+                let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client.clone(), permits());
+
+                let walked = walk(&mut pager, &client, line[4].signature, 0).await;
+                pager.finish().await;
+
+                assert_eq!(walked, vec![5, 4, 3, 2, 1]);
+                assert_eq!(stored_locally(&client, &[stray.signature]).await, [false]);
+                assert_eq!(
+                    anchors(&remote).0,
+                    [signature_of(&line, 5), signature_of(&line, 3)]
+                );
+            })
+            .await;
+    }
+
+    /// A remote that answers a revision number the line skips with the page holding the line's
+    /// nearest revision below it, as Lore Server does, lists the line ahead from there: the walk
+    /// reads no page by hash signature below its own two.
+    #[tokio::test]
+    async fn pages_ahead_list_the_line_from_a_page_answered_for_a_number_the_line_skips() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = skipping_line(branch_metadata(&stores, branch()).await, 640).await;
+                let mut remote = PagedRemote::new(branch(), line[999].signature)
+                    .holding(&line)
+                    .page(
+                        signature_of(&line, 1000),
+                        span(&line, 1000, 901),
+                        Hash::default(),
+                    )
+                    .page(
+                        signature_of(&line, 900),
+                        span(&line, 900, 805),
+                        line[639].signature,
+                    );
+                for skipped in [804, 800, 700] {
+                    remote = remote.page(
+                        Anchor::Number(skipped),
+                        span(&line, 640, 601),
+                        line[599].signature,
+                    );
+                }
+                for top in (100..=600).rev().step_by(100) {
+                    remote = remote.page(
+                        Anchor::Number(top),
+                        span(&line, top, top - 99),
+                        Hash::default(),
+                    );
+                }
+                let remote = Arc::new(remote);
+                let client = client_on(&stores, remote.clone());
+                let mut pager = LinePager::new(client.clone(), permits());
+
+                let walked = walk(&mut pager, &client, line[999].signature, 0).await;
+                pager.finish().await;
+
+                let line_numbers: Vec<u64> = (805..=1000).rev().chain((1..=640).rev()).collect();
+                assert_eq!(walked, line_numbers);
+                assert_eq!(
+                    anchors(&remote).0,
+                    [signature_of(&line, 1000), signature_of(&line, 900)]
                 );
             })
             .await;

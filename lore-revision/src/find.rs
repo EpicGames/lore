@@ -461,8 +461,8 @@ pub(crate) fn below(batch: &[(u64, Hash)], start: Hash) -> &[(u64, Hash)] {
 /// The local walk stops at a revision whose step gives no number and parent: one the store lacks,
 /// a failed read, or a blob that is not a revision state. Where the remote cannot list that page,
 /// only the revisions the local walk read. The number of a listed revision is read from its state,
-/// as [`verified_number`] describes, and the page's states are cached as [`cache_page_states`]
-/// describes. Fails where the page lists a revision on the line without its own state.
+/// as [`verified_line_step`] describes, and the page's states are cached as [`cache_page_states`]
+/// describes. Fails where the page does not continue the line, as [`remote_page`] describes.
 pub async fn batch_load_history(
     repository: Arc<RepositoryContext>,
     mut revision: Hash,
@@ -562,8 +562,9 @@ enum Ahead {
 /// below that of the branch's branch point names the revision of the branch it was created from,
 /// so the branch's revision numbers name every revision of the line. Not every number names one:
 /// a merged revision is numbered one above the higher of its parents, so the line skips the
-/// numbers between it and a first parent numbered below its other parent, and the remote lists no
-/// page from a skipped number. The first page is requested from the revision number below the
+/// numbers between it and a first parent numbered below its other parent. A remote may answer a
+/// skipped number with the page holding the line's nearest revision below it, or list no page
+/// from it. The first page is requested from the revision number below the
 /// walk's last page of its own, and each after it from the highest revision number of the
 /// remote's default page below, as [`page_floor`] answers. Each page reads the line down to the
 /// next page, however the remote sizes and aligns its pages, as [`page_by_number`] describes.
@@ -830,10 +831,11 @@ fn stored_local(
 /// picks the page's size. So the line starts at the first revision the page lists as numbered
 /// `number` or lower. Where a page ends above `bottom`, the page below it is read by the page's
 /// cursor, or where it has none, from the revision number below its oldest revision, and the line
-/// continues at the first revision that page lists as numbered below the line read so far. Only
-/// the states of the line are cached, and the line ends at the first state that isn't its
-/// revision's own, or isn't numbered below the one above it. Answers whether a page listed any of
-/// the line.
+/// continues at the first parent of the line's last revision. Only the states of the line are
+/// cached, and the line ends at the first state that isn't its revision's own, isn't numbered
+/// below the one above it, or isn't the first parent of the one above it, and at a page whose
+/// cursor isn't the first parent of the line's last revision. Answers whether a page listed any
+/// of the line.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
@@ -853,6 +855,7 @@ fn page_by_number(
         };
         let mut start: RevisionListStart = RevisionListIdentifier { branch, number }.into();
         let mut above = number.saturating_add(1);
+        let mut next = None;
         let mut listed_any = false;
         loop {
             let response = match revision_protocol.revision_list(start).await {
@@ -870,19 +873,25 @@ fn page_by_number(
                     return listed_any;
                 }
             };
-            let Some(first) = response.items.iter().position(|item| item.number < above) else {
-                return listed_any;
+            let line = match next {
+                Some(next) => response.items_from(next),
+                None => response
+                    .items
+                    .iter()
+                    .position(|item| item.number < above)
+                    .map_or(&[][..], |first| &response.items[first..]),
             };
-            let line = &response.items[first..];
             let mut listed = 0;
             for item in line {
-                let Some(item_number) =
-                    verified_number(item).filter(|&item_number| item_number < above)
+                let Some((item_number, parent)) = verified_line_step(item)
+                    .filter(|&(item_number, _)| item_number < above)
+                    .filter(|_| next.is_none_or(|next| item.signature == next))
                 else {
                     break;
                 };
                 listed += 1;
                 above = item_number;
+                next = Some(parent);
                 if item_number <= floor {
                     break;
                 }
@@ -892,7 +901,10 @@ fn page_by_number(
             }
             cache_page_states(repository.clone(), &line[..listed], 0).await;
             listed_any = true;
-            if above <= bottom.max(floor) || listed < line.len() {
+            if above <= bottom.max(floor)
+                || listed < line.len()
+                || !response.next_revision.is_zero() && next != Some(response.next_revision)
+            {
                 return true;
             }
             // `above` is above `bottom`, so the request's revision number is never 0, which the
@@ -923,11 +935,16 @@ struct Listed {
 /// first revision numbered `floor` or lower where there is a floor. Answers what it listed of the
 /// line, as [`Listed`] records it, none where it listed none or the remote cannot list it, and
 /// appends each revision it listed to `history`, if any, with its number as its state records it,
-/// read by [`verified_state`].
+/// read by [`verified_state`]. The line runs from `revision` through the first parent each state
+/// names.
 ///
 /// Without a floor the page's states and the metadata of the revisions on the line are cached, as
-/// [`batch_load_history`] describes. With one, only the states of the listed revisions are, as
-/// [`LinePager::page_in`] describes.
+/// [`batch_load_history`] describes. The read fails where the page doesn't hold `revision`, lists
+/// a revision of the line without its own state, or lists one that isn't the first parent of the
+/// revision above it, and where the page's cursor, if set, isn't the first parent of its last
+/// revision. With a floor, only the states of the listed revisions are cached, as
+/// [`LinePager::page_in`] describes, and the line ends at the first revision that isn't the first
+/// parent of the one above it. A revision without its own state fails the read either way.
 async fn remote_page(
     repository: Arc<RepositoryContext>,
     revision: Hash,
@@ -954,8 +971,14 @@ async fn remote_page(
     lore_debug!("Got {} revisions", response.items.len(),);
 
     let line = response.items_from(revision);
+    if line.is_empty() && floor.is_none() {
+        return Err(FindError::internal(format!(
+            "the remote listed a page without revision {revision}, which it was asked for"
+        )));
+    }
     let mut listed = 0;
     let mut page: Option<Listed> = None;
+    let mut next = revision;
     for item in line {
         let Some(state) = verified_state(item) else {
             return Err(FindError::internal(format!(
@@ -963,6 +986,16 @@ async fn remote_page(
                 item.signature
             )));
         };
+        if item.signature != next {
+            if floor.is_some() {
+                break;
+            }
+            return Err(FindError::internal(format!(
+                "the remote named revision {} where the line holds revision {next}",
+                item.signature
+            )));
+        }
+        next = state.parent[0];
         let number = state.revision_number;
         if let Some(history) = history.as_deref_mut() {
             history.push((number, item.signature));
@@ -980,6 +1013,12 @@ async fn remote_page(
     if floor.is_some() {
         cache_page_states(repository, &line[..listed], 0).await;
         return Ok(page);
+    }
+    if !response.next_revision.is_zero() && response.next_revision != next {
+        return Err(FindError::internal(format!(
+            "the remote named revision {} where the line holds revision {next}",
+            response.next_revision
+        )));
     }
 
     let metadata_addresses: Vec<Address> = line
@@ -1011,7 +1050,7 @@ pub fn cache_revision_list_states(
 /// they describe are read without a remote fetch. Each of the first `unverified` items is written
 /// where its state is its revision's own, as [`holds_its_state`] checks, so bytes that don't hash
 /// to the item's signature are not stored. Each item after them is one the caller has checked the
-/// same way, as [`verified_number`] does, so it is written without hashing it again.
+/// same way, as [`verified_line_step`] does, so it is written without hashing it again.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
@@ -1060,9 +1099,10 @@ pub fn verified_state(item: &lore_transport::RevisionItem) -> Option<StateData> 
         .filter(StateData::has_state_magic)
 }
 
-/// The revision number in the state `item` carries, as [`verified_state`] reads it.
-pub(crate) fn verified_number(item: &lore_transport::RevisionItem) -> Option<u64> {
-    verified_state(item).map(|state| state.revision_number)
+/// The revision number and first parent in the state `item` carries, as [`verified_state`] reads
+/// it. [`local_line_step`] answers the same for a revision in the local store.
+pub(crate) fn verified_line_step(item: &lore_transport::RevisionItem) -> Option<(u64, Hash)> {
+    verified_state(item).map(|state| (state.revision_number, state.parent[0]))
 }
 
 /// Data for the event reporting a revision found by a search.

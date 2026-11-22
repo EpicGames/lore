@@ -192,7 +192,7 @@ mod try_backfill_segment {
             let branch = BranchId::from(uuid::Uuid::now_v7());
 
             assert!(
-                try_backfill_segment(&repository, branch, 150, STEP_ONE_HUNDRED)
+                try_backfill_segment(&repository, branch, 150, STEP_ONE_HUNDRED, true)
                     .await
                     .expect("an unsealed segment is not an error")
                     .is_none()
@@ -213,7 +213,8 @@ mod try_backfill_segment {
             );
             let branch = BranchId::from(uuid::Uuid::now_v7());
 
-            let Err(err) = try_backfill_segment(&repository, branch, 150, STEP_ONE_HUNDRED).await
+            let Err(err) =
+                try_backfill_segment(&repository, branch, 150, STEP_ONE_HUNDRED, true).await
             else {
                 panic!("backpressure must not be read as an unsealed segment");
             };
@@ -234,7 +235,8 @@ mod try_backfill_segment {
             );
             let branch = BranchId::from(uuid::Uuid::now_v7());
 
-            let Err(err) = try_backfill_segment(&repository, branch, 150, STEP_ONE_HUNDRED).await
+            let Err(err) =
+                try_backfill_segment(&repository, branch, 150, STEP_ONE_HUNDRED, true).await
             else {
                 panic!("a failing store must not be read as an unsealed segment");
             };
@@ -385,80 +387,122 @@ mod sealed_boundaries {
     }
 }
 
-mod seal_boundary_revision_number {
+mod seal_crossed_boundaries {
+    use lore_storage::test_util::HookedStore;
+    use lore_storage::test_util::StoreCall;
+
     use super::*;
 
+    /// A jump from 150 to 400 crosses 200 and 300, and each holds 150, the
+    /// line's highest revision at or below it. The boundaries on either side
+    /// stay unsealed.
     #[tokio::test]
-    async fn seals_boundary_with_the_parent_revision() {
+    async fn seals_each_crossed_boundary_with_the_older_revision() {
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("create stores");
 
         Box::pin(LORE_CONTEXT.scope(execution, async move {
             let repository = test_repository(immutable_store, mutable_store);
             let branch = BranchId::from(uuid::Uuid::now_v7());
-
             let chain = serialize_linear_chain(&repository, 150).await;
-            let older = load_state(&repository, chain[149]).await;
-            let newer = serialize_jump_revision(&repository, chain[149], 400).await;
 
-            seal_boundary_revision_number(
-                repository.clone(),
+            let sealed = seal_crossed_boundaries(
+                &repository,
                 branch,
                 STEP_ONE_HUNDRED,
-                200,
-                &older,
-                &newer,
+                (150, chain[149]),
+                400,
             )
-            .await
-            .expect("seal boundary");
+            .await;
 
-            // Boundary 200 holds the highest revision numbered <= 200,
-            // which across the jump is the parent at 150.
-            assert_eq!(
-                load_step_key(&repository, branch, 200).await,
-                Some(chain[149])
-            );
-            // Exactly one boundary is sealed per call: neighbours, and in
-            // particular the ceil-space bucket of the new revision number,
-            // must be left untouched.
-            assert_eq!(load_step_key(&repository, branch, 100).await, None);
-            assert_eq!(load_step_key(&repository, branch, 300).await, None);
-            assert_eq!(load_step_key(&repository, branch, 400).await, None);
+            assert_eq!(sealed, 2);
+            for boundary in [200, 300] {
+                assert_eq!(
+                    load_step_key(&repository, branch, boundary).await,
+                    Some(chain[149]),
+                    "{boundary}"
+                );
+            }
+            for boundary in [100, 400] {
+                assert_eq!(load_step_key(&repository, branch, boundary).await, None);
+            }
         }))
         .await;
     }
 
+    /// An older revision on a boundary seals that boundary, and a pair that
+    /// crosses none seals nothing.
     #[tokio::test]
-    async fn seals_boundary_at_or_above_the_new_revision_with_that_revision() {
+    async fn seals_a_boundary_the_older_revision_is_on_and_no_other() {
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("create stores");
 
         Box::pin(LORE_CONTEXT.scope(execution, async move {
             let repository = test_repository(immutable_store, mutable_store);
             let branch = BranchId::from(uuid::Uuid::now_v7());
+            let chain = serialize_linear_chain(&repository, 201).await;
 
-            let chain = serialize_linear_chain(&repository, 150).await;
-            let older = load_state(&repository, chain[149]).await;
-            let newer = serialize_jump_revision(&repository, chain[149], 400).await;
-
-            seal_boundary_revision_number(
-                repository.clone(),
+            let on_boundary = seal_crossed_boundaries(
+                &repository,
                 branch,
                 STEP_ONE_HUNDRED,
-                400,
-                &older,
-                &newer,
+                (200, chain[199]),
+                201,
             )
-            .await
-            .expect("seal boundary");
+            .await;
+            let within = seal_crossed_boundaries(
+                &repository,
+                branch,
+                STEP_ONE_HUNDRED,
+                (150, chain[149]),
+                151,
+            )
+            .await;
 
+            assert_eq!((on_boundary, within), (1, 0));
             assert_eq!(
-                load_step_key(&repository, branch, 400).await,
-                Some(newer.revision())
+                load_step_key(&repository, branch, 200).await,
+                Some(chain[199])
             );
-            assert_eq!(load_step_key(&repository, branch, 200).await, None);
+            assert_eq!(load_step_key(&repository, branch, 100).await, None);
             assert_eq!(load_step_key(&repository, branch, 300).await, None);
-            assert_eq!(load_step_key(&repository, branch, 500).await, None);
+        }))
+        .await;
+    }
+
+    /// Sealing is best effort: a store that refuses every write fails
+    /// nothing, and none of its boundaries counts as sealed.
+    #[tokio::test]
+    async fn a_refused_write_counts_no_boundary() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let refusing = HookedStore::wrap(
+                mutable_store,
+                |call, _, _| {
+                    if call == StoreCall::Store {
+                        return Err(StoreError::internal("refusing every store"));
+                    }
+                    Ok(())
+                },
+                None,
+            );
+            let repository = test_repository(immutable_store, refusing);
+            let branch = BranchId::from(uuid::Uuid::now_v7());
+            let chain = serialize_linear_chain(&repository, 150).await;
+
+            let sealed = seal_crossed_boundaries(
+                &repository,
+                branch,
+                STEP_ONE_HUNDRED,
+                (150, chain[149]),
+                400,
+            )
+            .await;
+
+            assert_eq!(sealed, 0);
+            assert_eq!(load_step_key(&repository, branch, 200).await, None);
         }))
         .await;
     }

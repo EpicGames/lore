@@ -33,6 +33,7 @@ mod find_branch_point {
     use crate::paged_remote::client_stores;
     use crate::paged_remote::counted_client_stores;
     use crate::paged_remote::numbered;
+    use crate::paged_remote::off_the_line;
     use crate::paged_remote::remote_revision;
     use crate::paged_remote::stored_locally;
     use crate::paged_remote::without_its_own_state;
@@ -89,35 +90,49 @@ mod find_branch_point {
         assert_eq!(local_history, vec![branched.local]);
     }
 
-    /// A page that does not hold the revision it was asked for says nothing about the line
-    /// below that revision, so its cursor to an older page is not followed either.
+    /// A page that does not continue the line from the revision it was asked for fails the walk,
+    /// on either side: one listing a revision whose state is not the first parent the revision
+    /// above it names, one whose cursor is not its last revision's first parent, and one without
+    /// the revision asked for. Each revision it lists carries its own state, numbered in order.
     #[tokio::test]
-    async fn a_remote_page_without_its_anchor_ends_that_side_of_the_search() {
-        let stray = Hash::from([0xEE; 32]);
-        let branched = branched_from_remote_line(|remote, remote_line| {
-            remote
-                .page(
-                    Anchor::Signature(remote_line[2]),
-                    numbered(remote_line, &[6]),
-                    stray,
-                )
-                .page(
-                    Anchor::Signature(stray),
-                    vec![(9, stray), (5, remote_line[4]), (4, remote_line[3])],
-                    Hash::default(),
-                )
-        })
-        .await;
+    async fn a_page_that_does_not_continue_the_line_fails_the_walk() {
+        let deeper = remote_only(3, Hash::default()).await;
+        let below = remote_only(4, deeper.signature).await;
+        let stray = remote_revision(3, Hash::default(), Hash::from([0xB0; 32])).await;
+        for (kind, items, older) in
+            off_the_line((4, below.signature), deeper.signature, stray.signature)
+        {
+            for left_asks in [true, false] {
+                let stores = client_stores().await;
+                let left = write_line(&stores.writer, below.signature, 5, 1).await[0];
+                let right = write_branch_revision(&stores.writer, deeper.signature, 4, 1).await;
+                let remote = PagedRemote::new(BranchId::from([7; 16]), right)
+                    .holding([&below, &deeper, &stray])
+                    .page(Anchor::Signature(below.signature), items.clone(), older)
+                    .page(
+                        Anchor::Signature(deeper.signature),
+                        vec![(3, deeper.signature)],
+                        Hash::default(),
+                    )
+                    .page(
+                        Anchor::Signature(stray.signature),
+                        vec![(3, stray.signature)],
+                        Hash::default(),
+                    );
+                let client = client_on(&stores, Arc::new(remote));
 
-        let (branch_point, remote_history, local_history) = branch_point_of(&branched).await;
+                let walked = if left_asks {
+                    walk(client, left, right).await
+                } else {
+                    walk(client, right, left).await
+                };
 
-        let remote_line = &branched.remote_line;
-        assert_eq!(branch_point, remote_line[2]);
-        assert_eq!(
-            remote_history,
-            vec![remote_line[5], remote_line[4], remote_line[3]]
-        );
-        assert_eq!(local_history, vec![branched.local]);
+                assert!(
+                    walked.as_ref().is_err_and(|error| error.is_internal()),
+                    "{kind}, left line asking: {left_asks}: {walked:?}"
+                );
+            }
+        }
     }
 
     /// A line that reaches the newest revision the lines share a round before the other line,
@@ -246,33 +261,6 @@ mod find_branch_point {
             .expect("the line goes on in the store from the page's cursor");
 
         assert_eq!(walked, (shared[1], vec![top], vec![]));
-    }
-
-    /// A page that does not move its line stops the line, and the walk fails naming the revision
-    /// the line stopped at.
-    #[tokio::test]
-    async fn a_page_that_does_not_move_the_line_fails_the_walk_naming_its_revision() {
-        let listed = remote_only(3, Hash::default()).await;
-        let top = listed.signature;
-        let remote = Arc::new(
-            PagedRemote::new(BranchId::from([7; 16]), top)
-                .holding([&listed])
-                .page(Anchor::Signature(top), vec![(3, top)], top),
-        );
-        let (client, writer) = client_and_writer(remote).await;
-        let line = write_line(&writer, Hash::default(), 1, 2).await;
-
-        let error = walk(client, top, line[1])
-            .await
-            .expect_err("the remote's line stops at top");
-
-        assert_eq!(
-            error
-                .as_revision_not_found()
-                .map(|error| error.revision.clone()),
-            Some(top.to_string()),
-            "{error:?}"
-        );
     }
 
     /// A page listing a revision numbered no lower than the one above it does not follow self

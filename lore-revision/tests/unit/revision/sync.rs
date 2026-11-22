@@ -315,9 +315,9 @@ mod branch_point {
     }
 
     /// A sync whose walk between the remote's latest revision and the local one stops fails with
-    /// the walk's error, which keeps its code: `RevisionNotFound` naming the remote's latest where
-    /// the remote's page does not move the line, and the remote's `NotAuthorized` where its list
-    /// fails.
+    /// the walk's error, which keeps its code: an internal error where the remote's page does not
+    /// continue the line, its cursor naming the page's own revision, and the remote's
+    /// `NotAuthorized` where its list fails.
     #[tokio::test]
     async fn a_sync_whose_walk_stops_fails_with_the_walks_error() {
         let remote_latest = remote_revision(3, Hash::default(), Hash::from([0xA0; 32])).await;
@@ -337,16 +337,12 @@ mod branch_point {
 
         assert_eq!(
             (
-                stopped
-                    .as_ref()
-                    .err()
-                    .and_then(|error| error.as_revision_not_found())
-                    .map(|error| error.revision.clone()),
+                stopped.as_ref().is_err_and(|error| error.is_internal()),
                 refused
                     .as_ref()
                     .is_err_and(|error| error.is_not_authorized()),
             ),
-            (Some(top.to_string()), true),
+            (true, true),
             "{stopped:?}; {refused:?}"
         );
     }

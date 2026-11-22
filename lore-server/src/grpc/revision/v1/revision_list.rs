@@ -16,9 +16,8 @@ use lore_revision::metadata::BRANCH;
 use lore_revision::metadata::Metadata;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
-use lore_revision::revision;
-use lore_revision::revision::ResolveSearchLocation;
 use lore_revision::state;
+use lore_revision::state::StateError;
 use lore_revision::state::no_link_traversal;
 use lore_revision::util;
 use lore_storage::StoreError;
@@ -42,7 +41,6 @@ use zerocopy::IntoBytes;
 
 use crate::cache;
 use crate::grpc::FilterSlowDownExt;
-use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -57,15 +55,17 @@ use crate::util::setup_execution;
 const MAX_REVISION_LIST_RESPONSE_ITEMS: usize = 100;
 const METRICS_START_KEY: &str = "start_type";
 const METRICS_LIST_STRATEGY_KEY: &str = "list_strategy";
-/// Revisions walked between progress reports from the forward-cursor gap
-/// descent. The descent reports its totals when it finishes, and the
-/// handler timeout can end it before it ever gets there, so a descent long
-/// enough to be worth diagnosing reports as it goes.
+/// Revisions walked between progress reports from a [`descend_line`]. The
+/// descent reports its totals when it finishes, and the handler timeout can
+/// end it before it ever gets there, so a descent long enough to be worth
+/// diagnosing reports as it goes.
 const GAP_DESCENT_PROGRESS_HOPS: u64 = 10_000;
 
 enum RevisionListStrategy {
     Direct,
-    FullIteration,
+    /// A walk down the line of the branch it holds, which seals the step
+    /// boundaries it crosses under that branch.
+    FullIteration(BranchId),
     HistoryStep,
     ListCache,
     ListCacheBackfill,
@@ -75,7 +75,7 @@ impl RevisionListStrategy {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Direct => "direct",
-            Self::FullIteration => "full-iteration",
+            Self::FullIteration(_) => "full-iteration",
             Self::HistoryStep => "history-step",
             Self::ListCache => "list-cache",
             Self::ListCacheBackfill => "list-cache-backfill",
@@ -289,10 +289,14 @@ pub async fn handler(
         .await
 }
 
-/// Resolves the request's `start` anchor. May return pre-built items
-/// from the cache, or a hash for the walker to expand. Tip resolution
-/// (`number == 0`) takes a direct path via `branch::load_latest` since
-/// the step-key dance would always miss for the zero block.
+/// Resolves the request's `start`: a page built from the cache, or a
+/// revision for the walker to expand. A signature starts at its revision,
+/// served from the cached segment holding it where there is one. Number 0
+/// starts at the branch's latest revision. Any other number starts at the
+/// line's highest revision numbered at or below it: from the acceleration
+/// data of the requested branch, then of the branch that owns the number in
+/// its history, as [`accelerated_start`] describes, and otherwise from a
+/// walk down the line, as [`latest_line_start`] describes.
 async fn resolve_start(
     start: Start,
     lineage: Option<&BranchLineage>,
@@ -305,8 +309,15 @@ async fn resolve_start(
             let hash = crate::grpc::revision_signature(signature)?;
             debug!({REVISION} = %hash, "resolve_start - Signature");
             if acceleration.list_cache
-                && let Some(cached) =
-                    try_serve_signature_from_cache(repository, hash, history_step_size).await?
+                && let Some(cached) = try_serve_signature_from_cache(
+                    repository,
+                    hash,
+                    None,
+                    history_step_size,
+                    false,
+                    false,
+                )
+                .await?
             {
                 return Ok(cached);
             }
@@ -319,14 +330,8 @@ async fn resolve_start(
             let branch = BranchId::from(&identifier.branch_id);
             debug!({BRANCH_ID} = %branch, revision_number = identifier.number, "resolve_start - Identifier");
             if identifier.number == 0 {
-                let hash = branch::load_latest(repository.clone(), branch)
-                    .await
-                    .filter_slow_down()?
-                    .warn_map_err(|err| {
-                        Status::not_found(format!("Branch {branch} not found: {err}"))
-                    })?;
                 return Ok(ResolveStart::Walk {
-                    start: hash,
+                    start: branch_latest(repository, branch).await?,
                     strategy: RevisionListStrategy::Direct,
                 });
             }
@@ -361,42 +366,100 @@ async fn resolve_start(
                 return Ok(accelerated);
             }
 
-            let signature = format!("{branch}@{}", identifier.number);
-            let hash = revision::resolve_boxed(
-                repository.clone(),
-                signature,
-                ResolveSearchLocation::Local,
+            latest_line_start(
+                repository,
+                branch,
+                identifier.number,
+                history_step_size,
+                acceleration,
             )
             .await
-            .filter_slow_down()?
-            .map_err(|err| Status::not_found(format!("Revision not found: {err}")))?;
-            Ok(ResolveStart::Walk {
-                start: hash,
-                strategy: RevisionListStrategy::FullIteration,
-            })
         }
     }
 }
 
-/// Builds the page for a cached segment of `owner`.
+/// The latest revision of `branch`. `NotFound` where the branch doesn't
+/// exist, and internal where its latest revision can't be read.
+async fn branch_latest(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+) -> Result<Hash, Status> {
+    branch::load_latest(repository.clone(), branch)
+        .await
+        .filter_slow_down()?
+        .map_err(|err| {
+            if err.is_branch_not_found() {
+                Status::not_found(format!("Branch {branch} not found: {err}"))
+            } else {
+                warn_error_to_status(&err, |e| Status::internal(e.to_string()))
+            }
+        })
+}
+
+/// Starts at the line's highest revision numbered at or below `number`,
+/// found by a [`descend_line`] from the latest revision of `branch`, which
+/// seals the step boundaries it crosses where step keys are enabled.
+/// `NotFound` where the line holds no revision numbered at or below
+/// `number`, or `number` is above the branch's latest revision.
+async fn latest_line_start(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    number: u64,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+) -> Result<ResolveStart, Status> {
+    let latest = branch_latest(repository, branch).await?;
+    let descent = descend_line(
+        repository,
+        branch,
+        latest,
+        number,
+        history_step_size,
+        acceleration.step_keys,
+    )
+    .await
+    .filter_slow_down()?
+    .map_err(|err| warn_error_to_status(&err, |e| Status::internal(e.to_string())))?;
+    match descent {
+        Descent {
+            above,
+            at_or_below: Some((found, state)),
+        } if above.is_some() || state.revision_number() == number => Ok(ResolveStart::Walk {
+            start: found,
+            strategy: RevisionListStrategy::FullIteration(branch),
+        }),
+        _ => Err(Status::not_found(format!(
+            "Revision {branch}@{number} not found"
+        ))),
+    }
+}
+
+/// Builds the page for `visible`, the part of a cached segment of `branch`
+/// that the requested branch's history holds, as [`HistoryOwner::visible`]
+/// cuts it.
 fn cached_start(
-    owner: &HistoryOwner,
-    segment: &[branch::CachedRevisionItem],
+    branch: BranchId,
+    visible: &[branch::CachedRevisionItem],
     strategy: RevisionListStrategy,
 ) -> ResolveStart {
-    // The segment is the owner's and can run past the branch point: a branch
-    // made at 150 does not contain the owner's 151..=200.
-    let visible = owner.visible(segment);
     ResolveStart::Items {
         items: cached_to_proto(visible),
-        branch: owner.branch,
+        branch,
         next_older: cached_next_older(visible),
         strategy,
     }
 }
 
 /// Serves an identifier lookup from the acceleration data of `owner`, or
-/// `None` when that branch has none covering the number.
+/// `None` when that branch has none covering the number. The page holds the
+/// line's highest revision numbered at or below `number`. A cached segment
+/// of `number`'s step boundary B answers it, as [`segment_start`] describes.
+/// Without one, the skip pointer at B holds the line's highest revision
+/// numbered at or below B, so a pointer numbered at or below `number` is the
+/// answer. Otherwise the segment is backfilled, and failing that, the line is
+/// walked down from the pointer: revision numbers fall along the line, so
+/// the walk reads at most one segment. A pointer numbered above B does not
+/// describe the line and is not followed.
 async fn accelerated_start(
     repository: &Arc<RepositoryContext>,
     owner: &HistoryOwner,
@@ -404,74 +467,232 @@ async fn accelerated_start(
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<Option<ResolveStart>, Status> {
-    if acceleration.list_cache {
-        if let Some(cached) =
+    if acceleration.list_cache
+        && let Some(cached) =
             cache::revision::load_cached_list(repository, owner.branch, number, history_step_size)
                 .await
                 .filter_slow_down()?
                 .unwrap_or_default()
-            && cached.items().iter().any(|item| item.number == number)
-        {
-            debug!(number, "Served revision list from cache");
-            return Ok(Some(cached_start(
-                owner,
-                cached.items(),
-                RevisionListStrategy::ListCache,
-            )));
-        }
+        && let Some(start) = segment_start(
+            repository,
+            owner,
+            cached.items(),
+            number,
+            history_step_size,
+            acceleration,
+            RevisionListStrategy::ListCache,
+        )
+        .await?
+    {
+        debug!(number, "Served revision list from cache");
+        return Ok(Some(start));
+    }
 
-        if let Some(cached) = cache::revision::try_backfill_segment(
+    let pointer = if acceleration.step_keys {
+        boundary_pointer(repository, owner.branch, number, history_step_size).await?
+    } else {
+        None
+    };
+    if let Some((pointer, state)) = &pointer
+        && state.revision_number() <= number
+    {
+        debug!(
+            number,
+            pointer_number = state.revision_number(),
+            "Resolved revision number from history step key"
+        );
+        return anchored_start(
+            repository,
+            *pointer,
+            Some(state.clone()),
+            history_step_size,
+            acceleration,
+            RevisionListStrategy::HistoryStep,
+        )
+        .await
+        .map(Some);
+    }
+
+    if acceleration.list_cache
+        && let Some(cached) = cache::revision::try_backfill_segment(
             repository,
             owner.branch,
             number,
             history_step_size,
+            acceleration.step_keys,
         )
         .await
         .filter_slow_down()?
         .unwrap_or_default()
-            && cached.items().iter().any(|item| item.number == number)
-        {
-            debug!(number, "Backfilled revision list cache");
-            return Ok(Some(cached_start(
-                owner,
-                cached.items(),
-                RevisionListStrategy::ListCacheBackfill,
-            )));
-        }
+        && let Some(start) = segment_start(
+            repository,
+            owner,
+            cached.items(),
+            number,
+            history_step_size,
+            acceleration,
+            RevisionListStrategy::ListCacheBackfill,
+        )
+        .await?
+    {
+        debug!(number, "Backfilled revision list cache");
+        return Ok(Some(start));
     }
 
-    if !acceleration.step_keys {
+    let Some((pointer, state)) = pointer else {
+        return Ok(None);
+    };
+    if state.revision_number() > number.div_ceil(history_step_size) * history_step_size {
         return Ok(None);
     }
-    let step_key_hit =
-        cache::revision::resolve_via_step_key(repository, owner.branch, number, history_step_size)
+    let Descent {
+        at_or_below: Some((found, found_state)),
+        ..
+    } = descend_line(
+        repository,
+        owner.branch,
+        pointer,
+        number,
+        history_step_size,
+        acceleration.step_keys,
+    )
+    .await
+    .filter_slow_down()?
+    .unwrap_or_default()
+    else {
+        return Ok(None);
+    };
+    anchored_start(
+        repository,
+        found,
+        Some(found_state),
+        history_step_size,
+        acceleration,
+        RevisionListStrategy::HistoryStep,
+    )
+    .await
+    .map(Some)
+}
+
+/// The skip pointer of `branch` at the step boundary containing `number`,
+/// with the state of the revision it names. `None` where the boundary is
+/// unsealed or the pointer or its state cannot be read.
+async fn boundary_pointer(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    number: u64,
+    history_step_size: u64,
+) -> Result<Option<(Hash, Arc<state::State>)>, Status> {
+    let Some(pointer) =
+        cache::revision::load_step_pointer(repository, branch, number, history_step_size)
             .await
             .filter_slow_down()?
-            .unwrap_or_default();
-    Ok(step_key_hit.map(|hash| ResolveStart::Walk {
-        start: hash,
-        strategy: RevisionListStrategy::HistoryStep,
-    }))
+            .unwrap_or_default()
+    else {
+        return Ok(None);
+    };
+    Ok(state::State::deserialize(repository.clone(), pointer)
+        .await
+        .filter_slow_down()?
+        .ok()
+        .map(|state| (pointer, state)))
+}
+
+/// Starts an identifier lookup from `items`, a cached segment of `owner`
+/// holding `number`'s step boundary. The page is the segment where it holds
+/// a revision of the line numbered at or below `number`. Where every one is
+/// numbered above it, the page is the one anchored on the segment's older
+/// cursor, the line's highest revision below the segment. `None` where the
+/// segment holds none of the line, or the line ends within it.
+async fn segment_start(
+    repository: &Arc<RepositoryContext>,
+    owner: &HistoryOwner,
+    items: &[branch::CachedRevisionItem],
+    number: u64,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+    strategy: RevisionListStrategy,
+) -> Result<Option<ResolveStart>, Status> {
+    let visible = owner.visible(items);
+    if visible.last().is_some_and(|item| item.number <= number) {
+        return Ok(Some(cached_start(owner.branch, visible, strategy)));
+    }
+    let Some(older) = cached_next_older(visible) else {
+        return Ok(None);
+    };
+    anchored_start(
+        repository,
+        older,
+        None,
+        history_step_size,
+        acceleration,
+        strategy,
+    )
+    .await
+    .map(Some)
+}
+
+/// Starts a page at `anchor`, the line's highest revision numbered at or
+/// below a requested number, from the cached segment holding it, cut at
+/// `anchor`, or by a walk from it. The cut leaves out the segment's
+/// revisions above `anchor`, which the requested line does not hold where
+/// the segment belongs to another branch. `state` is the state of `anchor`
+/// where it is already read. Only a number the line skips, or a segment the
+/// cache misses, starts here, a cold path, so the cache lookup is boxed.
+async fn anchored_start(
+    repository: &Arc<RepositoryContext>,
+    anchor: Hash,
+    state: Option<Arc<state::State>>,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+    strategy: RevisionListStrategy,
+) -> Result<ResolveStart, Status> {
+    if acceleration.list_cache
+        && let Some(cached) = Box::pin(try_serve_signature_from_cache(
+            repository,
+            anchor,
+            state,
+            history_step_size,
+            true,
+            acceleration.step_keys,
+        ))
+        .await?
+    {
+        return Ok(cached);
+    }
+    Ok(ResolveStart::Walk {
+        start: anchor,
+        strategy,
+    })
 }
 
 /// Try to serve a signature-anchored request from the cache: deserialize
 /// the state to learn the branch (from metadata) and revision number,
 /// look up the segment's cached list, and serve it if the requested
-/// signature appears in the items.
+/// signature appears in the items. `known` is the state where it is already
+/// read. With `from_signature`, the page starts at the signature. With
+/// `seal`, a backfill of the segment seals the step boundaries its walk
+/// crosses.
 async fn try_serve_signature_from_cache(
     repository: &Arc<RepositoryContext>,
     signature: Hash,
+    known: Option<Arc<state::State>>,
     history_step_size: u64,
+    from_signature: bool,
+    seal: bool,
 ) -> Result<Option<ResolveStart>, Status> {
-    let state = match state::State::deserialize(repository.clone(), signature)
-        .await
-        .filter_slow_down()?
-    {
-        Ok(state) => state,
-        Err(err) => {
-            debug!(%signature, ?err, "Cache fast path: state deserialize failed");
-            return Ok(None);
-        }
+    let state = match known {
+        Some(state) => state,
+        None => match state::State::deserialize(repository.clone(), signature)
+            .await
+            .filter_slow_down()?
+        {
+            Ok(state) => state,
+            Err(err) => {
+                debug!(%signature, ?err, "Cache fast path: state deserialize failed");
+                return Ok(None);
+            }
+        },
     };
     let metadata = match Metadata::deserialize(repository.clone(), state.metadata_hash())
         .await
@@ -504,6 +725,7 @@ async fn try_serve_signature_from_cache(
             branch,
             revision_number,
             history_step_size,
+            seal,
         )
         .await
         .filter_slow_down()?
@@ -512,17 +734,18 @@ async fn try_serve_signature_from_cache(
         };
         (backfilled, RevisionListStrategy::ListCacheBackfill)
     };
-    if !cached
+    let Some(position) = cached
         .items()
         .iter()
-        .any(|item| item.signature == signature)
-    {
+        .position(|item| item.signature == signature)
+    else {
         return Ok(None);
-    }
+    };
+    let items = &cached.items()[if from_signature { position } else { 0 }..];
     Ok(Some(ResolveStart::Items {
-        items: cached_to_proto(cached.items()),
+        items: cached_to_proto(items),
         branch,
-        next_older: cached_next_older(cached.items()),
+        next_older: cached_next_older(items),
         strategy,
     }))
 }
@@ -620,33 +843,19 @@ async fn walk_revisions(
         // detects and the walk's exit point are the same revision, so
         // checking floor first would break out before this ever ran.
         if acceleration.step_keys
-            && matches!(strategy, RevisionListStrategy::FullIteration)
+            && let RevisionListStrategy::FullIteration(line) = strategy
             && let Some(previous_state) = &prev_step_state
-            && let Some((lowest_b, highest_b)) = cache::revision::sealed_boundaries(
-                state.revision_number(),
-                previous_state.revision_number(),
-                history_step_size,
-            )
-            // no filter_slow_down()? usage here: this read only enables the
-            // best-effort step-key backfill below.
-            && let Ok(metadata) =
-                Metadata::deserialize(repository.clone(), previous_state.metadata_hash()).await
-            && let Ok(branch_id) = metadata.get_branch()
         {
-            for boundary in (lowest_b..=highest_b).step_by(history_step_size as usize) {
-                let _ = cache::revision::seal_boundary_revision_number(
-                    repository.clone(),
-                    branch_id,
-                    history_step_size,
-                    boundary,
-                    &state,
-                    previous_state,
-                )
-                .await;
-                debug!(boundary, "Backfilled history step key");
-            }
+            cache::revision::seal_crossed_boundaries(
+                repository,
+                *line,
+                history_step_size,
+                (current_number, current),
+                previous_state.revision_number(),
+            )
+            .await;
         }
-        if matches!(strategy, RevisionListStrategy::FullIteration) {
+        if matches!(strategy, RevisionListStrategy::FullIteration(_)) {
             prev_step_state = Some(state.clone());
         }
 
@@ -947,98 +1156,74 @@ async fn forward_target(
         .map(|item| item.signature))
 }
 
-/// Walks `parent_self` from `anchor` down to the lowest revision numbered
-/// strictly above `first_number`, without assuming the gap fits in one
-/// band, or `None` when `anchor` is not numbered above it. When `step_keys` acceleration is enabled, writes the
-/// step-boundary skip pointer for every boundary the walk crosses, so a
-/// request that pays this walk's cost once leaves the fast path in place
-/// for later requests instead of leaving every subsequent lookup to
-/// rediscover the same gap.
+/// What a [`descend_line`] found on a line: the last revision it read
+/// numbered above the target number, and the first numbered at or below it,
+/// with its state. `at_or_below` is `None` where the line ends above the
+/// target.
+#[derive(Default)]
+struct Descent {
+    above: Option<Hash>,
+    at_or_below: Option<(Hash, Arc<state::State>)>,
+}
+
+/// Walks `parent_self` from `anchor`, on the line of `branch`, down to the
+/// first revision numbered at or below `number`, or to the end of the line.
+/// With `seal`, writes the skip pointer of `branch` at every step boundary
+/// the walk crosses, as [`cache::revision::seal_crossed_boundaries`]
+/// describes, so a later request in the range reads the pointer.
 ///
-/// Deliberately uncapped by hop count: revision numbers strictly decrease
-/// along `parent_self`, so this always terminates at `first_number` or the
-/// root, bounded only by the branch's real history depth — the same
-/// guarantee `resolve_start`'s `FullIteration` fallback already relies on
-/// via `revision::resolve` when no acceleration is
-/// available. An item-count cap here would fail requests anchored deep in
-/// a long, legitimately un-accelerated history — worse, retrying such a
-/// request would fail identically every time, since this always restarts
-/// from `anchor` and backfills top-down without ever reaching the
-/// boundary nearer `first_number` that a retry's first probe would check.
-/// `RevisionList` is wrapped in `timeout_grpc` at the service layer, which
-/// is the appropriate backstop for a pathologically deep walk, not a
-/// count that silently caps correctness.
-async fn descend_unverified_gap(
+/// Uncapped by hop count: revision numbers strictly decrease along
+/// `parent_self`, so the walk ends at `number` or the root. A cap would fail
+/// every retry of a request deep in an unaccelerated history the same way,
+/// since each restarts from `anchor`. `RevisionList` is wrapped in
+/// `timeout_grpc` at the service layer, which bounds a deep walk.
+async fn descend_line(
     repository: &Arc<RepositoryContext>,
     branch: BranchId,
     anchor: Hash,
-    first_number: u64,
+    number: u64,
     history_step_size: u64,
-    step_keys_enabled: bool,
-) -> Result<Option<Hash>, Status> {
+    seal: bool,
+) -> Result<Descent, StateError> {
     let mut hash = anchor;
     let mut prev_state: Option<Arc<state::State>> = None;
-    // Invariant: `last_above` is the most recently visited hash whose
-    // number was confirmed `> first_number`, if any.
-    let mut last_above = None;
+    let mut descent = Descent::default();
     let mut hops: u64 = 0;
     let mut sealed: u64 = 0;
 
-    loop {
-        let current_state = state::State::deserialize(repository.clone(), hash)
-            .await
-            .filter_slow_down()?
-            .map_err(|err| warn_error_to_status(&err, |e| Status::internal(e.to_string())))?;
-        let number = current_state.revision_number();
+    while !hash.is_zero() {
+        let current_state = state::State::deserialize(repository.clone(), hash).await?;
+        let current_number = current_state.revision_number();
 
         hops += 1;
         if hops.is_multiple_of(GAP_DESCENT_PROGRESS_HOPS) {
             debug!(
-                {BRANCH} = %branch, hops, number, first_number, sealed,
-                "Forward-cursor gap descent still walking",
+                {BRANCH} = %branch, hops, current_number, number, sealed,
+                "Line descent still walking",
             );
         }
 
-        if step_keys_enabled
-            && let Some(previous_state) = &prev_state
-            && let Some((lowest_b, highest_b)) = cache::revision::sealed_boundaries(
-                number,
-                previous_state.revision_number(),
+        if seal && let Some(previous_state) = &prev_state {
+            sealed += cache::revision::seal_crossed_boundaries(
+                repository,
+                branch,
                 history_step_size,
+                (current_number, hash),
+                previous_state.revision_number(),
             )
-        {
-            for boundary in (lowest_b..=highest_b).step_by(history_step_size as usize) {
-                // Counts what reached the store, not what was attempted:
-                // a descent reporting repairs it did not make reads as a
-                // fast path restored, when the next request will walk the
-                // same distance again.
-                if cache::revision::seal_boundary_revision_number(
-                    repository.clone(),
-                    branch,
-                    history_step_size,
-                    boundary,
-                    &current_state,
-                    previous_state,
-                )
-                .await
-                .is_ok()
-                {
-                    sealed += 1;
-                }
-            }
+            .await;
         }
 
-        if number <= first_number {
-            debug!(
-                {BRANCH} = %branch, %anchor, first_number, hops, sealed,
-                "Forward-cursor gap descent complete",
-            );
-            return Ok(last_above);
+        if current_number <= number {
+            descent.at_or_below = Some((hash, current_state));
+            break;
         }
-        last_above = Some(hash);
+        descent.above = Some(hash);
         hash = current_state.parent_self();
         prev_state = Some(current_state);
     }
+    debug!({BRANCH} = %branch, %anchor, number, hops, sealed, "Line descent complete");
+    Ok(descent)
 }
 
 /// Looks up the revision whose `parent_self` is items[0]'s signature —
@@ -1079,16 +1264,7 @@ async fn forward_cursor(
     let branch = owner.map_or(page_branch, |owner| owner.branch);
     let first_signature = Hash::from(first.signature.as_ref());
 
-    let latest = branch::load_latest(repository.clone(), branch)
-        .await
-        .filter_slow_down()?
-        .map_err(|err| {
-            if err.is_branch_not_found() {
-                Status::not_found(format!("Branch {branch} not found: {err}"))
-            } else {
-                warn_error_to_status(&err, |e| Status::internal(e.to_string()))
-            }
-        })?;
+    let latest = branch_latest(repository, branch).await?;
     if latest.is_zero() || latest == first_signature {
         return Ok(None);
     }
@@ -1099,8 +1275,8 @@ async fn forward_cursor(
     // write"). `latest` is the only anchor available; descend from it
     // directly, same as `resolve_start` falling through to `FullIteration`.
     if !acceleration.step_keys {
-        debug!({BRANCH} = %branch, first_number, "forward_cursor - descend_unverified_gap");
-        return descend_unverified_gap(
+        debug!({BRANCH} = %branch, first_number, "forward_cursor - descend_line");
+        return forward_descent(
             repository,
             branch,
             latest,
@@ -1154,7 +1330,7 @@ async fn forward_cursor(
                 {BRANCH} = %branch, first_number, %anchor,
                 "forward_cursor - calculating from unverified gap",
             );
-            descend_unverified_gap(
+            forward_descent(
                 repository,
                 branch,
                 anchor,
@@ -1166,4 +1342,29 @@ async fn forward_cursor(
         }
     };
     Ok(target)
+}
+
+/// The lowest revision numbered above `first_number` on the line of `branch`
+/// from `anchor`, found by a [`descend_line`], or `None` when `anchor` is not
+/// numbered above it.
+async fn forward_descent(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    anchor: Hash,
+    first_number: u64,
+    history_step_size: u64,
+    seal: bool,
+) -> Result<Option<Hash>, Status> {
+    let descent = descend_line(
+        repository,
+        branch,
+        anchor,
+        first_number,
+        history_step_size,
+        seal,
+    )
+    .await
+    .filter_slow_down()?
+    .map_err(|err| warn_error_to_status(&err, |e| Status::internal(e.to_string())))?;
+    Ok(descent.above)
 }

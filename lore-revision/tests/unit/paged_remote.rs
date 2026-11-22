@@ -241,6 +241,30 @@ pub(crate) fn without_its_own_state(
     ]
 }
 
+/// A page that a test names, as its name, its items and its cursor.
+pub(crate) type NamedPage = (&'static str, Vec<(u64, Hash)>, Hash);
+
+/// The pages for `asked` that do not continue its line, each with its name and its cursor: one
+/// listing `stray` where the line holds `parent`, the first parent of `asked`, one whose cursor
+/// names `stray`, and one without `asked`. `stray` is numbered as `parent` is, so only the parent
+/// link tells it from the line.
+pub(crate) fn off_the_line(asked: (u64, Hash), parent: Hash, stray: Hash) -> [NamedPage; 3] {
+    let below = asked.0 - 1;
+    [
+        (
+            "a revision off the line",
+            vec![asked, (below, stray)],
+            Hash::default(),
+        ),
+        ("a cursor off the line", vec![asked], stray),
+        (
+            "a page without the revision asked for",
+            vec![(below, parent)],
+            Hash::default(),
+        ),
+    ]
+}
+
 /// A local revision numbered 4 above two revisions only the remote holds, numbered 3 and 2, which
 /// the remote lists in one page asked for at 3, one of them without its own state.
 pub(crate) struct AboveUnverified {

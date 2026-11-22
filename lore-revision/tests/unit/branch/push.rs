@@ -2036,8 +2036,9 @@ mod unpushed_history {
     }
 
     /// A push whose walk back from the peer's latest revision stops fails with the walk's error,
-    /// which keeps its code: `RevisionNotFound` naming the peer's latest where the peer's page does
-    /// not move the line, and the peer's `NotAuthorized` where its list fails.
+    /// which keeps its code: an internal error where the peer's page does not continue the line,
+    /// its cursor naming the page's own revision, and the peer's `NotAuthorized` where its list
+    /// fails.
     #[tokio::test]
     async fn a_push_whose_walk_stops_fails_with_the_walks_error() {
         Box::pin(with_execution(async {
@@ -2062,13 +2063,8 @@ mod unpushed_history {
             .await;
 
             assert_eq!(
-                (
-                    stopped
-                        .as_revision_not_found()
-                        .map(|error| error.revision.clone()),
-                    refused.is_not_authorized(),
-                ),
-                (Some(top.to_string()), true),
+                (stopped.is_internal(), refused.is_not_authorized()),
+                (true, true),
                 "{stopped:?}; {refused:?}"
             );
         }))
