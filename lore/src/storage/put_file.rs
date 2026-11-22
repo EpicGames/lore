@@ -130,12 +130,12 @@ pub struct LoreStoragePutFileArgs {
 }
 
 /// Read one or more files into the content-addressed store.
-pub async fn put_file(
+pub fn put_file(
     globals: LoreGlobalArgs,
     args: LoreStoragePutFileArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, put_file_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, put_file_local)
 }
 
 async fn put_file_local(

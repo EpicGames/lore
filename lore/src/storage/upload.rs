@@ -68,12 +68,12 @@ pub struct LoreStorageUploadArgs {
 }
 
 /// Push one or more `(partition, address)` entries to the remote store.
-pub async fn upload(
+pub fn upload(
     globals: LoreGlobalArgs,
     args: LoreStorageUploadArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, upload_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, upload_local)
 }
 
 async fn upload_local(

@@ -957,12 +957,12 @@ async fn apply_plan(
 /// Concurrency across parents covers initializing and publishing a node, not
 /// allocating its slot: slot allocation is serialized per loaded tree, so a
 /// large batch allocates one node at a time however its parents are spread.
-pub async fn add(
+pub fn add(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeAddArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, add_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, add_impl)
 }
 
 /// Plan and apply one batch. Split out of the dispatcher closure so the batch

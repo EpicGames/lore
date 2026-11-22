@@ -724,12 +724,12 @@ async fn apply_plan(
 /// for the permit. A delete holds the permit for its whole batch too, so moves and deletes
 /// apply one after the other (H18). A commit cannot interleave at all: it claims the
 /// handle exclusively, and a move holds a shared claim for its whole batch.
-pub async fn move_node(
+pub fn move_node(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeMoveArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, move_node_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, move_node_impl)
 }
 
 /// Plan and apply one batch. Split out of the dispatcher closure so the batch

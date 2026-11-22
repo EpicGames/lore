@@ -79,12 +79,12 @@ pub struct LoreRevisionGraphBranchPushArgs {
 }
 
 /// Publish a branch's local history to the remote.
-pub async fn branch_push(
+pub fn branch_push(
     globals: LoreGlobalArgs,
     args: LoreRevisionGraphBranchPushArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, branch_push_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, branch_push_impl)
 }
 
 fn branch_push_impl(

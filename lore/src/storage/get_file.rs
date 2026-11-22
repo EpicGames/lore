@@ -111,12 +111,12 @@ pub struct LoreStorageGetFileArgs {
 }
 
 /// Write one or more content-addressed payloads to filesystem paths.
-pub async fn get_file(
+pub fn get_file(
     globals: LoreGlobalArgs,
     args: LoreStorageGetFileArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, get_file_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, get_file_local)
 }
 
 async fn get_file_local(

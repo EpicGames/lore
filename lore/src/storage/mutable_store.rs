@@ -63,12 +63,12 @@ pub struct LoreStorageMutableStoreArgs {
 }
 
 /// Write one or more mutable key-value pairs.
-pub async fn mutable_store(
+pub fn mutable_store(
     globals: LoreGlobalArgs,
     args: LoreStorageMutableStoreArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, mutable_store_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, mutable_store_impl)
 }
 
 async fn mutable_store_impl(

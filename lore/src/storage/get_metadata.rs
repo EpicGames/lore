@@ -79,12 +79,12 @@ pub struct LoreStorageGetMetadataArgs {
 /// Fetch fragment metadata for one or more addresses without paying the payload bytes. An address
 /// the local store does not hold and the remote does is written to the local store as an entry
 /// without its payload, marked stored durable, so a put of the same content uploads nothing.
-pub async fn get_metadata(
+pub fn get_metadata(
     globals: LoreGlobalArgs,
     args: LoreStorageGetMetadataArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, get_metadata_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, get_metadata_local)
 }
 
 async fn get_metadata_local(

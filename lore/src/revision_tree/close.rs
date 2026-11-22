@@ -77,12 +77,12 @@ impl EventError for CloseError {
 /// drain waits them out. A tree whose storage handle closed first is flushed as
 /// [`spawn_flush_after_storage_close`] describes, unless `skip_flush` is set, and
 /// the close returns the flush's result.
-pub async fn close(
+pub fn close(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeCloseArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, close_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, close_impl)
 }
 
 fn close_impl(

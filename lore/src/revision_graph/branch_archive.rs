@@ -81,12 +81,12 @@ struct RemoteBranch {
 }
 
 /// Archive a branch at each location the call consults.
-pub async fn branch_archive(
+pub fn branch_archive(
     globals: LoreGlobalArgs,
     args: LoreRevisionGraphBranchArchiveArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, branch_archive_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, branch_archive_impl)
 }
 
 fn branch_archive_impl(

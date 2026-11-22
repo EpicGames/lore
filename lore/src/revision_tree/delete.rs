@@ -943,12 +943,12 @@ async fn check_entries(
 /// delete's entry fails with `INTERNAL` and changes nothing. The batch runs
 /// in a task the call waits for, so a call dropped part way still finishes its
 /// batch, and reports nothing.
-pub async fn delete(
+pub fn delete(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeDeleteArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, delete_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, delete_impl)
 }
 
 /// Plan and apply one batch in a task of its own, then report what it found. Split out of the

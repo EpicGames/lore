@@ -73,12 +73,12 @@ fn emit_info_error(id: u64, error_code: LoreErrorCode) {
 /// Metadata fragment reports zeroed metadata fields (not an error); a
 /// present-but-unreadable fragment completes with `error_code = INTERNAL`. The
 /// verb materializes no bytes to disk.
-pub async fn info(
+pub fn info(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeInfoArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, info_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, info_impl)
 }
 
 async fn info_impl(

@@ -67,12 +67,12 @@ pub struct LoreStorageMutableCompareAndSwapArgs {
 }
 
 /// Conditionally swap one or more mutable key values.
-pub async fn mutable_compare_and_swap(
+pub fn mutable_compare_and_swap(
     globals: LoreGlobalArgs,
     args: LoreStorageMutableCompareAndSwapArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, mutable_compare_and_swap_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, mutable_compare_and_swap_impl)
 }
 
 async fn mutable_compare_and_swap_impl(

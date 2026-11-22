@@ -84,12 +84,12 @@ fn emit_node_path_error(id: u64, error_code: LoreErrorCode) {
 /// `error_code = INVALID_ARGUMENTS` — `State::node_path` does not distinguish an
 /// out-of-range id from a read failure, so both collapse to it, as in
 /// `list_children`. The verb materializes no bytes to disk.
-pub async fn node_path(
+pub fn node_path(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeNodePathArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, node_path_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, node_path_impl)
 }
 
 async fn node_path_impl(

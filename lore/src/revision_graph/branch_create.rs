@@ -456,12 +456,12 @@ pub(crate) fn settle(
 }
 
 /// Create a branch at each location the call consults.
-pub async fn branch_create(
+pub fn branch_create(
     globals: LoreGlobalArgs,
     args: LoreRevisionGraphBranchCreateArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, branch_create_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, branch_create_impl)
 }
 
 fn branch_create_impl(

@@ -102,12 +102,12 @@ pub struct LoreStoragePutArgs {
 }
 
 /// Store one or more content-addressed buffers.
-pub async fn put(
+pub fn put(
     globals: LoreGlobalArgs,
     args: LoreStoragePutArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, put_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, put_local)
 }
 
 async fn put_local(

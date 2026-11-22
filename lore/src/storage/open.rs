@@ -160,12 +160,12 @@ fn build_create_options(
 /// `{handle}` before `Complete` with `status` `0`. On failure, no
 /// `STORAGE_OPENED` and no `LORE_EVENT_ERROR` fire; `Complete` carries the
 /// error code in `status` and the full detail in its `error` field.
-pub async fn open(
+pub fn open(
     globals: LoreGlobalArgs,
     args: LoreStorageOpenArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, open_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, open_local)
 }
 
 fn open_local(

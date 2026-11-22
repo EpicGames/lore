@@ -3,6 +3,8 @@
 use std::pin::Pin;
 use std::pin::pin;
 
+use futures::FutureExt;
+use futures::future::Either;
 use lore_base::error::InvalidArguments;
 use lore_base::error::ShutDown;
 use lore_base::text::TextNotUtf8;
@@ -335,23 +337,26 @@ fn command_requires_service_given(
 /// Never runs the call here. Where no service can be reached or started, it reports
 /// [`lore_base::error::ServiceUnavailable`], saying why the call needs one and why none could be
 /// had.
-async fn forced_service_call(
+///
+/// Not an `async fn`, which would hold a second copy of its arguments: the closure holds them while
+/// the connect runs, and then the call on the service or the boxed fallback does.
+#[inline]
+fn forced_service_call(
     globals: LoreGlobalArgs,
     command: LoreCommand,
     callback: LoreEventCallback,
-) -> i32 {
-    let unreached = match connect_to_running_service().await {
-        Ok(Some(connection)) => {
-            let relayed = run_service_call(Some(connection), globals, command, callback).await;
-            return forced_status(relayed).await;
-        }
-        Ok(None) => None,
-        Err(error) => Some(error),
-    };
-    Box::pin(unanswered_forced_service_call(
-        globals, command, callback, unreached,
-    ))
-    .await
+) -> impl Future<Output = i32> {
+    connect_to_running_service().then(move |connected| match connected {
+        Ok(Some(connection)) => Either::Left(
+            run_service_call(Some(connection), globals, command, callback).then(forced_status),
+        ),
+        unanswered => Either::Right(Box::pin(unanswered_forced_service_call(
+            globals,
+            command,
+            callback,
+            unanswered.err(),
+        ))),
+    })
 }
 
 /// [`forced_service_call`] where no service answered its connect, failing with `unreached` or,
@@ -533,25 +538,31 @@ pub(crate) fn block_on_command(running: Pin<&mut dyn Future<Output = i32>>) -> i
 /// Runs `command` in the Lore service when the command requires one or one is in use, and in this
 /// process otherwise.
 ///
-/// Pins each future it awaits, for the reason `LoreCommand::invoke_local` gives.
+/// Pins each branch's future, for the reason `LoreCommand::invoke_local` gives. The block's
+/// captures stay reserved while the branch's future holds the arguments moved out of them.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
 #[lore_macro::test_pub]
-pub(crate) async fn dispatch_command(
+#[allow(clippy::manual_async_fn)]
+pub(crate) fn dispatch_command(
     globals: LoreGlobalArgs,
     command: LoreCommand,
     callback: LoreEventCallback,
-) -> i32 {
-    if command_requires_service(&globals, &command) {
-        let relay = pin!(forced_service_call(globals, command, callback));
-        relay.await
-    } else if service_in_use().await {
-        let relayed = {
-            let relay = pin!(run_service_call(None, globals, command, callback));
+) -> impl Future<Output = i32> {
+    async move {
+        if command_requires_service(&globals, &command) {
+            let relay = pin!(forced_service_call(globals, command, callback));
             relay.await
-        };
-        relayed_status(relayed).await
-    } else {
-        let handler = pin!(command.invoke_local(globals, callback));
-        handler.await
+        } else if service_in_use().await {
+            let relayed = {
+                let relay = pin!(run_service_call(None, globals, command, callback));
+                relay.await
+            };
+            relayed_status(relayed).await
+        } else {
+            let handler = pin!(command.invoke_local(globals, callback));
+            handler.await
+        }
     }
 }
 
@@ -565,8 +576,16 @@ pub(crate) fn invoke_locally(
     command.invoke_local(globals, callback)
 }
 
+/// Runs the call of `args` in the Lore service when it requires one or one is in use, and with
+/// `handler` in this process otherwise.
+///
+/// Pins each branch's future, for the reason `LoreCommand::invoke_local` gives. The block's
+/// captures stay reserved while the branch's future holds the arguments moved out of them.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
 #[lore_macro::test_pub]
-pub(crate) async fn dispatch_call<
+#[allow(clippy::manual_async_fn)]
+pub(crate) fn dispatch_call<
     ArgsType: LoreArgs,
     Handler: Fn(LoreGlobalArgs, ArgsType, LoreEventCallback) -> Fut,
     Fut: Future<Output = i32> + Send + 'static,
@@ -575,14 +594,20 @@ pub(crate) async fn dispatch_call<
     args: ArgsType,
     callback: LoreEventCallback,
     handler: Handler,
-) -> i32 {
-    if args_require_service(&globals, &args, running_as_service()) {
-        return forced_service_call(globals, args.to_command(), callback).await;
-    }
-    if service_in_use().await {
-        let relayed = run_service_call(None, globals, args.to_command(), callback).await;
-        relayed_status(relayed).await
-    } else {
-        handler(globals, args, callback).await
+) -> impl Future<Output = i32> {
+    async move {
+        if args_require_service(&globals, &args, running_as_service()) {
+            let relay = pin!(forced_service_call(globals, args.to_command(), callback));
+            relay.await
+        } else if service_in_use().await {
+            let relayed = {
+                let relay = pin!(run_service_call(None, globals, args.to_command(), callback));
+                relay.await
+            };
+            relayed_status(relayed).await
+        } else {
+            let handler = pin!(handler(globals, args, callback));
+            handler.await
+        }
     }
 }

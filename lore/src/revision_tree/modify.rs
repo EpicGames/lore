@@ -374,12 +374,12 @@ async fn apply_plan(
 /// Concurrency covers entries in different node blocks: each rewrite takes its
 /// target's block write lock for the field write, so entries sharing a block —
 /// which sequentially allocated node ids usually do — serialize on it.
-pub async fn modify(
+pub fn modify(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeModifyArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, modify_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, modify_impl)
 }
 
 /// Plan and apply one batch. Split out of the dispatcher closure so the batch

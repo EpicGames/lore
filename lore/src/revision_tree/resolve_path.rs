@@ -84,12 +84,12 @@ fn emit_resolve_complete(
 /// `error_code = INVALID_ARGUMENTS`. A path that is not valid UTF-8 never
 /// reaches the verb — the entry point rejects the call before dispatching it, so
 /// no `RESOLVE_PATH_COMPLETE` fires. The verb materializes no bytes to disk.
-pub async fn resolve_path(
+pub fn resolve_path(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeResolvePathArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, resolve_path_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, resolve_path_impl)
 }
 
 async fn resolve_path_impl(

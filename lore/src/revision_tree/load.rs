@@ -112,12 +112,12 @@ fn withdraw_if_parent_closed(store: LoreStore, revision_tree: LoreRevisionTree) 
 /// the new handle id before `Complete {status: 0}`. On failure, one
 /// `LORE_EVENT_ERROR` fires followed by `Complete {status: 1}` and no
 /// handle is registered.
-pub async fn load(
+pub fn load(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeLoadArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, load_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, load_impl)
 }
 
 fn load_impl(

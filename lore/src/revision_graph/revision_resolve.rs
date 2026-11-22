@@ -78,12 +78,12 @@ pub(crate) struct Resolved {
 }
 
 /// Resolve a revision at each location the call consults.
-pub async fn revision_resolve(
+pub fn revision_resolve(
     globals: LoreGlobalArgs,
     args: LoreRevisionGraphRevisionResolveArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, revision_resolve_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, revision_resolve_impl)
 }
 
 fn revision_resolve_impl(

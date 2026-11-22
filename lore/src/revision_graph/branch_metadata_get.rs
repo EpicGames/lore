@@ -62,12 +62,12 @@ pub struct LoreRevisionGraphBranchMetadataGetArgs {
 }
 
 /// Read a branch's metadata at each location the call consults.
-pub async fn branch_metadata_get(
+pub fn branch_metadata_get(
     globals: LoreGlobalArgs,
     args: LoreRevisionGraphBranchMetadataGetArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, branch_metadata_get_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, branch_metadata_get_impl)
 }
 
 fn branch_metadata_get_impl(

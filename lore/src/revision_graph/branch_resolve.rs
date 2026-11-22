@@ -58,12 +58,12 @@ pub struct LoreRevisionGraphBranchResolveArgs {
 }
 
 /// Resolve a branch name at each location the call consults.
-pub async fn branch_resolve(
+pub fn branch_resolve(
     globals: LoreGlobalArgs,
     args: LoreRevisionGraphBranchResolveArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, branch_resolve_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, branch_resolve_impl)
 }
 
 fn branch_resolve_impl(

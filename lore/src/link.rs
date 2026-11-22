@@ -58,12 +58,12 @@ pub struct LoreLinkAddArgs {
 /// | [`LoreEvent::RepositoryCloneEnd`](crate::interface::LoreEvent::RepositoryCloneEnd) | Emitted when cloning a linked repository completes |
 /// | [`LoreEvent::LinkBranchCreate`](crate::interface::LoreEvent::LinkBranchCreate) | Emitted when branching is enabled, reporting whether the link's branch was created or an existing one reused |
 /// | [`LoreEvent::LinkChange`](crate::interface::LoreEvent::LinkChange) | Emitted when the link has been added and saved |
-pub async fn add(
+pub fn add(
     globals: LoreGlobalArgs,
     args: LoreLinkAddArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, add_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, add_local)
 }
 
 fn add_local(
@@ -139,12 +139,12 @@ pub struct LoreLinkRemoveArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::LinkChange`](crate::interface::LoreEvent::LinkChange) | Emitted when the link has been removed |
-pub async fn remove(
+pub fn remove(
     globals: LoreGlobalArgs,
     args: LoreLinkRemoveArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, remove_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, remove_local)
 }
 
 fn remove_local(
@@ -199,12 +199,12 @@ pub struct LoreLinkListArgs {}
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::LinkEntry`](crate::interface::LoreEvent::LinkEntry) | Emitted for each linked repository |
-pub async fn list(
+pub fn list(
     globals: LoreGlobalArgs,
     args: LoreLinkListArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, list_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, list_local)
 }
 
 fn list_local(
@@ -246,12 +246,12 @@ pub struct LoreLinkInfoArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::LinkInfo`](crate::interface::LoreEvent::LinkInfo) | Emitted once for the described link |
-pub async fn info(
+pub fn info(
     globals: LoreGlobalArgs,
     args: LoreLinkInfoArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, info_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, info_local)
 }
 
 fn info_local(
@@ -302,12 +302,12 @@ pub struct LoreLinkListStagedArgs {}
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::LinkStagedEntry`](crate::interface::LoreEvent::LinkStagedEntry) | Emitted for each link with staged changes |
-pub async fn list_staged(
+pub fn list_staged(
     globals: LoreGlobalArgs,
     args: LoreLinkListStagedArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, list_staged_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, list_staged_local)
 }
 
 fn list_staged_local(
@@ -355,12 +355,12 @@ pub struct LoreLinkUpdateArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::LinkChange`](crate::interface::LoreEvent::LinkChange) | Emitted when a link property is updated and again when the link update is finalized |
-pub async fn update(
+pub fn update(
     globals: LoreGlobalArgs,
     args: LoreLinkUpdateArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, update_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, update_local)
 }
 
 fn update_local(

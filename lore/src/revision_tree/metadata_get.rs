@@ -315,12 +315,12 @@ fn emit_resolved(entries: &[LoreRevisionTreeMetadataGetEntry], resolved: &[Resol
 /// deserialized once for the whole batch — that, rather than any fan-out, is
 /// what batching buys here; the work per key is a buffer lookup. A fragment that
 /// cannot be read fails the call. Keys are reported in entry order.
-pub async fn metadata_get(
+pub fn metadata_get(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeMetadataGetArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, metadata_get_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, metadata_get_impl)
 }
 
 /// Resolve one batch. Split out of the dispatcher closure so the batch terminal

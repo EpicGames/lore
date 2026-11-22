@@ -194,12 +194,12 @@ fn emit_commit_complete(
 /// compare-and-swap decides which one publishes and the loser fails carrying the tip
 /// the winner set, having possibly left orphan tree blocks behind. They are
 /// content-addressed and no revision references them.
-pub async fn commit(
+pub fn commit(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeCommitArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, commit_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, commit_impl)
 }
 
 async fn commit_impl(

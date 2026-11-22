@@ -88,12 +88,12 @@ pub struct LoreRevisionCommitArgs {
 /// | [`LoreEvent::Metadata`](crate::interface::LoreEvent::Metadata) | Emitted for each metadata entry of the committed revision |
 /// | [`LoreEvent::RevisionCommitStats`](crate::interface::LoreEvent::RevisionCommitStats) | Emitted once when the commit finishes, with per-action file counts and fragment write/dedup/upload totals. Requires `stats >= 1` on the global arguments |
 /// | [`LoreEvent::FragmentWrite`](crate::interface::LoreEvent::FragmentWrite) | Emitted for each file fragment written or deduplicated. Requires `stats >= 2` on the global arguments |
-pub async fn commit(
+pub fn commit(
     globals: LoreGlobalArgs,
     args: LoreRevisionCommitArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, commit_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, commit_local)
 }
 
 #[lore_macro::test_pub]
@@ -220,12 +220,12 @@ pub struct LoreRevisionAmendArgs {
 /// |-------|-------------|
 /// | [`LoreEvent::RevisionCommitRevision`](crate::interface::LoreEvent::RevisionCommitRevision) | Emitted with the amended revision details |
 /// | [`LoreEvent::Metadata`](crate::interface::LoreEvent::Metadata) | Emitted for each metadata entry of the amended revision |
-pub async fn amend(
+pub fn amend(
     globals: LoreGlobalArgs,
     args: LoreRevisionAmendArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, amend_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, amend_local)
 }
 
 fn amend_local(
@@ -283,12 +283,12 @@ pub struct LoreRevisionInfoArgs {
 /// | [`LoreEvent::RevisionInfo`](crate::interface::LoreEvent::RevisionInfo) | Emitted with revision metadata (hash, branch, parents, file count, etc.) |
 /// | [`LoreEvent::RevisionInfoDelta`](crate::interface::LoreEvent::RevisionInfoDelta) | Emitted with delta information between the revision and its parent (when `delta=true`) |
 /// | [`LoreEvent::Metadata`](crate::interface::LoreEvent::Metadata) | Emitted for each metadata key/value of the revision (when `metadata=true`) |
-pub async fn info(
+pub fn info(
     globals: LoreGlobalArgs,
     args: LoreRevisionInfoArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, info_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, info_local)
 }
 
 fn info_local(
@@ -332,12 +332,12 @@ pub struct LoreRevisionMetadataClearArgs {}
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::MetadataClearRevision`](crate::interface::LoreEvent::MetadataClearRevision) | Emitted when metadata has been cleared for the current revision |
-pub async fn metadata_clear(
+pub fn metadata_clear(
     globals: LoreGlobalArgs,
     args: LoreRevisionMetadataClearArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, metadata_clear_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, metadata_clear_local)
 }
 
 fn metadata_clear_local(
@@ -387,12 +387,12 @@ pub struct LoreRevisionMetadataGetArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Metadata`](crate::interface::LoreEvent::Metadata) | Emitted with the requested key/value for the revision |
-pub async fn metadata_get(
+pub fn metadata_get(
     globals: LoreGlobalArgs,
     args: LoreRevisionMetadataGetArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, metadata_get_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, metadata_get_local)
 }
 
 fn metadata_get_local(
@@ -439,12 +439,12 @@ pub struct LoreRevisionMetadataListArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Metadata`](crate::interface::LoreEvent::Metadata) | Emitted for each metadata key/value associated with the revision |
-pub async fn metadata_list(
+pub fn metadata_list(
     globals: LoreGlobalArgs,
     args: LoreRevisionMetadataListArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, metadata_list_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, metadata_list_local)
 }
 
 fn metadata_list_local(
@@ -495,12 +495,12 @@ pub struct LoreRevisionMetadataSetArgs {
 /// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
-pub async fn metadata_set(
+pub fn metadata_set(
     globals: LoreGlobalArgs,
     args: LoreRevisionMetadataSetArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, metadata_set_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, metadata_set_local)
 }
 
 fn metadata_set_local(
@@ -591,12 +591,12 @@ pub struct LoreRevisionHistoryArgs {
 /// |-------|-------------|
 /// | [`LoreEvent::RevisionHistory`](crate::interface::LoreEvent::RevisionHistory) | Emitted once with summary info before entries stream |
 /// | [`LoreEvent::RevisionHistoryEntry`](crate::interface::LoreEvent::RevisionHistoryEntry) | Emitted for each revision in the history |
-pub async fn history(
+pub fn history(
     globals: LoreGlobalArgs,
     args: LoreRevisionHistoryArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, history_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, history_local)
 }
 
 fn history_local(
@@ -662,12 +662,12 @@ pub struct LoreRevisionRestoreArgs {
 /// | [`LoreEvent::RevisionCommitRevision`](crate::interface::LoreEvent::RevisionCommitRevision) | Emitted with the committed restored revision |
 /// | [`LoreEvent::Metadata`](crate::interface::LoreEvent::Metadata) | Emitted for each metadata entry of the restored revision |
 /// | [`LoreEvent::FragmentWrite`](crate::interface::LoreEvent::FragmentWrite) | Emitted for each fragment written during restore commit |
-pub async fn restore(
+pub fn restore(
     globals: LoreGlobalArgs,
     args: LoreRevisionRestoreArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, restore_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, restore_local)
 }
 
 fn restore_local(
@@ -759,12 +759,12 @@ pub struct LoreRevisionSyncArgs {
 /// | [`LoreEvent::RevisionCommitRevision`](crate::interface::LoreEvent::RevisionCommitRevision) | Emitted with the committed merge revision details |
 /// | [`LoreEvent::Metadata`](crate::interface::LoreEvent::Metadata) | Emitted for each metadata entry of the auto-merge commit |
 /// | [`LoreEvent::FragmentWrite`](crate::interface::LoreEvent::FragmentWrite) | Emitted for each file fragment written or deduplicated during auto-merge commit |
-pub async fn sync(
+pub fn sync(
     globals: LoreGlobalArgs,
     args: LoreRevisionSyncArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, sync_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, sync_local)
 }
 
 fn sync_local(
@@ -861,12 +861,12 @@ pub struct LoreRevisionBisectArgs {
 /// | [`LoreEvent::RevisionSyncRevision`](crate::interface::LoreEvent::RevisionSyncRevision) | Emitted once at the end with the resulting revision |
 /// | [`LoreEvent::RevisionResolve`](crate::interface::LoreEvent::RevisionResolve) | Emitted when resolving a revision |
 /// | [`LoreEvent::FilterExclude`](crate::interface::LoreEvent::FilterExclude) | Emitted for each path excluded by view or ignore filters |
-pub async fn bisect(
+pub fn bisect(
     globals: LoreGlobalArgs,
     args: LoreRevisionBisectArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, bisect_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, bisect_local)
 }
 
 fn bisect_local(
@@ -922,12 +922,12 @@ pub struct LoreRevisionFindArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::RevisionFind`](crate::interface::LoreEvent::RevisionFind) | Emitted for each matching revision found (exact or partial match) |
-pub async fn find(
+pub fn find(
     globals: LoreGlobalArgs,
     args: LoreRevisionFindArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, find_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, find_local)
 }
 
 pub fn find_local(
@@ -991,12 +991,12 @@ pub struct LoreRevisionDiffArgs {
 /// |-------|-------------|
 /// | [`LoreEvent::RevisionDiffFile`](crate::interface::LoreEvent::RevisionDiffFile) | Emitted for each file that differs between the two revisions |
 /// | [`LoreEvent::RevisionResolve`](crate::interface::LoreEvent::RevisionResolve) | Emitted when resolving a revision number |
-pub async fn diff(
+pub fn diff(
     globals: LoreGlobalArgs,
     args: LoreRevisionDiffArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, diff_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, diff_local)
 }
 
 fn diff_local(
@@ -1100,12 +1100,12 @@ pub struct LoreRevisionCherryPickArgs {
 /// | [`LoreEvent::RevisionCommitRevision`](crate::interface::LoreEvent::RevisionCommitRevision) | Emitted with the committed cherry-pick revision |
 /// | [`LoreEvent::Metadata`](crate::interface::LoreEvent::Metadata) | Emitted for each metadata entry of the auto-commit |
 /// | [`LoreEvent::FragmentWrite`](crate::interface::LoreEvent::FragmentWrite) | Emitted for each fragment written during auto-commit |
-pub async fn cherry_pick(
+pub fn cherry_pick(
     globals: LoreGlobalArgs,
     args: LoreRevisionCherryPickArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, cherry_pick_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, cherry_pick_local)
 }
 
 fn cherry_pick_local(
@@ -1150,12 +1150,12 @@ fn cherry_pick_local(
 #[handler(cherry_pick_abort_local)]
 pub struct LoreRevisionCherryPickAbortArgs {}
 
-pub async fn cherry_pick_abort(
+pub fn cherry_pick_abort(
     globals: LoreGlobalArgs,
     args: LoreRevisionCherryPickAbortArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, cherry_pick_abort_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, cherry_pick_abort_local)
 }
 
 fn cherry_pick_abort_local(
@@ -1181,12 +1181,12 @@ pub struct LoreRevisionCherryPickUnresolveArgs {
     pub paths: LoreArray<LoreString>,
 }
 
-pub async fn cherry_pick_unresolve(
+pub fn cherry_pick_unresolve(
     globals: LoreGlobalArgs,
     args: LoreRevisionCherryPickUnresolveArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, cherry_pick_unresolve_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, cherry_pick_unresolve_local)
 }
 
 fn cherry_pick_unresolve_local(
@@ -1214,12 +1214,12 @@ pub struct LoreRevisionCherryPickRestartArgs {
     pub paths: LoreArray<LoreString>,
 }
 
-pub async fn cherry_pick_restart(
+pub fn cherry_pick_restart(
     globals: LoreGlobalArgs,
     args: LoreRevisionCherryPickRestartArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, cherry_pick_restart_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, cherry_pick_restart_local)
 }
 
 fn cherry_pick_restart_local(
@@ -1247,12 +1247,12 @@ pub struct LoreRevisionCherryPickResolveArgs {
     pub paths: LoreArray<LoreString>,
 }
 
-pub async fn cherry_pick_resolve(
+pub fn cherry_pick_resolve(
     globals: LoreGlobalArgs,
     args: LoreRevisionCherryPickResolveArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, cherry_pick_resolve_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, cherry_pick_resolve_local)
 }
 
 fn cherry_pick_resolve_local(
@@ -1280,12 +1280,12 @@ pub struct LoreRevisionCherryPickResolveMineArgs {
     pub paths: LoreArray<LoreString>,
 }
 
-pub async fn cherry_pick_resolve_mine(
+pub fn cherry_pick_resolve_mine(
     globals: LoreGlobalArgs,
     args: LoreRevisionCherryPickResolveMineArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, cherry_pick_resolve_mine_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, cherry_pick_resolve_mine_local)
 }
 
 fn cherry_pick_resolve_mine_local(
@@ -1315,12 +1315,12 @@ pub struct LoreRevisionCherryPickResolveTheirsArgs {
     pub paths: LoreArray<LoreString>,
 }
 
-pub async fn cherry_pick_resolve_theirs(
+pub fn cherry_pick_resolve_theirs(
     globals: LoreGlobalArgs,
     args: LoreRevisionCherryPickResolveTheirsArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, cherry_pick_resolve_theirs_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, cherry_pick_resolve_theirs_local)
 }
 
 fn cherry_pick_resolve_theirs_local(
@@ -1390,12 +1390,12 @@ pub struct LoreRevisionRevertArgs {
 /// | [`LoreEvent::RevisionCommitRevision`](crate::interface::LoreEvent::RevisionCommitRevision) | Emitted with the committed revert revision |
 /// | [`LoreEvent::Metadata`](crate::interface::LoreEvent::Metadata) | Emitted for each metadata entry of the auto-commit |
 /// | [`LoreEvent::FragmentWrite`](crate::interface::LoreEvent::FragmentWrite) | Emitted for each fragment written during auto-commit |
-pub async fn revert(
+pub fn revert(
     globals: LoreGlobalArgs,
     args: LoreRevisionRevertArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, revert_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, revert_local)
 }
 
 pub fn revert_local(
@@ -1455,12 +1455,12 @@ pub struct LoreRevisionRevertAbortArgs {}
 /// | [`LoreEvent::RevertAbortBegin`](crate::interface::LoreEvent::RevertAbortBegin) | Emitted when revert abort begins |
 /// | [`LoreEvent::RevertAbortEnd`](crate::interface::LoreEvent::RevertAbortEnd) | Emitted when revert abort completes |
 /// | [`LoreEvent::RevisionSyncProgress`](crate::interface::LoreEvent::RevisionSyncProgress) | Emitted during file realization while reverting |
-pub async fn revert_abort(
+pub fn revert_abort(
     globals: LoreGlobalArgs,
     args: LoreRevisionRevertAbortArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, revert_abort_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, revert_abort_local)
 }
 
 fn revert_abort_local(
@@ -1507,12 +1507,12 @@ pub struct LoreRevisionRevertUnresolveArgs {
 /// |-------|-------------|
 /// | [`LoreEvent::RevertUnresolveFile`](crate::interface::LoreEvent::RevertUnresolveFile) | Emitted for each file marked as unresolved |
 /// | [`LoreEvent::RevertUnresolveRevision`](crate::interface::LoreEvent::RevertUnresolveRevision) | Emitted with the updated staged revision after unresolve completes |
-pub async fn revert_unresolve(
+pub fn revert_unresolve(
     globals: LoreGlobalArgs,
     args: LoreRevisionRevertUnresolveArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, revert_unresolve_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, revert_unresolve_local)
 }
 
 fn revert_unresolve_local(
@@ -1562,12 +1562,12 @@ pub struct LoreRevisionRevertRestartArgs {
 /// | [`LoreEvent::RevertConflictFile`](crate::interface::LoreEvent::RevertConflictFile) | Emitted for each file with a remaining revert conflict |
 /// | [`LoreEvent::RevisionSyncProgress`](crate::interface::LoreEvent::RevisionSyncProgress) | Emitted during file realization |
 /// | [`LoreEvent::RevisionSyncFile`](crate::interface::LoreEvent::RevisionSyncFile) | Emitted for each file re-materialized during restart |
-pub async fn revert_restart(
+pub fn revert_restart(
     globals: LoreGlobalArgs,
     args: LoreRevisionRevertRestartArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, revert_restart_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, revert_restart_local)
 }
 
 fn revert_restart_local(
@@ -1616,12 +1616,12 @@ pub struct LoreRevisionRevertResolveArgs {
 /// |-------|-------------|
 /// | [`LoreEvent::RevertResolveFile`](crate::interface::LoreEvent::RevertResolveFile) | Emitted for each file that was marked as resolved |
 /// | [`LoreEvent::RevertResolveRevision`](crate::interface::LoreEvent::RevertResolveRevision) | Emitted with the updated staged revision after resolve completes |
-pub async fn revert_resolve(
+pub fn revert_resolve(
     globals: LoreGlobalArgs,
     args: LoreRevisionRevertResolveArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, revert_resolve_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, revert_resolve_local)
 }
 
 fn revert_resolve_local(
@@ -1670,12 +1670,12 @@ pub struct LoreRevisionRevertResolveMineArgs {
 /// |-------|-------------|
 /// | [`LoreEvent::RevertResolveFile`](crate::interface::LoreEvent::RevertResolveFile) | Emitted for each file resolved by keeping "mine" |
 /// | [`LoreEvent::RevertResolveRevision`](crate::interface::LoreEvent::RevertResolveRevision) | Emitted with the updated staged revision after resolve completes |
-pub async fn revert_resolve_mine(
+pub fn revert_resolve_mine(
     globals: LoreGlobalArgs,
     args: LoreRevisionRevertResolveMineArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, revert_resolve_mine_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, revert_resolve_mine_local)
 }
 
 fn revert_resolve_mine_local(
@@ -1726,12 +1726,12 @@ pub struct LoreRevisionRevertResolveTheirsArgs {
 /// |-------|-------------|
 /// | [`LoreEvent::RevertResolveFile`](crate::interface::LoreEvent::RevertResolveFile) | Emitted for each file resolved by keeping "theirs" |
 /// | [`LoreEvent::RevertResolveRevision`](crate::interface::LoreEvent::RevertResolveRevision) | Emitted with the updated staged revision after resolve completes |
-pub async fn revert_resolve_theirs(
+pub fn revert_resolve_theirs(
     globals: LoreGlobalArgs,
     args: LoreRevisionRevertResolveTheirsArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, revert_resolve_theirs_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, revert_resolve_theirs_local)
 }
 
 fn revert_resolve_theirs_local(

@@ -121,12 +121,12 @@ pub struct LoreStorageGetArgs {
 }
 
 /// Read one or more content-addressed buffers.
-pub async fn get(
+pub fn get(
     globals: LoreGlobalArgs,
     args: LoreStorageGetArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, get_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, get_local)
 }
 
 async fn get_local(

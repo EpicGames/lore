@@ -124,12 +124,12 @@ pub struct LoreStoragePutFileResolvedArgs {
 }
 
 /// Store one or more files and publish a mutable key naming each.
-pub async fn put_file_resolved(
+pub fn put_file_resolved(
     globals: LoreGlobalArgs,
     args: LoreStoragePutFileResolvedArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, put_file_resolved_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, put_file_resolved_local)
 }
 
 async fn put_file_resolved_local(

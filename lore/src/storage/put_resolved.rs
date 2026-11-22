@@ -131,12 +131,12 @@ pub struct LoreStoragePutResolvedArgs {
 }
 
 /// Store one or more buffers and publish a mutable key naming each.
-pub async fn put_resolved(
+pub fn put_resolved(
     globals: LoreGlobalArgs,
     args: LoreStoragePutResolvedArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, put_resolved_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, put_resolved_local)
 }
 
 async fn put_resolved_local(

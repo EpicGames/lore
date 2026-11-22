@@ -61,12 +61,12 @@ pub struct LoreStorageObliterateArgs {
 }
 
 /// Delete one or more `(partition, address)` entries.
-pub async fn obliterate(
+pub fn obliterate(
     globals: LoreGlobalArgs,
     args: LoreStorageObliterateArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, obliterate_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, obliterate_local)
 }
 
 async fn obliterate_local(

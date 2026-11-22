@@ -49,12 +49,12 @@ pub struct LoreFileDependencyAddArgs {
     pub force: u8,
 }
 
-pub async fn dependency_add(
+pub fn dependency_add(
     globals: LoreGlobalArgs,
     args: LoreFileDependencyAddArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, dependency_add_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, dependency_add_local)
 }
 
 fn dependency_add_local(
@@ -161,12 +161,12 @@ pub struct LoreFileDependencyRemoveArgs {
     pub tag_counts: LoreArray<u32>,
 }
 
-pub async fn dependency_remove(
+pub fn dependency_remove(
     globals: LoreGlobalArgs,
     args: LoreFileDependencyRemoveArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, dependency_remove_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, dependency_remove_local)
 }
 
 fn dependency_remove_local(
@@ -271,12 +271,12 @@ pub struct LoreFileDependencyListArgs {
     pub depth_limit: u32,
 }
 
-pub async fn dependency_list(
+pub fn dependency_list(
     globals: LoreGlobalArgs,
     args: LoreFileDependencyListArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, dependency_list_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, dependency_list_local)
 }
 
 fn dependency_list_local(

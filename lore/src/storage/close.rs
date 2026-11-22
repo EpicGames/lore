@@ -144,12 +144,12 @@ pub struct LoreStorageCloseArgs {
 /// Releasing them is the caller's job, with `lore_revision_tree_close`. Background eviction
 /// and compaction, where the open enabled them, keep their schedule for as long as anything
 /// holds the store.
-pub async fn close(
+pub fn close(
     globals: LoreGlobalArgs,
     args: LoreStorageCloseArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, close_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, close_local)
 }
 
 fn close_local(

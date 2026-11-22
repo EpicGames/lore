@@ -242,12 +242,12 @@ enum Swapped {
 }
 
 /// Edit a branch's metadata at each location the call consults.
-pub async fn branch_metadata_set(
+pub fn branch_metadata_set(
     globals: LoreGlobalArgs,
     args: LoreRevisionGraphBranchMetadataSetArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, branch_metadata_set_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, branch_metadata_set_impl)
 }
 
 fn branch_metadata_set_impl(

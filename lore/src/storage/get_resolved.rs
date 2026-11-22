@@ -139,12 +139,12 @@ pub struct LoreStorageGetResolvedArgs {
 }
 
 /// Resolve one or more mutable keys and read the content they point at.
-pub async fn get_resolved(
+pub fn get_resolved(
     globals: LoreGlobalArgs,
     args: LoreStorageGetResolvedArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, get_resolved_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, get_resolved_local)
 }
 
 async fn get_resolved_local(

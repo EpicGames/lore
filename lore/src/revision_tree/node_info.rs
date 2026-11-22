@@ -96,12 +96,12 @@ fn emit_node_info_error(id: u64, error_code: LoreErrorCode) {
 /// as a zeroed record with an empty name; since every non-root node has a
 /// non-empty name, such an id is rejected with `INVALID_ARGUMENTS` rather than
 /// reported as a bogus record (consistent with `node_path`).
-pub async fn node_info(
+pub fn node_info(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeNodeInfoArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, node_info_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, node_info_impl)
 }
 
 async fn node_info_impl(

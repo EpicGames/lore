@@ -110,12 +110,12 @@ pub struct LoreStorageGetFileResolvedArgs {
 }
 
 /// Resolve one or more mutable keys and write the content they name to filesystem paths.
-pub async fn get_file_resolved(
+pub fn get_file_resolved(
     globals: LoreGlobalArgs,
     args: LoreStorageGetFileResolvedArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, get_file_resolved_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, get_file_resolved_local)
 }
 
 async fn get_file_resolved_local(

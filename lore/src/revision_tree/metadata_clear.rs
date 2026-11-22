@@ -196,12 +196,12 @@ fn apply_entries(
 /// The handle is claimed even though this edits no tree: that pending buffer is
 /// what a commit clones and then empties, so a clear landing inside a commit would
 /// apply to metadata the commit has already taken.
-pub async fn metadata_clear(
+pub fn metadata_clear(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeMetadataClearArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, metadata_clear_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, metadata_clear_impl)
 }
 
 /// Validate and apply one batch. Split out of the dispatcher closure so the

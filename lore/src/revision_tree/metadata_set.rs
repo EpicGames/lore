@@ -282,12 +282,12 @@ fn apply_plan(
 /// The handle is claimed even though this edits no tree: that pending buffer is
 /// what a commit clones and then empties, so an edit landing inside a commit would
 /// be recorded and dropped without ever reaching a revision.
-pub async fn metadata_set(
+pub fn metadata_set(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeMetadataSetArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, metadata_set_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, metadata_set_impl)
 }
 
 /// Plan and apply one batch. Split out of the dispatcher closure so the batch

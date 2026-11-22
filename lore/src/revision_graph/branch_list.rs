@@ -76,12 +76,12 @@ pub struct LoreRevisionGraphBranchListArgs {
 }
 
 /// List the branches of a repository at each location the call consults.
-pub async fn branch_list(
+pub fn branch_list(
     globals: LoreGlobalArgs,
     args: LoreRevisionGraphBranchListArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, branch_list_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, branch_list_impl)
 }
 
 fn branch_list_impl(

@@ -278,12 +278,12 @@ struct RemoteBranch {
 }
 
 /// Sync a branch's local latest to a target revision.
-pub async fn branch_sync(
+pub fn branch_sync(
     globals: LoreGlobalArgs,
     args: LoreRevisionGraphBranchSyncArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, branch_sync_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, branch_sync_impl)
 }
 
 fn branch_sync_impl(

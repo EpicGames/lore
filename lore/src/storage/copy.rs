@@ -96,12 +96,12 @@ pub struct LoreStorageCopyArgs {
 }
 
 /// Copy content between partitions for one or more items.
-pub async fn copy(
+pub fn copy(
     globals: LoreGlobalArgs,
     args: LoreStorageCopyArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, copy_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, copy_local)
 }
 
 async fn copy_local(

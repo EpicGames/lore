@@ -57,12 +57,12 @@ pub struct LoreStorageMutableListArgs {
 }
 
 /// List one or more partitions' mutable key-value pairs.
-pub async fn mutable_list(
+pub fn mutable_list(
     globals: LoreGlobalArgs,
     args: LoreStorageMutableListArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, mutable_list_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, mutable_list_local)
 }
 
 async fn mutable_list_local(

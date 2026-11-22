@@ -33,12 +33,12 @@ pub struct LoreStorageFlushArgs {
 /// Flush pending writes through the handle's stores. Disk-backed stores
 /// write as `globals.sync_data` and `globals.fast_flush` ask; in-memory stores
 /// no-op.
-pub async fn flush(
+pub fn flush(
     globals: LoreGlobalArgs,
     args: LoreStorageFlushArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, flush_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, flush_local)
 }
 
 async fn flush_local(

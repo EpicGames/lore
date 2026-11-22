@@ -62,12 +62,12 @@ pub struct LoreStorageMutableLoadArgs {
 }
 
 /// Read one or more mutable key values.
-pub async fn mutable_load(
+pub fn mutable_load(
     globals: LoreGlobalArgs,
     args: LoreStorageMutableLoadArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, mutable_load_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, mutable_load_impl)
 }
 
 async fn mutable_load_impl(
