@@ -1306,16 +1306,41 @@ impl InstanceOperationImpl {
         self.changed.store(true, Ordering::Release);
     }
 
-    /// Notes that a commit stored `path`, or removed it, so the provider thaws it as committed: SWFS
-    /// holds a change to a path until a thaw names it, and a later thaw naming a path it still
-    /// holds as deleted is taken as the commit of that deletion. Counted as a change, outside a dry
-    /// run.
+    /// Notes that a commit stored `path`, so the provider thaws it as committed once the commit
+    /// went through: SWFS holds a change to a path until a thaw names it. Counted as a change,
+    /// outside a dry run.
     pub fn committed_path(&self, path: &RelativePath) {
         if self.dry_run {
             return;
         }
         if let StaticDispatchInstanceOperation::Swfs(this) = &self.dispatch {
             this.committed_path(path);
+            self.record_change();
+        }
+    }
+
+    /// Notes that a commit deleted the file at `path`, so the provider names it as removed once the
+    /// commit went through, where SWFS lists it or a directory above it as deleted: SWFS holds
+    /// the user's deletion until a thaw names the path. Counted as a change, outside a dry run.
+    pub fn committed_removal(&self, path: &RelativePath) {
+        if self.dry_run {
+            return;
+        }
+        if let StaticDispatchInstanceOperation::Swfs(this) = &self.dispatch {
+            this.committed_removal(path);
+            self.record_change();
+        }
+    }
+
+    /// Notes that a commit deleted the directory at `path` and all it held, so the provider names
+    /// what SWFS holds deleted there once the commit went through. Counted as a change, outside a
+    /// dry run.
+    pub fn committed_tree_removal(&self, path: &RelativePath) {
+        if self.dry_run {
+            return;
+        }
+        if let StaticDispatchInstanceOperation::Swfs(this) = &self.dispatch {
+            this.committed_tree_removal(path);
             self.record_change();
         }
     }

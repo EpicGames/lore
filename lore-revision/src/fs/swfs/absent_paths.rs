@@ -18,6 +18,7 @@ use lore_storage::KeyType;
 use parking_lot::RwLock;
 
 use crate::errors::UnhandledError;
+use crate::fs::swfs::paths::self_and_ancestors;
 use crate::immutable;
 use crate::lore::Address;
 use crate::lore::Context;
@@ -200,13 +201,6 @@ impl AbsentPaths {
             .forward_any::<UnhandledError>("Flushing the paths absent from the SWFS instance")?;
         Ok(())
     }
-}
-
-/// `path` and each directory above it, deepest first.
-fn self_and_ancestors(path: &str) -> impl Iterator<Item = &str> {
-    std::iter::successors(Some(path), |path| {
-        path.rsplit_once('/').map(|(parent, _)| parent)
-    })
 }
 
 fn absent_key(repository: &RepositoryContext) -> Hash {

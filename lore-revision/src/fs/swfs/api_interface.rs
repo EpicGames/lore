@@ -226,7 +226,7 @@ impl SwfsInterface {
         _token: SwfsExecutionToken,
         _apply_changes: bool,
         _written_paths: &DashSet<RelativePathKey>,
-        _held_deleted: &DashSet<RelativePathKey>,
+        _removals: &crate::fs::swfs::state::ThawRemovals,
         _operation: OperationGuard,
     ) -> Result<OperationGuard, SwfsInterfaceError> {
         Err(Self::no_swfs_error())
@@ -316,6 +316,7 @@ mod swfs_impl {
     use crate::fs::swfs::paths::SwfsPath;
     use crate::fs::swfs::renamed_at_risk::note_move;
     use crate::fs::swfs::served_tree::ServedTree;
+    use crate::fs::swfs::state::ThawRemovals;
     use crate::fs::swfs::state::written_files;
     use crate::lore_debug;
     use crate::lore_warn;
@@ -381,8 +382,8 @@ mod swfs_impl {
         /// the guard of the operation once SWFS has finished the thaw and the mount is thawed, so
         /// the operation goes on holding the mount while it finishes its work there. Where SWFS
         /// can't finish it, the mount stays frozen, and the thaw is kept for the next
-        /// [`Self::freeze`] to finish. A path in `held_deleted`, which SWFS holds deleted, is not
-        /// named, as its entry would make it something that exists.
+        /// [`Self::freeze`] to finish. The paths in `removals` are named as [`written_files`]
+        /// names them.
         ///
         /// The thaw is always attempted. Where the files to apply can't be described, the thaw
         /// applies none, which changes nothing SWFS shows, and the failure is returned, so the
@@ -397,11 +398,11 @@ mod swfs_impl {
             token: SwfsExecutionToken,
             apply_changes: bool,
             written_paths: &DashSet<RelativePathKey>,
-            held_deleted: &DashSet<RelativePathKey>,
+            removals: &ThawRemovals,
             operation: OperationGuard,
         ) -> Result<OperationGuard, SwfsWorkError> {
             let (files, served, named, described) = match self
-                .describe_written(token, apply_changes, written_paths, held_deleted)
+                .describe_written(token, apply_changes, written_paths, removals)
                 .await
             {
                 Ok((files, served, named)) => {
@@ -546,8 +547,8 @@ mod swfs_impl {
         /// Reloads the state the mount serves, whatever `apply_changes` is, so the mount serves the
         /// state the operation left, then returns the files a thaw applies for the changes to
         /// `written_paths`, described as that state holds them, none unless `apply_changes`, and
-        /// the tree they are described from, and the paths it names other than as directories. A
-        /// path in `held_deleted` is not named.
+        /// the tree they are described from, and the paths it names other than as directories. The
+        /// paths in `removals` are named as [`written_files`] names them.
         ///
         /// The modified-file record moves to the state reloaded, rather than being emptied by it,
         /// until the thaw is applied to it ([`ModifiedTree::end_thaw`]).
@@ -556,7 +557,7 @@ mod swfs_impl {
             token: SwfsExecutionToken,
             apply_changes: bool,
             written_paths: &DashSet<RelativePathKey>,
-            held_deleted: &DashSet<RelativePathKey>,
+            removals: &ThawRemovals,
         ) -> Result<DescribedThaw, SwfsWorkError> {
             let file_time: u64;
             #[cfg(target_os = "windows")]
@@ -625,7 +626,7 @@ mod swfs_impl {
                     &mut files,
                     &served,
                     self.resources.mount_path(),
-                    held_deleted,
+                    removals,
                     &self.resources.take_removed_below_mounts(),
                     written_paths,
                     file_time,

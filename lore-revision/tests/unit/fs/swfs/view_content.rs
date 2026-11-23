@@ -428,3 +428,67 @@ async fn an_untrusted_record_answers_no_content_and_leaves_none_to_the_mount() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn the_origin_of_a_renamed_file_is_found_only_for_a_named_destination() {
+    in_context(async {
+        let f = fixture(
+            &[],
+            vec![],
+            FakeFrozen::default()
+                .with_unreadable_file(r"\b.txt", 4)
+                .with_move(r"\a.txt", r"\b.txt")
+                .with_unreadable_file(r"\other.txt", 4)
+                .with_move(r"\elsewhere.txt", r"\other.txt"),
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            f.view.origins_of_renamed_files(&[node("b.txt")]),
+            vec![node("a.txt")]
+        );
+        // In any spelling, as the mount names it.
+        assert_eq!(
+            f.view.origins_of_renamed_files(&[node("B.txt")]),
+            vec![node("a.txt")]
+        );
+        assert!(f.view.origins_of_renamed_files(&[node("c.txt")]).is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_origin_of_a_renamed_directory_is_not_found() {
+    in_context(async {
+        // Only a file's origin is named.
+        let f = fixture(
+            &[],
+            vec![],
+            FakeFrozen::default()
+                .with_directory(r"\e")
+                .with_move(r"\d", r"\e"),
+            true,
+        )
+        .await;
+
+        assert!(f.view.origins_of_renamed_files(&[node("e")]).is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_rename_swfs_froze_nothing_at_has_no_origin_found() {
+    in_context(async {
+        let f = fixture(
+            &[],
+            vec![],
+            FakeFrozen::default().with_move(r"\a.txt", r"\b.txt"),
+            true,
+        )
+        .await;
+
+        assert!(f.view.origins_of_renamed_files(&[node("b.txt")]).is_empty());
+    })
+    .await;
+}

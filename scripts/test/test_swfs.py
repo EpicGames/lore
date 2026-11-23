@@ -1132,6 +1132,57 @@ def test_swfs_a_sync_keeps_the_users_file_where_the_revision_adds_a_directory(
 @pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
 @pytest.mark.swfs
 @pytest.mark.smoke
+def test_swfs_a_file_renamed_again_after_its_rename_is_committed_keeps_its_contents(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"a.txt": "alpha\n", "other.txt": "other\n"})
+    swfs_repo = _swfs_clone(original_repo)
+
+    os.rename(os.path.join(swfs_repo.path, "a.txt"), os.path.join(swfs_repo.path, "b.txt"))
+    swfs_repo.stage(".", scan=True)
+    swfs_repo.commit(message="rename a to b")
+
+    # SWFS reads the bytes of a file renamed without changes from where it lists the file as
+    # renamed from: the commit's thaw names that origin, so a later rename comes from `b.txt`,
+    # which the revision holds, not from `a.txt`, which it no longer does.
+    os.rename(os.path.join(swfs_repo.path, "b.txt"), os.path.join(swfs_repo.path, "c.txt"))
+    with open(os.path.join(swfs_repo.path, "c.txt")) as held:
+        assert held.read() == "alpha\n"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_commit_of_a_deletion_keeps_a_file_made_at_the_path_since_it_was_staged(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first", {"a.txt": "a\n", "d/x.txt": "x\n", "other.txt": "other\n"}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+
+    os.remove(os.path.join(swfs_repo.path, "a.txt"))
+    os.remove(os.path.join(swfs_repo.path, "d", "x.txt"))
+    os.rmdir(os.path.join(swfs_repo.path, "d"))
+    swfs_repo.stage(".", scan=True)
+    # As on a plain instance, a file made where a staged deletion stands is the user's, which
+    # the commit of the deletion leaves as an addition.
+    swfs_repo.write_files({"a.txt": "made again\n"})
+    swfs_repo.commit(message="delete a and d")
+
+    with open(os.path.join(swfs_repo.path, "a.txt")) as held:
+        assert held.read() == "made again\n"
+    # The deleted directory leaves nothing behind, not even an empty file.
+    assert not os.path.lexists(os.path.join(swfs_repo.path, "d"))
+    scanned = swfs_repo.status(scan=True)
+    assert "a.txt" in scanned, scanned
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
 def test_swfs_stage_with_a_scan_and_commit_make_swfs_fetch_nothing_for_unchanged_files(
     new_lore_repo, background_lore_service
 ):
@@ -1969,6 +2020,202 @@ def test_swfs_a_renamed_file_keeps_its_content_when_a_new_file_at_its_origin_is_
         assert renamed.read() == "the original contents of a"
     with swfs_repo.open_file("a.txt", "r") as new:
         assert new.read() == "new"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_reverting_the_add_of_a_file_written_through_the_mount_removes_it(
+    new_lore_repo, background_lore_service
+):
+    """A revert removes the file in its own operation and commits the removal in the next, where
+    SWFS holds no deletion of the file for the commit to clear: an entry naming the path would
+    leave an empty file behind (ADR-00032)."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"a.txt": "a"})
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.write_files({"added.txt": "added"}, flush_writes=True)
+    swfs_repo.stage("added.txt")
+    swfs_repo.commit(message="add added.txt")
+
+    swfs_repo.revision_revert(revision=swfs_repo.history()[-1].signature, message="revert the add")
+
+    assert not swfs_repo.file_exists("added.txt")
+    with swfs_repo.open_file("a.txt", "r") as kept:
+        assert kept.read() == "a"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_committed_directory_deletion_lets_the_directory_come_back(
+    new_lore_repo, background_lore_service
+):
+    """A directory deleted whole is committed as one node, its files not walked. The commit's thaw
+    names the directory and each deletion SWFS lists below it: one left listed reads a later
+    thaw's entry for the path, which describes the file again, as the deletion to commit, and the
+    directory never comes back."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first", {"Dir/a.txt": "a", "Dir/Sub/B.txt": "b", "kept.txt": "k"}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.branch_create("delete-dir")
+    swfs_repo.rmtree("Dir")
+    swfs_repo.stage(".", scan=True)
+    swfs_repo.commit(message="delete dir")
+    assert not swfs_repo.path_exists("Dir")
+
+    swfs_repo.branch_switch("main")
+
+    with swfs_repo.open_file("Dir/a.txt", "r") as a:
+        assert a.read() == "a"
+    with swfs_repo.open_file("Dir/Sub/B.txt", "r") as b:
+        assert b.read() == "b"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_file_deleted_after_it_was_staged_comes_back(
+    new_lore_repo, background_lore_service
+):
+    """A commit removes a staged file the working tree no longer holds, and its thaw names the
+    deletion SWFS lists there as it does one staged as deleted: one left listed keeps the file
+    off the mount when a later operation restores it."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"a.txt": "a", "kept.txt": "k"})
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.branch_create("delete-file")
+    swfs_repo.write_files({"a.txt": "changed"}, flush_writes=True)
+    swfs_repo.stage("a.txt")
+    swfs_repo.remove_file("a.txt")
+    swfs_repo.commit(message="delete a staged file")
+    assert not swfs_repo.file_exists("a.txt")
+
+    swfs_repo.branch_switch("main")
+
+    with swfs_repo.open_file("a.txt", "r") as a:
+        assert a.read() == "a"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_directory_deleted_after_a_file_in_it_was_staged_comes_back(
+    new_lore_repo, background_lore_service
+):
+    """A commit removes a staged directory the working tree no longer holds, with all it held,
+    where everything in it was staged, and its thaw names the directory and each deletion SWFS
+    lists below it."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first", {"Dir/a.txt": "a", "Dir/Sub/B.txt": "b", "kept.txt": "k"}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.branch_create("delete-dir")
+    swfs_repo.write_files({"Dir/a.txt": "changed", "Dir/Sub/B.txt": "changed"}, flush_writes=True)
+    swfs_repo.stage(".", scan=True)
+    swfs_repo.rmtree("Dir")
+    swfs_repo.commit(message="delete a staged directory")
+    assert not swfs_repo.path_exists("Dir")
+
+    swfs_repo.branch_switch("main")
+
+    with swfs_repo.open_file("Dir/a.txt", "r") as a:
+        assert a.read() == "a"
+    with swfs_repo.open_file("Dir/Sub/B.txt", "r") as b:
+        assert b.read() == "b"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_file_renamed_after_it_was_staged_keeps_its_contents(
+    new_lore_repo, background_lore_service
+):
+    """A commit removes a staged file the user renamed since, and names the deletion SWFS lists
+    at its path, which is where SWFS lists the renamed file as coming from: the renamed file
+    holds bytes of its own, and keeps them."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"a.txt": "a", "kept.txt": "k"})
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.branch_create("rename-file")
+    swfs_repo.write_files({"a.txt": "changed"}, flush_writes=True)
+    swfs_repo.stage("a.txt")
+    os.rename(os.path.join(swfs_repo.path, "a.txt"), os.path.join(swfs_repo.path, "b.txt"))
+    swfs_repo.commit(message="delete a staged file renamed since")
+
+    assert not swfs_repo.file_exists("a.txt")
+    with swfs_repo.open_file("b.txt", "r") as b:
+        assert b.read() == "changed"
+    scanned = parse_status_json(swfs_repo.status(json=True, scan=True))
+    assert [(e["path"].replace("\\", "/"), e["action"]) for e in scanned] == [("b.txt", "add")]
+
+    swfs_repo.branch_switch("main")
+
+    with swfs_repo.open_file("a.txt", "r") as a:
+        assert a.read() == "a"
+    with swfs_repo.open_file("b.txt", "r") as b:
+        assert b.read() == "changed"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_staged_file_deleted_with_its_directory_leaves_the_rest_deleted(
+    new_lore_repo, background_lore_service
+):
+    """A commit removes a staged file the user deleted with its directory, and leaves the
+    directory, which holds a file that was not staged: the thaw names the file alone, and a
+    scan still finds the rest of the directory deleted."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push(
+        "first", {"Dir/a.txt": "a", "Dir/kept.txt": "k", "top.txt": "t"}
+    )
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.write_files({"Dir/a.txt": "changed"}, flush_writes=True)
+    swfs_repo.stage("Dir/a.txt")
+    swfs_repo.rmtree("Dir")
+    swfs_repo.commit(message="delete a staged file")
+
+    assert not swfs_repo.path_exists("Dir")
+    scanned = parse_status_json(swfs_repo.status(json=True, scan=True))
+    assert sorted(e["path"].replace("\\", "/") for e in scanned if e["action"] == "delete") == [
+        "Dir",
+        "Dir/kept.txt",
+    ]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_a_directory_moved_back_after_its_move_was_staged_stays_as_committed(
+    new_lore_repo, background_lore_service
+):
+    """A commit leaves out the staged move of a directory the user moved back, and the
+    directory reads as committed, with nothing left at the path it was moved to."""
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"Dir/a.txt": "a", "top.txt": "t"})
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.branch_create("move-back")
+    swfs_repo.move("Dir", "Moved")
+    swfs_repo.write_files({"top.txt": "changed"}, flush_writes=True)
+    swfs_repo.stage_move("Dir", "Moved")
+    swfs_repo.stage("top.txt")
+    swfs_repo.move("Moved", "Dir")
+    swfs_repo.commit(message="change top")
+
+    assert not swfs_repo.path_exists("Moved")
+    with swfs_repo.open_file("Dir/a.txt", "r") as a:
+        assert a.read() == "a"
+    assert parse_status_json(swfs_repo.status(json=True, scan=True)) == []
+
+    swfs_repo.branch_switch("main")
+
+    assert not swfs_repo.path_exists("Moved")
+    with swfs_repo.open_file("Dir/a.txt", "r") as a:
+        assert a.read() == "a"
 
 
 # What an operation logs for each renamed file it gives bytes of its own (`renamed_at_risk`).

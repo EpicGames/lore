@@ -4036,11 +4036,16 @@ fn commit_child(
         walk.discard.write().push((child_node_id, child_node.flags));
         frame.holds_deletion = true;
         if child_node.flags & NodeFlags::File != 0 {
+            walk.operation.committed_removal(&relative_path);
             walk.stats
                 .complete
                 .file_total
                 .fetch_add(1, Ordering::Relaxed);
         } else {
+            // A deleted directory, or a link's mount path, which is one on the mount: named only
+            // where the mount holds it deleted, as an entry naming one it does not makes it an
+            // empty file.
+            walk.operation.committed_tree_removal(&relative_path);
             walk.stats
                 .complete
                 .directory_total
@@ -4215,6 +4220,12 @@ impl Gone {
 /// such a directory, for [`commit_discard`] to record and free. `walk_root` is the node the walk
 /// starts at, which never leaves, and its working-tree path. Answers the sorted nodes the revision
 /// holds nothing at the walk's path of: those that leave and the directories that go back.
+///
+/// `operation` is told the path of each gone file and of the topmost directory of those that leave
+/// together, as it is those of what was staged as deleted
+/// ([`InstanceOperationImpl::committed_removal`],
+/// [`InstanceOperationImpl::committed_tree_removal`]): the revision holds nothing at a gone
+/// file's path whether the file leaves or goes back to its committed one.
 #[allow(clippy::too_many_arguments)]
 async fn commit_gone(
     operation: &InstanceOperationImpl,
@@ -4257,6 +4268,7 @@ async fn commit_gone(
     let mut roots = Vec::with_capacity(files.len());
     let mut moved = Vec::new();
     for (node, path) in files {
+        operation.committed_removal(&path);
         let record = state
             .node(repository.clone(), node)
             .await
@@ -4290,7 +4302,7 @@ async fn commit_gone(
         ))
         .await?;
     }
-    let mut on_disk = Box::pin(gone_directories(
+    let (mut on_disk, gone_paths) = Box::pin(gone_directories(
         operation,
         repository,
         state,
@@ -4319,6 +4331,14 @@ async fn commit_gone(
         .collect();
     topmost.sort_unstable();
     topmost.dedup();
+    for top in &topmost {
+        let path = gone_paths.get(top);
+        debug_assert!(path.is_some(), "a directory that leaves has its path");
+        if let Some(path) = path {
+            operation.committed_tree_removal(path);
+        }
+    }
+    drop(gone_paths);
     let (gone_below, kept) = if returned.is_empty() {
         drop(added_tops);
         let mut gone_below = Vec::new();
@@ -4937,8 +4957,9 @@ struct Holder {
 /// Finds what the working tree holds of each directory of `starts`, and of those above it: the
 /// directories of `starts` read side by side ([`directories_held`]), but for one a file it sent
 /// showed held ([`Holder`]), then the parents of those it no longer holds, a level at a time, up
-/// to the first held one. Answers what it found of each directory, nothing where the working tree
-/// holds every one of `starts`. `walk_root`, the node the walk starts at, and the root are held.
+/// to the first held one. Answers what it found of each directory, with the path of each that may
+/// leave, and nothing where the working tree holds every one of `starts`. `walk_root`, the node
+/// the walk starts at, and the root are held.
 /// Boxed by [`commit_gone`], whose future it would outgrow.
 ///
 /// A directory the working tree no longer holds leaves only where it is staged, if only for a node
@@ -4956,7 +4977,7 @@ async fn gone_directories(
     state: &State,
     walk_root: NodeID,
     mut starts: Vec<Holder>,
-) -> Result<HashMap<NodeID, OnDisk>, CommitError> {
+) -> Result<(HashMap<NodeID, OnDisk>, HashMap<NodeID, RelativePath>), CommitError> {
     starts.sort_unstable_by_key(|holder| holder.node);
     starts.dedup_by(|later, kept| {
         let same = later.node == kept.node;
@@ -4977,9 +4998,10 @@ async fn gone_directories(
     }
     let mut frontier = read_held(operation, frontier, &mut on_disk).await?;
     if frontier.is_empty() {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), HashMap::new()));
     }
     let mut up = HashMap::new();
+    let mut paths = HashMap::new();
     let mut holding = Vec::new();
     let mut linked = None;
     let filter = &repository.filter;
@@ -5016,6 +5038,7 @@ async fn gone_directories(
             if parent != walk_root && parent != ROOT_NODE && !on_disk.contains_key(&parent) {
                 parents.push((parent, path.parent_path()));
             }
+            paths.insert(directory, path);
         }
         parents.sort_unstable_by_key(|&(node, _)| node);
         parents.dedup_by_key(|(node, _)| *node);
@@ -5045,7 +5068,7 @@ async fn gone_directories(
             on_disk.insert(below, OnDisk::Below(top));
         }
     }
-    Ok(on_disk)
+    Ok((on_disk, paths))
 }
 
 /// Holds each gone directory of `holding`, staged only for what lies below it and holding a child
@@ -5991,11 +6014,12 @@ pub(crate) fn merged_past_the_view(
 }
 
 /// Commits one file node, recording the modified time it read the file at and telling the
-/// operation what it stored ([`InstanceOperation::stored`]). A file whose content is taken from
-/// the staged node ([`takes_staged_content`]) records and tells nothing. A file the working tree
-/// no longer holds at its spelling, a directory standing there or nothing, is answered as gone
-/// ([`gone_file`]), for [`commit_gone`], which refuses one held under another case
-/// ([`refuse_case_variants`]).
+/// operation what it stored ([`InstanceOperation::stored`]) and that the revision now holds what
+/// the working tree holds at the path ([`InstanceOperationImpl::committed_path`]). A file whose
+/// content is taken from the staged node ([`takes_staged_content`]) records and tells nothing. A
+/// file the working tree no longer holds at its spelling, a directory standing there or nothing,
+/// is answered as gone ([`gone_file`]), for [`commit_gone`], which refuses one held under another
+/// case ([`refuse_case_variants`]).
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -6100,6 +6124,7 @@ fn commit_file(
                 };
             let mode = info.mode(node.mode);
             operation.stored(&relative_path, address, size_content, mode, info.mtime());
+            operation.committed_path(&relative_path);
 
             (address, size_content, mode, Some(info.mtime()))
         };

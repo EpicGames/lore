@@ -3,6 +3,7 @@
 
 mod absent_paths;
 mod callback_counters;
+mod committed_removals;
 mod fake_frozen;
 mod file;
 mod frozen_files;

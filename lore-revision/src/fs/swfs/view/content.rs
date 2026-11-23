@@ -159,6 +159,21 @@ impl SwfsView {
             .is_some())
     }
 
+    /// The origin of each rename of a file SWFS lists whose destination is in `paths`. A
+    /// directory's origin is left out.
+    pub fn origins_of_renamed_files(&self, paths: &[RelativePath]) -> Vec<RelativePath> {
+        paths
+            .iter()
+            .filter(|path| {
+                self.snapshot
+                    .get(path)
+                    .is_some_and(|file| !file.is_directory)
+            })
+            .filter_map(|path| self.snapshot.origin_of(path))
+            .filter_map(|origin| RelativePath::new_from_initial_path(origin).ok())
+            .collect()
+    }
+
     /// Where `path` was moved from, where SWFS lists a directory above it as moved.
     pub fn moved_from(&self, path: &RelativePath) -> Option<RelativePath> {
         self.snapshot.moved_from(path)

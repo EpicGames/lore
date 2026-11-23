@@ -34,6 +34,7 @@ use crate::fs::filesystem_provider::StaticDispatchInstanceOperation;
 use crate::fs::os::OsFilesystem;
 use crate::fs::os::OsOperation;
 use crate::fs::swfs::api_interface::SwfsInterface;
+use crate::fs::swfs::api_interface::swfs_api::SWFSNodeModFlag_Deleted;
 use crate::fs::swfs::callback_counters::CallbackMark;
 use crate::fs::swfs::frozen_files::FrozenSnapshot;
 use crate::fs::swfs::frozen_files::SwfsFrozenReader;
@@ -44,6 +45,7 @@ use crate::fs::swfs::mount_io::MountIo;
 use crate::fs::swfs::mount_resources::SwfsExecutionToken;
 use crate::fs::swfs::operation_lock::OperationGuard;
 use crate::fs::swfs::paths::RelativePathKey;
+use crate::fs::swfs::paths::SwfsPath;
 use crate::fs::swfs::paths::at_or_below;
 use crate::fs::swfs::paths::rest_below_exactly;
 use crate::fs::swfs::record_diff;
@@ -53,6 +55,9 @@ use crate::fs::swfs::served_tree::Served;
 use crate::fs::swfs::served_tree::ServedMount;
 use crate::fs::swfs::served_tree::ServedTree;
 use crate::fs::swfs::served_tree::mount_changes;
+use crate::fs::swfs::state::ListedDeletions;
+use crate::fs::swfs::state::ThawRemovals;
+use crate::fs::swfs::state::name_committed_removals;
 use crate::fs::swfs::state::tracked_file_info;
 use crate::fs::swfs::view::ContentAnswer;
 use crate::fs::swfs::view::HoldsAnswer;
@@ -154,7 +159,7 @@ impl SwfsFilesystem {
                         SwfsExecutionToken {},
                         false,
                         &DashSet::new(),
-                        &DashSet::new(),
+                        &ThawRemovals::default(),
                         operation,
                     )
                     .await
@@ -297,9 +302,16 @@ pub struct SwfsOperation {
     /// The paths [`InstanceOperation::remove`] removed as intents: each alone, not with what lies
     /// below it, as it would have from disk.
     removed_singly: DashSet<RelativePathKey>,
-    /// The paths a commit told the operation it stored or removed, which the thaw names once the
-    /// commit is known to have succeeded.
+    /// The paths a commit told the operation it stored, which the thaw names once the commit is
+    /// known to have succeeded.
     committed: DashSet<RelativePathKey>,
+    /// The files a commit told the operation it deleted. Once the commit is known to have
+    /// succeeded, the thaw names each SWFS lists as deleted, or the deleted directory it lay in,
+    /// unless SWFS froze something there since.
+    committed_removed: DashSet<RelativePathKey>,
+    /// The directories a commit told the operation it deleted with all they held, of which the
+    /// thaw names what SWFS lists as deleted at and below each.
+    committed_removed_trees: DashSet<RelativePathKey>,
     /// The files SWFS froze, unmoved, that a comparison found holding the content each names, and
     /// its size: the thaw ending a successful operation names each where the state it describes
     /// from holds that content, so SWFS and the record drop a file the user changed back
@@ -668,6 +680,8 @@ impl SwfsOperation {
             removed_subtrees: Default::default(),
             removed_singly: Default::default(),
             committed: Default::default(),
+            committed_removed: Default::default(),
+            committed_removed_trees: Default::default(),
             unchanged: Default::default(),
             removed_on_mount: Default::default(),
             recreated_mounts: Default::default(),
@@ -1914,11 +1928,31 @@ impl SwfsOperation {
         self.leaves_changes_unwritten.store(true, Ordering::Release);
     }
 
-    /// Notes that a commit stored or removed `path`, which the thaw then describes as the
-    /// revision it committed holds it.
+    /// Notes that a commit stored `path`, which the thaw then describes as the revision it
+    /// committed holds it.
     pub(crate) fn committed_path(&self, path: &RelativePath) {
         if !path.is_empty() {
             self.committed.insert(RelativePathKey(path.clone()));
+        }
+    }
+
+    /// Notes that a commit deleted the file at `path`. The thaw then names it as holding nothing
+    /// where SWFS lists it as deleted, or names the deleted directory it lay in, where the
+    /// revision it committed holds nothing there and SWFS froze nothing there since: what it
+    /// froze is the user's.
+    pub(crate) fn committed_removal(&self, path: &RelativePath) {
+        if !path.is_empty() {
+            self.committed_removed.insert(RelativePathKey(path.clone()));
+        }
+    }
+
+    /// Notes that a commit deleted the directory at `path` and all it held. The thaw names what SWFS
+    /// lists as deleted there, the directory and each path below it, and nothing where SWFS lists no
+    /// deletion: an entry naming a path SWFS does not hold deleted makes an empty file of it.
+    pub(crate) fn committed_tree_removal(&self, path: &RelativePath) {
+        if !path.is_empty() {
+            self.committed_removed_trees
+                .insert(RelativePathKey(path.clone()));
         }
     }
 
@@ -2091,14 +2125,41 @@ impl SwfsOperation {
         })
     }
 
-    /// Notes in `held_deleted` each path the thaw is to describe that SWFS holds deleted: a path
+    /// The paths SWFS lists as deleted (`swfsGetModifiedFileList`), as a thaw entry naming one
+    /// commits it. `None` where SWFS cannot list them: nothing the commit removed is then named,
+    /// as an entry naming a path SWFS does not list as deleted makes an empty file of it. The
+    /// thaw that follows lists them again to describe what the operation wrote, and fails where
+    /// it cannot either.
+    fn deletions_swfs_lists(&self) -> Option<ListedDeletions> {
+        let listed = match self.mount.modified_files() {
+            Ok(listed) => listed,
+            Err(error) => {
+                lore_warn!(
+                    "Unable to list the deletions SWFS holds, so the thaw names nothing the \
+                     commit removed: {error}"
+                );
+                return None;
+            }
+        };
+        Some(
+            listed
+                .iter()
+                .filter(|file| file.mod_flags & SWFSNodeModFlag_Deleted != 0)
+                .filter_map(|file| SwfsPath(&file.path).node_path().ok())
+                .map(|path| (path.0.as_lowercase_str().to_owned(), path.0))
+                .collect(),
+        )
+    }
+
+    /// Notes in `removals.held_deleted` each path the thaw is to describe that SWFS holds deleted,
+    /// other than one a commit removed, which the thaw names: a path
     /// SWFS holds deleted, as a directory it keeps listed after the user deleted it, is not named
     /// in the thaw, whose entry would make it something that exists. Asks the record as the
     /// operation left it: called before realizing, which may rebuild an untrusted record and
     /// notes as created a deleted path it leaves the thaw to bring back. Loading the new revision
     /// moves the record rather than emptying it, as [`ModifiedTree::begin_thaw`] has begun the
     /// thaw.
-    async fn note_held_deleted(&self, held_deleted: &DashSet<RelativePathKey>) {
+    async fn note_held_deleted(&self, removals: &mut ThawRemovals) {
         let paths: Vec<RelativePath> = self
             .touched_nodes
             .iter()
@@ -2106,7 +2167,8 @@ impl SwfsOperation {
             .collect();
         let record = self.mount.resources().modified().clone();
         for path in paths {
-            if held_deleted.contains(&RelativePathKey(path.clone())) {
+            let key = RelativePathKey(path.clone());
+            if removals.held_deleted.contains(&key) || removals.committed.contains(&key) {
                 continue;
             }
             if record
@@ -2114,7 +2176,7 @@ impl SwfsOperation {
                 .await
                 .is_ok_and(|coverage| coverage == Coverage::Deleted)
             {
-                held_deleted.insert(RelativePathKey(path));
+                removals.held_deleted.insert(key);
             }
         }
     }
@@ -2202,30 +2264,64 @@ impl SwfsOperation {
         // after the operation realizing it ran, is described again whether or not this operation
         // wrote anything.
         let changes_made = changes_made || self.mounts_moved().await || !self.unchanged.is_empty();
-        // What a commit removed is no more a path to name than one SWFS holds deleted: the commit is
-        // SWFS's own deletion made a revision's, and an entry naming it reads to SWFS as something
-        // that exists.
-        let held_deleted: DashSet<RelativePathKey> = self
-            .removed_on_mount
-            .iter()
-            .map(|removed| removed.clone())
-            .collect();
         // What a commit stored, named in the thaw only if the commit went through: SWFS takes a path a
         // thaw names off its list of what is modified, and a failed commit changed no revision, so
         // the file is still the user's edit.
+        let committed: Vec<RelativePath> =
+            self.committed.iter().map(|path| path.0.clone()).collect();
+        self.committed.clear();
+        let committed_removed: Vec<RelativePath> = self
+            .committed_removed
+            .iter()
+            .map(|path| path.0.clone())
+            .collect();
+        self.committed_removed.clear();
+        let committed_removed_trees: Vec<RelativePath> = self
+            .committed_removed_trees
+            .iter()
+            .map(|path| path.0.clone())
+            .collect();
+        self.committed_removed_trees.clear();
+        // What the operation removed from the mount itself is no more a path to name than one SWFS
+        // holds deleted: an entry naming it reads to SWFS as something that exists.
+        let mut removals = ThawRemovals::default();
+        for removed in self.removed_on_mount.iter() {
+            removals.held_deleted.insert(removed.clone());
+        }
         if succeeded {
-            for path in self.committed.iter() {
-                held_deleted.insert(path.clone());
-                // What lies below a directory the commit deleted went with it, so it is the commit's to
-                // leave, not a change the operation left alone to keep.
-                self.removed_trees.insert(path.clone());
-                self.record_written(&path.0);
+            // A file the commit took in renamed leaves SWFS listing where it came from as deleted,
+            // which pairs with its next rename as its origin, a path the revision may no longer
+            // hold: SWFS then reads its bytes from a source that holds none. Named, the origin
+            // comes off the list. An origin the user made something at again is not listed, as
+            // SWFS drops the deletion then.
+            let origins = self.view.origins_of_renamed_files(&committed);
+            // Only a deletion SWFS lists is committed by an entry naming it. Any other, as one an
+            // earlier operation's thaw made, or the merge resolve that removed a file the merge
+            // wrote, has nothing for the entry to clear, and SWFS makes it an empty file. What
+            // SWFS froze at a path the commit deleted, as a file the user made there since the
+            // deletion was staged, is the user's, and naming the path would drop it.
+            let anything_removed = !committed_removed.is_empty()
+                || !origins.is_empty()
+                || !committed_removed_trees.is_empty();
+            if anything_removed && let Some(listed) = self.deletions_swfs_lists() {
+                name_committed_removals(
+                    &mut removals,
+                    &listed,
+                    committed_removed.into_iter().chain(origins),
+                    &committed_removed_trees,
+                    |path| self.view.frozen_info(path).is_some(),
+                );
+                for named in &removals.committed {
+                    self.record_written(&named.0);
+                }
+            }
+            for path in committed {
+                self.record_written(&path);
             }
         }
-        self.committed.clear();
         // Thawed whether or not realizing succeeds, so a failure never leaves the mount frozen.
         let realized = if changes_made {
-            self.note_held_deleted(&held_deleted).await;
+            self.note_held_deleted(&mut removals).await;
             self.realize_what_the_revision_does_not_hold().await
         } else {
             Ok(())
@@ -2247,7 +2343,7 @@ impl SwfsOperation {
                 token,
                 changes_made,
                 &self.touched_nodes,
-                &held_deleted,
+                &removals,
                 operation,
             )
             .await

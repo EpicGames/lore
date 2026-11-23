@@ -22,6 +22,7 @@ use lore_revision::fs::swfs::served_tree::MountChange;
 use lore_revision::fs::swfs::served_tree::Served;
 use lore_revision::fs::swfs::served_tree::ServedTree;
 use lore_revision::fs::swfs::served_tree::mount_changes;
+use lore_revision::fs::swfs::state::ThawRemovals;
 use lore_revision::fs::swfs::state::written_files;
 use lore_revision::fs::swfs::view::ContentAnswer;
 use lore_revision::fs::swfs::view::ListingAnswer;
@@ -494,6 +495,62 @@ fn mount_holding(test: &str, files: &[&str]) -> std::path::PathBuf {
     mount
 }
 
+/// A commit's removal is spelled as SWFS lists it, here below the spelling `Dir` had before the
+/// user renamed it, and `gone` is a directory the user deleted that the revision still holds: an
+/// entry naming either directory would respell the one and commit the deletion of the other.
+#[tokio::test]
+async fn the_directories_leading_to_what_a_commit_removed_are_not_named() {
+    in_context(async {
+        let fixture = Fixture::new().await;
+        let current = fixture
+            .state(&[
+                ("DIR/kept.txt", Held::File(b"kept")),
+                ("gone/kept.txt", Held::File(b"kept")),
+            ])
+            .await;
+        let tree = fixture.tree(current, None, &[]).await;
+        let written = DashSet::new();
+        let mut removals = ThawRemovals::default();
+        for path in ["dir/removed.txt", "gone/removed.txt"] {
+            written.insert(RelativePathKey(node(path)));
+            removals.committed.insert(RelativePathKey(node(path)));
+        }
+        written.insert(RelativePathKey(node("DIR/kept.txt")));
+
+        let mount = mount_holding("the_directories_leading_to_a_removal", &[]);
+        let mut files = Vec::new();
+        written_files(
+            &mut files,
+            &tree,
+            &mount,
+            &removals,
+            &DashSet::new(),
+            &written,
+            0,
+        )
+        .await
+        .expect("describing the written paths");
+        std::fs::remove_dir_all(&mount).expect("removing the stand-in mount");
+
+        let mut described: Vec<String> = SwfsFileArray::new(files)
+            .entries()
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .collect();
+        described.sort();
+        assert_eq!(
+            described,
+            [
+                r"\DIR",
+                r"\DIR\kept.txt",
+                r"\dir\removed.txt",
+                r"\gone\removed.txt"
+            ]
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_written_path_below_a_link_is_described_from_the_linked_state() {
     in_context(async {
@@ -517,7 +574,7 @@ async fn a_written_path_below_a_link_is_described_from_the_linked_state() {
             &mut files,
             &tree,
             &mount,
-            &DashSet::new(),
+            &ThawRemovals::default(),
             &DashSet::new(),
             &written,
             0,
@@ -531,9 +588,13 @@ async fn a_written_path_below_a_link_is_described_from_the_linked_state() {
         assert_eq!(
             described,
             vec![
-                ("/gone.txt".to_owned(), false, 0),
-                ("/lib".to_owned(), true, 0),
-                ("/lib/lib.txt".to_owned(), false, b"linked one".len() as u64),
+                (r"\gone.txt".to_owned(), false, 0),
+                (r"\lib".to_owned(), true, 0),
+                (
+                    r"\lib\lib.txt".to_owned(),
+                    false,
+                    b"linked one".len() as u64
+                ),
             ]
         );
         // The link's mount path is described as a directory, which keeps what lies below it.
@@ -554,8 +615,10 @@ async fn a_removed_path_the_mount_holds_nothing_at_or_swfs_holds_deleted_is_not_
         for path in ["gone.txt", "absent.txt", "kept.txt"] {
             written.insert(RelativePathKey(node(path)));
         }
-        let held_deleted = DashSet::new();
-        held_deleted.insert(RelativePathKey(node("kept.txt")));
+        let mut removals = ThawRemovals::default();
+        removals
+            .held_deleted
+            .insert(RelativePathKey(node("kept.txt")));
 
         // `gone.txt` is on the mount, and is named. `absent.txt` is not, and `kept.txt` is held
         // deleted by SWFS, which lists it still: an entry naming either would read to SWFS as
@@ -569,7 +632,7 @@ async fn a_removed_path_the_mount_holds_nothing_at_or_swfs_holds_deleted_is_not_
             &mut files,
             &tree,
             &mount,
-            &held_deleted,
+            &removals,
             &DashSet::new(),
             &written,
             0,
@@ -580,9 +643,48 @@ async fn a_removed_path_the_mount_holds_nothing_at_or_swfs_holds_deleted_is_not_
 
         assert_eq!(
             SwfsFileArray::new(files).entries(),
-            vec![("/gone.txt".to_owned(), false, 0)]
+            vec![(r"\gone.txt".to_owned(), false, 0)]
         );
         assert_eq!(named, vec![node("gone.txt")]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_path_a_commit_removed_is_described_where_the_revision_holds_nothing_there() {
+    in_context(async {
+        let fixture = Fixture::new().await;
+        let current = fixture.state(&[("kept.txt", Held::File(b"kept"))]).await;
+        let tree = fixture.tree(current, None, &[]).await;
+        let written = DashSet::new();
+        let mut removals = ThawRemovals::default();
+        for path in ["origin.txt", "kept.txt"] {
+            written.insert(RelativePathKey(node(path)));
+            removals.committed.insert(RelativePathKey(node(path)));
+        }
+        // SWFS holds `origin.txt` deleted and the mount holds nothing there, yet it is named, which
+        // takes the deletion off SWFS's list. The revision holds `kept.txt`, so the commit did not
+        // take in its removal, and it is not named.
+        let mount = mount_holding("a_path_a_commit_removed", &[]);
+        let mut files = Vec::new();
+        let named = written_files(
+            &mut files,
+            &tree,
+            &mount,
+            &removals,
+            &DashSet::new(),
+            &written,
+            0,
+        )
+        .await
+        .expect("describing the written paths");
+        std::fs::remove_dir_all(&mount).expect("removing the stand-in mount");
+
+        assert_eq!(
+            SwfsFileArray::new(files).entries(),
+            vec![(r"\origin.txt".to_owned(), false, 0)]
+        );
+        assert_eq!(named, vec![node("origin.txt")]);
     })
     .await;
 }

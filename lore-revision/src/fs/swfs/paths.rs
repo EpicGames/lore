@@ -60,6 +60,13 @@ pub fn rest_below_exactly<'a>(path: &'a str, ancestor: &str) -> Option<&'a str> 
     }
 }
 
+/// `path` and each directory above it, deepest first.
+pub fn self_and_ancestors(path: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(Some(path), |path| {
+        path.rsplit_once('/').map(|(parent, _)| parent)
+    })
+}
+
 /// Whether `path` is `ancestor` or lies below it, in any spelling.
 pub fn at_or_below(path: &RelativePath, ancestor: &RelativePath) -> bool {
     rest_below(path.as_str(), ancestor.as_str()).is_some()
@@ -91,8 +98,12 @@ impl SwfsPath<'_> {
         ))
     }
 
+    /// A thaw entry's path, spelled as SWFS spells the paths it lists: backslash separated, from a
+    /// leading backslash. SWFS matches an entry against the deletions it reported by that exact
+    /// spelling, as `swfsThaw` takes the path as given, and an entry naming a deletion spelled any
+    /// other way makes a new, empty file there rather than committing the deletion.
     pub fn c_string_from_relative_path(path: &RelativePath) -> Result<CString, SwfsWorkError> {
-        let result = format!("/{}", path.as_str());
+        let result = format!("\\{}", path.as_str().replace('/', "\\"));
         Ok(CString::new(result).internal("Path contained a null byte")?)
     }
 }
