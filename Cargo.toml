@@ -288,7 +288,8 @@ lto = "off"
 inherits = "release"
 incremental = false
 opt-level = 3
-debug = 2
+# Full debug info more than doubles the memory of the fat-LTO links, and nearly doubles their time.
+debug = "line-tables-only"
 lto = "fat"
 codegen-units = 4
 debug-assertions = false
