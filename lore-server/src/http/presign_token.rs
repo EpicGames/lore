@@ -33,8 +33,9 @@ pub enum PresignTokenError {
     UnknownVersion(u8),
     #[error("token was signed by a different key")]
     KeyIdMismatch,
+    /// The token is authentic but past its expiry; carries its payload.
     #[error("token has expired")]
-    Expired,
+    Expired(Box<PresignTokenPayload>),
 }
 
 pub const CURRENT_TOKEN_VERSION: u8 = 1;
@@ -46,6 +47,14 @@ pub fn sign(payload: &PresignTokenPayload, key: &hmac::Key) -> String {
     let signature = hmac::sign(key, encoded_payload.as_bytes());
     let encoded_sig = URL_SAFE_NO_PAD.encode(signature.as_ref());
     format!("{encoded_payload}.{encoded_sig}")
+}
+
+/// The hex-encoded SHA-256 digest of `token`, which names a token in logs without revealing it.
+pub fn token_hash(token: &str) -> String {
+    hex::encode(ring::digest::digest(
+        &ring::digest::SHA256,
+        token.as_bytes(),
+    ))
 }
 
 /// Verifies a token and returns the payload if valid.
@@ -84,7 +93,7 @@ pub fn verify(
     }
 
     if now_unix >= payload.expires_at {
-        return Err(PresignTokenError::Expired);
+        return Err(PresignTokenError::Expired(Box::new(payload)));
     }
 
     Ok(payload)

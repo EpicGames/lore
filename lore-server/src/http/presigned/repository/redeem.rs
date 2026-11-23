@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use axum::Extension;
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::State;
@@ -17,6 +21,7 @@ use axum::http::header::CONTENT_ENCODING;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::header::InvalidHeaderValue;
 use axum::response::IntoResponse;
+use axum::response::Response;
 use hex::FromHexError;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
@@ -32,9 +37,11 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::mpsc::channel;
 use tokio_stream::wrappers::ReceiverStream;
+use tracing::info;
 
 use crate::http::log_http_error;
 use crate::http::presign_token::PresignTokenError;
+use crate::http::presign_token::token_hash;
 use crate::http::presign_token::verify;
 use crate::http::range::Selection;
 use crate::http::range::range_headers;
@@ -101,16 +108,78 @@ pub struct RedeemQuery {
     pub token: String,
 }
 
-/// Serves the content a presigned token names, or the byte range its `Range` header asks for.
+/// One redemption's log line, written when it drops, so a request abandoned before its response,
+/// as by a timeout, is logged too.
+struct Redemption {
+    token_hash: String,
+    client_ip: Option<IpAddr>,
+    /// Set once the token verifies or fails only as expired.
+    key_id: Option<String>,
+    /// Set once the token verifies or fails only as expired.
+    expires_at: Option<u64>,
+    /// Set once the response is built; absent for a request abandoned before then.
+    status: Option<StatusCode>,
+    /// The response's `Content-Length`; zero for a response with no content.
+    bytes_served: u64,
+}
+
+impl Drop for Redemption {
+    fn drop(&mut self) {
+        info!(
+            key_id = self.key_id,
+            expires_at = self.expires_at,
+            token_hash = self.token_hash,
+            client_ip = self.client_ip.map(tracing::field::display),
+            status = self.status.map(|status| status.as_u16()),
+            bytes_served = self.bytes_served,
+            "Presigned URL redemption"
+        );
+    }
+}
+
+/// Serves the content a presigned token names, or the byte range its `Range` header asks for,
+/// and logs one line per request that carries a token, whatever its outcome.
 ///
 /// Answers `GET` only: the router sends every other method to `reject_non_get`, so it reads
-/// `Range` as a `GET` request's.
+/// `Range` as a `GET` request's. The client IP is the TCP peer's, present only when the server
+/// is served with connect info.
 pub async fn handler(
     State(state): State<Arc<ServerState>>,
     Path((repository_id, address)): Path<(String, String)>,
     Query(query): Query<RedeemQuery>,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, RedeemError> {
+) -> Response {
+    let mut redemption = Redemption {
+        token_hash: token_hash(&query.token),
+        client_ip: connect_info.map(|Extension(ConnectInfo(peer))| peer.ip().to_canonical()),
+        key_id: None,
+        expires_at: None,
+        status: None,
+        bytes_served: 0,
+    };
+    let response = redeem(
+        state,
+        repository_id,
+        address,
+        &query.token,
+        headers,
+        &mut redemption,
+    )
+    .await
+    .into_response();
+    redemption.status = Some(response.status());
+    response
+}
+
+async fn redeem(
+    state: Arc<ServerState>,
+    repository_id: String,
+    address: String,
+    token: &str,
+    headers: HeaderMap,
+    redemption: &mut Redemption,
+) -> Result<(StatusCode, HeaderMap, Body), RedeemError> {
     let presign_config = state
         .presign_config
         .as_ref()
@@ -128,13 +197,18 @@ pub async fn handler(
         .unwrap_or_default()
         .as_secs();
 
-    let payload = verify(
-        &query.token,
-        &presign_config.hmac_key,
-        &presign_config.key_id,
-        now,
-    )
-    .map_err(RedeemError::InvalidToken)?;
+    let verified = verify(token, &presign_config.hmac_key, &presign_config.key_id, now);
+    // An expired token's signature has verified, so its claims are trustworthy enough to log.
+    let claims = match &verified {
+        Ok(payload) => Some(payload),
+        Err(PresignTokenError::Expired(payload)) => Some(&**payload),
+        Err(_) => None,
+    };
+    if let Some(payload) = claims {
+        redemption.key_id = Some(payload.key_id.clone());
+        redemption.expires_at = Some(payload.expires_at);
+    }
+    let payload = verified.map_err(RedeemError::InvalidToken)?;
 
     if payload.repository != repository_id || payload.address != address {
         return Err(RedeemError::TokenMismatch);
@@ -226,6 +300,7 @@ pub async fn handler(
                     .map_err(RedeemError::HeaderGeneration)?,
             );
 
+            redemption.bytes_served = content_length;
             let stream = ReceiverStream::new(rx);
             Ok((status, response_headers, Body::from_stream(stream)))
         })

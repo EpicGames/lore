@@ -99,3 +99,65 @@ async fn returns_400_for_unserializable_header_value() {
     let response = mint(json!({"content_type": "image/png; x=\u{7}"})).await;
     assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
 }
+
+mod handler {
+    use std::sync::Arc;
+
+    use axum::Extension;
+    use axum::Json;
+    use axum::extract::Path;
+    use axum::extract::State;
+    use axum::http::Extensions;
+    use axum::http::HeaderMap;
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt as _;
+    use lore_server::http::presign_token::token_hash;
+    use lore_server::http::repositories::repository::contents::content::presign_repository_content::handler;
+
+    use super::*;
+    use crate::http::test_utils::presign_config;
+    use crate::http::test_utils::put_compressed_content;
+    use crate::http::test_utils::test_state;
+    use crate::log_capture::CapturedLogs;
+
+    /// Minting logs the same token hash a redemption of the URL logs, beside the minter.
+    #[tokio::test]
+    async fn a_minted_url_is_logged_with_its_token_hash_and_minter() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = random::<lore_revision::lore::RepositoryId>();
+                let address = put_compressed_content(immutable_store.clone(), repository).await;
+                let (repository, address) = (format!("{repository}"), format!("{address}"));
+                let state = test_state(immutable_store, mutable_store, Some(presign_config()));
+
+                let (logs, _guard) = CapturedLogs::start();
+                let response = handler(
+                    State(Arc::new(state)),
+                    Path((repository.clone(), address.clone())),
+                    Extension(None),
+                    Extensions::new(),
+                    HeaderMap::new(),
+                    Json(serde_json::from_value(json!({})).unwrap()),
+                )
+                .await
+                .into_response();
+
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let url_suffix = body["url_suffix"].as_str().expect("url_suffix");
+                let (_, token) = url_suffix.split_once("?token=").expect("token in URL");
+                let fields = logs.event("Minted presigned URL");
+                assert_eq!(fields["token_hash"], token_hash(token));
+                assert_eq!(fields["user_id"], "<unknown>");
+                assert_eq!(fields["key_id"], "test_key_id_1234");
+                assert_eq!(fields["repository"], repository);
+                assert_eq!(fields["address"], address);
+                assert_eq!(fields["expires_at"], body["expires_at"]);
+                assert!(!logs.text().contains(token), "{}", logs.text());
+            })
+            .await;
+    }
+}

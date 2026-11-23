@@ -437,9 +437,12 @@ impl LoreHttpServer {
         }
 
         lore_spawn_net!(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(signal)
-                .await
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(signal)
+            .await
         })
         .await??;
 

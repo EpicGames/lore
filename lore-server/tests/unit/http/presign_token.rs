@@ -49,7 +49,7 @@ fn expired_token_returns_expired() {
     // now_unix == expires_at is already expired
     assert_eq!(
         verify(&token, &key, "test_key_id", 100 /* now_unix */),
-        Err(PresignTokenError::Expired)
+        Err(PresignTokenError::Expired(Box::new(payload)))
     );
 }
 

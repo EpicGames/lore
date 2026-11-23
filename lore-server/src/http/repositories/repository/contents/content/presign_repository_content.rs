@@ -24,6 +24,7 @@ use lore_transport::grpc::CORRELATION_ID_HEADER;
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
+use tracing::info;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
@@ -34,6 +35,7 @@ use crate::http::log_http_error;
 use crate::http::presign_token::CURRENT_TOKEN_VERSION;
 use crate::http::presign_token::PresignTokenPayload;
 use crate::http::presign_token::sign;
+use crate::http::presign_token::token_hash;
 use crate::http::server::ServerState;
 use crate::util::get_user_id_from_token;
 use crate::util::setup_execution;
@@ -175,11 +177,8 @@ pub async fn handler(
         .get(CORRELATION_ID_HEADER)
         .and_then(|v| v.to_str().map(str::to_string).ok())
         .unwrap_or_default();
-    let execution = setup_execution(
-        module_path!(),
-        correlation_id,
-        get_user_id_from_token(user_info),
-    );
+    let user_id = get_user_id_from_token(user_info);
+    let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
 
     let immutable_store = state.immutable_store.clone();
 
@@ -224,6 +223,15 @@ pub async fn handler(
             };
 
             let token_str = sign(&payload, &presign_config.hmac_key);
+            info!(
+                user_id,
+                key_id = payload.key_id,
+                repository = payload.repository,
+                address = payload.address,
+                expires_at,
+                token_hash = token_hash(&token_str),
+                "Minted presigned URL"
+            );
 
             let url_suffix = format!("/v1/presigned/{repository_id}/{address}?token={token_str}");
 

@@ -624,6 +624,7 @@ async fn redeem_decodes_the_root_once() {
                     Query(RedeemQuery {
                         token: token.clone(),
                     }),
+                    None,
                     headers,
                 )
                 .await
@@ -634,4 +635,192 @@ async fn redeem_decodes_the_root_once() {
             }
         })
         .await;
+}
+
+mod handler {
+    use std::net::SocketAddr;
+
+    use axum::Extension;
+    use axum::extract::ConnectInfo;
+    use lore_server::http::presign_token::token_hash;
+    use lore_server::http::server::ServerState;
+
+    use super::*;
+    use crate::log_capture::CapturedLogs;
+
+    const MESSAGE: &str = "Presigned URL redemption";
+    const EXPIRES_AT: u64 = 4_000_000_000;
+
+    fn token_expiring_far_ahead(repository: &str, address: &str, config: &PresignConfig) -> String {
+        let payload = PresignTokenPayload {
+            version: CURRENT_TOKEN_VERSION,
+            key_id: config.key_id.clone(),
+            repository: repository.to_string(),
+            address: address.to_string(),
+            expires_at: EXPIRES_AT,
+            content_type: None,
+            content_encoding: None,
+            content_disposition: None,
+        };
+        sign(&payload, &config.hmac_key)
+    }
+
+    /// Redeems `token` for `MISSING_ADDRESS` in `repository` through the handler, with no
+    /// connect info.
+    async fn redeem_missing(state: Arc<ServerState>, repository: &str, token: &str) -> StatusCode {
+        handler(
+            State(state),
+            Path((repository.to_string(), MISSING_ADDRESS.to_string())),
+            Query(RedeemQuery {
+                token: token.to_string(),
+            }),
+            None,
+            HeaderMap::new(),
+        )
+        .await
+        .status()
+    }
+
+    /// Redeems stored content through the handler from a fixed peer, with `range` as the
+    /// request's `Range` header, returning the response status, the token and the captured logs.
+    async fn redeem_from_peer(range: Option<&'static str>) -> (StatusCode, String, CapturedLogs) {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = random::<RepositoryId>();
+                let address = put_compressed_content(immutable_store.clone(), repository).await;
+                let config = presign_config();
+                let (repository, address) = (format!("{repository}"), format!("{address}"));
+                let token = token_expiring_far_ahead(&repository, &address, &config);
+                let state = Arc::new(test_state(immutable_store, mutable_store, Some(config)));
+                let mut headers = HeaderMap::new();
+                if let Some(range) = range {
+                    headers.insert(RANGE, HeaderValue::from_static(range));
+                }
+                let peer: SocketAddr = "192.0.2.7:40000".parse().unwrap();
+
+                let (logs, _guard) = CapturedLogs::start();
+                let response = handler(
+                    State(state),
+                    Path((repository, address)),
+                    Query(RedeemQuery {
+                        token: token.clone(),
+                    }),
+                    Some(Extension(ConnectInfo(peer))),
+                    headers,
+                )
+                .await
+                .into_response();
+                (response.status(), token, logs)
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_served_redemption_logs_the_token_the_peer_and_the_bytes() {
+        let (status, token, logs) = redeem_from_peer(None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let fields = logs.event(MESSAGE);
+        assert_eq!(fields["key_id"], "test_key_id_1234");
+        assert_eq!(fields["expires_at"], EXPIRES_AT);
+        assert_eq!(fields["token_hash"], token_hash(&token));
+        assert_eq!(fields["client_ip"], "192.0.2.7");
+        assert_eq!(fields["status"], 200);
+        assert_eq!(fields["bytes_served"], 64 * 1024);
+        assert!(!logs.text().contains(&token), "{}", logs.text());
+    }
+
+    #[tokio::test]
+    async fn a_ranged_redemption_logs_the_bytes_in_the_range() {
+        let (status, _token, logs) = redeem_from_peer(Some("bytes=0-9")).await;
+
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        let fields = logs.event(MESSAGE);
+        assert_eq!(fields["status"], 206);
+        assert_eq!(fields["bytes_served"], 10);
+    }
+
+    /// An expired token's signature verifies, so its claims are logged beside its hash.
+    #[tokio::test]
+    async fn an_expired_token_is_logged_at_info_with_its_claims() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = format!("{}", random::<RepositoryId>());
+                let config = presign_config();
+                let token = expired_token(&repository, MISSING_ADDRESS, &config);
+                let state = Arc::new(test_state(immutable_store, mutable_store, Some(config)));
+
+                let (logs, _guard) = CapturedLogs::start();
+                let status = redeem_missing(state, &repository, &token).await;
+
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                let fields = logs.event(MESSAGE);
+                assert_eq!(fields["status"], 401);
+                assert_eq!(fields["token_hash"], token_hash(&token));
+                assert_eq!(fields["key_id"], "test_key_id_1234");
+                assert_eq!(fields["expires_at"], 1);
+                assert_eq!(fields["bytes_served"], 0);
+            })
+            .await;
+    }
+
+    /// A token whose signature fails is logged by its hash alone, since nothing it claims can be
+    /// trusted.
+    #[tokio::test]
+    async fn a_forged_token_is_logged_at_info_by_its_hash_alone() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = format!("{}", random::<RepositoryId>());
+                let mut forger = presign_config();
+                forger.hmac_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[1u8; 32]);
+                let token = token_expiring_far_ahead(&repository, MISSING_ADDRESS, &forger);
+                let state = Arc::new(test_state(
+                    immutable_store,
+                    mutable_store,
+                    Some(presign_config()),
+                ));
+
+                let (logs, _guard) = CapturedLogs::start();
+                let status = redeem_missing(state, &repository, &token).await;
+
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                let fields = logs.event(MESSAGE);
+                assert_eq!(fields["status"], 401);
+                assert_eq!(fields["token_hash"], token_hash(&token));
+                assert!(fields["key_id"].is_null(), "{fields}");
+                assert!(fields["expires_at"].is_null(), "{fields}");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_redemption_of_missing_content_is_logged_at_info_with_its_token() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = format!("{}", random::<RepositoryId>());
+                let config = presign_config();
+                let token = token_expiring_far_ahead(&repository, MISSING_ADDRESS, &config);
+                let state = Arc::new(test_state(immutable_store, mutable_store, Some(config)));
+
+                let (logs, _guard) = CapturedLogs::start();
+                let status = redeem_missing(state, &repository, &token).await;
+
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                let fields = logs.event(MESSAGE);
+                assert_eq!(fields["status"], 404);
+                assert_eq!(fields["key_id"], "test_key_id_1234");
+                assert_eq!(fields["expires_at"], EXPIRES_AT);
+                assert_eq!(fields["token_hash"], token_hash(&token));
+                assert_eq!(fields["bytes_served"], 0);
+            })
+            .await;
+    }
 }

@@ -20,6 +20,6 @@ pub struct MakeCorrelationIdSpan;
 impl<B> MakeSpan<B> for MakeCorrelationIdSpan {
     fn make_span(&mut self, request: &http::Request<B>) -> Span {
         let correlation_id = extract_correlation_id(request);
-        info_span!(SPAN_NAME, {CORRELATION_ID} = correlation_id, method = %request.method(), uri = %request.uri())
+        info_span!(SPAN_NAME, {CORRELATION_ID} = correlation_id, method = %request.method(), uri = %request.uri().path())
     }
 }
