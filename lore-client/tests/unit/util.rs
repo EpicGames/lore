@@ -24,3 +24,30 @@ mod termination_signal_tests {
             .expect("a signal delivered before the wait must still end it");
     }
 }
+
+mod rfc2822_display_tests {
+    use lore_client::util::rfc2822_display;
+
+    #[test]
+    fn a_timestamp_displays_as_rfc2822_in_utc() {
+        assert_eq!(
+            rfc2822_display(1_795_351_520_303).as_deref(),
+            Some("Sun, 22 Nov 2026 12:45:20 +0000")
+        );
+    }
+
+    /// The timestamp is read as signed, so the largest one is a millisecond before the epoch.
+    #[test]
+    fn a_timestamp_past_the_signed_range_displays_before_the_epoch() {
+        assert_eq!(
+            rfc2822_display(u64::MAX).as_deref(),
+            Some("Wed, 31 Dec 1969 23:59:59 +0000")
+        );
+    }
+
+    #[test]
+    fn a_timestamp_past_the_year_9999_displays_nothing() {
+        assert_eq!(rfc2822_display(253_402_300_800_000), None);
+        assert_eq!(rfc2822_display(1 << 63), None);
+    }
+}

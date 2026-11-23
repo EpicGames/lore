@@ -6,7 +6,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use chrono::DateTime;
 use clap::Args;
 use clap::Subcommand;
 use lore::branch::LoreBranchMetadataClearArgs;
@@ -758,9 +757,7 @@ fn handle_branch_info(globals: LoreGlobalArgs, args: &BranchInfoArgs) -> u8 {
             );
         }
 
-        if let Some(created) =
-            DateTime::from_timestamp_millis(data.created as i64).map(|time| time.to_rfc2822())
-        {
+        if let Some(created) = util::rfc2822_display(data.created) {
             println!(
                 "  {}Created:{} {created}",
                 CommonStyles::HEADERS,

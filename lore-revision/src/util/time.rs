@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+/// Milliseconds from the Unix epoch to now, and zero for a clock set before the epoch.
 pub fn timestamp() -> u64 {
-    chrono::Utc::now().timestamp_millis() as u64
+    super::fs::modified_millis(None)
 }
 
 /// Serializable settings. Do not rename without being careful of what toml files

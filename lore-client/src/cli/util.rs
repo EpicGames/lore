@@ -21,6 +21,7 @@ use lore::interface::LoreRevisionResolveEventData;
 use lore::interface::LoreRevisionResolveTarget;
 use lore::interface::LoreRevisionSyncProgressEventData;
 use lore::interface::LoreString;
+use lore_base::timestamp;
 use parking_lot::Mutex;
 
 use crate::eprintln;
@@ -313,6 +314,13 @@ pub fn merge_result_display(progress: &LoreRevisionSyncProgressEventData) -> Str
         "Merged files, {} updated, {} deleted, {} merged, {} conflicted",
         progress.file_update, progress.file_delete, progress.file_automerge, progress.file_conflict
     )
+}
+
+/// `millis`, read as signed milliseconds from the Unix epoch, as an RFC 2822 date and time in
+/// UTC, such as `Sun, 22 Nov 2026 12:45:20 +0000`, or `None` for a time outside the years 0 to
+/// 9999.
+pub fn rfc2822_display(millis: u64) -> Option<String> {
+    timestamp::from_unix_millis(millis as i64).and_then(timestamp::rfc2822)
 }
 
 /// The termination signals, registered separately from the wait on them.

@@ -5,14 +5,13 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use chrono::SecondsFormat;
-use chrono::Utc;
 use lore_base::directories::project_directory;
 use lore_base::error::FileNotFound;
 use lore_base::error::InvalidArguments;
 use lore_base::log::LoreLogLevel;
 use lore_base::log::rotate::RotatingLogFile;
 use lore_base::text::ValidateText;
+use lore_base::timestamp;
 use lore_error_set::FfiError;
 use lore_error_set::prelude::*;
 use lore_macro::ValidateText;
@@ -20,6 +19,7 @@ use lore_revision::event::LoreEvent;
 use lore_revision::event::LoreLogEventData;
 use lore_revision::interface::LoreString;
 use lore_revision::lore::try_execution_context;
+use time::UtcDateTime;
 
 #[repr(C)]
 #[derive(Debug, Clone, Default, PartialEq, ValidateText)]
@@ -44,6 +44,9 @@ pub struct LoreLogConfig {
 }
 
 const LORE_LOGFILE_PREFIX: &str = "lore";
+/// The bytes of a log file line besides its correlation ID, location and message, for the
+/// longest level name.
+const LOG_LINE_FRAME_LEN: usize = 41;
 const LORE_LOGFILE_MAX_COUNT: usize = 8;
 
 #[error_set]
@@ -150,12 +153,15 @@ fn lore_log_dispatch(level: LoreLogLevel, location: &str, message: &str) {
     if let Some(sender) = LOG_FILE_WRITER.get()
         && level >= LoreLogLevel::Debug
     {
-        let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let correlation_id = execution
             .as_ref()
             .map_or("-", |e| e.dispatcher.correlation_id.as_str());
-        let _ = sender.send(format!(
-            "[{timestamp}] [{correlation_id}] [{level}] [{location}] {message}"
+        let _ = sender.send(log_line(
+            UtcDateTime::now(),
+            correlation_id,
+            level,
+            location,
+            message,
         ));
     }
 
@@ -169,6 +175,32 @@ fn lore_log_dispatch(level: LoreLogLevel, location: &str, message: &str) {
             message: LoreString::from(message),
         }));
     }
+}
+
+/// The log file's line for a message, such as
+/// `[2026-11-22T12:45:20.303Z] [<correlation id>] [Debug] [<location>] <message>`.
+#[lore_macro::test_pub]
+fn log_line(
+    time: UtcDateTime,
+    correlation_id: &str,
+    level: LoreLogLevel,
+    location: &str,
+    message: &str,
+) -> String {
+    let mut line = String::with_capacity(
+        LOG_LINE_FRAME_LEN + correlation_id.len() + location.len() + message.len(),
+    );
+    line.push('[');
+    timestamp::push_rfc3339_millis(&mut line, time);
+    line.push_str("] [");
+    line.push_str(correlation_id);
+    line.push_str("] [");
+    line.push_str(level.name());
+    line.push_str("] [");
+    line.push_str(location);
+    line.push_str("] ");
+    line.push_str(message);
+    line
 }
 
 pub fn get_logs_path() -> String {

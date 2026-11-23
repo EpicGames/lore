@@ -124,6 +124,20 @@ fn audit_date_without_a_timestamp_prints_a_placeholder() {
     assert_eq!(audit_date(1_758_585_600_000), "2025-09-23");
 }
 
+/// The timestamp is read as signed: the largest one is a millisecond before the epoch, and one
+/// outside the years -9999 to 9999 prints the placeholder.
+#[test]
+fn audit_date_reads_the_timestamp_as_signed() {
+    assert_eq!(audit_date(u64::MAX), "1969-12-31");
+    assert_eq!(audit_date(1 << 63), "-");
+}
+
+#[test]
+fn audit_date_past_the_year_9999_prints_a_placeholder() {
+    assert_eq!(audit_date(253_402_300_799_999), "9999-12-31");
+    assert_eq!(audit_date(253_402_300_800_000), "-");
+}
+
 /// `--max-revisions 0` removes the bound, which the library asks for as the
 /// largest bound. Without the translation a zero would read as "use the default".
 #[test]

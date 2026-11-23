@@ -13,6 +13,7 @@ pub mod runtime;
 #[cfg(feature = "test-util")]
 pub mod test_util;
 pub mod text;
+pub mod timestamp;
 pub mod types;
 pub mod units;
 pub mod version;

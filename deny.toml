@@ -5,7 +5,9 @@ all-features = true
 feature-depth = 1
 
 [advisories]
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; only tracing-ecs, which lore-server uses for ECS log output, and expect-json, which lore-server's tests reach through axum-test, still depend on it" },
+]
 
 [licenses]
 version = 2

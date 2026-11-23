@@ -11,6 +11,7 @@ use bytes::Bytes;
 use lore_base::error::LockNotFound;
 use lore_base::error::LockNotOwned;
 use lore_base::error::SlowDown;
+use lore_base::timestamp;
 use lore_base::types::Hash;
 use lore_base::types::LockData;
 use lore_base::types::LockResource;
@@ -22,6 +23,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use serde::Deserialize;
 use serde::Serialize;
+use time::UtcDateTime;
 use tracing::debug;
 use tracing::info_span;
 use tracing::warn;
@@ -105,7 +107,7 @@ impl std::fmt::Debug for LockEntry {
 impl TryFrom<LockEntry> for LockData {
     type Error = LockError;
     fn try_from(value: LockEntry) -> Result<Self, Self::Error> {
-        let timestamp = chrono::DateTime::parse_from_rfc3339(value.timestamp.as_str())
+        let locked_at = timestamp::parse_rfc3339_millis(value.timestamp.as_str())
             .internal("failed to parse timestamp")?;
         let resource = LockResource {
             branch: value.branch,
@@ -115,7 +117,7 @@ impl TryFrom<LockEntry> for LockData {
         Ok(Self {
             resource,
             owner: value.owner_id,
-            locked_at: timestamp.timestamp_millis() as u64,
+            locked_at: locked_at as u64,
         })
     }
 }
@@ -365,7 +367,7 @@ impl LockStore for DynamoDbLockStore {
             HashMap::<LockEntryKey, TransactWriteItem>::with_capacity(resources.len());
 
         // Use the same timestamp for all locks
-        let timestamp = chrono::Utc::now();
+        let now = UtcDateTime::now();
 
         for resource in resources {
             let candidate_key = LockEntryKey {
@@ -383,7 +385,7 @@ impl LockStore for DynamoDbLockStore {
                 repository_branch: Bytes::from_owner(
                     [*repository.data(), *resource.branch.data()].concat(),
                 ),
-                timestamp: timestamp.to_rfc3339(),
+                timestamp: timestamp::rfc3339(now),
             };
 
             let item =
@@ -412,7 +414,7 @@ impl LockStore for DynamoDbLockStore {
                 LockData {
                     resource: resource.clone(),
                     owner: owner_id.to_string(),
-                    locked_at: timestamp.timestamp_millis() as u64,
+                    locked_at: timestamp::unix_millis(now) as u64,
                 },
             );
         }
@@ -1068,7 +1070,7 @@ mod test {
                 .chain(foo_branch.data().iter())
                 .copied()
                 .collect(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: timestamp::rfc3339(UtcDateTime::now()),
         };
 
         let lock_entry_bar = LockEntry {
@@ -1083,7 +1085,7 @@ mod test {
                 .chain(bar_branch.data().iter())
                 .copied()
                 .collect(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: timestamp::rfc3339(UtcDateTime::now()),
         };
 
         let query = LockQuery::Hash(hash);
@@ -1150,7 +1152,7 @@ mod test {
                 .chain(foo_branch.data().iter())
                 .copied()
                 .collect(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: timestamp::rfc3339(UtcDateTime::now()),
         };
 
         let lock_entry_bar = LockEntry {
@@ -1165,7 +1167,7 @@ mod test {
                 .chain(bar_branch.data().iter())
                 .copied()
                 .collect(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: timestamp::rfc3339(UtcDateTime::now()),
         };
 
         let query = LockQuery::HashRepository(hash, repository);
@@ -1232,7 +1234,7 @@ mod test {
             owner_id: owner_id.clone(),
             repository,
             repository_branch: Bytes::copy_from_slice(repo_branch.as_slice()),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: timestamp::rfc3339(UtcDateTime::now()),
         };
 
         let query = LockQuery::HashRepositoryBranch(hash, repository, branch);
@@ -1290,7 +1292,7 @@ mod test {
                 .chain(foo_branch.data().iter())
                 .copied()
                 .collect(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: timestamp::rfc3339(UtcDateTime::now()),
         };
 
         let bar_branch: BranchId = rand::random();
@@ -1310,7 +1312,7 @@ mod test {
                 .chain(bar_branch.data().iter())
                 .copied()
                 .collect(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: timestamp::rfc3339(UtcDateTime::now()),
         };
 
         let query = LockQuery::Owner(owner_id.clone());
@@ -1377,7 +1379,7 @@ mod test {
                 .chain(foo_branch.data().iter())
                 .copied()
                 .collect(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: timestamp::rfc3339(UtcDateTime::now()),
         };
 
         let bar_branch: BranchId = rand::random();
@@ -1396,7 +1398,7 @@ mod test {
                 .chain(bar_branch.data().iter())
                 .copied()
                 .collect(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: timestamp::rfc3339(UtcDateTime::now()),
         };
 
         let query = LockQuery::OwnerRepository(owner_id.clone(), repository);
@@ -1463,7 +1465,7 @@ mod test {
             owner_id: owner_id.clone(),
             repository,
             repository_branch: Bytes::from_owner(repo_branch),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: timestamp::rfc3339(UtcDateTime::now()),
         };
 
         let query = LockQuery::OwnerRepositoryBranch(owner_id.clone(), repository, branch);
@@ -1521,7 +1523,7 @@ mod test {
                 .chain(foo_branch.data().iter())
                 .copied()
                 .collect(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: timestamp::rfc3339(UtcDateTime::now()),
         };
 
         let bar_branch: BranchId = rand::random();
@@ -1541,7 +1543,7 @@ mod test {
                 .chain(bar_branch.data().iter())
                 .copied()
                 .collect(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: timestamp::rfc3339(UtcDateTime::now()),
         };
 
         let query = LockQuery::Repository(repository);
@@ -1608,7 +1610,7 @@ mod test {
                 .chain(branch.data().iter())
                 .copied()
                 .collect(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: timestamp::rfc3339(UtcDateTime::now()),
         };
 
         let bar_description = "/my/test2/file2.txt".to_string();
@@ -1627,7 +1629,7 @@ mod test {
                 .chain(branch.data().iter())
                 .copied()
                 .collect(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: timestamp::rfc3339(UtcDateTime::now()),
         };
 
         let query = LockQuery::RepositoryBranch(repository, branch);
@@ -1694,7 +1696,7 @@ mod test {
             owner_id: owner_id.clone(),
             repository,
             repository_branch: Bytes::from_owner(repo_branch),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: timestamp::rfc3339(UtcDateTime::now()),
         };
 
         let query = LockQuery::RepositoryBranchDescription(repository, branch, description.clone());
@@ -1792,7 +1794,7 @@ mod test {
             owner_id: owner_id.clone(),
             repository,
             repository_branch: Bytes::from_owner(repo_branch),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: timestamp::rfc3339(UtcDateTime::now()),
         };
 
         dynamodb_mock.expect_transact_write_items().return_once(

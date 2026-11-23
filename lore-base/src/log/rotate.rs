@@ -8,28 +8,32 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use chrono::Local;
-use chrono::TimeZone;
+use time::UtcDateTime;
 
 use crate::fs::lock::FSLock;
+use crate::timestamp;
+
+const SECONDS_PER_DAY: i64 = 86_400;
 
 /// A daily-rotating log file writer that is safe for multi-process use.
 ///
-/// Log lines are appended to `{prefix}.log` in the configured directory. When the date
-/// changes, the current file is renamed to `{prefix}.log.{YYYY-MM-DD}` and a fresh
-/// `{prefix}.log` is created. Rotation is serialized across processes using an `FSLock`
-/// on the log directory, so concurrent writers never race on the rename.
+/// Log lines are appended to `{prefix}.log` in the configured directory. When the UTC date
+/// changes, the current file is renamed to `{prefix}.log.{YYYY-MM-DD}`, after the UTC date it
+/// was written on, and a fresh `{prefix}.log` is created. Rotation is serialized across
+/// processes using an `FSLock` on the log directory, so concurrent writers never race on the
+/// rename.
 ///
 /// Old rotated files beyond `max_files` are deleted during rotation (oldest first).
+#[lore_macro::test_pub]
 pub struct RotatingLogFile {
     dir: PathBuf,
     log_path: PathBuf,
     prefix: String,
     max_files: usize,
     file: Option<File>,
-    /// The date label for the current log file, used as suffix when rotating.
+    /// The UTC date label for the current log file, used as suffix when rotating.
     current_date: String,
-    /// Unix timestamp (seconds) of the next local midnight. Compared against
+    /// Unix timestamp (seconds) of the next UTC midnight. Compared against
     /// `SystemTime::now()` on each write — a single syscall with no allocation.
     next_rotation_ts: i64,
 }
@@ -43,8 +47,7 @@ impl RotatingLogFile {
     pub fn new(dir: PathBuf, prefix: String, max_files: usize) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
         let log_path = dir.join(format!("{prefix}.log"));
-        let current_date = today_label();
-        let next_rotation_ts = next_midnight_ts();
+        let (current_date, next_rotation_ts) = today();
         let mut writer = Self {
             dir,
             log_path,
@@ -54,7 +57,6 @@ impl RotatingLogFile {
             current_date,
             next_rotation_ts,
         };
-        // Rotate stale log files from a previous day before opening.
         writer.rotate_if_stale()?;
         writer.reopen()?;
         Ok(writer)
@@ -67,24 +69,22 @@ impl RotatingLogFile {
                 .append(true)
                 .open(&self.log_path)?,
         );
-        self.current_date = today_label();
-        self.next_rotation_ts = next_midnight_ts();
+        (self.current_date, self.next_rotation_ts) = today();
         Ok(())
     }
 
-    /// Rotates a stale log file from a previous day on startup. If the active log file
-    /// exists and was last modified before today, it is rotated under the `FSLock` before
-    /// any new writes occur.
+    /// Rotates a log file from another day on startup. If the active log file exists and was
+    /// last modified on another UTC date, it is rotated under the `FSLock` before any new writes
+    /// occur. A file whose modification time is before the Unix epoch or past the year 9999 has
+    /// no UTC date: it stays in place and rotates at the next UTC midnight.
     fn rotate_if_stale(&mut self) -> io::Result<()> {
         if let Ok(meta) = fs::metadata(&self.log_path)
             && let Ok(modified) = meta.modified()
+            && let Some(modified_label) = date_label(modified)
         {
-            let modified_label = date_label_from_system_time(modified);
             if modified_label == self.current_date {
-                // File was last written today — no rotation needed.
                 return Ok(());
             }
-            // File is from a previous day — rotate it.
             self.current_date = modified_label;
             self.rotate()?;
         }
@@ -172,47 +172,24 @@ impl Write for RotatingLogFile {
     }
 }
 
-/// Returns the current local date formatted as `YYYY-MM-DD`.
-fn today_label() -> String {
-    Local::now().format("%Y-%m-%d").to_string()
+/// Returns the current UTC date formatted as `YYYY-MM-DD`, and the unix timestamp (seconds) of
+/// the next UTC midnight.
+fn today() -> (String, i64) {
+    let now = UtcDateTime::now();
+    (timestamp::date(now), next_midnight_ts(now.unix_timestamp()))
 }
 
-/// Returns the local date label for an arbitrary `SystemTime`.
-fn date_label_from_system_time(time: SystemTime) -> String {
-    let datetime: chrono::DateTime<Local> = time.into();
-    datetime.format("%Y-%m-%d").to_string()
+/// Returns the UTC date label for an arbitrary `SystemTime`, or `None` for a time before the
+/// Unix epoch or past the year 9999.
+#[lore_macro::test_pub]
+fn date_label(time: SystemTime) -> Option<String> {
+    let seconds = time.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
+    let time = UtcDateTime::from_unix_timestamp(i64::try_from(seconds).ok()?).ok()?;
+    Some(timestamp::date(time))
 }
 
-/// Returns the unix timestamp (seconds) of the start of the next local day.
-/// Handles DST transitions gracefully: if midnight doesn't exist (spring-forward),
-/// falls back to the first valid instant of the next day (typically 01:00).
-fn next_midnight_ts() -> i64 {
-    let tomorrow = Local::now().date_naive() + chrono::Duration::days(1);
-    let midnight = tomorrow
-        .and_hms_opt(0, 0, 0)
-        .expect("00:00:00 is valid HMS");
-    match Local.from_local_datetime(&midnight) {
-        chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => dt.timestamp(),
-        chrono::LocalResult::None => {
-            // Midnight doesn't exist in this timezone (DST spring-forward).
-            // Use 01:00 as fallback — the earliest time that is guaranteed to exist
-            // after a DST skip.
-            let fallback = tomorrow
-                .and_hms_opt(1, 0, 0)
-                .expect("01:00:00 is valid HMS");
-            if let Some(dt) = Local.from_local_datetime(&fallback).earliest() {
-                dt.timestamp()
-            } else {
-                // Last resort: use raw 86400-second offset from today's midnight.
-                let today = Local::now()
-                    .date_naive()
-                    .and_hms_opt(0, 0, 0)
-                    .expect("valid HMS");
-                Local
-                    .from_local_datetime(&today)
-                    .earliest()
-                    .map_or(0, |dt| dt.timestamp() + 86400)
-            }
-        }
-    }
+/// Returns the unix timestamp (seconds) of the first UTC midnight after `unix_seconds`.
+#[lore_macro::test_pub]
+fn next_midnight_ts(unix_seconds: i64) -> i64 {
+    (unix_seconds.div_euclid(SECONDS_PER_DAY) + 1) * SECONDS_PER_DAY
 }

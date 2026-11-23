@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use chrono::DateTime;
 use clap::Args;
 use clap::Subcommand;
 use lore::auth::LoreAuthClearArgs;
@@ -364,13 +363,12 @@ pub fn handle_list_command(globals: LoreGlobalArgs, cli_args: &AuthListArgs) -> 
             );
         }
         if data.expires > 0
-            && let Some(time) = DateTime::from_timestamp_millis(data.expires as i64)
+            && let Some(time) = util::rfc2822_display(data.expires)
         {
             println!(
-                "  {}Expires:{} {}",
+                "  {}Expires:{} {time}",
                 CommonStyles::HEADERS,
-                anstyle::Reset,
-                time.to_rfc2822()
+                anstyle::Reset
             );
         }
         if !data.token.is_empty() {
@@ -477,24 +475,17 @@ pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u
                     println!("Service account");
                 }
                 if user_token.expires > 0
-                    && let Some(time) = DateTime::from_timestamp_millis(user_token.expires as i64)
+                    && let Some(time) = util::rfc2822_display(user_token.expires)
                 {
-                    println!(
-                        "{}Expires:{} {}",
-                        CommonStyles::HEADERS,
-                        anstyle::Reset,
-                        time.to_rfc2822()
-                    );
+                    println!("{}Expires:{} {time}", CommonStyles::HEADERS, anstyle::Reset);
                 }
                 if user_token.refresh_expires > 0
-                    && let Some(time) =
-                        DateTime::from_timestamp_millis(user_token.refresh_expires as i64)
+                    && let Some(time) = util::rfc2822_display(user_token.refresh_expires)
                 {
                     println!(
-                        "{}Refreshable until:{} {}",
+                        "{}Refreshable until:{} {time}",
                         CommonStyles::HEADERS,
-                        anstyle::Reset,
-                        time.to_rfc2822()
+                        anstyle::Reset
                     );
                 } else if user_token.refreshable != 0 {
                     println!("Refreshable");

@@ -83,10 +83,14 @@ Defined in `lore/src/log.rs` via `LoreLogConfig`:
 | Field | Default | Description |
 | --- | --- | --- |
 | `file` | 0 | Enable file logging |
-| `file_rolling` | 0 | Enable daily rotation |
-| `level` | Info | Minimum log level |
-| `file_max_size` | 10MB | Max file size |
-| `file_max_count` | 8 | Max rotated files |
+| `file_rolling` | 0 | Not read by any code |
+| `level` | `None`, with Info used until file logging is configured and in place of `None` | Minimum log level |
+| `file_max_size` | 0 | Not read by any code |
+| `file_max_count` | 0, which `configure` reads as 8 | Max rotated files |
+
+Every log file rotates at midnight UTC, and the CLI always writes one. The file `{prefix}.log`
+is renamed `{prefix}.log.YYYY-MM-DD`, after the UTC date it was written on, and the oldest
+rotated files beyond `file_max_count` are removed.
 
 **Default log paths:**
 

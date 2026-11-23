@@ -51,8 +51,8 @@ tempfile = { workspace = true, optional = true }
 serde = { workspace = true }
 uuid = { workspace = true, features = ["zerocopy"] }
 
-# log
-chrono = { workspace = true }
+# log, timestamp
+time = { workspace = true }
 
 # runtime
 lore-io = { workspace = true }

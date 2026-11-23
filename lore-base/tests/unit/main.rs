@@ -9,9 +9,11 @@
 mod allocator;
 mod error;
 mod fs;
+mod log;
 mod retry;
 mod runtime;
 mod test_util;
 mod text;
+mod timestamp;
 mod types;
 mod units;
