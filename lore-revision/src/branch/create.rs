@@ -23,6 +23,7 @@ use crate::util;
 
 #[error_set]
 pub enum CreateError {
+    LinkPinsDiverge,
     NodeNotFound,
     LinkNotFound,
     NotFound,

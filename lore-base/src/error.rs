@@ -315,6 +315,16 @@ pub struct LinkDivergent {
     pub branch: String,
 }
 
+#[derive(Debug, Clone, Error, FfiError)]
+#[error(
+    "The mounts of linked repository {repository} disagree on their revision, branch or flags: {mounts}; pin them at one revision with `lore link update <mount>`, and remove and add again a mount whose flags differ"
+)]
+#[ffi_code(53)]
+pub struct LinkPinsDiverge {
+    pub repository: String,
+    pub mounts: String,
+}
+
 // ---------------------------------------------------------------------------
 // Already exists (56–63)
 //

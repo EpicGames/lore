@@ -1255,6 +1255,7 @@ pub mod in_memory {
     use lore_revision::commit::BasedOn;
     use lore_revision::commit::commit_in_memory_revision;
     use lore_revision::commit::weave_changes;
+    use lore_revision::link::LinkFlags;
     use lore_revision::lore::RepositoryId;
     use lore_revision::metadata::Metadata;
     use lore_revision::node::Node;
@@ -1431,6 +1432,40 @@ pub mod in_memory {
         )
         .await
         .expect("committing the revision must succeed")
+    }
+
+    /// A State linking a new repository at `a` and `b`, both pinned at `pin`, with that repository
+    /// and the nodes of the two mounts.
+    pub async fn linking_twice(
+        repository: &Arc<RepositoryContext>,
+        pin: Hash,
+    ) -> (Arc<State>, RepositoryId, NodeID, NodeID) {
+        let linked = RepositoryId::from(uuid::Uuid::now_v7());
+        let state = State::new();
+        let mut mounts = Vec::new();
+        for name in ["a", "b"] {
+            let node = add(
+                &state,
+                repository.clone(),
+                ROOT_NODE,
+                link_node(name, linked, pin),
+                name,
+            )
+            .await;
+            state
+                .link_add(
+                    repository.clone(),
+                    linked,
+                    BranchId::default(),
+                    pin,
+                    node,
+                    LinkFlags::NoFlags,
+                )
+                .await
+                .expect("registering the mount");
+            mounts.push(node);
+        }
+        (state, linked, mounts[0], mounts[1])
     }
 
     pub async fn revision_state(repository: &Arc<RepositoryContext>, revision: Hash) -> Arc<State> {

@@ -828,9 +828,11 @@ def change_through_both_links(urc: Lore, shape: str, files: dict[str, str]):
     urc.write_commit_push(
         "Change d", {f"{first}/{path}": c for path, c in files.items()}
     )
-    urc.link_update(second, pin=link_pin_at(urc, first))
-    urc.commit("Pin the second link of d")
-    urc.push()
+    # Mounts in one repository move together; nested ones live in two holders.
+    if shape == "nested":
+        urc.link_update(second, pin=link_pin_at(urc, first))
+        urc.commit("Pin the second link of d")
+        urc.push()
 
 
 SAME_SIZE_LINK_FILES = {

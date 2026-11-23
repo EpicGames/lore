@@ -1018,6 +1018,276 @@ async fn a_link_walk_stops_at_the_depth_limit() {
         .await;
 }
 
+/// A revision of `linked` holding a directory for each of `names`, added in that order.
+async fn revision_with_directories(linked: &Arc<RepositoryContext>, names: &[&str]) -> Hash {
+    let state = State::new();
+    for &name in names {
+        add(&state, linked.clone(), ROOT_NODE, directory(name), name).await;
+    }
+    in_memory::commit(linked, &state, Hash::default(), branch_id()).await
+}
+
+/// A State linking `linked` at `a`, exposing `foo`, and at `b`, exposing `bar`, both of the
+/// revision `pin`, with the nodes of the two mounts.
+async fn mounting_foo_and_bar(
+    repository: &Arc<RepositoryContext>,
+    linked: &Arc<RepositoryContext>,
+    pin: Hash,
+) -> (Arc<State>, NodeID, NodeID) {
+    let pinned = in_memory::revision_state(linked, pin).await;
+    let state = State::new();
+    let mut mounts = Vec::new();
+    for (name, source) in [("a", "foo"), ("b", "bar")] {
+        let child = node_at(linked, &pinned, source).await;
+        let node = add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            lore_revision::node::Node {
+                child,
+                ..link_node(name, linked.id, pin)
+            },
+            name,
+        )
+        .await;
+        state
+            .link_add(
+                repository.clone(),
+                linked.id,
+                BranchId::default(),
+                pin,
+                node,
+                LinkFlags::NoFlags,
+            )
+            .await
+            .expect("registering the mount");
+        mounts.push(node);
+    }
+    (state, mounts[0], mounts[1])
+}
+
+/// Repinning a repository rewrites the row and the node of every mount: a mount whose folder keeps
+/// its node in the new revision keeps it, and one whose node the new revision gives another folder
+/// exposes its folder again.
+#[tokio::test]
+async fn repinning_a_repository_moves_every_mount_to_the_folder_it_exposed() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let linked = repository
+                .to_link_context(RepositoryId::from(uuid::Uuid::now_v7()))
+                .await;
+            let old = revision_with_directories(&linked, &["foo", "bar"]).await;
+            let new = revision_with_directories(&linked, &["other", "bar", "foo"]).await;
+            let (old_state, new_state) = (
+                in_memory::revision_state(&linked, old).await,
+                in_memory::revision_state(&linked, new).await,
+            );
+            let old_foo = node_at(&linked, &old_state, "foo").await;
+            let (new_foo, new_bar) = (
+                node_at(&linked, &new_state, "foo").await,
+                node_at(&linked, &new_state, "bar").await,
+            );
+            assert_eq!(node_at(&linked, &new_state, "other").await, old_foo);
+            assert_eq!(node_at(&linked, &old_state, "bar").await, new_bar);
+            let (state, a, b) = mounting_foo_and_bar(&repository, &linked, old).await;
+
+            let moved = repin_repository(&state, repository.clone(), linked.id, new, branch_id())
+                .await
+                .expect("repinning the repository");
+
+            assert_eq!(
+                moved
+                    .iter()
+                    .map(|mount| (mount.link_node, mount.child))
+                    .collect::<Vec<_>>(),
+                [(a, new_foo), (b, new_bar)]
+            );
+            for (mount, child) in [(a, new_foo), (b, new_bar)] {
+                let node = state
+                    .node(repository.clone(), mount)
+                    .await
+                    .expect("reading the mount");
+                assert_eq!((node.address.hash, node.child), (new, child));
+            }
+            let rows = state
+                .link_list(repository.clone())
+                .await
+                .expect("reading the registry");
+            assert!(rows.iter().all(|row| row.signature() == new));
+        })
+        .await;
+}
+
+/// Repinning a repository at a revision lacking the folder a mount exposes fails as an invalid
+/// path.
+#[tokio::test]
+async fn repinning_a_repository_refuses_a_revision_lacking_a_mounted_folder() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let linked = repository
+                .to_link_context(RepositoryId::from(uuid::Uuid::now_v7()))
+                .await;
+            let old = revision_with_directories(&linked, &["foo", "bar"]).await;
+            let new = revision_with_directories(&linked, &["foo"]).await;
+            let (state, _, _) = mounting_foo_and_bar(&repository, &linked, old).await;
+
+            let refused = repin_repository(&state, repository, linked.id, new, branch_id())
+                .await
+                .err()
+                .expect("bar is gone from the new revision");
+
+            assert!(refused.is_invalid_path(), "{refused:?}");
+        })
+        .await;
+}
+
+/// Repinning a repository whose mounts carry different flags fails before any mount moves.
+#[tokio::test]
+async fn repinning_a_repository_refuses_mounts_with_different_flags() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let linked = repository
+                .to_link_context(RepositoryId::from(uuid::Uuid::now_v7()))
+                .await;
+            let old = revision_with_directories(&linked, &["foo", "bar"]).await;
+            let new = revision_with_directories(&linked, &["foo", "bar", "baz"]).await;
+            let (state, a, b) = mounting_foo_and_bar(&repository, &linked, old).await;
+            let row = state
+                .link_find(repository.clone(), linked.id, b)
+                .await
+                .expect("finding the mount's row");
+            state
+                .link_replace(
+                    repository.clone(),
+                    LinkReference {
+                        flags: LinkFlags::DisableAutoFollow.bits(),
+                        ..row
+                    },
+                )
+                .await
+                .expect("changing one mount's flags");
+
+            let refused = repin_repository(&state, repository.clone(), linked.id, new, branch_id())
+                .await
+                .err()
+                .expect("the mounts carry different flags");
+
+            assert!(refused.is_link_pins_diverge(), "{refused:?}");
+            for mount in [a, b] {
+                let node = state
+                    .node(repository.clone(), mount)
+                    .await
+                    .expect("reading the mount");
+                assert_eq!(node.address.hash, old);
+            }
+        })
+        .await;
+}
+
+/// A State of `repository` mounting `linked` at `a`, exposing `foo`, staged at a revision lacking
+/// `bar`, and at `b`, exposing `bar`, pinned at the revision before, as mounts that disagree from
+/// before every mount shared one pin can hold.
+async fn mounting_a_revision_lacking_a_mounted_folder(
+    repository: &Arc<RepositoryContext>,
+    linked: &Arc<RepositoryContext>,
+) -> Arc<State> {
+    let old = revision_with_directories(linked, &["foo", "bar"]).await;
+    let new = revision_with_directories(linked, &["foo"]).await;
+    let state = State::new();
+    for (name, source, pin, staged) in [("a", "foo", new, true), ("b", "bar", old, false)] {
+        let pinned = in_memory::revision_state(linked, pin).await;
+        let node = lore_revision::node::Node {
+            child: node_at(linked, &pinned, source).await,
+            ..link_node(name, linked.id, pin)
+        };
+        let node = if staged {
+            add(&state, repository.clone(), ROOT_NODE, node, name).await
+        } else {
+            state
+                .node_add(repository.clone(), ROOT_NODE, node, name)
+                .await
+                .expect("adding the mount")
+        };
+        state
+            .link_add(
+                repository.clone(),
+                linked.id,
+                BranchId::default(),
+                pin,
+                node,
+                LinkFlags::NoFlags,
+            )
+            .await
+            .expect("registering the mount");
+    }
+    state
+}
+
+/// A commit through a mount staged at a revision lacking the folder another mount exposes is
+/// refused before anything is committed, whether the parent mounts the repository or a repository
+/// the parent links does.
+#[tokio::test]
+async fn a_commit_refuses_a_staged_revision_lacking_a_folder_another_mount_exposes() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let linked = repository
+                .to_link_context(RepositoryId::from(uuid::Uuid::now_v7()))
+                .await;
+            let top_level =
+                mounting_a_revision_lacking_a_mounted_folder(&repository, &linked).await;
+
+            let holder = repository
+                .to_link_context(RepositoryId::from(uuid::Uuid::now_v7()))
+                .await;
+            let holder_state = mounting_a_revision_lacking_a_mounted_folder(&holder, &linked).await;
+            let staged = holder_state
+                .serialize(holder.clone(), &in_memory::token())
+                .await
+                .expect("storing the holder's staged state");
+            let nested = State::new();
+            let node = add(
+                &nested,
+                repository.clone(),
+                ROOT_NODE,
+                link_node("holder", holder.id, staged),
+                "holder",
+            )
+            .await;
+            nested
+                .link_add(
+                    repository.clone(),
+                    holder.id,
+                    BranchId::default(),
+                    staged,
+                    node,
+                    LinkFlags::NoFlags,
+                )
+                .await
+                .expect("registering the holder");
+
+            for state in [top_level, nested] {
+                let refused =
+                    lore_revision::commit::reject_unmovable_link_mounts(&repository, &state)
+                        .await
+                        .expect_err("bar is gone from the staged revision");
+                assert!(refused.is_invalid_arguments(), "{refused:?}");
+            }
+        })
+        .await;
+}
+
 /// Mounts a link to `link_id` at `<directory_name>/lib` in `state` and registers it.
 async fn mount_registered_link(
     state: &State,

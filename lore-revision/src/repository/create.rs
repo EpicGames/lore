@@ -44,6 +44,7 @@ pub struct LoreRepositoryCreateEventData {
 
 #[error_set]
 pub enum CreateError {
+    LinkPinsDiverge,
     RepositoryAlreadyExists,
     InvalidPath,
     Disconnected,

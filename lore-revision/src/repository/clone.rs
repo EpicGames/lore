@@ -85,6 +85,7 @@ use crate::util::serde::u8_as_bool;
 
 #[error_set(clone)]
 pub enum CloneError {
+    LinkPinsDiverge,
     NodeNotFound,
     LinkNotFound,
     NotFound,

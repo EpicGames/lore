@@ -38,6 +38,7 @@ pub struct StatusOptions {
 
 #[error_set]
 pub enum StatusError {
+    LinkPinsDiverge,
     Disconnected,
     InvalidArguments,
     SlowDown,

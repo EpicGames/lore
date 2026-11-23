@@ -84,6 +84,7 @@ use lore_revision::state::*;
 use lore_storage::FlushOptions;
 
 use crate::fs::filesystem_provider::setup_test_execution;
+use crate::fs::filesystem_provider::test_store_create;
 
 /// The key every stored modification time is filed under. It has to stay the
 /// digest over the path's own lowercase form, or a scan finds nothing it wrote
@@ -4924,4 +4925,255 @@ async fn a_mount_names_its_modified_files_in_path_order() {
     let mut all: Vec<String> = names.iter().map(|name| format!("vendor/{name}")).collect();
     all.sort();
     assert_eq!(mount_work(true).await, (all, names.len()));
+}
+
+/// A committed save refuses the mounts of a repository it changed pinning different revisions.
+#[tokio::test]
+async fn a_committed_save_refuses_a_changed_repository_whose_mounts_disagree() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            use crate::helper::in_memory;
+
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let (state, linked, a, _) =
+                in_memory::linking_twice(&repository, Hash::from_u64(1)).await;
+            state
+                .link_update(
+                    repository.clone(),
+                    linked,
+                    BranchId::default(),
+                    Hash::from_u64(2),
+                    a,
+                )
+                .await
+                .expect("moving one mount");
+
+            let refused = state
+                .serialize_committed(repository, &in_memory::token())
+                .await
+                .expect_err("the mounts pin different revisions");
+
+            assert!(refused.is_link_pins_diverge(), "{refused:?}");
+        })
+        .await;
+}
+
+/// A committed save keeps a revision whose mounts of a repository it doesn't change disagree.
+#[tokio::test]
+async fn a_committed_save_keeps_the_disagreeing_mounts_of_a_repository_it_leaves() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            use crate::helper::in_memory;
+
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let (state, linked, a, _) =
+                in_memory::linking_twice(&repository, Hash::from_u64(1)).await;
+            state
+                .link_update(
+                    repository.clone(),
+                    linked,
+                    BranchId::default(),
+                    Hash::from_u64(2),
+                    a,
+                )
+                .await
+                .expect("moving one mount");
+            let diverged = state
+                .serialize(repository.clone(), &in_memory::token())
+                .await
+                .expect("a staged save takes mounts at different revisions");
+            let state = in_memory::revision_state(&repository, diverged).await;
+            let other = RepositoryId::from(uuid::Uuid::now_v7());
+            let node = in_memory::add(
+                &state,
+                repository.clone(),
+                ROOT_NODE,
+                in_memory::link_node("c", other, Hash::from_u64(3)),
+                "c",
+            )
+            .await;
+            state
+                .link_add(
+                    repository.clone(),
+                    other,
+                    BranchId::default(),
+                    Hash::from_u64(3),
+                    node,
+                    LinkFlags::NoFlags,
+                )
+                .await
+                .expect("registering another repository");
+
+            let committed = state
+                .serialize_committed(repository.clone(), &in_memory::token())
+                .await
+                .expect("the disagreeing repository is not one the save changed");
+
+            let pins: Vec<_> = in_memory::revision_state(&repository, committed)
+                .await
+                .link_list(repository)
+                .await
+                .expect("reading the registry")
+                .into_iter()
+                .filter(|row| row.repository() == linked)
+                .map(|row| row.signature())
+                .collect();
+            assert_eq!(pins, [Hash::from_u64(2), Hash::from_u64(1)]);
+        })
+        .await;
+}
+
+/// A committed save keeps the disagreeing mounts of a repository it only removes a mount of.
+#[tokio::test]
+async fn a_committed_save_keeps_the_disagreeing_mounts_of_a_repository_it_removes_a_mount_of() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            use crate::helper::in_memory;
+
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let (state, linked, a, _) =
+                in_memory::linking_twice(&repository, Hash::from_u64(1)).await;
+            let c = in_memory::add(
+                &state,
+                repository.clone(),
+                ROOT_NODE,
+                in_memory::link_node("c", linked, Hash::from_u64(1)),
+                "c",
+            )
+            .await;
+            state
+                .link_add(
+                    repository.clone(),
+                    linked,
+                    BranchId::default(),
+                    Hash::from_u64(1),
+                    c,
+                    LinkFlags::NoFlags,
+                )
+                .await
+                .expect("registering a third mount");
+            state
+                .link_update(
+                    repository.clone(),
+                    linked,
+                    BranchId::default(),
+                    Hash::from_u64(2),
+                    a,
+                )
+                .await
+                .expect("moving one mount");
+            let diverged = state
+                .serialize(repository.clone(), &in_memory::token())
+                .await
+                .expect("a staged save takes mounts at different revisions");
+            let state = in_memory::revision_state(&repository, diverged).await;
+            state
+                .link_remove(repository.clone(), linked, c)
+                .await
+                .expect("removing the third mount");
+            in_memory::add(
+                &state,
+                repository.clone(),
+                ROOT_NODE,
+                in_memory::file("x.txt"),
+                "x.txt",
+            )
+            .await;
+
+            let committed = state
+                .serialize_committed(repository.clone(), &in_memory::token())
+                .await
+                .expect("removing a mount changes none of the others");
+
+            let pins: Vec<_> = in_memory::revision_state(&repository, committed)
+                .await
+                .link_list(repository)
+                .await
+                .expect("reading the registry")
+                .into_iter()
+                .map(|row| row.signature())
+                .collect();
+            assert_eq!(pins, [Hash::from_u64(2), Hash::from_u64(1)]);
+        })
+        .await;
+}
+
+/// A staged save takes the mounts of a repository at different revisions, and refuses them on
+/// different branches or with different flags.
+#[tokio::test]
+async fn a_staged_save_refuses_mounts_of_a_repository_on_different_branches_or_flags() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            use crate::helper::in_memory;
+
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let save = async |state: &Arc<State>| {
+                state
+                    .serialize(repository.clone(), &in_memory::token())
+                    .await
+            };
+
+            let (state, linked, a, _) =
+                in_memory::linking_twice(&repository, Hash::from_u64(1)).await;
+            state
+                .link_update(
+                    repository.clone(),
+                    linked,
+                    BranchId::default(),
+                    Hash::from_u64(2),
+                    a,
+                )
+                .await
+                .expect("moving one mount");
+            save(&state)
+                .await
+                .expect("a staged save takes mounts at different revisions");
+
+            let (state, linked, a, _) =
+                in_memory::linking_twice(&repository, Hash::from_u64(1)).await;
+            state
+                .link_update(
+                    repository.clone(),
+                    linked,
+                    Context::from(uuid::Uuid::now_v7()),
+                    Hash::from_u64(1),
+                    a,
+                )
+                .await
+                .expect("moving one mount to another branch");
+            let refused = save(&state)
+                .await
+                .expect_err("the mounts follow other branches");
+            assert!(refused.is_link_pins_diverge(), "{refused:?}");
+
+            let (state, linked, a, _) =
+                in_memory::linking_twice(&repository, Hash::from_u64(1)).await;
+            let row = state
+                .link_find(repository.clone(), linked, a)
+                .await
+                .expect("finding the mount's row");
+            state
+                .link_replace(
+                    repository.clone(),
+                    LinkReference {
+                        flags: LinkFlags::DisableAutoFollow.bits(),
+                        ..row
+                    },
+                )
+                .await
+                .expect("changing one mount's flags");
+            let refused = save(&state)
+                .await
+                .expect_err("the mounts carry other flags");
+            assert!(refused.is_link_pins_diverge(), "{refused:?}");
+        })
+        .await;
 }

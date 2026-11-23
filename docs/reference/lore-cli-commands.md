@@ -2148,7 +2148,7 @@ Link commands
 
 * `add` — Link to the given point in the repository and subpath from the given repository
 * `remove` — Remove the link at the given point in the repository
-* `update` — Update the link to a new pin
+* `update` — Update every mount of the linked repository to a new pin
 * `list` — List all links in the repository
 * `info` — Show detailed information about the link at the given path
 
@@ -2166,7 +2166,8 @@ Link to the given point in the repository and subpath from the given repository
 
 ###### **Options:**
 
-* `--pin <pin>` — Branch or specific revision to pin the link to, defaulting to latest on the main branch
+* `--pin <pin>` — Branch or specific revision to pin the link to, defaulting to latest on the main branch, or to the
+  revision the other mounts of the repository pin
 * `--disable-branching` — Disable automatic branch creation in the linked repository
 
 ## `lore link remove`
@@ -2181,7 +2182,7 @@ Remove the link at the given point in the repository
 
 ## `lore link update`
 
-Update the link to a new pin
+Update every mount of the linked repository to a new pin
 
 **Usage:** `lore link update [OPTIONS] <link_path>`
 

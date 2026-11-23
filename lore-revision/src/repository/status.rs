@@ -346,6 +346,7 @@ impl StatusSummaryStats {
 
 #[error_set]
 pub enum StatusError {
+    LinkPinsDiverge,
     NodeNotFound,
     LinkNotFound,
     NotFound,

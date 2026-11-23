@@ -817,42 +817,6 @@ def test_link_scoped_commit_consecutive(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_link_scoped_commit_onto_an_advanced_link_branch_records_its_deletions(
-    new_lore_repo,
-):
-    """Committing a link's changes through one mount of a linked repository, after revisions
-    committed through another mount advanced the link branch, records the revision's change from
-    the branch's latest: no deletion of a file the latest deleted already, whose slot it reuses for
-    a file it adds."""
-    parent = make_repo(new_lore_repo, {"parent-file.txt": "parent content\n"})
-    link_repo = make_repo(new_lore_repo, {"g.txt": "g\n", "keep.txt": "keep\n"})
-    for mount in ("a", "b"):
-        parent.link_add(mount, link_repo.get_id(), "/")
-    parent.commit("Mount the linked repository twice")
-    parent.push()
-
-    parent.remove_file("a/g.txt")
-    parent.stage("a/g.txt")
-    parent.commit("Delete g through a", link="a")
-    parent.write_files({"a/h.txt": "h\n"})
-    parent.stage("a/h.txt")
-    parent.commit("Add h through a", link="a")
-    parent.remove_file("b/g.txt")
-    parent.stage("b/g.txt")
-    parent.commit("Delete g through b", link="b")
-    parent.commit("Pin the link commits")
-    parent.push()
-
-    link_repo.sync()
-    deltas = parse_jsonl(
-        link_repo.revision_info(delta=True, json=True), "revisionInfoDelta"
-    )
-    deleted = [delta["path"] for delta in deltas if delta["action"] == "delete"]
-    assert "g.txt" not in deleted, deltas
-    assert link_repo.file_exists("h.txt") == ("h.txt" not in deleted), deltas
-
-
-@pytest.mark.smoke
 def test_link_scoped_commit_push_propagates_to_link(new_lore_repo):
     """Pushing after a `commit --link` must push the linked repo's new revision.
 

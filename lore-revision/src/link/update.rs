@@ -7,8 +7,8 @@ use lore_error_set::prelude::*;
 use super::LinkError;
 use crate::branch;
 use crate::errors::Divergent;
+use crate::errors::LinkNotFound;
 use crate::event;
-use crate::filter::FilterMode;
 use crate::find;
 use crate::find::HistoryPosition;
 use crate::fs::filesystem_provider::with_operation;
@@ -21,9 +21,10 @@ use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_info;
 use crate::lore_warn;
+use crate::node::NodeFlags;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
-use crate::stage;
+use crate::state::Mark;
 use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util::path::RelativePath;
@@ -55,26 +56,38 @@ pub(crate) async fn update(
     let (link_node_id, link_node) = chain.innermost_link(&link_path).await?;
     lore_debug!("Link node is {link_node_id}");
 
-    if link_node.is_staged() {
-        return Err(LinkError::internal("Link has staged changes"));
-    }
-
-    let linked_node = link_node.child;
-
     let link = repository
         .to_link_context(link_node.address.context.into())
         .await;
     let unreachable = || link::unreachable(link.id);
+    let rows: Vec<_> = inner_state
+        .link_list(inner_repository.clone())
+        .await
+        .forward::<LinkError>("Failed to find link")?
+        .into_iter()
+        .filter(|row| row.repository() == link.id)
+        .collect();
+    let link_reference = *rows
+        .iter()
+        .find(|row| row.local_node() == link_node_id)
+        .ok_or(LinkNotFound)?;
+    for row in &rows {
+        if inner_state
+            .node(inner_repository.clone(), row.local_node())
+            .await
+            .forward::<LinkError>("Failed deserializing state")?
+            .is_staged()
+        {
+            return Err(LinkError::internal("Link has staged changes"));
+        }
+    }
+
     let link_remote = link
         .remote()
         .await
         .forward_with::<LinkError, _>(unreachable)?;
-    let link_reference = inner_state
-        .link_find(inner_repository.clone(), link.id, link_node_id)
-        .await
-        .forward::<LinkError>("Failed to find link")?;
 
-    let current_link_revision = link_reference.signature;
+    let current_link_revision = link_reference.signature();
     let owner_branch = chain.owner_branch(parent_branch);
     let resolved_branch = link_reference.resolve_branch(owner_branch);
 
@@ -130,8 +143,14 @@ pub(crate) async fn update(
 
     lore_debug!("Updating to link revision {link_revision} on branch {link_branch}");
 
+    let stored_branch = link_reference.branch_to_store(link_branch, owner_branch);
     // Link is unchanged
-    if current_link_revision == link_revision && resolved_branch == link_branch {
+    if rows.iter().all(|row| {
+        row.signature() == link_revision
+            && row.branch() == stored_branch
+            && row.flags() == link_reference.flags()
+    }) && resolved_branch == link_branch
+    {
         event::LoreEvent::LinkChange(LoreLinkChangeEventData::new(
             link_path.as_str(),
             link.id,
@@ -144,59 +163,67 @@ pub(crate) async fn update(
         return Ok(());
     }
 
-    // The pinned revision numbers its nodes afresh, so the mount is carried across by path.
-    let pin = link::ResolvedLinkPin::resolve(
-        &link,
-        link::LinkPinRealizeTarget {
-            link_path: link_path.clone(),
-            old_signature: current_link_revision,
-            new_signature: link_revision,
-            current_node: linked_node,
-            mount_source: link::LinkMountSource::SamePath,
-        },
-    )
-    .await
-    .forward_with::<LinkError, _>(unreachable)?;
-
-    let mut node = link_node;
-    node.address.hash = link_revision;
-    node.child = pin.node_target;
-
-    lore_debug!("Staging link node");
-    let link_node = stage::stage_single_node(
+    let moved = link::repin_repository(
+        &inner_state,
         inner_repository.clone(),
-        inner_state.clone(),
-        chain.remainder_path.clone().freeze(),
-        node,
-        Arc::default(),
-        None, // No link tracking when updating links
-        FilterMode::View,
+        link.id,
+        link_revision,
+        stored_branch,
     )
     .await
-    .forward::<LinkError>("Failed staging the link node")?;
+    .forward::<LinkError>("Failed to update link")?;
+    if moved.is_empty() {
+        // Only the branch changes, so nothing below reads the pin; reading it here still refuses
+        // a repository the user can't reach.
+        State::deserialize(link.clone(), link_revision)
+            .await
+            .forward_with::<LinkError, _>(unreachable)?;
+    }
 
-    inner_state
-        .link_update(
-            inner_repository.clone(),
-            link.id,
-            link_reference.branch_to_store(link_branch, owner_branch),
-            link_revision,
-            link_node.node,
-        )
-        .await
-        .forward::<LinkError>("Failed to update link")?;
+    let mut pins = Vec::with_capacity(moved.len());
+    let mut mount_paths = Vec::with_capacity(rows.len());
+    for row in &rows {
+        inner_state
+            .node_mark(
+                &inner_repository,
+                row.local_node(),
+                Mark::staged(NodeFlags::Staged, true),
+            )
+            .await
+            .forward::<LinkError>("Failed staging the link node")?;
+        let Some(below) = inner_state
+            .node_path_below(
+                inner_repository.clone(),
+                row.local_node(),
+                chain.innermost.node,
+            )
+            .await
+            .forward::<LinkError>("Failed resolving the path of a mount")?
+        else {
+            continue;
+        };
+        let mount_path = chain.innermost.path.join(below.as_str());
+        if let Some(mount) = moved
+            .iter()
+            .find(|mount| mount.link_node == row.local_node())
+        {
+            pins.push(mount.pin(mount_path.clone()));
+        }
+        mount_paths.push(mount_path);
+    }
 
     // The staged state is stored before the operation that realizes the new pin finalizes: an
     // SWFS instance serves the link from what is stored then (ADR-00042).
     with_operation::<_, LinkError, _>(repository.file_system(), async |operation| {
-        // Filesystem realize uses the full mount path.
-        link::realize_resolved_link_pin_in_operation(
-            &operation,
-            repository.clone(),
-            link.clone(),
-            &pin,
-            false,
-        )
+        futures::future::try_join_all(pins.iter().map(|pin| {
+            link::realize_resolved_link_pin_in_operation(
+                &operation,
+                repository.clone(),
+                link.clone(),
+                pin,
+                false,
+            )
+        }))
         .await?;
 
         // Fold nested link revisions up into the top-level state (no-op if flat).
@@ -216,14 +243,16 @@ pub(crate) async fn update(
     })
     .await?;
 
-    event::LoreEvent::LinkChange(LoreLinkChangeEventData::new(
-        link_path.as_str(),
-        link.id,
-        link_branch,
-        link_revision,
-        LoreFileAction::Keep,
-    ))
-    .send();
+    for mount_path in &mount_paths {
+        event::LoreEvent::LinkChange(LoreLinkChangeEventData::new(
+            mount_path.as_str(),
+            link.id,
+            link_branch,
+            link_revision,
+            LoreFileAction::Keep,
+        ))
+        .send();
+    }
 
     Ok(())
 }

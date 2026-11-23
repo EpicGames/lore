@@ -769,8 +769,13 @@ def test_link_with_url(new_lore_repo):
 
     # Verify both links appear in link list
     link_list_output = repo.link_list()
-    assert link_list_output.count(link_repo_id) == 2, (
-        "Repository should appear twice in link list (once for each URL method)"
+    mounts = [
+        entry["linkPath"]
+        for entry in parse_jsonl(repo.link_list(json=True), "linkEntry")
+        if entry["link"] == link_repo_id
+    ]
+    assert len(mounts) == 2, (
+        "Repository should be mounted twice (once for each URL method)"
     )
 
     # Verify both link paths exist

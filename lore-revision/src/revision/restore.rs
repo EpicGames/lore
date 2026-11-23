@@ -139,6 +139,7 @@ pub struct LoreRevisionRestoreSyncEndEventData {
 
 #[error_set]
 pub enum RestoreError {
+    LinkPinsDiverge,
     NodeNotFound,
     LinkNotFound,
     NotFound,

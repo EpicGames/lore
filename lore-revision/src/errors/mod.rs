@@ -45,6 +45,7 @@ pub(crate) use lore_base::error::LayerNotFound;
 pub(crate) use lore_base::error::LinkDivergent;
 pub(crate) use lore_base::error::LinkNotFound;
 pub(crate) use lore_base::error::LinkPathNotFound;
+pub(crate) use lore_base::error::LinkPinsDiverge;
 pub(crate) use lore_base::error::LocalModifications;
 pub(crate) use lore_base::error::LockNotFound;
 pub(crate) use lore_base::error::LockNotOwned;
@@ -77,6 +78,7 @@ pub(crate) use lore_base::error::is_refusal;
 pub enum StateErrors {
     NodeNotFound,
     LinkNotFound,
+    LinkPinsDiverge,
     NotFound,
     RevisionNotFound,
     WriteRequired,

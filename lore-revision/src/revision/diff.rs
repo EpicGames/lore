@@ -64,6 +64,7 @@ impl LoreRevisionDiffFileEventData {
 
 #[error_set]
 pub enum DiffError {
+    LinkPinsDiverge,
     AddressNotFound,
     InvalidNodeHierarchy,
     InvalidPath,

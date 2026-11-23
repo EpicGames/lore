@@ -54,7 +54,8 @@ pub struct LinkAddArgs {
     #[clap(value_name = "source_path")]
     source_path: String,
 
-    /// Branch or specific revision to pin the link to, defaulting to latest on the main branch
+    /// Branch or specific revision to pin the link to, defaulting to latest on the main branch, or
+    /// to the revision the other mounts of the repository pin
     #[clap(long, value_name = "pin")]
     pin: Option<String>,
 
@@ -103,7 +104,7 @@ pub enum LinkCommands {
     /// Remove the link at the given point in the repository
     Remove(LinkRemoveArgs),
 
-    /// Update the link to a new pin
+    /// Update every mount of the linked repository to a new pin
     Update(LinkUpdateArgs),
 
     /// List all links in the repository
@@ -227,7 +228,7 @@ fn format_link_staged_state(state: LoreLinkStagedState) -> &'static str {
     }
 }
 
-/// Prints the rows every link listing shares. `link info` adds its own below.
+/// Prints a link's rows for `link info`, which adds its own below.
 fn print_link_entry(data: &LoreLinkEntryEventData, branch_name: &str) {
     println!(
         "{}Link {}{}",
@@ -249,6 +250,61 @@ fn print_link_entry(data: &LoreLinkEntryEventData, branch_name: &str) {
         data.source_path,
         data.source_node
     );
+    print_link_branch(data, branch_name);
+    print_link_revision(data);
+    print_link_flags(data);
+}
+
+/// Prints each repository `entries` link once per branch and flags its mounts share, in the order
+/// they first appear: its pin, then those mounts, each with the revision it pins where they
+/// disagree.
+fn print_linked_repositories(
+    entries: &[LoreLinkEntryEventData],
+    branches: &mut util::BranchNameResolver,
+) {
+    let shared =
+        |entry: &LoreLinkEntryEventData| (entry.link, entry.branch, entry.tracking, entry.flags);
+    let mut groups = Vec::new();
+    for entry in entries {
+        if !groups.contains(&shared(entry)) {
+            groups.push(shared(entry));
+        }
+    }
+    for group in groups {
+        let mounts: Vec<_> = entries
+            .iter()
+            .filter(|entry| shared(entry) == group)
+            .collect();
+        let first = mounts[0];
+        let agreed = mounts.iter().all(|mount| mount.revision == first.revision);
+        println!(
+            "{}Link {}{}",
+            CommonStyles::HEADERS,
+            first.link,
+            anstyle::Reset
+        );
+        print_link_branch(
+            first,
+            &branches.name(first.branch, first.link_path.as_str()),
+        );
+        if agreed {
+            print_link_revision(first);
+        }
+        print_link_flags(first);
+        println!("  {}Mounts:{}", CommonStyles::HEADERS, anstyle::Reset);
+        for mount in mounts {
+            let pin = if agreed {
+                String::new()
+            } else {
+                format!(" @ {}", mount.revision)
+            };
+            println!("    {} <- {}{pin}", mount.link_path, mount.source_path);
+        }
+        println!("");
+    }
+}
+
+fn print_link_branch(data: &LoreLinkEntryEventData, branch_name: &str) {
     let branch_id = data.branch.to_string();
     let branch = if branch_name.is_empty() || branch_name == branch_id {
         branch_id
@@ -266,12 +322,18 @@ fn print_link_entry(data: &LoreLinkEntryEventData, branch_name: &str) {
             "pinned"
         }
     );
+}
+
+fn print_link_revision(data: &LoreLinkEntryEventData) {
     println!(
         "  {}Revision:{} {}",
         CommonStyles::HEADERS,
         anstyle::Reset,
         data.revision
     );
+}
+
+fn print_link_flags(data: &LoreLinkEntryEventData) {
     println!(
         "  {}Flags:{} {}",
         CommonStyles::HEADERS,
@@ -372,12 +434,7 @@ fn handle_link_list(globals: LoreGlobalArgs, args: &LinkListArgs) -> u8 {
         return status;
     }
 
-    let mut branches = util::BranchNameResolver::new(globals);
-    for entry in &entries {
-        let branch_name = branches.name(entry.branch, entry.link_path.as_str());
-        print_link_entry(entry, &branch_name);
-        println!("");
-    }
+    print_linked_repositories(&entries, &mut util::BranchNameResolver::new(globals));
 
     return status;
 }

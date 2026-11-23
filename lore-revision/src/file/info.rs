@@ -50,6 +50,7 @@ use crate::util::serde::u8_as_bool;
 
 #[error_set]
 pub enum InfoError {
+    LinkPinsDiverge,
     InvalidArguments,
     InvalidPath,
     RevisionNotFound,

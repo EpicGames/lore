@@ -1844,6 +1844,7 @@ impl RepositoryContext {
 
 #[error_set]
 pub enum RepositoryError {
+    LinkPinsDiverge,
     RepositoryAlreadyExists,
     RepositoryNotFound,
     NodeNotFound,

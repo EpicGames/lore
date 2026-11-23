@@ -3,14 +3,24 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Hash;
 use lore_revision::commit::CommitError;
+use lore_revision::commit::CommittedLink;
 use lore_revision::commit::UncommittedPin;
 use lore_revision::commit::refuse_link_commits;
 use lore_revision::commit::refuse_scoped_link_commit;
+use lore_revision::commit::reject_unmovable_link_mounts;
+use lore_revision::commit::repins;
+use lore_revision::link::LinkFlags;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
+use lore_revision::state::LinkReference;
 use lore_revision::util::path::RelativePath;
+
+use crate::fs::filesystem_provider::setup_test_execution;
+use crate::fs::filesystem_provider::test_store_create;
+use crate::helper::in_memory;
 
 fn pin(mount_path: &str, pin: u8, branch: u8) -> UncommittedPin {
     UncommittedPin {
@@ -119,4 +129,76 @@ fn a_link_committed_alone_is_refused_while_another_link_pins_its_repository() {
         refuse_scoped_link_commit(&pins, &path(scope))
             .expect("no link outside the scope shares it");
     }
+}
+
+fn committed(repository: u8, signature: u8, made: bool) -> CommittedLink {
+    CommittedLink {
+        repository: RepositoryId::from([repository; 16]),
+        branch: BranchId::from([1; 16]),
+        signature: Hash::from([signature; 32]),
+        made,
+    }
+}
+
+/// Every mount of a repository takes the revision a commit made through one of them, whatever
+/// order the walk committed them in, and the revision its mounts kept where they kept one. Mounts
+/// that kept different revisions stay where they are.
+#[test]
+fn a_repository_takes_the_revision_its_commit_made() {
+    let taken = |links: Vec<CommittedLink>| -> Vec<(RepositoryId, Hash)> {
+        repins(links)
+            .iter()
+            .map(|link| (link.repository, link.signature))
+            .collect()
+    };
+    let (one, two) = (RepositoryId::from([1; 16]), RepositoryId::from([2; 16]));
+
+    assert_eq!(
+        taken(vec![
+            committed(1, 1, false),
+            committed(1, 2, true),
+            committed(2, 3, false),
+            committed(2, 3, false),
+        ]),
+        [(one, Hash::from([2; 32])), (two, Hash::from([3; 32]))]
+    );
+    assert_eq!(
+        taken(vec![committed(1, 1, false), committed(1, 2, false)]),
+        []
+    );
+}
+
+/// A commit through a staged link node refuses where the mounts of its repository carry different
+/// flags.
+#[tokio::test]
+async fn a_commit_refuses_a_staged_repository_whose_mounts_carry_different_flags() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let (state, linked, _, b) =
+                in_memory::linking_twice(&repository, Hash::from_u64(1)).await;
+            let row = state
+                .link_find(repository.clone(), linked, b)
+                .await
+                .expect("finding the mount's row");
+            state
+                .link_replace(
+                    repository.clone(),
+                    LinkReference {
+                        flags: LinkFlags::DisableAutoFollow.bits(),
+                        ..row
+                    },
+                )
+                .await
+                .expect("changing one mount's flags");
+
+            let refused = reject_unmovable_link_mounts(&repository, &state)
+                .await
+                .expect_err("the mounts carry different flags");
+
+            assert!(refused.is_link_pins_diverge(), "{refused:?}");
+        })
+        .await;
 }

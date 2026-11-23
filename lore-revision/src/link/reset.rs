@@ -364,7 +364,8 @@ pub(crate) async fn reset_staged_relink(
 }
 
 /// Puts the branch and flags of the current revision's registry row for the link `link_id` at
-/// `link_node_id` back on its staged row, and leaves the pin to the changes staged inside the link.
+/// `link_node_id` back on every staged row of `link_id`, which all mounts of a repository share,
+/// and leaves the pins to the changes staged inside the links.
 pub(crate) async fn reset_staged_link_branching(
     repository: Arc<RepositoryContext>,
     state_staged: &State,
@@ -372,24 +373,12 @@ pub(crate) async fn reset_staged_link_branching(
     link_id: RepositoryId,
     link_node_id: NodeID,
 ) -> Result<(), LinkError> {
-    let (staged, current) = tokio::try_join!(
-        state_staged.link_find(repository.clone(), link_id, link_node_id),
-        state_current.link_find(repository.clone(), link_id, link_node_id),
-    )
-    .forward::<LinkError>("Failed to find the link's registry rows")?;
-    if staged.branch == current.branch && staged.flags == current.flags {
-        return Ok(());
-    }
-
+    let current = state_current
+        .link_find(repository.clone(), link_id, link_node_id)
+        .await
+        .forward::<LinkError>("Failed to find the link's registry row")?;
     state_staged
-        .link_replace(
-            repository,
-            LinkReference {
-                branch: current.branch,
-                flags: current.flags,
-                ..staged
-            },
-        )
+        .link_rebranch(repository, link_id, current.branch, current.flags)
         .await
         .forward::<LinkError>("Failed to restore the link's branch and flags")
 }

@@ -37,6 +37,7 @@ pub const DEFAULT_MAX_REVISIONS: u32 = 100;
 
 #[error_set]
 pub enum AuditError {
+    LinkPinsDiverge,
     InvalidArguments,
     InvalidPath,
     FileNotFound,

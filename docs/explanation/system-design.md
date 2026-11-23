@@ -2639,6 +2639,12 @@ Updating the link to a different revision is an explicit `link update` operation
 produces a new parent revision; the previous parent revision still pins the previous
 linked revision.
 
+A parent may link one repository at several paths, each mount exposing another folder of
+it. The mounts share one pin, branch and flags ([ADR-00043](../developing/decisions/00043-one-pin-per-linked-repository.md)):
+`link add` of a repository the parent already links takes the pin of its other mounts, and
+`link update` and a commit through any one mount move every mount together, as unstaging
+an update does in the top-level repository.
+
 A branch create also reaches nested links, so the repositories those link to get the
 branch too, up to the link depth limit of 8. It follows three rules:
 

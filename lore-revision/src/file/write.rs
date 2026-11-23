@@ -42,6 +42,7 @@ pub struct LoreFileWriteEventData {
 
 #[error_set]
 pub enum WriteError {
+    LinkPinsDiverge,
     InvalidArguments,
     InvalidPath,
     InvalidAddress,

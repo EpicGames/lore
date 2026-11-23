@@ -311,6 +311,7 @@ pub struct LoreBranchUnprotectEventData {
 
 #[error_set]
 pub enum BranchError {
+    LinkPinsDiverge,
     BranchNotFound,
     BranchAlreadyExists,
     DeleteProtected,

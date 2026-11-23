@@ -157,20 +157,13 @@ def test_link_add_merged_into_another_branch_pushes(new_lore_repo, merge_into):
     """A link merged onto a branch it was not added on follows that branch and pushes.
 
     The link follows its parent's branch, which only `link add` and `branch create` give a
-    counterpart in the linked repository, so the merge has to give it one, even where the
-    repository is already mounted elsewhere without following.
+    counterpart in the linked repository, so the merge has to give it one.
     """
     link_path = "linked/repo"
     repo = make_repo(new_lore_repo, {"main-file.txt": "initial content\n"})
     source_repo = make_repo(
-        new_lore_repo,
-        {"shared/link-file.txt": "link source content\n", "pinned/p.txt": "p\n"},
+        new_lore_repo, {"shared/link-file.txt": "link source content\n"}
     )
-    repo.link_add(
-        "vendor/pinned", source_repo.get_id(), "pinned", disable_branching=True
-    )
-    repo.commit("Mount the repository without following")
-    repo.push()
 
     repo.branch_create("release")
     repo.write_commit_push("Release change", {"release-file.txt": "release\n"})
@@ -939,10 +932,14 @@ def test_link_pin_update_on_branch_merge_into(new_lore_repo):
         "merge into should carry the pin onto the target branch"
     )
 
-    link_output = repo.link_list()
-    assert re.search(
-        rf"Link\s+{source_repo.get_id()}.*?Source path:\s+/", link_output, re.DOTALL
-    ), f"Merged link should still mount the linked repository root.\nGot: {link_output}"
+    sources = [
+        entry["sourcePath"]
+        for entry in parse_jsonl(repo.link_list(json=True), "linkEntry")
+        if entry["link"] == source_repo.get_id()
+    ]
+    assert sources == ["/"], (
+        f"Merged link should still mount the linked repository root, mounts {sources}"
+    )
 
     with repo.open_file(linked_file, "r") as f:
         assert "revision two" in f.read(), (

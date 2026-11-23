@@ -90,6 +90,7 @@ use crate::repository::verify::verify_state_for_commit;
 use crate::revision::sync;
 use crate::state;
 use crate::state::LinkMergeEntry;
+use crate::state::LinkPinAgreement;
 use crate::state::LinkReference;
 use crate::state::Mark;
 use crate::state::NodeMapping;
@@ -273,6 +274,7 @@ pub enum CommitError {
     NotFound,
     NodeNotFound,
     LinkNotFound,
+    LinkPinsDiverge,
     // Forwarded from MetadataError
     FileNotFound,
     InvalidArguments,
@@ -808,6 +810,7 @@ async fn commit_staged_with_layers(
         })?;
     reject_unresolved_link_merge_conflicts(&repository, &state_staged, &link::Mount::root())
         .await?;
+    reject_unmovable_link_mounts(&repository, &state_staged).await?;
 
     let metadata = build_commit_metadata(
         repository.clone(),
@@ -1346,6 +1349,12 @@ async fn commit_link_only(
     if !chain.levels.is_empty() {
         reject_unresolved_link_holders(&chain).await?;
     }
+    reject_scoped_commit_of_a_mounted_repository(
+        &chain,
+        resolved_staged.link_context.id,
+        &link_path_rel,
+    )
+    .await?;
 
     let resolved_current =
         link::resolve_link_at_path(&state_parent_current, repository.clone(), &link_path)
@@ -2615,7 +2624,7 @@ pub(crate) async fn commit_files_and_rehash(
 
     let (walk, file_rx) = CommitWalk::new(
         operation.holds_state(),
-        operation,
+        operation.clone(),
         repository.clone(),
         token,
         state.clone(),
@@ -2626,16 +2635,27 @@ pub(crate) async fn commit_files_and_rehash(
         tracker.clone(),
         gone,
     );
+    let committed_links = walk.committed_links.clone();
     let delta = commit_walks(
         walk,
         file_rx,
-        relative_path,
+        relative_path.clone(),
         node_id,
         based_on,
         modified_times,
         true,
     )
     .await?;
+    if !committed_links.lock().is_empty() {
+        Box::pin(repin_committed_links(
+            &operation,
+            (&repository, &state),
+            (&relative_path, node_id),
+            &committed_links,
+            &delta,
+        ))
+        .await?;
+    }
 
     drop(ticker);
 
@@ -2953,6 +2973,113 @@ async fn directories_above(
     Ok(directories)
 }
 
+/// A linked repository a commit walk committed through one of its link nodes.
+#[lore_macro::test_pub]
+#[derive(Clone, Copy)]
+struct CommittedLink {
+    repository: RepositoryId,
+    /// The branch the link's row stores.
+    branch: BranchId,
+    /// The revision the link node pins once committed.
+    signature: Hash,
+    /// Whether the commit made `signature`, rather than keeping the revision the link was built on.
+    made: bool,
+}
+
+#[lore_macro::test_pub]
+type CommittedLinks = Arc<parking_lot::Mutex<Vec<CommittedLink>>>;
+
+/// The link of each repository in `committed` whose revision every mount of it takes.
+#[lore_macro::test_pub]
+fn repins(mut committed: Vec<CommittedLink>) -> Vec<CommittedLink> {
+    // A revision the commit made outranks one a link node kept, whatever order the tasks ran in.
+    committed.sort_by_key(|link| !link.made);
+    let mut repins: Vec<CommittedLink> = Vec::new();
+    for link in &committed {
+        if repins
+            .iter()
+            .any(|repin| repin.repository == link.repository)
+        {
+            continue;
+        }
+        // Mounts that kept different revisions, as a revision written before every mount shared
+        // one can hold, give the commit no revision to move them to.
+        if !link.made
+            && committed.iter().any(|other| {
+                other.repository == link.repository && other.signature != link.signature
+            })
+        {
+            continue;
+        }
+        repins.push(*link);
+    }
+    repins
+}
+
+/// Pins every mount of each repository in `committed` at the revision committed, so a commit through
+/// one mount moves the others with it: records each mount moved in `delta`, stages the directories
+/// above it for the rehash, and realizes it through `operation` where the walk from `walk_path` at
+/// `walk_node` materializes it.
+///
+/// Runs once the walk is done: its tasks have cleared the directories they committed, so a mount
+/// moved from inside one would leave a directory above it the rehash doesn't visit.
+async fn repin_committed_links(
+    operation: &Arc<InstanceOperationImpl>,
+    (repository, state): (&Arc<RepositoryContext>, &Arc<State>),
+    (walk_path, walk_node): (&RelativePath, NodeID),
+    committed: &CommittedLinks,
+    delta: &Arc<parking_lot::RwLock<BytesMut>>,
+) -> Result<(), CommitError> {
+    let committed = std::mem::take(&mut *committed.lock());
+    for link in repins(committed) {
+        let moved = link::repin_repository(
+            state,
+            repository.clone(),
+            link.repository,
+            link.signature,
+            link.branch,
+        )
+        .await
+        .forward::<CommitError>("Failed to pin every mount of a committed repository")?;
+        let mut pins = Vec::with_capacity(moved.len());
+        for mount in &moved {
+            state
+                .node_mark(
+                    repository,
+                    mount.parent,
+                    Mark::staged(NodeFlags::Staged, true),
+                )
+                .await
+                .forward::<CommitError>("Failed to stage the directory holding a mount")?;
+            delta_add(
+                delta.clone(),
+                mount.link_node,
+                (NodeFlags::Link | NodeFlags::StagedModify).bits(),
+            );
+            if let Some(below) = state
+                .node_path_below(repository.clone(), mount.link_node, walk_node)
+                .await
+                .forward::<CommitError>("Failed resolving the path of a mount")?
+            {
+                pins.push(mount.pin(walk_path.join(below.as_str())));
+            }
+        }
+        let link_context = repository.to_link_context(link.repository).await;
+        futures::future::try_join_all(pins.iter().map(|pin| {
+            link::realize_resolved_link_pin_in_operation(
+                operation,
+                repository.clone(),
+                link_context.clone(),
+                pin,
+                false,
+            )
+        }))
+        .await
+        .forward_any::<CommitError>("Failed to realize a mount the commit moved")?;
+    }
+    Ok(())
+}
+
 /// Rehashes the whole of `state` under one filesystem operation, answering with the modified
 /// times the fragmenting recorded and the node delta it records, for the history weave
 /// ([`weave_changes`]).
@@ -3070,6 +3197,96 @@ fn reject_unresolved_conflict(node: &Node, path: &str) -> Result<(), CommitError
         .into());
     }
     Ok(())
+}
+
+/// Fails where the commit of `state` couldn't move every mount of a repository it commits through
+/// a staged link node, in `state` or in a linked state the commit commits: with
+/// [`LinkPinsDiverge`] where the mounts disagree on branch or flags, and with
+/// [`InvalidArguments`] where the revision staged at the link node lacks the folder another mount
+/// exposes. Checked before anything is committed, as the commit publishes a linked revision before
+/// it moves the other mounts.
+#[lore_macro::test_pub]
+fn reject_unmovable_link_mounts<'a>(
+    repository: &'a Arc<RepositoryContext>,
+    state: &'a State,
+) -> crate::BoxFuture<'a, Result<(), CommitError>> {
+    Box::pin(async move {
+        let link_list = state
+            .link_list(repository.clone())
+            .await
+            .forward::<CommitError>("Failed reading the link registry")?;
+        let mut mounts: HashMap<RepositoryId, usize> = HashMap::new();
+        for row in &link_list {
+            *mounts.entry(row.repository()).or_default() += 1;
+        }
+        // Each repository committed through a staged link node, with the revisions staged at them.
+        let mut committed: Vec<(RepositoryId, Vec<Hash>)> = Vec::new();
+        for row in &link_list {
+            let node = state
+                .node(repository.clone(), row.local_node())
+                .await
+                .forward::<CommitError>("Failed reading a link node")?;
+            if !node.is_staged() {
+                continue;
+            }
+            match committed
+                .iter_mut()
+                .find(|(linked, _)| *linked == row.repository())
+            {
+                Some((_, staged)) if !staged.contains(&node.address.hash) => {
+                    staged.push(node.address.hash);
+                }
+                Some(_) => {}
+                None => committed.push((row.repository(), vec![node.address.hash])),
+            }
+        }
+        // A repository mounted once has no other mount to move.
+        let repositories: Vec<_> = committed
+            .iter()
+            .map(|(linked, _)| *linked)
+            .filter(|linked| mounts[linked] > 1)
+            .collect();
+        state
+            .check_link_rows_agree(
+                repository,
+                &link_list,
+                &repositories,
+                LinkPinAgreement::Rows,
+            )
+            .await
+            .forward::<CommitError>("Checking the rows of the repositories the commit links")?;
+        for (linked, staged) in &committed {
+            // Mounts staged at different revisions are refused once the walk compares them.
+            if let [staged] = staged[..]
+                && mounts[linked] > 1
+                && let Some(missing) =
+                    link::mount_missing_at(state, repository, &link_list, *linked, staged)
+                        .await
+                        .forward::<CommitError>("Checking the mounts the commit moves")?
+            {
+                let mount = state
+                    .node_path(repository.clone(), missing)
+                    .await
+                    .forward::<CommitError>("Failed resolving the path of a mount")?;
+                return Err(InvalidArguments {
+                    reason: format!(
+                        "the mount at {mount} exposes a folder the revision committed for linked \
+                         repository {linked} no longer holds; remove that mount, or restore the \
+                         folder"
+                    ),
+                }
+                .into());
+            }
+            for &staged in staged {
+                let link_repository = repository.to_link_context(*linked).await;
+                let link_state = State::deserialize(link_repository.clone(), staged)
+                    .await
+                    .forward::<CommitError>("Failed to deserialize link state")?;
+                reject_unmovable_link_mounts(&link_repository, &link_state).await?;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Refuses the commit of `state`, which the working tree materializes at `mount`, where a link it
@@ -3196,6 +3413,9 @@ struct CommitWalk {
     dir_semaphore: Arc<Semaphore>,
     /// The node the walk starts at, set by [`commit_walks`].
     root: NodeID,
+    /// Each linked repository the walk committed through a link node, with the stored branch and
+    /// the revision committed, for [`repin_committed_links`].
+    committed_links: CommittedLinks,
     link_commits: Arc<LinkCommits>,
 }
 
@@ -3391,6 +3611,41 @@ fn refuse_link_commits(
     Ok(())
 }
 
+/// Refuses a commit of the link at `scope` alone where its repository, `linked`, or one on the way
+/// to it in `chain` is mounted more than once in the repository holding it: the commit would move
+/// one mount of it, and every mount of a repository pins one revision.
+async fn reject_scoped_commit_of_a_mounted_repository(
+    chain: &link::ResolvedLinkChain,
+    linked: RepositoryId,
+    scope: &RelativePath,
+) -> Result<(), CommitError> {
+    let levels = chain
+        .levels
+        .iter()
+        .map(|level| (&level.repository, &level.state, level.child_repository_id))
+        .chain([(&chain.innermost.repository, &chain.innermost.state, linked)]);
+    for (repository, state, linked) in levels {
+        let mounts = state
+            .link_list(repository.clone())
+            .await
+            .forward::<CommitError>("Failed reading the link registry")?
+            .iter()
+            .filter(|row| row.repository() == linked)
+            .count();
+        if mounts > 1 {
+            return Err(NotSupported {
+                operation: format!(
+                    "committing the link at {} alone, while linked repository {linked} is \
+                     mounted {mounts} times. Commit without --link, which moves every mount of it",
+                    link::display_path(scope.as_str())
+                ),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// Refuses a commit of the link at `scope` alone, and the links below it, where a link outside it
 /// to one of their repositories on the same branch pins an uncommitted revision too: the commit
 /// would leave that link's revision to commit apart on the same branch.
@@ -3472,6 +3727,7 @@ impl CommitWalk {
             tracker,
             dir_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DIRECTORY_TASKS)),
             root: ROOT_NODE,
+            committed_links: CommittedLinks::default(),
             link_commits: Arc::default(),
         };
         (walk, file_rx)
@@ -3821,6 +4077,7 @@ fn commit_child(
                 walk.parent_branch,
                 walk.tracker.clone(),
                 (walk.missing(), walk.replaced()),
+                walk.committed_links.clone(),
                 walk.link_commits.clone(),
             ))
         );
@@ -5990,6 +6247,7 @@ async fn commit_link_node(
         MissingPaths,
         Option<Arc<parking_lot::Mutex<Vec<RelativePath>>>>,
     ),
+    committed_links: CommittedLinks,
     link_commits: Arc<LinkCommits>,
 ) -> Result<(), CommitError> {
     let block_index = NodeBlock::index(node_id);
@@ -6043,6 +6301,7 @@ async fn commit_link_node(
         .forward::<CommitError>("Commit of link node failed")?;
 
     let branch_id = link_reference.resolve_branch(parent_branch);
+    let built_on = link_state.committed_revision();
     let committed = link_commits
         .lock()
         .entry((link.repository, branch_id, node.address.hash))
@@ -6127,6 +6386,13 @@ async fn commit_link_node(
     )
     .await
     .forward::<CommitError>("Commit of link node failed")?;
+
+    committed_links.lock().push(CommittedLink {
+        repository: link.repository,
+        branch: link_reference.branch,
+        signature: link_latest,
+        made: link_latest != built_on,
+    });
 
     Ok(())
 }
@@ -6273,19 +6539,30 @@ async fn commit_link(
                 work_tracker.clone(),
                 gone,
             );
+            let committed_links = walk.committed_links.clone();
             let delta = commit_walks(
                 CommitWalk {
                     link_commits,
                     ..walk
                 },
                 file_rx,
-                relative_path,
+                relative_path.clone(),
                 node_id,
                 based_on,
                 link_modified_times,
                 false,
             )
             .await?;
+            if !committed_links.lock().is_empty() {
+                Box::pin(repin_committed_links(
+                    &operation,
+                    (&repository, &state),
+                    (&relative_path, node_id),
+                    &committed_links,
+                    &delta,
+                ))
+                .await?;
+            }
 
             // A merge commits as a revision of its own even where it changed nothing, so that
             // the merged branch is recorded as its second parent.

@@ -3016,7 +3016,6 @@ def test_link_merge_abort_of_a_repository_two_links_reach(new_lore_repo):
     "shape, refused",
     [
         ("nested", "pins"),
-        ("top-level", "pins"),
         ("nested", "conflict"),
         ("subtrees", "conflict"),
     ],

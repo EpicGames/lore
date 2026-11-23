@@ -54,6 +54,7 @@ const HEADER_SIZE: usize = 16; // magic(4) + version(4) + entry_count(4) + reser
 
 #[error_set]
 pub enum DependencyError {
+    LinkPinsDiverge,
     FileNotFound,
     InvalidArguments,
     NodeNotFound,

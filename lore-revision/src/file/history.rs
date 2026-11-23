@@ -95,6 +95,7 @@ impl LoreFileHistoryEventData {
 
 #[error_set]
 pub enum FileHistoryError {
+    LinkPinsDiverge,
     InvalidArguments,
     InvalidPath,
     FileNotFound,

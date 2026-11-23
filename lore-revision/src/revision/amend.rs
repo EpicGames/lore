@@ -23,6 +23,7 @@ use crate::state::State;
 
 #[error_set]
 pub enum AmendRevisionError {
+    LinkPinsDiverge,
     IdenticalMetadata,
     AddressNotFound,
     AlreadyLinked,

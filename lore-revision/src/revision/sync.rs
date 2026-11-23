@@ -160,6 +160,7 @@ pub enum SyncError {
     InvalidPath,
     LayerNotFound,
     LinkNotFound,
+    LinkPinsDiverge,
     LinkPathNotFound,
     LockNotFound,
     LockNotOwned,

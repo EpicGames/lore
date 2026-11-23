@@ -397,6 +397,7 @@ pub struct LoreBranchMergeResolveRevisionEventData {
 
 #[error_set]
 pub enum MergeError {
+    LinkPinsDiverge,
     NodeNotFound,
     LinkNotFound,
     NotFound,

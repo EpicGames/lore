@@ -7,6 +7,7 @@ from error_types import (
     OverlappingMountError,
 )
 from link_helpers import layer_targets, parse_revision_diff, remote_branch_names
+from lore_parsers import parse_jsonl
 from test_utils import status_by_path, unstaged_entries, working_tree_files
 
 from lore import Lore
@@ -34,16 +35,10 @@ def _parent_and_link_for_overlap(new_lore_repo, name: str = ""):
 
 def _mounted_source_paths(repo: Lore) -> dict:
     """Maps every mount path in `repo` to the source path it exposes."""
-    mounts = {}
-    link_path = None
-    for line in repo.link_list().splitlines():
-        line = line.strip()
-        if line.startswith("Link path:"):
-            link_path = line.split(":", 1)[1].split("(")[0].strip()
-        elif line.startswith("Source path:") and link_path is not None:
-            mounts[link_path] = line.split(":", 1)[1].split("(")[0].strip()
-            link_path = None
-    return mounts
+    return {
+        entry["linkPath"]: entry["sourcePath"]
+        for entry in parse_jsonl(repo.link_list(json=True), "linkEntry")
+    }
 
 
 @pytest.mark.smoke
@@ -142,23 +137,16 @@ def test_link_add_allows_non_nesting_source_paths(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_link_mounts_of_one_folder_must_agree_on_branch_and_flags(new_lore_repo):
-    """Mounts exposing one folder have to track the same branch with the same flags.
-
-    Mounts of separate folders expose separate subtrees, so they are free to differ.
-    """
+def test_link_mounts_of_one_repository_must_agree_on_branch_and_flags(new_lore_repo):
+    """Every mount of one repository shares its pin, so a mount of the same folder or of
+    another one has to track the same branch with the same flags."""
     parent, link_repo = _parent_and_link_for_overlap(new_lore_repo)
     parent.link_add("vendor/test", link_repo.get_id(), "sub/test")
 
-    with pytest.raises(ImproperArgumentsError):
-        parent.link_add(
-            "vendor/again", link_repo.get_id(), "sub/test", disable_branching=True
-        )
-
-    parent.link_add("vendor/again", link_repo.get_id(), "sub/test")
-    parent.link_add(
-        "vendor/other", link_repo.get_id(), "sub/other", disable_branching=True
-    )
+    for mount, source in (("vendor/again", "sub/test"), ("vendor/other", "sub/other")):
+        with pytest.raises(ImproperArgumentsError):
+            parent.link_add(mount, link_repo.get_id(), source, disable_branching=True)
+        parent.link_add(mount, link_repo.get_id(), source)
     parent.commit("Add links")
     parent.push()
 
@@ -167,6 +155,25 @@ def test_link_mounts_of_one_folder_must_agree_on_branch_and_flags(new_lore_repo)
             assert f.read() == _OVERLAP_LINK_FILES["sub/test/inner.txt"]
     with parent.open_file("vendor/other/sibling.txt") as f:
         assert f.read() == _OVERLAP_LINK_FILES["sub/other/sibling.txt"]
+
+
+@pytest.mark.smoke
+def test_link_mount_added_without_flags_takes_the_flags_of_its_repository(
+    new_lore_repo,
+):
+    """A mount of a repository mounted without following branches, added without
+    `--disable-branching`, takes the flags of the other mounts."""
+    parent, link_repo = _parent_and_link_for_overlap(new_lore_repo)
+    parent.link_add(
+        "vendor/test", link_repo.get_id(), "sub/test", disable_branching=True
+    )
+    parent.link_add("vendor/other", link_repo.get_id(), "sub/other")
+
+    flags = {
+        entry["linkPath"]: entry["flags"]
+        for entry in parse_jsonl(parent.link_list(json=True), "linkEntry")
+    }
+    assert flags == {"vendor/test": 1, "vendor/other": 1}
 
 
 @pytest.mark.smoke

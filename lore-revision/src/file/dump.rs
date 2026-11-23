@@ -31,6 +31,7 @@ pub struct LoreFileDumpEventData {
 
 #[error_set]
 pub enum DumpError {
+    LinkPinsDiverge,
     AddressNotFound,
     Disconnected,
     InvalidArguments,

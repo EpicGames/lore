@@ -200,6 +200,15 @@ fn registry() -> Vec<(&'static str, Group, i32)> {
             .ffi_code(),
         ),
         (
+            "LinkPinsDiverge",
+            Group::RepositoryState,
+            LinkPinsDiverge {
+                repository: text(),
+                mounts: text(),
+            }
+            .ffi_code(),
+        ),
+        (
             "AlreadyLinked",
             Group::AlreadyExists,
             AlreadyLinked.ffi_code(),

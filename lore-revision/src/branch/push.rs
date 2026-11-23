@@ -281,6 +281,7 @@ pub struct LoreBranchPushRevisionPushEndEventData {
 
 #[error_set]
 pub enum PushError {
+    LinkPinsDiverge,
     NodeNotFound,
     LinkNotFound,
     NotFound,

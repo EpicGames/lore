@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -124,6 +125,7 @@ pub struct LoreFileUnstageFileEventData {
 
 #[error_set]
 pub enum UnstageError {
+    LinkPinsDiverge,
     InvalidArguments,
     InvalidPath,
     InvalidNodeHierarchy,
@@ -1268,10 +1270,24 @@ async fn unstage_node(
                 link_tracker.remove_link(node.linked_node().repository, node_id, repository.id);
             }
 
+            let moved_to = node.address.hash;
             take_back_link_pin(&state_staged, &block, node_id, &mut node, &current_node)?;
             stats
                 .directory_unstaged_count
                 .fetch_add(1, Ordering::Relaxed);
+            if !relinked {
+                unstage_mounts_moved_with(
+                    &operation,
+                    (&repository, &state_staged, node_id),
+                    (node.linked_node().repository, moved_to),
+                    &state_current,
+                    &discard,
+                    options,
+                    &stats,
+                    &link_tracker,
+                )
+                .await?;
+            }
         } else if kept_link && was_staged_delete {
             take_back_link_pin(&state_staged, &block, node_id, &mut node, &current_node)?;
         } else if kept_link {
@@ -1514,6 +1530,70 @@ async fn unstage_node(
         .send();
     }
 
+    Ok(())
+}
+
+/// Unstages each other mount of `link_repository` that pins `moved_to`, the revision a staged update
+/// moved the link `node_id` to, as a staged update moves every mount of a repository.
+///
+/// Only for the top-level repository, whose working tree paths are its paths in the tree; in a
+/// linked repository the mounts are left as they are.
+#[allow(clippy::too_many_arguments)]
+async fn unstage_mounts_moved_with(
+    operation: &Arc<InstanceOperationImpl>,
+    (repository, state_staged, node_id): (&Arc<RepositoryContext>, &Arc<State>, NodeID),
+    (link_repository, moved_to): (RepositoryId, Hash),
+    state_current: &Arc<State>,
+    discard: &Arc<DashMap<RepositoryId, Vec<u32>>>,
+    options: UnstageOptions,
+    stats: &Arc<UnstageStats>,
+    link_tracker: &Arc<LinkTracker>,
+) -> Result<(), UnstageError> {
+    if repository.is_link() || repository.is_layer() {
+        return Ok(());
+    }
+    let rows = state_staged
+        .link_list(repository.clone())
+        .await
+        .forward::<UnstageError>("Failed reading the link registry")?;
+    for row in rows
+        .iter()
+        .filter(|row| row.repository() == link_repository && row.local_node() != node_id)
+    {
+        let mount = state_staged
+            .node(repository.clone(), row.local_node())
+            .await
+            .forward::<UnstageError>("Failed deserializing state node block")?;
+        if !mount.is_staged() || mount.address.hash != moved_to {
+            continue;
+        }
+        let Ok(mount_path) = RelativePath::from_str(
+            &state_staged
+                .node_path(repository.clone(), row.local_node())
+                .await
+                .forward::<UnstageError>("Failed resolving the path of a mount")?,
+        );
+        let states = repository.filter.parent_exclusion_states(&mount_path);
+        unstage_node_recurse(
+            operation.clone(),
+            NodeMapping {
+                repository: repository.clone(),
+                state: state_staged.clone(),
+                path: mount_path,
+                node: row.local_node(),
+            },
+            state_current.clone(),
+            discard.clone(),
+            UnstageOptions {
+                single_node: true,
+                ..options
+            },
+            stats.clone(),
+            link_tracker.clone(),
+            states,
+        )
+        .await?;
+    }
     Ok(())
 }
 

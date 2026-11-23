@@ -196,6 +196,7 @@ pub struct LoreFileStageFileEventData {
 
 #[error_set]
 pub enum StageError {
+    LinkPinsDiverge,
     NodeNotFound,
     LinkNotFound,
     NotFound,

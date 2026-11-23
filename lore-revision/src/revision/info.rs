@@ -106,6 +106,7 @@ impl LoreRevisionInfoDeltaEventData {
 
 #[error_set]
 pub enum InfoError {
+    LinkPinsDiverge,
     AddressNotFound,
     Disconnected,
     FileNotFound,

@@ -129,6 +129,7 @@ pub struct LoreFileResetFileEventData {
 
 #[error_set]
 pub enum ResetError {
+    LinkPinsDiverge,
     InvalidArguments,
     InvalidPath,
     RevisionNotFound,

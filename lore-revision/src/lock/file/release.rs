@@ -39,6 +39,7 @@ pub struct ReleaseOptions {
 
 #[error_set]
 pub enum ReleaseError {
+    LinkPinsDiverge,
     Disconnected,
     InvalidArguments,
     SlowDown,

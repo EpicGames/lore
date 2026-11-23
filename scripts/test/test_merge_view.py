@@ -469,15 +469,7 @@ def test_merge_grafts_a_link_moved_in_an_out_of_view_subtree(
     [
         ("hidden/plugins/old", None),
         ("hidden/plugins/old", "plugins/new"),
-        pytest.param(
-            "plugins/old",
-            "hidden/plugins/new",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="the graft registers the added link while the in-view link the merge "
-                "removes still holds its row, and fails with Link divergence",
-            ),
-        ),
+        ("plugins/old", "hidden/plugins/new"),
     ],
     ids=[
         "removed out of view",
@@ -488,10 +480,9 @@ def test_merge_grafts_a_link_moved_in_an_out_of_view_subtree(
 def test_merge_of_a_link_removed_with_incoming_changes_under_a_view(
     new_lore_repo, scratch_dir, old_path, new_path
 ):
-    """A link following branches, which the merged branch removes out of view while its
-    repository has incoming changes, leaves the merge, alone or beside a link the branch adds to
-    the same repository in view, which stands at the pin the branch gives it. An in-view removal
-    beside an out-of-view addition is the failure the xfail names."""
+    """A link following branches, which the merged branch removes while its repository has
+    incoming changes, leaves the merge, alone or beside a link the branch adds to the same
+    repository, which stands at the pin the branch gives it, on either side of the view."""
 
     def change_links(repo: Lore, link_repo: Lore):
         link_repo.write_commit_push("linked v2", {"linked.txt": "linked v2\n"})

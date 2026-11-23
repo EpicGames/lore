@@ -28,6 +28,7 @@ use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreNodeType;
 use crate::interface::LoreString;
+use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Context;
 use crate::lore::Hash;
@@ -56,6 +57,7 @@ use crate::state;
 use crate::state::Clear;
 use crate::state::Ext;
 use crate::state::LinkPin;
+use crate::state::LinkPinAgreement;
 use crate::state::LinkReference;
 use crate::state::Mark;
 use crate::state::NodeMapping;
@@ -76,6 +78,7 @@ pub mod update;
 pub enum LinkError {
     NodeNotFound,
     LinkNotFound,
+    LinkPinsDiverge,
     NotFound,
     FileNotFound,
     RevisionNotFound,
@@ -1098,8 +1101,8 @@ pub(crate) struct ResolvedLinkPin {
 }
 
 impl ResolvedLinkPin {
-    /// A revision numbers its nodes as it pleases, so a node id is only meaningful in the revision
-    /// it was read from, and a mount named by the revision it leaves is carried across by path.
+    /// A node id is only meaningful in the revision it was read from, so a mount named by the
+    /// revision it leaves is carried across ([`carry_mount`]).
     pub(crate) async fn resolve(
         link_context: &Arc<RepositoryContext>,
         target: LinkPinRealizeTarget,
@@ -1118,27 +1121,12 @@ impl ResolvedLinkPin {
         )
         .forward::<LinkError>("Failed deserializing state")?;
 
-        let node_at = async |path: RelativePath| -> Result<NodeID, LinkError> {
-            let node_link = state_target
-                .find_node_link(link_context.clone(), path.as_str())
-                .await
-                .forward::<LinkError>("Failed resolving the subtree a link exposes")?;
-            if !node_link.is_valid_or_root() {
-                return Err(InvalidPath {
-                    path: path.to_string(),
-                }
-                .into());
-            }
-            Ok(node_link.node)
-        };
         let node_target = match mount_source {
             LinkMountSource::Node(node) => node,
-            LinkMountSource::SamePath if current_node == ROOT_NODE => ROOT_NODE,
             LinkMountSource::SamePath => {
-                let path = link_source_path(link_context.clone(), &state_current, current_node)
+                carry_mount(link_context, &state_current, current_node, &state_target)
                     .await
-                    .forward::<LinkError>("Failed resolving link node")?;
-                node_at(path).await?
+                    .forward::<LinkError>("Failed resolving the subtree a link exposes")?
             }
         };
 
@@ -1212,6 +1200,173 @@ pub async fn repin_link_node(
             )
             .await
     }
+}
+
+/// A mount [`repin_repository`] moved: its link node, and the revision and node of the linked
+/// repository it exposed before and exposes now.
+#[lore_macro::test_pub]
+#[derive(Clone)]
+pub(crate) struct RepinnedMount {
+    pub link_node: NodeID,
+    /// The directory holding the link node.
+    pub parent: NodeID,
+    pub old_state: Arc<State>,
+    pub old_child: NodeID,
+    pub new_state: Arc<State>,
+    pub child: NodeID,
+}
+
+impl RepinnedMount {
+    /// The move of this mount, which the working tree holds at `link_path`, to realize.
+    pub(crate) fn pin(&self, link_path: RelativePath) -> ResolvedLinkPin {
+        ResolvedLinkPin {
+            link_path,
+            new_signature: self.new_state.revision(),
+            state_current: self.old_state.clone(),
+            state_target: self.new_state.clone(),
+            node_current: self.old_child,
+            node_target: self.child,
+        }
+    }
+}
+
+/// Pins every mount of `link_repository_id` in `state` at `signature` on the stored `branch`, and
+/// answers the mounts that moved.
+///
+/// The pin is held twice, in the registry row and in the link node, so both are rewritten for
+/// every mount. Each moved mount exposes the folder it exposed before ([`carry_mount`]). Fails
+/// with [`LinkPinsDiverge`](crate::errors::LinkPinsDiverge) where the mounts carry different
+/// flags, before any link node is rewritten.
+#[lore_macro::test_pub]
+pub(crate) async fn repin_repository(
+    state: &Arc<State>,
+    repository: Arc<RepositoryContext>,
+    link_repository_id: RepositoryId,
+    signature: Hash,
+    branch: BranchId,
+) -> Result<Vec<RepinnedMount>, StateError> {
+    let rows = state
+        .link_repin(repository.clone(), link_repository_id, branch, signature)
+        .await?;
+    state
+        .check_link_rows_agree(
+            &repository,
+            &rows,
+            &[link_repository_id],
+            LinkPinAgreement::Rows,
+        )
+        .await?;
+    let link_context = repository.to_link_context(link_repository_id).await;
+    let mut states = Vec::new();
+    let mut repinned = Vec::with_capacity(rows.len());
+    for row in rows {
+        let link_node = row.local_node();
+        let node = state.node(repository.clone(), link_node).await?;
+        if node.address.hash == signature {
+            continue;
+        }
+        let source = revision_state(&mut states, &link_context, node.address.hash).await?;
+        let target = revision_state(&mut states, &link_context, signature).await?;
+        let child = carry_mount(&link_context, &source, node.child, &target).await?;
+        state
+            .node_set_link_target(
+                &repository,
+                link_node,
+                LinkPin::Whole {
+                    address: Address {
+                        hash: signature,
+                        ..node.address
+                    },
+                    child,
+                },
+            )
+            .await?;
+        repinned.push(RepinnedMount {
+            link_node,
+            parent: node.parent,
+            old_state: source,
+            old_child: node.child,
+            new_state: target,
+            child,
+        });
+    }
+    Ok(repinned)
+}
+
+/// The mount of `link_repository_id` among `rows` of `state` that [`repin_repository`] couldn't
+/// move to `signature`, as the folder it exposes is missing there.
+pub(crate) async fn mount_missing_at(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+    rows: &[LinkReference],
+    link_repository_id: RepositoryId,
+    signature: Hash,
+) -> Result<Option<NodeID>, StateError> {
+    let link_context = repository.to_link_context(link_repository_id).await;
+    let mut states = Vec::new();
+    for row in rows
+        .iter()
+        .filter(|row| row.repository() == link_repository_id)
+    {
+        let node = state.node(repository.clone(), row.local_node()).await?;
+        if node.address.hash == signature {
+            continue;
+        }
+        let source = revision_state(&mut states, &link_context, node.address.hash).await?;
+        let target = revision_state(&mut states, &link_context, signature).await?;
+        match carry_mount(&link_context, &source, node.child, &target).await {
+            Err(err) if err.is_invalid_path() => return Ok(Some(row.local_node())),
+            carried => carried?,
+        };
+    }
+    Ok(None)
+}
+
+/// `revision` of `link_context`, read once into `states`.
+async fn revision_state(
+    states: &mut Vec<Arc<State>>,
+    link_context: &Arc<RepositoryContext>,
+    revision: Hash,
+) -> Result<Arc<State>, StateError> {
+    if let Some(state) = states.iter().find(|state| state.revision() == revision) {
+        return Ok(state.clone());
+    }
+    let state = State::deserialize(link_context.clone(), revision).await?;
+    states.push(state.clone());
+    Ok(state)
+}
+
+/// The node of `target` at the path `node` has in `source`. A revision numbers its nodes as it
+/// pleases, so a mount is carried across revisions by path; fails with [`InvalidPath`] where
+/// `target` holds nothing there to mount.
+async fn carry_mount(
+    link_context: &Arc<RepositoryContext>,
+    source: &State,
+    node: NodeID,
+    target: &State,
+) -> Result<NodeID, StateError> {
+    if node == ROOT_NODE {
+        return Ok(ROOT_NODE);
+    }
+    let path = link_source_path(link_context.clone(), source, node).await?;
+    let invalid = || InvalidPath {
+        path: path.to_string(),
+    };
+    let found = match target
+        .find_node_link(link_context.clone(), path.as_str())
+        .await
+    {
+        Err(err) if err.is_node_not_found() => {
+            return Err(StateError::InvalidPath(
+                invalid().chain_err_from(err, "finding the folder a mount exposes"),
+            ));
+        }
+        found => found?,
+    };
+    if !found.is_valid_or_root() {
+        return Err(invalid().into());
+    }
+    Ok(found.node)
 }
 
 /// A linked repository's state, with the context reaching it.

@@ -7,6 +7,7 @@ use lore_error_set::prelude::*;
 
 use super::LinkError;
 use crate::branch;
+use crate::errors::InvalidArguments;
 use crate::errors::InvalidPath;
 use crate::errors::is_refusal;
 use crate::event;
@@ -22,6 +23,7 @@ use crate::link::LinkFlags;
 use crate::link::LoreLinkChangeEventData;
 use crate::lore::Address;
 use crate::lore::BranchId;
+use crate::lore::Hash;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::node::Node;
@@ -126,8 +128,38 @@ pub async fn add(
         .await
         .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
 
+    // Resolve through any parent links so the link lands in the innermost
+    // containing repository (empty chain for a plain top-level link).
+    let chain = link::resolve_link_chain(
+        NodeMapping::root(repository.clone(), state_staged.clone()),
+        state_current.clone(),
+        link_path.clone(),
+        current_branch,
+    )
+    .await?;
+
+    let inner_repository = chain.innermost.repository.clone();
+    let inner_state = chain.innermost.state.clone();
+    let remainder_path = chain.remainder_path.clone();
+
+    let mounted = inner_state
+        .link_list(inner_repository.clone())
+        .await
+        .forward::<LinkError>("Failed reading the link registry")?
+        .into_iter()
+        .find(|row| row.repository() == link.id);
+
     // Determine the link branch and revision based on --pin and --disable-branching
-    let (link_revision, link_branch) = if disable_branching {
+    let (link_revision, link_branch) = if let Some(row) = mounted {
+        mounted_pin(
+            &link,
+            row,
+            pin,
+            disable_branching,
+            chain.owner_branch(current_branch),
+        )
+        .await?
+    } else if disable_branching {
         if let Some(pin) = pin {
             link::resolve_pin(link.clone(), pin)
                 .await
@@ -275,27 +307,15 @@ pub async fn add(
 
     let clone_path = link_path.clone();
 
-    // Resolve through any parent links so the link lands in the innermost
-    // containing repository (empty chain for a plain top-level link).
-    let chain = link::resolve_link_chain(
-        NodeMapping::root(repository.clone(), state_staged.clone()),
-        state_current.clone(),
-        link_path.clone(),
-        current_branch,
-    )
-    .await?;
-
-    let inner_repository = chain.innermost.repository.clone();
-    let inner_state = chain.innermost.state.clone();
-    let remainder_path = chain.remainder_path.clone();
-
     // The stored path rather than the argument, which resolved case-insensitively.
     let resolved_source_path =
         link::link_source_path(link.clone(), &link_state, link_node_link.node)
             .await
             .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
 
-    let (link_flags, stored_branch) = if disable_branching {
+    let (link_flags, stored_branch) = if let Some(row) = mounted {
+        (LinkFlags::from_bits_retain(row.flags()), row.branch())
+    } else if disable_branching {
         lore_debug!("Disabled auto-follow for link {}", link.id);
         (LinkFlags::DisableAutoFollow, link_branch)
     } else {
@@ -575,6 +595,48 @@ async fn create_link_mount(
     }
 
     Ok(())
+}
+
+/// The pin a new mount of a repository the parent already mounts takes, on the branch `row`, one
+/// of its rows, resolves to: the committed revision its mounts are built on. Refuses a `pin`
+/// resolving to another revision, and `disable_branching` where its mounts follow branches.
+async fn mounted_pin(
+    link: &Arc<RepositoryContext>,
+    row: LinkReference,
+    pin: Option<String>,
+    disable_branching: bool,
+    parent_branch: BranchId,
+) -> Result<(Hash, BranchId), LinkError> {
+    if disable_branching && row.auto_follows() {
+        return Err(InvalidArguments {
+            reason: format!(
+                "linked repository {} is already mounted following branches; add this mount \
+                 without --disable-branching",
+                link.id,
+            ),
+        }
+        .into());
+    }
+    let revision = State::deserialize(link.clone(), row.signature())
+        .await
+        .forward_with::<LinkError, _>(|| link::unreachable(link.id))?
+        .committed_revision();
+    if let Some(pin) = pin {
+        let (pinned, _) = link::resolve_pin(link.clone(), pin)
+            .await
+            .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
+        if pinned != revision {
+            return Err(InvalidArguments {
+                reason: format!(
+                    "linked repository {} is already mounted at {revision}; every mount of it \
+                     pins the same revision",
+                    link.id
+                ),
+            }
+            .into());
+        }
+    }
+    Ok((revision, row.resolve_branch(parent_branch)))
 }
 
 async fn default_branch(link: &Arc<RepositoryContext>) -> Result<BranchId, LinkError> {

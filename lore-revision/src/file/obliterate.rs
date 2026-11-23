@@ -42,6 +42,7 @@ pub struct LoreFileObliterateEventData {
 
 #[error_set]
 pub enum ObliterateError {
+    LinkPinsDiverge,
     InvalidArguments,
     InvalidPath,
     InvalidAddress,

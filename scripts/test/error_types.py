@@ -218,6 +218,10 @@ class MountsBusyError(LoreException):
     """A service stop refused because something holds one of its mounts."""
 
 
+class LinkPinsDivergeError(LoreException):
+    """The mounts of one linked repository disagree on their pin."""
+
+
 ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     # A refused revision specifier carries "Failed to find revision" on its
     # trace, which a pattern below matches, so the refusal is named here by the
@@ -305,6 +309,7 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ),
     ("without using the service", VfsOutsideServiceError),
     ("Mounts are busy:", MountsBusyError),
+    ("disagree on their revision, branch or flags", LinkPinsDivergeError),
     ("invalid arguments:", ImproperArgumentsError),
     ("Address not found", AddressNotFound),
 ]

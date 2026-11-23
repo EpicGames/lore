@@ -116,6 +116,7 @@ use crate::change::FileAction;
 use crate::change::NodeChange;
 use crate::change::NodeChangeState;
 use crate::errors::LinkNotFound;
+use crate::errors::LinkPinsDiverge;
 use crate::errors::NodeNotFound;
 use crate::errors::NotFound;
 use crate::errors::Oversized;
@@ -1483,6 +1484,16 @@ pub struct LinkReference {
     pub(crate) unused: u32,
 }
 
+/// What the rows of one linked repository must agree on, which every mount of it shares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LinkPinAgreement {
+    /// Branch and flags. A staged state holds the mounts a stage changed at an uncommitted revision
+    /// and the others at the committed pin, until the commit moves them all.
+    Rows,
+    /// Branch, flags and signature, as a committed revision holds them.
+    Pins,
+}
+
 impl LinkReference {
     pub fn resolve_branch(&self, parent_branch: BranchId) -> BranchId {
         if self.branch.is_zero() {
@@ -1545,6 +1556,14 @@ impl LinkReference {
     pub(crate) fn with_signature(mut self, signature: Hash) -> Self {
         self.signature = signature;
         self
+    }
+
+    /// Whether this row and `other`, rows of one repository, agree as `agreement` requires.
+    pub(crate) fn agrees(&self, other: &Self, agreement: LinkPinAgreement) -> bool {
+        match agreement {
+            LinkPinAgreement::Rows => self.branch == other.branch && self.flags == other.flags,
+            LinkPinAgreement::Pins => self.stores_same(other),
+        }
     }
 
     /// The linked branch this row follows under a parent on `parent_branch`, or `None` where an
@@ -1820,6 +1839,8 @@ struct StateRuntime {
     block_file_metadata_checked_next: usize,
     /// Link list
     link_list: Option<Vec<LinkReference>>,
+    /// The linked repositories whose rows an edit changed, whose rows every save checks
+    link_touched: Vec<RepositoryId>,
     /// Name table (read only, for old data formats)
     name_table_deprecated: Option<Arc<NameTable>>,
     /// Rehash node names
@@ -1848,6 +1869,7 @@ impl StateRuntime {
             block_file_metadata_checked: vec![],
             block_file_metadata_checked_next: 0,
             link_list: None,
+            link_touched: Vec::new(),
             name_table_deprecated: None,
             rehash_node_names,
             unswept: Vec::new(),
@@ -2464,11 +2486,26 @@ impl State {
     /// parent block imaged after a publish can name a child whose block was imaged before it, and
     /// a block threaded onto the unused chain behind a fresh head this save does not write is
     /// reached in the next save alone.
-    pub async fn serialize_keeping(
+    ///
+    /// The rows of each linked repository an edit changed must agree on branch and flags
+    /// ([`LinkPinAgreement::Rows`]), or the save fails with [`LinkPinsDiverge`].
+    pub fn serialize_keeping<'a>(
+        self: &'a Arc<Self>,
+        repository: Arc<RepositoryContext>,
+        token: &'a RepositoryWriteToken,
+        keep: impl FnOnce(SerializedBlocks) + Send + 'a,
+    ) -> impl Future<Output = Result<Hash, StateError>> + Send + 'a {
+        self.serialize_agreeing(repository, token, keep, LinkPinAgreement::Rows)
+    }
+
+    /// [`Self::serialize_keeping`], with the rows of each linked repository an edit changed agreeing
+    /// as `agreement` requires.
+    async fn serialize_agreeing(
         self: &Arc<Self>,
         repository: Arc<RepositoryContext>,
         _token: &RepositoryWriteToken,
         keep: impl FnOnce(SerializedBlocks) + Send,
+        agreement: LinkPinAgreement,
     ) -> Result<Hash, StateError> {
         debug_assert!(
             self.runtime_read().fresh_blocks_from.is_none(),
@@ -2569,8 +2606,13 @@ impl State {
             .await?;
         }
 
-        let link_list = { self.runtime_read().link_list.clone() };
+        let (link_list, link_touched) = {
+            let runtime = self.runtime_read();
+            (runtime.link_list.clone(), runtime.link_touched.clone())
+        };
         if let Some(link_list) = link_list {
+            self.check_link_rows_agree(&repository, &link_list, &link_touched, agreement)
+                .await?;
             let list_hash = hash::hash_slice(link_list.as_bytes());
             if list_hash != self.data_read().hash_link {
                 let rehashed_list = if link_list.is_empty() {
@@ -6713,7 +6755,8 @@ impl State {
     /// Serialize a state that is becoming a committed revision.
     ///
     /// A merge's flags and its link rows are bookkeeping for the operation in progress and must
-    /// not reach a committed revision, so every commit drops both here.
+    /// not reach a committed revision, so every commit drops both here. The rows of each linked
+    /// repository an edit changed must also agree on their signature ([`LinkPinAgreement::Pins`]).
     pub fn serialize_committed<'a>(
         self: &'a Arc<Self>,
         repository: Arc<RepositoryContext>,
@@ -6733,7 +6776,7 @@ impl State {
         self.reset_merge_conflict_flags();
         self.clear_link_merge_state();
 
-        self.serialize_keeping(repository, token, keep)
+        self.serialize_agreeing(repository, token, keep, LinkPinAgreement::Pins)
     }
 
     pub fn link_merge_hash(&self) -> Hash {
@@ -6886,9 +6929,13 @@ impl State {
     /// stored in the meantime. The serialized list is loaded before the lock is taken, because
     /// reading it awaits; an edit that then finds the registry already populated discards what it
     /// loaded, since the populated copy is the one carrying edits.
+    ///
+    /// `edit` changes the rows of `link_id` alone, which are noted for the next save to check
+    /// ([`Self::check_link_rows_agree`]) where it changed them.
     async fn edit_link_list(
         &self,
         repository: Arc<RepositoryContext>,
+        link_id: RepositoryId,
         edit: impl FnOnce(&mut Vec<LinkReference>) -> Result<(), StateError>,
     ) -> Result<(), StateError> {
         let populated = self.runtime_read().link_list.is_some();
@@ -6899,7 +6946,57 @@ impl State {
         };
 
         let mut runtime = self.runtime_write();
-        edit(runtime.link_list.get_or_insert(loaded))
+        let runtime = &mut *runtime;
+        let link_list = runtime.link_list.get_or_insert(loaded);
+        if runtime.link_touched.contains(&link_id) {
+            return edit(link_list);
+        }
+        let before: Vec<_> = link_list
+            .iter()
+            .filter(|row| row.repository == link_id)
+            .copied()
+            .collect();
+        let result = edit(link_list);
+        let after = link_list.iter().filter(|row| row.repository == link_id);
+        // Removing rows leaves the others as they were, so it can't make them disagree.
+        let changed = after.clone().count() >= before.len()
+            && !after
+                .map(IntoBytes::as_bytes)
+                .eq(before.iter().map(IntoBytes::as_bytes));
+        if changed {
+            runtime.link_touched.push(link_id);
+        }
+        result
+    }
+
+    /// Fails with [`LinkPinsDiverge`] where the rows in `link_list` of one of `repositories`
+    /// disagree as `agreement` requires.
+    pub(crate) async fn check_link_rows_agree(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        link_list: &[LinkReference],
+        repositories: &[RepositoryId],
+        agreement: LinkPinAgreement,
+    ) -> Result<(), StateError> {
+        for &linked in repositories {
+            let mut rows = link_list.iter().filter(|row| row.repository == linked);
+            let Some(first) = rows.next() else {
+                continue;
+            };
+            if rows.all(|row| row.agrees(first, agreement)) {
+                continue;
+            }
+            let mut mounts = Vec::new();
+            for row in link_list.iter().filter(|row| row.repository == linked) {
+                mounts.push(self.node_path(repository.clone(), row.local_node).await?);
+            }
+            return Err(LinkPinsDiverge {
+                repository: linked.to_string(),
+                mounts: mounts.join(", "),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     pub async fn link_find(
@@ -6954,13 +7051,8 @@ impl State {
         local_node: NodeID,
         link_flags: LinkFlags,
     ) -> Result<(), StateError> {
-        self.edit_link_list(repository, |link_list| {
-            // Ensure link is not referenced by other revision anywhere
+        self.edit_link_list(repository, link_id, |link_list| {
             for link in link_list.iter_mut() {
-                if link.repository == link_id && link.signature != signature {
-                    // TODO(vri): Link revision divergence
-                    return Err(StateError::internal("Link divergence"));
-                }
                 if link.repository == link_id && link.local_node == local_node {
                     link.signature = signature;
                     return Ok(());
@@ -7000,6 +7092,53 @@ impl State {
         .await
     }
 
+    /// Pins every row of `link_id` at `signature` on `branch`, keeping their flags, and answers
+    /// those rows.
+    #[lore_macro::test_pub]
+    pub(crate) async fn link_repin(
+        &self,
+        repository: Arc<RepositoryContext>,
+        link_id: RepositoryId,
+        branch: BranchId,
+        signature: Hash,
+    ) -> Result<Vec<LinkReference>, StateError> {
+        let mut rows = Vec::new();
+        self.edit_link_list(repository, link_id, |link_list| {
+            for link in link_list
+                .iter_mut()
+                .filter(|link| link.repository == link_id)
+            {
+                link.branch = branch;
+                link.signature = signature;
+                rows.push(*link);
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(rows)
+    }
+
+    /// Sets `branch` and `flags` on every row of `link_id`.
+    pub(crate) async fn link_rebranch(
+        &self,
+        repository: Arc<RepositoryContext>,
+        link_id: RepositoryId,
+        branch: BranchId,
+        flags: u32,
+    ) -> Result<(), StateError> {
+        self.edit_link_list(repository, link_id, |link_list| {
+            for link in link_list
+                .iter_mut()
+                .filter(|link| link.repository == link_id)
+            {
+                link.branch = branch;
+                link.flags = flags;
+            }
+            Ok(())
+        })
+        .await
+    }
+
     /// Replaces the registry row of `reference`'s repository and node with `reference`, or fails
     /// with [`LinkNotFound`] where the registry holds no such row.
     pub async fn link_replace(
@@ -7027,7 +7166,7 @@ impl State {
         local_node: &'a NodeID,
         edit: impl FnOnce(&mut LinkReference) + 'a,
     ) -> impl Future<Output = Result<(), StateError>> + 'a {
-        self.edit_link_list(repository, |link_list| {
+        self.edit_link_list(repository, *link_id, |link_list| {
             let link = link_list
                 .iter_mut()
                 .find(|link| link.repository == *link_id && link.local_node == *local_node)
@@ -7045,7 +7184,7 @@ impl State {
     ) -> Result<(), StateError> {
         lore_debug!("Remove link with ID {link_id}, local node {local_node}");
 
-        self.edit_link_list(repository, |link_list| {
+        self.edit_link_list(repository, link_id, |link_list| {
             if let Some(index) = link_list
                 .iter()
                 .position(|link| link.repository == link_id && link.local_node == local_node)
