@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_base::lore_spawn;
-use lore_base::lore_spawn_blocking;
 use lore_error_set::prelude::*;
 use lore_storage::ContentSource;
 
@@ -239,12 +238,7 @@ pub(crate) async fn merge_conflict_as_text(
         read_side(repository, Some(&conflict.mine)),
         read_side(repository, Some(&conflict.theirs))
     )?;
-    let rules = conflict.rules;
-    Ok(
-        lore_spawn_blocking!(move || merge_sides(&base, &mine, &theirs, rules))
-            .await
-            .internal("merging a file's sides")?,
-    )
+    Ok(merge_sides(&base, &mine, &theirs, conflict.rules))
 }
 
 /// Whether `side` is text by its first bytes, `true` where no side is checked.

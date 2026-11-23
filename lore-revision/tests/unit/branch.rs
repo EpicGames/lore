@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -12,9 +13,13 @@ use lore_base::error::AddressNotFound;
 use lore_base::error::Disconnected;
 use lore_base::error::NotAuthorized;
 use lore_base::lore_spawn;
+use lore_base::lore_spawn_blocking;
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::runtime::core_blocking_threads;
+use lore_base::runtime::thread_counts;
 use lore_base::types::Address;
 use lore_base::types::BranchPoint;
+use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_error_set::FfiError;
@@ -22,11 +27,14 @@ use lore_revision::change;
 use lore_revision::change::FileAction;
 use lore_revision::change::NodeChange;
 use lore_revision::event::LoreEvent;
+use lore_revision::immutable;
 use lore_revision::interface::ExecutionContext;
 use lore_revision::interface::LoreEventCallback;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::lore::*;
+use lore_revision::node::Node;
 use lore_revision::node::NodeFlags;
+use lore_revision::node::ROOT_NODE;
 use lore_revision::relay::EventDispatcher;
 use lore_revision::repository::BranchSwitchOptions;
 use lore_revision::repository::RepositoryContext;
@@ -40,6 +48,7 @@ use lore_storage::KeyType;
 use lore_storage::MutableStore;
 use lore_storage::ReadOptions;
 use lore_storage::StoreError;
+use lore_storage::WriteOptions;
 use lore_transport::ProtocolError;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -1841,6 +1850,76 @@ async fn the_auto_resolve_step_does_not_hold_the_text_merge() {
             size_of_val(&step),
             size_of_val(&merge)
         );
+    }))
+    .await;
+}
+
+/// The text merge runs on the core workers, so a conflict auto-resolves while every core blocking
+/// thread is held.
+#[tokio::test]
+async fn a_conflict_auto_resolves_while_the_core_blocking_pool_is_held() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let state = State::new();
+        let context = Context::from(uuid::Uuid::now_v7());
+        let file = async |name: &str, text: &'static str| {
+            let address = immutable::write(
+                repository.clone(),
+                context,
+                Bytes::from_static(text.as_bytes()),
+                WriteOptions::default(),
+            )
+            .await
+            .expect("writing the file's content");
+            let node = Node {
+                size: text.len() as u64,
+                address,
+                ..in_memory::file(name)
+            };
+            in_memory::add(&state, repository.clone(), ROOT_NODE, node, name).await
+        };
+        let base = file("base", "one\ntwo\nthree\n").await;
+        let mine = file("mine", "one\ntwo\nmine\n").await;
+        let theirs = file("theirs", "theirs\ntwo\nthree\n").await;
+        let change = |to| {
+            let mut change = node_change(
+                &repository,
+                &state,
+                FileAction::Keep,
+                NodeFlags::File,
+                "file.txt",
+                None,
+            );
+            change.from.mapping.node = base;
+            change.to.mapping.node = to;
+            change
+        };
+        let (source, target) = (change(theirs), change(mine));
+
+        let mut releases = Vec::new();
+        for _ in 0..core_blocking_threads(thread_counts()) {
+            let (parked, ready) = tokio::sync::oneshot::channel::<()>();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            drop(lore_spawn_blocking!(move || {
+                let _ = parked.send(());
+                let _ = released.recv();
+            }));
+            ready.await.expect("a blocking thread parks");
+            releases.push(release);
+        }
+        let resolved = tokio::time::timeout(
+            Duration::from_secs(10),
+            try_auto_resolve_conflict(&source, &target),
+        )
+        .await;
+        drop(releases);
+
+        let resolved = resolved
+            .expect("the merge must not wait on the blocking pool")
+            .expect("auto-resolving must succeed")
+            .expect("the text merges cleanly");
+        assert!(resolved.flags.contains(change::Flags::ConflictAutomerged));
+        assert_eq!(resolved.to.mapping.node, mine);
     }))
     .await;
 }
