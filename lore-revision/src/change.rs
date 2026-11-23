@@ -365,9 +365,12 @@ impl NodeChange {
     pub fn reverse(&mut self) {
         // Reverse add/delete/copy - other actions are transitive
         if self.action == FileAction::Delete {
-            if self.flags.is_conflict() && self.to.flags.contains(NodeFlags::StagedDelete) {
-                // If the change is a conflict where the "from" state is a deleted node and the "to"
-                // state is staged delete, keep it as delete
+            if self.flags.is_conflict()
+                && self.to.flags.contains(NodeFlags::StagedDelete)
+                && !self.from.mapping.node.is_valid_node_id()
+            {
+                // A conflict the merge staged as a node added and deleted at once, which the from
+                // side never held, reverses to nothing to add.
             } else {
                 self.action = FileAction::Add;
             }

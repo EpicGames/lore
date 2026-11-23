@@ -4,6 +4,7 @@
 
 import os
 import re
+from collections.abc import Callable
 
 import pytest
 from error_types import OverlappingLinkError
@@ -231,7 +232,7 @@ def folder_replaced_by_a_link(new_lore_repo, **link_add_options) -> tuple[Lore, 
     moving a folder out into its own repository leaves behind.
     """
     parent = make_repo(new_lore_repo, {"root.txt": "root\n", **SHARED_FOLDER})
-    source = make_repo(new_lore_repo, _unprefixed(SHARED_FOLDER))
+    source = make_repo(new_lore_repo, in_the_shared_mount(SHARED_FOLDER))
 
     parent.branch_create("feature")
     replace_folder_with_a_link(parent, source, **link_add_options)
@@ -259,7 +260,7 @@ def link_replaced_by_its_folder(new_lore_repo) -> tuple[Lore, Lore]:
     """Parent on `main` holding a link at `shared/`, plus a `feature` branch where
     a folder of the link's content replaced it, with `main` checked out."""
     parent, source = make_parent_with_link(
-        new_lore_repo, "shared", _unprefixed(SHARED_FOLDER)
+        new_lore_repo, "shared", in_the_shared_mount(SHARED_FOLDER)
     )
     parent.branch_create("feature")
     replace_link_with_folder(parent)
@@ -267,8 +268,9 @@ def link_replaced_by_its_folder(new_lore_repo) -> tuple[Lore, Lore]:
     return parent, source
 
 
-def _unprefixed(folder: dict[str, str]) -> dict[str, str]:
-    return {path.removeprefix("shared/"): content for path, content in folder.items()}
+def in_the_shared_mount(files: dict[str, str]) -> dict[str, str]:
+    """`files` below `shared/`, by their paths in a mount there."""
+    return {path.removeprefix("shared/"): content for path, content in files.items()}
 
 
 def replace_link_with_folder(repo: Lore, files: dict[str, str] = SHARED_FOLDER):
@@ -337,6 +339,20 @@ def assert_holds_link(repo: Lore, source: Lore, pin: str | None = None):
         "the mount must serve the linked repository's content"
     )
     assert unstaged_entries(repo) == [], "the file system must match the revision"
+
+
+def assert_merge_settled(repo: Lore, merged: str, assert_holds: Callable[[Lore], None]):
+    """Pushes the merge of `merged` `repo` committed, which `assert_holds` checks `repo` and a
+    fresh clone of its branch hold; the revision verifies, and merging `merged` again leaves
+    nothing to merge."""
+    repo.push()
+    assert_holds(repo)
+    assert "Verified repository state integrity" in repo.repository_verify()
+    assert_holds(repo.clone(branch=repo.branch_info().name))
+    again = repo.branch_merge_start(merged, message="Merge again")
+    assert "0 updated, 0 deleted, 0 merged, 0 conflicted" in again, (
+        f"a merge after the resolve must have nothing left to merge:\n{again}"
+    )
 
 
 def mount_listing(repo: Lore, link_path: str) -> list[str]:
@@ -532,9 +548,9 @@ def mount_part_inside_the_second_link_on_feature(urc: Lore, nested: Lore) -> Lor
     return feature
 
 
-def remove_the_second_link(feature: Lore):
-    feature.link_remove("libs/second")
-    feature.commit("Feature removes the second link")
+def unmount_the_part_inside_the_second_link(feature: Lore):
+    feature.link_remove("libs/second/part")
+    feature.commit("Feature takes back the mount inside the second link")
     feature.push()
 
 

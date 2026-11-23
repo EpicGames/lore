@@ -2661,7 +2661,11 @@ branch too, up to the link depth limit of 8. It follows three rules:
   branches it already created there. A branch it fails to delete stays, with a warning.
 
 Merging the parent carries its link changes as the parent's diff records them. A link the
-merged branch removes is removed, and its repository is not merged. The repository of an
+merged branch removes is removed, and its repository is not merged, unless this branch changed
+it: outside a linked repository, a link one branch removes and the other changes conflicts at
+the mount, as does a link against a folder, a file or a link to another repository. `theirs`
+takes the merged branch's side whole, landing a link as a merge brings one in; `mine` keeps
+this branch's. The repository of an
 auto-following link the merged branch adds is merged into the linked branch the link lands
 on, and the link pins the result: the pin it was given names a revision of the merged
 branch's counterpart, which the target's need not hold. A link with an explicit branch keeps

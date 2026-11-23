@@ -3023,7 +3023,7 @@ async fn landed_mounts<'a>(
 
 /// A linked repository with no branch for the links a merge brings in to land on, with the
 /// links.
-type MissingBranch = (RepositoryId, Vec<link::IncomingLink>);
+pub(crate) type MissingBranch = (RepositoryId, Vec<link::IncomingLink>);
 
 /// The branch `landed`, links a merge brings in, need, which the merge creates at `pin`, the
 /// revision they land at.
@@ -3045,6 +3045,88 @@ fn missing_branch(
             })
             .collect(),
     )
+}
+
+/// Lands `mounts`, following links of `state_staged` to one repository that a resolve took from the
+/// merged branch `merged_branch`, as a merge bringing them in does ([`land_incoming_links`]): the
+/// repository merged once into the linked branch they follow on `target_branch`, at the first
+/// one's pin, the merge realized in the mounts with its entries and conflicts recorded. Answers
+/// the branch to create where the repository holds none, once the staged state is stored.
+pub(crate) async fn land_resolved_links(
+    repository: &Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    state_staged: &Arc<State>,
+    mounts: Vec<link::IncomingLink>,
+    merged_branch: BranchId,
+    target_branch: BranchId,
+) -> Result<Option<MissingBranch>, MergeError> {
+    let row = mounts[0].link_reference;
+    let link_context = repository.to_link_context(row.repository).await;
+    let target_latest = branch::load_latest_preferring_remote(&link_context, target_branch)
+        .await
+        .forward_any::<MergeError>("loading the linked branch's latest")?;
+    let merge = if target_latest.is_zero() {
+        IncomingMerge::MissingBranch(row.signature)
+    } else if target_latest == row.signature {
+        IncomingMerge::Latest(target_latest)
+    } else {
+        IncomingMerge::Merge(
+            merge_source_at(
+                &link_context,
+                row.resolve_branch(merged_branch),
+                row.signature,
+                target_branch,
+                target_latest,
+            )
+            .await?,
+        )
+    };
+    let incoming = IncomingLinks {
+        link_context,
+        mounts,
+        merge,
+    };
+    let landed = landed_mounts(repository, state_staged, &incoming).await?;
+    let missing = match incoming.merge {
+        IncomingMerge::MissingBranch(pin) => Some(missing_branch(&incoming, &landed, pin)),
+        _ => None,
+    };
+    let inherit = MetadataInherit::default();
+    let landed = land_incoming_links(
+        repository,
+        MergeWrite {
+            token,
+            inherit: &inherit,
+            dry_run: false,
+        },
+        state_staged,
+        &incoming,
+        landed,
+        link::LinkPinRealize::WorkingTree,
+    )
+    .await?;
+    for pending in &landed.conflicts {
+        realize_link_conflicts(pending).await?;
+    }
+    if !landed.entries.is_empty() {
+        let mut entries = if state_staged.link_merge_hash().is_zero() {
+            Vec::new()
+        } else {
+            state_staged
+                .deserialize_link_merge_state(repository.clone())
+                .await
+                .forward::<MergeError>("deserializing link merge state")?
+        };
+        entries.extend(landed.entries);
+        state_staged
+            .serialize_link_merge_state(repository.clone(), &entries)
+            .await
+            .forward::<MergeError>("serializing link merge state")?;
+    }
+    if landed.has_conflicts {
+        state_staged.set_merge_conflict();
+    }
+    Ok(missing)
 }
 
 /// Stages each of `landed`, links a merge brings in, at `pin`, the revision its repository's
@@ -6548,6 +6630,7 @@ async fn files_to_resolve(
         return Ok(FilesToResolve {
             files: vec![(user_relative, node_link)],
             links: Vec::new(),
+            mounts: Vec::new(),
         });
     }
     let expanded = stage::collect_merge_paths(
@@ -6576,6 +6659,7 @@ async fn files_to_resolve(
     Ok(FilesToResolve {
         files,
         links: expanded.links,
+        mounts: expanded.mounts,
     })
 }
 
@@ -6583,6 +6667,7 @@ async fn files_to_resolve(
 struct FilesToResolve {
     files: Vec<(RelativePath, NodeLink)>,
     links: Vec<(RelativePath, NodeLink)>,
+    mounts: Vec<RelativePath>,
 }
 
 /// A link a resolve has reached, deserialized once however many of its paths are named.
@@ -6808,7 +6893,8 @@ async fn pin_touched_links(
 }
 
 /// Resolves each of `paths` against the state that holds it, which for a path inside a link is
-/// the link's own rather than the parent's.
+/// the link's own rather than the parent's. Answers the conflicts at link mounts they name, checked
+/// for keeping this branch's side, for the caller to settle.
 async fn resolve_paths(
     operation: &Arc<InstanceOperationImpl>,
     repository: &Arc<RepositoryContext>,
@@ -6817,10 +6903,11 @@ async fn resolve_paths(
     paths: &LoreArray<LoreString>,
     merge_type: MergeType,
     cache: &mut ResolveCache,
-) -> Result<(), MergeError> {
+) -> Result<stage::MountResolve, MergeError> {
     let refusal = stage::ResolveRefusal::new(repository, state_staged);
     // Every path is checked before any is marked, so a refused resolve reports nothing resolved.
     let mut files = Vec::new();
+    let mut mounts = Vec::new();
     let root = NodeMapping::root(repository.clone(), state_staged.clone());
     for path in paths.as_slice().iter() {
         let Ok(relative_path) =
@@ -6836,6 +6923,15 @@ async fn resolve_paths(
             relative_path.as_str(),
             repository.path_for_display()
         );
+
+        if refusal
+            .is_mount_conflict_at(&relative_path, true)
+            .await
+            .forward::<MergeError>("checking for a conflict at a link mount")?
+        {
+            mounts.push(relative_path);
+            continue;
+        }
 
         // Filter out paths that don't have a staged node - they can't be a merged change.
         // Use is_valid_or_root() since directory/root paths are now supported.
@@ -6879,6 +6975,7 @@ async fn resolve_paths(
                 .into_iter()
                 .map(|(path, node_link)| (root.clone(), path, node_link)),
         );
+        mounts.extend(collected.mounts);
         for (mount, mounted) in collected.links {
             files.append(
                 &mut files_to_resolve_in_link(
@@ -6895,11 +6992,14 @@ async fn resolve_paths(
         }
     }
 
+    let mounts = Box::pin(refusal.check_mounts(operation, mounts, stage::MergeParent::Mine))
+        .await
+        .forward::<MergeError>("checking the conflicts at link mounts")?;
     for (mapping, file_path, node_link) in files {
         let side = (mapping.repository.id == repository.id).then_some(state_current);
         resolve_single_file(operation, &mapping, side, file_path, node_link, merge_type).await?;
     }
-    Ok(())
+    Ok(mounts)
 }
 
 pub async fn merge_resolve(
@@ -6908,7 +7008,7 @@ pub async fn merge_resolve(
     paths: LoreArray<LoreString>,
     merge_type: MergeType,
 ) -> Result<(), MergeError> {
-    let (state_current, state_staged, _branch) =
+    let (state_current, state_staged, branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await
             .forward::<MergeError>("deserializing current and staged state")?;
@@ -6935,21 +7035,28 @@ pub async fn merge_resolve(
     // One operation covers every path: resolving reads the working tree to tell a conflict still
     // marked up from one settled, and stages a deleted or missing file from it, removing a
     // directory only the merge's change of the file kept.
-    if !paths.is_empty() {
-        with_operation(repository.file_system(), async |operation| {
-            resolve_paths(
-                &operation,
-                &repository,
-                &state_staged,
-                &state_current,
-                &paths,
-                merge_type,
-                &mut cache,
-            )
-            .await
-        })
-        .await?;
-    }
+    let missing = if paths.is_empty() {
+        None
+    } else {
+        Some(
+            with_operation(repository.file_system(), async |operation| {
+                let mounts = resolve_paths(
+                    &operation,
+                    &repository,
+                    &state_staged,
+                    &state_current,
+                    &paths,
+                    merge_type,
+                    &mut cache,
+                )
+                .await?;
+                Box::pin(mounts.apply(&operation, &repository, &state_staged, token, branch))
+                    .await
+                    .forward::<MergeError>("resolving the conflicts at link mounts")
+            })
+            .await?,
+        )
+    };
 
     pin_touched_links(&repository, &state_staged, token, cache).await?;
 
@@ -6975,6 +7082,12 @@ pub async fn merge_resolve(
     crate::instance::store_staged_anchor(&repository, signature)
         .await
         .forward::<MergeError>("storing staged anchor")?;
+    if let Some(missing) = missing {
+        missing
+            .create(&repository)
+            .await
+            .forward::<MergeError>("creating the branches the resolved links follow")?;
+    }
 
     match merge_type {
         MergeType::CherryPick => {

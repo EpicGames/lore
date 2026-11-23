@@ -585,9 +585,7 @@ pub async fn diff3_with_source_cap(
     if !joined_conflicts.is_empty() {
         let conflicted = sorted_paths(joined_conflicts.iter().map(|(from, _to)| from.path()));
         joined_changes.retain(|item| {
-            !(item.from.flags.is_directory()
-                && item.action == FileAction::Delete
-                && overlaps_any(&conflicted, item.path().as_str()))
+            !(is_directory_delete(item) && overlaps_any(&conflicted, item.path().as_str()))
         });
         lore_debug!("Identify resolved conflicts through merges");
     }
@@ -640,9 +638,31 @@ pub async fn diff3_with_source_cap(
             );
         }
     }
+    // A mount conflict inside a linked repository is not resolvable yet, so there the removal
+    // stands. Boxed: run once a diff, its walks would otherwise make every diff's future as large
+    // as theirs.
+    if !repository.is_link() {
+        for mount in Box::pin(crate::link::removed_links_changed_by_the_other_side(
+            &repository,
+            &state_base,
+            [
+                (&state_source, source_branch),
+                (&state_target, target_branch),
+            ],
+            path.as_ref(),
+        ))
+        .await
+        .forward::<StateError>("Failed to compare the links of the merge")?
+        {
+            push_unique_path(&mut conflicting_mounts, &mount);
+        }
+    }
     for mount in conflicting_mounts.iter() {
         lore_debug!("{mount} was replaced on one side and changed on the other, conflict there");
-        joined_changes.retain(|change| !mount.covers(change.path()));
+        joined_changes.retain(|change| {
+            !mount.covers(change.path())
+                && !(is_directory_delete(change) && change.path().covers(mount))
+        });
         final_conflicts.retain(|(source_conflict, target_conflict)| {
             !mount.covers(source_conflict.path()) && !mount.covers(target_conflict.path())
         });
@@ -849,6 +869,10 @@ fn is_below(mount: &RelativePath, path: &RelativePath) -> bool {
     mount.covers(path) && mount != path
 }
 
+fn is_directory_delete(change: &NodeChange) -> bool {
+    change.action == FileAction::Delete && change.from.flags.is_directory()
+}
+
 #[lore_macro::test_pub]
 fn push_unique_path(paths: &mut Vec<RelativePath>, path: &RelativePath) {
     if !paths.contains(path) {
@@ -962,7 +986,7 @@ async fn replacement_conflict(
 /// The node `state` holds at `path`, which is the link node itself where the path ends at a mount
 /// rather than anything the linked repository holds. A side that holds nothing there is the side
 /// that deleted the path.
-async fn mount_node_change_state(
+pub(crate) async fn mount_node_change_state(
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
     path: &RelativePath,

@@ -1680,13 +1680,12 @@ async fn add_change_for_paired_nodes(
                 .await?;
             }
 
-            // A conflict on a directory node is at the path itself, and the
+            // A conflict on a directory or link node is at the path itself, and the
             // walk below it reports nothing that carries it.
-            let conflicted_directory =
-                is_staged_merge_conflict && to_type == LoreNodeType::Directory;
+            let conflicted_subtree = is_staged_merge_conflict && to_type != LoreNodeType::File;
             let settles_from = flags.contains(DiffFlags::SettlesFrom)
                 && (from_node.is_dirty_add() || from_node.is_staged_delete());
-            let node_reported = !mode_equal || is_rename || conflicted_directory || settles_from;
+            let node_reported = !mode_equal || is_rename || conflicted_subtree || settles_from;
             if node_reported {
                 lore_trace!(
                     "Diff node {subpath} directory mode change from {from_mode} to {to_mode}, {action:?}|modify"

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::str::FromStr;
 use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
@@ -17,6 +18,7 @@ use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::diff3_collect;
+use lore_revision::state::LinkPin;
 use lore_revision::state::LinkReference;
 use lore_revision::state::Mark;
 use lore_revision::state::NodeMapping;
@@ -643,6 +645,260 @@ async fn a_link_the_merged_branch_moves_keeps_or_never_held_is_not_deleted_by_th
         .await;
 }
 
+/// How a side of a merge changes the link at `libs/old` of a base linking it.
+#[derive(Debug, Clone, Copy)]
+enum LinkEdit {
+    /// Adds a file at the root and leaves the link.
+    Keep,
+    Remove,
+    /// Deletes `libs`, the directory holding the link.
+    RemoveDirectory,
+    /// Removes the link and links its repository at `libs/new`.
+    MoveElsewhere,
+    /// Pins the link to another revision of its repository.
+    Repin,
+    /// Has the link's row name another branch, at the same pin.
+    ChangeBranch,
+    /// Has the link's row stop following its parent's branch.
+    ChangeFlags,
+}
+
+/// Commits `edit` on a revision of `base`, where `link` and `libs` are the link and the directory
+/// holding it.
+async fn commit_link_edit(
+    repository: &Arc<RepositoryContext>,
+    base: Hash,
+    (link, libs): (NodeID, NodeID),
+    (merged, pin): (RepositoryId, Hash),
+    edit: LinkEdit,
+) -> Hash {
+    let state = in_memory::revision_state(repository, base).await;
+    let remove = async |node| {
+        state
+            .node_delete(repository.clone(), node)
+            .await
+            .expect("deleting the node");
+        state
+            .link_remove(repository.clone(), merged, link)
+            .await
+            .expect("removing the link's row");
+    };
+    match edit {
+        LinkEdit::Keep => {
+            add(
+                &state,
+                repository.clone(),
+                ROOT_NODE,
+                in_memory::file("beside.txt"),
+                "beside.txt",
+            )
+            .await;
+        }
+        LinkEdit::Remove => remove(link).await,
+        LinkEdit::RemoveDirectory => remove(libs).await,
+        LinkEdit::MoveElsewhere => {
+            remove(link).await;
+            let moved = add(
+                &state,
+                repository.clone(),
+                libs,
+                link_node("new", merged, pin),
+                "new",
+            )
+            .await;
+            state
+                .link_add(
+                    repository.clone(),
+                    merged,
+                    tracking(),
+                    pin,
+                    moved,
+                    LinkFlags::NoFlags,
+                )
+                .await
+                .expect("registering the moved link");
+        }
+        LinkEdit::Repin => {
+            let linked = repository.to_link_context(merged).await;
+            let linked_state = in_memory::revision_state(&linked, pin).await;
+            add(
+                &linked_state,
+                linked.clone(),
+                ROOT_NODE,
+                in_memory::file("m.txt"),
+                "m.txt",
+            )
+            .await;
+            let repin = in_memory::commit(&linked, &linked_state, pin, branch_id()).await;
+            state
+                .node_set_link_target(
+                    repository,
+                    link,
+                    LinkPin::Whole {
+                        address: Address {
+                            hash: repin,
+                            context: Context::from(merged),
+                        },
+                        child: ROOT_NODE,
+                    },
+                )
+                .await
+                .expect("repinning the link");
+            state
+                .link_update(repository.clone(), merged, tracking(), repin, link)
+                .await
+                .expect("repinning the link's row");
+        }
+        LinkEdit::ChangeBranch => {
+            state
+                .link_update(repository.clone(), merged, branch_id(), pin, link)
+                .await
+                .expect("naming another branch in the link's row");
+        }
+        LinkEdit::ChangeFlags => {
+            let row = state
+                .link_find(repository.clone(), merged, link)
+                .await
+                .expect("the link's row");
+            state
+                .link_replace(
+                    repository.clone(),
+                    LinkReference {
+                        flags: LinkFlags::DisableAutoFollow.bits(),
+                        ..row
+                    },
+                )
+                .await
+                .expect("fixing the link's row");
+        }
+    }
+    in_memory::commit(repository, &state, base, branch_id()).await
+}
+
+/// The diff, at `path` or of the whole trees, of a merge whose merged branch makes `source` and
+/// whose current branch makes `target` on a base linking a repository at `libs/old`. Answers the
+/// diff and the linked repository.
+async fn diff_of_link_edits(
+    source: LinkEdit,
+    target: LinkEdit,
+    path: Option<&str>,
+) -> (lore_revision::revision::DiffResult, RepositoryId) {
+    let (immutable, mutable, _execution) = test_store_create().await.expect("making test stores");
+    let repository = in_memory::repository(immutable, mutable);
+    let merged = RepositoryId::from(uuid::Uuid::now_v7());
+    let pin = linked_revision(&repository, merged).await;
+    let base_state = State::new();
+    let libs = add(
+        &base_state,
+        repository.clone(),
+        ROOT_NODE,
+        directory("libs"),
+        "libs",
+    )
+    .await;
+    let link = add(
+        &base_state,
+        repository.clone(),
+        libs,
+        link_node("old", merged, pin),
+        "old",
+    )
+    .await;
+    add(
+        &base_state,
+        repository.clone(),
+        libs,
+        in_memory::file("beside.txt"),
+        "beside.txt",
+    )
+    .await;
+    base_state
+        .link_add(
+            repository.clone(),
+            merged,
+            tracking(),
+            pin,
+            link,
+            LinkFlags::NoFlags,
+        )
+        .await
+        .expect("registering the link");
+    let base = in_memory::commit(&repository, &base_state, Hash::default(), branch_id()).await;
+    let nodes = (link, libs);
+    let source = commit_link_edit(&repository, base, nodes, (merged, pin), source).await;
+    let target = commit_link_edit(&repository, base, nodes, (merged, pin), target).await;
+
+    let path = path.map(|path| RelativePath::from_str(path).expect("a valid path"));
+    let diff = diff3_collect(repository.clone(), base, source, target, path, true)
+        .await
+        .expect("diffing the revisions");
+    (diff, merged)
+}
+
+/// A link one side removes, also with the directory holding it, conflicts at its mount where the
+/// other side repinned it or changed its row, whichever side removes it, within the path the diff
+/// covers. Otherwise it is removed, and moved where the removing side links its repository
+/// elsewhere. Removing the directory still deletes what it holds beside the conflict.
+#[tokio::test]
+async fn a_link_removed_on_one_side_conflicts_where_the_other_side_changed_it() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            use FileAction::Add;
+            use FileAction::Delete;
+            use LinkEdit::*;
+            for (source, target, path, conflicted, changed) in [
+                (Remove, Repin, None, &["libs/old"][..], &[][..]),
+                (Repin, Remove, None, &["libs/old"], &[]),
+                (Remove, ChangeBranch, None, &["libs/old"], &[]),
+                (Remove, ChangeFlags, None, &["libs/old"], &[]),
+                (
+                    RemoveDirectory,
+                    ChangeBranch,
+                    None,
+                    &["libs/old"],
+                    &[(Delete, "libs/beside.txt")],
+                ),
+                (Remove, Repin, Some("libs"), &["libs/old"], &[]),
+                (Remove, Repin, Some("other"), &[], &[]),
+                (
+                    MoveElsewhere,
+                    Repin,
+                    None,
+                    &[],
+                    &[(Add, "libs/new"), (Delete, "libs/old")],
+                ),
+                (Remove, Remove, None, &[], &[(Delete, "libs/old")]),
+                (Remove, Keep, None, &[], &[(Delete, "libs/old")]),
+            ] {
+                let (diff, merged) = diff_of_link_edits(source, target, path).await;
+                let case = format!("{source:?} against {target:?} at {path:?}");
+                let paths: Vec<_> = diff
+                    .conflicts
+                    .iter()
+                    .map(|(source, _)| source.path().as_str())
+                    .collect();
+                assert_eq!(paths, conflicted, "{case}");
+                let mut changes = diff.changes;
+                lore_revision::change::sort_by_path(&mut changes);
+                let under_libs: Vec<_> = changes
+                    .iter()
+                    .filter(|change| change.path().as_str().starts_with("libs"))
+                    .map(|change| (change.action, change.path().as_str()))
+                    .collect();
+                assert_eq!(under_libs, changed, "{case}");
+                if !conflicted.is_empty() {
+                    continue;
+                }
+                assert_eq!(
+                    merge_deletes_link(&changes, "libs/old", merged),
+                    !changed.is_empty(),
+                    "{case}"
+                );
+            }
+        })
+        .await;
+}
+
 /// A change taking `action` at `path` from a node of `from` to one of `to`, each addressed in
 /// [`merged`], in states holding nothing.
 fn change_of(
@@ -673,6 +929,35 @@ fn change_of(
         from: side(from),
         to: side(to),
     }
+}
+
+/// Reversing a conflicted delete the staged state holds adds back the node the from side holds,
+/// and adds nothing where the merge staged a node the from side never held, added and deleted at
+/// once.
+#[tokio::test]
+async fn reversing_a_conflicted_delete_adds_back_only_a_node_the_from_side_holds() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            for (held, reversed) in [(true, FileAction::Add), (false, FileAction::Delete)] {
+                let mut change = change_of(
+                    &repository,
+                    FileAction::Delete,
+                    "a.txt",
+                    NodeFlags::File,
+                    NodeFlags::File | NodeFlags::StagedDelete | NodeFlags::StagedMergeConflict,
+                );
+                change.flags = lore_revision::change::Flags::Conflict;
+                if !held {
+                    change.from = change.from.invalid(change.from.mapping.path.clone());
+                }
+                change.reverse();
+                assert_eq!(change.action, reversed, "held by the from side: {held}");
+            }
+        })
+        .await;
 }
 
 /// A change replacing a link, or a directory above it, with a file takes the link with it, and

@@ -160,7 +160,7 @@ pub fn remove_boxed(
 /// Removing a link deletes from disk the files it tracks in its mount, which `shown` maps, taking
 /// their uncommitted changes with no way back. What it does not track stays. A file under a case
 /// variant of its name holding what the link holds is no such change.
-async fn verify_no_local_changes_under_link(
+pub(crate) async fn verify_no_local_changes_under_link(
     operation: &Arc<InstanceOperationImpl>,
     shown: Option<MountedTree>,
     link_path: &RelativePath,

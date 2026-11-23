@@ -3407,6 +3407,137 @@ pub(crate) fn merge_deletes_link(
     })
 }
 
+/// The mounts of the links `base` holds at or below `scope`, or anywhere where `None`, that one
+/// side of a merge removed while the other changed the link's row or the subtree it mounts. Each
+/// side is a state with the branch it was committed on. Neither diff carries such a change: the
+/// removal is one change at the mount, and the other side's is a pin or a row. A side linking the
+/// repository at a path `base` does not link it at moved the link there rather than removed it.
+pub(crate) async fn removed_links_changed_by_the_other_side(
+    repository: &Arc<RepositoryContext>,
+    base: &Arc<State>,
+    sides: [(&Arc<State>, BranchId); 2],
+    scope: Option<&RelativePath>,
+) -> Result<Vec<RelativePath>, LinkError> {
+    let base_rows = LinkRows::read(base, repository.clone()).await?;
+    if base_rows.rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let side_rows = tokio::try_join!(
+        LinkRows::read(sides[0].0, repository.clone()),
+        LinkRows::read(sides[1].0, repository.clone()),
+    )?;
+    let side_rows = [side_rows.0, side_rows.1];
+    let mut base_branch = None;
+    let mut mounts = Vec::new();
+    for base_row in &base_rows.rows {
+        let link_repository = base_row.repository;
+        // A side that removed a link holds no row for its node.
+        if side_rows
+            .iter()
+            .all(|rows| rows.row(base_row.local_node, link_repository).is_some())
+        {
+            continue;
+        }
+        let path = base
+            .node_path(repository.clone(), base_row.local_node)
+            .await
+            .forward::<LinkError>("Failed resolving link node path")?;
+        let mount =
+            RelativePath::from_str(&path).internal_with(|| format!("Invalid link path {path}"))?;
+        if scope.is_some_and(|scope| !scope.overlaps(&mount)) {
+            continue;
+        }
+        let held = tokio::try_join!(
+            row_at(repository, &side_rows[0], &path, link_repository),
+            row_at(repository, &side_rows[1], &path, link_repository),
+        )?;
+        let held = [held.0, held.1];
+        let (removing, changing, changed) = match &held {
+            [None, Some(changed)] => (0, 1, changed),
+            [Some(changed), None] => (1, 0, changed),
+            _ => continue,
+        };
+        let Some(base_held) = row_at(repository, &base_rows, &path, link_repository).await? else {
+            continue;
+        };
+        let base_branch = match base_branch {
+            Some(branch) => branch,
+            None => *base_branch.insert(parent_branch(base, repository).await?),
+        };
+        let unchanged = changed
+            .0
+            .same_row(sides[changing].1, &base_held.0, base_branch)
+            && changed.1 == base_held.1;
+        if !unchanged
+            && !links_elsewhere(
+                repository,
+                &side_rows[removing],
+                link_repository,
+                &base_rows,
+            )
+            .await?
+        {
+            mounts.push(mount);
+        }
+    }
+    Ok(mounts)
+}
+
+/// The row `rows` hold for the link at `path` of their state, to `link_repository` where given,
+/// pinned at the revision its tree node carries, with the node it mounts.
+#[lore_macro::test_pub]
+pub(crate) async fn row_at(
+    repository: &Arc<RepositoryContext>,
+    rows: &LinkRows,
+    path: &str,
+    link_repository: impl Into<Option<RepositoryId>>,
+) -> Result<Option<(LinkReference, NodeID)>, LinkError> {
+    let Some((node_id, node)) = link_node_at_path(&rows.state, repository.clone(), path).await?
+    else {
+        return Ok(None);
+    };
+    let held_repository = RepositoryId::from(node.address.context);
+    if link_repository
+        .into()
+        .is_some_and(|link_repository| link_repository != held_repository)
+    {
+        return Ok(None);
+    }
+    Ok(rows
+        .row(node_id, held_repository)
+        .map(|row| (row.with_signature(node.address.hash), node.child)))
+}
+
+/// Whether `rows` link `link_repository` at a path none of `base_rows` links it at.
+async fn links_elsewhere(
+    repository: &Arc<RepositoryContext>,
+    rows: &LinkRows,
+    link_repository: RepositoryId,
+    base_rows: &LinkRows,
+) -> Result<bool, LinkError> {
+    let paths = async |rows: &LinkRows| {
+        let mut paths = Vec::new();
+        for row in rows
+            .rows
+            .iter()
+            .filter(|row| row.repository == link_repository)
+        {
+            paths.push(
+                rows.state
+                    .node_path(repository.clone(), row.local_node)
+                    .await
+                    .forward::<LinkError>("Failed resolving link node path")?,
+            );
+        }
+        Ok::<_, LinkError>(paths)
+    };
+    let base_paths = paths(base_rows).await?;
+    Ok(paths(rows)
+        .await?
+        .iter()
+        .any(|path| !base_paths.contains(path)))
+}
+
 /// Each directory above `path` and `path` itself, outermost first, with whether it is `path`.
 fn covering_paths(path: &str) -> impl Iterator<Item = (&str, bool)> {
     path.match_indices('/')
@@ -3506,7 +3637,7 @@ fn link_row(
 }
 
 /// The branch `state`'s revision was committed on, which its auto-following rows resolve to.
-async fn parent_branch(
+pub(crate) async fn parent_branch(
     state: &Arc<State>,
     repository: &Arc<RepositoryContext>,
 ) -> Result<BranchId, LinkError> {
