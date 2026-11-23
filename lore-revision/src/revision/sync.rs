@@ -86,6 +86,9 @@ pub struct LoreRevisionSyncTargetEventData {
     pub remote_available: u8,
     /// Remote branch query returned an authoritative answer, identity is authorized to access the repository.
     pub remote_authorized: u8,
+    /// No valid login reached the remote: none is stored for its server, it expired and could not
+    /// be refreshed, or the remote rejected the token presented.
+    pub remote_unauthenticated: u8,
 }
 
 /// Progress counters reported while a sync updates the working files.
@@ -656,10 +659,6 @@ pub(crate) async fn sync(
     let local_latest = branch::load_latest(repository.clone(), anchor_branch)
         .await
         .unwrap_or_default();
-    let mut remote_latest = Hash::default();
-    let mut remote_available = false;
-    let mut remote_authorized = false;
-
     // Unreadable answers for divergent: what is not known to stand in the remote's
     // history is what the divergence handling below exists for.
     let mut local_latest_diverged =
@@ -667,31 +666,15 @@ pub(crate) async fn sync(
             .await
             .unwrap_or(true);
 
-    match repository.remote().await {
-        Ok(remote) => {
-            remote_available = true;
-            match branch::load_remote(remote.clone(), repository.id, anchor_branch).await {
-                Ok(status) => {
-                    remote_latest = status.latest;
-                    remote_authorized = true;
-                }
-                Err(err) if err.is_branch_not_found() => {
-                    remote_authorized = true;
-                }
-                Err(err) => {
-                    lore_debug!("Remote branch query failed: {err}");
-                }
-            }
-            lore_debug!("Remote latest revision is {remote_latest}");
-        }
-        // No remote configured for this repository, nothing to report
-        Err(err) if err.is_no_remote() => {}
-        // Remote is configured but the connection failed
-        Err(err) => {
-            lore_debug!("Remote connection failed: {err}");
-            remote_available = true;
-        }
-    }
+    let branch::RemoteLatest {
+        latest: remote_latest,
+        configured: remote_configured,
+        authorized: remote_authorized,
+        unauthenticated: remote_unauthenticated,
+        ..
+    } = branch::resolve_remote_latest(&repository, anchor_branch).await;
+    let remote_latest = remote_latest.unwrap_or_default();
+    lore_debug!("Remote latest revision is {remote_latest}");
 
     let mut revision;
     if let Some(requested_revision) = requested_revision {
@@ -879,8 +862,9 @@ pub(crate) async fn sync(
         target_revision_number: state_target.revision_number(),
         is_latest: at_latest.into(),
         local: (location == LoreBranchLocation::Local).into(),
-        remote_available: remote_available.into(),
+        remote_available: remote_configured.into(),
         remote_authorized: remote_authorized.into(),
+        remote_unauthenticated: remote_unauthenticated.into(),
     })
     .send();
 

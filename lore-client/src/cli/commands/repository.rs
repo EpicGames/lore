@@ -621,19 +621,17 @@ pub fn handle_repository_status(globals: LoreGlobalArgs, args: &RepositoryStatus
                     data.revision_number,
                     data.revision
                 );
-                if data.remote_available != 0 {
-                    if data.remote_authorized == 0 {
-                        println!(
-                            "Remote reachable but could not read remote revision (not authorized or unavailable)"
-                        );
-                    } else if data.remote_branch_exist != 0 {
-                        println!(
-                            "Remote revision {} -> {}",
-                            data.revision_remote_number, data.revision_remote
-                        );
-                    } else {
-                        println!("Remote branch does not exist");
-                    }
+                if data.remote_unauthenticated != 0
+                    || (data.remote_available != 0 && data.remote_authorized == 0)
+                {
+                    util::print_remote_unread(data.remote_unauthenticated != 0, "");
+                } else if data.remote_branch_exist != 0 {
+                    println!(
+                        "Remote revision {} -> {}",
+                        data.revision_remote_number, data.revision_remote
+                    );
+                } else if data.remote_available != 0 {
+                    println!("Remote branch does not exist");
                 }
                 if data.is_local_ahead > 0 {
                     if data.is_remote_ahead > 0 {
@@ -661,8 +659,12 @@ pub fn handle_repository_status(globals: LoreGlobalArgs, args: &RepositoryStatus
             }
             LoreEvent::RepositoryStatusSummary(data) => {
                 summary_holder.adds.store(data.adds, Ordering::Relaxed);
-                summary_holder.deletes.store(data.deletes, Ordering::Relaxed);
-                summary_holder.modifies.store(data.modifies, Ordering::Relaxed);
+                summary_holder
+                    .deletes
+                    .store(data.deletes, Ordering::Relaxed);
+                summary_holder
+                    .modifies
+                    .store(data.modifies, Ordering::Relaxed);
                 summary_holder.moves.store(data.moves, Ordering::Relaxed);
                 summary_holder.copies.store(data.copies, Ordering::Relaxed);
                 summary_holder.seen.store(true, Ordering::Relaxed);

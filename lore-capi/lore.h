@@ -2247,6 +2247,10 @@ typedef struct lore_repository_status_revision_event_data_t {
   uint8_t remote_authorized;
   // Branch exists on the remote and the query returned a latest revisoin (possibly zero if branch does not exist on remote)
   uint8_t remote_branch_exist;
+  // No valid login reached the remote: none is stored for its server, it expired and could not
+  // be refreshed, or the remote rejected the token presented. Set where `remote_available` is
+  // zero too, since a login refused at the connect leaves the remote unreachable.
+  uint8_t remote_unauthenticated;
 } lore_repository_status_revision_event_data_t;
 
 // Status of a single file or node reported by a repository status operation.
@@ -2583,6 +2587,9 @@ typedef struct lore_revision_sync_target_event_data_t {
   uint8_t remote_available;
   // Remote branch query returned an authoritative answer, identity is authorized to access the repository.
   uint8_t remote_authorized;
+  // No valid login reached the remote: none is stored for its server, it expired and could not
+  // be refreshed, or the remote rejected the token presented.
+  uint8_t remote_unauthenticated;
 } lore_revision_sync_target_event_data_t;
 
 // Details of a single file changed by a sync.

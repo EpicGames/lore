@@ -1162,6 +1162,61 @@ pub async fn load_remote(
     })
 }
 
+/// What the remote answered for a branch's latest revision.
+#[lore_macro::test_pub]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RemoteLatest {
+    /// The remote latest revision, `None` where the branch isn't on the remote or the query failed.
+    pub latest: Option<Hash>,
+    /// The repository has a remote and the command isn't offline.
+    pub configured: bool,
+    /// The connection to the remote succeeded.
+    pub connected: bool,
+    /// The remote answered the query, which proves the caller may read the repository.
+    pub authorized: bool,
+    /// No valid login reached the remote, at the connect or at the query.
+    pub unauthenticated: bool,
+}
+
+/// The remote's latest revision for a branch. A failure to reach the remote or to query it is
+/// reported in the result, never returned, so a remote that can't answer never fails a local
+/// read; transport connect timeouts bound the wait.
+#[lore_macro::test_pub]
+pub(crate) async fn resolve_remote_latest(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+) -> RemoteLatest {
+    let remote = match repository.remote().await {
+        Ok(remote) => remote,
+        Err(err) if err.is_no_remote() => return RemoteLatest::default(),
+        Err(err) => {
+            lore_debug!("Remote connection failed: {err}");
+            return RemoteLatest {
+                configured: true,
+                unauthenticated: err.is_not_authenticated(),
+                ..RemoteLatest::default()
+            };
+        }
+    };
+
+    let (latest, authorized, unauthenticated) =
+        match load_remote(remote, repository.id, branch).await {
+            Ok(status) => (Some(status.latest), true, false),
+            Err(err) if err.is_branch_not_found() => (None, true, false),
+            Err(err) => {
+                lore_debug!("Remote branch query failed: {err}");
+                (None, false, err.is_not_authenticated())
+            }
+        };
+    RemoteLatest {
+        latest,
+        configured: true,
+        connected: true,
+        authorized,
+        unauthenticated,
+    }
+}
+
 pub async fn load_latest(
     repository: Arc<RepositoryContext>,
     branch: BranchId,

@@ -102,6 +102,10 @@ pub struct LoreRepositoryStatusRevisionEventData {
     pub remote_authorized: u8,
     /// Branch exists on the remote and the query returned a latest revisoin (possibly zero if branch does not exist on remote)
     pub remote_branch_exist: u8,
+    /// No valid login reached the remote: none is stored for its server, it expired and could not
+    /// be refreshed, or the remote rejected the token presented. Set where `remote_available` is
+    /// zero too, since a login refused at the connect leaves the remote unreachable.
+    pub remote_unauthenticated: u8,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -125,6 +129,7 @@ impl LoreRepositoryStatusRevisionEventData {
         remote_available: bool,
         remote_authorized: bool,
         remote_branch_exist: bool,
+        remote_unauthenticated: bool,
     ) -> Self {
         LoreRepositoryStatusRevisionEventData {
             repository,
@@ -144,6 +149,7 @@ impl LoreRepositoryStatusRevisionEventData {
             remote_available: remote_available.into(),
             remote_authorized: remote_authorized.into(),
             remote_branch_exist: remote_branch_exist.into(),
+            remote_unauthenticated: remote_unauthenticated.into(),
         }
     }
 }
@@ -1311,35 +1317,6 @@ async fn count_subtrees(roots: Vec<CountWork>) -> Result<(u64, u64), StatusError
     Ok((directories, files))
 }
 
-/// Resolve the remote's latest revision for a branch, degrading to the existing
-/// `NoRemote` state when the remote is unavailable so an unreachable remote never
-/// stalls a local status read; transport connect timeouts bound the wait.
-///
-/// Returns `(latest, authorized, available)`, where `available` reflects
-/// connectivity, not query success — a reachable remote that errors is still available.
-#[lore_macro::test_pub]
-async fn resolve_remote_latest(
-    repository: &Arc<RepositoryContext>,
-    branch_id: BranchId,
-) -> (Option<Hash>, bool, bool) {
-    let remote = match repository.remote().await {
-        Ok(r) => r,
-        Err(err) => {
-            lore_debug!("Remote unavailable for status: {err}");
-            return (None, false, false);
-        }
-    };
-
-    match branch::load_remote(remote, repository.id, branch_id).await {
-        Ok(status) => (Some(status.latest), true, true),
-        Err(err) if err.is_branch_not_found() => (None, true, true),
-        Err(err) => {
-            lore_debug!("Remote branch query failed: {err}");
-            (None, false, true)
-        }
-    }
-}
-
 /// Whether a branch has revisions the remote latest does not, and whether the remote latest has
 /// revisions the branch does not, answered as `(local_ahead, remote_ahead)` for `local_state`, the
 /// branch's local latest, and `remote_state`, a different remote latest.
@@ -1964,10 +1941,13 @@ pub(crate) async fn status(
         .await
         .forward::<StatusError>("deserializing local state")?;
 
-    // Authorized only on an authoritative answer — a latest revision
-    // or branch not found; proving the identity is authorized and has access
-    let (remote_latest, remote_authorized, remote_available) =
-        resolve_remote_latest(&repository, branch.id).await;
+    let branch::RemoteLatest {
+        latest: remote_latest,
+        connected: remote_connected,
+        authorized: remote_authorized,
+        unauthenticated: remote_unauthenticated,
+        ..
+    } = branch::resolve_remote_latest(&repository, branch.id).await;
 
     let remote_state = if let Some(remote_latest) = remote_latest {
         state::State::deserialize(repository.clone(), remote_latest)
@@ -2117,9 +2097,10 @@ pub(crate) async fn status(
             },
             local_ahead,
             remote_ahead,
-            remote_available,
+            remote_connected,
             remote_authorized,
             remote_latest.is_some(),
+            remote_unauthenticated,
         );
         lore_debug!("Repository status: {data:?}");
         event::LoreEvent::RepositoryStatusRevision(data).send();

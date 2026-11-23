@@ -27,6 +27,7 @@ use parking_lot::Mutex;
 use crate::eprintln;
 use crate::println;
 use crate::styling::CommonStyles;
+use crate::styling::LogStyles;
 
 /// Discover the repository root by walking up from the process working
 /// directory, when `--repository` named none.
@@ -453,5 +454,22 @@ pub fn read_line_with_editing(buf: &mut String) -> std::io::Result<usize> {
     #[cfg(not(unix))]
     {
         std::io::stdin().read_line(buf)
+    }
+}
+
+/// Prints why the remote latest revision could not be read, followed by `consequence`.
+pub fn print_remote_unread(unauthenticated: bool, consequence: &str) {
+    let reason = if unauthenticated {
+        "Not logged in to the remote"
+    } else {
+        "Could not read the remote revision (not authorized or unavailable)"
+    };
+    println!(
+        "{}{reason}{consequence}{}",
+        LogStyles::WARNING,
+        anstyle::Reset
+    );
+    if unauthenticated {
+        println!("Log in with `lore auth login`");
     }
 }

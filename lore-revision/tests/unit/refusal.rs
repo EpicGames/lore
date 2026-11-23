@@ -23,10 +23,12 @@ use lore_base::types::Partition;
 use lore_base::types::TypedBytes;
 use lore_error_set::prelude::*;
 use lore_revision::branch;
+use lore_revision::branch::RemoteLatest;
 use lore_revision::branch::merge::MergeIntoOptions;
 use lore_revision::branch::push::MountPolicy;
 use lore_revision::branch::push::PushRun;
 use lore_revision::branch::push::collect_targets;
+use lore_revision::branch::resolve_remote_latest;
 use lore_revision::commit;
 use lore_revision::commit::CommitOptions;
 use lore_revision::file::audit::AuditError;
@@ -116,6 +118,8 @@ enum BranchQueryAnswer {
     Latest(Hash),
     /// No such branch.
     NotFound,
+    /// A refusal of the caller's login.
+    Unauthenticated,
 }
 
 /// A remote revision service that refuses the caller on every request but a branch query, which it
@@ -153,6 +157,9 @@ impl Revision for RefusingRevision {
             BranchQueryAnswer::Refusal => return Err(refusal()),
             BranchQueryAnswer::Latest(latest) => latest,
             BranchQueryAnswer::NotFound => return Err(ProtocolError::from(NotFound)),
+            BranchQueryAnswer::Unauthenticated => {
+                return Err(ProtocolError::from(NotAuthenticated));
+            }
         };
         Ok(BranchQueryResponse {
             id: branch.unwrap_or_default(),
@@ -545,6 +552,66 @@ async fn create_feature_branch(
 
 async fn with_execution<F: Future>(body: F) -> F::Output {
     LORE_CONTEXT.scope(setup_test_execution(), body).await
+}
+
+/// The remote latest query reports a refusal of the caller's login, at the connect or at the query,
+/// as one, and a refusal of access to the repository as unauthorized only.
+#[tokio::test]
+async fn a_remote_latest_query_reports_a_refused_login() {
+    Box::pin(with_execution(async {
+        let repository = RepositoryId::from(uuid::Uuid::now_v7());
+        let unauthenticated_query = Connection::detached_revision(
+            Vec::new(),
+            Ok(()),
+            repository,
+            Arc::new(RefusingRevision {
+                answer: BranchQueryAnswer::Unauthenticated,
+                ..RefusingRevision::default()
+            }),
+        );
+        let configured = RemoteLatest {
+            configured: true,
+            ..RemoteLatest::default()
+        };
+        let connected = RemoteLatest {
+            connected: true,
+            ..configured
+        };
+        let cases = [
+            (
+                "login refused at the connect",
+                RemoteState::Failed(ProtocolError::from(NotAuthenticated)),
+                RemoteLatest {
+                    unauthenticated: true,
+                    ..configured
+                },
+            ),
+            (
+                "login refused at the query",
+                RemoteState::Connected(unauthenticated_query),
+                RemoteLatest {
+                    unauthenticated: true,
+                    ..connected
+                },
+            ),
+            (
+                "access refused at the connect",
+                RemoteState::Failed(refusal()),
+                configured,
+            ),
+            (
+                "access refused at the query",
+                RemoteState::Connected(refusing_connection(repository)),
+                connected,
+            ),
+        ];
+        for (name, remote, expected) in cases {
+            let context = context_with_remote(repository, remote).await;
+            let remote = resolve_remote_latest(&context, BranchId::from([1; 16])).await;
+            assert_eq!(remote, expected, "{name}");
+        }
+    }))
+    .await;
 }
 
 /// A revision's state the instance does not hold is read from the remote, whose refusal is the
