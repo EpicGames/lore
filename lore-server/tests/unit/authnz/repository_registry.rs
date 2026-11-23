@@ -23,9 +23,28 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Code;
 use tonic::Request;
 use tonic::Status;
+use tonic_types::ErrorDetails;
+use tonic_types::StatusExt;
 
 const AUTH_URL: &str = "https://auth.example.com";
 const USER_URL: &str = "https://directory.example.com";
+
+fn invalid_argument(reason: &str, domain: &str, field: &str, message: &str) -> Status {
+    Status::with_error_details(
+        Code::InvalidArgument,
+        message,
+        ErrorDetails::with_error_info(reason, domain, [("field".to_string(), field.to_string())]),
+    )
+}
+
+fn invalid_name(field: &str, message: &str) -> Status {
+    invalid_argument(
+        "ERROR_REASON_INVALID_FORMAT",
+        "lore.error.v1",
+        field,
+        message,
+    )
+}
 
 fn repository() -> RepositoryId {
     Context::from_str("2fc8bf934117e250152eba9a1fc78e71")
@@ -89,8 +108,9 @@ fn display_names_the_registry() {
 
 #[test]
 fn add_outcome_maps_the_registration_status() {
-    let outcome = |status: Status| add_outcome(Err(status), repository(), "org/repo", "rpc");
-    add_outcome(Ok(()), repository(), "org/repo", "rpc").expect("OK continues the create");
+    let outcome =
+        |status: Status| add_outcome(Err(status), repository(), "org/repo", "name", "rpc");
+    add_outcome(Ok(()), repository(), "org/repo", "name", "rpc").expect("OK continues the create");
     outcome(Status::already_exists("")).expect("AlreadyExists continues the create");
     let cases = [
         (Status::permission_denied(""), Code::PermissionDenied),
@@ -98,6 +118,46 @@ fn add_outcome_maps_the_registration_status() {
         (Status::not_found(""), Code::FailedPrecondition),
         (
             Status::invalid_argument("invalid resource_id"),
+            Code::Internal,
+        ),
+        (
+            Status::invalid_argument(r#"resource_name must be "<org>/<repo>", got "repo""#),
+            Code::Internal,
+        ),
+        (
+            invalid_argument(
+                "ERROR_REASON_INVALID_FORMAT",
+                "example.com",
+                "name",
+                "bad name",
+            ),
+            Code::Internal,
+        ),
+        (
+            invalid_argument(
+                "ERROR_REASON_INVALID_FORMAT",
+                "lore.error.v1",
+                "id",
+                "bad id",
+            ),
+            Code::Internal,
+        ),
+        (
+            invalid_argument(
+                "ERROR_REASON_NAME_TAKEN",
+                "lore.error.v1",
+                "name",
+                "bad name",
+            ),
+            Code::Internal,
+        ),
+        (
+            invalid_argument(
+                "REPOSITORY_REGISTRY_ERROR_REASON_INVALID_NAME",
+                "lore.user.v1.RepositoryRegistryService",
+                "name",
+                "bad name",
+            ),
             Code::Internal,
         ),
         (Status::unavailable("down"), Code::Internal),
@@ -108,13 +168,24 @@ fn add_outcome_maps_the_registration_status() {
     let err = outcome(Status::unavailable("down")).unwrap_err();
     assert!(err.message().contains("Failed to call rpc: "), "{err}");
 
-    let name_format = r#"resource_name must be "<org>/<repo>", got "repo""#;
-    let err = outcome(Status::invalid_argument(name_format)).unwrap_err();
-    assert_eq!(err.code(), Code::InvalidArgument);
-    assert_eq!(
-        err.message(),
-        format!("Invalid repository name: {name_format}")
-    );
+    for reason in [
+        "ERROR_REASON_UNSPECIFIED",
+        "ERROR_REASON_INVALID_FORMAT",
+        "ERROR_REASON_MISSING_REQUIRED_FIELD",
+    ] {
+        let err = outcome(invalid_argument(
+            reason,
+            "lore.error.v1",
+            "name",
+            "must be <org>/<repo>",
+        ))
+        .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{reason}");
+        assert_eq!(
+            err.message(),
+            "Invalid repository name: must be <org>/<repo>"
+        );
+    }
 }
 
 #[test]
@@ -150,7 +221,7 @@ async fn unregistered_sends_nothing() {
 /// `None`.
 #[derive(Default)]
 struct Registry {
-    status: Option<Code>,
+    status: Option<Status>,
     registers: Mutex<Vec<(RepositoryRegisterRequest, Option<String>)>>,
     unregisters: Mutex<Vec<(RepositoryUnregisterRequest, Option<String>)>>,
 }
@@ -164,9 +235,9 @@ fn authorization<T>(request: &tonic::Request<T>) -> Option<String> {
 
 impl Registry {
     fn answer<T: Default>(&self) -> Result<tonic::Response<T>, Status> {
-        match self.status {
+        match &self.status {
             None => Ok(tonic::Response::new(T::default())),
-            Some(code) => Err(Status::new(code, "answered by the test")),
+            Some(status) => Err(status.clone()),
         }
     }
 }
@@ -207,7 +278,7 @@ impl RepositoryRegistryService for Registry {
     }
 }
 
-async fn serve(status: Option<Code>) -> (RepositoryRegistry, Arc<Registry>) {
+async fn serve(status: Option<Status>) -> (RepositoryRegistry, Arc<Registry>) {
     let stub = Arc::new(Registry {
         status,
         ..Registry::default()
@@ -259,12 +330,26 @@ async fn user_service_registers_and_unregisters_the_repository() {
 
 #[tokio::test]
 async fn user_service_already_exists_is_a_name_conflict() {
-    let (registry, _stub) = serve(Some(Code::AlreadyExists)).await;
+    let (registry, _stub) = serve(Some(Status::already_exists("answered by the test"))).await;
     let err = registry
         .add(None, repository(), "org/repo")
         .await
         .expect_err("the repository is registered under another name");
     assert_eq!(err.code(), Code::AlreadyExists);
+}
+
+#[tokio::test]
+async fn user_service_invalid_name_carries_the_registry_message() {
+    let (registry, _stub) = serve(Some(invalid_name("name", "must be <org>/<repo>"))).await;
+    let err = registry
+        .add(None, repository(), "repo")
+        .await
+        .expect_err("the registry rejects the name");
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(
+        err.message(),
+        "Invalid repository name: must be <org>/<repo>"
+    );
 }
 
 #[tokio::test]
@@ -282,7 +367,7 @@ async fn user_service_refusals_map_as_the_rebac_ones() {
         ),
         (Code::NotFound, Code::FailedPrecondition, Code::Internal),
     ] {
-        let (registry, _stub) = serve(Some(answer)).await;
+        let (registry, _stub) = serve(Some(Status::new(answer, "answered by the test"))).await;
         let add = registry.add(None, repository(), "org/repo").await;
         assert_eq!(
             add.unwrap_err().code(),
@@ -366,43 +451,16 @@ mod repository_create_auth_resource_tests {
     }
 
     #[tokio::test]
-    async fn invalid_repository_name_returns_invalid_argument() {
+    async fn invalid_name_returns_invalid_argument_with_registry_message() {
         let repo_name = "2fc8bf934117e250152eba9a1fc78e71";
         let repository: RepositoryId = Context::from_str(repo_name)
             .expect("Failed to create repository")
             .into();
 
         let mut client = MockMockRebacApiClient::new();
-        client.expect_create_resource().return_once(|_| {
-            Err(Status::invalid_argument(
-                "Missing resource context in resourceName",
-            ))
-        });
-
-        let error = repository_create_auth_resource(Box::new(client), None, repository, repo_name)
-            .await
-            .expect_err("Should have errored");
-        assert_eq!(error.code(), Code::InvalidArgument);
-        assert_eq!(
-            error.message(),
-            "Invalid repository name - missing Organization context"
-        );
-    }
-
-    #[tokio::test]
-    async fn name_format_rejection_returns_invalid_argument_with_registry_message() {
-        let repo_name = "2fc8bf934117e250152eba9a1fc78e71";
-        let repository: RepositoryId = Context::from_str(repo_name)
-            .expect("Failed to create repository")
-            .into();
-        let registry_message =
-            format!("resource_name must be \"<org>/<repo>\", got \"{repo_name}\"");
-
-        let mut client = MockMockRebacApiClient::new();
-        let rejection = registry_message.clone();
         client
             .expect_create_resource()
-            .return_once(move |_| Err(Status::invalid_argument(rejection)));
+            .return_once(|_| Err(invalid_name("resource_name", "must be <org>/<repo>")));
 
         let error = repository_create_auth_resource(Box::new(client), None, repository, repo_name)
             .await
@@ -410,7 +468,7 @@ mod repository_create_auth_resource_tests {
         assert_eq!(error.code(), Code::InvalidArgument);
         assert_eq!(
             error.message(),
-            format!("Invalid repository name: {registry_message}")
+            "Invalid repository name: must be <org>/<repo>"
         );
     }
 

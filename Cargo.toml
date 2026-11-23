@@ -240,6 +240,7 @@ toml = "0.9.5"
 trybuild = "1"
 tonic = { version = "0.14.2", default-features = false, features = ["codegen", "router", "server", "tls-native-roots", "tls-webpki-roots"] }
 tonic-prost = "0.14.2"
+tonic-types = "0.14.2"
 tonic-prost-build = "0.14.2"
 tower = { version = "0.5.2", default-features = false }
 tower-http = { version = "0.6.11", default-features = false }
