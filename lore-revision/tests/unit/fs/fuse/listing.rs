@@ -10,7 +10,6 @@ use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_revision::filter::Filter;
 use lore_revision::filter::FilterStates;
-use lore_revision::fs::fuse::FuseProviderError;
 use lore_revision::fs::fuse::listing::Hit;
 use lore_revision::fs::fuse::listing::Listing;
 use lore_revision::fs::fuse::listing::ListingEntry;
@@ -504,8 +503,10 @@ async fn listing_skips_names_with_slash_nul_dot_dotdot_or_over_255_bytes_and_cou
     .expect("task failed");
 }
 
+/// A link is listed as a directory marked a link, and its own listing holds nothing: the mount
+/// does not serve a link's content.
 #[tokio::test]
-async fn listing_refuses_link_nodes() {
+async fn a_link_is_listed_as_a_directory_with_an_empty_listing() {
     let (_immutable, mutable, execution) = fuse_fixture::test_store_create()
         .await
         .expect("test store creation must succeed");
@@ -521,16 +522,30 @@ async fn listing_refuses_link_nodes() {
             address: placeholder_address(0x5a),
             ..Default::default()
         };
-        add(&state, repository.clone(), ROOT_NODE, link, "vendor").await;
+        let link = add(&state, repository.clone(), ROOT_NODE, link, "vendor").await;
 
         let served = test_served(state, repository);
-        let result =
-            Listing::build(&served, ROOT_NODE, FilterStates::ROOT, &RelativePath::new()).await;
-
-        assert!(
-            matches!(result, Err(FuseProviderError::NotSupported(_))),
-            "a link child must fail the build with NotSupported"
+        let listing = Listing::build(&served, ROOT_NODE, FilterStates::ROOT, &RelativePath::new())
+            .await
+            .expect("a directory holding a link lists");
+        assert_eq!(listing.len(), 1);
+        assert_eq!(listing.name(0), b"vendor");
+        assert_eq!(
+            listing.entry(0).flags & (entry_flags::IS_DIR | entry_flags::LINK),
+            entry_flags::IS_DIR | entry_flags::LINK,
+            "a link is listed as a directory marked a link"
         );
+
+        let linked = Listing::build(
+            &served,
+            link,
+            FilterStates::ROOT,
+            &RelativePath::new().join("vendor"),
+        )
+        .await
+        .expect("a link's own listing builds");
+        assert_eq!(linked.len(), 0, "a link's content is not served");
+        assert_eq!(linked.dir, link);
     }))
     .await
     .expect("task failed");

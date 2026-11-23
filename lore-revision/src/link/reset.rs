@@ -27,7 +27,9 @@ use crate::state::State;
 
 /// Removes a staged link add from the registry and the link's files from the mount, where they
 /// hold no local change unless `overwrite_local` says to discard it. Files the link does not hold
-/// stay, and with them the mount.
+/// stay, and with them the mount. A provider holding its state holds nothing of the link, so its
+/// mount stays as it is
+/// ([`holds_state`](crate::fs::filesystem_provider::FilesystemProvider::holds_state)).
 pub(crate) async fn reset_staged_add_link(
     operation: &Arc<InstanceOperationImpl>,
     at: NodeMapping,
@@ -80,7 +82,7 @@ pub(crate) async fn reset_staged_add_link(
         return Ok(());
     }
 
-    if dry_run || operation.remove(&link_path).await.is_err() {
+    if dry_run || operation.holds_state() || operation.remove(&link_path).await.is_err() {
         return Ok(());
     }
 
@@ -135,7 +137,9 @@ async fn drop_staged_link(
 
 /// Restores the link registry entry a staged removal dropped and re-realizes the pinned content
 /// at the mount, refusing to replace a file standing there or a local change to a file the link
-/// holds unless `overwrite_local` says to discard it.
+/// holds unless `overwrite_local` says to discard it. A provider holding its state serves the link
+/// from its node, so nothing of it is written
+/// ([`holds_state`](crate::fs::filesystem_provider::FilesystemProvider::holds_state)).
 ///
 /// Realizes through `operation`, the caller's: a filesystem holds one operation at a time and
 /// unstaging opens one for the whole walk.
@@ -234,10 +238,12 @@ async fn restore_link(
         .await
         .forward::<LinkError>("Failed to restore link registry entry")?;
 
-    operation
-        .create_dir_all(&link_path)
-        .await
-        .forward::<LinkError>("Failed to recreate the link directory")?;
+    if !operation.holds_state() {
+        operation
+            .create_dir_all(&link_path)
+            .await
+            .forward::<LinkError>("Failed to recreate the link directory")?;
+    }
 
     if execution_context().globals().dry_run() {
         return Ok(());
@@ -313,7 +319,9 @@ pub(crate) async fn reset_staged_update_link(
 /// Drops the staged link `staged_link_node` to another repository than the current revision's
 /// link `current_link_node` at the mount `at`, and restores the latter. Refuses before it changes
 /// anything where the latter's mount overlaps one staged since, or, unless `overwrite_local`, where
-/// a sync moving the link back would ([`crate::fs::realize::verify_mount_replacement`]).
+/// a sync moving the link back would ([`crate::fs::realize::verify_mount_replacement`]). A provider
+/// holding its state holds the files of neither link, so neither revision is read for that check
+/// ([`holds_state`](crate::fs::filesystem_provider::FilesystemProvider::holds_state)).
 pub(crate) async fn reset_staged_relink(
     operation: &Arc<InstanceOperationImpl>,
     at: NodeMapping,
@@ -323,7 +331,7 @@ pub(crate) async fn reset_staged_relink(
     overwrite_local: bool,
 ) -> Result<(), LinkError> {
     let restorable = restorable_link(&at, &state_current, &current_link_node).await?;
-    if !overwrite_local {
+    if !overwrite_local && !operation.holds_state() {
         let (shown, incoming) = tokio::join!(
             open_mounted_tree(&at.repository, &staged_link_node),
             open_mounted_tree(&at.repository, &current_link_node),

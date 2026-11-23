@@ -29,6 +29,10 @@ use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util::path::RelativePath;
 
+/// Removes the link at `link_path` and the files it tracks in its mount, which a local change to
+/// any of them refuses unless forced. A provider holding its state serves the link from its node,
+/// so nothing at or below the mount is read or written
+/// ([`holds_state`](crate::fs::filesystem_provider::FilesystemProvider::holds_state)).
 pub(crate) async fn remove(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -68,16 +72,21 @@ pub(crate) async fn remove(
         _ => link_path.clone(),
     };
 
-    let shown = open_mounted_tree(&inner_repository, &link_node).await;
+    let shown = if repository.file_system().holds_state() {
+        None
+    } else {
+        open_mounted_tree(&inner_repository, &link_node).await
+    };
     // One operation covers the removal: the working tree read to find local changes is the one
     // the mount is then deleted from, and the staged state is stored before it finalizes, as an
     // SWFS instance serves links from what is stored then (ADR-00042).
     with_operation::<_, LinkError, _>(repository.file_system(), async |operation| {
-        if !execution_context().globals().force() {
-            verify_no_local_changes_under_link(&operation, shown.clone(), &mount).await?;
+        if !operation.holds_state() {
+            if !execution_context().globals().force() {
+                verify_no_local_changes_under_link(&operation, shown.clone(), &mount).await?;
+            }
+            remove_link_mount(&operation, &repository, &mount, shown, is_staged_add).await?;
         }
-
-        remove_link_mount(&operation, &repository, &mount, shown, is_staged_add).await?;
 
         if is_staged_add {
             // Link was added but never committed — discard the node from the staged tree

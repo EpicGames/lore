@@ -35,6 +35,7 @@ use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::FsError;
 use crate::fs::filesystem_provider::HoldOptions;
 use crate::hash::hash_string;
+use crate::interface::LoreNodeType;
 use crate::lore_error;
 use crate::lore_info;
 use crate::node::INVALID_NODE;
@@ -1377,6 +1378,10 @@ impl<'a, H: HoldHost> Directories<'a, H> {
                 return Ok(true);
             }
         }
+        if held.is_link() {
+            // A link's subtree is the linked revision's, never children to remove one by one.
+            return Ok(false);
+        }
         if held.is_file() {
             // A forced hold overwrites a local edit of a file the revision holds, never a file
             // added locally, which an ordinary clone keeps too.
@@ -1458,7 +1463,8 @@ impl<'a, H: HoldHost> Directories<'a, H> {
     /// whole, local content included. Where nothing stands, the path is added where the change adds
     /// it or restores it (`absent`): a path the revision holds and the State does not is a local
     /// deletion, which only a change of the file restores. A directory the change adds over a
-    /// directory takes whatever of the target's subtree it lacks.
+    /// directory takes whatever of the target's subtree it lacks. A link stays where the target
+    /// holds the same link, and is replaced by a copy, or replaces what stands, otherwise.
     async fn place(
         &mut self,
         parent: NodeID,
@@ -1489,6 +1495,10 @@ impl<'a, H: HoldHost> Directories<'a, H> {
             true => Some(self.paths.spelled(existing, path).await),
             false => None,
         };
+        let link = held.is_link() || wanted.is_link();
+        if link && same_link(&held, wanted) {
+            return Ok(());
+        }
         match (held.is_file(), wanted.is_file()) {
             (true, true) if !is_local(&held) => {
                 self.record(path, false);
@@ -1563,14 +1573,14 @@ impl<'a, H: HoldHost> Directories<'a, H> {
                 }
                 Ok(())
             }
-            (false, false) if added || exact => {
+            (false, false) if !link && (added || exact) => {
                 Box::pin(fill_in(self, existing, side, path, exact)).await
             }
             (true, true) => {
                 self.kept.push(path.clone());
                 Ok(())
             }
-            (false, false) => Ok(()),
+            (false, false) if !link => Ok(()),
             _ => {
                 let whole = self.options.reset_local;
                 if Box::pin(self.remove_node(existing, held, path, whole)).await? {
@@ -1630,12 +1640,12 @@ impl Resolver<'_> {
     }
 }
 
-/// Adds to directory `dir`, at `path`, whatever of `side`'s directory it lacks, descending into
-/// the directories both hold. Where `exact`, it also makes what both hold match `side`: a child
-/// `side` lacks goes unless it holds local content, a file takes `side`'s content unless it
-/// holds local content, and a child of the other kind is replaced; each path so changed is
-/// noted in `reconciled`. A child a served removal takes while its content is replaced is absent,
-/// as where nothing stood.
+/// Adds to directory `dir`, at `path`, whatever of `side`'s directory it lacks, descending into the
+/// directories both hold. Where `exact`, it also makes what both hold match `side`: a child `side`
+/// lacks goes unless it holds local content, a file takes `side`'s content unless it holds local
+/// content, a link stays where `side` holds the same link, and a child of the other kind, or
+/// another link, is replaced; each path so changed is noted in `reconciled`. A child a served
+/// removal takes while its content is replaced is absent, as where nothing stood.
 async fn fill_in<H: HoldHost>(
     dirs: &mut Directories<'_, H>,
     dir: NodeID,
@@ -1683,23 +1693,24 @@ async fn fill_in<H: HoldHost>(
         };
         let existing = held[at].1;
         // The record read in a block, so no later await holds it.
-        let (existing_directory, keeps_content) = {
+        let (existing_type, keeps_content, kept_link) = {
             let existing_node = dirs.paths.node(existing).await?;
             (
-                existing_node.is_directory(),
+                existing_node.node_type(),
                 is_local(&existing_node)
                     || (existing_node.address.hash == wanted.address.hash
                         && existing_node.mode == wanted.mode),
+                same_link(&existing_node, &wanted),
             )
         };
-        match (existing_directory, wanted.is_directory()) {
-            (true, true) => {
+        match (existing_type, wanted.node_type()) {
+            (LoreNodeType::Directory, LoreNodeType::Directory) => {
                 let child_path =
                     path.join(&from.node_name_clone(from_repository.clone(), child).await?);
                 Box::pin(fill_in(dirs, existing, &child_side, &child_path, exact)).await?;
             }
-            _ if !exact => {}
-            (false, false) => {
+            _ if !exact || kept_link => {}
+            (LoreNodeType::File, LoreNodeType::File) => {
                 if keeps_content {
                     continue;
                 }
@@ -1862,16 +1873,27 @@ fn unloaded_attach() -> StateError {
     StateError::internal("an attach that may load found nothing to load")
 }
 
-/// A node holding what `node` holds: its kind, mode, size and address.
+/// A node holding what `node` holds: its kind, mode, size and address, and the subtree a link
+/// mounts.
 fn copy_of(node: &Node) -> Node {
-    Node {
-        flags: node.flags & NodeFlags::File.bits(),
+    let mut copy = Node {
+        flags: node.flags & (NodeFlags::File | NodeFlags::Link).bits(),
         mode: node.mode,
         size: node.size,
         address: node.address,
         name_hash: node.name_hash,
         ..Node::default()
-    }
+    };
+    copy.take_mount_source(node);
+    copy
+}
+
+/// Whether `held` and `wanted` are links mounting the same subtree of the same revision.
+fn same_link(held: &Node, wanted: &Node) -> bool {
+    held.is_link()
+        && wanted.is_link()
+        && held.address == wanted.address
+        && held.mounts_same_source(wanted)
 }
 
 /// Detaches `node` when it is as `when` asks, decided under the locks the detach takes, and

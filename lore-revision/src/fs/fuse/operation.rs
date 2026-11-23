@@ -72,8 +72,10 @@ use crate::state::ChangeStream;
 use crate::state::FilesystemDiffStats;
 use crate::state::NodeComparison;
 use crate::state::NodeMapping;
+use crate::state::PathStop;
 use crate::state::SerializedBlocks;
 use crate::state::State;
+use crate::state::Stop;
 use crate::util::path::RelativePath;
 
 /// How much of a file `infer_is_diffable` reads.
@@ -1433,11 +1435,15 @@ impl InstanceOperation for FuseOperation {
     /// own, where the provider's context holds those of the last revision it held. After a marking
     /// diff under the command's write token, the operation serves from the store, as it ends, the
     /// local files its comparisons found holding the mounted revision's content
-    /// ([`FuseOperation::serve_unchanged`]).
+    /// ([`FuseOperation::serve_unchanged`]). Nothing at or below a link is reported, as no write
+    /// changes a link: not a diff of a linked repository, nor one at a path through a link.
     fn changes_from_filesystem_to_state(
         &self,
         diff: FilesystemDiffContext,
     ) -> ChangeStream<FilesystemDiffStats> {
+        if diff.from.repository.is_link() {
+            return ChangeStream::nothing();
+        }
         if diff.intent.marks_dirty()
             && diff.from.repository.try_write_token().is_some()
             && !diff.operation.dry_run()
@@ -1448,11 +1454,29 @@ impl InstanceOperation for FuseOperation {
         let filesystem = self.filesystem.clone();
         ChangeStream::spawn(async move |changes| {
             let served = filesystem.served();
-            let node = served
+            let node = match served
                 .state
-                .find_node_link(served.repository.clone(), diff.filesystem_path.as_str())
+                .find_to_link::<true>(
+                    &served.repository,
+                    ROOT_NODE,
+                    diff.filesystem_path.as_str(),
+                    true,
+                )
                 .await
-                .map_or(INVALID_NODE, |link| link.node);
+            {
+                Ok(PathStop {
+                    at: Stop::Link(_), ..
+                }) => return Ok(FilesystemDiffStats::default()),
+                Ok(PathStop {
+                    at: Stop::End,
+                    node,
+                    ..
+                }) => node,
+                Ok(PathStop {
+                    at: Stop::Missing, ..
+                })
+                | Err(_) => INVALID_NODE,
+            };
             let spelled = state_spelling(&served, node, &diff).await;
             let to = NodeMapping {
                 node,

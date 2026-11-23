@@ -3042,7 +3042,9 @@ async fn refuse_files_over_mounts_before_reset(
 /// is renamed to that spelling ([`respell`]) before it is walked or its file is handed off. Where
 /// the caller reads its directory only on a miss, `missed` holds that directory's entries, and the
 /// node is renamed where the stat of its spelling misses: in [`reset_file_realize`] for a file, in
-/// [`reset_walk_directory`] for a directory, and here for a link's mount.
+/// [`reset_walk_directory`] for a directory, and here for a link's mount. A link is walked into
+/// its linked repository, except on a provider holding its state, which serves nothing below a
+/// link ([`holds_state`](crate::fs::filesystem_provider::FilesystemProvider::holds_state)).
 ///
 /// `staged` is the node the staged tree holds where the walk found `node_id`, whose marks the
 /// reset checks and clears, `None` where it holds none.
@@ -3119,7 +3121,7 @@ fn reset_walk_node(
 
         // If the node is a link, traverse into the linked repository
         if node.is_link() {
-            if options.single_node {
+            if options.single_node || operation.holds_state() {
                 return Ok(());
             }
             if let Some(missed) = &missed

@@ -1766,6 +1766,9 @@ file, and the mount serves one that holds the revision's content from the store 
 file a commit stores. A recorded time stands only for content read after no write could still carry
 that time, and only for the revision the mount serves, and a file returns to the store only while
 it still shows the time that was read, so no write racing a status, a stage or a commit is missed.
+It holds a link as the link's node alone, so nothing at or below a link is a change of its working
+tree, and nothing of a link is written through it: a merge bringing one, or a link's update or
+removal, changes the node.
 
 #### 15.3 Paths into the dirty set
 

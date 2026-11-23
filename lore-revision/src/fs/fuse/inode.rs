@@ -39,6 +39,9 @@ pub enum InodeKind {
         /// Whether the directory was added under `write/`, whose host directory answers its
         /// mode and times.
         local: bool,
+        /// Whether the directory is a link, whose content the mount does not serve and which
+        /// no write changes.
+        link: bool,
     },
     File {
         address: Address,
@@ -60,6 +63,7 @@ impl InodeKind {
             view_line: 0,
             node,
             local: false,
+            link: false,
         }
     }
 
@@ -80,6 +84,11 @@ impl InodeKind {
     /// Whether this is a file whose bytes live under `write/`.
     pub fn is_local_file(&self) -> bool {
         matches!(self, Self::File { local: true, .. })
+    }
+
+    /// Whether this is a link.
+    pub fn is_link(&self) -> bool {
+        matches!(self, Self::Dir { link: true, .. })
     }
 }
 

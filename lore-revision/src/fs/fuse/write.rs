@@ -1160,12 +1160,16 @@ pub(crate) enum Found {
         local: bool,
     },
     Symlink,
+    /// A link, which no write changes.
+    Link,
 }
 
 impl Found {
     fn of_entry(entry: &ListingEntry) -> Self {
         let local = entry.flags & entry_flags::LOCAL != 0;
-        if entry.flags & entry_flags::IS_DIR != 0 {
+        if entry.flags & entry_flags::LINK != 0 {
+            Self::Link
+        } else if entry.flags & entry_flags::IS_DIR != 0 {
             Self::Dir { local }
         } else if entry.flags & entry_flags::SYMLINK != 0 {
             Self::Symlink
@@ -1928,7 +1932,7 @@ impl FuseFilesystem {
     ) -> Result<EntryReply, ReadFault> {
         let local = self.writable()?;
         let name = new_name(name)?;
-        let (dir_node, parent_filter) = self.dir_node(parent)?;
+        let (dir_node, parent_filter) = self.dir_to_change(parent)?;
         let served = self.served();
         let absent = match self.resolve_to_attach(&served, parent, name, fetch).await? {
             Resolved {
@@ -2024,6 +2028,7 @@ impl FuseFilesystem {
                     view_line: view_line(state),
                     node: node_id,
                     local: true,
+                    link: false,
                 }
             }
         };
@@ -2496,7 +2501,8 @@ impl FuseFilesystem {
     }
 
     /// SETATTR of inode `ino`: size, mode and times; owner and group only as they are. A
-    /// tracked file is copied up first, and a tracked directory takes a new time only.
+    /// tracked file is copied up first, a tracked directory takes a new time only, and a link
+    /// takes nothing (`EROFS`).
     pub(crate) async fn setattr_node(
         &self,
         ino: u64,
@@ -2504,6 +2510,9 @@ impl FuseFilesystem {
         fetch: bool,
     ) -> Result<AttrReply, ReadFault> {
         let local = self.writable()?;
+        if self.inodes().get(ino).ok_or(Errno::ENOENT)?.kind.is_link() {
+            return Err(Errno::EROFS.into());
+        }
         let valid = attr.valid;
         let context = self.attr_context();
         if (valid & setattr_valid::UID != 0 && attr.uid != context.uid)
@@ -2647,11 +2656,13 @@ impl FuseFilesystem {
         fetch: bool,
     ) -> Result<(), ReadFault> {
         self.writable()?;
+        self.dir_to_change(parent)?;
         let name = std::str::from_utf8(name).map_err(|_invalid| Errno::ENOENT)?;
         let served = self.served();
         let resolved = self.resolve(&served, parent, name, fetch).await?;
         match (resolved.found, dir) {
             (Found::Nothing, _) => return Err(Errno::ENOENT.into()),
+            (Found::Link, _) => return Err(Errno::EROFS.into()),
             (found, true) if !found.is_dir() => return Err(Errno::ENOTDIR.into()),
             (found, false) if found.is_dir() => return Err(Errno::EISDIR.into()),
             _ => {}
@@ -2799,7 +2810,7 @@ impl FuseFilesystem {
                     ],
                 })
             }
-            Found::File { local: false } | Found::Nothing => Ok(Aside::Nothing),
+            Found::File { local: false } | Found::Nothing | Found::Link => Ok(Aside::Nothing),
         })
     }
 
@@ -2955,18 +2966,19 @@ impl FuseFilesystem {
         let served = self.served();
         let from = Side {
             dir: parent,
-            node: self.dir_node(parent)?.0,
+            node: self.dir_to_change(parent)?.0,
             name,
         };
         let to = Side {
             dir: newparent,
-            node: self.dir_node(newparent)?.0,
+            node: self.dir_to_change(newparent)?.0,
             name: newname,
         };
         let source = self.resolve(&served, from.dir, name, fetch).await?;
         let same_name = from.dir == to.dir && fold_eq(name, newname);
         match source.found {
             Found::Nothing => return Err(Errno::ENOENT.into()),
+            Found::Link => return Err(Errno::EROFS.into()),
             // A change of case alone respells the directory in place, whatever it holds.
             Found::Dir { .. } if same_name => {}
             Found::Dir { local: false } => return Err(Errno::EXDEV.into()),
@@ -3003,6 +3015,9 @@ impl FuseFilesystem {
             self.resolve_to_attach(served, to.dir, to.name, fetch)
                 .await?
         };
+        if target.found == Found::Link {
+            return Err(Errno::EROFS.into());
+        }
         let mut replaced = None;
         let mut counted = false;
         if target.found != Found::Nothing {

@@ -194,7 +194,8 @@ bitflags! {
         /// The to side is a filesystem State that changes under the walk, and the from side the
         /// tree lore holds against it. A to child is reported only while it is live under the
         /// parent and the name it was listed with, and the from side is listed with its staged
-        /// deletes, which a name the to side holds again pairs with.
+        /// deletes, which a name the to side holds again pairs with. A link on either side is
+        /// neither descended nor reported, as a filesystem State changes nothing at or below one.
         const FilesystemTo = 0b100;
         /// The walk leaves link pins to the link registry: a link it would descend, one the
         /// caller can read that mounts the same subtree of the same repository on both
@@ -204,6 +205,11 @@ bitflags! {
         /// read the linked repository.
         const ReportsLinkNodes = 0b10000;
     }
+}
+
+/// Whether a walk under `flags` leaves `node` alone ([`DiffFlags::FilesystemTo`]).
+fn leaves(flags: DiffFlags, node: &Node) -> bool {
+    flags.contains(DiffFlags::FilesystemTo) && node.is_link()
 }
 
 impl DiffFlags {
@@ -1079,6 +1085,9 @@ async fn add_change_for_solo_from_node(
         node: from_node,
         path: from_path,
     } = from_node_search;
+    if leaves(context.flags, from_node) {
+        return Ok(());
+    }
     if context.flags.contains(DiffFlags::FilesystemTo)
         && (from_node.is_staged_delete()
             // Boxed: a cold path only a filesystem diff takes, which unboxed would sit in every
@@ -1176,7 +1185,9 @@ async fn add_change_for_solo_to_node(
     else {
         return Ok(());
     };
-    if moved_since_listed(context, to_named_node, &to_node, subpath.name()) {
+    if leaves(context.flags, &to_node)
+        || moved_since_listed(context, to_named_node, &to_node, subpath.name())
+    {
         return Ok(());
     }
 
@@ -1467,6 +1478,9 @@ async fn add_change_for_paired_nodes(
         .block(to_nodes.repository.clone(), to_block_index)
         .await?;
     let to_node = to_block.node(to_node_index);
+    if leaves(flags, from_node) || leaves(flags, &to_node) {
+        return Ok(());
+    }
 
     let from_size = from_node.size;
     let to_size = to_node.size;

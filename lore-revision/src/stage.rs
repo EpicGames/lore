@@ -81,6 +81,7 @@ use crate::state::State;
 use crate::state::StateError;
 use crate::state::StateNodeChildrenIterator;
 use crate::state::StateNodeChildrenWithNameIterator;
+use crate::state::Stop;
 use crate::state::file_modified_against_node;
 use crate::util;
 use crate::util::path::RelativePath;
@@ -566,6 +567,9 @@ async fn is_uncommitted_child(
 /// where the caller established it ([`KnownChild`]). The walk takes it as given, and searches from
 /// it for the rest of the path, but for a path the filter leaves out, whose replaced node it
 /// searches for from `base`.
+///
+/// Nothing at or below a link is staged where the provider holds its state: it serves a link from
+/// its node, so what the working tree shows there is no change.
 #[lore_macro::test_pub]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stage_filesystem_path(
@@ -784,6 +788,7 @@ pub(crate) async fn stage_filesystem_path(
         base.node,
         remainder_path.as_str(),
         known,
+        operation.holds_state(),
     )
     .await
     else {
@@ -812,6 +817,9 @@ pub(crate) async fn stage_filesystem_path(
         lore_debug!("Non-existing path ignored by force flag");
         return Ok(NodeLink::default());
     };
+    if node_link.node == INVALID_NODE {
+        return Ok(NodeLink::invalid());
+    }
     let (current_repository, node_state) =
         linked.unwrap_or_else(|| (repository.clone(), state.clone()));
     // A block of its own, so the future holds the node only until the discard check.
@@ -962,39 +970,57 @@ async fn discard_unkept(
 /// The node `path` names below `base`, as [`State::find_relative`] finds it, with `known` the child
 /// of `base` its first component names where the caller established it: that child for a path
 /// of one component, else a search from it for the rest of the path. A known child that is a link
-/// leaves the search to start at `base`, which crosses the link. `Err` where the tree holds no
-/// node at `path`.
+/// leaves the search to start at `base`, which crosses the link. Where `ends_at_links`, a search
+/// reaching a link at or above `path` answers [`INVALID_NODE`] instead, reading nothing of the
+/// link. `Err` where the tree holds no node at `path`.
 async fn find_known_relative(
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
     base: NodeID,
     path: &str,
     known: KnownChild,
+    ends_at_links: bool,
 ) -> Result<(NodeLink, Option<crate::link::LinkedState>), ()> {
+    let held = |node| NodeLink {
+        node,
+        repository: repository.id,
+        revision: state.revision(),
+    };
     let (start, rest) = match (known, path.split_once('/')) {
         (KnownChild::Unresolved, _) => (base, path),
         (KnownChild::Resolved(None), _) => return Err(()),
-        (KnownChild::Resolved(Some(node)), None) => {
-            let link = NodeLink {
-                node,
-                repository: repository.id,
-                revision: state.revision(),
-            };
-            return Ok((link, None));
+        (KnownChild::Resolved(Some(node)), None) if !ends_at_links => {
+            return Ok((held(node), None));
         }
-        (KnownChild::Resolved(Some(node)), Some((_, rest))) => {
+        (KnownChild::Resolved(Some(node)), rest) => {
             let is_link = state
                 .node(repository.clone(), node)
                 .await
                 .map_err(drop)?
                 .is_link();
-            if is_link { (base, path) } else { (node, rest) }
+            match rest {
+                _ if is_link && ends_at_links => return Ok((NodeLink::invalid(), None)),
+                None => return Ok((held(node), None)),
+                Some(_) if is_link => (base, path),
+                Some((_, rest)) => (node, rest),
+            }
         }
     };
-    state
-        .find_relative(repository.clone(), start, rest)
+    if !ends_at_links {
+        return state
+            .find_relative(repository.clone(), start, rest)
+            .await
+            .map_err(drop);
+    }
+    let stop = state
+        .find_to_link::<true>(repository, start, rest, true)
         .await
-        .map_err(drop)
+        .map_err(drop)?;
+    match stop.at {
+        Stop::End => Ok((held(stop.node), None)),
+        Stop::Link(_) => Ok((NodeLink::invalid(), None)),
+        Stop::Missing => Err(()),
+    }
 }
 
 /// The node a staged path's descent has reached, in the repository and state holding it past
@@ -1038,7 +1064,8 @@ impl StageDescent {
     }
 
     /// Stage each component of `remainder_path` in turn and step into the node it names, and
-    /// into the linked state where that node is a link.
+    /// into the linked state where that node is a link. A provider holding its state serves
+    /// nothing below a link, so there the descent ends, staging nothing.
     ///
     /// Each component is staged under the name `remainder_path` spells it with, which the caller
     /// resolves against the file system, so `stage_node_from_metadata` does not look up its case
@@ -1233,7 +1260,9 @@ impl StageDescent {
                 .await?;
             }
 
-            // Transition into the link
+            if node.is_link() && operation.holds_state() {
+                return Ok(Some(NodeLink::invalid()));
+            }
             if node.is_link() {
                 let link_repository_id: RepositoryId = node.address.context.into();
                 let link_revision = node.address.hash;
@@ -3064,6 +3093,9 @@ fn fold_child(result: Result<bool, StageError>, outcome: &mut Result<bool, Stage
 /// Split out from the child loop so the bounded fan-out there can either spawn this or await it
 /// inline without duplicating the body.
 ///
+/// A link is kept and not descended where the provider holds its state, which serves the link
+/// from its node.
+///
 /// A directory the filter excludes stands on disk only for content below it. Where this stage
 /// adds such a directory, one no commit holds, and the descent keeps nothing below it, the
 /// directory is discarded rather than staged, and its add is recorded only where it is kept. An
@@ -3098,6 +3130,9 @@ async fn stage_child_directory(
         .await
         .forward::<StageError>("Failed to resolve node path in state")?;
 
+    if from_node.is_link() && operation.holds_state() {
+        return Ok(true);
+    }
     if from_node.is_link() {
         let link = from_node.linked_node();
 

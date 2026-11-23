@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 
+/// Held by each test from setting the process-wide log callback until it restores it, so that
+/// two tests running at once don't take each other's messages or callback.
+#[allow(dead_code)]
+pub static LOG_CAPTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[allow(dead_code)]
 pub async fn test_store_create() -> Result<
     (
@@ -1345,9 +1350,20 @@ pub mod in_memory {
         repository: &Arc<RepositoryContext>,
         link_repository: RepositoryId,
     ) -> Hash {
+        linked_revision_holding(repository, link_repository, &["l.txt"]).await
+    }
+
+    /// A revision of the repository `link_repository` holding a file at each of `names`.
+    pub async fn linked_revision_holding(
+        repository: &Arc<RepositoryContext>,
+        link_repository: RepositoryId,
+        names: &[&str],
+    ) -> Hash {
         let linked = repository.to_link_context(link_repository).await;
         let state = State::new();
-        add(&state, linked.clone(), ROOT_NODE, file("l.txt"), "l.txt").await;
+        for name in names {
+            add(&state, linked.clone(), ROOT_NODE, file(name), name).await;
+        }
         commit(&linked, &state, Hash::default(), branch_id()).await
     }
 

@@ -7,6 +7,7 @@ relayed staged-link and latest-list listings, an interactive commit through the 
 and a diff after a sync."""
 
 import contextlib
+import errno
 import glob
 import os
 import platform
@@ -20,6 +21,7 @@ from time import monotonic, sleep
 
 import pytest
 from error_types import MountsBusyError, RepositoryAlreadyExistsError, RevisionNotFound
+from lore_parsers import parse_status_json
 from service_util import (
     LORE_NO_SERVICE_MESSAGE,
     LORE_SERVICE_CLAIM_REFUSED_MESSAGE,
@@ -1350,3 +1352,114 @@ def test_a_move_by_rename_mounts_fuse_instances_again_from_the_new_root(
     assert is_mounted(fuse.path)
     assert cat(os.path.join(fuse.path, "written.txt")) == written
     assert not target.exists()
+
+
+def status_of(instance: Lore) -> dict[str, bool]:
+    """The paths `lore status` reports of `instance`, each with whether it is staged."""
+    return {
+        entry["path"]: bool(entry.get("flagStaged"))
+        for entry in parse_status_json(instance.status(json=True))
+    }
+
+
+def linking_repositories(new_lore_repo, link_path: str) -> tuple[Lore, Lore, str]:
+    """A parent repository holding `README.txt` and, from its second revision on, a link at
+    `link_path` to the root of a repository holding `linked.txt` and `sub/deep.txt`: the
+    parent, the linked repository, and the parent's revision before the link."""
+    parent: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    parent.write_commit_push("Baseline", {"README.txt": "baseline\n"})
+    base = parent.branch_info().local_latest
+    linked: Lore = new_lore_repo()
+    linked.write_commit_push(
+        "Linked", {"linked.txt": "linked content\n", "sub/deep.txt": "deep\n"}
+    )
+    parent.link_add(link_path, linked.get_id(), "/")
+    parent.commit("Add the link")
+    parent.push()
+    return parent, linked, base
+
+
+def assert_read_only_and_empty(path: str) -> None:
+    """The directory at `path` lists nothing, carries no write bit, and refuses a file: the
+    kernel refuses it by the mode, and the mount, which answers `EROFS`, a caller the mode does
+    not stop."""
+    assert listing(path) == []
+    mode = os.stat(path).st_mode
+    assert stat.S_ISDIR(mode) and mode & 0o222 == 0, oct(mode)
+    with pytest.raises(OSError) as refused:
+        Path(path, "new.txt").write_text("new\n")
+    assert refused.value.errno in (errno.EACCES, errno.EROFS), refused.value
+
+
+@pytest.mark.smoke
+def test_a_commit_after_a_sync_brings_a_link_leaves_the_linked_repository_whole(
+    new_lore_repo, fuse_mounts
+):
+    """A sync bringing a link serves it as an empty, read-only directory, and a commit after it
+    commits only the parent's own change: the linked repository keeps its files and the link
+    its pin."""
+    parent, linked, base = linking_repositories(new_lore_repo, "vendor/lib")
+    pin = linked.branch_info().local_latest
+    fuse = parent.clone(vfs="fuse", use_shared_store=True, revision=base)
+    fuse_mounts.append(fuse.path)
+
+    fuse.sync()
+    assert listing(fuse.path) == ["README.txt", "vendor"]
+    assert_read_only_and_empty(os.path.join(fuse.path, "vendor", "lib"))
+    fuse.write_files({"README.txt": "edited\n"})
+    fuse.stage(scan=True)
+    assert status_of(fuse) == {"README.txt": True}
+    fuse.commit("README beside the link")
+    fuse.push()
+
+    linked.sync()
+    assert linked.branch_info().local_latest == pin
+    check: Lore = parent.clone()
+    check.sync()
+    assert check.read_files() == {
+        "README.txt": "edited\n",
+        "vendor/lib/linked.txt": "linked content\n",
+        "vendor/lib/sub/deep.txt": "deep\n",
+    }
+
+
+@pytest.mark.smoke
+def test_a_link_at_the_root_is_served_as_an_empty_read_only_directory(
+    new_lore_repo, fuse_mounts
+):
+    """A FUSE instance of a revision holding a link at its root lists the link as an empty,
+    read-only directory beside the root's files, and takes writes beside it."""
+    parent, _, _ = linking_repositories(new_lore_repo, "lib")
+    fuse = fuse_clone(parent, fuse_mounts)
+
+    assert listing(fuse.path) == ["README.txt", "lib"]
+    assert cat(os.path.join(fuse.path, "README.txt")) == b"baseline\n"
+    assert_read_only_and_empty(os.path.join(fuse.path, "lib"))
+    fuse.write_files({"new.txt": "new\n"})
+    assert status_of(fuse) == {"new.txt": False}
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("force", [False, True], ids=["checked", "forced"])
+def test_link_update_and_remove_on_a_fuse_instance_commit_and_push(
+    new_lore_repo, fuse_mounts, force
+):
+    """`lore link update` moving a link's pin and `lore link remove` work on a FUSE instance,
+    writing nothing through the mount, and what they commit and push is what an ordinary clone
+    then holds."""
+    parent, linked, _ = linking_repositories(new_lore_repo, "vendor/lib")
+    fuse = fuse_clone(parent, fuse_mounts)
+    linked.write_commit_push("Linked two", {"two.txt": "two\n"})
+
+    fuse.link_update("vendor/lib")
+    fuse.commit("Move the pin")
+    fuse.push()
+    check: Lore = parent.clone()
+    check.sync()
+    assert check.read_files()["vendor/lib/two.txt"] == "two\n"
+
+    fuse.link_remove("vendor/lib", force=force)
+    fuse.commit("Remove the link")
+    fuse.push()
+    check.sync()
+    assert check.read_files() == {"README.txt": "baseline\n"}

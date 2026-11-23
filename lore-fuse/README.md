@@ -1118,6 +1118,7 @@ READ leaves them nothing of the caller's (`fetch_all`, `fragment_cache.rs`).
 | xattr, copy_file_range, tmpfile, flush, fsyncdir, lseek, poll, bmap, statx, access, locks; fsync without `write/` | `ENOSYS`, which the kernel remembers per connection; it copies a `copy_file_range(2)` with splice and answers `EOPNOTSUPP` to xattr writes and `O_TMPFILE` |
 | `READLINK` of anything but a local symlink / `IOCTL` | `EINVAL` / `ENOTTY` |
 | `LINK` on a writable provider / renaming a tracked directory | `EPERM` / `EXDEV` |
+| A write at or below a link | `EROFS` (`dir_to_change`, `src/fs/fuse/filesystem.rs`; `setattr_node`, `remove_node`, `rename_node`, `fs/fuse/write.rs`); the kernel answers most with `EACCES` first, as a link's directory has no write bit |
 | Local read failure, remote failure, missed deadline, fail-fast window | `EIO` (`read_file`, `read.rs`) |
 | INTERRUPT wins the race | `EINTR` |
 | Name over 255 bytes, or another body that does not decode | `ENAMETOOLONG` for a name, `EIO` otherwise; FORGET gets no reply (`src/session.rs`, `answer_undecodable`) |
@@ -1126,7 +1127,7 @@ FUSE adds one Lore error code, `MountsBusy` (51). The protocol layer's errors (`
 `FuseError`, `DecodeError`, `TransportError`) carry none: a decode failure becomes an errno for
 the kernel, and a mount, unmount or INIT failure leaves the provider as `Internal` with its
 context. What crosses the `FilesystemProvider` boundary uses Lore's codes: a write refused by a
-read-only instance, and a mount of a revision holding a link, are `NotSupported`.
+read-only instance is `NotSupported`.
 
 ### Access recording
 
@@ -1677,13 +1678,28 @@ Open follow-ups from milestone 3:
   below, so the mount lists it, empty where it holds nothing in view, where an ordinary instance
   creates no directory it finds nothing in (`child_filter`, `view.rs`). Left: hide such a
   directory until something below it is in view, which takes a walk below it per listing.
-- **Links.** Adding a link to a FUSE instance is refused (`lore-revision/src/link/add.rs`): the
-  provider serves no link, and a link node in the State failed the node block's child assertion,
-  which aborts the service.
-- **A link a swap adds.** A swap copies a node the target revision adds without its `Link`
-  flag (`hold::copy_of`), so a repository link the target adds is served as an empty directory,
-  where a mount refuses a revision holding one (`Listing::build_with`, `listing.rs`). Left: refuse a
-  sync or switch whose target adds a link, in `hold::check`.
+- **Links.** A link is served as an empty, read-only directory, at the root too, and the mount
+  warns once for each link it serves (`Listing::build_with`, `fs/fuse/listing.rs`;
+  `warn_unserved_link`, `fs/fuse/filesystem.rs`). A write at or below one is `EROFS`. Nothing at
+  or below a link is staged or reported changed (`stage_child_directory`, `stage.rs`;
+  `changes_from_filesystem_to_state`, `fs/fuse/operation.rs`), and nothing of a link is written
+  through the instance's operations: a merge bringing one, `lore link update`, `lore link remove`
+  and a reset undoing one change the link node alone (`realize_change_modify_add`,
+  `fs/realize.rs`; `realize_resolved_link_pin_in_operation`, `link.rs`; `remove`,
+  `link/remove.rs`; `restore_link`, `link/reset.rs`), and a reset walks nothing below a link
+  (`reset_walk_node`, `file/reset.rs`). Adding a link (`add`, `link/add.rs`) and a commit of a
+  link alone (`refused`, `fs/hold.rs`) are refused.
+  Left: serve the linked revision's content (lore-6ib), and writes below a link (lore-zhjq).
+- **A link a commit or swap changes.** A link a commit adds, moves to another pin or removes
+  shows on a running mount only after the next remount: the commit's hand-over reconciles the
+  files it read and the directories it was handed, and no link is among them
+  (`FuseFilesystem::committed`, `fs/fuse/write.rs`). Until that remount, status reports no file
+  created at the mount path of a link the commit added, as the status diff leaves a path alone
+  where either side holds a link (`DiffFlags::FilesystemTo`, `state/diff.rs`). A swap whose target
+  moves a link to another pin keeps serving the old pin: the changes a hold applies name the
+  pinned content, not the link node (`changes`, `fs/hold.rs`). Left (lore-6ib): the commit hands the
+  provider the link paths it staged, the hand-over places them as a hold places a node, and a swap
+  that moves a pin updates the served link.
 - **Detached slots of the served State.** A request dropped or refused part way can leave a slot
   detached or taken and never published, and an unlinked node's slot is never reused within a
   mount. The State node module frees such slots with a sweep at quiescent points
@@ -1917,9 +1933,9 @@ Reads, listings and prefetch:
   the build's own misses share it: UnrealBuildTool compiled in 14.3 s with READs fetching at
   priority (18.2 s at normal priority), against 12.6-13.2 s on an ordinary instance. Listing builds
   for kernel requests and for the prefetch's paths share the priority streams.
-- **Repository links** (lore-6ib). A listing that holds a Lore link node (a linked repository)
-  fails with `NotSupported` (`Listing::build_with`, `listing.rs`). READLINK answers local symlinks
-  only.
+- **Repository links** (lore-6ib). A link is served as an empty, read-only directory
+  (`Listing::build_with`, `listing.rs`), as Remaining work describes. READLINK answers local
+  symlinks only.
 - **Kernel readahead cap.** An unprivileged mount gets 128 KiB kernel readahead whatever
   `max_readahead` negotiates. Kernel behaviour: only root can raise the mount's `read_ahead_kb`,
   so it is not tracked.

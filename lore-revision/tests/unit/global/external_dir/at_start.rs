@@ -465,10 +465,6 @@ async fn an_adopt_whose_root_has_gone_waits_for_the_next_start() {
     assert!(fixture.record().is_some(), "the record stays");
 }
 
-/// Held by each test from setting the process-wide log callback until it restores it, so that
-/// two tests running at once don't take each other's messages or callback.
-static LOG_CAPTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// The messages of a move that waits, collected by the log callback.
 static HELD_STORE_LOGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -508,7 +504,7 @@ async fn a_store_held_across_retries_logs_the_wait_once() {
         tokio::time::sleep(held_for).await;
         drop(other);
     });
-    let capture = LOG_CAPTURE.lock().await;
+    let capture = crate::helper::LOG_CAPTURE.lock().await;
     let level = lore_base::log::log_level();
     lore_base::log::set_log_level(lore_base::log::LoreLogLevel::Info);
     lore_base::log::set_log_callback(Some(collect_held_store_logs));
@@ -551,7 +547,7 @@ async fn a_start_refused_exclusive_access_reports_it() {
     let other = FSLock::try_acquire_shared_file_lock(fixture.global().join("external"))
         .expect("attempt")
         .expect("hold shared access");
-    let capture = LOG_CAPTURE.lock().await;
+    let capture = crate::helper::LOG_CAPTURE.lock().await;
     HELD_STORE_LOGS
         .lock()
         .expect("the log collector lock is not poisoned")

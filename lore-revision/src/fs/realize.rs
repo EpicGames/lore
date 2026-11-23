@@ -1654,10 +1654,12 @@ impl KeptEntries {
     }
 }
 
-/// Removes the mount at `mount` of the tree `shown` maps there but for what the link does not
-/// track ([`MountWalk`]), which stays with the directories leading to it, and the files `held`
-/// names, lowercase and sorted, and answers what stayed. A forced removal takes everything. Where
-/// `shown` is `None`, the link's revision cannot be opened, so only an empty mount goes.
+/// Removes the mount at `mount` of the tree `shown` maps there but for what the link does not track
+/// ([`MountWalk`]), which stays with the directories leading to it, and the files `held` names,
+/// lowercase and sorted, and answers what stayed. A forced removal takes everything. Where `shown`
+/// is `None`, the link's revision cannot be opened, so only an empty mount goes. A provider holding
+/// its state has no mount to remove
+/// ([`holds_state`](crate::fs::filesystem_provider::FilesystemProvider::holds_state)).
 ///
 /// `root` is the working tree's, to tell a nested repository by.
 pub(crate) async fn remove_link_mount(
@@ -1669,6 +1671,9 @@ pub(crate) async fn remove_link_mount(
     held: &[&str],
 ) -> Result<KeptEntries, SyncError> {
     let mut kept = KeptEntries::default();
+    if operation.holds_state() {
+        return Ok(kept);
+    }
     if execution_context().globals().force() {
         operation.remove_recursive(mount).await?;
         return Ok(kept);
@@ -4523,10 +4528,12 @@ fn realize_change_modify_add<'a>(
         // Only on-disk work honours the view. This gates directory creation, link cloning and the
         // file write. A directory the view does not create is created by the first write below
         // it. A link's content is written only here, so a link is kept wherever the view could
-        // re-include something below it. The move rename below is not gated, because it
-        // repositions a path an earlier in-view realize may have written.
+        // re-include something below it. The move rename below is not gated by the view, because
+        // it repositions a path an earlier in-view realize may have written. Nothing of a link is
+        // written to a provider holding its state, which serves the link from its node.
+        let held_link = node.is_link() && operation.holds_state();
         let write_to_disk = if node.is_link() {
-            !view_filter.excludes_tree(path, true, FilterMode::View)
+            !held_link && !view_filter.excludes_tree(path, true, FilterMode::View)
         } else if node.is_directory() {
             view_filter
                 .exclusion_states(path)
@@ -4557,6 +4564,7 @@ fn realize_change_modify_add<'a>(
         };
 
         let renamed = if !dry_run
+            && !held_link
             && change.action == change::FileAction::Move
             && let Some(from_path) = change.move_source()
         {

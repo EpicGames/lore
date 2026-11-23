@@ -19,6 +19,7 @@ use lore_base::error::NotSupported;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::test_util::TempDir;
 use lore_base::types::Address;
+use lore_base::types::Hash;
 use lore_error_set::FfiError as _;
 use lore_fuse::filesystem::Filesystem;
 use lore_fuse::reply::Errno;
@@ -37,6 +38,8 @@ use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
 use lore_revision::fs::filesystem_provider::StageIntent;
 use lore_revision::fs::filesystem_provider::StaticDispatchInstanceOperation;
 use lore_revision::fs::fuse::attr::AttrContext;
+use lore_revision::fs::fuse::deletions::DELETION_LIST;
+use lore_revision::fs::fuse::deletions::DeletionList;
 use lore_revision::fs::fuse::filesystem::FuseFilesystem;
 use lore_revision::fs::fuse::filesystem::WriteStep;
 use lore_revision::fs::fuse::inode::InodeKind;
@@ -47,9 +50,11 @@ use lore_revision::fs::fuse::swap::NotificationSink;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreFileAction;
 use lore_revision::interface::LoreString;
+use lore_revision::lore::RepositoryId;
 use lore_revision::node::Node;
 use lore_revision::node::NodeExtFlags;
 use lore_revision::node::NodeFlags;
+use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::stage::StageCaseChange;
@@ -76,6 +81,7 @@ use crate::fs::fuse::fuse_test_util;
 use crate::fs::fuse::fuse_test_util::req;
 use crate::fs::fuse::staged_state;
 use crate::fs::fuse::staged_state::Action;
+use crate::helper::in_memory;
 
 #[test]
 fn a_deletion_read_holds_a_listed_path_and_what_is_below_it_case_folded() {
@@ -4254,4 +4260,138 @@ async fn file_info_of_a_local_file_below_another_spelling_of_its_directory_reads
         operation.file_info(&path("DIR/c.txt")).await.expect("info"),
         FileInfo::File { size: 4, .. }
     ));
+}
+
+/// A context over `w`'s stores and repository that commits in memory.
+fn writer(w: &Working) -> Arc<RepositoryContext> {
+    in_memory::repository_in(w.immutable.clone(), w.mutable.clone(), w.repository.id)
+}
+
+/// A revision of `w`'s repository holding what `w`'s current revision holds and a link at each
+/// path of `links` to its pin of `linked`, committed on a branch of its own.
+async fn linking(w: &Working, linked: RepositoryId, links: &[(&str, Hash)]) -> Arc<State> {
+    let writer = writer(w);
+    let base = w.current.revision();
+    let state = in_memory::revision_state(&writer, base).await;
+    for &(name, pin) in links {
+        let link = in_memory::link_node(name, linked, pin);
+        in_memory::add(&state, writer.clone(), ROOT_NODE, link, name).await;
+    }
+    let revision = in_memory::commit(&writer, &state, base, in_memory::branch_id()).await;
+    State::deserialize(w.repository.clone(), revision)
+        .await
+        .expect("the revision holding the links loads")
+}
+
+/// The intents a provider diff runs with.
+fn every_intent() -> [FilesystemDiffIntent; 4] {
+    [
+        FilesystemDiffIntent::Report,
+        FilesystemDiffIntent::ReportTracked,
+        FilesystemDiffIntent::MarkDirty,
+        FilesystemDiffIntent::Stage(StageIntent::default()),
+    ]
+}
+
+/// The provider's diff reports nothing at or below a link, whatever its intent: not a link the
+/// filesystem State lacks or holds alone, not a link whose pin moved past the one the filesystem
+/// State holds, nothing at a path below the link, and nothing of the linked repository diffed at
+/// the link's path. A file written beside the link before a remount has the walk descend to it.
+#[tokio::test]
+async fn the_provider_diff_reports_nothing_at_or_below_a_link() {
+    in_context(async {
+        let mut w = working(&[("keep.txt", b"k")]).await;
+        let linked = RepositoryId::from(uuid::Uuid::now_v7());
+        let served_pin = in_memory::linked_revision_holding(&writer(&w), linked, &["l.txt"]).await;
+        let moved_pin =
+            in_memory::linked_revision_holding(&writer(&w), linked, &["l.txt", "two.txt"]).await;
+        let base = w.current.clone();
+        let served = linking(&w, linked, &[("vendor", served_pin)]).await;
+        let moved = linking(&w, linked, &[("vendor", moved_pin)]).await;
+        let more = linking(&w, linked, &[("vendor", served_pin), ("other", served_pin)]).await;
+        write_new(&w.fs, ROOT_INO, "new.txt", b"new").await;
+        w.current = served.clone();
+        w.fs = w.reopen().await;
+        let link_repository = w.repository.to_link_context(linked).await;
+        let linked_state = State::deserialize(link_repository.clone(), moved_pin)
+            .await
+            .expect("the linked revision loads");
+
+        let besides_new = |changes: Vec<NodeChange>| {
+            summary(&changes)
+                .into_iter()
+                .filter(|(path, _, _)| path != "new.txt")
+                .collect::<Vec<_>>()
+        };
+        for (index, intent) in every_intent().into_iter().enumerate() {
+            let nothing: Vec<(String, FileAction, bool)> = Vec::new();
+            for (from, what) in [
+                (&served, "the served pin"),
+                (&moved, "a moved pin"),
+                (&base, "a link the filesystem State holds alone"),
+                (&more, "a link the filesystem State lacks"),
+            ] {
+                let reported = besides_new(w.diff(from, intent).await);
+                assert_eq!(reported, nothing, "intent {index}: {what}");
+            }
+            let below = summary(&w.diff_at(&moved, "vendor/l.txt", intent).await);
+            assert_eq!(below, nothing, "intent {index}: below the link");
+            let from = NodeMapping {
+                repository: link_repository.clone(),
+                state: linked_state.clone(),
+                path: path("vendor"),
+                node: ROOT_NODE,
+            };
+            let (of_linked, _) = w.diff_from(from, "vendor", intent).await;
+            assert_eq!(
+                summary(&of_linked),
+                nothing,
+                "intent {index}: the linked repository"
+            );
+        }
+    })
+    .await;
+}
+
+/// A remount keeps a link the revision holds where `write/` holds entries at its path, or the
+/// deletion list names it: the instance does not change a link's content. The link is served
+/// empty, and the provider's diff reports nothing of it.
+#[tokio::test]
+async fn a_remount_keeps_a_link_that_local_changes_name() {
+    in_context(async {
+        let mut w = working(&[("keep.txt", b"k")]).await;
+        let linked = RepositoryId::from(uuid::Uuid::now_v7());
+        let pin = in_memory::linked_revision(&writer(&w), linked).await;
+        w.current = linking(&w, linked, &[("vendor", pin)]).await;
+        let made = w.write_dir().join("vendor");
+        std::fs::create_dir_all(&made).expect("the local directory");
+        std::fs::write(made.join("made.txt"), b"m").expect("the local file");
+        let deletions =
+            DeletionList::open(&w.external.path().join(DELETION_LIST)).expect("the deletion list");
+
+        for listed in ["vendor/made.txt", "vendor"] {
+            deletions.append(&path(listed)).expect("a deletion");
+            w.fs = w.reopen().await;
+            let state = w.fs.state();
+            let node = state
+                .find_subnode(w.repository.clone(), ROOT_NODE, hash_string("vendor"))
+                .await
+                .expect("vendor is held");
+            let node = state
+                .node(w.repository.clone(), node)
+                .await
+                .expect("vendor's node");
+            assert!(node.is_link(), "listing {listed}: vendor stays a link");
+            let vendor = lookup_ino(&w.fs, ROOT_INO, "vendor")
+                .await
+                .expect("vendor is served");
+            assert_eq!(lookup_ino(&w.fs, vendor, "made.txt").await, None);
+            assert_eq!(
+                summary(&w.diff(&w.current, FilesystemDiffIntent::Report).await),
+                Vec::new(),
+                "listing {listed}: nothing changed"
+            );
+        }
+    })
+    .await;
 }

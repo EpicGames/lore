@@ -2193,7 +2193,9 @@ struct LinkPinDiff {
 ///
 /// Deserializes the old and new link states, computes a 2-way diff scoped to
 /// the linked node and spelled from the mount, verifies filesystem consistency,
-/// and realizes the changes on disk.
+/// and realizes the changes on disk. A provider holding its state is written
+/// nothing, and neither revision is read for it, as it serves the link from its node
+/// ([`holds_state`](crate::fs::filesystem_provider::FilesystemProvider::holds_state)).
 ///
 /// Opens the filesystem operation the realize takes, so a caller already holding one calls
 /// [`realize_link_pin_change_in_operation`] instead.
@@ -2202,6 +2204,9 @@ pub async fn realize_link_pin_change(
     link_context: Arc<RepositoryContext>,
     pin_change: LinkPinRealizeTarget,
 ) -> Result<(), LinkError> {
+    if repository.file_system().holds_state() {
+        return Ok(());
+    }
     let pin = ResolvedLinkPin::resolve(&link_context, pin_change).await?;
     realize_resolved_link_pin(repository, link_context, &pin).await
 }
@@ -2212,6 +2217,9 @@ pub(crate) async fn realize_resolved_link_pin(
     link_context: Arc<RepositoryContext>,
     pin: &ResolvedLinkPin,
 ) -> Result<(), LinkError> {
+    if repository.file_system().holds_state() {
+        return Ok(());
+    }
     let diff = link_pin_diff(&link_context, pin).await?;
     with_operation(repository.file_system(), async |operation| {
         realize_link_pin_diff(
@@ -2234,6 +2242,7 @@ pub(crate) async fn realize_resolved_link_pin(
 ///
 /// `overwrite_local` realizes the pin over local changes to the files it changes, which are
 /// otherwise refused.
+#[lore_macro::test_pub]
 pub(crate) async fn realize_link_pin_change_in_operation(
     operation: &Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
@@ -2241,6 +2250,9 @@ pub(crate) async fn realize_link_pin_change_in_operation(
     pin_change: LinkPinRealizeTarget,
     overwrite_local: bool,
 ) -> Result<(), LinkError> {
+    if operation.holds_state() {
+        return Ok(());
+    }
     let pin = ResolvedLinkPin::resolve(&link_context, pin_change).await?;
     realize_resolved_link_pin_in_operation(
         operation,
@@ -2260,6 +2272,9 @@ pub(crate) async fn realize_resolved_link_pin_in_operation(
     pin: &ResolvedLinkPin,
     overwrite_local: bool,
 ) -> Result<(), LinkError> {
+    if operation.holds_state() {
+        return Ok(());
+    }
     let diff = link_pin_diff(&link_context, pin).await?;
     realize_link_pin_diff(
         operation,

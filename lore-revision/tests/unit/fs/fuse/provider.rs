@@ -1680,28 +1680,18 @@ async fn a_directory_attached_since_the_listing_keeps_its_view_state() {
     );
 }
 
-/// Names attached since their directory's listing that no listing serves answer absent, with
-/// no inode made: a link, and one the view excludes. A name no FUSE entry carries never comes
-/// this way: the State refuses `/`, NUL, `.` and `..`, and LOOKUP answers a name over 255 bytes
-/// itself. The caller runs in no execution context: the event the exclusion reports goes out
-/// under the one the provider captured.
+/// A name attached since its directory's listing that the view excludes answers absent, with no
+/// inode made. A name no FUSE entry carries never comes this way: the State refuses `/`, NUL, `.`
+/// and `..`, and LOOKUP answers a name over 255 bytes itself. The caller runs in no execution
+/// context: the event the exclusion reports goes out under the one the provider captured.
 #[tokio::test]
-async fn names_attached_since_the_listing_that_listings_leave_out_answer_absent() {
+async fn a_name_attached_since_the_listing_that_the_view_excludes_answers_absent() {
     let fixture = fuse_fixture::committed(&[("keep.txt", b"k")]).await;
     let repository = view_repository(&fixture, &["drop.txt"]);
     let fs = provider(repository.clone(), fixture.state.clone()).await;
     fs.lookup(&req(), ROOT_INO, b"keep.txt")
         .await
         .expect("keep.txt");
-    let link = Node {
-        flags: NodeFlags::Link.bits(),
-        mode: 0o755,
-        ..Node::default()
-    };
-    fs.state()
-        .node_attach(repository.clone(), ROOT_NODE, link, "vendor")
-        .await
-        .expect("attach the link");
     attach_named(&fs, &repository, ROOT_NODE, "drop.txt", true).await;
     let added = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = added.clone();
@@ -1716,19 +1706,75 @@ async fn names_attached_since_the_listing_that_listings_leave_out_answer_absent(
     }));
     let inodes = fs.inodes().len();
 
-    for name in ["vendor", "drop.txt"] {
-        let found = fs.lookup(&req(), ROOT_INO, name.as_bytes()).await;
-        assert!(
-            found.is_err() || found.is_ok_and(|entry| entry.ino == 0),
-            "{name} is absent"
-        );
-    }
+    let found = fs.lookup(&req(), ROOT_INO, b"drop.txt").await;
+    assert!(
+        found.is_err() || found.is_ok_and(|entry| entry.ino == 0),
+        "drop.txt is absent"
+    );
     assert_eq!(
         added.load(Ordering::SeqCst),
-        2,
-        "each lookup read a node attached since the listing"
+        1,
+        "the lookup read a node attached since the listing"
     );
     assert_eq!(fs.inodes().len(), inodes, "no inode was made");
+}
+
+/// Attaches a link named `name` under `parent`, as a sync bringing a revision that holds one
+/// leaves it.
+async fn attach_link(
+    fs: &FuseFilesystem,
+    repository: &Arc<RepositoryContext>,
+    parent: NodeID,
+    name: &str,
+) {
+    let link = Node {
+        flags: NodeFlags::Link.bits(),
+        mode: 0o755,
+        address: marked_address(0x5a),
+        ..Node::default()
+    };
+    fs.state()
+        .node_attach(repository.clone(), parent, link, name)
+        .await
+        .expect("attach the link");
+}
+
+/// A link is served as an empty directory with no write bit, whether its directory's listing
+/// holds it or it was attached since: the mount does not serve a link's content.
+#[tokio::test]
+async fn a_link_is_served_as_an_empty_read_only_directory() {
+    let (fixture, fs) = mounted(&[("keep.txt", b"k")]).await;
+    attach_link(&fs, &fixture.repository, ROOT_NODE, "listed").await;
+    let (records, _) = readdirplus(&fs, ROOT_INO, 0, 64 * 1024).await;
+    let listed = records
+        .iter()
+        .find(|record| record.name == b"listed")
+        .expect("the root lists the link");
+    assert_eq!(listed.kind, lore_fuse::abi::DirentType::Dir as u32);
+    attach_link(&fs, &fixture.repository, ROOT_NODE, "added").await;
+
+    for name in ["listed", "added"] {
+        let built = fs.listings_built();
+        let entry = fs
+            .lookup(&req(), ROOT_INO, name.as_bytes())
+            .await
+            .expect(name);
+        assert_ne!(entry.ino, 0, "{name} is served");
+        assert_eq!(entry.attr.mode, libc::S_IFDIR | 0o555, "{name}");
+        assert_eq!(fs.listings_built(), built, "{name} is found with no build");
+        let records = readdir(&fs, entry.ino, 0, 4096).await;
+        let names: Vec<&[u8]> = records.iter().map(|r| r.name.as_slice()).collect();
+        assert_eq!(
+            names,
+            [b".".as_slice(), b"..".as_slice()],
+            "{name} lists nothing"
+        );
+        let inner = fs.lookup(&req(), entry.ino, b"keep.txt").await;
+        assert!(
+            inner.is_err() || inner.is_ok_and(|entry| entry.ino == 0),
+            "nothing is found below {name}"
+        );
+    }
 }
 
 /// The node blocks cached listings hold count against the cache's budget once each, however many

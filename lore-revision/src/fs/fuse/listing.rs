@@ -17,7 +17,6 @@ use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 
 use crate::BoxFuture;
-use crate::errors::NotSupported;
 use crate::filter::FilterStates;
 use crate::fs::fuse::FuseProviderError;
 use crate::fs::fuse::filesystem::ListingHook;
@@ -27,6 +26,7 @@ use crate::fs::fuse::view::filter_states_to_u8;
 use crate::fs::fuse::view::view_line;
 use crate::hash::hash_string;
 use crate::node::ChainLog;
+use crate::node::LogMark;
 use crate::node::Newest;
 use crate::node::Node;
 use crate::node::NodeBlock;
@@ -53,6 +53,9 @@ pub mod entry_flags {
     pub const LOCAL: u8 = 4;
     /// The child is a symbolic link under `write/`.
     pub const SYMLINK: u8 = 8;
+    /// The child is a link: a directory whose content the mount does not serve, and which no
+    /// write changes.
+    pub const LINK: u8 = 16;
 }
 
 /// One child of a directory.
@@ -189,7 +192,12 @@ impl Listing {
         if node.is_discarded() || node.child().is_some() {
             return None;
         }
-        Some(Arc::new(Self {
+        Some(Arc::new(Self::holding_nothing(dir, mark, dir_block)))
+    }
+
+    /// The listing of `dir`, held in `dir_block`, holding no entry, from the log position `mark`.
+    fn holding_nothing(dir: NodeID, mark: LogMark, dir_block: Arc<NodeBlock>) -> Self {
+        Self {
             entries: Box::new([]),
             names: Box::new([]),
             node_ids: Box::new([]),
@@ -202,7 +210,7 @@ impl Listing {
             skipped_invalid: 0,
             dir_block: Some(dir_block),
             blocks: Box::new([]),
-        }))
+        }
     }
 
     /// This listing holding `blocks`, as a build leaves it holding the blocks of its entries.
@@ -470,7 +478,8 @@ impl Listing {
         pack_entry(node, 0, name_len, (0, 0), false)
     }
 
-    /// Builds a listing from `parent`'s live children.
+    /// Builds a listing from `parent`'s live children. A link lists nothing: the mount does not
+    /// serve a link's content.
     ///
     /// `parent_filter` is the mounted view's state at `parent`, and
     /// `parent_path` its path; both feed [`child_filter`] to decide each
@@ -508,7 +517,13 @@ impl Listing {
             .await
             .forward_any::<FuseProviderError>("reading the directory")?;
         // The mark is read before the walk, so a patch landing during it is replayed.
-        let (mark, _) = dir_block.watch_chain(Node::index(parent), None);
+        let (mark, link) = {
+            let (mark, node) = dir_block.watch_chain(Node::index(parent), None);
+            (mark, node.is_link())
+        };
+        if link {
+            return Ok(Arc::new(Self::holding_nothing(parent, mark, dir_block)));
+        }
         if let Some(hook) = walk_hook {
             hook(parent).await;
         }
@@ -547,12 +562,6 @@ impl Listing {
                 skipped_staged += 1;
                 continue; // drops name_lock before the loop's next .await
             }
-            if node.is_link() {
-                return Err(FuseProviderError::from(NotSupported {
-                    operation: "a FUSE mount of a revision holding a link".to_string(),
-                }));
-            }
-
             // The view match reads the lock's &str directly: it is a pure,
             // synchronous glob match, never an await point or a State call,
             // so doing it before the copy-and-drop below holds no lock across
@@ -562,7 +571,7 @@ impl Listing {
                 &served.repository,
                 parent_filter,
                 &child_path,
-                node.is_directory(),
+                !node.is_file(),
             );
             // A local change stays listed outside the view, as an ordinary working tree keeps a
             // local file a view leaves out: a sync narrowing the view past one refuses unless it
@@ -671,6 +680,8 @@ fn pack_entry(
     let mut flags = 0u8;
     if node.is_directory() {
         flags |= entry_flags::IS_DIR;
+    } else if node.is_link() {
+        flags |= entry_flags::IS_DIR | entry_flags::LINK;
     }
     if view_excluded {
         flags |= entry_flags::VIEW_EXCLUDED;

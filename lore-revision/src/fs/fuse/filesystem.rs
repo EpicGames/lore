@@ -231,6 +231,8 @@ pub struct FuseFilesystem {
     plain_first: AtomicBool,
     /// Directories a file of which was looked up while `plain_first` was on.
     advised: DashSet<u64>,
+    /// The paths of the links this mount warned it serves empty.
+    warned_links: DashSet<String>,
     statfs: parking_lot::RwLock<Kstatfs>,
     dir_handles: DashMap<u64, DirHandle>,
     next_dir_handle: AtomicU64,
@@ -717,11 +719,11 @@ fn read_local_changes(
     Ok((deletions, deleted, local))
 }
 
-/// `revision` loaded afresh under `repository`, with each path of `deleted` it holds detached
-/// and every entry of `local` added, as [`FuseFilesystem::new_writable`] describes. Each
-/// directory holding local entries has its children read once, into an index by name hash, so
-/// a directory of `n` entries costs `O(n log n)`; nothing else is read, so a State with no
-/// local changes loads no block.
+/// `revision` loaded afresh under `repository`, with each path of `deleted` it holds detached and
+/// every entry of `local` added but those at or below a link, as [`FuseFilesystem::new_writable`]
+/// describes. Each directory holding local entries has its children read once, into an index by
+/// name hash, so a directory of `n` entries costs `O(n log n)`; nothing else is read, so a State
+/// with no local changes loads no block.
 async fn local_state(
     repository: &Arc<RepositoryContext>,
     revision: &State,
@@ -747,6 +749,9 @@ async fn local_state(
                 .binary_search_by_key(&entry.name_hash, |(name_hash, _, _)| *name_hash)
                 .ok()
                 .map(|index| (held[index].1, held[index].2));
+            if existing.is_some_and(|(_, node)| node.is_link()) {
+                continue;
+            }
             let name = local.name(entry);
             let (node_id, added) =
                 add_local_node(&state, repository, parent, name, entry, existing).await?;
@@ -758,10 +763,10 @@ async fn local_state(
     Ok(state)
 }
 
-/// Detaches each path of `deleted` that `state` holds, but for one `local` recreates with the
-/// same kind, a file or symlink over a file or a directory over a directory, which stays the
-/// node it was, as an edited file does; the listed paths below it are still applied. A path
-/// below a detached one is skipped.
+/// Detaches each path of `deleted` that `state` holds, but for a link, and for one `local`
+/// recreates with the same kind, a file or symlink over a file or a directory over a directory,
+/// which stays the node it was, as an edited file does; the listed paths below it are still
+/// applied. A path below a detached one is skipped.
 async fn apply_deletions(
     state: &State,
     repository: &Arc<RepositoryContext>,
@@ -780,9 +785,10 @@ async fn apply_deletions(
             continue;
         };
         let node = state.node(repository.clone(), node_id).await?;
-        if local
-            .find(path)
-            .is_some_and(|entry| same_kind(entry.kind, &node))
+        if node.is_link()
+            || local
+                .find(path)
+                .is_some_and(|entry| same_kind(entry.kind, &node))
         {
             continue;
         }
@@ -961,8 +967,9 @@ impl FuseFilesystem {
     /// symlink and directory under `write/` (`local_tree.rs`), so `write/` wins over a deletion
     /// of the same path. A tracked file under `write/` stays its node, modified, even where it
     /// is also listed as deleted; a tracked directory under `write/` keeps its node and tracked
-    /// children. Writes change the State and `write/` (`write.rs`), and lore reads them through
-    /// the diff of the State (`operation.rs`).
+    /// children. A link stays as the revision holds it, whatever the deletion list or `write/`
+    /// holds at or below it, as no write changes a link. Writes change the State and `write/`
+    /// (`write.rs`), and lore reads them through the diff of the State (`operation.rs`).
     pub async fn new_writable(
         repository: Arc<RepositoryContext>,
         revision: Arc<State>,
@@ -1081,6 +1088,7 @@ impl FuseFilesystem {
             recent_misses: RecentMisses::default(),
             plain_first: AtomicBool::new(false),
             advised: DashSet::new(),
+            warned_links: DashSet::new(),
             statfs: parking_lot::RwLock::new(statfs),
             dir_handles: DashMap::new(),
             next_dir_handle: AtomicU64::new(1),
@@ -1549,11 +1557,22 @@ impl FuseFilesystem {
 
     /// The node and view state of directory inode `ino`; `ENOTDIR` for a file or symlink.
     pub(crate) fn dir_node(&self, ino: u64) -> Result<(NodeID, FilterStates), Errno> {
+        self.dir_of(ino, false)
+    }
+
+    /// [`Self::dir_node`] of a directory a write changes: `EROFS` for a link.
+    pub(crate) fn dir_to_change(&self, ino: u64) -> Result<(NodeID, FilterStates), Errno> {
+        self.dir_of(ino, true)
+    }
+
+    /// [`Self::dir_node`], refusing a link with `EROFS` where `to_change`.
+    fn dir_of(&self, ino: u64, to_change: bool) -> Result<(NodeID, FilterStates), Errno> {
         if ino == ROOT_INO {
             return Ok((ROOT_NODE, FilterStates::ROOT));
         }
         let entry = self.inodes.get(ino).ok_or(Errno::ENOENT)?;
         match entry.kind {
+            InodeKind::Dir { link: true, .. } if to_change => Err(Errno::EROFS),
             InodeKind::Dir {
                 node,
                 filter_state,
@@ -1740,9 +1759,9 @@ impl FuseFilesystem {
 
     /// `child`, a node of directory `dir` with view state `filter` at `dir_path` found for
     /// `name`, as a listing would hold it, read from `block` where the log named it there. A
-    /// link, and a child a listing would leave out, staged for deletion, spelled otherwise,
-    /// unrepresentable or excluded by the view, answer `None`, as an absent name does. A node
-    /// that left the name since the log named it is looked up again by name in the State.
+    /// child a listing would leave out, staged for deletion, spelled otherwise, unrepresentable
+    /// or excluded by the view, answers `None`, as an absent name does. A node that left the name
+    /// since the log named it is looked up again by name in the State.
     async fn child_of_node(
         &self,
         served: &Served,
@@ -1796,7 +1815,7 @@ impl FuseFilesystem {
             drop(held);
             (child, record, spelled)
         };
-        if record.is_link() || record.is_staged_delete() {
+        if record.is_staged_delete() {
             return Ok(None);
         }
         let Some(spelled) = spelled else {
@@ -1807,7 +1826,7 @@ impl FuseFilesystem {
             &served.repository,
             filter,
             &dir_path.join(spelled_str),
-            record.is_directory(),
+            !record.is_file(),
         );
         if excluded && !holds_local(&record) {
             return Ok(None);
@@ -2461,13 +2480,10 @@ impl FuseFilesystem {
                 LookupCase::Exact => name == requested,
                 LookupCase::Folded => fold_eq(name, requested),
             };
-            if node.is_link() || !matches || !is_representable(name.as_bytes()) {
+            if !matches || !is_representable(name.as_bytes()) {
                 return Read::Hidden;
             }
-            Read::Found(
-                Listing::entry_of(node, requested.len()),
-                node.is_directory(),
-            )
+            Read::Found(Listing::entry_of(node, requested.len()), !node.is_file())
         });
         let (mut child, is_directory) = match read {
             Read::Found(child, is_directory) => (child, is_directory),
@@ -2736,7 +2752,7 @@ impl FuseFilesystem {
     /// left the name: checked before the inode is indexed by name and after, under the shard
     /// lock, so an inode made during the settle, or for a node a RENAME or UNLINK detached, is
     /// rolled back before any other lookup counts it. The path is built only where a recorded
-    /// time needs it.
+    /// time or a link's warning needs it.
     async fn insert_child(
         &self,
         served: &Served,
@@ -2745,6 +2761,10 @@ impl FuseFilesystem {
         (child, name, node, holds): (&ListingEntry, &str, NodeID, impl Fn() -> bool),
         pinned: Pinned,
     ) -> Result<Option<(u64, Attr)>, Errno> {
+        let link = child.flags & entry_flags::LINK != 0;
+        if link {
+            self.warn_unserved_link(parent, parent_path, name);
+        }
         let mut mtime = 0;
         if !self.recorded.none() {
             let (parent_path, _) = match parent_path {
@@ -2762,6 +2782,7 @@ impl FuseFilesystem {
                 view_line: child.view_line,
                 node,
                 local: child.flags & entry_flags::LOCAL != 0,
+                link,
             }
         } else if child.flags & entry_flags::SYMLINK != 0 {
             InodeKind::Symlink
@@ -2813,6 +2834,34 @@ impl FuseFilesystem {
             self.lookup_refusals[2].fetch_add(1, Ordering::Relaxed);
         })?;
         Ok(Some((ino, attr)))
+    }
+
+    /// Warns, once for each link this mount serves, that the link named `name` in directory
+    /// `parent` is served empty. `parent_path` caches `parent`'s path, as [`Self::insert_child`]
+    /// fills it in.
+    fn warn_unserved_link(
+        &self,
+        parent: u64,
+        parent_path: &mut Option<(RelativePath, u32)>,
+        name: &str,
+    ) {
+        let (parent_path, _) = match parent_path {
+            Some(known) => &*known,
+            None => match self.path_of(parent) {
+                Ok(found) => parent_path.insert(found),
+                Err(_) => return,
+            },
+        };
+        let separator = if parent_path.is_empty() { "" } else { "/" };
+        if self
+            .warned_links
+            .insert([parent_path.as_str(), separator, name].concat())
+        {
+            lore_warn!(
+                "The link at '{parent_path}{separator}{name}' is served as an empty, read-only \
+                 directory: a FUSE virtual instance does not serve a link's content"
+            );
+        }
     }
 
     /// The path of `ino` from the root, by the spellings its inodes were created under.
@@ -2915,10 +2964,10 @@ impl FuseFilesystem {
     }
 
     /// Attributes of `entry` from what it holds, under its entry lock and with no host call,
-    /// with the owner write bit on a writable provider.
+    /// with the owner write bit on a writable provider but for a link.
     fn entry_attr(&self, entry: &InodeEntry) -> Attr {
         let mut attr = attr_for(entry, &self.attr);
-        if self.local.is_some() {
+        if self.local.is_some() && !entry.kind.is_link() {
             attr.mode |= libc::S_IWUSR;
         }
         attr

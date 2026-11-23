@@ -180,7 +180,8 @@ fn plan_swap_into(
 /// Plans the name at `path`, which holds `after` once the swap is published (nothing when
 /// `None`). A file whose content changes keeps its inode, which takes the new content: where
 /// it holds other content than `after`, or where `rewrites`, the change's own content differs,
-/// whatever the inode holds now. A directory whose node is in `kept` stays as it is.
+/// whatever the inode holds now. A directory whose node is in `kept` stays as it is; one that
+/// turns into a file goes.
 fn plan_path(
     plan: &mut SwapPlan,
     inodes: &InodeTable,

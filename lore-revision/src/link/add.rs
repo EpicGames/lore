@@ -55,8 +55,8 @@ pub async fn add(
     pin: Option<String>,
     disable_branching: bool,
 ) -> Result<(), LinkError> {
-    // A provider holding whole revisions serves no linked repository: its mount refuses a
-    // revision holding a link, and files written below the link would land in this State.
+    // A provider holding its state serves a link from the link's node and takes none of the link
+    // through its operations (`FilesystemProvider::holds_state`), which the clone below writes.
     if repository.file_system().holds_state() {
         return Err(crate::fs::hold::refused("add a link").into());
     }

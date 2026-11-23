@@ -23186,3 +23186,642 @@ async fn instance_writes_racing_to_make_their_directory(writes: usize) {
         })
         .await;
 }
+
+/// Attaches a link named `name` below `parent` in the provider's filesystem State, as a sync
+/// bringing a revision that holds one leaves it.
+async fn attach_link(fs: &FuseFilesystem, instance: &Instance, parent: NodeID, name: &str) {
+    let link = Node {
+        flags: NodeFlags::Link.bits(),
+        mode: 0o755,
+        address: address(0x5a),
+        ..Node::default()
+    };
+    fs.state()
+        .node_attach(instance.fixture.repository.clone(), parent, link, name)
+        .await
+        .expect("attach the link");
+}
+
+/// A link is served as a directory without a write bit, and every write at or below it answers
+/// `EROFS`: a create, mknod, mkdir or symlink in it, its unlink or rmdir, a rename of it, into
+/// it, out of it or over it, and a setattr of it. The link stays, and `write/` holds nothing for
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_write_at_or_below_a_link_answers_read_only() {
+    use lore_fuse::abi::SetattrIn;
+    use lore_fuse::abi::entry::setattr_valid;
+
+    let instance = Instance::new(&[("keep.txt", b"k"), ("dir/a.txt", b"a")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            attach_link(&fs, &instance, ROOT_NODE, "vendor").await;
+            let vendor = lookup(&fs, ROOT_INO, "vendor").await.expect("vendor");
+            let attr = fs.getattr(&request(), vendor).await.expect("getattr").attr;
+            assert_eq!(attr.mode & libc::S_IFMT, libc::S_IFDIR);
+            assert_eq!(attr.mode & 0o222, 0, "a link has no write bit");
+            fs.mkdir(&request(), ROOT_INO, b"empty", libc::S_IFDIR | 0o755, 0o022)
+                .await
+                .expect("mkdir");
+            let erofs = Some(Errno::EROFS);
+            let create_flags = (libc::O_CREAT | libc::O_RDWR) as u32;
+
+            let created = fs
+                .create(
+                    &request(),
+                    vendor,
+                    b"new.txt",
+                    libc::S_IFREG | 0o644,
+                    0o022,
+                    create_flags,
+                )
+                .await;
+            assert_eq!(created.err(), erofs, "create in the link");
+            let made = fs
+                .mknod(&request(), vendor, b"node", libc::S_IFREG | 0o644, 0, 0o022)
+                .await;
+            assert_eq!(made.err(), erofs, "mknod in the link");
+            let made = fs
+                .mkdir(&request(), vendor, b"sub", libc::S_IFDIR | 0o755, 0o022)
+                .await;
+            assert_eq!(made.err(), erofs, "mkdir in the link");
+            let made = fs.symlink(&request(), vendor, b"ln", b"x").await;
+            assert_eq!(made.err(), erofs, "symlink in the link");
+            assert_eq!(
+                fs.unlink(&request(), ROOT_INO, b"vendor").await.err(),
+                erofs,
+                "unlink of the link"
+            );
+            assert_eq!(
+                fs.rmdir(&request(), ROOT_INO, b"vendor").await.err(),
+                erofs,
+                "rmdir of the link"
+            );
+            for (parent, name, new_parent, new_name, what) in [
+                (
+                    ROOT_INO,
+                    "vendor",
+                    ROOT_INO,
+                    "moved",
+                    "a rename of the link",
+                ),
+                (
+                    ROOT_INO,
+                    "keep.txt",
+                    vendor,
+                    "keep.txt",
+                    "a rename into the link",
+                ),
+                (
+                    vendor,
+                    "l.txt",
+                    ROOT_INO,
+                    "out.txt",
+                    "a rename out of the link",
+                ),
+                (
+                    ROOT_INO,
+                    "empty",
+                    ROOT_INO,
+                    "vendor",
+                    "a rename over the link",
+                ),
+            ] {
+                let renamed = fs
+                    .rename(
+                        &request(),
+                        parent,
+                        name.as_bytes(),
+                        new_parent,
+                        new_name.as_bytes(),
+                        0,
+                    )
+                    .await;
+                assert_eq!(renamed.err(), erofs, "{what}");
+            }
+            for valid in [setattr_valid::MTIME_NOW, setattr_valid::MODE] {
+                let attr = SetattrIn {
+                    valid,
+                    mode: libc::S_IFDIR | 0o700,
+                    ..SetattrIn::default()
+                };
+                let set = fs.setattr(&request(), vendor, &attr).await;
+                assert_eq!(set.err(), erofs, "a setattr of the link");
+            }
+
+            assert_eq!(lookup(&fs, ROOT_INO, "vendor").await, Ok(vendor));
+            lookup(&fs, ROOT_INO, "keep.txt")
+                .await
+                .expect("keep.txt stays");
+            assert!(!instance.write_dir().join("vendor").exists());
+            let node = node_at(&instance, &fs, "vendor").await;
+            let node = fs
+                .state()
+                .node(instance.fixture.repository.clone(), node)
+                .await
+                .expect("the link's node");
+            assert!(node.is_link(), "the link stays a link");
+        })
+        .await;
+}
+
+/// The messages that name [`WARNED_LINK`], collected by the log callback.
+static WARNED_LINK_LOGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// A link name no other test's messages carry.
+const WARNED_LINK: &str = "linked-6ib-warned";
+
+/// Collects each warning naming [`WARNED_LINK`] in [`WARNED_LINK_LOGS`].
+fn collect_warned_link_logs(level: lore_base::log::LoreLogLevel, _location: &str, message: &str) {
+    if level == lore_base::log::LoreLogLevel::Warn && message.contains(WARNED_LINK) {
+        WARNED_LINK_LOGS
+            .lock()
+            .expect("the log collector lock is not poisoned")
+            .push(message.to_string());
+    }
+}
+
+/// A mount warns once for each link it serves, however often the link's inode is made, and a
+/// new mount warns again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mount_warns_once_for_each_link() {
+    let instance = Instance::new(&[("keep.txt", b"k")]).await;
+    let capture = crate::helper::LOG_CAPTURE.lock().await;
+    WARNED_LINK_LOGS
+        .lock()
+        .expect("the log collector lock is not poisoned")
+        .clear();
+    let level = lore_base::log::log_level();
+    lore_base::log::set_log_level(lore_base::log::LoreLogLevel::Info);
+    lore_base::log::set_log_callback(Some(collect_warned_link_logs));
+    let warned = || {
+        WARNED_LINK_LOGS
+            .lock()
+            .expect("the log collector lock is not poisoned")
+            .len()
+    };
+    let counted = LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            attach_link(&fs, &instance, ROOT_NODE, WARNED_LINK).await;
+            let link = lookup(&fs, ROOT_INO, WARNED_LINK).await.expect("the link");
+            let first = warned();
+            fs.forget(link, 1);
+            assert!(
+                fs.inodes().get(link).is_none(),
+                "the forget drops the inode"
+            );
+            lookup(&fs, ROOT_INO, WARNED_LINK)
+                .await
+                .expect("the link again");
+            let again = warned();
+            drop(fs);
+            let fs = provider(&instance).await;
+            attach_link(&fs, &instance, ROOT_NODE, WARNED_LINK).await;
+            lookup(&fs, ROOT_INO, WARNED_LINK)
+                .await
+                .expect("the link remounted");
+            (first, again, warned())
+        })
+        .await;
+    lore_base::log::set_log_callback(None);
+    lore_base::log::set_log_level(level);
+    drop(capture);
+    assert_eq!(counted, (1, 1, 2), "one warning per mount and link");
+}
+
+/// The repository's context over the instance's stores, which commits in memory.
+fn in_memory_writer(instance: &Instance) -> Arc<lore_revision::repository::RepositoryContext> {
+    crate::helper::in_memory::repository_in(
+        instance.fixture.immutable.clone(),
+        instance.fixture.mutable.clone(),
+        instance.fixture.repository.id,
+    )
+}
+
+/// Merges through `fs` a branch whose revision adds a link at `vendor` to a revision of another
+/// repository holding `l.txt`, leaving the link staged; answers the repository and the revision.
+async fn merge_a_link(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+) -> (lore_revision::lore::RepositoryId, Hash) {
+    use crate::helper::in_memory;
+
+    let feature = create_branch_id_through(instance, fs, "feature").await;
+    let writer = in_memory_writer(instance);
+    let linked = lore_revision::lore::RepositoryId::from(uuid::Uuid::now_v7());
+    let pin = in_memory::linked_revision(&writer, linked).await;
+    let base = instance.fixture.state.revision();
+    let state = in_memory::revision_state(&writer, base).await;
+    let link = in_memory::link_node("vendor", linked, pin);
+    in_memory::add(&state, writer.clone(), ROOT_NODE, link, "vendor").await;
+    in_memory::commit(&writer, &state, base, feature).await;
+    switch_through(instance, fs, lore_revision::branch::DEFAULT_DEFAULT_NAME)
+        .await
+        .expect("switch back");
+    merge_through(instance, fs, feature)
+        .await
+        .expect("the merge");
+    (linked, pin)
+}
+
+/// Runs `lore link remove <link_path>` through `fs`.
+async fn link_remove_through(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+    link_path: &str,
+) -> Result<(), String> {
+    use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::util::path::RelativePath;
+
+    let token = RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    let context = instance.command_context(fs, Some(token.share()));
+    let link_path = RelativePath::new_from_initial_path(link_path).expect("a link path");
+    LORE_CONTEXT
+        .scope(
+            fuse_fixture::setup_test_execution(),
+            lore_revision::link::remove::remove_boxed(context, &token, link_path),
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))
+}
+
+/// A merge bringing a link writes none of the link through the mount: nothing lands in `write/`
+/// for it, status shows the link staged and nothing dirty, and the merge commits with nothing
+/// left in status. A remount serves the link as a read-only directory.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_bringing_a_link_writes_none_of_it_and_commits() {
+    use lore_revision::interface::LoreFileAction;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            merge_a_link(&instance, &fs).await;
+
+            assert!(
+                !instance.write_dir().join("vendor").exists(),
+                "write/ holds nothing of the link"
+            );
+            let status = status_of(&instance, &fs).await;
+            assert_eq!(
+                status.into_iter().collect::<Vec<_>>(),
+                [("vendor".to_string(), (LoreFileAction::Add, false))],
+                "the link is staged and nothing is dirty"
+            );
+
+            let merged = commit_through(&instance, &fs, false)
+                .await
+                .expect("the commit of the merge");
+            assert_eq!(status_of(&instance, &fs).await, Default::default());
+            drop(fs);
+
+            let fs = provider_at(&instance, merged).await;
+            let vendor = lookup(&fs, ROOT_INO, "vendor").await.expect("vendor");
+            let attr = fs.getattr(&request(), vendor).await.expect("getattr").attr;
+            assert_eq!(attr.mode & libc::S_IFMT, libc::S_IFDIR);
+            assert_eq!(attr.mode & 0o222, 0, "the link is served read-only");
+            assert!(
+                !instance.write_dir().join("vendor").exists(),
+                "write/ holds nothing of the link"
+            );
+        })
+        .await;
+}
+
+/// Each stage after a sync brings a link stages nothing of the link: a scan of the whole tree, a
+/// stage of the directory holding it, of the link itself, and of a path below it. Status reports
+/// nothing, and the staged link keeps its pin.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_after_a_sync_brings_a_link_stages_nothing_of_it() {
+    use crate::helper::in_memory;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let writer = in_memory::repository_in(
+                instance.fixture.immutable.clone(),
+                instance.fixture.mutable.clone(),
+                instance.fixture.repository.id,
+            );
+            let linked = lore_revision::lore::RepositoryId::from(uuid::Uuid::now_v7());
+            let pin =
+                in_memory::linked_revision_holding(&writer, linked, &["l.txt", "m.txt"]).await;
+            let base = instance.fixture.state.revision();
+            let (_, branch) =
+                lore_revision::instance::load_current_anchor_boxed(&instance.fixture.repository)
+                    .await
+                    .expect("the current anchor reads");
+            let state = in_memory::revision_state(&writer, base).await;
+            // As a stage of the working tree records them, with no mode.
+            let vendor = Node {
+                mode: 0,
+                ..in_memory::directory("vendor")
+            };
+            let dir = in_memory::add(&state, writer.clone(), ROOT_NODE, vendor, "vendor").await;
+            let link = Node {
+                mode: 0,
+                ..in_memory::link_node("lib", linked, pin)
+            };
+            let link = in_memory::add(&state, writer.clone(), dir, link, "lib").await;
+            state
+                .link_add(
+                    writer.clone(),
+                    linked,
+                    in_memory::branch_id(),
+                    pin,
+                    link,
+                    lore_revision::link::LinkFlags::NoFlags,
+                )
+                .await
+                .expect("registering the link");
+            let linking = in_memory::commit(&writer, &state, base, branch).await;
+            sync_through(&instance, &fs, linking, Default::default())
+                .await
+                .expect("the sync bringing the link");
+
+            let scan = lore_revision::stage::StageOptions {
+                scan: true,
+                ..Default::default()
+            };
+            let root = vec![instance.fixture.path.clone()];
+            for (what, staged) in [
+                (
+                    "a scan",
+                    stage_hosts_through(&instance, &fs, root, Default::default(), scan).await,
+                ),
+                (
+                    "the directory",
+                    stage_paths_through(&instance, &fs, &["vendor"]).await,
+                ),
+                (
+                    "the link",
+                    stage_paths_through(&instance, &fs, &["vendor/lib"]).await,
+                ),
+                (
+                    "below it",
+                    stage_paths_through(&instance, &fs, &["vendor/lib/l.txt"]).await,
+                ),
+            ] {
+                let staged = staged.unwrap_or_else(|error| panic!("{what}: {error}"));
+                assert_eq!(
+                    status_of(&instance, &fs).await,
+                    Default::default(),
+                    "{what}"
+                );
+                if staged.is_zero() {
+                    continue;
+                }
+                let staged = lore_revision::state::State::deserialize(
+                    instance.fixture.repository.clone(),
+                    staged,
+                )
+                .await
+                .expect("the staged State loads");
+                let held = staged
+                    .find_node_link(instance.fixture.repository.clone(), "vendor/lib")
+                    .await
+                    .expect("vendor/lib");
+                let held = staged
+                    .node(instance.fixture.repository.clone(), held.node)
+                    .await
+                    .expect("vendor/lib");
+                assert!(held.is_link(), "{what}: vendor/lib stays a link");
+                assert_eq!(held.address.hash, pin, "{what}: the link keeps its pin");
+            }
+        })
+        .await;
+}
+
+/// Removing a link a merge staged through the mount leaves nothing at its path: the mount holds
+/// none of the link to take back.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_link_a_merge_staged_leaves_nothing_at_its_path() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            merge_a_link(&instance, &fs).await;
+
+            link_remove_through(&instance, &fs, "vendor")
+                .await
+                .expect("the link removal");
+
+            assert!(
+                !instance.write_dir().join("vendor").exists(),
+                "write/ holds nothing at the link's path"
+            );
+            assert_eq!(lookup(&fs, ROOT_INO, "vendor").await, Err(Errno::ENOENT));
+            let status = status_of(&instance, &fs).await;
+            assert!(
+                !status.contains_key("vendor"),
+                "nothing is staged at the link's path: {status:?}"
+            );
+        })
+        .await;
+}
+
+/// Removing a link a merge staged through the mount reads nothing of the link and nothing at or
+/// below its path, as the removal takes nothing there: a local file at its path does not refuse
+/// the removal of a link whose revision the store no longer holds, and stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_link_a_merge_staged_reads_nothing_below_its_path() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let (linked, pin) = merge_a_link(&instance, &fs).await;
+            instance
+                .fixture
+                .immutable
+                .clone()
+                .obliterate(linked, Address::zero_context_hash(pin), Arc::default())
+                .await
+                .expect("dropping the linked revision");
+            let vendor = fs
+                .mkdir(
+                    &request(),
+                    ROOT_INO,
+                    b"vendor",
+                    libc::S_IFDIR | 0o755,
+                    0o022,
+                )
+                .await
+                .expect("mkdir")
+                .ino;
+            create_with(&fs, vendor, "l.txt", b"local").await;
+
+            link_remove_through(&instance, &fs, "vendor")
+                .await
+                .expect("the link removal");
+
+            assert_eq!(
+                std::fs::read(instance.write_dir().join("vendor/l.txt")).expect("the local file"),
+                b"local"
+            );
+        })
+        .await;
+}
+
+/// A link pin change realizes nothing through a provider holding its state, so neither of its
+/// entry points reads the linked revisions: one between revisions the store does not hold
+/// succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_pin_change_on_the_mount_reads_neither_revision() {
+    use lore_revision::link::LinkMountSource;
+    use lore_revision::link::LinkPinRealizeTarget;
+    use lore_revision::util::path::RelativePath;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let repository = instance.command_context(&fs, None);
+            let linked = lore_revision::lore::RepositoryId::from(uuid::Uuid::now_v7());
+            let link_context = repository.to_link_context(linked).await;
+            let target = LinkPinRealizeTarget {
+                link_path: RelativePath::new_from_initial_path("vendor").expect("a link path"),
+                old_signature: Hash::from_u64(0x6a),
+                new_signature: Hash::from_u64(0x6b),
+                current_node: ROOT_NODE,
+                mount_source: LinkMountSource::SamePath,
+            };
+
+            lore_revision::link::realize_link_pin_change(
+                repository.clone(),
+                link_context.clone(),
+                target.clone(),
+            )
+            .await
+            .expect("the realize opening its operation");
+            lore_revision::fs::filesystem_provider::with_operation(
+                repository.file_system(),
+                async |operation| {
+                    lore_revision::link::realize_link_pin_change_in_operation(
+                        &operation,
+                        repository.clone(),
+                        link_context.clone(),
+                        target,
+                        false,
+                    )
+                    .await
+                },
+            )
+            .await
+            .expect("the realize in the caller's operation");
+        })
+        .await;
+}
+
+/// A stage naming a path below a link through the mount stages nothing, and reads nothing of the
+/// link: a link whose revision the store does not hold answers the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_below_a_link_whose_revision_is_not_held_stages_nothing() {
+    use crate::helper::in_memory;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let writer = in_memory_writer(&instance);
+            let linked = lore_revision::lore::RepositoryId::from(uuid::Uuid::now_v7());
+            let base = instance.fixture.state.revision();
+            let (_, branch) =
+                lore_revision::instance::load_current_anchor_boxed(&instance.fixture.repository)
+                    .await
+                    .expect("the current anchor reads");
+            let state = in_memory::revision_state(&writer, base).await;
+            let link = in_memory::link_node("vendor", linked, Hash::from_u64(0x6c));
+            in_memory::add(&state, writer.clone(), ROOT_NODE, link, "vendor").await;
+            let linking = in_memory::commit(&writer, &state, base, branch).await;
+            sync_through(&instance, &fs, linking, Default::default())
+                .await
+                .expect("the sync bringing the link");
+
+            stage_paths_through(&instance, &fs, &["vendor/l.txt"])
+                .await
+                .expect("the stage below the link");
+            assert_eq!(status_of(&instance, &fs).await, Default::default());
+        })
+        .await;
+}
+
+/// A reset of a link's staged removal through the mount restores the link and writes nothing of
+/// it, whether or not the mount serves the link yet: nothing lands in `write/`, the link stands in
+/// the State the mount serves as it did, and status is clean.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_of_a_link_removal_writes_nothing_of_the_link() {
+    for remounted in [false, true] {
+        let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+        LORE_CONTEXT
+            .scope(fuse_fixture::setup_test_execution(), async {
+                let fs = provider(&instance).await;
+                merge_a_link(&instance, &fs).await;
+                let merged = commit_through(&instance, &fs, false)
+                    .await
+                    .expect("the commit of the merge");
+                let fs = if remounted {
+                    drop(fs);
+                    provider_at(&instance, merged).await
+                } else {
+                    fs
+                };
+                let served = lookup(&fs, ROOT_INO, "vendor").await;
+                link_remove_through(&instance, &fs, "vendor")
+                    .await
+                    .expect("the link removal");
+
+                reset_through(&instance, &fs, &["vendor"], None, false)
+                    .await
+                    .unwrap_or_else(|error| panic!("remounted {remounted}: the reset: {error}"));
+
+                assert!(
+                    !instance.write_dir().join("vendor").exists(),
+                    "remounted {remounted}: write/ holds nothing at the link's path"
+                );
+                assert_eq!(
+                    lookup(&fs, ROOT_INO, "vendor").await,
+                    served,
+                    "remounted {remounted}: the mount serves the link's path as before"
+                );
+                assert_eq!(
+                    status_of(&instance, &fs).await,
+                    Default::default(),
+                    "remounted {remounted}: nothing changed"
+                );
+            })
+            .await;
+    }
+}
+
+/// A reset of a link a merge staged through the mount removes nothing at its path, which holds
+/// none of the link: a directory made there stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_of_a_link_a_merge_staged_keeps_the_directory_at_its_path() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            merge_a_link(&instance, &fs).await;
+            fs.mkdir(
+                &request(),
+                ROOT_INO,
+                b"vendor",
+                libc::S_IFDIR | 0o755,
+                0o022,
+            )
+            .await
+            .expect("mkdir");
+
+            reset_through(&instance, &fs, &["vendor"], None, false)
+                .await
+                .expect("the reset");
+
+            assert!(
+                instance.write_dir().join("vendor").is_dir(),
+                "the directory at the link's path stays"
+            );
+        })
+        .await;
+}

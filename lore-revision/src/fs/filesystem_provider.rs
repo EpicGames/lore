@@ -476,6 +476,9 @@ pub trait FilesystemProvider: Send + Sync + 'static {
     /// ([`InstanceOperationImpl::holds_state`]), so a provider handing out another provider's
     /// operations answers as that provider does.
     ///
+    /// Such a provider serves a link from the link's node, so nothing of a link is written through
+    /// its operations: not the link's directory, its content, a move of it or its removal.
+    ///
     /// # Implementation notes
     ///
     /// - **FUSE**: true. Every change reaches the tree through the provider, which diffs the

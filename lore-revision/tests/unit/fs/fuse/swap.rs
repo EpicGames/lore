@@ -42,8 +42,11 @@ use lore_revision::fs::fuse::swap::swap;
 use lore_revision::fs::hold::SwapHook;
 use lore_revision::fs::hold::SwapPhase;
 use lore_revision::lore::RepositoryId;
+use lore_revision::node::Node;
 use lore_revision::node::NodeFileMode;
 use lore_revision::node::NodeFlags;
+use lore_revision::node::NodeID;
+use lore_revision::node::ROOT_NODE;
 use lore_revision::records::InstanceRecords;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
@@ -67,6 +70,7 @@ use crate::fs::fuse::fuse_fixture;
 use crate::fs::fuse::fuse_fixture::RepositoryContextCreationArgsExt as _;
 use crate::fs::fuse::fuse_test_util;
 use crate::fs::fuse::fuse_test_util::req;
+use crate::helper::in_memory;
 
 const BASE_TIME: u64 = 1_700_000_000_000;
 const BLKSIZE: u32 = 1 << 17;
@@ -272,6 +276,216 @@ async fn swapping(files: &[(&str, &[u8])], work: impl AsyncFnOnce(Swapping)) {
             .await;
         })
         .await;
+}
+
+/// A revision of `s`'s repository holding what its first revision holds, with a link at `vendor`
+/// and another in place of the directory `dir`, both to `pin` of `linked`.
+async fn linking(s: &Swapping, linked: RepositoryId, pin: Hash) -> Arc<State> {
+    let repository = s.repository();
+    let writer = writer(&repository);
+    let base = s.first.revision();
+    let state = in_memory::revision_state(&writer, base).await;
+    in_memory::add(
+        &state,
+        writer.clone(),
+        ROOT_NODE,
+        in_memory::link_node("vendor", linked, pin),
+        "vendor",
+    )
+    .await;
+    let dir = state
+        .find_subnode(writer.clone(), ROOT_NODE, hash_string("dir"))
+        .await
+        .expect("dir");
+    state
+        .node_delete(writer.clone(), dir)
+        .await
+        .expect("deleting dir");
+    in_memory::add(
+        &state,
+        writer.clone(),
+        ROOT_NODE,
+        in_memory::link_node("dir", linked, pin),
+        "dir",
+    )
+    .await;
+    let revision = in_memory::commit(&writer, &state, base, in_memory::branch_id()).await;
+    State::deserialize(repository, revision)
+        .await
+        .expect("the revision holding the links loads")
+}
+
+/// A context over `repository`'s stores and repository that commits in memory.
+fn writer(repository: &Arc<RepositoryContext>) -> Arc<RepositoryContext> {
+    in_memory::repository_in(
+        repository.immutable_store(),
+        repository
+            .try_mutable_store_arc()
+            .expect("the fixture holds a write token"),
+        repository.id,
+    )
+}
+
+/// Whether the provider orphaned `ino`, and a lookup through it finds nothing.
+async fn orphaned(s: &Swapping, ino: u64) -> bool {
+    s.fs.inodes().get(ino).is_some_and(|entry| entry.orphaned)
+        && s.lookup(ino, "x.txt").await.is_err()
+}
+
+/// Whether the inode at `ino` is a link.
+fn served_as_link(s: &Swapping, ino: u64) -> bool {
+    s.fs.inodes()
+        .get(ino)
+        .is_some_and(|entry| entry.kind.is_link())
+}
+
+/// A swap to a revision holding links serves each as a link with its pin, which lists nothing:
+/// one the revision adds, and one in place of a directory. A swap back takes them away and
+/// restores the directory. Each swap orphans the inode the kernel held where a directory turned
+/// into a link or back.
+#[tokio::test]
+async fn a_swap_serves_each_link_the_revision_holds_as_a_link() {
+    swapping(
+        &[("keep.txt", b"k"), ("dir/x.txt", b"x")],
+        async |s: Swapping| {
+            let repository = s.repository();
+            let linked = RepositoryId::from(uuid::Uuid::now_v7());
+            let pin = in_memory::linked_revision(&writer(&repository), linked).await;
+            let target = linking(&s, linked, pin).await;
+            let directory = s.lookup(ROOT_INO, "dir").await.expect("dir");
+            assert!(!served_as_link(&s, directory));
+
+            s.swap_to(&target, Arc::new(RecordingSink::default())).await;
+            assert!(
+                orphaned(&s, directory).await,
+                "the directory's inode is orphaned"
+            );
+            for name in ["vendor", "dir"] {
+                let node = served_node(&s, name).await;
+                assert!(node.is_link(), "{name} is served as a link");
+                assert_eq!(node.address.hash, pin, "{name} keeps its pin");
+                let ino = s.lookup(ROOT_INO, name).await.expect(name);
+                for below in ["l.txt", "x.txt"] {
+                    assert_eq!(
+                        s.lookup(ino, below).await,
+                        Err(Errno::ENOENT),
+                        "nothing is served below {name}"
+                    );
+                }
+            }
+
+            let link = s.lookup(ROOT_INO, "dir").await.expect("dir");
+            assert_ne!(link, directory, "the link is a new inode");
+            assert!(served_as_link(&s, link));
+
+            s.swap_to(&s.first, Arc::new(RecordingSink::default()))
+                .await;
+            assert!(orphaned(&s, link).await, "the link's inode is orphaned");
+            assert_eq!(s.lookup(ROOT_INO, "vendor").await, Err(Errno::ENOENT));
+            let dir = s.lookup(ROOT_INO, "dir").await.expect("dir");
+            assert_ne!(dir, link, "the directory is a new inode");
+            assert!(!served_as_link(&s, dir));
+            s.lookup(dir, "x.txt").await.expect("dir/x.txt is back");
+        },
+    )
+    .await;
+}
+
+/// The node the served State holds at `name` in the root.
+async fn served_node(s: &Swapping, name: &str) -> Node {
+    let repository = s.repository();
+    let served = s.fs.served();
+    let node = served
+        .state
+        .find_subnode(repository.clone(), ROOT_NODE, hash_string(name))
+        .await
+        .expect(name);
+    served.state.node(repository, node).await.expect(name)
+}
+
+/// A revision of `linked` holding the directories `a` and `b`, each holding a file, and the nodes
+/// of `a` and `b` in it.
+async fn linked_directories(
+    repository: &Arc<RepositoryContext>,
+    linked: RepositoryId,
+) -> (Hash, NodeID, NodeID) {
+    let context = writer(repository).to_link_context(linked).await;
+    let state = State::new();
+    for name in ["a", "b"] {
+        let dir = in_memory::add(
+            &state,
+            context.clone(),
+            ROOT_NODE,
+            in_memory::directory(name),
+            name,
+        )
+        .await;
+        in_memory::add(
+            &state,
+            context.clone(),
+            dir,
+            in_memory::file("x.txt"),
+            "x.txt",
+        )
+        .await;
+    }
+    let pin = in_memory::commit(&context, &state, Hash::default(), in_memory::branch_id()).await;
+    let pinned = State::deserialize(context.clone(), pin)
+        .await
+        .expect("the linked revision loads");
+    let mut nodes = Vec::new();
+    for name in ["a", "b"] {
+        let node = pinned
+            .find_subnode(context.clone(), ROOT_NODE, hash_string(name))
+            .await
+            .expect(name);
+        nodes.push(node);
+    }
+    (pin, nodes[0], nodes[1])
+}
+
+/// A revision of `s`'s repository holding what its first revision holds and a link at `vendor`
+/// to `pin` of `linked`, mounting the node `source` of it.
+async fn mounting(s: &Swapping, linked: RepositoryId, pin: Hash, source: NodeID) -> Arc<State> {
+    let repository = s.repository();
+    let writer = writer(&repository);
+    let base = s.first.revision();
+    let state = in_memory::revision_state(&writer, base).await;
+    let link = Node {
+        child: source,
+        ..in_memory::link_node("vendor", linked, pin)
+    };
+    in_memory::add(&state, writer.clone(), ROOT_NODE, link, "vendor").await;
+    let revision = in_memory::commit(&writer, &state, base, in_memory::branch_id()).await;
+    State::deserialize(repository, revision)
+        .await
+        .expect("the revision holding the link loads")
+}
+
+/// A swap places a link mounting a subtree of the revision it pins with that subtree, and a swap
+/// to a revision whose link differs only by the subtree it mounts places the link again.
+#[tokio::test]
+async fn a_swap_places_the_subtree_a_link_mounts() {
+    swapping(&[("keep.txt", b"k")], async |s: Swapping| {
+        let linked = RepositoryId::from(uuid::Uuid::now_v7());
+        let (pin, a, b) = linked_directories(&s.repository(), linked).await;
+        assert!(a != b && a != ROOT_NODE && b != ROOT_NODE);
+        let mounting_a = mounting(&s, linked, pin, a).await;
+        let mounting_b = mounting(&s, linked, pin, b).await;
+
+        for (target, source, what) in [(&mounting_a, a, "a"), (&mounting_b, b, "b")] {
+            s.swap_to(target, Arc::new(RecordingSink::default())).await;
+            let held = served_node(&s, "vendor").await;
+            assert!(held.is_link(), "mounting {what}: vendor is a link");
+            assert_eq!(held.address.hash, pin, "mounting {what}: the pin");
+            assert_eq!(
+                held.mount_source(),
+                Some(source),
+                "mounting {what}: the subtree it mounts"
+            );
+        }
+    })
+    .await;
 }
 
 #[tokio::test]
