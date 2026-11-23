@@ -365,3 +365,40 @@ fn details_of_another_length_are_not_read_as_an_address() {
     let error = ProtocolError::from(status);
     assert!(error.is_internal(), "{error:?}");
 }
+
+fn authorization_header(auth: GRPCAuth) -> Option<String> {
+    let mut interceptor = AuthnInterceptor {
+        auth: std::sync::Arc::new(parking_lot::RwLock::new(auth)),
+    };
+    let request = tonic::service::Interceptor::call(&mut interceptor, tonic::Request::new(()))
+        .expect("the interceptor accepts the request");
+    request
+        .metadata()
+        .get("authorization")
+        .map(|value| value.to_str().expect("an ASCII header").to_string())
+}
+
+/// The repository service sends the authentication token, and the authorization token when there
+/// is none: a caller that supplied only an access token presents it.
+#[test]
+fn the_authn_interceptor_falls_back_to_the_authorization_token() {
+    let both = GRPCAuth {
+        authentication_token: "identity".to_string(),
+        authorization_token: "access".to_string(),
+        ..Default::default()
+    };
+    let access_only = GRPCAuth {
+        authorization_token: "access".to_string(),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        authorization_header(both).as_deref(),
+        Some("Bearer identity")
+    );
+    assert_eq!(
+        authorization_header(access_only).as_deref(),
+        Some("Bearer access")
+    );
+    assert_eq!(authorization_header(GRPCAuth::default()), None);
+}

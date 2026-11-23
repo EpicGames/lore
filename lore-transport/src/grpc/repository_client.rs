@@ -20,8 +20,9 @@ use crate::error::ProtocolError;
 use crate::types::MetadataSetResult;
 use crate::types::RepositoryData;
 
-/// The repository service, sending the token its interceptor injects: the login token by
-/// default, or a partition's authorization token from [`RepositoryService::for_partition`].
+/// The repository service, sending the token its interceptor injects: by default the login
+/// token, or the access token when one is supplied without an identity token, or a partition's
+/// authorization token from [`RepositoryService::for_partition`].
 #[derive(Clone)]
 pub struct RepositoryService<I = AuthnInterceptor> {
     client: RepositoryServiceClient<InterceptedService<Channel, I>>,

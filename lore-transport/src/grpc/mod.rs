@@ -354,6 +354,8 @@ impl Interceptor for CorrelationInterceptor {
     }
 }
 
+/// Sends the authentication token, or the authorization token when there is none, as when the
+/// caller supplied only an access token.
 #[derive(Clone)]
 pub struct AuthnInterceptor {
     pub auth: Arc<parking_lot::RwLock<GRPCAuth>>,
@@ -365,7 +367,13 @@ impl Interceptor for AuthnInterceptor {
         mut request: tonic::Request<()>,
     ) -> Result<tonic::Request<()>, tonic::Status> {
         inject_correlation_id(&mut request)?;
-        inject_authorization(&mut request, self.auth.read().authentication_token.as_str())?;
+        let auth = self.auth.read();
+        let token = if auth.authentication_token.is_empty() {
+            auth.authorization_token.as_str()
+        } else {
+            auth.authentication_token.as_str()
+        };
+        inject_authorization(&mut request, token)?;
         Ok(request)
     }
 }

@@ -72,6 +72,25 @@ async fn access_token_alone_authorizes_without_an_authentication_token() {
     assert_eq!(identity, "alice");
 }
 
+/// Without a repository, a supplied access token is still the authorization token, so the
+/// repository service, which needs no repository, has a credential to present.
+#[tokio::test]
+async fn access_token_alone_authorizes_without_a_repository() {
+    let (authentication_token, authorization_token, identity) = auth_exchange(
+        &AuthEndpoint::resolve("ucs-auth://auth.example.com").expect("a registered scheme"),
+        "example.com",
+        "alice",
+        RepositoryId::default(),
+        "",
+        "supplied-authz",
+    )
+    .await;
+
+    assert!(authentication_token.is_empty());
+    assert_eq!(authorization_token, "supplied-authz");
+    assert_eq!(identity, "alice");
+}
+
 #[tokio::test]
 async fn no_auth_endpoint_with_an_identity_sends_an_unsigned_identity_token() {
     let (authentication_token, authorization_token, identity) = auth_exchange(
