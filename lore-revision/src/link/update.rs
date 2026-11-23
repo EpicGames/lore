@@ -6,15 +6,21 @@ use lore_error_set::prelude::*;
 
 use super::LinkError;
 use crate::branch;
+use crate::errors::Divergent;
 use crate::event;
 use crate::filter::FilterMode;
+use crate::find;
+use crate::find::HistoryPosition;
 use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreFileAction;
 use crate::link;
 use crate::link::LoreLinkChangeEventData;
 use crate::lore::Context;
 use crate::lore::Hash;
+use crate::lore::execution_context;
 use crate::lore_debug;
+use crate::lore_info;
+use crate::lore_warn;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::stage;
@@ -84,7 +90,42 @@ pub(crate) async fn update(
 
         lore_debug!("Using latest {link_latest} of current branch {resolved_branch} as link pin");
 
-        (link_latest, resolved_branch)
+        // A zero remote latest, or a walk that cannot decide, updates as before.
+        let position = if link_latest.is_zero()
+            || link_latest == current_link_revision
+            || execution_context().globals().force()
+        {
+            None
+        } else {
+            find::try_history_position(&link, current_link_revision, link_latest)
+                .await
+                .inspect_err(|err| {
+                    lore_debug!(
+                        "Pin {current_link_revision} not placed against {link_latest}: {err}"
+                    );
+                })
+                .ok()
+        };
+        let link_revision = match position {
+            None | Some(HistoryPosition::OnHistory) => link_latest,
+            Some(HistoryPosition::Ahead) => {
+                let branch = branch::display_name(link.clone(), resolved_branch).await;
+                lore_info!(
+                    "Link '{link_path}' is ahead of remote branch '{branch}': its pin {current_link_revision} holds revisions not pushed yet. Push to publish them."
+                );
+                current_link_revision
+            }
+            Some(HistoryPosition::Diverged) => {
+                let branch = branch::display_name(link.clone(), resolved_branch).await;
+                lore_warn!(
+                    "Link '{link_path}' and remote branch '{branch}' have diverged: the pin {current_link_revision} holds revisions not pushed, and the remote branch has new ones. Updating would drop the unpushed revisions from the working tree; they stay reachable as {current_link_revision}. To drop them, run `lore --force link update {link_path}`, or pick a revision with `lore link update {link_path} --pin <revision>`."
+                );
+                return Err(LinkError::from(Divergent)).forward_with::<LinkError, _>(|| {
+                    format!("updating the link at {link_path} to the latest of branch {branch}")
+                });
+            }
+        };
+        (link_revision, resolved_branch)
     };
 
     lore_debug!("Updating to link revision {link_revision} on branch {link_branch}");

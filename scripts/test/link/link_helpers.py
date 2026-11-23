@@ -559,6 +559,17 @@ def assert_link_holds(repo: Lore, link_path: str, files: dict[str, str]):
     assert mounted_files(repo, link_path) == files
 
 
+def commit_through_mount(
+    repo: Lore, files: dict[str, str], link_path: str = DEFAULT_LINK_MOUNT
+):
+    """Writes `files` under the link at `link_path` and commits them, which commits the linked
+    repository locally and pins the link to that unpushed revision."""
+    paths = {f"{link_path}/{path}": content for path, content in files.items()}
+    repo.write_files(paths)
+    repo.stage(list(paths))
+    repo.commit("Edit through the mount")
+
+
 SUBTREE_LINK = "linked/repo"
 
 
@@ -650,7 +661,9 @@ def repo_holding_links(new_lore_repo, outer: str) -> tuple[Lore, str]:
     there, so the links the test adds are nested in that link."""
     if not outer:
         return make_repo(new_lore_repo, {"main-file.txt": "main base\n"}), ""
-    urc, _ = make_parent_with_link(new_lore_repo, outer, {"main-file.txt": "main base\n"})
+    urc, _ = make_parent_with_link(
+        new_lore_repo, outer, {"main-file.txt": "main base\n"}
+    )
     return urc, f"{outer}/"
 
 
@@ -812,7 +825,9 @@ def change_through_both_links(urc: Lore, shape: str, files: dict[str, str]):
     """Commits `files` inside the repository both links of `shape` reach, through the first, and
     pins the second at the result."""
     first, second = LINKS_TO_ONE_REPOSITORY[shape]
-    urc.write_commit_push("Change d", {f"{first}/{path}": c for path, c in files.items()})
+    urc.write_commit_push(
+        "Change d", {f"{first}/{path}": c for path, c in files.items()}
+    )
     urc.link_update(second, pin=link_pin_at(urc, first))
     urc.commit("Pin the second link of d")
     urc.push()

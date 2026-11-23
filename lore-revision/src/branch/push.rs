@@ -2623,8 +2623,8 @@ enum RecordedLocalLatest {
 
 /// Records `pushed`, a revision the peer holds on `branch`, as the branch's local latest and last
 /// synchronized revision where the local latest is at `pushed` or behind it, as `accepted` says,
-/// behind being on its history ([`find::is_on_history`]). Answers whether `pushed` is now, or was
-/// already, the recorded local latest. A dry run records nothing.
+/// behind being on its history ([`find::try_is_on_recent_history`]). Answers whether `pushed` is
+/// now, or was already, the recorded local latest. A dry run records nothing.
 ///
 /// A layer or a link records `pushed` as the last synchronized revision alone, and answers `false`.
 /// A local latest that cannot be read, or that another command moves while this records, is left
@@ -2673,7 +2673,13 @@ async fn record_pushed_latest(
         if !diverged && last_sync == pushed {
             return Ok(true);
         }
-    } else if !local_latest_on_history(repository, pushed, local_latest).await {
+    } else if !find::try_is_on_recent_history(repository, pushed, local_latest)
+        .await
+        .unwrap_or_else(|err| {
+            lore_debug!("Local latest {local_latest} not found on the history of {pushed}: {err}");
+            false
+        })
+    {
         return Ok(false);
     }
     if dry_run {
@@ -2689,35 +2695,6 @@ async fn record_pushed_latest(
         }
         Err(err) => Err(err).forward::<PushError>("setting new latest revision for branch"),
     }
-}
-
-/// Whether `local_latest` is on the history of `pushed`, walked at most
-/// [`branch::MAX_DIVERGENT_HISTORY_LENGTH`] revisions. A revision that cannot be read answers
-/// `false`.
-async fn local_latest_on_history(
-    repository: &Arc<RepositoryContext>,
-    pushed: Hash,
-    local_latest: Hash,
-) -> bool {
-    let local_latest_number = if local_latest.is_zero() {
-        0
-    } else {
-        match State::deserialize(repository.clone(), local_latest).await {
-            Ok(state) => state.revision_number(),
-            Err(err) => {
-                lore_debug!("Local latest {local_latest} is unread: {err}");
-                return false;
-            }
-        }
-    };
-    find::is_on_history(
-        repository.clone(),
-        pushed,
-        local_latest,
-        local_latest_number,
-        Some(branch::MAX_DIVERGENT_HISTORY_LENGTH),
-    )
-    .await
 }
 
 /// The error of a push that fails because the peer holds revisions on the branch that the local
@@ -3176,9 +3153,7 @@ async fn mount_name(
         Mount::Link { .. } => "link",
         Mount::Layer(_) => "layer",
     };
-    let branch = load_branch_metadata(repository, branch)
-        .await
-        .map_or_else(|_| branch.to_string(), |metadata| metadata.name);
+    let branch = branch::display_name(repository.clone(), branch).await;
     Some(MountName {
         kind,
         path: mount_path(targets, mount).await,

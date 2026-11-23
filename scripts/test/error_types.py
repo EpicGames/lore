@@ -70,6 +70,9 @@ class LocalModificationsError(LocalChanges):
 #: The exit status of a command refused by local modifications.
 LOCAL_MODIFICATIONS = 44
 
+#: The exit status of a command refused by a divergent history.
+DIVERGENT = 42
+
 
 class FileAlreadyExist(LoreException): ...
 

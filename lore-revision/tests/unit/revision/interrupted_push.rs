@@ -10,6 +10,7 @@ use lore_revision::branch::BranchLatestStatus;
 use lore_revision::branch::push::RecordedLocalLatest;
 use lore_revision::branch::push::record_pushed_latest;
 use lore_revision::find;
+use lore_revision::find::HistoryPosition;
 
 use super::instance::Instance;
 use super::instance::create_branch;
@@ -254,24 +255,57 @@ async fn an_unreadable_local_latest_is_kept() {
 }
 
 #[tokio::test]
-async fn a_history_walk_stops_at_its_search_limit() {
+async fn a_history_walk_answers_where_it_decides_and_fails_where_it_cannot() {
     run(
-        "interrupted-push-search-limit",
+        "interrupted-push-history-walk",
         &TREE,
         |instance| async move {
+            create_branch(&instance, "feature").await;
+            let elsewhere = commit_change(&instance, "b.txt", "Feature").await;
+            switch_to(&instance, branch::DEFAULT_DEFAULT_NAME).await;
             let ancestor = current(&instance).await;
             let number = revision_state(&instance, ancestor).await.revision_number();
-            commit_change(&instance, "a.txt", "Second").await;
-            commit_change(&instance, "b.txt", "Third").await;
-            let latest = commit_change(&instance, "a.txt", "Fourth").await;
+            let second = commit_change(&instance, "a.txt", "Second").await;
+            let latest = commit_change(&instance, "b.txt", "Third").await;
             let repository = &instance.repository;
+            let unread = Hash::from([7u8; 32]);
+            let position = async |revision, latest| {
+                find::try_history_position(repository, revision, latest)
+                    .await
+                    .ok()
+            };
 
             assert!(
-                find::is_on_history(repository.clone(), latest, ancestor, number, Some(4)).await
+                find::try_is_on_history(repository.clone(), latest, ancestor, number, Some(3))
+                    .await
+                    .expect("Failed to walk the history")
             );
             assert!(
-                !find::is_on_history(repository.clone(), latest, ancestor, number, Some(3)).await
+                !find::try_is_on_recent_history(repository, ancestor, second)
+                    .await
+                    .expect("Failed to walk the history")
             );
+            assert!(
+                find::try_is_on_history(repository.clone(), latest, ancestor, number, Some(2))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                find::try_is_on_recent_history(repository, latest, unread)
+                    .await
+                    .is_err()
+            );
+
+            assert_eq!(
+                position(second, latest).await,
+                Some(HistoryPosition::OnHistory)
+            );
+            assert_eq!(position(latest, second).await, Some(HistoryPosition::Ahead));
+            assert_eq!(
+                position(elsewhere, latest).await,
+                Some(HistoryPosition::Diverged)
+            );
+            assert_eq!(position(latest, unread).await, None);
         },
     )
     .await;

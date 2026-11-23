@@ -168,25 +168,27 @@ where
 ///
 /// The walk stops at the first revision numbered at or below `ancestor_number`, so it reads at most
 /// one revision for each revision number between the two, and after `search_limit` revisions where
-/// one is given. A revision that cannot be read, or a spent limit, ends it, answering `false`.
+/// one is given. It fails where it cannot decide: where a revision cannot be read, `search_limit`
+/// is spent, or the walk ends before passing `ancestor_number`.
 ///
 /// The branch module's history-line search walks a line too, but over batches of revision numbers
 /// and hashes, which carry no other parent. This walk reads each revision's state for it.
-pub async fn is_on_history(
+pub async fn try_is_on_history(
     repository: Arc<RepositoryContext>,
     revision: Hash,
     ancestor: Hash,
     ancestor_number: u64,
     search_limit: Option<usize>,
-) -> bool {
+) -> Result<bool, FindError> {
     if ancestor.is_zero() {
-        return true;
+        return Ok(true);
     }
     if revision.is_zero() {
-        return false;
+        return Ok(false);
     }
+    let mut passed = false;
     // The branch names where a zero revision starts, so a walk from `revision` never reads it.
-    find_revision(
+    let found = find_revision(
         repository,
         BranchId::default(),
         revision,
@@ -196,17 +198,72 @@ pub async fn is_on_history(
             if state.revision() == ancestor || state.parent_other() == ancestor {
                 FindMatchResult::Match
             } else if state.revision_number() <= ancestor_number {
+                passed = true;
                 FindMatchResult::Abort
             } else {
                 FindMatchResult::Continue
             }
         },
     )
+    .await;
+    match found {
+        Ok(_) => Ok(true),
+        Err(_) if passed => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+/// Whether `ancestor` is on the history of `revision`, as [`try_is_on_history`] answers it, walked
+/// at most [`branch::MAX_DIVERGENT_HISTORY_LENGTH`] revisions. Reads the revision number of
+/// `ancestor` itself.
+pub async fn try_is_on_recent_history(
+    repository: &Arc<RepositoryContext>,
+    revision: Hash,
+    ancestor: Hash,
+) -> Result<bool, FindError> {
+    let ancestor_number = if ancestor.is_zero() {
+        0
+    } else {
+        State::deserialize(repository.clone(), ancestor)
+            .await
+            .forward_any::<FindError>("reading the ancestor's revision number")?
+            .revision_number()
+    };
+    try_is_on_history(
+        repository.clone(),
+        revision,
+        ancestor,
+        ancestor_number,
+        Some(branch::MAX_DIVERGENT_HISTORY_LENGTH),
+    )
     .await
-    .inspect_err(|err| {
-        lore_debug!("Revision {ancestor} not found on the history of {revision}: {err}");
-    })
-    .is_ok()
+}
+
+/// Where a revision sits against a later revision, `latest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryPosition {
+    /// On the history of `latest`.
+    OnHistory,
+    /// Holds `latest` on its own history.
+    Ahead,
+    /// Neither holds the other.
+    Diverged,
+}
+
+/// Where `revision` sits against `latest`, each way walked as [`try_is_on_recent_history`] walks
+/// it. It fails where either walk cannot decide.
+pub async fn try_history_position(
+    repository: &Arc<RepositoryContext>,
+    revision: Hash,
+    latest: Hash,
+) -> Result<HistoryPosition, FindError> {
+    if try_is_on_recent_history(repository, latest, revision).await? {
+        return Ok(HistoryPosition::OnHistory);
+    }
+    if try_is_on_recent_history(repository, revision, latest).await? {
+        return Ok(HistoryPosition::Ahead);
+    }
+    Ok(HistoryPosition::Diverged)
 }
 
 /// Find revision in the current branch history which has a matching key-value pair in metadata

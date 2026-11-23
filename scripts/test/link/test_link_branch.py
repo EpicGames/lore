@@ -6,13 +6,21 @@ import shutil
 import sys
 
 import pytest
-from error_types import BranchDivergedError, LinkDivergedError, LocalChanges
+from error_types import (
+    DIVERGENT,
+    BranchDivergedError,
+    LinkDivergedError,
+    LocalChanges,
+    LoreException,
+)
 from link_helpers import (
     DEFAULT_LINK_MOUNT,
     DEFAULT_PARENT_FILE,
     assert_holds_folder,
     assert_holds_link,
+    assert_link_holds,
     build_nested_link_repos_at,
+    commit_through_mount,
     folder_replaced_by_a_link,
     link_entry,
     link_field,
@@ -737,9 +745,7 @@ def test_link_push_tells_a_layer_from_a_link(new_lore_repo):
     layer_repo.write_commit_push(None, {"lay/layered.txt": b"layer content"})
     parent_repo.layer_add("lay", layer_repo, "lay/")
 
-    parent_repo.write_files({"vendor/lib/linked.txt": "edited through the mount\n"})
-    parent_repo.stage("vendor/lib/linked.txt")
-    parent_repo.commit("Edit through the mount")
+    commit_through_mount(parent_repo, {"linked.txt": "edited through the mount\n"})
 
     kinds = sorted(
         (event["flagLink"], event["flagLayer"])
@@ -1046,20 +1052,52 @@ def test_link_push_onto_a_moved_link_branch_fails_as_diverged(new_lore_repo):
     """A link push onto a linked branch that moved on fails as a diverged link.
 
     Linked `main` moves on from another clone, so the commit made through the
-    mount is not a fast-forward of it.
+    mount is not a fast-forward of it. A link update then refuses rather than
+    drop that commit from the mount, unless forced.
     """
     parent, link_repo = make_parent_with_link(new_lore_repo)
-    link_repo.clone().write_commit_push(
+    upstream = link_repo.clone()
+    upstream.write_commit_push(
         "Move linked main", {"linked.txt": "moved on upstream\n"}
     )
-
-    mounted_file = f"{DEFAULT_LINK_MOUNT}/linked.txt"
-    parent.write_files({mounted_file: "edited through the mount\n"})
-    parent.stage(mounted_file)
-    parent.commit("Edit through the mount")
+    commit_through_mount(parent, {"linked.txt": "edited through the mount\n"})
+    pin = link_pin_at(parent, DEFAULT_LINK_MOUNT)
 
     with pytest.raises(LinkDivergedError):
         parent.push()
+    with pytest.raises(LoreException) as failure:
+        parent.link_update(DEFAULT_LINK_MOUNT)
+
+    assert failure.value.returncode == DIVERGENT, str(failure.value)
+    assert "have diverged" in str(failure.value), str(failure.value)
+    assert_link_holds(
+        parent, DEFAULT_LINK_MOUNT, {"linked.txt": "edited through the mount\n"}
+    )
+    assert link_pin_at(parent, DEFAULT_LINK_MOUNT) == pin
+    assert parse_status_json(parent.status(json=True)) == []
+
+    parent.link_update(DEFAULT_LINK_MOUNT, force=True)
+
+    assert (
+        link_pin_at(parent, DEFAULT_LINK_MOUNT) == upstream.branch_info().remote_latest
+    )
+    assert_link_holds(parent, DEFAULT_LINK_MOUNT, {"linked.txt": "moved on upstream\n"})
+
+
+@pytest.mark.smoke
+def test_link_update_keeps_a_pin_ahead_of_its_link_branch(new_lore_repo):
+    """A link pinned ahead of its branch's remote latest keeps its pin and reports it ahead."""
+    parent, _link_repo = make_parent_with_link(new_lore_repo)
+    commit_through_mount(parent, {"linked.txt": "edited through the mount\n"})
+    pin = link_pin_at(parent, DEFAULT_LINK_MOUNT)
+
+    output = parent.link_update(DEFAULT_LINK_MOUNT)
+
+    assert "is ahead of remote branch" in output, output
+    assert link_pin_at(parent, DEFAULT_LINK_MOUNT) == pin
+    assert_link_holds(
+        parent, DEFAULT_LINK_MOUNT, {"linked.txt": "edited through the mount\n"}
+    )
 
 
 @pytest.mark.smoke

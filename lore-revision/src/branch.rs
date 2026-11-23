@@ -2011,6 +2011,14 @@ pub fn name(metadata: &Metadata) -> Result<&str, BranchError> {
         .forward::<BranchError>("reading branch name from metadata")
 }
 
+/// The name of `branch` for a message, or its id where its name cannot be read.
+pub async fn display_name(repository: Arc<RepositoryContext>, branch: BranchId) -> String {
+    match metadata(repository, branch).await {
+        Ok(metadata) => name(&metadata).map_or_else(|_| branch.to_string(), str::to_owned),
+        Err(_) => branch.to_string(),
+    }
+}
+
 pub fn category(metadata: &Metadata) -> Result<&str, BranchError> {
     metadata
         .get_string(CATEGORY)
