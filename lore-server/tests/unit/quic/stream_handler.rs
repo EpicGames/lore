@@ -302,6 +302,7 @@ fn test_limits() -> AdmissionLimits {
         inflight_limit: process_limit * STREAM_COUNT as usize,
         handler_timeout: None,
         permit_timeout: None,
+        slow_send_threshold: None,
     }
 }
 
@@ -910,6 +911,7 @@ async fn connection_inflight_ceiling_sheds_without_waiting() {
                     inflight_limit: 1,
                     handler_timeout: Some(HANDLER_TIMEOUT),
                     permit_timeout: Some(PERMIT_TIMEOUT),
+                    slow_send_threshold: None,
                 },
             )),
             MOCK_PROTOCOL,
@@ -1085,6 +1087,7 @@ async fn stream_permit_pools_are_independent() {
                     inflight_limit: 8,
                     handler_timeout: Some(Duration::from_secs(30)),
                     permit_timeout: Some(PERMIT_TIMEOUT),
+                    slow_send_threshold: None,
                 },
             )),
             MOCK_PROTOCOL,
@@ -1789,4 +1792,56 @@ async fn the_default_is_16_sockets_or_one_per_processor_if_fewer() {
     }))
     .await
     .expect("Test task failed");
+}
+
+mod write_timed {
+    use tokio::sync::Mutex;
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    const BLOCKED_FOR: Duration = Duration::from_millis(40);
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_that_blocks_counts_as_write_time() {
+        let stream = Mutex::new(());
+
+        let (written, response) = write_timed(&stream, 64, async |_: &mut ()| {
+            tokio::time::sleep(BLOCKED_FOR).await;
+            7
+        })
+        .await;
+
+        assert_eq!(written, 7);
+        assert_eq!(response.lock_wait, Duration::ZERO);
+        assert_eq!(response.write, BLOCKED_FOR);
+        assert_eq!(response.bytes, 64);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_writer_queued_behind_a_blocked_write_counts_as_lock_wait() {
+        let stream = Arc::new(Mutex::new(()));
+        let (holding, held) = oneshot::channel();
+
+        let first = lore_spawn!({
+            let stream = stream.clone();
+            async move {
+                write_timed(&stream, 1, async |_: &mut ()| {
+                    let _ = holding.send(());
+                    tokio::time::sleep(BLOCKED_FOR).await;
+                })
+                .await
+                .1
+            }
+        });
+        held.await.expect("the first write holds the stream");
+
+        let (_, second) = write_timed(&stream, 1, async |_: &mut ()| {}).await;
+        let first = first.await.expect("the first write completes");
+
+        assert_eq!(first.lock_wait, Duration::ZERO);
+        assert_eq!(first.write, BLOCKED_FOR);
+        assert_eq!(second.lock_wait, BLOCKED_FOR);
+        assert_eq!(second.write, Duration::ZERO);
+    }
 }

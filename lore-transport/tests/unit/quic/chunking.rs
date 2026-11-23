@@ -1361,3 +1361,89 @@ mod resolve {
         }
     }
 }
+
+mod resolve_arrived_into {
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use super::*;
+
+    fn chunk(stream: &[u8], range: std::ops::Range<usize>) -> Chunk {
+        Chunk {
+            offset: range.start as u64,
+            bytes: Bytes::copy_from_slice(&stream[range]),
+        }
+    }
+
+    #[test]
+    fn a_header_is_dated_from_the_chunk_completing_it() {
+        let message = WireMessage::success(9, 1, 0, false, vec![0xab; 32]);
+        let stream = encode_all(std::slice::from_ref(&message));
+        let first = Instant::now();
+        let second = first + Duration::from_millis(5);
+        let last = second + Duration::from_millis(5);
+        let mut chunker = ParallelChunking::new(COMMAND_HEADER_SIZE, MAX_CHUNK, None);
+        let mut messages = Vec::new();
+
+        for (range, arrived) in [
+            (0..COMMAND_HEADER_SIZE / 2, first),
+            (COMMAND_HEADER_SIZE / 2..COMMAND_HEADER_SIZE + 4, second),
+            (COMMAND_HEADER_SIZE + 4..stream.len(), last),
+        ] {
+            chunker
+                .resolve_arrived_into(chunk(&stream, range), Some(arrived), &mut messages)
+                .expect("a valid stream");
+        }
+
+        let [message] = messages.as_slice() else {
+            panic!("expected one message, got {messages:?}");
+        };
+        assert_eq!(message.header_at, Some(second));
+    }
+
+    #[test]
+    fn a_header_arriving_ahead_of_the_one_before_it_is_dated_when_that_one_completes() {
+        let earlier = WireMessage::success(9, 1, 0, false, vec![0xab; 32]);
+        let later = WireMessage::success(9, 2, 0, false, vec![0xcd; 32]);
+        let stream = encode_all(&[earlier.clone(), later]);
+        let split = COMMAND_HEADER_SIZE + earlier.payload.len();
+        let first = Instant::now();
+        let second = first + Duration::from_millis(5);
+        let mut chunker = ParallelChunking::new(COMMAND_HEADER_SIZE, MAX_CHUNK, None);
+        let mut messages = Vec::new();
+
+        chunker
+            .resolve_arrived_into(
+                chunk(&stream, split..stream.len()),
+                Some(first),
+                &mut messages,
+            )
+            .expect("a valid stream");
+        chunker
+            .resolve_arrived_into(chunk(&stream, 0..split), Some(second), &mut messages)
+            .expect("a valid stream");
+
+        let header_times: Vec<_> = messages
+            .iter()
+            .map(|message| (message.header.command_id, message.header_at))
+            .collect();
+        assert_eq!(header_times, vec![(1, Some(second)), (2, Some(second))]);
+    }
+
+    #[test]
+    fn resolving_without_arrival_times_dates_nothing() {
+        let message = WireMessage::success(9, 1, 0, false, vec![0xab; 32]);
+        let stream = encode_all(std::slice::from_ref(&message));
+        let mut chunker = ParallelChunking::new(COMMAND_HEADER_SIZE, MAX_CHUNK, None);
+        let mut messages = Vec::new();
+
+        chunker
+            .resolve_into(chunk(&stream, 0..stream.len()), &mut messages)
+            .expect("a valid stream");
+
+        let [message] = messages.as_slice() else {
+            panic!("expected one message, got {messages:?}");
+        };
+        assert_eq!(message.header_at, None);
+    }
+}

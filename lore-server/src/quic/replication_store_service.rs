@@ -14,6 +14,7 @@ use crate::protocol::replication_store::put;
 
 pub mod client;
 pub mod client_container;
+pub mod peer_responses;
 pub mod server;
 
 pub const MAX_CHUNK_SIZE: usize =

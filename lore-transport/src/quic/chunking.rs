@@ -18,6 +18,9 @@ use crate::quic::command_header::CommandHeader;
 pub struct QuicMessage {
     pub header: CommandHeader,
     pub payload: Option<Bytes>,
+    /// When the chunk completing the message's header arrived, where the caller supplied arrival
+    /// times.
+    pub header_at: Option<Instant>,
 }
 
 pub enum ChunkingMetric {
@@ -147,6 +150,7 @@ impl SerialChunking {
                                     messages.push(QuicMessage {
                                         header: self.request,
                                         payload: Some(current_payload),
+                                        header_at: None,
                                     });
                                 } else {
                                     // Allocate buffer for request payload
@@ -160,6 +164,7 @@ impl SerialChunking {
                                 messages.push(QuicMessage {
                                     header: self.request,
                                     payload: None,
+                                    header_at: None,
                                 });
                             }
                         }
@@ -189,6 +194,7 @@ impl SerialChunking {
                             messages.push(QuicMessage {
                                 header: self.request,
                                 payload: Some(current_payload.freeze()),
+                                header_at: None,
                             });
                         } else {
                             self.payload = Some(current_payload);
@@ -584,6 +590,10 @@ struct PendingBoundary {
     /// unreachable header costs no sort.
     lowest_pending_offset: u64,
 
+    /// When the chunk completing this message's header arrived, once it has and arrival times are
+    /// supplied.
+    header_at: Option<Instant>,
+
     is_dirty: bool,
 }
 
@@ -597,6 +607,7 @@ impl PendingBoundary {
             pending_bytes: 0,
             chunks_sorted: true,
             lowest_pending_offset: u64::MAX,
+            header_at: None,
             is_dirty: false,
         }
     }
@@ -791,6 +802,9 @@ pub struct ParallelChunking {
     reported_pending_chunks: usize,
     stall_start: Instant,
 
+    /// When the chunk being resolved arrived, if the caller supplied it.
+    arrived: Option<Instant>,
+
     /// Ordered by start offset. The last boundary is always open, so every byte the peer can
     /// still send belongs to one of these.
     pending_boundaries: Vec<PendingBoundary>,
@@ -810,6 +824,7 @@ impl ParallelChunking {
             metrics,
             reported_pending_chunks: 0,
             stall_start: Instant::now(),
+            arrived: None,
             pending_boundaries: vec![PendingBoundary::open_at(0)],
         }
     }
@@ -822,6 +837,18 @@ impl ParallelChunking {
         new_chunk: Chunk,
         messages: &mut Vec<QuicMessage>,
     ) -> Result<(), CommandHeader> {
+        self.resolve_arrived_into(new_chunk, None, messages)
+    }
+
+    /// Frames whatever messages the chunk completes, appending them to `messages`, and dates each
+    /// header the chunk completes from `arrived`, when the chunk arrived.
+    pub fn resolve_arrived_into(
+        &mut self,
+        new_chunk: Chunk,
+        arrived: Option<Instant>,
+        messages: &mut Vec<QuicMessage>,
+    ) -> Result<(), CommandHeader> {
+        self.arrived = arrived;
         self.distribute_chunk(new_chunk)?;
 
         // Oldest boundary first: framing one header hands the bytes past its message end to the
@@ -951,6 +978,7 @@ impl ParallelChunking {
         lore_trace!("QUIC stream framed request header {:?}", header);
 
         self.pending_boundaries[index].header = Some(header);
+        self.pending_boundaries[index].header_at = self.arrived;
 
         // Only the open boundary has an unframed header, and it is always the last, so the next
         // message starts where this one ends.
@@ -980,10 +1008,11 @@ impl ParallelChunking {
         let payload_size = payload_size(&header);
 
         if payload_size == 0 {
-            self.pending_boundaries.remove(index);
+            let boundary = self.pending_boundaries.remove(index);
             return Some(QuicMessage {
                 header,
                 payload: None,
+                header_at: boundary.header_at,
             });
         }
 
@@ -991,13 +1020,14 @@ impl ParallelChunking {
             return None;
         }
         let payload = self.pending_boundaries[index].take_payload(payload_size as usize);
-        self.pending_boundaries.remove(index);
+        let boundary = self.pending_boundaries.remove(index);
 
         lore_trace!("QUIC stream framed {} bytes of payload", payload_size);
 
         Some(QuicMessage {
             header,
             payload: Some(payload),
+            header_at: boundary.header_at,
         })
     }
 

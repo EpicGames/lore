@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
 use lore_base::lore_spawn_core;
 use lore_telemetry::InstrumentProvider;
 use opentelemetry::KeyValue;
+use opentelemetry::metrics::Counter;
 use opentelemetry::metrics::Histogram;
 use quinn::Connection;
 use tokio::select;
@@ -77,6 +80,10 @@ struct QuinnConnectionInstruments {
     rtt: Histogram<f64>,
     congestion_window: Histogram<u64>,
 
+    // counted while a connection is open, so loss shows before the connection ends
+    packets_lost: Counter<u64>,
+    packets_sent: Counter<u64>,
+
     // observed once, when a connection ends, being totals it reached rather than a current value
     duration: Histogram<u64>,
     lost_packets: Histogram<u64>,
@@ -105,6 +112,14 @@ impl QuinnConnectionInstruments {
                 .u64_histogram(provider.scope_name("connection.path.cwnd"))
                 .with_unit("bytes")
                 .with_boundaries(CWND_BYTES_BUCKETS.to_vec())
+                .build(),
+            packets_lost: provider
+                .meter()
+                .u64_counter(provider.scope_name("connection.path.packets.lost"))
+                .build(),
+            packets_sent: provider
+                .meter()
+                .u64_counter(provider.scope_name("connection.path.packets.sent"))
                 .build(),
 
             duration: provider
@@ -170,6 +185,29 @@ impl ConnectionLabels {
     }
 }
 
+/// The packet totals of one connection that have been counted so far.
+#[lore_macro::test_pub]
+#[derive(Default)]
+struct PacketTally {
+    lost: AtomicU64,
+    sent: AtomicU64,
+}
+
+impl PacketTally {
+    /// Moves the tally up to the connection's current totals and returns the lost and sent
+    /// packets not yet counted. The totals only grow, so a report carrying older totals than the
+    /// tally, such as one racing another, returns zero rather than counting packets twice.
+    #[lore_macro::test_pub]
+    fn advance(&self, lost: u64, sent: u64) -> (u64, u64) {
+        let lost_before = self.lost.fetch_max(lost, Ordering::Relaxed);
+        let sent_before = self.sent.fetch_max(sent, Ordering::Relaxed);
+        (
+            lost.saturating_sub(lost_before),
+            sent.saturating_sub(sent_before),
+        )
+    }
+}
+
 pub(crate) fn track_connection_stats<'a>(
     service_name: &'static str,
     connection: &'a Connection,
@@ -182,6 +220,7 @@ pub(crate) fn track_connection_stats<'a>(
         context,
         task_handle: None,
         established_at: Instant::now(),
+        packets: Arc::default(),
     };
 
     guard.start(interval);
@@ -195,10 +234,12 @@ pub(crate) struct ConnectionMetricsGuard<'a> {
     context: Arc<AttributeMap>,
     task_handle: Option<JoinHandle<()>>,
     established_at: Instant,
+    packets: Arc<PacketTally>,
 }
 
-/// Samples what the connection's path looks like at this moment.
-fn sample_path(connection: &Connection, labels: &ConnectionLabels) {
+/// Samples what the connection's path looks like at this moment, and counts the packets it has
+/// lost and sent since the last sample.
+fn sample_path(connection: &Connection, labels: &ConnectionLabels, packets: &PacketTally) {
     let path = connection.stats().path;
     let instruments = QuinnConnectionInstruments::instance();
     let labels = labels.undirected();
@@ -207,13 +248,26 @@ fn sample_path(connection: &Connection, labels: &ConnectionLabels) {
         .rtt
         .record(path.rtt.as_secs_f64() * 1000.0, &labels);
     instruments.congestion_window.record(path.cwnd, &labels);
+    count_packets(&path, &labels, packets);
+}
+
+fn count_packets(path: &quinn::PathStats, labels: &[KeyValue], packets: &PacketTally) {
+    let instruments = QuinnConnectionInstruments::instance();
+    let (lost, sent) = packets.advance(path.lost_packets, path.sent_packets);
+    instruments.packets_lost.add(lost, labels);
+    instruments.packets_sent.add(sent, labels);
 }
 
 /// Records what a connection reached over its life, once it has ended.
 ///
 /// Quinn holds these as totals for the connection, so one observation of each describes that
 /// connection and the distribution describes the connections a service served.
-fn record_totals(connection: &Connection, labels: &ConnectionLabels, elapsed: Duration) {
+fn record_totals(
+    connection: &Connection,
+    labels: &ConnectionLabels,
+    elapsed: Duration,
+    packets: &PacketTally,
+) {
     let stats = connection.stats();
 
     debug!(
@@ -225,6 +279,7 @@ fn record_totals(connection: &Connection, labels: &ConnectionLabels, elapsed: Du
     let undirected = labels.undirected();
 
     instruments.duration.record(elapsed.as_secs(), &undirected);
+    count_packets(&stats.path, &undirected, packets);
     instruments
         .lost_packets
         .record(stats.path.lost_packets, &undirected);
@@ -276,6 +331,7 @@ impl ConnectionMetricsGuard<'_> {
         let connection = self.connection.clone();
         let service_name = self.service_name;
         let context = self.context.clone();
+        let packets = self.packets.clone();
 
         self.task_handle = Some(lore_spawn_core!(async move {
             let mut ticker = tokio::time::interval(interval);
@@ -285,7 +341,7 @@ impl ConnectionMetricsGuard<'_> {
                 select! {
                     _ = ticker.tick() => {
                         let labels = ConnectionLabels::new(service_name, &context);
-                        sample_path(&connection, &labels);
+                        sample_path(&connection, &labels, &packets);
                     }
                     e = connection.closed() => {
                         debug!("Connection closed with: {e:?}, exiting metrics loop");
@@ -309,7 +365,12 @@ impl Drop for ConnectionMetricsGuard<'_> {
             // Built here rather than shared with the sampler: this runs once, when the client is
             // whatever the connection settled on.
             let labels = ConnectionLabels::new(self.service_name, &self.context);
-            record_totals(self.connection, &labels, self.established_at.elapsed());
+            record_totals(
+                self.connection,
+                &labels,
+                self.established_at.elapsed(),
+                &self.packets,
+            );
         }
     }
 }

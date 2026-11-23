@@ -2605,3 +2605,47 @@ mod replicated_store_settings_congestion_algorithm {
         assert!(parse("congestion_algorithm = \"reno\"").is_err());
     }
 }
+
+mod quic_settings_slow_send_threshold {
+    use super::deserialize_quic_internal::parse;
+
+    #[test]
+    fn unset_neither_endpoint_logs() {
+        let server = parse("");
+
+        assert_eq!(
+            server
+                .quic_internal
+                .expect("[server.quic_internal] present")
+                .slow_send_threshold_ms,
+            None
+        );
+        assert_eq!(
+            server
+                .quic
+                .expect("[server.quic] present")
+                .slow_send_threshold_ms,
+            None
+        );
+    }
+
+    #[test]
+    fn a_configured_threshold_is_kept_on_either_endpoint() {
+        let server = parse("slow_send_threshold_ms = 50");
+
+        assert_eq!(
+            server
+                .quic
+                .expect("[server.quic] present")
+                .slow_send_threshold_ms,
+            Some(50)
+        );
+        assert_eq!(
+            server
+                .quic_internal
+                .expect("[server.quic_internal] present")
+                .slow_send_threshold_ms,
+            Some(50)
+        );
+    }
+}

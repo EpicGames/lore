@@ -37,6 +37,7 @@ use lore_transport::quic::client::connect;
 use lore_transport::quic::client::send_client_identify;
 use lore_transport::quic::client::send_high_priority_with_reconnect;
 use lore_transport::quic::client::send_normal_with_reconnect;
+use lore_transport::quic::response_observer::ResponseObserver;
 use opentelemetry::KeyValue;
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -204,6 +205,14 @@ pub struct ReplicationStoreClient {
     quic: Arc<QuicConnection>,
     command_limit: Semaphore,
     permit_wait: CommandPermitWait,
+}
+
+impl ReplicationStoreClient {
+    /// Reports every response the client's connection reads from now on to `observer`. Returns
+    /// `false`, leaving the first observer in place, when one is already set.
+    pub fn observe_responses(&self, observer: Arc<dyn ResponseObserver>) -> bool {
+        self.quic.observe_responses(observer)
+    }
 }
 
 impl Drop for ReplicationStoreClient {

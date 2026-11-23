@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 mod client;
 mod client_container;
+mod peer_responses;
 mod server;
 
 use lore_base::error::AddressNotFound;

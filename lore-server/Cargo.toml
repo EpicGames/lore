@@ -127,6 +127,10 @@ name = "uds-bench"
 path = "examples/uds_bench.rs"
 required-features = ["uds-bench"]
 
+[[example]]
+name = "quic-peer-bench"
+path = "examples/quic_peer_bench.rs"
+
 [lib]
 name = "lore_server"
 test = false

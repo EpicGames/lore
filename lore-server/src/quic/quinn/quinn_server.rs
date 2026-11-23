@@ -34,6 +34,7 @@ use tracing::warn;
 
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
+use crate::protocol::attribute_map::QuinnConnection;
 use crate::quic::StreamDataHandler;
 use crate::quic::StreamHandlerFactory;
 use crate::quic::initial_cwnd::InitialCwndBytes;
@@ -450,6 +451,7 @@ async fn handle_conn(
     let context = Arc::new(AttributeMap::default());
     context.insert(conn_span.clone());
     context.insert(ConnectionId(connection_id));
+    context.insert(QuinnConnection(connection.clone()));
 
     let _stats_guard = track_connection_stats(
         service_name,

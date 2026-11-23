@@ -53,6 +53,8 @@ use super::QuicOpCode;
 use super::TIME_THRESHOLD;
 use super::command_header::COMMAND_HEADER_SIZE_V4;
 use super::command_header::CommandHeader;
+use super::response_observer::ResponseObserver;
+use super::response_observer::ResponseObserverSlot;
 use super::response_reader::PendingCommands;
 use super::response_reader::PendingResultSender;
 use super::response_reader::ResponseReader;
@@ -444,7 +446,8 @@ impl QuicQuinnConnection {
         recv: quinn::RecvStream,
         quic: &QuicConnection,
     ) {
-        let pending = Arc::new(PendingCommands::new());
+        let pending = Arc::new(PendingCommands::new(quic.response_observer.clone()));
+        let stream_index = self.reader.len();
         self.reader.push(ResponseReader::new(
             recv,
             pending.clone(),
@@ -452,6 +455,8 @@ impl QuicQuinnConnection {
             quic.last_recv.clone(),
             quic.created,
             quic.v4,
+            self.connection.clone(),
+            stream_index,
         ));
         let stream = Arc::new(StreamShared {
             queue: parking_lot::Mutex::default(),
@@ -508,6 +513,7 @@ pub struct QuicConnection {
     stream_inflight: Arc<[AtomicU64; STREAM_COUNT as usize]>,
     max_chunk_size: usize,
     v4: bool,
+    response_observer: ResponseObserverSlot,
 }
 
 impl QuicConnection {
@@ -534,7 +540,15 @@ impl QuicConnection {
             stream_inflight: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             max_chunk_size,
             v4,
+            response_observer: ResponseObserverSlot::default(),
         }
+    }
+
+    /// Reports every response the connection reads from now on to `observer`, including those on
+    /// streams a reconnect opens. Returns `false`, leaving the first observer in place, when one
+    /// is already set.
+    pub fn observe_responses(&self, observer: Arc<dyn ResponseObserver>) -> bool {
+        self.response_observer.set(observer).is_ok()
     }
 
     pub async fn create_initial_stream(&self) -> Result<(), QuicClientError> {
@@ -1622,16 +1636,20 @@ struct QueuedFrame {
     reply: PendingResultSender,
     /// Whether the command waits for its answer, rather than only for its frame to be written.
     await_response: bool,
+    /// When the frame was queued, set only while the stream's responses are observed.
+    queued: Option<Instant>,
 }
 
 impl QueuedFrame {
-    /// The frame `chunks` hold, header first, of the command `command_id`, taking the chunks.
+    /// The frame `chunks` hold, header first, of the command `command_id`, taking the chunks,
+    /// queued at `queued`.
     #[lore_macro::test_pub]
     fn new(
         chunks: &mut [Bytes],
         command_id: u32,
         reply: PendingResultSender,
         await_response: bool,
+        queued: Option<Instant>,
     ) -> Self {
         let mut frame: [Bytes; FRAME_CHUNKS] = Default::default();
         let chunk_count = chunks.len().min(FRAME_CHUNKS);
@@ -1648,6 +1666,7 @@ impl QueuedFrame {
             command_id,
             reply,
             await_response,
+            queued,
         }
     }
 }
@@ -1724,6 +1743,7 @@ impl StreamQueue {
             command_id,
             reply,
             await_response,
+            queued,
         } = frame;
         if reply.is_closed() {
             return;
@@ -1733,12 +1753,12 @@ impl StreamQueue {
             return;
         }
         let written = if await_response {
-            if !pending.wait_for(command_id, reply) {
+            if !pending.wait_for(command_id, reply, queued) {
                 return;
             }
             None
         } else {
-            if !pending.wait_for(command_id, oneshot::channel().0) {
+            if !pending.wait_for(command_id, oneshot::channel().0, queued) {
                 let _ = reply.send(Err(QuicClientError::Terminated));
                 return;
             }
@@ -1770,11 +1790,11 @@ impl StreamQueue {
         }
     }
 
-    /// Takes out the frames at the front written in full, completing each command that waits only
-    /// for that, and taking the rest of a dropped frame off `inflight`, the stream's count of
-    /// requests outstanding.
+    /// Takes out the frames at the front written in full, recording each as written among the
+    /// commands `pending` holds, completing each command that waits only for that, and taking the
+    /// rest of a dropped frame off `inflight`, the stream's count of requests outstanding.
     #[lore_macro::test_pub]
-    fn pop_written(&mut self, inflight: &AtomicU64) {
+    fn pop_written(&mut self, pending: &PendingCommands, inflight: &AtomicU64) {
         while let Some(frame) = self.frames.front()
             && self
                 .chunks
@@ -1785,6 +1805,7 @@ impl StreamQueue {
             let Some(frame) = self.frames.pop_front() else {
                 break;
             };
+            pending.written(frame.command_id);
             if let Some(written) = frame.written {
                 let _ = written.send(Ok(Bytes::new()));
             }
@@ -1955,7 +1976,7 @@ async fn write_stream(
         while failed.is_none() && !queue.frames.is_empty() {
             let written = std::pin::pin!(send.write_chunks(queue.unwritten())).poll(cx);
             match written {
-                Poll::Ready(Ok(_)) => queue.pop_written(inflight),
+                Poll::Ready(Ok(_)) => queue.pop_written(&stream.pending, inflight),
                 Poll::Ready(Err(err)) => {
                     let error = frame_write_error(err);
                     queue.fail(&error, &stream.pending, inflight);
@@ -2109,9 +2130,16 @@ pub fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>(
                 chunks[0] = Bytes::from_owner(header.to_bytes());
             }
             let (reply, result) = oneshot::channel();
+            let queued = writer.stream.pending.observed().then(Instant::now);
             if writer
                 .frames
-                .send(QueuedFrame::new(chunks, command_id, reply, AWAIT_RESPONSE))
+                .send(QueuedFrame::new(
+                    chunks,
+                    command_id,
+                    reply,
+                    AWAIT_RESPONSE,
+                    queued,
+                ))
                 .is_err()
             {
                 return Err(QuicClientError::Terminated);

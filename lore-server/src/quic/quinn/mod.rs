@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 mod config;
+#[cfg(not(feature = "test-util"))]
 mod metrics;
+#[cfg(feature = "test-util")]
+pub mod metrics;
 mod quinn_server;
 pub mod service_store;
 

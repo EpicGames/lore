@@ -4,10 +4,12 @@ pub mod chunking;
 pub mod client;
 pub mod command_header;
 pub mod net_runtime;
+pub mod response_observer;
 #[cfg(not(feature = "test-util"))]
 pub(crate) mod response_reader;
 #[cfg(feature = "test-util")]
 pub mod response_reader;
+pub mod slow_response;
 pub mod storage_service;
 
 use std::sync::Arc;

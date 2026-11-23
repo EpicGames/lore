@@ -17,6 +17,7 @@ use tracing::error;
 
 use crate::protocol::attribute_map::AttributeMap;
 use crate::quic::QuicService;
+use crate::quic::RESPONSE_DURATION_MS_BUCKETS;
 use crate::quic::SERVICE_LABEL_KEY;
 
 #[lore_macro::test_pub]
@@ -34,9 +35,31 @@ pub struct MessageFailure {
 }
 
 pub struct MessageHandling {
+    /// Time from the request's arrival until its response was ready to send.
     pub elapsed: Duration,
     pub opcode: u8,
     pub error_info: Option<MessageFailure>,
+    pub response: ResponseWrite,
+}
+
+/// How long sending one response took.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ResponseWrite {
+    /// Time waiting for the stream, which another response's write may be holding.
+    pub lock_wait: Duration,
+    /// Time handing the response to the transport with the stream held. The transport takes data
+    /// only as the peer's flow-control credit and its own send buffer allow, so this includes
+    /// waiting for both.
+    pub write: Duration,
+    /// Bytes of the response, its header included.
+    pub bytes: usize,
+}
+
+impl ResponseWrite {
+    /// Whether waiting for the stream or writing took longer than `threshold`.
+    pub fn exceeds(&self, threshold: Duration) -> bool {
+        self.lock_wait.max(self.write) > threshold
+    }
 }
 
 pub enum ServiceMetricEvent {
@@ -150,6 +173,8 @@ impl InstrumentProvider for StreamHandlerInstrumentProvider {
 
 struct StreamHandlerInstruments {
     latency_histogram: Histogram<f64>,
+    response_lock_wait_histogram: Histogram<f64>,
+    response_write_histogram: Histogram<f64>,
     peak_pending_chunks_histogram: Histogram<u64>,
     peak_pending_chunk_stall_histogram: Histogram<u64>,
     pending_chunk_stall_histogram: Histogram<u64>,
@@ -166,6 +191,14 @@ impl StreamHandlerInstruments {
 
         Self {
             latency_histogram: provider.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME),
+            response_lock_wait_histogram: provider.latency_histogram_ms_with_boundaries(
+                "response.lock_wait_duration",
+                RESPONSE_DURATION_MS_BUCKETS.to_vec(),
+            ),
+            response_write_histogram: provider.latency_histogram_ms_with_boundaries(
+                "response.write_duration",
+                RESPONSE_DURATION_MS_BUCKETS.to_vec(),
+            ),
             peak_pending_chunks_histogram: provider.length_histogram(
                 "stream.peak_pending_chunks",
                 vec![
@@ -254,11 +287,19 @@ where
     }
 
     fn consume_message(&self, event: MessageHandling) {
+        let instruments = StreamHandlerInstruments::instance();
         let (labels, applicable) = self.message_labels(event.opcode, event.error_info.as_ref());
-
-        StreamHandlerInstruments::instance()
+        instruments
             .latency_histogram
             .record(event.elapsed.as_millis() as f64, &labels[..applicable]);
+        instruments.response_lock_wait_histogram.record(
+            event.response.lock_wait.as_secs_f64() * 1_000.,
+            &labels[..applicable],
+        );
+        instruments.response_write_histogram.record(
+            event.response.write.as_secs_f64() * 1_000.,
+            &labels[..applicable],
+        );
     }
 
     /// Labels a stream's distributions are recorded under.

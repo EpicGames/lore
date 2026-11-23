@@ -250,6 +250,37 @@ mod integration {
         .await
         .expect("Test task failed");
     }
+
+    struct IgnoredResponses;
+
+    impl lore_transport::quic::response_observer::ResponseObserver for IgnoredResponses {
+        fn observe(
+            &self,
+            _response: &lore_transport::quic::response_observer::ObservedResponse,
+            _connection: &quinn::Connection,
+        ) {
+        }
+    }
+
+    /// A client the factory makes reports its responses to the factory's observer, which is set
+    /// once per connection, so a second observer is refused.
+    #[tokio::test]
+    async fn a_made_client_already_has_the_factory_observer() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create store");
+
+        lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+            let (server_addr, _server) = start_test_server(immutable_store, mutable_store);
+            let mut factory = no_tls_factory(server_addr);
+            factory.response_observer = Some(Arc::new(IgnoredResponses));
+
+            let client = factory.make_client(None).await.expect("Failed to connect");
+
+            assert!(!client.observe_responses(Arc::new(IgnoredResponses)));
+        }))
+        .await
+        .expect("Test task failed");
+    }
 }
 
 struct GatedClient {

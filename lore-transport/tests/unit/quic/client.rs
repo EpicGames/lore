@@ -990,3 +990,66 @@ mod controller_factory {
         assert_eq!(controller.window(), SMALL_SEND_WINDOW);
     }
 }
+
+mod observe_responses {
+    use bytes::Bytes;
+    use lore_transport::quic::response_observer::ObservedResponse;
+    use lore_transport::quic::response_observer::ResponseObserver;
+    use lore_transport::quic::storage_service::Command;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Recorded(Mutex<Vec<ObservedResponse>>);
+
+    impl ResponseObserver for Recorded {
+        fn observe(&self, response: &ObservedResponse, _connection: &quinn::Connection) {
+            self.0.lock().push(*response);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_observer_sees_each_answered_command() {
+        let (_server, _client, quic) = served_connection().await;
+        let recorded = Arc::new(Recorded::default());
+        assert!(quic.observe_responses(recorded.clone()));
+
+        let mut chunks = [Bytes::new(), Bytes::from_static(b"observed")];
+        send_normal(
+            quic.clone(),
+            Command::Put as u8,
+            BoundSession::any(0),
+            true,
+            &mut chunks,
+        )
+        .await
+        .expect("the put is answered");
+
+        // The reader observes a response once it has handed it over, so the observation can trail
+        // the answer.
+        let observed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let observed = recorded.0.lock().clone();
+                if !observed.is_empty() {
+                    return observed;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the response was never observed");
+        let [response] = observed.as_slice() else {
+            panic!("expected one observed response, got {observed:?}");
+        };
+        assert_eq!(response.opcode, Command::Put as u8);
+        assert_eq!(response.error_status, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_observer_is_refused() {
+        let (_server, _client, quic) = served_connection().await;
+
+        assert!(quic.observe_responses(Arc::new(Recorded::default())));
+        assert!(!quic.observe_responses(Arc::new(Recorded::default())));
+    }
+}

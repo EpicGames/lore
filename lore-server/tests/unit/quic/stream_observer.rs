@@ -339,3 +339,34 @@ mod context_updated {
         );
     }
 }
+
+mod exceeds {
+    use super::*;
+
+    #[test]
+    fn exceeds_when_either_part_passes_the_threshold() {
+        let threshold = Duration::from_millis(20);
+        let waited = ResponseWrite {
+            lock_wait: Duration::from_millis(21),
+            ..ResponseWrite::default()
+        };
+        let wrote = ResponseWrite {
+            write: Duration::from_millis(21),
+            ..ResponseWrite::default()
+        };
+
+        assert!(waited.exceeds(threshold));
+        assert!(wrote.exceeds(threshold));
+    }
+
+    #[test]
+    fn does_not_exceed_at_the_threshold() {
+        let response = ResponseWrite {
+            lock_wait: Duration::from_millis(20),
+            write: Duration::from_millis(20),
+            bytes: 0,
+        };
+
+        assert!(!response.exceeds(Duration::from_millis(20)));
+    }
+}

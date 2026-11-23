@@ -15,6 +15,7 @@ use lore_transport::quic::QuicServiceError;
 use lore_transport::quic::chunking::ChunkingMetric;
 use lore_transport::quic::chunking::ParallelChunking;
 use lore_transport::quic::command_header::CommandHeader;
+use lore_transport::quic::slow_response::ReportRateLimit;
 use quinn::ClosedStream;
 use quinn::ReadError;
 use quinn::RecvStream;
@@ -32,6 +33,7 @@ use tracing::trace;
 use tracing::warn;
 
 use crate::protocol::attribute_map::AttributeMap;
+use crate::protocol::attribute_map::QuinnConnection;
 use crate::quic::ProtocolErrorInfo;
 use crate::quic::QuicErrorStatus;
 use crate::quic::QuicService;
@@ -39,6 +41,7 @@ use crate::quic::StreamDataHandler;
 use crate::quic::StreamHandlerError;
 use crate::quic::stream_observer::MessageFailure;
 use crate::quic::stream_observer::MessageHandling;
+use crate::quic::stream_observer::ResponseWrite;
 use crate::quic::stream_observer::ServiceMetricEvent;
 use crate::quic::stream_observer::StreamMetricEvent;
 use crate::quic::stream_observer::StreamMetricSender;
@@ -61,6 +64,9 @@ const DEFAULT_PERMIT_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Ceiling on a request's total time when no `handler_timeout_seconds` is configured.
 const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// Slow responses logged across every connection the process serves.
+static SLOW_RESPONSE_REPORTS: ReportRateLimit = ReportRateLimit::new();
 
 fn is_graceful_close(err: &ReadError) -> bool {
     match err {
@@ -97,7 +103,8 @@ impl Drop for AdmissionGuard {
     }
 }
 
-/// Limits governing how much work a connection may have in progress.
+/// Limits governing how much work a connection may have in progress, and how long its requests
+/// may take.
 #[derive(Copy, Clone)]
 pub struct AdmissionLimits {
     /// Concurrent requests allowed per stream.
@@ -108,6 +115,9 @@ pub struct AdmissionLimits {
     pub handler_timeout: Option<Duration>,
     /// Wait for a stream permit; [`DEFAULT_PERMIT_ACQUIRE_TIMEOUT`] when unset.
     pub permit_timeout: Option<Duration>,
+    /// Wait for a response's stream, or time writing it, above which the response is logged as
+    /// slow. Unset, no response is logged.
+    pub slow_send_threshold: Option<Duration>,
 }
 
 pub struct StreamHandler<ServiceType>
@@ -129,6 +139,7 @@ where
     /// Clamped at construction to no more than [`StreamHandler::handler_duration_timeout`], so a
     /// short request deadline wins over the permit budget.
     permit_acquire_timeout: Duration,
+    slow_send_threshold: Option<Duration>,
 
     service_metrics: async_channel::Sender<ServiceMetricEvent>,
     stream_metrics: async_channel::Sender<StreamMetricEvent>,
@@ -166,6 +177,7 @@ where
                 .permit_timeout
                 .unwrap_or(DEFAULT_PERMIT_ACQUIRE_TIMEOUT)
                 .min(handler_duration_timeout),
+            slow_send_threshold: limits.slow_send_threshold,
             service_metrics,
             stream_metrics,
         }
@@ -207,7 +219,7 @@ where
         reason: &'static str,
         waited: Duration,
     ) {
-        if let Err(err) = Self::send_response(
+        let (response, sent) = Self::send_response(
             send,
             Err((
                 header,
@@ -219,9 +231,10 @@ where
                 },
             )),
         )
-        .await
-        {
-            warn!(reason, error = %err, "Failed sending rejection response");
+        .await;
+        match sent {
+            Ok(()) => self.report_if_slow(header.cmd, false, response),
+            Err(err) => warn!(reason, error = %err, "Failed sending rejection response"),
         }
 
         let _ = self
@@ -233,6 +246,7 @@ where
                     classification: HANDLE_MESSAGE_USER_ERROR_LABEL_VALUE,
                     error_label: reason,
                 }),
+                response,
             }))
             .inspect_err(|err| error!(?err, "failed to send service reject metric"));
     }
@@ -274,6 +288,7 @@ where
         start: Instant,
     ) -> Result<(), StreamHandlerError> {
         let handler_duration_timeout = self.handler_duration_timeout;
+        let slow_send_threshold = self.slow_send_threshold;
 
         let Some(admission) = AdmissionGuard::take(&self.admission, self.inflight_limit) else {
             self.reject(
@@ -300,6 +315,7 @@ where
         };
 
         let context = self.context.clone();
+        let handler_context = context.clone();
         let metrics_sender = self.service_metrics.clone();
         let service = self.service.clone();
         let request_span = service.build_request_span(&header, &message, &context);
@@ -310,7 +326,7 @@ where
                     Err(ProtocolErrorInfo::timed_out())
                 },
                 result = async {
-                    service.run_request_handler(context, message).await.map_err(|protocol_error| {
+                    service.run_request_handler(handler_context, message).await.map_err(|protocol_error| {
                         service.transform_protocol_error(&protocol_error)
                     })
                 } => result
@@ -361,10 +377,19 @@ where
 
             let elapsed = start.elapsed();
             let success = result.is_ok();
-            if let Err(err) = Self::send_response(send, result).await {
-                if success {
+            let (response, sent) = Self::send_response(send, result).await;
+            match sent {
+                Ok(()) => report_slow_response(
+                    slow_send_threshold,
+                    &context,
+                    service.command_to_metrics_label(header.cmd),
+                    success,
+                    response,
+                ),
+                Err(err) if success => {
                     warn!(error = %err, "Failed to send response after successful message handling");
-                } else {
+                }
+                Err(err) => {
                     warn!(error = %err, "Failed to send response after failed message handling");
                 }
             }
@@ -377,6 +402,7 @@ where
                     elapsed,
                     opcode: header.cmd,
                     error_info,
+                    response,
                 }))
                 .inspect_err(|err| error!(?err, "failed to send service handle metric"));
         });
@@ -422,10 +448,11 @@ where
         }
     }
 
+    /// Writes the response to `send`, returning how long it waited for the stream and wrote.
     async fn send_response(
         send: Arc<Mutex<SendStream>>,
         result: MessageProcessingResult,
-    ) -> Result<(), StreamHandlerError> {
+    ) -> (ResponseWrite, Result<(), StreamHandlerError>) {
         match result {
             Ok((header, mut data)) => {
                 let total_length: usize = data.iter().map(|chunk| chunk.len()).sum();
@@ -441,34 +468,108 @@ where
                 chunks.push(Bytes::copy_from_slice(&header_buf[..header_len]));
                 chunks.append(&mut data);
 
-                send.lock()
-                    .await
-                    .write_all_chunks(chunks.as_mut_slice())
-                    .instrument(info_span!("send_response"))
-                    .await
-                    .map(|_| ())
-                    .or_else(Self::handle_write_error)?;
+                let (written, response) =
+                    write_timed(&send, header_len + total_length, async |stream| {
+                        stream
+                            .write_all_chunks(chunks.as_mut_slice())
+                            .instrument(info_span!("send_response"))
+                            .await
+                    })
+                    .await;
+                if let Err(err) = written.map(|_| ()).or_else(Self::handle_write_error) {
+                    return (response, Err(err));
+                }
 
                 trace!(
                     "Message for command: {header:?} was handled successfully, sent {} bytes of data in response",
                     total_length,
                 );
+                (response, Ok(()))
             }
             Err((header, error)) => {
                 error.log(&header);
                 let response_header = header.response_error(error.response_error_code);
                 let (header_buf, header_len) = response_header.response_bytes();
-                send.lock()
-                    .await
-                    .write_all(&header_buf[..header_len])
-                    .await
-                    .map_err(StreamHandlerError::WriteFailed)?;
+                let (written, response) = write_timed(&send, header_len, async |stream| {
+                    stream.write_all(&header_buf[..header_len]).await
+                })
+                .await;
+                if let Err(err) = written {
+                    return (response, Err(StreamHandlerError::WriteFailed(err)));
+                }
                 trace!("Wrote error response header: {response_header:?}");
+                (response, Ok(()))
             }
         }
-
-        Ok(())
     }
+
+    fn report_if_slow(&self, opcode: u8, success: bool, response: ResponseWrite) {
+        report_slow_response(
+            self.slow_send_threshold,
+            &self.context,
+            self.service.command_to_metrics_label(opcode),
+            success,
+            response,
+        );
+    }
+}
+
+/// Runs `write` with `send` held, timing the wait for `send` apart from the write itself.
+/// `bytes` is the size of what `write` sends.
+#[lore_macro::test_pub]
+async fn write_timed<S, T>(
+    send: &Mutex<S>,
+    bytes: usize,
+    write: impl AsyncFnOnce(&mut S) -> T,
+) -> (T, ResponseWrite) {
+    let asked = tokio::time::Instant::now();
+    let mut stream = send.lock().await;
+    let acquired = tokio::time::Instant::now();
+    let written = write(&mut stream).await;
+    let response = ResponseWrite {
+        lock_wait: acquired - asked,
+        write: acquired.elapsed(),
+        bytes,
+    };
+    (written, response)
+}
+
+/// Logs a response that waited for its stream, or took to write, longer than `threshold`, with
+/// the state of the connection's path at that moment. Rate limited across the process, so a burst
+/// of slow responses is logged in part. Without a threshold nothing is logged.
+fn report_slow_response(
+    threshold: Option<Duration>,
+    context: &AttributeMap,
+    opcode: &'static str,
+    success: bool,
+    response: ResponseWrite,
+) {
+    let Some(threshold) = threshold else {
+        return;
+    };
+    if !response.exceeds(threshold) || !SLOW_RESPONSE_REPORTS.admit() {
+        return;
+    }
+
+    let stats = context
+        .get::<QuinnConnection>()
+        .map(|connection| connection.0.stats());
+    warn!(
+        opcode,
+        success,
+        response_bytes = response.bytes,
+        lock_wait_ms = response.lock_wait.as_secs_f64() * 1_000.,
+        write_ms = response.write.as_secs_f64() * 1_000.,
+        cwnd = stats.as_ref().map(|stats| stats.path.cwnd),
+        rtt_ms = stats
+            .as_ref()
+            .map(|stats| stats.path.rtt.as_secs_f64() * 1_000.),
+        data_blocked_sent = stats.as_ref().map(|stats| stats.frame_tx.data_blocked),
+        stream_data_blocked_sent = stats
+            .as_ref()
+            .map(|stats| stats.frame_tx.stream_data_blocked),
+        "Slow QUIC response"
+    );
 }
 
 type MessageProcessingResult =

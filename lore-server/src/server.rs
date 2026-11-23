@@ -1667,6 +1667,9 @@ async fn configure_composite_store(
             Duration::from_secs(factory_settings.quic_client_monitor_interval_seconds);
         factory.enable_same_region_write = factory_settings.enable_same_region_write;
         factory.initial_cwnd_bytes = factory_settings.initial_cwnd_bytes;
+        factory.slow_response_threshold = factory_settings
+            .slow_response_threshold_ms
+            .map(Duration::from_millis);
 
         composite_store_builder = composite_store_builder.with_replica_builder(Arc::new(factory));
     }
@@ -2454,6 +2457,9 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 inflight_limit: connection_inflight_limit(&quic_settings, process_limit),
                 handler_timeout: request_handler_timeout,
                 permit_timeout: quic_settings.permit_timeout_ms.map(Duration::from_millis),
+                slow_send_threshold: quic_settings
+                    .slow_send_threshold_ms
+                    .map(Duration::from_millis),
             };
 
             let local_immutable_store = local_store().unwrap_or_else(|| {
@@ -2564,6 +2570,9 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 inflight_limit: connection_inflight_limit(&quic_settings, process_limit),
                 handler_timeout: request_handler_timeout,
                 permit_timeout: quic_settings.permit_timeout_ms.map(Duration::from_millis),
+                slow_send_threshold: quic_settings
+                    .slow_send_threshold_ms
+                    .map(Duration::from_millis),
             };
 
             launch_quinn_server(

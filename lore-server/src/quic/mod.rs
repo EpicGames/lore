@@ -89,6 +89,16 @@ pub trait StreamHandlerFactory: Send + Sync + 'static {
     }
 }
 
+/// Milliseconds one response spent in a part of its delivery, such as waiting for its stream or
+/// arriving. Fine-grained below a millisecond, where a response on a nearby, uncongested path
+/// finishes.
+///
+/// Shared by both ends of a connection, so that a server's write can be read against the
+/// client's receipt.
+pub(crate) const RESPONSE_DURATION_MS_BUCKETS: &[f64] = &[
+    0.1, 0.25, 0.5, 1., 2., 5., 10., 20., 50., 100., 200., 500., 1_000., 2_000., 5_000., 10_000.,
+];
+
 /// Round trip boundaries in milliseconds, from same-region sub-millisecond up to a cross-region
 /// tail of two seconds.
 ///
@@ -371,6 +381,7 @@ pub mod tests {
                                 inflight_limit: 800,
                                 handler_timeout: None,
                                 permit_timeout: None,
+                                slow_send_threshold: None,
                             },
                         ))
                     }),
@@ -401,6 +412,7 @@ pub mod tests {
                                 inflight_limit: 800,
                                 handler_timeout: None,
                                 permit_timeout: None,
+                                slow_send_threshold: None,
                             },
                         ))
                     }),
@@ -426,6 +438,7 @@ pub mod tests {
                                 inflight_limit: 800,
                                 handler_timeout: None,
                                 permit_timeout: None,
+                                slow_send_threshold: None,
                             },
                         ))
                     }),

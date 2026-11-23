@@ -17,6 +17,7 @@ use lore_transport::quic::client::CongestionAlgorithm;
 use lore_transport::quic::client::ConnectionStats;
 use lore_transport::quic::client::DEFAULT_EXPECTED_RTT_MS;
 use lore_transport::quic::client::TransportConfig;
+use lore_transport::quic::response_observer::ResponseObserver;
 use opentelemetry::KeyValue;
 use parking_lot::RwLock;
 use parking_lot::RwLockReadGuard;
@@ -50,6 +51,8 @@ pub struct QuicClientFactory {
     pub quic_max_reconnects: Option<u32>,
     pub sni_override: Option<String>,
     pub user_agent: Option<String>,
+    /// Receives the responses read on every connection the factory makes.
+    pub response_observer: Option<Arc<dyn ResponseObserver>>,
 }
 
 impl QuicClientFactory {
@@ -73,6 +76,7 @@ impl QuicClientFactory {
             quic_max_reconnects: None,
             sni_override: None,
             user_agent: None,
+            response_observer: None,
         }
     }
 }
@@ -98,6 +102,9 @@ impl ClientFactory for QuicClientFactory {
             self.user_agent.clone(),
         )
         .await?;
+        if let Some(observer) = &self.response_observer {
+            client.observe_responses(observer.clone());
+        }
         Ok(client)
     }
 }

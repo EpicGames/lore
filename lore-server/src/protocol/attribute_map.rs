@@ -21,6 +21,9 @@ type AnyMap = HashMap<TypeId, Arc<dyn Any + Send + Sync>>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConnectionId(pub usize);
 
+/// The QUIC connection the attributes describe, for reading its transport statistics.
+pub struct QuinnConnection(pub quinn::Connection);
+
 #[derive(Default)]
 pub struct AttributeMap {
     map: Arc<RwLock<AnyMap>>,
