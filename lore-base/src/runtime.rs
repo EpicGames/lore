@@ -656,11 +656,15 @@ pub fn default_net_threads() -> usize {
 /// resurrecting a runtime with fresh threads during teardown.
 pub fn net_runtime() -> Handle {
     NET_RUNTIME
-        .get_or_init(|| SharedRuntime::new(build_net_runtime()))
+        .get_or_init(|| {
+            crate::allocator::start_heap_reap();
+            SharedRuntime::new(build_net_runtime())
+        })
         .handle
         .clone()
 }
 
+#[lore_macro::test_pub]
 fn build_net_runtime() -> tokio::runtime::Runtime {
     settle_net_connections();
     let threads = default_net_threads();
@@ -675,7 +679,18 @@ fn build_net_runtime() -> tokio::runtime::Runtime {
             static ID: AtomicUsize = AtomicUsize::new(0);
             format!("lore-net-{}", ID.fetch_add(1, Ordering::Relaxed))
         });
+    leave_heaps_idle_while_parked(&mut builder);
     builder.build().expect("Failed to create net runtime")
+}
+
+/// Has the runtime's workers leave their allocator heap idle while they are parked, where the heaps
+/// of idle threads are reaped.
+fn leave_heaps_idle_while_parked(builder: &mut tokio::runtime::Builder) {
+    if crate::allocator::heap_reap_enabled() {
+        builder
+            .on_thread_park(crate::allocator::thread_idle_begin)
+            .on_thread_unpark(crate::allocator::thread_idle_end);
+    }
 }
 static DEFAULT_THREAD_KEEP_ALIVE_SECONDS: u64 = 10;
 
@@ -1176,6 +1191,7 @@ fn core_runtime_with_settings(settings: Option<TokioSettings>, timer: CoreTimer)
     CORE_RUNTIME
         .get_or_init(|| {
             let _ = CORE_RUNTIME_TIMER.set(available_core_timer(timer));
+            crate::allocator::start_heap_reap();
             SharedRuntime::new(build_core_runtime(settings, timer))
         })
         .handle
@@ -1222,6 +1238,12 @@ fn build_core_runtime(
     // The syscall pool builds itself on the first file operation, which in every Lore process
     // happens on this runtime and so after this point.
     lore_io::set_max_threads(counts.io);
+    if crate::allocator::heap_reap_enabled() {
+        lore_io::set_idle_hooks(lore_io::IdleHooks {
+            begin: crate::allocator::thread_idle_begin,
+            end: crate::allocator::thread_idle_end,
+        });
+    }
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder
         .enable_all()
@@ -1231,6 +1253,7 @@ fn build_core_runtime(
             static ID: AtomicUsize = AtomicUsize::new(0);
             format!("lore-tokio-{}", ID.fetch_add(1, Ordering::Relaxed))
         });
+    leave_heaps_idle_while_parked(&mut builder);
     // Tokio would otherwise default to the raw core count and ignore the thread limit.
     builder.worker_threads(counts.worker);
     #[cfg(tokio_unstable)]
@@ -1363,7 +1386,8 @@ where
 }
 
 /// Gracefully shuts down the tokio runtimes: flushes guarded tasks, then shuts
-/// down tokio with a timeout.
+/// down tokio with a timeout. Then stops the thread that reaps idle allocator
+/// heaps.
 ///
 /// Terminal for the process — neither runtime is rebuilt afterwards, and the
 /// accessors keep handing out the shut-down handles. Concurrent callers past
@@ -1382,6 +1406,8 @@ pub fn runtime_shutdown_timeout(wait_timeout: Duration) {
     let core = CORE_RUNTIME.get().and_then(SharedRuntime::take);
     let net = NET_RUNTIME.get().and_then(SharedRuntime::take);
     if core.is_none() && net.is_none() {
+        // Also where no runtime was built, so that none built later starts the reap.
+        crate::allocator::stop_heap_reap();
         return;
     }
 
@@ -1406,4 +1432,6 @@ pub fn runtime_shutdown_timeout(wait_timeout: Duration) {
     if let Err(panic) = shutdown.join() {
         std::panic::resume_unwind(panic);
     }
+    // Before the allocator is finalized, which the C `lore_shutdown()` does next.
+    crate::allocator::stop_heap_reap();
 }

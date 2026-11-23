@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use parking_lot::Condvar;
 use parking_lot::Mutex;
+use parking_lot::MutexGuard;
 
 const KEEP_ALIVE: Duration = Duration::from_secs(10);
 
@@ -102,6 +103,26 @@ static BUDGETED_MAX_THREADS: OnceLock<usize> = OnceLock::new();
 /// file operation, which is what builds the pool; returns false if a cap was already set.
 pub fn set_max_threads(count: usize) -> bool {
     BUDGETED_MAX_THREADS.set(count.max(1)).is_ok()
+}
+
+/// Functions a pool thread runs around its waits for work, without the pool's lock held, so either
+/// may wait.
+#[derive(Clone, Copy)]
+pub struct IdleHooks {
+    /// Runs as the thread finds no work and begins waiting for it.
+    pub begin: fn(),
+    /// Runs once the thread has work after a wait, before it runs the work. A thread taking work
+    /// queued as it ends a job runs neither, and a thread can end after `begin` without `end`.
+    pub end: fn(),
+}
+
+static IDLE_HOOKS: OnceLock<IdleHooks> = OnceLock::new();
+
+/// Sets the functions the pool threads run around their waits for work. Applies to the threads
+/// started after the call, so like [`set_max_threads`] it must run before the first file operation.
+/// Returns false if hooks were already set.
+pub fn set_idle_hooks(hooks: IdleHooks) -> bool {
+    IDLE_HOOKS.set(hooks).is_ok()
 }
 
 /// The cap the process-wide pool is built with: its budgeted share when one has been set, else
@@ -591,7 +612,10 @@ fn spawn_worker_thread(inner: Arc<PoolInner>) -> std::io::Result<()> {
 }
 
 fn worker_loop(inner: &PoolInner) {
+    let idle_hooks = IDLE_HOOKS.get();
     loop {
+        // Whether the thread ran the begin hook since its last job.
+        let mut waited = false;
         let job = {
             let mut state = inner.state.lock();
             loop {
@@ -603,6 +627,16 @@ fn worker_loop(inner: &PoolInner) {
                 }
                 if let Some(job) = state.queue.pop_front() {
                     break Some(job);
+                }
+                if let Some(hooks) = idle_hooks.filter(|_| !waited) {
+                    // Outside the lock every submitter takes. Counted idle meanwhile, so work queued
+                    // now wakes a waiting thread rather than starting one, and the loop checks the
+                    // queue again.
+                    waited = true;
+                    state.idle += 1;
+                    MutexGuard::unlocked(&mut state, hooks.begin);
+                    state.idle -= 1;
+                    continue;
                 }
                 state.idle += 1;
                 let timed_out = inner
@@ -617,7 +651,12 @@ fn worker_loop(inner: &PoolInner) {
             }
         };
         match job {
-            Some(job) => job.run(),
+            Some(job) => {
+                if let Some(hooks) = idle_hooks.filter(|_| waited) {
+                    (hooks.end)();
+                }
+                job.run();
+            }
             None => return,
         }
     }

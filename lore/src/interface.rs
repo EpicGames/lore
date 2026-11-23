@@ -8254,7 +8254,10 @@ pub extern "C" fn lore_shutdown() -> i32 {
 /// # What is not counted
 ///
 /// Threads the host application or a linked library creates. Lore accounts only
-/// for its own.
+/// for its own threads, except one: unless an allocator was installed with
+/// `lore_set_allocator` or `LORE_ALLOCATOR` selects the system allocator, Lore
+/// runs a thread outside the limit, `lore-heap-reap`, which sleeps except while
+/// it returns the memory of idle threads.
 ///
 /// Must be called before the first Lore operation, while the runtime is still
 /// unconstructed. Returns `0` if the limit was applied, `1` if it had already

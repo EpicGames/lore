@@ -3,12 +3,17 @@
 mod growvec;
 mod heapbox;
 mod heapbuf;
+#[cfg(not(feature = "test-util"))]
+mod reap;
+#[cfg(feature = "test-util")]
+pub mod reap;
 mod rpmalloc;
 mod tracking;
 
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 
@@ -20,6 +25,11 @@ pub use growvec::GrowVecMemoryStats;
 pub use growvec::memory_stats;
 pub use heapbox::HeapBox;
 pub use heapbuf::HeapBuf;
+pub(crate) use reap::heap_reap_enabled;
+pub(crate) use reap::start_heap_reap;
+pub(crate) use reap::stop_heap_reap;
+pub(crate) use reap::thread_idle_begin;
+pub(crate) use reap::thread_idle_end;
 pub use rpmalloc::RpmallocGlobalStatistics;
 pub use rpmalloc::RpmallocHeapAllocator;
 pub use rpmalloc::RpmallocHeapStatistics;
@@ -74,6 +84,8 @@ unsafe impl GlobalAlloc for ExternalAllocator {
 
 static EXTERN_ALLOCATOR: OnceLock<ExternalAllocator> = OnceLock::new();
 static SELECTED_ALLOCATOR: OnceLock<&'static (dyn GlobalAlloc + Sync)> = OnceLock::new();
+/// Whether [`SELECTED_ALLOCATOR`] is rpmalloc, set as it is selected.
+static RPMALLOC_SELECTED: AtomicBool = AtomicBool::new(false);
 static STANDARD_ALLOCATOR: std::alloc::System = std::alloc::System;
 /// The allocation tracking options in effect, any combination of [`tracking::COUNT`],
 /// [`tracking::TRACK`] and [`MEASURE`]. `tracking` in `LORE_ALLOCATOR` enables [`tracking::TRACK`]
@@ -145,6 +157,13 @@ pub(crate) fn system_allocator_selected() -> bool {
     }
 }
 
+/// Whether rpmalloc is the global allocator. Selects the global allocator if no allocation has yet,
+/// so the answer never changes.
+fn rpmalloc_selected() -> bool {
+    SELECTED_ALLOCATOR.get_or_init(default_allocator);
+    RPMALLOC_SELECTED.load(Ordering::Relaxed)
+}
+
 fn default_allocator() -> &'static (dyn GlobalAlloc + Sync) {
     measure_from_environment();
     unsafe {
@@ -156,6 +175,7 @@ fn default_allocator() -> &'static (dyn GlobalAlloc + Sync) {
     if system_allocator_selected() {
         &STANDARD_ALLOCATOR
     } else {
+        RPMALLOC_SELECTED.store(true, Ordering::Relaxed);
         &rpmalloc::RPMALLOC_ALLOCATOR
     }
 }

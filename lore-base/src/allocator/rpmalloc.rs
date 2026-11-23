@@ -67,6 +67,9 @@ unsafe extern "C" {
     pub(crate) fn rpmalloc_heap_statistics(heap: *mut std::ffi::c_void) -> RpmallocHeapStatistics;
     #[link_name = "rpmalloc_global_statistics"]
     pub(crate) fn rpmalloc_global_statistics_ffi(stats: *mut RpmallocGlobalStatistics);
+    pub(super) fn rpmalloc_thread_idle_begin();
+    pub(super) fn rpmalloc_thread_idle_end();
+    pub(super) fn rpmalloc_reap_idle_heaps(min_idle_ms: u32, max_heaps: u32) -> usize;
 }
 
 pub(crate) struct RpmallocAllocator;

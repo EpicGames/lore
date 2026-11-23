@@ -243,9 +243,42 @@ rpmalloc_thread_initialize(void);
 RPMALLOC_EXPORT void
 rpmalloc_thread_finalize(void);
 
-//! Perform deferred deallocations pending for the calling thread heap
+//! Perform deferred deallocations pending for the calling thread heap: collect the blocks other threads freed into
+//  its full pages, and decommit its free pages beyond the retain count right away. Cheap enough to call often, it
+//  leaves the heap the free blocks and pages it keeps for its next allocations
 RPMALLOC_EXPORT void
 rpmalloc_thread_collect(void);
+
+//! Collect all of the memory the calling thread heap holds without using it: the blocks other threads freed into its
+//  pages, the free blocks it keeps for its next allocations and the pages left without used blocks, including the
+//  last available page of each size class, and decommit its free pages beyond the few small pages it keeps for reuse.
+//  For a thread about to wait for work or stop allocating for a while, its next allocations initialize pages again
+RPMALLOC_EXPORT void
+rpmalloc_thread_collect_unused(void);
+
+//! Leave the calling thread heap idle while the thread waits for work, as a worker of a thread pool does when it
+//  finds no work, so rpmalloc_reap_idle_heaps called by another thread can collect the memory the heap holds without
+//  using it. The thread takes the same heap back with rpmalloc_thread_idle_end once it has work, or with its first
+//  allocation before that, and a free by the thread meanwhile is handled as a free by another thread. A thread
+//  exiting with its heap idle releases it as usual. Does nothing for a thread without a heap or using a first class
+//  heap
+RPMALLOC_EXPORT void
+rpmalloc_thread_idle_begin(void);
+
+//! Take back the heap the calling thread left idle with rpmalloc_thread_idle_begin, waiting for a reap of it to
+//  finish. Does nothing if the thread has no idle heap
+RPMALLOC_EXPORT void
+rpmalloc_thread_idle_end(void);
+
+//! Reap the heaps left idle with rpmalloc_thread_idle_begin for at least min_idle_ms and used since their last reap,
+//  each at most once per min_idle_ms: collect the memory they hold without using it, as
+//  rpmalloc_thread_collect_unused does for the calling thread. Reaps up to max_heaps heaps and at most 64 per call, 64
+//  if max_heaps is zero. Each heap is held only for its own reap, a thread taking it back waits for that reap at most.
+//  Also collects the calling thread heap as rpmalloc_thread_collect does, if used since its last reap and at most
+//  once per min_idle_ms. Returns the number of idle heaps reaped, a call returning its limit may have left others to
+//  reap. Can be called from any thread
+RPMALLOC_EXPORT size_t
+rpmalloc_reap_idle_heaps(unsigned int min_idle_ms, unsigned int max_heaps);
 
 //! Query if allocator is initialized for calling thread
 RPMALLOC_EXPORT int

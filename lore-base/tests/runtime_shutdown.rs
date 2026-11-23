@@ -8,6 +8,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use lore_base::allocator::reap::heap_reap_enabled;
+use lore_base::allocator::reap::heap_reap_running;
 use lore_base::runtime::claim_runtime_shutdown;
 use lore_base::runtime::core_runtime;
 use lore_base::runtime::net_runtime;
@@ -21,8 +23,14 @@ use lore_base::runtime::shutdown_block_on;
 /// run on the calling thread. Guarded tasks must still be flushed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_from_an_async_context_flushes_without_panicking() {
-    let _core = core_runtime();
+    // The net runtime first: either runtime alone starts the heap reap thread.
     let _net = net_runtime();
+    assert_eq!(
+        heap_reap_running(),
+        heap_reap_enabled(),
+        "the net runtime starts the heap reap thread where rpmalloc is the global allocator"
+    );
+    let _core = core_runtime();
 
     assert!(
         !runtime_shutdown_started(),
@@ -71,6 +79,10 @@ async fn shutdown_from_an_async_context_flushes_without_panicking() {
         "guarded task was not flushed by shutdown"
     );
     assert!(runtime_shutdown_started(), "admission stays closed");
+    assert!(
+        !heap_reap_running(),
+        "the heap reap thread outlived the shutdown, and would reap after rpmalloc is finalized"
+    );
 
     // Repeating the shutdown is a no-op rather than a panic.
     runtime_shutdown_timeout(Duration::from_secs(5));

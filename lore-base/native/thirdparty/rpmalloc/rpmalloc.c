@@ -60,8 +60,10 @@
 
 #if defined(_MSC_VER)
 #define NOINLINE __declspec(noinline)
+#define FORCEINLINE __forceinline
 #else
 #define NOINLINE __attribute__((noinline))
+#define FORCEINLINE inline __attribute__((always_inline))
 #endif
 
 #if PLATFORM_WINDOWS
@@ -678,6 +680,9 @@ struct page_t {
 			page_t* prev;
 			//! Block count
 			uint32_t block_count;
+			//! Bytes of page memory committed from the page start. A page of a span committing on demand
+			//  commits its memory in parts as its blocks are initialized, the other pages are committed whole
+			uint32_t commit_size;
 			//! Flag set if part of heap full list
 			uint32_t is_full : 1;
 			//! Flag set if part of heap free list
@@ -838,6 +843,22 @@ struct heap_t {
 	uint32_t orphaning;
 	//! Time (monotonic ms) the heap was released, while in the queue of released heaps
 	uint64_t release_ms;
+	//! Idle state of a thread heap, HEAP_STATE_ACTIVE while its thread uses it, HEAP_STATE_IDLE while its thread
+	//  waits for work, and HEAP_STATE_REAPING while another thread reaps it. The idle fields are ordered to take 32
+	//  bytes without padding
+	atomic_uint idle_state;
+	//! Count of the refills and page retirements of the heap, which a reap compares with the count at the last
+	//  reap to tell a heap used since
+	uint32_t activity;
+	//! Activity count at the last reap of the heap
+	uint32_t reaped_activity;
+	//! Activity count when idle_ms was taken
+	uint32_t idle_activity;
+	//! Time (monotonic ms) of the first time the thread of the heap began waiting for work since the heap was last
+	//  used, a thread woken without work to do keeps it
+	uint64_t idle_ms;
+	//! Time (monotonic ms) of the last reap of the heap, or of the last check finding nothing to reap
+	uint64_t reap_ms;
 	//! Set for a first class heap, written before the heap has any page and cleared when a thread takes the
 	//  released heap over. Copied to the pages initialized for a size class, other threads never hold blocks of
 	//  such a page in their free chain, since rpmalloc_heap_free_all unmaps the pages regardless
@@ -1105,7 +1126,8 @@ os_huge_reserve_size(size_t alloc_size) {
 //  the previous one is linked into the chain without atomic operations, and the chain is pushed to the
 //  page with a single compare and swap when the thread frees into another page, when the chain holds
 //  THREAD_FREE_CHAIN_LIMIT_BYTES of blocks or at a flush point (its allocation slow path,
-//  rpmalloc_thread_collect or rpmalloc_thread_finalize, which also runs from the thread exit destructor).
+//  rpmalloc_thread_collect, rpmalloc_thread_collect_unused or rpmalloc_thread_finalize, which also runs from the
+//  thread exit destructor).
 //  Chained blocks are still counted as used by the page, so the page cannot be retired while the chain holds
 //  them. The heap pointer and the chain share one thread local object so the cross-thread free path makes a
 //  single thread local access
@@ -1125,6 +1147,10 @@ typedef struct thread_context_t {
 	uint32_t chain_count;
 	//! Thread exit push of the chain, see thread_free_chain_register
 	uint32_t chain_exit;
+	//! Heap the thread left idle in rpmalloc_thread_idle_begin, taken back by the thread before it uses the
+	//  allocator again. The thread heap is the fallback heap meanwhile, so any allocation takes the path that
+	//  initializes a thread, which takes this heap back
+	heap_t* idle_heap;
 } thread_context_t;
 
 //! Bytes of blocks a thread free chain holds before it is pushed, bounding the memory a thread that frees into a
@@ -1144,7 +1170,7 @@ typedef struct thread_context_t {
 //  thread exit destructor may not run another time
 #define CHAIN_EXIT_FINALIZED 2
 
-static _Thread_local thread_context_t global_thread TLS_MODEL = {&global_heap_fallback, 0, 0, 0, 0, 0};
+static _Thread_local thread_context_t global_thread TLS_MODEL = {&global_heap_fallback, 0, 0, 0, 0, 0, 0};
 
 static heap_t*
 heap_allocate(int first_class);
@@ -1758,6 +1784,55 @@ page_get_size(page_t* page) {
 		return page_get_span(page)->page_size;
 }
 
+#ifndef PAGE_COMMIT_PART_SHIFT
+//! A page committing on demand commits its memory as its blocks are initialized, first a part of
+//  1/2^PAGE_COMMIT_PART_SHIFT of the page, of at least a small page and the commit unit, then at least doubling
+//  the committed memory each time. A page of large blocks most often holds a few of them, committing all of it up
+//  front charged the process commit for memory it never touched, and the doubling bounds the commit calls of a page
+//  filled up to PAGE_COMMIT_PART_SHIFT + 1
+#define PAGE_COMMIT_PART_SHIFT 4
+#endif
+
+//! Size of the parts a page of the given size commits its memory in
+static inline size_t
+page_commit_part_size(size_t page_size, uint32_t commit_shift) {
+	size_t part = page_size >> PAGE_COMMIT_PART_SHIFT;
+	if (part < SMALL_PAGE_SIZE)
+		part = SMALL_PAGE_SIZE;
+	if (part < ((size_t)1 << commit_shift))
+		part = (size_t)1 << commit_shift;
+	return (part < page_size) ? part : page_size;
+}
+
+#if ENABLE_DECOMMIT
+//! Commit the memory of a page committing on demand up to at least the given offset from the page start, in whole
+//  parts and at least doubling the committed memory. Returns non-zero if the memory could not be committed
+static NOINLINE int
+page_commit_extend(page_t* page, size_t end) {
+	size_t page_size = page_get_size(page);
+	size_t part = page_commit_part_size(page_size, page->commit_shift);
+	size_t commit_size = page->commit_size;
+	size_t commit_end = (end + (part - 1)) & ~(part - 1);
+	if (commit_end < (commit_size << 1))
+		commit_end = commit_size << 1;
+	if (commit_end > page_size)
+		commit_end = page_size;
+	// The page is in the available list and can have no used block. Counted as used across the commit, so a collect
+	// from the commit, as by the map fail callback of the default commit, does not retire it under the allocation
+	++page->block_used;
+	int failed = global_memory_interface->memory_commit(pointer_offset(page->block_start, commit_size),
+	                                                    commit_end - commit_size);
+	--page->block_used;
+	if (failed)
+		return 1;
+#if RPMALLOC_HEAP_STATISTICS
+	page->heap->stats.committed_size += commit_end - commit_size;
+#endif
+	page->commit_size = (uint32_t)commit_end;
+	return 0;
+}
+#endif
+
 //! Check if the page is owned by the calling thread. Compares the owning heap with the thread heap
 //  rather than loading heap->owner_thread: the thread heap load does not depend on the page header,
 //  so the check is one dependent load shorter, and a cross-thread free no longer reads the first
@@ -1836,28 +1911,25 @@ page_decommit_memory_pages(page_t* page) {
 	size_t page_size = page_get_size(page);
 	if (page_size < ((size_t)1 << page->commit_shift))
 		return;
-	if (global_memory_interface->memory_decommit(page->block_start, page_size) != 0)
+	// Only the committed part of the page memory is decommitted, the rest was never committed
+	size_t commit_size = page->commit_size;
+	if (commit_size && (global_memory_interface->memory_decommit(page->block_start, commit_size) != 0))
 		return;
 #if RPMALLOC_HEAP_STATISTICS && ENABLE_DECOMMIT
 	if (page->heap)
-		page->heap->stats.committed_size -= page_size;
+		page->heap->stats.committed_size -= commit_size;
 #endif
+	page->commit_size = 0;
 	page->is_decommitted = 1;
 }
 
+//! Make a decommitted page usable again. Its memory is committed in parts as its blocks are initialized
 static inline int
 page_commit_memory_pages(page_t* page) {
 	if (!page->is_decommitted)
 		return 0;
-	size_t page_size = page_get_size(page);
-	if (global_memory_interface->memory_commit(page->block_start, page_size) != 0)
-		return 1;
 	page->is_decommitted = 0;
 #if ENABLE_DECOMMIT
-#if RPMALLOC_HEAP_STATISTICS
-	if (page->heap)
-		page->heap->stats.committed_size += page_size;
-#endif
 #if OS_DECOMMIT_ZEROES
 	// All of the page memory was decommitted, so the OS zero fills it when recommitted - take advantage in
 	// zalloc/calloc calls. A custom memory interface may keep the content of decommitted pages
@@ -1890,7 +1962,7 @@ page_available_rotate(heap_t* heap, page_t* page) {
 	page->next = 0;
 }
 
-static void
+static FORCEINLINE void
 heap_page_free(heap_t* heap, page_t* page);
 
 static void
@@ -1901,6 +1973,7 @@ page_available_to_free(page_t* page) {
 	if (UNEXPECTED(atomic_load_explicit(&page->thread_free, memory_order_relaxed) & THREAD_FREE_QUEUED))
 		return;
 	heap_t* heap = page->heap;
+	++heap->activity;
 	if (heap->page_available[page->size_class] == page) {
 		// Keep the last available page of a size class in place. Retiring it would make the next
 		// allocation of the class take the generic path and reinitialize the page from scratch,
@@ -1915,8 +1988,9 @@ page_available_to_free(page_t* page) {
 	heap_page_free(heap, page);
 }
 
-//! Put a page without used blocks, unlinked from the available list, in the free pages of the heap
-static void
+//! Put a page without used blocks, unlinked from the available list, in the free pages of the heap. Inlined in the
+//  free path, the compilers moved it out of line once the collect also called it
+static FORCEINLINE void
 heap_page_free(heap_t* heap, page_t* page) {
 	page->is_free = 1;
 	page->is_zero = 0;
@@ -2281,12 +2355,13 @@ thread_free_chain_register(thread_context_t* thread) {
 //! Begin a chain with the second free in a row into the chain page, the first one was pushed at once and a run
 //  of one free is never delayed. Batching is limited to small and medium small pages to bound the memory a
 //  thread can hold back, and to pages of heaps that are not first class. A thread with a null heap does not
-//  batch, it has no flush points. Otherwise the chain page is cleared and the block pushed
+//  batch, it has no flush points, nor does a thread with its heap idle, which has none until it takes the heap back
+//  and would hold the blocks back from the reaps. Otherwise the chain page is cleared and the block pushed
 static NOINLINE void
 thread_free_chain_begin(page_t* page, block_t* block) {
 	thread_context_t* thread = &global_thread;
 	heap_t* heap = thread->heap;
-	int batch = (page->page_type <= PAGE_MEDIUM_SMALL) && heap;
+	int batch = (page->page_type <= PAGE_MEDIUM_SMALL) && heap && !thread->idle_heap;
 #if RPMALLOC_FIRST_CLASS_HEAPS
 	batch = batch && !page->heap_first_class;
 #endif
@@ -2329,6 +2404,7 @@ page_push_local_free_to_heap(page_t* page) {
 	// Push the page free list as the fast track list of free blocks for heap
 	// Every initialized block not counted as used is in the local free list, so after handing the
 	// whole list to the heap all initialized blocks are in use
+	++page->heap->activity;
 	page->heap->local_free[page->size_class] = page->local_free;
 	page->block_used = page->block_initialized;
 	page->local_free = 0;
@@ -2337,6 +2413,13 @@ page_push_local_free_to_heap(page_t* page) {
 static NOINLINE void*
 page_initialize_blocks(page_t* page) {
 	rpmalloc_assert(page->block_initialized < page->block_count, "Block initialization internal failure");
+#if ENABLE_DECOMMIT
+	// Blocks are initialized in address order, the committed part of the page grows ahead of them. A small
+	// page commits all of its memory with its first block, the free list linked below stays within it
+	size_t block_end = ((size_t)page->block_initialized + 1) * page->block_size;
+	if (UNEXPECTED(block_end > page->commit_size) && (page_commit_extend(page, block_end) != 0))
+		return 0;
+#endif
 	block_t* block = page_block(page, page->block_initialized);
 	++page->block_initialized;
 	++page->block_used;
@@ -2393,6 +2476,11 @@ page_allocate_block(page_t* page, size_t zero_size) {
 				return 0;
 			}
 			block = page_initialize_blocks(page);
+#if ENABLE_DECOMMIT
+			// Committing the memory of the block failed
+			if (UNEXPECTED(block == 0))
+				return 0;
+#endif
 			is_zero = page->is_zero;
 		}
 	}
@@ -2456,19 +2544,14 @@ span_allocate_page(span_t* span) {
 	if (UNEXPECTED(page_index == global_thp_small_page) && (span->page_type == PAGE_SMALL))
 		thp_advise_small_span(span);
 
+	// Reserve-only spans commit the page structure here and the page memory in parts as its blocks are
+	// initialized; fully committed spans are already committed from the map and must not be committed per page
 #if ENABLE_DECOMMIT
-	// Reserve-only spans commit the page structure and the page on demand; fully committed spans are
-	// already committed from the map and must not be committed per page
-	if (span->commit_on_demand) {
-		if (span_commit_metadata(span, (size_t)pointer_diff(page, span) + PAGE_HEADER_SIZE) != 0)
-			return 0;
-		if (global_memory_interface->memory_commit(page_memory, span->page_size) != 0)
-			return 0;
-#if RPMALLOC_HEAP_STATISTICS
-		heap->stats.committed_size += span->page_size;
+	if (span->commit_on_demand &&
+	    (span_commit_metadata(span, (size_t)pointer_diff(page, span) + PAGE_HEADER_SIZE) != 0))
+		return 0;
 #endif
-	}
-#endif
+	page->commit_size = span->commit_on_demand ? 0 : span->page_size;
 	++span->page_initialized;
 
 	page->page_type = (uint16_t)span->page_type;
@@ -3616,8 +3699,9 @@ static atomic_ullong global_page_orphan_sweep_ms;
 //  orphan page is taken for a page of any size class of its page type
 static void
 page_orphan_sweep(uint64_t now) {
+	// A reap takes the time once for all the heaps it reaps, a sweep by another thread meanwhile can be later
 	unsigned long long last = atomic_load_explicit(&global_page_orphan_sweep_ms, memory_order_relaxed);
-	if (((now - last) < heap_orphan_delay_ms()) ||
+	if ((now < last) || ((now - last) < heap_orphan_delay_ms()) ||
 	    !atomic_compare_exchange_strong_explicit(&global_page_orphan_sweep_ms, &last, now, memory_order_relaxed,
 	                                             memory_order_relaxed))
 		return;
@@ -3683,7 +3767,7 @@ heap_orphan_free_pages(heap_t* heap, page_t* chain) {
 			page_t* next = page->next;
 #if RPMALLOC_HEAP_STATISTICS && ENABLE_DECOMMIT
 			if (!page->is_decommitted)
-				heap->stats.committed_size -= page_get_size(page);
+				heap->stats.committed_size -= page->commit_size;
 #endif
 			page->heap = &global_heap_orphan;
 			page->next = chain;
@@ -3711,7 +3795,7 @@ heap_take_orphan_empty_page(heap_t* heap, uint32_t page_type, uint32_t size_clas
 		return 0;
 #if RPMALLOC_HEAP_STATISTICS && ENABLE_DECOMMIT
 	if (!page->is_decommitted)
-		heap->stats.committed_size += page_get_size(page);
+		heap->stats.committed_size += page->commit_size;
 #endif
 	if (heap_make_free_page_available(heap, size_class, page) != 0)
 		return 0;
@@ -3760,7 +3844,7 @@ heap_orphan_pages(heap_t* heap) {
 				page_set_key(page, PAGE_KEY_GENERIC);
 				page->heap = &global_heap_orphan;
 #if RPMALLOC_HEAP_STATISTICS && ENABLE_DECOMMIT
-				heap->stats.committed_size -= page_get_size(page);
+				heap->stats.committed_size -= page->commit_size;
 #endif
 				_rpmalloc_stat_add_used(heap, iclass, -(int32_t)page->block_used);
 #if ENABLE_STATISTICS
@@ -3823,7 +3907,7 @@ page_orphan_full(page_t* page, heap_t* heap, block_t* head, block_t** tail_link,
 		if (orphaned > 0) {
 			page->heap = &global_heap_orphan;
 #if RPMALLOC_HEAP_STATISTICS && ENABLE_DECOMMIT
-			heap->stats.committed_size -= page_get_size(page);
+			heap->stats.committed_size -= page->commit_size;
 #endif
 			_rpmalloc_stat_add_used(heap, page->size_class, -(int32_t)page->block_used);
 			page_orphan_lock_acquire();
@@ -3856,7 +3940,7 @@ heap_take_orphan_page(heap_t* heap, uint32_t size_class) {
 	page->heap_first_class = 0;
 #endif
 #if RPMALLOC_HEAP_STATISTICS && ENABLE_DECOMMIT
-	heap->stats.committed_size += page_get_size(page);
+	heap->stats.committed_size += page->commit_size;
 #endif
 	page_t* head = heap->page_available[size_class];
 	page->next = head;
@@ -4144,10 +4228,11 @@ heap_get_page_generic(heap_t* heap, uint32_t size_class) {
 	rpmalloc_assert(heap->page_free_commit_count[page_type] == 0, "Free committed page count out of sync");
 
 	if (heap->id == 0) {
-		// Thread has not yet initialized, assign heap and try again
+		// Thread has not yet initialized, or left its heap idle, assign heap and try again
 		rpmalloc_initialize(0);
 		return heap_get_page(get_thread_heap(), size_class);
 	}
+	++heap->activity;
 
 	// A thread heap takes an empty orphan page of the page type before a new page from its spans
 	if (UNEXPECTED(atomic_load_explicit(&global_page_orphan_empty[page_type], memory_order_relaxed) != 0) &&
@@ -4251,6 +4336,11 @@ heap_allocate_block_small_to_large(heap_t* heap, uint32_t size_class, size_t zer
 			_rpmalloc_stat_inc_alloc(page->heap, size_class);
 			return block;
 		}
+#if ENABLE_DECOMMIT
+		// A page with blocks left to initialize only fails to allocate when committing their memory failed
+		if (UNEXPECTED(page->block_initialized != page->block_count))
+			return 0;
+#endif
 		// Running out of a page is a flush point of the thread free chain, bounding how long the blocks
 		// an allocating thread freed into other heaps stay hidden from their owner, at about one check per
 		// page of allocations
@@ -4809,7 +4899,8 @@ heap_free_all(heap_t* heap) {
 
 int
 rpmalloc_is_thread_initialized(void) {
-	return (get_thread_heap() != global_heap_default) ? 1 : 0;
+	// A thread with its heap idle holds the heap apart from the thread local pointer
+	return ((get_thread_heap() != global_heap_default) || global_thread.idle_heap) ? 1 : 0;
 }
 
 extern inline RPMALLOC_ALLOCATOR ENTRY_ALIGNED void*
@@ -4950,6 +5041,35 @@ rpmalloc_linker_reference(void) {
 ///
 //////
 
+#define HEAP_STATE_ACTIVE 0
+#define HEAP_STATE_IDLE 1
+#define HEAP_STATE_REAPING 2
+
+//! Take an idle heap back from the idle state, waiting for a reap holding it to finish
+static NOINLINE void
+heap_idle_acquire(heap_t* heap) {
+	unsigned int state = HEAP_STATE_IDLE;
+	uint32_t spin = 0;
+	while (!atomic_compare_exchange_weak_explicit(&heap->idle_state, &state, HEAP_STATE_ACTIVE, memory_order_acquire,
+	                                              memory_order_relaxed)) {
+		rpmalloc_assert(state != HEAP_STATE_ACTIVE, "Idle heap taken back twice");
+		if (state == HEAP_STATE_ACTIVE)
+			return;
+		if (state == HEAP_STATE_REAPING)
+			wait_spin(&spin);
+		state = HEAP_STATE_IDLE;
+	}
+}
+
+//! Make the heap the calling thread left idle its thread heap again
+static NOINLINE void
+heap_idle_attach(heap_t* heap) {
+	heap_idle_acquire(heap);
+	global_thread.idle_heap = 0;
+	// Only the thread local pointer was cleared, the platform key and owner thread still name the heap
+	global_thread.heap = heap;
+}
+
 static void
 rpmalloc_thread_destructor(void* value) {
 	// If this is called on main thread assume it means rpmalloc_finalize
@@ -4964,6 +5084,11 @@ rpmalloc_thread_destructor(void* value) {
 	// then still holds the heap and is reset as in rpmalloc_thread_finalize, or destructors running later on this
 	// thread would allocate from the released heap while another thread adopts it
 	if (value && (value != global_heap_default)) {
+		if (atomic_load_explicit(&((heap_t*)value)->idle_state, memory_order_relaxed) != HEAP_STATE_ACTIVE) {
+			heap_idle_acquire(value);
+			if (global_thread.idle_heap == value)
+				global_thread.idle_heap = 0;
+		}
 		if (get_thread_heap() == value)
 			set_thread_heap(global_heap_default);
 		heap_release_trim(value);
@@ -5587,12 +5712,44 @@ rpmalloc_finalize(void) {
 
 extern void
 rpmalloc_thread_initialize(void) {
-	if (get_thread_heap() == global_heap_default)
-		get_thread_heap_allocate();
+	if (get_thread_heap() == global_heap_default) {
+		if (global_thread.idle_heap)
+			heap_idle_attach(global_thread.idle_heap);
+		else
+			get_thread_heap_allocate();
+	}
+}
+
+extern void
+rpmalloc_thread_idle_begin(void) {
+	// The blocks this thread freed into other heaps are pushed, their owners cannot reclaim them otherwise
+	thread_free_chain_flush(&global_thread);
+	heap_t* heap = get_thread_heap();
+	if (!heap || (heap == global_heap_default) || heap->first_class)
+		return;
+	if (heap->activity != heap->idle_activity) {
+		heap->idle_activity = heap->activity;
+		heap->idle_ms = monotonic_time_ms();
+	}
+	global_thread.idle_heap = heap;
+	// Only the thread local pointer: the platform key still names the heap, so the thread exit destructor runs and
+	// takes it back from the idle state. A free by this thread meanwhile takes the cross-thread path without the
+	// free chain, which is safe alongside a reap, and an allocation takes the heap back
+	global_thread.heap = global_heap_default;
+	atomic_store_explicit(&heap->idle_state, HEAP_STATE_IDLE, memory_order_release);
+}
+
+extern void
+rpmalloc_thread_idle_end(void) {
+	heap_t* heap = global_thread.idle_heap;
+	if (heap)
+		heap_idle_attach(heap);
 }
 
 extern void
 rpmalloc_thread_finalize(void) {
+	if (global_thread.idle_heap)
+		heap_idle_attach(global_thread.idle_heap);
 	// Push the blocks this thread freed into other heaps, the thread has no flush point left
 	thread_free_chain_release();
 #if !defined(__APPLE__)
@@ -5605,17 +5762,115 @@ rpmalloc_thread_finalize(void) {
 	}
 }
 
-extern void
-rpmalloc_thread_collect(void) {
-	// Push the blocks this thread freed into other heaps and collect the blocks other threads freed into full
-	// pages, so the pages they emptied are free, then decommit the free pages held above the retain count right
-	// away instead of waiting for the decommit delay
-	thread_free_chain_flush(&global_thread);
-	heap_t* heap = get_thread_heap();
-	if (heap == global_heap_default)
-		return;
+//! Hand the blocks of the heap local free list of a size class back to the free lists of their pages, and adopt the
+//  blocks other threads freed into the available pages of the size class. Retires the pages left without used blocks
+static void
+heap_collect_size_class(heap_t* heap, uint32_t size_class) {
+	block_t* block = heap->local_free[size_class];
+	if (block) {
+		// The heap list holds blocks of one page, page_push_local_free_to_heap hands it the page list whole
+		heap->local_free[size_class] = 0;
+		page_t* page = block_get_page(block);
+		block_t* last = block;
+		uint32_t count = 1;
+		while (last->next) {
+			last = last->next;
+			++count;
+		}
+		last->next = page->local_free;
+		page->local_free = block;
+		page->block_used -= count;
+		if (UNEXPECTED(page->is_full != 0))
+			page_full_to_available(page);
+	}
+	page_t* page = heap->page_available[size_class];
+	while (page) {
+		page_t* next = page->next;
+		// A queued page is taken from the pending list, which retires it if it is empty. A free can queue the
+		// page while its list is claimed here, then the page is left to the pending list
+		unsigned long long token = atomic_load_explicit(&page->thread_free, memory_order_acquire);
+		int queued = 0;
+		while (token) {
+			if (token & THREAD_FREE_QUEUED) {
+				queued = 1;
+				break;
+			}
+			if (atomic_compare_exchange_weak_explicit(&page->thread_free, &token, 0, memory_order_acquire,
+			                                          memory_order_relaxed))
+				break;
+		}
+		if (queued) {
+			page = next;
+			continue;
+		}
+		if (token) {
+			block_t* first;
+			uint32_t count = page_block_from_thread_free_list(page, token, &first);
+			if (count) {
+				if (page->local_free) {
+					block_t* last = first;
+					while (last->next)
+						last = last->next;
+					last->next = page->local_free;
+				}
+				page->local_free = first;
+				page->remote_fed = 1;
+				rpmalloc_assert(count <= page->block_used, "Page thread free list count internal failure");
+				page->block_used -= count;
+				_rpmalloc_stat_add_free(heap, page->size_class, count);
+			}
+		}
+		if (!page->block_used) {
+			// No block of the page is held anywhere, so no other thread can free into it and queue it
+			if (heap->page_available[size_class] == page) {
+				heap->page_available[size_class] = next;
+				if (next)
+					next->prev = page->prev;
+			} else {
+				page_available_unlink(heap, page);
+			}
+			heap_page_free(heap, page);
+		}
+		page = next;
+	}
+}
+
+//! Collect the memory a heap holds without using it: the blocks other threads freed into its pages, the pages
+//  left without used blocks, and the free pages beyond the retain count of the small page types
+static void
+heap_collect_unused(heap_t* heap, uint64_t now) {
 #if HUGE_CACHE_SLOT_COUNT
-	huge_cache_collect(monotonic_time_ms());
+	huge_cache_collect(now);
+#endif
+	if (atomic_load_explicit(&heap->page_pending, memory_order_relaxed))
+		heap_collect_pending_pages(heap);
+	heap_collect_thread_free(heap);
+	// A heap whose thread stops allocating keeps the free blocks of the pages it last allocated from in its local
+	// free lists, and the blocks other threads freed into its available pages in their thread free lists, both
+	// counted as used by the pages. A page whose blocks are all in those lists is retired, including the last
+	// available page of its size class, which is kept only to spare an allocating thread reinitializing it
+	for (uint32_t iclass = 0; iclass < SIZE_CLASS_COUNT; ++iclass)
+		heap_collect_size_class(heap, iclass);
+	for (uint32_t itype = 0; itype < 4; ++itype) {
+		if (global_page_free_overflow[itype] == 0xFFFFFFFFU)
+			continue;
+		heap->page_free_overflow_ms[itype] = 0;
+		// Free medium-large and large pages are all decommitted, a retained page holds the memory of up to the
+		// largest block, and the small page types keep their retain count
+		uint32_t retain = (itype >= PAGE_MEDIUM_LARGE) ? 0 : global_page_free_retain[itype];
+		if (heap->page_free_commit_count[itype] > retain)
+			heap_page_free_decommit(heap, itype, retain);
+		heap->page_free_low[itype] = heap->page_free_commit_count[itype];
+	}
+	page_orphan_sweep(now);
+}
+
+//! Collect the blocks other threads freed into the full pages of a heap, so the pages they emptied are free, and
+//  decommit the free pages held beyond the retain count. Leaves the heap what it keeps for its next allocations
+static void
+heap_collect(heap_t* heap, uint64_t now) {
+#if HUGE_CACHE_SLOT_COUNT
+	huge_cache_collect(now);
 #endif
 	if (atomic_load_explicit(&heap->page_pending, memory_order_relaxed))
 		heap_collect_pending_pages(heap);
@@ -5627,6 +5882,117 @@ rpmalloc_thread_collect(void) {
 		if (heap->page_free_commit_count[itype] > global_page_free_retain[itype])
 			heap_page_free_decommit(heap, itype, global_page_free_retain[itype]);
 	}
+}
+
+extern void
+rpmalloc_thread_collect(void) {
+	// Push the blocks this thread freed into other heaps and collect the blocks other threads freed into full
+	// pages, so the pages they emptied are free, then decommit the free pages held above the retain count right
+	// away instead of waiting for the decommit delay
+	thread_free_chain_flush(&global_thread);
+	heap_t* heap = get_thread_heap();
+	if (heap == global_heap_default)
+		return;
+	heap_collect(heap, monotonic_time_ms());
+}
+
+extern void
+rpmalloc_thread_collect_unused(void) {
+	// Push the blocks this thread freed into other heaps, then collect all the heap holds unused right away
+	thread_free_chain_flush(&global_thread);
+	heap_t* heap = get_thread_heap();
+	if (heap == global_heap_default)
+		return;
+	heap_collect_unused(heap, monotonic_time_ms());
+}
+
+#ifndef HEAP_REAP_LIMIT
+//! Most idle heaps one rpmalloc_reap_idle_heaps call reaps, the rest wait for the next call
+#define HEAP_REAP_LIMIT 64
+#endif
+
+//! Check if other threads freed blocks into the available pages of a heap the calling thread holds
+static int
+heap_has_available_thread_free(heap_t* heap) {
+	for (uint32_t iclass = 0; iclass < SIZE_CLASS_COUNT; ++iclass) {
+		for (page_t* page = heap->page_available[iclass]; page; page = page->next) {
+			unsigned long long token = atomic_load_explicit(&page->thread_free, memory_order_relaxed);
+			if ((token >> 32ULL) & THREAD_FREE_COUNT_MASK)
+				return 1;
+		}
+	}
+	return 0;
+}
+
+//! Check if a heap the calling thread holds was used since its last reap, by its thread or by other threads freeing
+//  into its pages
+static int
+heap_reap_pending(heap_t* heap) {
+	return (heap->activity != heap->reaped_activity) || heap_has_thread_free(heap) ||
+	       atomic_load_explicit(&heap->page_pending, memory_order_relaxed) || heap_has_available_thread_free(heap);
+}
+
+extern size_t
+rpmalloc_reap_idle_heaps(unsigned int min_idle_ms, unsigned int max_heaps) {
+	thread_free_chain_flush(&global_thread);
+	uint64_t now = monotonic_time_ms();
+	if ((max_heaps == 0) || (max_heaps > HEAP_REAP_LIMIT))
+		max_heaps = HEAP_REAP_LIMIT;
+	// The calling thread runs, so its heap is not idle and keeps what it holds for its next allocations. It is
+	// collected here if used since its last reap, at most once per min idle time, and is not counted: the thread
+	// runs the reaps, and the next reap would always find it used
+	heap_t* self = get_thread_heap();
+	if (self && (self != global_heap_default) && !self->first_class &&
+	    (!self->reap_ms || ((now >= self->reap_ms) && ((now - self->reap_ms) >= min_idle_ms))) &&
+	    heap_reap_pending(self)) {
+		heap_collect(self, now);
+		self->reaped_activity = self->activity;
+		self->reap_ms = now;
+	}
+	// The heaps are claimed, checked and reaped one at a time, a thread taking its heap back waits for the reap of
+	// its own heap only. The heap lock is held to walk the used list, not to check or reap a heap, which scans its
+	// pages and makes system calls: a claimed heap stays in the list, its thread waits to take it back before it
+	// can release it
+	size_t count = 0;
+	heap_lock_acquire();
+	heap_t* heap = global_heap_used;
+	while (heap && (count < max_heaps)) {
+		// Claimed before its fields are read, its thread writes them while it uses the heap. A heap reaped or found
+		// with nothing to reap within the min idle time is skipped before the scan of its pages, a caller reaping in
+		// steps walks the heaps again
+		unsigned int state = HEAP_STATE_IDLE;
+		if ((atomic_load_explicit(&heap->idle_state, memory_order_relaxed) != HEAP_STATE_IDLE) ||
+		    !atomic_compare_exchange_strong_explicit(&heap->idle_state, &state, HEAP_STATE_REAPING,
+		                                             memory_order_acquire, memory_order_relaxed)) {
+			heap = heap->next;
+			continue;
+		}
+		uint64_t since = heap->idle_ms;
+		uint64_t reaped = heap->reap_ms;
+		int due = (since <= now) && ((now - since) >= min_idle_ms) &&
+		          (!reaped || ((reaped <= now) && ((now - reaped) >= min_idle_ms)));
+		if (!due) {
+			atomic_store_explicit(&heap->idle_state, HEAP_STATE_IDLE, memory_order_release);
+			heap = heap->next;
+			continue;
+		}
+		heap_lock_release();
+		if (heap_reap_pending(heap)) {
+			// The pages the reap retires count as activity of the heap, not of its thread: a thread woken without
+			// work keeps its idle time
+			heap_collect_unused(heap, now);
+			heap->reaped_activity = heap->activity;
+			heap->idle_activity = heap->activity;
+			++count;
+		}
+		heap->reap_ms = now;
+		heap_lock_acquire();
+		heap_t* next = heap->next;
+		atomic_store_explicit(&heap->idle_state, HEAP_STATE_IDLE, memory_order_release);
+		heap = next;
+	}
+	heap_lock_release();
+	return count;
 }
 
 void
@@ -5904,6 +6270,8 @@ rpmalloc_heap_statistics(rpmalloc_heap_t* heap) {
 
 extern inline void
 rpmalloc_heap_thread_set_current(rpmalloc_heap_t* heap) {
+	if (global_thread.idle_heap)
+		heap_idle_attach(global_thread.idle_heap);
 	heap_t* prev_heap = get_thread_heap();
 	if (prev_heap != heap) {
 		// The new heap can be null, which leaves the thread without flush points

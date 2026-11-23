@@ -30,6 +30,11 @@ fn a_process_that_sizes_for_nothing_keeps_the_defaults() {
     }
 
     let core = core_runtime();
+    assert_eq!(
+        lore_base::allocator::reap::heap_reap_running(),
+        lore_base::allocator::reap::heap_reap_enabled(),
+        "the core runtime starts the heap reap thread where rpmalloc is the global allocator"
+    );
 
     let defaults = default_thread_counts(processor_count(), lore_io::requested_max_threads());
     assert_eq!(thread_counts(), defaults);
