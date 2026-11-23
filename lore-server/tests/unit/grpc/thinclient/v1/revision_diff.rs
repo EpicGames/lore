@@ -205,6 +205,7 @@ async fn push_linked_revision(
         .expect("serialize state");
     branch_push::push(
         repository.clone(),
+        None,
         branch_id,
         serialized,
         crate::util::test_support::PUSH_ANY,

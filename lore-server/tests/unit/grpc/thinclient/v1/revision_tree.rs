@@ -139,6 +139,7 @@ async fn push_branch_with_revisions(
             .expect("serialize state");
         let signature = branch_push::push(
             repository.clone(),
+            None,
             branch_id,
             serialized,
             crate::util::test_support::PUSH_ANY,
@@ -214,6 +215,7 @@ async fn push_branch_with_subdir(repository: &Arc<RepositoryContext>) -> (Branch
         .expect("serialize state");
     let signature = branch_push::push(
         repository.clone(),
+        None,
         branch_id,
         serialized,
         crate::util::test_support::PUSH_ANY,
@@ -304,6 +306,7 @@ async fn push_branch_with_link(
         .expect("serialize state");
     let signature = branch_push::push(
         repository.clone(),
+        None,
         branch_id,
         serialized,
         crate::util::test_support::PUSH_ANY,
@@ -1367,6 +1370,7 @@ async fn distinct_links_to_same_repository_both_walked() {
             .expect("serialize state");
         let a_sig = branch_push::push(
             a_context.clone(),
+            None,
             branch_id,
             serialized,
             crate::util::test_support::PUSH_ANY,

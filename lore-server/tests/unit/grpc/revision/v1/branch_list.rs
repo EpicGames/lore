@@ -66,6 +66,7 @@ async fn seed_revision(repository_context: &Arc<RepositoryContext>, branch: Bran
         .expect("Failed to serialize state");
     branch_push::push(
         repository_context.clone(),
+        None,
         branch,
         state_hash,
         crate::util::test_support::PUSH_ANY,

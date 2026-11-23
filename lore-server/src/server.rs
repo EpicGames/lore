@@ -35,6 +35,7 @@ use lore_revision::environment::EnvironmentConfig;
 use lore_revision::lock::LockStore;
 use lore_revision::notification::NotificationSender;
 use lore_revision::runtime::execution_context;
+use lore_revision::store::composite::CompositeStore;
 use lore_revision::store::composite::CompositeStoreBuilder;
 use lore_revision::store::remote::RemoteImmutableStore;
 use lore_revision::store::remote::RemoteMutableStore;
@@ -464,6 +465,7 @@ pub fn compiled_features() -> Vec<String> {
 async fn launch_grpc_server(
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
     token_verification: TokenVerification,
@@ -531,7 +533,7 @@ async fn launch_grpc_server(
     GrpcServerBuilder::new()
         .with_environment(environment)
         .with_feature(feature)
-        .with_immutable_store(immutable_store, local_store)
+        .with_immutable_store(immutable_store, local_store, local_tier)
         .with_mutable_store(mutable_store)
         .with_lock_store(lock_store)
         .with_notification(notification_sender, notification_service)
@@ -922,14 +924,44 @@ impl StreamHandlerFactory for QuicInternalStreamHandler {
     }
 }
 
+struct ConfiguredImmutableStore {
+    /// The store the server reads through.
+    store: Arc<dyn ImmutableStore>,
+    /// The store that reads through `store` fill with what they read. `None` where they fill none.
+    local_tier: Option<Arc<dyn ImmutableStore>>,
+}
+
+impl ConfiguredImmutableStore {
+    fn without_local_tier(store: Arc<dyn ImmutableStore>) -> Self {
+        Self {
+            store,
+            local_tier: None,
+        }
+    }
+}
+
 async fn configure_immutable_store_via_plugin(
     registry: &PluginRegistry,
     settings: &Settings,
     topology: Option<Arc<dyn Topology + Send + Sync>>,
-) -> Result<Arc<dyn ImmutableStore>> {
+) -> Result<ConfiguredImmutableStore> {
     let mode = &settings.immutable_store.mode;
 
-    match mode.as_str() {
+    if mode == store_mode::COMPOSITE {
+        let composite_settings = settings
+            .immutable_store
+            .composite
+            .as_ref()
+            .ok_or(anyhow!("Missing composite store settings"))?;
+        let composite =
+            configure_composite_store(registry, composite_settings, settings, topology).await?;
+        return Ok(ConfiguredImmutableStore {
+            local_tier: Some(composite.local()),
+            store: composite,
+        });
+    }
+
+    let store = match mode.as_str() {
         store_mode::LOCAL => {
             let local_settings = settings
                 .immutable_store
@@ -938,15 +970,6 @@ async fn configure_immutable_store_via_plugin(
                 .ok_or(anyhow!("Missing local immutable store settings"))?;
 
             configure_local_immutable_store(local_settings).await
-        }
-        store_mode::COMPOSITE => {
-            let composite_settings = settings
-                .immutable_store
-                .composite
-                .as_ref()
-                .ok_or(anyhow!("Missing composite store settings"))?;
-
-            configure_composite_store(registry, composite_settings, settings, topology).await
         }
         store_mode::REPLICATED => {
             let replicated_settings = settings
@@ -978,7 +1001,8 @@ async fn configure_immutable_store_via_plugin(
                 .create_immutable_store(mode, &plugin_config)
                 .map_err(|e| anyhow!("Failed to create immutable store plugin '{mode}': {e}"))
         }
-    }
+    }?;
+    Ok(ConfiguredImmutableStore::without_local_tier(store))
 }
 
 async fn configure_mutable_store_via_plugin(
@@ -1540,7 +1564,7 @@ async fn configure_composite_store(
     settings: &CompositeStoreSettings,
     global_settings: &Settings,
     topology: Option<Arc<dyn Topology + Send + Sync>>,
-) -> Result<Arc<dyn ImmutableStore>> {
+) -> Result<Arc<CompositeStore>> {
     info!("Wiring up Composite store");
 
     let mut composite_store_builder = CompositeStoreBuilder::default()
@@ -2108,8 +2132,10 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         info!("Running in single-node mode (no topology configured)");
     }
 
-    let immutable_store =
-        configure_immutable_store_via_plugin(&plugin_registry, &settings, topology.clone()).await?;
+    let ConfiguredImmutableStore {
+        store: immutable_store,
+        local_tier,
+    } = configure_immutable_store_via_plugin(&plugin_registry, &settings, topology.clone()).await?;
 
     let mutable_store =
         configure_mutable_store_via_plugin(&plugin_registry, &settings, immutable_store.clone())
@@ -2313,6 +2339,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             launch_grpc_server(
                 immutable_store,
                 local_immutable_store,
+                local_tier,
                 mutable_store,
                 lock_store,
                 token_verification,

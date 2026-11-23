@@ -123,6 +123,7 @@ async fn returns_metadata_hash_for_deleted_branch() {
             .expect("serialize state");
         let main_latest = branch_push::push(
             repository.clone(),
+            None,
             main_id,
             state_hash,
             crate::util::test_support::PUSH_ANY,

@@ -63,6 +63,7 @@ async fn test_handle() {
             .expect("Failed to serialize state");
         let head = branch_push::push(
             repository.clone(),
+            None,
             main,
             first_hash,
             crate::util::test_support::PUSH_ANY,
@@ -86,6 +87,7 @@ async fn test_handle() {
             .expect("Failed to serialize state");
         let head = branch_push::push(
             repository.clone(),
+            None,
             main,
             second_hash,
             crate::util::test_support::PUSH_ANY,
@@ -109,6 +111,7 @@ async fn test_handle() {
             .expect("Failed to serialize state");
         let head = branch_push::push(
             repository.clone(),
+            None,
             main,
             third_hash,
             crate::util::test_support::PUSH_ANY,
@@ -132,6 +135,7 @@ async fn test_handle() {
             .expect("Failed to serialize state");
         let head = branch_push::push(
             repository.clone(),
+            None,
             main,
             fourth_hash,
             crate::util::test_support::PUSH_ANY,
@@ -371,6 +375,7 @@ async fn test_handle_optional_branch() {
             .expect("Failed to serialize state");
         branch_push::push(
             repository.clone(),
+            None,
             main,
             first_hash,
             crate::util::test_support::PUSH_ANY,
@@ -393,6 +398,7 @@ async fn test_handle_optional_branch() {
             .expect("Failed to serialize state");
         branch_push::push(
             repository.clone(),
+            None,
             main,
             second_hash,
             crate::util::test_support::PUSH_ANY,
@@ -415,6 +421,7 @@ async fn test_handle_optional_branch() {
             .expect("Failed to serialize state");
         branch_push::push(
             repository.clone(),
+            None,
             main,
             third_hash,
             crate::util::test_support::PUSH_ANY,

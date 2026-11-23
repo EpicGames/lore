@@ -3848,7 +3848,7 @@ impl State {
     ///
     /// Serialize writes the list from this, so a State that loaded no block still writes the
     /// stored address of every block it did not change.
-    async fn node_block_addresses(
+    pub(crate) async fn node_block_addresses(
         &self,
         repository: &Arc<RepositoryContext>,
         hash_node: Hash,
@@ -12255,7 +12255,9 @@ async fn collect_name_fragments(
 
 /// The name table of the node block `stored` read: a current or V2 block's, and none for a V0
 /// block, whose names its State's name table holds.
-fn stored_name_table(stored: Result<StoredNodeBlock, ImmutableError>) -> Result<Hash, StateError> {
+pub(crate) fn stored_name_table(
+    stored: Result<StoredNodeBlock, ImmutableError>,
+) -> Result<Hash, StateError> {
     Ok(
         match stored.forward::<StateError>("Failed to deserialize node block")? {
             StoredNodeBlock::Current(block) => block.name_table,

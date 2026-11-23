@@ -741,6 +741,7 @@ mod resolve_revision_number {
                 .expect("serialize state");
             parent = lore_server::grpc::handlers::branch_push::push(
                 repository.clone(),
+                None,
                 branch,
                 serialized,
                 crate::util::test_support::PUSH_ANY,
@@ -774,6 +775,7 @@ mod resolve_revision_number {
             .expect("serialize state");
         let result = lore_server::grpc::handlers::branch_push::push(
             repository.clone(),
+            None,
             branch,
             serialized,
             crate::util::test_support::PUSH_ANY,

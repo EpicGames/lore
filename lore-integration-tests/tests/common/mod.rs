@@ -167,7 +167,7 @@ pub(crate) mod net_common {
             let outcome = GrpcServerBuilder::new()
                 .with_environment(EnvironmentConfig::default())
                 .with_feature(FeatureSettings::default())
-                .with_immutable_store(backend_immutable.clone(), backend_immutable)
+                .with_immutable_store(backend_immutable.clone(), backend_immutable, None)
                 .with_mutable_store(backend_mutable)
                 .with_lock_store(None)
                 .with_notification(notification_sender, None)

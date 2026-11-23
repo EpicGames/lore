@@ -72,6 +72,7 @@ pub async fn handler(
     request: Request<BranchPushRequest>,
     authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    local_tier: Option<Arc<dyn lore_storage::ImmutableStore>>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification: Arc<dyn NotificationSender>,
     hook_dispatcher: &HookDispatcher,
@@ -155,6 +156,7 @@ pub async fn handler(
                 async {
                     let pushed = push_loaded(
                         repository.clone(),
+                        local_tier.as_ref(),
                         branch_id,
                         revision,
                         access,

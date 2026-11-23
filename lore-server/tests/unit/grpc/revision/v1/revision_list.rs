@@ -135,6 +135,7 @@ async fn create_branch_with_history(
             .expect("serialize state");
         let pushed = branch_push::push(
             repository.clone(),
+            None,
             branch_id,
             serialized,
             crate::util::test_support::PUSH_ANY,
@@ -208,6 +209,7 @@ async fn push_revision(
 ) -> (Hash, u64) {
     let result = branch_push::push(
         repository.clone(),
+        None,
         branch_id,
         revision,
         crate::util::test_support::PUSH_ANY,

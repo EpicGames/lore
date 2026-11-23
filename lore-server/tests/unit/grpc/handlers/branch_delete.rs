@@ -71,6 +71,7 @@ async fn create_test_branch(repository_context: Arc<RepositoryContext>, branch: 
 
     let head = branch_push::push(
         repository_context.clone(),
+        None,
         main,
         state_hash,
         crate::util::test_support::PUSH_ANY,

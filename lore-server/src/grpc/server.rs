@@ -331,16 +331,21 @@ pub struct WantsImmutableStore {
 }
 
 impl GrpcServerBuilder<WantsImmutableStore> {
+    /// `local_store` is the store this node holds its own copy of content in, or `immutable_store`
+    /// itself where it holds none. `local_tier` is the store that reads through `immutable_store`
+    /// fill with what they read, and `None` where they fill none.
     pub fn with_immutable_store(
         self,
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
+        local_tier: Option<Arc<dyn ImmutableStore>>,
     ) -> GrpcServerBuilder<WantsMutableStore> {
         GrpcServerBuilder(WantsMutableStore {
             environment: self.0.environment,
             feature: self.0.feature,
             immutable_store,
             local_store,
+            local_tier,
         })
     }
 }
@@ -350,6 +355,7 @@ pub struct WantsMutableStore {
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
 }
 
 impl GrpcServerBuilder<WantsMutableStore> {
@@ -362,6 +368,7 @@ impl GrpcServerBuilder<WantsMutableStore> {
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
+            local_tier: self.0.local_tier,
             mutable_store,
         })
     }
@@ -372,6 +379,7 @@ pub struct MaybeLockStore {
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
     mutable_store: Arc<dyn MutableStore>,
 }
 
@@ -385,6 +393,7 @@ impl GrpcServerBuilder<MaybeLockStore> {
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
+            local_tier: self.0.local_tier,
             mutable_store: self.0.mutable_store,
             lock_store,
         })
@@ -396,6 +405,7 @@ pub struct WantsNotification {
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
 }
@@ -411,6 +421,7 @@ impl GrpcServerBuilder<WantsNotification> {
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
+            local_tier: self.0.local_tier,
             mutable_store: self.0.mutable_store,
             lock_store: self.0.lock_store,
             notification_sender: sender,
@@ -424,6 +435,7 @@ pub struct MaybeHookDispatcher {
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
     notification_sender: Arc<dyn NotificationSender>,
@@ -440,6 +452,7 @@ impl GrpcServerBuilder<MaybeHookDispatcher> {
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
+            local_tier: self.0.local_tier,
             mutable_store: self.0.mutable_store,
             lock_store: self.0.lock_store,
             notification_sender: self.0.notification_sender,
@@ -454,6 +467,7 @@ pub struct WantsTlsConfig {
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
     notification_sender: Arc<dyn NotificationSender>,
@@ -487,6 +501,7 @@ impl GrpcServerBuilder<WantsTlsConfig> {
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
+            local_tier: self.0.local_tier,
             mutable_store: self.0.mutable_store,
             lock_store: self.0.lock_store,
             hook_dispatcher: self.0.hook_dispatcher,
@@ -502,6 +517,7 @@ pub struct WantsAdminEndpoints {
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
     hook_dispatcher: Arc<HookDispatcher>,
@@ -529,6 +545,7 @@ impl GrpcServerBuilder<WantsAdminEndpoints> {
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
+            local_tier: self.0.local_tier,
             mutable_store: self.0.mutable_store,
             lock_store: self.0.lock_store,
             notification_sender: self.0.notification_sender,
@@ -545,6 +562,7 @@ pub struct WantsHttp2Config {
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
     notification_sender: Arc<dyn NotificationSender>,
@@ -585,6 +603,7 @@ impl GrpcServerBuilder<WantsHttp2Config> {
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
+            local_tier: self.0.local_tier,
             mutable_store: self.0.mutable_store,
             lock_store: self.0.lock_store,
             notification_sender: self.0.notification_sender,
@@ -608,6 +627,7 @@ pub struct MaybeJwtVerifier {
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
     notification_sender: Arc<dyn NotificationSender>,
@@ -757,6 +777,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         );
         let revision_svc = ServiceBuilder::new().service(LoreRevisionService::new(
             self.0.immutable_store.clone(),
+            self.0.local_tier.clone(),
             self.0.mutable_store.clone(),
             self.0.notification_sender.clone(),
             self.0.hook_dispatcher.clone(),
@@ -767,6 +788,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         ));
         let revision_v1_svc = LoreRevisionV1Service::new(
             self.0.immutable_store.clone(),
+            self.0.local_tier.clone(),
             self.0.mutable_store.clone(),
             self.0.notification_sender.clone(),
             self.0.hook_dispatcher.clone(),

@@ -89,6 +89,7 @@ async fn tree_on_file_returns_invalid_argument() {
 
             branch_push::push(
                 repository.clone(),
+                None,
                 main,
                 revision_hash,
                 crate::util::test_support::PUSH_ANY,
@@ -170,6 +171,7 @@ async fn tree_on_missing_path_returns_not_found() {
 
             branch_push::push(
                 repository.clone(),
+                None,
                 main,
                 revision_hash,
                 crate::util::test_support::PUSH_ANY,
@@ -268,6 +270,7 @@ async fn tree_emits_link_node_with_target_repository_context() {
 
             branch_push::push(
                 repository.clone(),
+                None,
                 main,
                 revision_hash,
                 crate::util::test_support::PUSH_ANY,
@@ -391,6 +394,7 @@ async fn link_tree_path(
 
     branch_push::push(
         repository.clone(),
+        None,
         main,
         revision_hash,
         crate::util::test_support::PUSH_ANY,

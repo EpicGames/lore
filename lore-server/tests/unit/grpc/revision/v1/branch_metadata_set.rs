@@ -484,6 +484,7 @@ async fn cas_succeeds_on_deleted_branch() {
             .expect("serialize state");
         let main_latest = lore_server::grpc::handlers::branch_push::push(
             repository.clone(),
+            None,
             main_id,
             state_hash,
             crate::util::test_support::PUSH_ANY,

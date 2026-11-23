@@ -1,12 +1,19 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 //! Warming a revision's tree into the local store, walked from the root or loaded block by block,
-//! and the access recordings that name what to warm.
+//! the access recordings that name what to warm, and fetching the node blocks states differ in into
+//! the store a server's reads fill.
 
+use std::collections::HashSet;
+use std::fmt;
+use std::future::Future;
 use std::mem::offset_of;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use std::time::Instant;
 
 use lore_base::lore_spawn;
@@ -14,8 +21,13 @@ use lore_base::types::Address;
 use lore_base::types::Hash;
 use lore_base::types::TypedBytes;
 use lore_error_set::prelude::*;
+use lore_storage::ImmutableStore;
 use lore_storage::ReadOptions;
+use lore_storage::StoreMatchResult;
 use lore_transport::StorageSession;
+use parking_lot::Mutex;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
@@ -30,6 +42,8 @@ use crate::node::NodeBlockFormat;
 use crate::repository::RepositoryContext;
 use crate::state::State;
 use crate::state::StateError;
+use crate::state::block::read_stored_node_block;
+use crate::state::stored_name_table;
 use crate::util::path::RelativePath;
 
 /// The environment variable that selects [`TreePrefetch`] for a [`plan`] given none.
@@ -701,4 +715,419 @@ fn name_table_of(content: &[u8]) -> Option<Address> {
         Hash::read_from_prefix(&content[offset_of!(NodeBlockData, name_table)..]).ok()?;
     (version <= NodeBlockFormat::Nametable as u32 && !name_table.is_zero())
         .then(|| Address::zero_context_hash(name_table))
+}
+
+/// What the prefetches of one operation did. The counts only grow; a fetch still running when
+/// its prefetch stopped is counted when it ends.
+#[derive(Debug, Default)]
+pub struct PrefetchTracker {
+    runs: AtomicU64,
+    /// Prefetches that ran to their end, their fetches included.
+    finished: AtomicU64,
+    /// Prefetches skipped for a state of more blocks than they were given to compare.
+    skipped: AtomicU64,
+    /// The time the finished prefetches took, in microseconds.
+    finished_micros: AtomicU64,
+    /// The node blocks at the indexes where the compared states differ that were looked for in the
+    /// store the prefetch fills.
+    blocks_changed: AtomicU64,
+    blocks_missing: AtomicU64,
+    blocks_fetched: AtomicU64,
+    /// The name tables of the fetched blocks that were read, whether the store the prefetch fills
+    /// held them or they were fetched into it.
+    name_tables_fetched: AtomicU64,
+    /// State loads, tree and block list reads, local queries and block and name table reads that
+    /// failed.
+    failed: AtomicU64,
+}
+
+/// A snapshot of a [`PrefetchTracker`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrefetchCounts {
+    pub runs: u64,
+    pub finished: u64,
+    pub skipped: u64,
+    /// The time the finished prefetches took.
+    pub elapsed: Duration,
+    pub blocks_changed: u64,
+    pub blocks_missing: u64,
+    pub blocks_fetched: u64,
+    pub name_tables_fetched: u64,
+    pub failed: u64,
+}
+
+impl PrefetchTracker {
+    pub fn counts(&self) -> PrefetchCounts {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        PrefetchCounts {
+            runs: load(&self.runs),
+            finished: load(&self.finished),
+            skipped: load(&self.skipped),
+            elapsed: Duration::from_micros(load(&self.finished_micros)),
+            blocks_changed: load(&self.blocks_changed),
+            blocks_missing: load(&self.blocks_missing),
+            blocks_fetched: load(&self.blocks_fetched),
+            name_tables_fetched: load(&self.name_tables_fetched),
+            failed: load(&self.failed),
+        }
+    }
+
+    fn add(counter: &AtomicU64, amount: usize) {
+        counter.fetch_add(amount as u64, Ordering::Relaxed);
+    }
+}
+
+impl fmt::Display for PrefetchCounts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "runs={} finished={} skipped={} ms={} blocks_changed={} blocks_missing={} \
+             blocks_fetched={} name_tables_fetched={} failed={}",
+            self.runs,
+            self.finished,
+            self.skipped,
+            self.elapsed.as_millis(),
+            self.blocks_changed,
+            self.blocks_missing,
+            self.blocks_fetched,
+            self.name_tables_fetched,
+            self.failed,
+        )
+    }
+}
+
+/// Fetches into `local` the node blocks at which the state of revision `state` differs from that of
+/// any of `against`, both sides' block at each such index, each with the name table it names.
+/// `local` must be the store that reads through `repository`'s store fill with what they read: the
+/// prefetch asks `local` which blocks it holds, and reads the rest through `repository`'s store.
+///
+/// A revision's blocks keep their indexes in the revisions edited from it, so the blocks at an
+/// index where two states' block hashes differ hold every node one changed against the other. A
+/// block holding only nodes neither changed is not fetched, even where it holds the children of a
+/// changed directory.
+///
+/// A state of more than `max_blocks` blocks is not compared, and nothing is fetched.
+///
+/// The blocks are compared with `local` and fetched as they are found, 512 at a time. Each fetch
+/// is a task of its own that runs to its end even once this future is dropped, so a reader that
+/// joined the fetch is answered; dropping the future stops the comparing and the fetches it would
+/// start, and a fetch whose node block is still being read then leaves its name table unread.
+/// It only fetches ahead and answers nothing: a failure is counted, and leaves what it would have
+/// fetched unfetched.
+pub fn prefetch_changed_node_blocks(
+    repository: Arc<RepositoryContext>,
+    local: Arc<dyn ImmutableStore>,
+    state: Hash,
+    against: Vec<Hash>,
+    max_blocks: usize,
+    tracker: Arc<PrefetchTracker>,
+) -> impl Future<Output = ()> {
+    prefetch_changed_node_blocks_in_chunks(
+        repository,
+        local,
+        state,
+        against,
+        max_blocks,
+        tracker,
+        BLOCKS_IN_FLIGHT,
+    )
+}
+
+/// [`prefetch_changed_node_blocks`], comparing the blocks with `local` `chunk` at a time.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+#[lore_macro::test_pub]
+fn prefetch_changed_node_blocks_in_chunks(
+    repository: Arc<RepositoryContext>,
+    local: Arc<dyn ImmutableStore>,
+    state: Hash,
+    against: Vec<Hash>,
+    max_blocks: usize,
+    tracker: Arc<PrefetchTracker>,
+    chunk: usize,
+) -> impl Future<Output = ()> {
+    async move {
+        let started = tokio::time::Instant::now();
+        PrefetchTracker::add(&tracker.runs, 1);
+        let Some(lists) =
+            compared_block_lists(&repository, state, against, max_blocks, &tracker).await
+        else {
+            return;
+        };
+        let Some((state_list, against_lists)) = lists.split_first() else {
+            return;
+        };
+        if !fetch_changed_blocks(
+            &repository,
+            &local,
+            state_list,
+            against_lists,
+            &tracker,
+            chunk,
+        )
+        .await
+        {
+            return;
+        }
+        PrefetchTracker::add(&tracker.finished, 1);
+        tracker.finished_micros.fetch_add(
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// Compares the blocks at which the list `state` differs from any of `against` with `local`
+/// `chunk` at a time, and fetches each it lacks as it is found ([`fetch_block`]), at most
+/// [`BLOCKS_IN_FLIGHT`] at once. Answers whether it compared every block and every fetch ended.
+///
+/// A function of its own because the changed blocks are held across its awaits: in its caller's
+/// body they would take space beside the loading of the states.
+async fn fetch_changed_blocks(
+    repository: &Arc<RepositoryContext>,
+    local: &Arc<dyn ImmutableStore>,
+    state: &[Hash],
+    against: &[Vec<Hash>],
+    tracker: &Arc<PrefetchTracker>,
+    chunk: usize,
+) -> bool {
+    let stopped = CancellationToken::new();
+    let _stop_when_dropped = stopped.clone().drop_guard();
+    let permits = Arc::new(Semaphore::new(BLOCKS_IN_FLIGHT));
+    let name_tables: Arc<Mutex<HashSet<Hash>>> = Arc::default();
+    let mut changed = changed_blocks(state, against);
+    // Grown as far as the first chunk needs, and reused for the rest.
+    let mut blocks = Vec::new();
+    loop {
+        blocks.clear();
+        blocks.extend(changed.by_ref().take(chunk));
+        if blocks.is_empty() {
+            break;
+        }
+        // A block can be named at more than one index; a chunk asks for it once.
+        blocks.sort_unstable();
+        blocks.dedup();
+        PrefetchTracker::add(&tracker.blocks_changed, blocks.len());
+        let missing = missing_locally(local, repository, &blocks, tracker).await;
+        PrefetchTracker::add(&tracker.blocks_missing, missing.len());
+        for block in missing {
+            let Ok(permit) = permits.clone().acquire_owned().await else {
+                return false;
+            };
+            lore_spawn!(fetch_block(
+                repository.clone(),
+                block,
+                FetchShared {
+                    stopped: stopped.clone(),
+                    name_tables: name_tables.clone(),
+                    tracker: tracker.clone(),
+                },
+                permit
+            ));
+        }
+    }
+    // Every permit back means every fetch has ended.
+    permits.acquire_many(BLOCKS_IN_FLIGHT as u32).await.is_ok()
+}
+
+/// The stored node block hashes of the states of `state` and of those of `against` that load,
+/// `state`'s first.
+/// `None` where `state` or every one of `against` fails to load, or a state can't be compared.
+async fn compared_block_lists(
+    repository: &Arc<RepositoryContext>,
+    state: Hash,
+    against: Vec<Hash>,
+    max_blocks: usize,
+    tracker: &PrefetchTracker,
+) -> Option<Vec<Vec<Hash>>> {
+    let (state, against) = load_compared(repository, state, against, tracker).await?;
+    node_block_lists(
+        repository,
+        std::iter::once(&state).chain(&against),
+        max_blocks,
+        tracker,
+    )
+    .await
+}
+
+/// The states of `state` and of those of `against` that load. `None` where `state` or every one of
+/// `against` fails to.
+async fn load_compared(
+    repository: &Arc<RepositoryContext>,
+    state: Hash,
+    against: Vec<Hash>,
+    tracker: &PrefetchTracker,
+) -> Option<(Arc<State>, Vec<Arc<State>>)> {
+    let mut loaded = Vec::with_capacity(against.len() + 1);
+    let mut state_loaded = false;
+    for (index, result) in futures::future::join_all(
+        std::iter::once(state)
+            .chain(against)
+            .map(|revision| State::deserialize(repository.clone(), revision)),
+    )
+    .await
+    .into_iter()
+    .enumerate()
+    {
+        match result {
+            Ok(state) => {
+                state_loaded |= index == 0;
+                loaded.push(state);
+            }
+            Err(_) => PrefetchTracker::add(&tracker.failed, 1),
+        }
+    }
+    if !state_loaded || loaded.len() < 2 {
+        return None;
+    }
+    let state = loaded.remove(0);
+    Some((state, loaded))
+}
+
+/// The addresses of the blocks at each index where the list `state` holds a different block from
+/// one of `against`: `state`'s block, then the block of each of `against` that differs, each named
+/// once per index. A zero hash, or an index past a list's end, is a block with nothing stored,
+/// which differs from any stored block and is not named.
+fn changed_blocks<'a>(
+    state: &'a [Hash],
+    against: &'a [Vec<Hash>],
+) -> impl Iterator<Item = Address> + 'a {
+    let length = against.iter().map(Vec::len).fold(state.len(), usize::max);
+    (0..length).flat_map(move |index| {
+        let ours = state.get(index);
+        let changed = against.iter().any(|list| list.get(index) != ours);
+        let theirs = against
+            .iter()
+            .enumerate()
+            .filter(move |&(position, list)| {
+                let block = list.get(index);
+                block != ours
+                    && against[..position]
+                        .iter()
+                        .all(|earlier| earlier.get(index) != block)
+            })
+            .filter_map(move |(_, list)| block_address(list, index));
+        changed
+            .then(|| block_address(state, index))
+            .flatten()
+            .into_iter()
+            .chain(theirs)
+    })
+}
+
+/// The stored node block hashes of each of `states`, in block order. `None` where a state has
+/// more than `max_blocks` blocks, or a tree or block list can't be read.
+async fn node_block_lists(
+    repository: &Arc<RepositoryContext>,
+    states: impl Iterator<Item = &Arc<State>>,
+    max_blocks: usize,
+    tracker: &PrefetchTracker,
+) -> Option<Vec<Vec<Hash>>> {
+    let mut lists = Vec::new();
+    for state in states {
+        let Ok((block_count, hash_node)) = state
+            .tree(repository.clone())
+            .await
+            .map(|tree| (tree.block_count as usize, tree.hash_node))
+        else {
+            PrefetchTracker::add(&tracker.failed, 1);
+            return None;
+        };
+        // The block count sizes the block list read below, so it is checked first.
+        if block_count > max_blocks {
+            PrefetchTracker::add(&tracker.skipped, 1);
+            return None;
+        }
+        if hash_node.is_zero() {
+            lists.push(Vec::new());
+            continue;
+        }
+        let Ok(list) = state
+            .node_block_addresses(repository, hash_node, block_count)
+            .await
+        else {
+            PrefetchTracker::add(&tracker.failed, 1);
+            return None;
+        };
+        lists.push(
+            list.as_type_slice::<Hash>()
+                .iter()
+                .take(block_count)
+                .copied()
+                .collect(),
+        );
+    }
+    Some(lists)
+}
+
+/// The addresses of `addresses` whose payload `local` lacks. Where the query fails, none are, so
+/// none of them is fetched.
+async fn missing_locally(
+    local: &Arc<dyn ImmutableStore>,
+    repository: &RepositoryContext,
+    addresses: &[Address],
+    tracker: &PrefetchTracker,
+) -> Vec<Address> {
+    let mut resolved = vec![StoreMatchResult::default(); addresses.len()];
+    if local
+        .clone()
+        .query(repository.id, addresses, &mut resolved)
+        .await
+        .is_err()
+    {
+        PrefetchTracker::add(&tracker.failed, 1);
+        return Vec::new();
+    }
+    addresses
+        .iter()
+        .zip(resolved.iter())
+        .filter(|(_, resolved)| !immutable::held_locally(resolved))
+        .map(|(address, _)| *address)
+        .collect()
+}
+
+/// What the block fetches of one prefetch share.
+struct FetchShared {
+    /// Cancelled once the prefetch is dropped.
+    stopped: CancellationToken,
+    /// The name tables a fetch has started reading.
+    name_tables: Arc<Mutex<HashSet<Hash>>>,
+    tracker: Arc<PrefetchTracker>,
+}
+
+/// Reads the node block at `block` through `repository`'s store, which fills the store the prefetch
+/// fills with it, and then the name table it names, unless the prefetch has stopped by then or another of its
+/// fetches has read that name table. Holds `permit` until it ends.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn fetch_block(
+    repository: Arc<RepositoryContext>,
+    block: Address,
+    shared: FetchShared,
+    permit: OwnedSemaphorePermit,
+) -> impl Future<Output = ()> {
+    async move {
+        let tracker = &shared.tracker;
+        match stored_name_table(read_stored_node_block(repository.clone(), block).await) {
+            Ok(name_table) => {
+                PrefetchTracker::add(&tracker.blocks_fetched, 1);
+                // A prefetch dropped since this block's read started starts no more reads.
+                if !name_table.is_zero()
+                    && !shared.stopped.is_cancelled()
+                    && shared.name_tables.lock().insert(name_table)
+                {
+                    let options = immutable::read_options_from_repository(&repository).with_cache();
+                    let address = Address::zero_context_hash(name_table);
+                    match immutable::read(repository, address, None, options).await {
+                        Ok(_) => PrefetchTracker::add(&tracker.name_tables_fetched, 1),
+                        Err(_) => PrefetchTracker::add(&tracker.failed, 1),
+                    }
+                }
+            }
+            Err(_) => PrefetchTracker::add(&tracker.failed, 1),
+        }
+        drop(permit);
+    }
 }

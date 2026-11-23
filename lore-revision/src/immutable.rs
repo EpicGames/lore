@@ -874,7 +874,7 @@ enum LocalCopy {
 
 /// Whether `resolved` holds a payload locally. An entry without its payload, as eviction leaves
 /// one, holds nothing to serve or walk, so it counts as lacking.
-fn held_locally(resolved: &StoreMatchResult) -> bool {
+pub(crate) fn held_locally(resolved: &StoreMatchResult) -> bool {
     resolved.match_made != StoreMatch::MatchNone && resolved.stored_local
 }
 

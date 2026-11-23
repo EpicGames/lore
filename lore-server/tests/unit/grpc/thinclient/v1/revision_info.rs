@@ -81,6 +81,7 @@ async fn create_branch_with_history(
             .expect("serialize state");
         let pushed = branch_push::push(
             repository.clone(),
+            None,
             branch_id,
             serialized,
             crate::util::test_support::PUSH_ANY,
@@ -277,6 +278,7 @@ async fn merge_revision_includes_parent_other() {
             .expect("serialize state");
         let merge_signature = branch_push::push(
             repository_context.clone(),
+            None,
             branch_id,
             serialized,
             crate::util::test_support::PUSH_ANY,
@@ -372,6 +374,7 @@ async fn metadata_fields_are_extracted() {
             .expect("serialize state");
         let signature = branch_push::push(
             repository_context.clone(),
+            None,
             branch_id,
             serialized,
             crate::util::test_support::PUSH_ANY,
