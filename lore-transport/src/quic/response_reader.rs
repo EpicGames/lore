@@ -25,7 +25,7 @@ use super::command_header::COMMAND_HEADER_SIZE;
 use super::command_header::COMMAND_HEADER_SIZE_V4;
 use crate::quic::chunking::ParallelChunking;
 
-type PendingResultSender = oneshot::Sender<Result<Bytes, QuicClientError>>;
+pub(crate) type PendingResultSender = oneshot::Sender<Result<Bytes, QuicClientError>>;
 
 /// The commands waiting for their answer on one stream, by the ids it assigns them, and whether
 /// the stream's reader has stopped.
@@ -41,6 +41,7 @@ pub struct PendingCommands {
 
 impl PendingCommands {
     /// An empty set, whose first command takes id 1.
+    #[lore_macro::test_pub]
     pub(crate) fn new() -> Self {
         Self {
             commands: DashMap::default(),
@@ -49,25 +50,33 @@ impl PendingCommands {
         }
     }
 
-    /// Assigns the command a new stream-specific id and puts its completion channel in the map.
-    ///
-    /// Fails with `Terminated` once the reader has stopped, since nothing would read the answer.
-    pub(crate) fn wait_for(
-        &self,
-        tx: oneshot::Sender<Result<Bytes, QuicClientError>>,
-    ) -> Result<u32, QuicClientError> {
-        let command_id = self.counter.fetch_add(1, Ordering::Relaxed);
+    /// A new stream-specific id for a command.
+    pub(crate) fn next_id(&self) -> u32 {
+        self.counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Puts the completion channel of the command `command_id` in the map, and answers whether it
+    /// stays there. Once the reader has stopped, nothing would read the answer, so the command is
+    /// taken out again and fails with `Terminated`.
+    pub(crate) fn wait_for(&self, command_id: u32, tx: PendingResultSender) -> bool {
         self.commands.insert(command_id, tx);
         if self.closed.load(Ordering::Relaxed) {
-            self.commands.remove(&command_id);
-            return Err(QuicClientError::Terminated);
+            self.fail(command_id, QuicClientError::Terminated);
+            return false;
         }
-        Ok(command_id)
+        true
     }
 
     /// Takes out the command `command_id`, for which no answer will come.
     pub(crate) fn remove(&self, command_id: u32) {
         self.commands.remove(&command_id);
+    }
+
+    /// Takes out the command `command_id`, failing it with `error`.
+    pub(crate) fn fail(&self, command_id: u32, error: QuicClientError) {
+        if let Some((_, tx)) = self.commands.remove(&command_id) {
+            let _ = tx.send(Err(error));
+        }
     }
 }
 
@@ -211,6 +220,22 @@ async fn read_response(
     }
 
     Ok(())
+}
+
+/// Whether `result` shows its command's frame written in full: the server's answer, which it sends
+/// only once it has read the frame in full, or the `Ok` of a command that waits only for its frame
+/// to be written. Every error [`handle_error`] makes is the server's.
+#[lore_macro::test_pub]
+pub(crate) fn shows_frame_written(result: &Result<Bytes, QuicClientError>) -> bool {
+    matches!(
+        result,
+        Ok(_)
+            | Err(QuicClientError::SlowDown
+                | QuicClientError::NotAuthorized
+                | QuicClientError::NotFound
+                | QuicClientError::Oversized
+                | QuicClientError::ServerError(_))
+    )
 }
 
 #[lore_macro::test_pub]

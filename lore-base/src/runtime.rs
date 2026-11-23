@@ -1031,11 +1031,91 @@ impl TokioSettings {
     }
 }
 
+/// The timer a core runtime keeps its sleeps and timeouts in.
+#[lore_macro::test_pub]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoreTimer {
+    /// Tokio's default timer: one wheel for the runtime, behind one lock.
+    Shared,
+    /// Tokio's alternative timer: one wheel per worker, which only that worker reads and writes.
+    /// A cancel still locks the cancel queue of the wheel that holds the timer, and a timer set
+    /// from outside the workers locks a queue the whole runtime shares. It needs
+    /// `cfg(tokio_unstable)`; a build without it keeps [`CoreTimer::Shared`].
+    PerWorker,
+}
+
+/// Environment variable naming the timer [`serving_runtime`] builds the core runtime with:
+/// `per-worker`, the default, or `shared`.
+pub const CORE_TIMER_ENV: &str = "LORE_CORE_TIMER";
+
+/// The timer [`serving_core_timer`] reads from a value of [`CORE_TIMER_ENV`], with the value when
+/// it names neither timer.
+#[lore_macro::test_pub]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CoreTimerChoice {
+    timer: CoreTimer,
+    unknown_value: Option<String>,
+}
+
+/// What [`serving_runtime`] chose, kept for [`report_serving_runtime`]: a process that serves
+/// builds its runtime before its logging is set up, so a message logged then is lost.
+static SERVING_CORE_TIMER: OnceLock<CoreTimerChoice> = OnceLock::new();
+
+/// The timer a value of [`CORE_TIMER_ENV`] names, without surrounding whitespace:
+/// [`CoreTimer::Shared`] for `shared`, and [`CoreTimer::PerWorker`] for `per-worker`, for no value,
+/// for a blank one, and for any other.
+#[lore_macro::test_pub]
+fn serving_core_timer(value: Option<&str>) -> CoreTimerChoice {
+    let (timer, unknown_value) = match value.map(str::trim) {
+        None | Some("" | "per-worker") => (CoreTimer::PerWorker, None),
+        Some("shared") => (CoreTimer::Shared, None),
+        Some(_) => (CoreTimer::PerWorker, value.map(str::to_string)),
+    };
+    CoreTimerChoice {
+        timer,
+        unknown_value,
+    }
+}
+
+/// The timer the core runtime was built with, once it is built.
+static CORE_RUNTIME_TIMER: OnceLock<CoreTimer> = OnceLock::new();
+
+/// Logs what a process that serves built its runtime with: a warning for each retired thread
+/// variable still set, a warning for a [`CORE_TIMER_ENV`] that names neither timer, and the core
+/// runtime's timer. Call it once the process's logging is set up.
+pub fn report_serving_runtime() {
+    warn_retired_thread_vars();
+    if let Some(value) = SERVING_CORE_TIMER
+        .get()
+        .and_then(|choice| choice.unknown_value.as_ref())
+    {
+        crate::lore_warn!(
+            "{CORE_TIMER_ENV} is `{value}`, not `per-worker` or `shared`; keeping the per-worker timer"
+        );
+    }
+    if let Some(timer) = CORE_RUNTIME_TIMER.get() {
+        crate::lore_info!("Core runtime timer: {timer:?}");
+    }
+}
+
+/// `timer` where the build has `cfg(tokio_unstable)`, and [`CoreTimer::Shared`] where it does not.
+fn available_core_timer(timer: CoreTimer) -> CoreTimer {
+    if cfg!(tokio_unstable) {
+        timer
+    } else {
+        CoreTimer::Shared
+    }
+}
+
 /// Returns a handle to the core runtime of a process that serves, building it with `settings`
 /// if none exists: one core thread and one net thread per processor, since serving thousands of
 /// concurrent client connections is its normal case. `settings.net_threads` and
 /// `LORE_NET_THREADS` set the net threads instead, and a thread limit bounds the total. The net
 /// threads are set before the runtime is built, since both runtimes are sized from them once.
+/// The core runtime keeps a [`CoreTimer::PerWorker`] timer, since its workers set and cancel
+/// many timers at once, unless [`CORE_TIMER_ENV`] is `shared`: Tokio's per-worker timer is
+/// unstable, and the variable lets an operator leave it without a rebuild. The process reports the
+/// choice with [`report_serving_runtime`] once its logging is set up.
 pub fn serving_runtime(settings: Option<TokioSettings>) -> Handle {
     let _ = set_net_threads_default(
         settings
@@ -1044,7 +1124,15 @@ pub fn serving_runtime(settings: Option<TokioSettings>) -> Handle {
             .filter(|&count| count > 0)
             .unwrap_or_else(processor_count),
     );
-    runtime_with_settings(settings)
+    let choice = SERVING_CORE_TIMER.get_or_init(|| {
+        serving_core_timer(
+            std::env::var_os(CORE_TIMER_ENV)
+                .as_deref()
+                .map(|value| value.to_string_lossy())
+                .as_deref(),
+        )
+    });
+    current_or_core_runtime(settings, choice.timer)
 }
 
 /// Returns a handle to the shared tokio runtime, creating it lazily with default settings.
@@ -1058,10 +1146,16 @@ pub fn runtime() -> Handle {
 /// If a tokio runtime is already active on the current thread, returns its handle instead.
 /// Worker count comes from `settings` when it sets one, else from the thread budget.
 pub fn runtime_with_settings(settings: Option<TokioSettings>) -> Handle {
+    current_or_core_runtime(settings, CoreTimer::Shared)
+}
+
+/// The current runtime's handle, else the core runtime's, built with `settings` and `timer` if
+/// none exists.
+fn current_or_core_runtime(settings: Option<TokioSettings>, timer: CoreTimer) -> Handle {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle
     } else {
-        core_runtime_with_settings(settings)
+        core_runtime_with_settings(settings, timer)
     }
 }
 
@@ -1075,17 +1169,20 @@ pub fn runtime_with_settings(settings: Option<TokioSettings>) -> Handle {
 /// Built once per process, with the same post-shutdown behaviour as
 /// [`net_runtime`].
 pub fn core_runtime() -> Handle {
-    core_runtime_with_settings(None)
+    core_runtime_with_settings(None, CoreTimer::Shared)
 }
 
-fn core_runtime_with_settings(settings: Option<TokioSettings>) -> Handle {
+fn core_runtime_with_settings(settings: Option<TokioSettings>, timer: CoreTimer) -> Handle {
     CORE_RUNTIME
-        .get_or_init(|| SharedRuntime::new(build_core_runtime(settings)))
+        .get_or_init(|| {
+            let _ = CORE_RUNTIME_TIMER.set(available_core_timer(timer));
+            SharedRuntime::new(build_core_runtime(settings, timer))
+        })
         .handle
         .clone()
 }
 
-/// Warns once for a retired per-pool thread variable that is still set.
+/// Warns for each retired per-pool thread variable that is still set.
 ///
 /// Removing the knob silently would lose whatever tuning a caller had configured without telling
 /// them; `LORE_MAX_THREADS` is what replaces it.
@@ -1101,7 +1198,13 @@ fn warn_retired_thread_vars() {
     }
 }
 
-fn build_core_runtime(settings: Option<TokioSettings>) -> tokio::runtime::Runtime {
+/// Builds a core runtime sized by `settings` over the defaults, with `timer` where the build has
+/// `cfg(tokio_unstable)` and [`CoreTimer::Shared`] where it does not.
+#[lore_macro::test_pub]
+fn build_core_runtime(
+    settings: Option<TokioSettings>,
+    timer: CoreTimer,
+) -> tokio::runtime::Runtime {
     warn_retired_thread_vars();
     let settings = settings.unwrap_or_default();
     if let Some(net_threads) = settings.net_threads.filter(|&count| count > 0) {
@@ -1109,8 +1212,9 @@ fn build_core_runtime(settings: Option<TokioSettings>) -> tokio::runtime::Runtim
     }
     settle_net_connections();
     let counts = core_thread_counts(&settings);
+    let timer = available_core_timer(timer);
     crate::lore_debug!(
-        "Core runtime: {} workers, {} blocking; syscall pool: {}",
+        "Core runtime: {} workers, {} blocking, {timer:?} timer; syscall pool: {}",
         counts.worker,
         core_blocking_threads(counts),
         counts.io
@@ -1129,6 +1233,10 @@ fn build_core_runtime(settings: Option<TokioSettings>) -> tokio::runtime::Runtim
         });
     // Tokio would otherwise default to the raw core count and ignore the thread limit.
     builder.worker_threads(counts.worker);
+    #[cfg(tokio_unstable)]
+    if timer == CoreTimer::PerWorker {
+        builder.enable_alt_timer();
+    }
     builder.build().expect("Failed to create runtime")
 }
 

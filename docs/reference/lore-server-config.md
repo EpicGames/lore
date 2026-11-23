@@ -64,6 +64,16 @@ Environment-variable overrides apply last, after every file layer, so they win o
 > [!NOTE]
 > Only scalar fields can be set this way. Array-valued fields — such as the `peers` list under `[topology.fixed]` — cannot be overridden through a single environment variable; configure those in a file layer instead.
 
+## Runtime environment variables
+
+This variable is not a settings field, so it has no `LORE__` form and no config-file key. The server reads it once, when it builds its async runtime at startup.
+
+| Variable | Values | Default | Effect |
+| --- | --- | --- | --- |
+| `LORE_CORE_TIMER` | `per-worker`, `shared` | `per-worker` | The timer the server's core runtime keeps its sleeps and timeouts in. `per-worker` gives each worker thread its own timer, which suits a server whose requests set many timers at once. `per-worker` is Tokio's unstable alternative timer; `shared` selects Tokio's default timer, one for the whole runtime, without a rebuild. |
+
+Unset or blank, `LORE_CORE_TIMER` is `per-worker`. Surrounding whitespace is ignored. Any other value keeps `per-worker`, and the server logs a warning once its logging is set up. Only the server reads it: the CLI and programs that embed Lore always use the shared timer.
+
 ## Zero-config defaults
 
 With no config files loaded, the server runs as a self-contained, single-node instance, substituting ephemeral local artifacts for what a production deployment would configure. It logs each substitution so the choice is visible.

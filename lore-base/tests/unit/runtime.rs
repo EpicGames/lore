@@ -199,6 +199,72 @@ fn runtime_with_settings_returns_valid_handle() {
     });
 }
 
+/// Both timers a core runtime can keep.
+const CORE_TIMERS: [CoreTimer; 2] = [CoreTimer::Shared, CoreTimer::PerWorker];
+
+#[test]
+fn a_core_runtime_fires_sleeps_and_timeouts_with_either_timer() {
+    for timer in CORE_TIMERS {
+        let runtime = build_core_runtime(None, timer);
+        crate::timer::assert_timers_fire(runtime.handle());
+    }
+}
+
+/// A runtime keeps the timer it is built with. A build without `cfg(tokio_unstable)` has only
+/// Tokio's default timer, which a per-worker request falls back to.
+#[test]
+fn a_core_runtime_keeps_the_timer_it_is_built_with() {
+    for timer in CORE_TIMERS {
+        let runtime = build_core_runtime(None, timer);
+        let sleep = crate::timer::pending_sleep(runtime.handle());
+        drop(runtime);
+        assert_eq!(
+            crate::timer::completes_after_shutdown(sleep),
+            timer == CoreTimer::PerWorker && cfg!(tokio_unstable),
+            "{timer:?}"
+        );
+    }
+}
+
+/// `LORE_CORE_TIMER` selects the shared timer by `shared`, and the per-worker timer by
+/// `per-worker`, unset or blank, around any surrounding whitespace.
+#[test]
+fn the_core_timer_variable_selects_either_timer_and_defaults_to_per_worker() {
+    for (value, timer) in [
+        (None, CoreTimer::PerWorker),
+        (Some(""), CoreTimer::PerWorker),
+        (Some("  "), CoreTimer::PerWorker),
+        (Some("per-worker"), CoreTimer::PerWorker),
+        (Some(" per-worker\n"), CoreTimer::PerWorker),
+        (Some("shared"), CoreTimer::Shared),
+        (Some(" shared "), CoreTimer::Shared),
+    ] {
+        assert_eq!(
+            serving_core_timer(value),
+            CoreTimerChoice {
+                timer,
+                unknown_value: None
+            },
+            "{value:?}"
+        );
+    }
+}
+
+/// A value that names neither timer keeps the per-worker timer, and is recorded to be reported.
+#[test]
+fn an_unknown_core_timer_value_keeps_the_per_worker_timer() {
+    for value in ["Shared", "per_worker", "default"] {
+        assert_eq!(
+            serving_core_timer(Some(value)),
+            CoreTimerChoice {
+                timer: CoreTimer::PerWorker,
+                unknown_value: Some(value.to_string())
+            },
+            "{value:?}"
+        );
+    }
+}
+
 /// The syscall pool's request on a host with this many cores, so the cases
 /// below do not depend on the machine running them.
 const IO_REQUEST: usize = 16;

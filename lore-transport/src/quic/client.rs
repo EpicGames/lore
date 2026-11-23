@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::VecDeque;
 use std::future::Future;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
@@ -12,6 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -35,10 +39,10 @@ use quinn::VarInt;
 use quinn::congestion;
 use quinn::crypto::rustls::QuicClientConfig;
 use thiserror::Error;
-use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
+use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use url::Url;
 
@@ -50,7 +54,9 @@ use super::TIME_THRESHOLD;
 use super::command_header::COMMAND_HEADER_SIZE_V4;
 use super::command_header::CommandHeader;
 use super::response_reader::PendingCommands;
+use super::response_reader::PendingResultSender;
 use super::response_reader::ResponseReader;
+use super::response_reader::shows_frame_written;
 use crate::connection::RECONNECT_MAX_ATTEMPTS;
 use crate::connection::RECONNECT_MAX_DELAY;
 use crate::connection::RECONNECT_START_DELAY;
@@ -418,41 +424,48 @@ impl BoundSession {
 
 struct QuicQuinnConnection {
     connection: quinn::Connection,
-    writer: Vec<Arc<Mutex<StreamWriter>>>,
+    writer: Vec<StreamWriter>,
     reader: Vec<ResponseReader>,
 }
 
-/// A stream's send half, with the commands waiting for their answer on the stream. A command
-/// registers only while it holds the writer, so one dropped while it waits for the writer leaves
-/// nothing registered, and the command's future holds nothing more during that wait.
-#[lore_macro::test_pub]
+/// The way to the task that writes a stream ([`write_stream`]): the channel a command queues its
+/// frame on, and what the task shares with the commands it writes for.
 struct StreamWriter {
-    send: quinn::SendStream,
-    pending: Arc<PendingCommands>,
+    frames: mpsc::UnboundedSender<QueuedFrame>,
+    stream: Arc<StreamShared>,
 }
 
 impl QuicQuinnConnection {
-    /// Adds the stream whose halves are `send` and `recv`, with a reader of its answers.
+    /// Adds the stream of `quic` whose halves are `send` and `recv`, with a task that writes the
+    /// frames queued for it and a reader of its answers.
     fn push_stream(
         &mut self,
         send: quinn::SendStream,
         recv: quinn::RecvStream,
-        max_chunk_size: usize,
-        last_recv: Arc<AtomicU64>,
-        created: Instant,
-        v4: bool,
+        quic: &QuicConnection,
     ) {
         let pending = Arc::new(PendingCommands::new());
         self.reader.push(ResponseReader::new(
             recv,
             pending.clone(),
-            max_chunk_size,
-            last_recv,
-            created,
-            v4,
+            quic.max_chunk_size,
+            quic.last_recv.clone(),
+            quic.created,
+            quic.v4,
         ));
-        self.writer
-            .push(Arc::new(Mutex::new(StreamWriter { send, pending })));
+        let stream = Arc::new(StreamShared {
+            queue: parking_lot::Mutex::default(),
+            pending,
+        });
+        let (frames, queued) = mpsc::unbounded_channel();
+        lore_spawn_net_nocontext!(write_stream(
+            send,
+            queued,
+            stream.clone(),
+            quic.stream_inflight.clone(),
+            self.writer.len() as u8,
+        ));
+        self.writer.push(StreamWriter { frames, stream });
     }
 
     async fn close(&mut self) {
@@ -465,8 +478,8 @@ impl QuicQuinnConnection {
         // CONNECTION_CLOSE(app, 0) as a graceful close (see is_graceful_close in
         // lore-server/src/quic/stream_handler.rs), so the stream-level FIN handshake
         // (1 RTT per stream) is unnecessary. Dropping the reader/writer vecs detaches
-        // the reader tasks; they exit promptly once the connection's close() below
-        // terminates their recv streams.
+        // the reader and writer tasks; they exit promptly once the connection's close()
+        // below terminates their streams.
         self.writer.clear();
         self.reader.clear();
         self.connection
@@ -525,9 +538,6 @@ impl QuicConnection {
     }
 
     pub async fn create_initial_stream(&self) -> Result<(), QuicClientError> {
-        let last_recv = self.last_recv.clone();
-        let created = self.created;
-
         {
             let mut connection = self.connection.write().await;
 
@@ -536,7 +546,7 @@ impl QuicConnection {
                 .open_bi()
                 .await
                 .map_err(|_err| QuicClientError::StreamOpen)?;
-            connection.push_stream(send, recv, self.max_chunk_size, last_recv, created, self.v4);
+            connection.push_stream(send, recv, self);
             lore_trace!("Created initial connect bidirectional stream");
         }
 
@@ -646,19 +656,52 @@ impl QuicConnection {
         Ok(())
     }
 
-    /// Opens every stream the connection may have, then holds the writer of each until the guards
-    /// are dropped.
+    /// Opens every stream the connection may have, then holds the writer of each, which takes no
+    /// frame from its channel until the [`HeldWriters`] are dropped.
     #[cfg(feature = "test-util")]
-    pub async fn lock_writers(
-        self: &Arc<Self>,
-    ) -> Result<Vec<tokio::sync::OwnedMutexGuard<StreamWriter>>, QuicClientError> {
+    pub async fn hold_writers(self: &Arc<Self>) -> Result<HeldWriters, QuicClientError> {
         self.open_streams().await?;
-        let writers = self.connection.read().await.writer.clone();
-        let mut locked = Vec::with_capacity(writers.len());
-        for writer in writers {
-            locked.push(writer.lock_owned().await);
+        let streams: Vec<_> = self
+            .connection
+            .read()
+            .await
+            .writer
+            .iter()
+            .map(|writer| writer.stream.clone())
+            .collect();
+        for stream in &streams {
+            stream.queue.lock().held = true;
         }
-        Ok(locked)
+        Ok(HeldWriters(streams))
+    }
+
+    /// How many frames the writers of the connection's streams have taken from their channels and
+    /// not yet written in full.
+    #[cfg(feature = "test-util")]
+    pub async fn queued_frames(&self) -> usize {
+        self.connection
+            .read()
+            .await
+            .writer
+            .iter()
+            .map(|writer| writer.stream.queue.lock().frames.len())
+            .sum()
+    }
+}
+
+/// The writers of a connection's streams, which [`QuicConnection::hold_writers`] holds until this
+/// is dropped.
+#[cfg(feature = "test-util")]
+pub struct HeldWriters(Vec<Arc<StreamShared>>);
+
+#[cfg(feature = "test-util")]
+impl Drop for HeldWriters {
+    fn drop(&mut self) {
+        for stream in &self.0 {
+            let mut queue = stream.queue.lock();
+            queue.held = false;
+            queue.wake();
+        }
     }
 }
 
@@ -1380,9 +1423,6 @@ where
 /// which compares its round-robin index against it, stops asking for more streams once
 /// all `STREAM_COUNT` of them exist.
 async fn add_stream(connection: Arc<QuicConnection>) -> Result<u32, QuicClientError> {
-    let last_recv = connection.last_recv.clone();
-    let created = connection.created;
-
     let mut connection_lock = connection.connection.write().await;
 
     let stream_index = connection_lock.writer.len() as u32;
@@ -1398,14 +1438,7 @@ async fn add_stream(connection: Arc<QuicConnection>) -> Result<u32, QuicClientEr
                 }
             })
             .map_err(|_err| QuicClientError::StreamOpen)?;
-        connection_lock.push_stream(
-            send,
-            recv,
-            connection.max_chunk_size,
-            last_recv.clone(),
-            created,
-            connection.v4,
-        );
+        connection_lock.push_stream(send, recv, &connection);
 
         connection
             .stream_count
@@ -1565,123 +1598,409 @@ where
     )
 }
 
-/// A frame being written to a stream, with the stream's writer held while it is. A stream carries
-/// one frame after another, so a frame cut short would put the next frame's header inside its
-/// payload, and the server would read the two as one request. Dropped part way through its write,
-/// as when the command's future is dropped, it hands a copy of the rest of the frame and the writer
-/// to [`finish_frame`], spawned without the command's context as it serves every later command on
-/// the stream, and counts the finish as a request outstanding on the stream, which
-/// [`select_stream`] balances on, until the finish releases the writer; dropped before any of the
-/// frame was written, it sends nothing and takes out the command's registration, as no answer will
-/// come. The rest is copied as the finish outlives the command, and a chunk may be memory its
-/// caller lends only until the command is done.
-struct FrameWrite<'a> {
-    /// The stream's writer while the write is under way; `None` once it has returned.
-    stream: Option<tokio::sync::OwnedMutexGuard<StreamWriter>>,
-    chunks: &'a mut [Bytes],
-    /// The id of the frame's command among those waiting on the stream.
-    command_id: u32,
-    /// The requests outstanding on each of the connection's streams.
-    stream_inflight: &'a Arc<[AtomicU64; STREAM_COUNT as usize]>,
-    /// The index of the frame's stream. A byte, as is `header_size`, so that the command id fits
-    /// in the frame's future without growing it.
-    stream_index: u8,
-    /// The length of the frame's header, its first chunk, which keeps that length until the write
-    /// takes some of the frame.
-    header_size: u8,
-}
+/// The most chunks a queued frame holds, its header included. A frame of more has the rest joined
+/// into its last chunk.
+#[lore_macro::test_pub]
+const FRAME_CHUNKS: usize = 6;
+
+/// The frames a stream's empty queue keeps room for. A queue that grew past them in a burst gives
+/// the rest back once it empties.
+#[lore_macro::test_pub]
+const QUEUE_FRAMES_KEPT: usize = 64;
 
 const _: () = assert!(STREAM_COUNT <= u8::MAX as u32 + 1);
 const _: () = assert!(COMMAND_HEADER_SIZE_V4 <= u8::MAX as usize);
 
-impl<'a> FrameWrite<'a> {
-    /// The frame `chunks` hold of the command `command_id`, to be written to the stream at
-    /// `stream_index` whose writer `stream` holds.
+/// A command's frame on its way to its stream's writer ([`write_stream`]), with the channel that
+/// completes the command.
+#[lore_macro::test_pub]
+struct QueuedFrame {
+    /// The frame's chunks, its header first, in the first `chunk_count`.
+    chunks: [Bytes; FRAME_CHUNKS],
+    chunk_count: u8,
+    command_id: u32,
+    reply: PendingResultSender,
+    /// Whether the command waits for its answer, rather than only for its frame to be written.
+    await_response: bool,
+}
+
+impl QueuedFrame {
+    /// The frame `chunks` hold, header first, of the command `command_id`, taking the chunks.
+    #[lore_macro::test_pub]
     fn new(
-        stream: tokio::sync::OwnedMutexGuard<StreamWriter>,
-        chunks: &'a mut [Bytes],
+        chunks: &mut [Bytes],
         command_id: u32,
-        stream_inflight: &'a Arc<[AtomicU64; STREAM_COUNT as usize]>,
-        stream_index: u8,
+        reply: PendingResultSender,
+        await_response: bool,
     ) -> Self {
+        let mut frame: [Bytes; FRAME_CHUNKS] = Default::default();
+        let chunk_count = chunks.len().min(FRAME_CHUNKS);
+        for (slot, chunk) in frame.iter_mut().zip(chunks.iter_mut()) {
+            *slot = std::mem::take(chunk);
+        }
+        if chunks.len() > FRAME_CHUNKS {
+            frame[FRAME_CHUNKS - 1] =
+                joined(std::iter::once(&frame[FRAME_CHUNKS - 1]).chain(&chunks[FRAME_CHUNKS..]));
+        }
         Self {
-            stream: Some(stream),
-            header_size: chunks[0].len() as u8,
-            chunks,
+            chunks: frame,
+            chunk_count: chunk_count as u8,
             command_id,
-            stream_inflight,
-            stream_index,
+            reply,
+            await_response,
+        }
+    }
+}
+
+/// A copy of `chunks`, one after another, in one chunk.
+fn joined<'a>(chunks: impl Iterator<Item = &'a Bytes> + Clone) -> Bytes {
+    let mut joined = Vec::with_capacity(chunks.clone().map(Bytes::len).sum());
+    for chunk in chunks {
+        joined.extend_from_slice(chunk);
+    }
+    Bytes::from(joined)
+}
+
+/// What the task that writes a stream ([`write_stream`]) shares with the commands it writes for:
+/// the frames it has taken from its channel, and the commands waiting for their answer on the
+/// stream.
+struct StreamShared {
+    queue: parking_lot::Mutex<StreamQueue>,
+    pending: Arc<PendingCommands>,
+}
+
+/// The frames a stream's writer has taken from its channel and not yet written in full, in the
+/// order it writes them, one after another. The writer holds the lock while it takes frames and
+/// while it writes, never across an await, so a command that takes its frame back under the lock
+/// ([`StreamQueue::take_back`]) finds it either not yet taken, or queued and not being written.
+#[lore_macro::test_pub]
+#[derive(Default)]
+struct StreamQueue {
+    /// The chunks of `frames`, one frame's after another's. A write empties or shortens in place
+    /// the chunks it takes.
+    chunks: VecDeque<Bytes>,
+    frames: VecDeque<FrameEntry>,
+    /// When the stream is reset if the first frame, whose command was dropped part way through its
+    /// write, is not yet written in full.
+    finish_by: Option<tokio::time::Instant>,
+    /// The writer's waker, while it waits.
+    waker: Option<Waker>,
+    /// Whether the writer takes no frame from its channel ([`QuicConnection::hold_writers`]).
+    #[cfg(feature = "test-util")]
+    held: bool,
+}
+
+/// A frame in a [`StreamQueue`].
+#[lore_macro::test_pub]
+struct FrameEntry {
+    command_id: u32,
+    chunk_count: u8,
+    /// The length of the frame's header, its first chunk, which keeps that length until a write
+    /// takes some of the frame.
+    header_size: u8,
+    /// Completes a command that does not wait for its answer once its frame is written.
+    written: Option<PendingResultSender>,
+    /// Whether the frame's command was dropped part way through its write. The rest of the frame
+    /// counts as a request outstanding on the stream, which [`select_stream`] balances on, until
+    /// it is written or fails.
+    dropped: bool,
+}
+
+impl StreamQueue {
+    /// Puts `frame` at the end of the queue, and its command among those waiting for an answer on
+    /// the stream, unless the command is gone, the stream's reader has stopped, or the stream
+    /// failed with `failed`. A command that waits only for its frame to be written waits among
+    /// them on a channel nothing reads, so that its answer is taken and discarded.
+    #[lore_macro::test_pub]
+    fn push(
+        &mut self,
+        frame: QueuedFrame,
+        pending: &PendingCommands,
+        failed: Option<&QuicClientError>,
+    ) {
+        let QueuedFrame {
+            chunks,
+            chunk_count,
+            command_id,
+            reply,
+            await_response,
+        } = frame;
+        if reply.is_closed() {
+            return;
+        }
+        if let Some(error) = failed {
+            let _ = reply.send(Err(error.clone()));
+            return;
+        }
+        let written = if await_response {
+            if !pending.wait_for(command_id, reply) {
+                return;
+            }
+            None
+        } else {
+            if !pending.wait_for(command_id, oneshot::channel().0) {
+                let _ = reply.send(Err(QuicClientError::Terminated));
+                return;
+            }
+            Some(reply)
+        };
+        let header_size = chunks[0].len() as u8;
+        self.chunks
+            .extend(chunks.into_iter().take(chunk_count as usize));
+        self.frames.push_back(FrameEntry {
+            command_id,
+            chunk_count,
+            header_size,
+            written,
+            dropped: false,
+        });
+    }
+
+    /// The chunks for the next write, those written included: the front part of the queue's
+    /// buffer until all of it is written, then the part after it. A frame the buffer holds in both
+    /// parts is written in two writes, which costs less than moving every chunk queued to make the
+    /// buffer one part.
+    #[lore_macro::test_pub]
+    fn unwritten(&mut self) -> &mut [Bytes] {
+        let (front, back) = self.chunks.as_mut_slices();
+        if front.iter().all(Bytes::is_empty) {
+            back
+        } else {
+            front
         }
     }
 
-    /// Writes the frame, then releases the stream's writer. Each `write_chunks` is cancel safe and
-    /// empties or shortens in place the chunks it takes, so `chunks` hold what is left to write at
-    /// every await.
-    async fn write(&mut self) -> Result<(), quinn::WriteError> {
-        while let Some(stream) = self.stream.as_mut()
-            && self.chunks.iter().any(|chunk| !chunk.is_empty())
+    /// Takes out the frames at the front written in full, completing each command that waits only
+    /// for that, and taking the rest of a dropped frame off `inflight`, the stream's count of
+    /// requests outstanding.
+    #[lore_macro::test_pub]
+    fn pop_written(&mut self, inflight: &AtomicU64) {
+        while let Some(frame) = self.frames.front()
+            && self
+                .chunks
+                .range(..frame.chunk_count as usize)
+                .all(Bytes::is_empty)
         {
-            if let Err(err) = stream.send.write_chunks(self.chunks).await {
-                self.stream = None;
-                return Err(err);
+            self.chunks.drain(..frame.chunk_count as usize);
+            let Some(frame) = self.frames.pop_front() else {
+                break;
+            };
+            if let Some(written) = frame.written {
+                let _ = written.send(Ok(Bytes::new()));
+            }
+            if frame.dropped {
+                inflight.fetch_sub(1, Ordering::Relaxed);
+                self.finish_by = None;
             }
         }
-        self.stream = None;
-        Ok(())
+        self.shrink_when_empty();
     }
-}
 
-impl Drop for FrameWrite<'_> {
-    fn drop(&mut self) {
-        let Some(stream) = self.stream.take() else {
+    /// Gives back the room of an empty queue beyond [`QUEUE_FRAMES_KEPT`] frames.
+    fn shrink_when_empty(&mut self) {
+        if !self.frames.is_empty() {
+            return;
+        }
+        if self.frames.capacity() > 2 * QUEUE_FRAMES_KEPT {
+            self.frames.shrink_to(QUEUE_FRAMES_KEPT);
+        }
+        if self.chunks.capacity() > 2 * QUEUE_FRAMES_KEPT * FRAME_CHUNKS {
+            self.chunks.shrink_to(QUEUE_FRAMES_KEPT * FRAME_CHUNKS);
+        }
+    }
+
+    /// Fails every frame queued with `error`, as no answer will come for a frame the stream did not
+    /// take in full, taking the rest of a dropped frame off `inflight`.
+    fn fail(&mut self, error: &QuicClientError, pending: &PendingCommands, inflight: &AtomicU64) {
+        for frame in self.frames.drain(..) {
+            pending.fail(frame.command_id, error.clone());
+            if let Some(written) = frame.written {
+                let _ = written.send(Err(error.clone()));
+            }
+            if frame.dropped {
+                inflight.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        self.chunks.clear();
+        self.finish_by = None;
+        self.shrink_when_empty();
+    }
+
+    /// Takes back the frame of the command `command_id`, whose chunks may be memory its caller
+    /// lends only until the command is done, when the command ends without its frame known to be
+    /// written. A frame none of which is written is taken out, with the command's place among
+    /// those waiting for an answer, as none will come. A frame written in part keeps a copy of its
+    /// rest, which the writer finishes so that the next frame's header does not land inside its
+    /// payload. The rest counts as a request outstanding on `inflight`, the stream's count, until
+    /// it is written, and is given until [`FINISH_FRAME_TIMEOUT`] from now before the stream is
+    /// reset. A frame not in the queue, not yet taken from the channel or written in full, is left
+    /// alone.
+    #[lore_macro::test_pub]
+    fn take_back(&mut self, command_id: u32, pending: &PendingCommands, inflight: &AtomicU64) {
+        let mut start = 0;
+        let Some(index) = self.frames.iter().position(|frame| {
+            let found = frame.command_id == command_id;
+            if !found {
+                start += frame.chunk_count as usize;
+            }
+            found
+        }) else {
             return;
         };
-        if self.chunks[0].len() == self.header_size as usize {
-            stream.pending.remove(self.command_id);
+        let frame = &mut self.frames[index];
+        let end = start + frame.chunk_count as usize;
+        if self.chunks[start].len() == frame.header_size as usize {
+            self.chunks.drain(start..end);
+            self.frames.remove(index);
+            pending.remove(command_id);
             return;
         }
-        let mut rest = Vec::with_capacity(self.chunks.iter().map(Bytes::len).sum());
-        for chunk in self.chunks.iter() {
-            rest.extend_from_slice(chunk);
+        let rest = joined(self.chunks.range(start..end));
+        for chunk in self.chunks.range_mut(start..end) {
+            *chunk = Bytes::new();
         }
-        self.stream_inflight[self.stream_index as usize].fetch_add(1, Ordering::Relaxed);
-        lore_spawn_net_nocontext!(finish_frame(
-            stream,
-            Bytes::from(rest),
-            self.stream_inflight.clone(),
-            self.stream_index
-        ));
+        self.chunks[start] = rest;
+        frame.dropped = true;
+        inflight.fetch_add(1, Ordering::Relaxed);
+        self.finish_by = Some(tokio::time::Instant::now() + finish_frame_timeout());
+        self.wake();
+    }
+
+    /// Keeps the waker of `cx`, the writer's, to wake it when the queue changes other than through
+    /// its channel.
+    fn wait(&mut self, cx: &Context<'_>) {
+        if !self
+            .waker
+            .as_ref()
+            .is_some_and(|waker| waker.will_wake(cx.waker()))
+        {
+            self.waker = Some(cx.waker().clone());
+        }
+    }
+
+    fn wake(&mut self) {
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
     }
 }
 
-/// Writes `rest`, the remainder of a dropped frame, to the stream whose writer `stream` holds, and
-/// resets the stream when the write does not finish within [`FINISH_FRAME_TIMEOUT`]. The request
-/// [`FrameWrite`] counted for it on the stream at `stream_index` of `stream_inflight` is taken off
-/// once the writer is released.
-async fn finish_frame(
-    mut stream: tokio::sync::OwnedMutexGuard<StreamWriter>,
-    mut rest: Bytes,
+/// A command whose frame is queued for its stream's writer, and the channel its result comes on.
+/// Dropped before its result, as when the command's future is dropped, or after one that does not
+/// show its frame written, it takes its frame back ([`StreamQueue::take_back`]), so nothing reads
+/// the command's chunks after it.
+struct QueuedCommand<'a> {
+    result: oneshot::Receiver<Result<Bytes, QuicClientError>>,
+    stream: Arc<StreamShared>,
+    command_id: u32,
+    /// Whether the frame is known to be written in full.
+    written: bool,
+    inflight: StreamInflightGuard<'a>,
+}
+
+impl Drop for QueuedCommand<'_> {
+    fn drop(&mut self) {
+        if self.written {
+            return;
+        }
+        self.result.close();
+        self.stream.queue.lock().take_back(
+            self.command_id,
+            &self.stream.pending,
+            self.inflight.inflight,
+        );
+    }
+}
+
+/// Writes the frames queued on `frames` to `send`, the send half of the stream at `stream_index`,
+/// in the order they are queued, each whole, and every frame queued at once in as few writes as
+/// the stream's flow control allows, and one more where the queue's buffer wraps
+/// ([`StreamQueue::unwritten`]). Runs as a task of its own on the net runtime, without the
+/// context of the command that opens the stream, as it serves every command the stream carries,
+/// until the channel is closed and every frame queued is written or failed.
+///
+/// The writer takes every frame from the channel as it comes, so that a command ended before its
+/// frame is written takes it back from the queue ([`StreamQueue::take_back`]), and registers the
+/// frame's command with the stream's [`ResponseReader`] as it takes the frame, before any of it is
+/// written. A frame whose command is gone by then is dropped unwritten.
+///
+/// A write that fails fails every frame queued, and every frame after it, with the write's error
+/// ([`frame_write_error`]). The rest of a frame whose command was dropped part way through its
+/// write that is not written within [`FINISH_FRAME_TIMEOUT`] has the stream reset, and fails
+/// every frame queued as a write to a reset stream does, with `Terminated`.
+async fn write_stream(
+    mut send: quinn::SendStream,
+    mut frames: mpsc::UnboundedReceiver<QueuedFrame>,
+    stream: Arc<StreamShared>,
     stream_inflight: Arc<[AtomicU64; STREAM_COUNT as usize]>,
     stream_index: u8,
 ) {
-    if tokio::time::timeout(
-        finish_frame_timeout(),
-        stream
-            .send
-            .write_all_chunks(std::slice::from_mut(&mut rest)),
-    )
-    .await
-    .is_err()
-    {
-        lore_warn!(
-            "QUIC stream {} reset: the rest of a dropped frame was not written within {:?}",
-            stream.send.id(),
-            finish_frame_timeout()
-        );
-        let _ = stream.send.reset(VarInt::from_u32(0));
+    let inflight = &stream_inflight[stream_index as usize];
+    let mut failed = None;
+    let mut finish: Option<Pin<Box<tokio::time::Sleep>>> = None;
+    std::future::poll_fn(|cx| {
+        let mut queue = stream.queue.lock();
+        #[cfg(feature = "test-util")]
+        if queue.held {
+            queue.wait(cx);
+            return Poll::Pending;
+        }
+        let closed = loop {
+            match frames.poll_recv(cx) {
+                Poll::Ready(Some(frame)) => queue.push(frame, &stream.pending, failed.as_ref()),
+                Poll::Ready(None) => break true,
+                Poll::Pending => break false,
+            }
+        };
+        while failed.is_none() && !queue.frames.is_empty() {
+            let written = std::pin::pin!(send.write_chunks(queue.unwritten())).poll(cx);
+            match written {
+                Poll::Ready(Ok(_)) => queue.pop_written(inflight),
+                Poll::Ready(Err(err)) => {
+                    let error = frame_write_error(err);
+                    queue.fail(&error, &stream.pending, inflight);
+                    failed = Some(error);
+                }
+                Poll::Pending => break,
+            }
+        }
+        if finish_overdue(&mut finish, queue.finish_by, cx) {
+            lore_warn!(
+                "QUIC stream {} reset: the rest of a dropped frame was not written within {:?}",
+                send.id(),
+                finish_frame_timeout()
+            );
+            let _ = send.reset(VarInt::from_u32(0));
+            let error = QuicClientError::Terminated;
+            queue.fail(&error, &stream.pending, inflight);
+            failed = Some(error);
+        }
+        if closed && queue.frames.is_empty() {
+            return Poll::Ready(());
+        }
+        queue.wait(cx);
+        Poll::Pending
+    })
+    .await;
+}
+
+/// Whether `deadline`, by which the rest of a dropped frame must be written, has passed, polling
+/// `finish`, the sleep until it, with `cx`, and dropping the sleep once there is no deadline. The
+/// sleep is boxed, as a frame is dropped part way through its write only on a cold path.
+fn finish_overdue(
+    finish: &mut Option<Pin<Box<tokio::time::Sleep>>>,
+    deadline: Option<tokio::time::Instant>,
+    cx: &mut Context<'_>,
+) -> bool {
+    let Some(deadline) = deadline else {
+        *finish = None;
+        return false;
+    };
+    let finish = finish.get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+    if finish.deadline() != deadline {
+        finish.as_mut().reset(deadline);
     }
-    drop(stream);
-    stream_inflight[stream_index as usize].fetch_sub(1, Ordering::Relaxed);
+    finish.as_mut().poll(cx).is_ready()
 }
 
 /// A failed frame write as a client error. A stream reset or stopped by the server takes no further
@@ -1706,13 +2025,14 @@ fn frame_write_error(err: quinn::WriteError) -> QuicClientError {
 ///
 /// `AWAIT_RESPONSE` is a const parameter rather than a split into a write half and a wait half so
 /// that each instantiation is a single future: a wait half awaited by a write half would nest one
-/// future inside the other and grow the send path. A `false` instantiation compiles the response
-/// wait out entirely and resolves as soon as the bytes are written, yielding `Bytes::default()`.
+/// future inside the other and grow the send path. A `false` instantiation resolves as soon as the
+/// frame is written, yielding `Bytes::default()`.
 ///
-/// Either way the command is registered with the stream's [`ResponseReader`] once it holds the
-/// stream's writer and before the bytes go out. Dropping the receiver unread is expected and
-/// handled; leaving the command unregistered is not, and would make the reader treat the response
-/// as unexpected and tear the stream down.
+/// The command takes `chunks`, header slot first, as its frame, and queues it for the stream's
+/// writer ([`write_stream`]), which writes it on the net runtime, after the frames queued before
+/// it, and completes the command. Queuing the frame takes no lock the stream's writer holds. The
+/// command takes that lock only when it ends without its frame known to be written
+/// ([`QueuedCommand`]).
 ///
 /// A command on a stream whose reader has stopped, that the peer has stopped reading, or that a
 /// dropped frame's finish reset, fails with `Terminated`, as one on a lost connection does, so
@@ -1746,7 +2066,7 @@ pub fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>(
             Ordering::Relaxed,
         );
 
-        let (writer, stream_index, _inflight) = {
+        let mut queued = {
             let connection_lock = connection.connection.read().await;
             if connection_lock.reader.is_empty() {
                 lore_debug!("No quic stream available when sending command");
@@ -1767,28 +2087,19 @@ pub fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>(
             ) as usize
                 % connection_lock.reader.len();
             let inflight = StreamInflightGuard::new(&connection.stream_inflight[stream_index]);
-            let writer = connection_lock.writer[stream_index].clone();
-            (writer, stream_index as u8, inflight)
-        };
 
-        // Skip any previous header in case this is a resend
-        let total_size: usize = chunks.iter().skip(1).map(|buffer| buffer.len()).sum();
-        if total_size > connection.max_chunk_size {
-            lore_debug!(
-                "Client '{command}' message too big - message size '{total_size}' exceeds {}",
-                connection.max_chunk_size
-            );
-            return Err(QuicClientError::ClientMessageTooBig);
-        }
+            // Skip any previous header in case this is a resend
+            let total_size: usize = chunks.iter().skip(1).map(|buffer| buffer.len()).sum();
+            if total_size > connection.max_chunk_size {
+                lore_debug!(
+                    "Client '{command}' message too big - message size '{total_size}' exceeds {}",
+                    connection.max_chunk_size
+                );
+                return Err(QuicClientError::ClientMessageTooBig);
+            }
 
-        // A block of its own, as the guard is used by reference before it moves into the frame:
-        // outside one, the guard would keep a slot of its own in the future beside the frame.
-        // The command registers under the writer lock, so that one dropped while it waits for the
-        // lock registers nothing; the cost is the channel and header built while the lock is held.
-        let (stream, command_id, rx) = {
-            let stream = writer.lock_owned().await;
-            let (tx, rx) = oneshot::channel();
-            let command_id = stream.pending.wait_for(tx)?;
+            let writer = &connection_lock.writer[stream_index];
+            let command_id = writer.stream.pending.next_id();
             if v4 {
                 let header =
                     CommandHeader::new_with_session(command, command_id, total_size, session.id);
@@ -1797,28 +2108,32 @@ pub fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>(
                 let header = CommandHeader::new(command, command_id, total_size);
                 chunks[0] = Bytes::from_owner(header.to_bytes());
             }
-            (stream, command_id, rx)
+            let (reply, result) = oneshot::channel();
+            if writer
+                .frames
+                .send(QueuedFrame::new(chunks, command_id, reply, AWAIT_RESPONSE))
+                .is_err()
+            {
+                return Err(QuicClientError::Terminated);
+            }
+            QueuedCommand {
+                result,
+                stream: writer.stream.clone(),
+                command_id,
+                written: false,
+                inflight,
+            }
         };
 
-        {
-            let mut frame = FrameWrite::new(
-                stream,
-                chunks,
-                command_id,
-                &connection.stream_inflight,
-                stream_index,
-            );
-            frame.write().await.map_err(frame_write_error)?;
-        }
-
-        if !AWAIT_RESPONSE {
-            return Ok(Bytes::default());
-        }
-
-        rx.await.map_err(|err| {
-            lore_warn!("{}: {err}", QuicClientError::Read);
-            QuicClientError::Read
-        })?
+        let result = match (&mut queued.result).await {
+            Ok(result) => result,
+            Err(err) => {
+                lore_warn!("{}: {err}", QuicClientError::Read);
+                Err(QuicClientError::Read)
+            }
+        };
+        queued.written = shows_frame_written(&result);
+        result
     }
 }
 

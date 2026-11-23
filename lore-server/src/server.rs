@@ -25,6 +25,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::LoreTaskLifecycleEvent;
 use lore_base::runtime::LoreTaskSpawn;
 use lore_base::runtime::TaskLifecycleObserver;
+use lore_base::runtime::report_serving_runtime;
 use lore_base::runtime::runtime;
 use lore_base::runtime::serving_runtime;
 use lore_base::runtime::set_task_lifecycle_observer;
@@ -1993,6 +1994,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         .init()?
     };
 
+    report_serving_runtime();
     observe_task_lifecycles();
 
     let up_gauge = lore_telemetry::meter("urc.server")
