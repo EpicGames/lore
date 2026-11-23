@@ -24,11 +24,12 @@ use super::repository_query::repository_query_id;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_registry::RepositoryRegistry;
 use crate::grpc::FilterSlowDownExt;
+use crate::grpc::RepositoryAdministration;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
-use crate::grpc::may_administer_repository;
+use crate::grpc::repository_administration;
 use crate::grpc::requested_repository_id;
 use crate::util::setup_execution;
 
@@ -77,6 +78,13 @@ async fn repository_delete(
     extensions: &Extensions,
     authorization: Option<String>,
 ) -> Result<(), Status> {
+    // Asked before the load, so a repository the caller's grants do not reach
+    // is answered as a missing one.
+    let administration = repository_administration(authorizer, extensions, repository.id).await?;
+    if administration == RepositoryAdministration::Unreachable {
+        return Err(Status::not_found("Repository does not exist"));
+    }
+
     let Ok(data) = repository_query_id(
         repository.clone(),
         repository.id,
@@ -96,15 +104,7 @@ async fn repository_delete(
 
     let user_id = execution_context().user_id().await;
 
-    if !may_administer_repository(
-        authorizer,
-        extensions,
-        repository.id,
-        &metadata.creator,
-        &user_id,
-    )
-    .await?
-    {
+    if !administration.permits(&metadata.creator, &user_id) {
         info!(
             "Repository delete refused for user {user_id}, creator {}",
             metadata.creator

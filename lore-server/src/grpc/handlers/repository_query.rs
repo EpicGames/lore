@@ -75,7 +75,7 @@ pub async fn handler(
                     .map_err(|err| {
                         lookup_error_status(&err, || {
                             warn!("Repository ID {id} not known: {err}");
-                            Status::not_found(err.to_string())
+                            Status::not_found(format!("Repository {id} not found"))
                         })
                     })?
                 }
@@ -90,7 +90,7 @@ pub async fn handler(
                 .map_err(|err| {
                     lookup_error_status(&err, || {
                         warn!("Repository name {name} not known: {err}");
-                        Status::not_found(err.to_string())
+                        Status::not_found(format!("Repository {name} not found"))
                     })
                 })?,
             };

@@ -50,6 +50,17 @@ impl ResourceGrantsAuthorizer {
         }
     }
 
+    /// Whether the token carries nothing at the resource claim: the claim is absent, null
+    /// or an empty array. A claim holding only entries that [`grants`](Self::grants) skips
+    /// as malformed is not empty.
+    fn has_no_resource_claim(&self, token: &VerifiedToken<'_>) -> bool {
+        match token.claims.claim_at(&self.resource_claim) {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Array(entries)) => entries.is_empty(),
+            Some(_) => false,
+        }
+    }
+
     /// The token's grant entries.
     fn grants(&self, token: &VerifiedToken<'_>) -> Vec<ResourcePermission> {
         let Some(serde_json::Value::Array(entries)) = token.claims.claim_at(&self.resource_claim)
@@ -141,17 +152,26 @@ impl RepositoryAuthorizer for ResourceGrantsAuthorizer {
         self.check(token, repository_id, action)
     }
 
-    /// Any verified token: the client looks a repository up before it can exchange for a
-    /// token naming it, and a record discloses no more than `RepositoryCreate` refusing a
-    /// taken name already does.
+    /// A token with nothing at the resource claim is a login token, and looks any
+    /// repository up: the client does so before it can exchange for a token naming the
+    /// repository. A token with anything there is an exchanged access token, and looks up
+    /// only the repositories its entries match, so none when every entry is malformed. Nothing else tells the two apart when one issuer mints both, so
+    /// this relies on the issuer never minting an access token with an empty claim. See
+    /// ADR-00043.
     async fn check_repository_lookup(
         &self,
         token: Option<&VerifiedToken<'_>>,
-        _repository_id: RepositoryId,
+        repository_id: RepositoryId,
     ) -> Result<(), Status> {
-        match token {
-            Some(_) => Ok(()),
-            None => Err(Status::unauthenticated("No token")),
+        let Some(token) = token else {
+            return Err(Status::unauthenticated("No token"));
+        };
+        if self.has_no_resource_claim(token)
+            || self.matcher.any_match(&self.grants(token), repository_id)
+        {
+            Ok(())
+        } else {
+            Err(Status::permission_denied("No grant for repository"))
         }
     }
 

@@ -479,6 +479,10 @@ pub enum RepositoryAdministration {
     /// `write`: permitted only to the recorded creator.
     CreatorOnly,
     Denied,
+    /// The caller's enumerated grants do not reach the repository at all. A
+    /// handler whose refusal would tell an existing repository from a missing
+    /// one answers this as the missing one.
+    Unreachable,
 }
 
 impl RepositoryAdministration {
@@ -486,7 +490,7 @@ impl RepositoryAdministration {
         match self {
             Self::Permitted => true,
             Self::CreatorOnly => creator == user_id,
-            Self::Denied => false,
+            Self::Denied | Self::Unreachable => false,
         }
     }
 }
@@ -514,6 +518,9 @@ pub async fn repository_administration(
         }
         enumerated.as_ref()
     };
+    if grants.is_some_and(|grants| !grants.reachable()) {
+        return Ok(RepositoryAdministration::Unreachable);
+    }
     let permits = async |action| {
         permits_with(&**authorizer, grants, token.as_ref(), repository, action).await
     };
@@ -588,7 +595,7 @@ pub async fn require_branch_protection_administration(
     let permitted = match repository_administration(authorizer, extensions, repository.id).await? {
         RepositoryAdministration::Permitted => true,
         RepositoryAdministration::CreatorOnly => repository_creator(repository).await? == user_id,
-        RepositoryAdministration::Denied => false,
+        RepositoryAdministration::Denied | RepositoryAdministration::Unreachable => false,
     };
     if permitted {
         Ok(())

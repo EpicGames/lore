@@ -383,10 +383,11 @@ async fn no_token_denies_even_read() {
     }
 }
 
-/// A lookup needs a verified token and no grant: the client looks a repository up before
-/// it can exchange for a token naming it. Reaching the partition still needs the grant.
+/// A login token carries no grant entries and looks any repository up: the client does so
+/// before it can exchange for a token naming the repository. Reaching the partition still
+/// needs the grant.
 #[tokio::test]
-async fn a_lookup_needs_a_verified_token_and_no_grant() {
+async fn a_token_without_grant_entries_looks_any_repository_up() {
     let authorizer = default_authorizer();
     let login = token_with_extra(json!({}));
     let token = VerifiedToken {
@@ -398,7 +399,7 @@ async fn a_lookup_needs_a_verified_token_and_no_grant() {
         authorizer
             .check_repository_lookup(Some(&token), repository(id))
             .await
-            .expect("any verified token may look a repository up");
+            .expect("a token without grant entries may look a repository up");
         let err = check(&authorizer, &login, repository(id), Action::Read)
             .await
             .unwrap_err();
@@ -410,4 +411,67 @@ async fn a_lookup_needs_a_verified_token_and_no_grant() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::Unauthenticated);
+}
+
+#[tokio::test]
+async fn a_token_with_grant_entries_looks_up_only_the_repositories_they_match() {
+    let authorizer = default_authorizer();
+    let lookup = async |claims: &AuthorizationToken, id: &str| {
+        let token = VerifiedToken { raw: "raw", claims };
+        authorizer
+            .check_repository_lookup(Some(&token), repository(id))
+            .await
+    };
+
+    let scoped = claims_with_resources(vec![entry(&format!("urc-{REPOSITORY_HEX}"), &[])]);
+    lookup(&scoped, REPOSITORY_HEX)
+        .await
+        .expect("the entry matches the repository");
+    let err = lookup(&scoped, UNRELATED_HEX).await.unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+
+    let wildcard = claims_with_resources(vec![entry("urc-*", &["read"])]);
+    for id in [REPOSITORY_HEX, UNRELATED_HEX] {
+        lookup(&wildcard, id)
+            .await
+            .expect("the wildcard entry matches every repository");
+    }
+}
+
+/// Only a token with nothing at the resource claim is a login token. A claim holding entries
+/// that are all skipped as malformed, or holding something other than an array, looks no
+/// repository up.
+#[tokio::test]
+async fn a_resource_claim_without_a_readable_entry_looks_nothing_up() {
+    let authorizer = ResourceGrantsAuthorizer::new(
+        "grants".to_string(),
+        "resource_id".to_string(),
+        None,
+        "urc-{id}".to_string(),
+        "urc-*".to_string(),
+    );
+    let lookup = async |grants: serde_json::Value| {
+        let claims = token_with_extra(json!({ "grants": grants }));
+        let token = VerifiedToken {
+            raw: "raw",
+            claims: &claims,
+        };
+        authorizer
+            .check_repository_lookup(Some(&token), repository(REPOSITORY_HEX))
+            .await
+    };
+
+    for nothing in [json!(null), json!([])] {
+        lookup(nothing)
+            .await
+            .expect("a token with nothing at the claim is a login token");
+    }
+    for unreadable in [
+        json!([{ "rsname": format!("urc-{REPOSITORY_HEX}") }]),
+        json!(["not an object", { "resource_id": 42 }]),
+        json!({ "resource_id": format!("urc-{REPOSITORY_HEX}") }),
+    ] {
+        let err = lookup(unreadable).await.unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
 }
