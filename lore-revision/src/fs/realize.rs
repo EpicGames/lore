@@ -29,7 +29,6 @@ use crate::event;
 use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
-use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
 use crate::fs::filesystem_provider::FsError;
 use crate::fs::filesystem_provider::HoldOptions;
@@ -2442,7 +2441,8 @@ async fn rename_held_spelling(
 
 /// [`rename_held_spelling`] where `listed`, the listing of the directory holding `from`, holds
 /// another spelling of its name: pairs the entry with the source's node, compares its content, and
-/// renames it to `to`. A cold path, boxed by its caller.
+/// renames it to `to` ([`InstanceOperationImpl::rename_creating_parent`]). A cold path, boxed by its
+/// caller.
 #[allow(clippy::manual_async_fn)]
 fn rename_paired_spelling<'a>(
     operation: &'a InstanceOperationImpl,
@@ -2473,7 +2473,7 @@ fn rename_paired_spelling<'a>(
             return false;
         }
         lore_trace!("Moving {held}, which the working tree holds {from} as, to {to}");
-        operation.rename(&held, to).await.is_ok()
+        operation.rename_creating_parent(&held, to).await.is_ok()
     }
 }
 
@@ -4432,10 +4432,13 @@ async fn recover_refused_move(
     Ok(())
 }
 
-/// Renames `from`, the source of `change`, a move, to `to` ([`rename_creating_parent`]), from the
-/// path the directory moves realized before it carried it to ([`RealizeMoves::moved_source`]), and
-/// adds a directory it moves to them. Where the rename fails, it takes the entry the working tree
-/// holds the source in under another spelling, where `view_filter` holds the source
+/// Renames `from`, the source of `change`, a move, to `to`, from the path the directory moves
+/// realized before it carried it to ([`RealizeMoves::moved_source`]), and adds a directory it moves
+/// to them. The rename creates the directory `to` lands in where it is missing
+/// ([`InstanceOperationImpl::rename_creating_parent`]): a directory the realize adds stands on disk
+/// only as the parent of what lands in it, unless the view creates it
+/// ([`FilterStates::creates_directory`]). Where the rename fails, it takes the entry the working
+/// tree holds the source in under another spelling, where `view_filter` holds the source
 /// ([`rename_held_spelling`]), and otherwise recovers as [`recover_refused_move`] describes,
 /// counting a rename left undone in `kept`.
 /// Answers whether a rename carried the source to `to`.
@@ -4453,7 +4456,7 @@ async fn rename_move_source(
 ) -> Result<bool, SyncError> {
     let moved = moves.moved_source(from);
     let source = moved.as_ref().unwrap_or(from);
-    let renamed = match rename_creating_parent(operation, source, to).await {
+    let renamed = match operation.rename_creating_parent(source, to).await {
         Ok(()) => true,
         Err(refused) => {
             let respelled = !view_filter.excludes(
@@ -4471,27 +4474,6 @@ async fn rename_move_source(
         moves.directories.push((source.clone(), to.clone()));
     }
     Ok(renamed)
-}
-
-/// Renames `from` to `to`, creating the directory `to` lands in where the refused rename finds it
-/// missing: a directory the realize adds stands on disk only as the parent of what lands in it,
-/// unless the view creates it ([`FilterStates::creates_directory`]).
-async fn rename_creating_parent(
-    operation: &InstanceOperationImpl,
-    from: &RelativePath,
-    to: &RelativePath,
-) -> Result<(), FsError> {
-    let Err(refused) = operation.rename(from, to).await else {
-        return Ok(());
-    };
-    let parent = to.parent_path();
-    if parent.is_empty()
-        || !matches!(operation.file_info(&parent).await, Ok(FileInfo::NotExist))
-        || operation.create_dir_all(&parent).await.is_err()
-    {
-        return Err(refused);
-    }
-    operation.rename(from, to).await
 }
 
 /// Warns once for the renames left undone, `kept`, with how many and the first, which is all

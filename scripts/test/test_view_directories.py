@@ -313,6 +313,33 @@ def test_a_sync_and_a_branch_switch_create_what_a_clone_does(
 
 
 @pytest.mark.smoke
+def test_a_sync_moves_a_file_into_directories_no_view_line_names(
+    new_lore_repo, scratch_dir
+):
+    """A sync of a revision that moves a kept file into directories it adds,
+    which no line of the view names, creates them as the parents of the file,
+    and leaves the tree an instance cloned with the same view holds."""
+    repo: Lore = new_lore_repo()
+    commit_and_push_files(repo, FILES)
+    view = view_file(scratch_dir, "view", EXTENSION_VIEW)
+    synced: Lore = repo.clone(view=view)
+
+    repo.make_dirs("a/g/h")
+    repo.stage("a/g")
+    repo.move("a/e/f/deep.bat", "a/g/h/deep.bat")
+    repo.stage_move("a/e/f/deep.bat", "a/g/h/deep.bat")
+    repo.commit()
+    repo.push()
+
+    synced.sync()
+
+    held = working_tree_files(synced, directories=True)
+    assert "a/g/h/deep.bat" in held
+    assert held == working_tree_files(repo.clone(view=view), directories=True)
+    assert_nothing_missing(synced, "the synced tree")
+
+
+@pytest.mark.smoke
 def test_a_reset_restores_the_directories_a_clone_creates(new_lore_repo, scratch_dir):
     """`lore reset` of a tree the user removed creates what a clone under the same
     view holds: the directory a line names, and the chain above each kept file."""

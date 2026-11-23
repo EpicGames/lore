@@ -711,7 +711,8 @@ fn rename_unifying<'a>(
 ///
 /// A `to_path` naming the entry `from_path` does, as another spelling of its name does on a file
 /// system that folds case, or one that cannot be told apart from it, is not unified: removing or
-/// emptying it could remove the source. `refused` is answered and both stay as they stand.
+/// emptying it could remove the source. `refused` is answered and both stay as they stand, as it
+/// is for a `to_path` the rename refused as not found, whose directory is missing.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[lore_macro::test_pub]
@@ -729,6 +730,9 @@ fn unify_refused_rename<'a>(
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => return Err(err),
         };
+        if to_kind.is_none() && refused.kind() == std::io::ErrorKind::NotFound {
+            return Err(refused);
+        }
 
         if let Some(to_kind) = to_kind
             && (from_kind == StatKind::Directory) != (to_kind == StatKind::Directory)

@@ -46,6 +46,7 @@ use crate::lore::Address;
 use crate::lore::Context;
 use crate::lore_debug;
 use crate::lore_trace;
+use crate::lore_warn;
 use crate::node::Node;
 use crate::node::NodeFileMode;
 use crate::node::NodeFlags;
@@ -1556,6 +1557,67 @@ impl InstanceOperationImpl {
         }
     }
 
+    /// Renames `from` to `to` as [`InstanceOperation::rename`] does. Where the rename is refused,
+    /// the working tree holds `from` and the directory `to` lands in is missing, creates it and the
+    /// missing directories above it and renames again, removing those it created where that rename
+    /// fails too ([`Self::rename_into_created_parent`]).
+    pub async fn rename_creating_parent(
+        &self,
+        from: &RelativePath,
+        to: &RelativePath,
+    ) -> Result<(), FsError> {
+        let Err(refused) = self.rename(from, to).await else {
+            return Ok(());
+        };
+        Box::pin(self.rename_into_created_parent(from, to, refused)).await
+    }
+
+    /// The rename of `from` to `to` after its refusal, `refused`: answers `refused` where the
+    /// working tree holds nothing at `from` or [`Self::missing_ancestors`] finds no directory above
+    /// `to` missing, and otherwise the error of the create or of the rename into the directories
+    /// created. Boxed, being cold.
+    async fn rename_into_created_parent(
+        &self,
+        from: &RelativePath,
+        to: &RelativePath,
+        refused: FsError,
+    ) -> Result<(), FsError> {
+        if !self.file_info(from).await.is_ok_and(|info| info.exists()) {
+            return Err(refused);
+        }
+        let missing = self.missing_ancestors(to).await;
+        let Some(deepest) = missing.first() else {
+            return Err(refused);
+        };
+        create_empty_directory::<FsError>(self, deepest).await?;
+        let Err(failed) = self.rename(from, to).await else {
+            return Ok(());
+        };
+        for directory in &missing {
+            if let Err(left) = self.remove_empty_directory(directory).await {
+                lore_warn!(
+                    "A rename of {from} to {to} leaves {directory}, which it created: {left}"
+                );
+                break;
+            }
+        }
+        Err(failed)
+    }
+
+    /// The directories above `path` the working tree holds nothing at, deepest first, up to the
+    /// first one it holds or cannot describe.
+    async fn missing_ancestors(&self, path: &RelativePath) -> Vec<RelativePath> {
+        let mut missing = Vec::new();
+        let mut parent = path.parent_path();
+        while !parent.is_empty() && matches!(self.file_info(&parent).await, Ok(FileInfo::NotExist))
+        {
+            let above = parent.parent_path();
+            missing.push(parent);
+            parent = above;
+        }
+        missing
+    }
+
     /// Hands `target`, under `repository`, its context, to a provider that holds its state in a
     /// `State` ([`FilesystemProvider::holds_state`]) to hold as the revision the working tree
     /// stands at, its local changes refused, kept, overwritten or reset as `options` asks
@@ -2133,11 +2195,11 @@ pub mod test_util {
     /// handed over before the call)`.
     pub type StoredCalls = Arc<Mutex<Vec<(String, Address, u64, u16, bool)>>>;
 
-    /// Answers the reads and the directory create these tests make, refuses each rename, and
-    /// records each finalize, `stored` and `committed` call, hold, warm-up of the held ignore file
-    /// and recursive removal, which removes nothing. Where it reads from a directory, it also
-    /// writes and removes single entries there. `write_fails` fails only the directory create.
-    /// Every other member panics.
+    /// Answers the reads and the directory create these tests make, refuses each rename unless
+    /// `refuses_rename` says otherwise, and records each finalize, `stored` and `committed` call,
+    /// hold, warm-up of the held ignore file and recursive removal, which removes nothing. Where it
+    /// reads from a directory, it also writes and removes single entries there. `write_fails` fails
+    /// only the directory create. Every other member panics.
     #[derive(Default)]
     pub struct TestOperation {
         pub file_info_count: Arc<AtomicUsize>,
@@ -2183,6 +2245,12 @@ pub mod test_util {
         pub directory_reads: Arc<AtomicUsize>,
         /// How many directory creates were asked for.
         pub directory_creates: Arc<AtomicUsize>,
+        /// How many renames were asked for.
+        pub rename_count: Arc<AtomicUsize>,
+        /// The error that refuses each rename, by the number of renames asked for before it, or
+        /// `None` to carry it out in the directory the provider reads from. Without it, or without
+        /// a directory to read from, every rename is refused.
+        pub refuses_rename: Option<fn(usize) -> Option<FsError>>,
     }
 
     /// How a [`TestOperation`] answers `names_one_entry`.
@@ -2409,9 +2477,17 @@ pub mod test_util {
             }
         }
 
-        /// Refuses the rename, as a file system that cannot carry it does.
-        async fn rename(&self, _from: &RelativePath, _to: &RelativePath) -> Result<(), FsError> {
-            Err(FsError::internal("Rename refused"))
+        /// Counts the rename, and refuses it, as a file system that cannot carry it does, or
+        /// carries it out as `refuses_rename` says.
+        async fn rename(&self, from: &RelativePath, to: &RelativePath) -> Result<(), FsError> {
+            let asked = self.rename_count.fetch_add(1, Ordering::AcqRel);
+            match (&self.reads, self.refuses_rename) {
+                (Some(reads), Some(refuses)) => match refuses(asked) {
+                    Some(refused) => Err(refused),
+                    None => reads.rename(from, to).await,
+                },
+                _ => Err(FsError::internal("Rename refused")),
+            }
         }
 
         /// Answers for the paths alone, as [`TestIdentity`] says.

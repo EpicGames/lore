@@ -604,6 +604,34 @@ async fn rename_merges_a_directory_into_the_one_at_the_destination() {
     assert!(!from.exists(), "the source must be gone");
 }
 
+/// A rename into a directory the file system lacks is refused for a directory as for a file: the
+/// source keeps what it holds, and nothing is created at the destination.
+#[tokio::test]
+async fn rename_refuses_a_destination_whose_directory_is_missing() {
+    let dir = temp_dir();
+    std::fs::create_dir(dir.path().join("from")).expect("create source");
+    std::fs::write(dir.path().join("from").join("child"), b"kept").expect("write child");
+    std::fs::write(dir.path().join("file"), b"kept").expect("write file");
+    let operation = os_operation(dir.path()).await;
+
+    for source in ["from", "file"] {
+        operation
+            .rename(&relative(source), &relative(&format!("missing/{source}")))
+            .await
+            .expect_err("the destination's directory is missing");
+    }
+
+    assert!(!dir.path().join("missing").exists());
+    assert_eq!(
+        Some(b"kept".to_vec()),
+        std::fs::read(dir.path().join("from").join("child")).ok()
+    );
+    assert_eq!(
+        Some(b"kept".to_vec()),
+        std::fs::read(dir.path().join("file")).ok()
+    );
+}
+
 /// A file and a directory are not two spellings of one thing, so there is no move that leaves
 /// one of them.
 #[tokio::test]

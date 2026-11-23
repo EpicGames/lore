@@ -2512,6 +2512,112 @@ async fn a_move_into_an_added_directory_creates_it() {
     .await;
 }
 
+/// A move into a directory the sync adds carries the entry the working tree holds its source in
+/// under another spelling there, creating the directory it lands in.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_move_into_an_added_directory_carries_the_other_spelling_of_its_source() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(1174, 0);
+        let state = plugin_tree(&repository, &[(TRACKED, &content)]).await;
+        write_working_files(&repository, &[(VARIANT, &content)]).await;
+        let from = Staged {
+            node: state
+                .find_node_link(repository.clone(), TRACKED)
+                .await
+                .unwrap()
+                .node,
+            state,
+            address: file_node(&content).address,
+            mode: 0,
+        };
+        let destination = "Moved/Plugin.Build.cs";
+        let to = state_holding(&repository, &relative(destination), file_node(&content), 2).await;
+        let moved = NodeChange {
+            action: FileAction::Move,
+            flags: change::Flags::None,
+            from: side(&repository, &from, relative(TRACKED)),
+            to: side(&repository, &to, relative(destination)),
+        };
+
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        Box::pin(realize_changes(
+            repository.clone(),
+            operation,
+            Arc::new(vec![moved]),
+            &[],
+            None, /* No subtrees */
+            None,
+            false,
+            None,
+            None,
+            Arc::default(),
+        ))
+        .await
+        .expect("the move realizes");
+        assert!(!working_path_exists(&repository, VARIANT).await);
+        assert_eq!(working_file(&repository, destination).await, content);
+    }))
+    .await;
+}
+
+/// A move into a directory the realize adds whose renames are refused is realized by writing the
+/// node at its destination, in the directory the write creates: the rename removes the directory it
+/// created for the refused second rename, and nothing else.
+#[tokio::test]
+async fn a_refused_move_into_an_added_directory_writes_its_destination() {
+    Box::pin(with_execution(async {
+        let (immutable_store, mutable_store, _) =
+            test_store_create().await.expect("Making test stores");
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        std::fs::create_dir(dir.path().join("Dir")).expect("the source on disk");
+        let filesystem = Arc::new(TestFilesystemProvider::reading(dir.path()));
+        let repository = test_repository_over(immutable_store, mutable_store, filesystem.clone());
+        let state = State::new();
+        let node = add_clean(&repository, &state, ROOT_NODE, (directory, "Dir")).await;
+        let side = |path: &str| NodeChangeState {
+            mapping: NodeMapping {
+                repository: repository.clone(),
+                state: state.clone(),
+                path: relative(path),
+                node,
+            },
+            observed: None,
+            flags: NodeFlags::NoFlags,
+            address: Default::default(),
+            mode: 0,
+        };
+        let change = NodeChange {
+            action: FileAction::Move,
+            flags: change::Flags::None,
+            from: side("Dir"),
+            to: side("New/Dir"),
+        };
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        realize_changes(
+            repository.clone(),
+            operation,
+            Arc::new(vec![change]),
+            &[],
+            None, /* No subtrees */
+            None,
+            false,
+            None,
+            None,
+            Arc::default(),
+        )
+        .await
+        .expect("a refused rename is realized by writing the node");
+
+        assert_eq!(filesystem.removed.lock().as_slice(), ["New/Dir"]);
+        assert!(dir.path().join("New/Dir").is_dir());
+        assert!(dir.path().join("Dir").is_dir());
+    }))
+    .await;
+}
+
 /// A file a move carries out of the deleted directory is judged against that move's target, not
 /// against the target of a move from another spelling of its name, whichever spelling the working
 /// tree holds and in either order of the moves.

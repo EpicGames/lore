@@ -46,7 +46,6 @@ use crate::lore::Hash;
 use crate::lore_debug;
 use crate::lore_limit_drain_tasks;
 use crate::lore_trace;
-use crate::lore_warn;
 use crate::node;
 use crate::node::Node;
 use crate::node::NodeBlock;
@@ -1430,43 +1429,25 @@ async fn return_dirty_move(
     Ok(Returned::Back(to.clone(), to))
 }
 
-/// Moves what the working tree holds at `from` to `to`, creating the directories `to` lands in and
-/// removing them again where the move fails; nothing where it holds nothing at `from`, which
-/// leaves the walk to restore `to`.
+/// Moves what the working tree holds at `from` to `to`, creating the directories `to` lands in
+/// where they are missing ([`InstanceOperationImpl::rename_creating_parent`]); nothing where it
+/// holds nothing at `from`, which leaves the walk to restore `to`.
 async fn move_entry(
     operation: &InstanceOperationImpl,
     from: &RelativePath,
     to: &RelativePath,
 ) -> Result<(), ResetError> {
-    let exists = async |path: &RelativePath| {
-        operation
-            .file_info(path)
-            .await
-            .is_ok_and(|info| info.exists())
-    };
-    if !exists(from).await {
+    if !operation
+        .file_info(from)
+        .await
+        .is_ok_and(|info| info.exists())
+    {
         return Ok(());
     }
-    let mut created = Vec::new();
-    let mut parent = to.parent_path();
-    while !parent.is_empty() && !exists(&parent).await {
-        let above = parent.parent_path();
-        created.push(parent);
-        parent = above;
-    }
-    if let Some(deepest) = created.first() {
-        create_empty_directory::<ResetError>(operation, deepest).await?;
-    }
-    let Err(err) = operation.rename(from, to).await else {
-        return Ok(());
-    };
-    for directory in created.iter() {
-        if let Err(left) = operation.remove_empty_directory(directory).await {
-            lore_warn!("Reset leaves {directory}, which it created for a move back: {left}");
-            break;
-        }
-    }
-    Err(err).forward::<ResetError>("Moving a moved node back")
+    operation
+        .rename_creating_parent(from, to)
+        .await
+        .forward::<ResetError>("Moving a moved node back")
 }
 
 /// Names in `err` whether the working tree holds the path it failed on, which separates a path

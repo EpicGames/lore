@@ -17,6 +17,7 @@ file/directory state after each operation.
 
 import logging
 import os
+import shutil
 
 import pytest
 from lore_parsers import find_status_entry, parse_jsonl, parse_status_json
@@ -7790,6 +7791,29 @@ def test_reset_dirty_move(new_lore_repo):
     assert_file_set(no_scan, [], msg="status clean after resetting the dirty move")
     scanned = get_status_files_twice(repo, scan=True)
     assert_file_set(scanned, [], msg="--scan agrees the tree is clean after move reset")
+
+
+@pytest.mark.smoke
+def test_reset_moves_a_dirty_move_back_into_a_directory_the_working_tree_lost(
+    new_lore_repo,
+):
+    """Resetting the destination of a dirty move whose source directories the
+    working tree no longer holds creates them and moves the file back into them."""
+    repo: Lore = new_lore_repo()
+    commit_base(repo, {"d/e/old.txt": "movable content\n", "other.txt": "other\n"})
+
+    os.rename(repo._fix_path("d/e/old.txt"), repo._fix_path("new.txt"))
+    repo.dirty_move("d/e/old.txt", "new.txt", offline=True)
+    shutil.rmtree(repo._fix_path("d"))
+
+    repo.reset(["new.txt"], offline=True)
+
+    assert _chain_read(repo, "d/e/old.txt") == "movable content\n", (
+        "reset must move the file back into the directories it creates"
+    )
+    assert not _chain_exists(repo, "new.txt"), "reset must remove the move destination"
+    scanned = get_status_files_twice(repo, scan=True)
+    assert_file_set(scanned, [], msg="--scan agrees the tree is clean after the reset")
 
 
 @pytest.mark.smoke
