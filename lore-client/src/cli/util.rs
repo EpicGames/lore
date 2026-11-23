@@ -132,20 +132,28 @@ pub fn cwd_relativizer(globals: &LoreGlobalArgs) -> impl Fn(&str) -> String + 's
 pub fn read_targets_file(path: &String) -> Vec<String> {
     let targets_file = std::fs::File::open(path).unwrap();
     let reader = std::io::BufReader::new(targets_file);
+    let base_path = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
 
     reader
         .lines()
         .map(|line| {
             if let Ok(line) = line {
-                // TODO(mjansson): If this is a relative path it should be made absolute
-                // using the target_file path as the base path
-                line
+                resolve_targets_file_path(base_path, &line)
             } else {
                 "".to_owned()
             }
         })
         .filter(|path| !path.is_empty())
         .collect()
+}
+
+fn resolve_targets_file_path(base_path: &Path, target: &str) -> String {
+    let target_path = Path::new(target);
+    if target_path.is_absolute() {
+        target.to_owned()
+    } else {
+        base_path.join(target_path).to_string_lossy().into_owned()
+    }
 }
 
 pub fn convert_to_lore_string_vec(paths: &[String]) -> Vec<LoreString> {
@@ -453,5 +461,33 @@ pub fn read_line_with_editing(buf: &mut String) -> std::io::Result<usize> {
     #[cfg(not(unix))]
     {
         std::io::stdin().read_line(buf)
+    }
+}
+
+#[cfg(test)]
+mod targets_file_tests {
+    use std::path::Path;
+
+    use super::resolve_targets_file_path;
+
+    #[test]
+    fn relative_entries_are_resolved_from_the_targets_file_directory() {
+        let base = Path::new("project/targets");
+        assert_eq!(
+            resolve_targets_file_path(base, "assets/hero.uasset"),
+            base.join("assets/hero.uasset")
+                .to_string_lossy()
+                .into_owned()
+        );
+    }
+
+    #[test]
+    fn absolute_entries_are_preserved() {
+        let absolute = std::env::temp_dir().join("hero.uasset");
+        let absolute = absolute.to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_targets_file_path(Path::new("project/targets"), &absolute),
+            absolute
+        );
     }
 }
