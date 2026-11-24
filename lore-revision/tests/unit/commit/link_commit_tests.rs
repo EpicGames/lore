@@ -5,8 +5,12 @@ use std::collections::HashSet;
 
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Hash;
+use lore_revision::branch;
+use lore_revision::branch::BranchLatestStatus;
 use lore_revision::commit::CommitError;
 use lore_revision::commit::CommittedLink;
+use lore_revision::commit::LinkCommits;
+use lore_revision::commit::MovedLinkBranch;
 use lore_revision::commit::UncommittedPin;
 use lore_revision::commit::refuse_link_commits;
 use lore_revision::commit::refuse_scoped_link_commit;
@@ -199,6 +203,68 @@ async fn a_commit_refuses_a_staged_repository_whose_mounts_carry_different_flags
                 .expect_err("the mounts carry different flags");
 
             assert!(refused.is_link_pins_diverge(), "{refused:?}");
+        })
+        .await;
+}
+
+/// Rolling back a failed commit moves each linked branch it moved back to the latest it replaced,
+/// clearing the divergent status it stored, and leaves a branch another commit moved since there.
+/// A commit that published the revision pinning them keeps them.
+#[tokio::test]
+async fn rolling_back_a_commit_restores_its_branches_and_keeps_one_moved_since() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let (restored, moved_since) = (BranchId::from([1; 16]), BranchId::from([2; 16]));
+            let [previous, signature, other] = [1, 2, 3].map(|byte| Hash::from([byte; 32]));
+            let link_commits = LinkCommits::default();
+            for branch in [restored, moved_since] {
+                for (from, to, status) in [
+                    (Hash::default(), previous, BranchLatestStatus::Convergent),
+                    (previous, signature, BranchLatestStatus::Divergent),
+                ] {
+                    branch::store_latest(repository.clone(), branch, from, to, status)
+                        .await
+                        .expect("moving the branch");
+                }
+                link_commits.record(MovedLinkBranch {
+                    repository: repository.clone(),
+                    branch,
+                    previous,
+                    signature,
+                    divergent: false,
+                });
+            }
+            branch::store_latest(
+                repository.clone(),
+                moved_since,
+                signature,
+                other,
+                BranchLatestStatus::Divergent,
+            )
+            .await
+            .expect("another commit moving the branch");
+            let latest = async |branch| {
+                branch::load_latest(repository.clone(), branch)
+                    .await
+                    .expect("reading the latest")
+            };
+
+            link_commits
+                .roll_back_unpublished((&repository, restored, signature))
+                .await;
+            assert_eq!(latest(restored).await, signature);
+            link_commits.roll_back().await;
+
+            assert_eq!(latest(restored).await, previous);
+            assert!(
+                !branch::load_latest_divergent(repository.clone(), restored)
+                    .await
+                    .expect("reading the latest status")
+            );
+            assert_eq!(latest(moved_since).await, other);
         })
         .await;
 }

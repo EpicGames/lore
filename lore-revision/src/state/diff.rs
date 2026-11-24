@@ -1722,7 +1722,7 @@ async fn add_change_for_paired_nodes(
 
                     let can_read_link = to.mapping.repository.can_read_link(link_repository_id);
 
-                    // If the link is staged and doesn't have staged children, it's a link update
+                    // A staged link holding neither staged nor dirty children is a link update
                     let recurse_link =
                         if !can_read_link || flags.contains(DiffFlags::ReportsLinkNodes) {
                             false
@@ -1737,13 +1737,16 @@ async fn add_change_for_paired_nodes(
                                     .await
                                     .forward::<StateError>("Link error")?;
 
-                            let has_staged_children = linked_state
-                                .node_has_staged_children(linked_repository.clone(), to_node.child)
+                            let has_changed_children = linked_state
+                                .node_has_staged_or_dirty_children(
+                                    linked_repository.clone(),
+                                    to_node.child,
+                                )
                                 .await?;
 
                             // The two subtrees of a remount, or of a link replaced by one to another
                             // repository, don't correspond, so the link node is reported instead.
-                            (!is_staged || has_staged_children)
+                            (!is_staged || has_changed_children)
                                 && !(from_node.is_link()
                                     && crate::link::link_remounted(
                                         &linked_repository,

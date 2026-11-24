@@ -42,6 +42,7 @@ use crate::layer;
 use crate::link::LinkedStagedContent;
 use crate::link::LinkedState;
 use crate::link::settle_linked_staged_state;
+use crate::link::sharing_mounts;
 use crate::lore::BranchId;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
@@ -57,6 +58,7 @@ use crate::node::ROOT_NODE;
 use crate::path::emit_path_ignore;
 use crate::state;
 use crate::state::Clear;
+use crate::state::LinkReference;
 use crate::state::State;
 use crate::util::fan_out;
 use crate::util::path::RelativePath;
@@ -843,12 +845,14 @@ async fn settle_cleared_links(
         .link_list(repository.clone())
         .await
         .forward::<StatusError>("listing links to settle")?;
-    for link in links {
+    let mut settled = Vec::new();
+    for &link in &links {
         if pending.is_empty() {
             break;
         }
         let node = link.local_node();
-        if !repository.can_read_link(link.repository)
+        if settled.contains(&node)
+            || !repository.can_read_link(link.repository)
             || !state
                 .node(repository.clone(), node)
                 .await
@@ -858,13 +862,11 @@ async fn settle_cleared_links(
             continue;
         }
 
-        let cleared = pending
-            .iter()
-            .position(|(linked, linked_state)| {
-                linked.id == link.repository && linked_state.revision() == link.signature
-            })
-            .map(|index| pending.swap_remove(index));
+        let cleared = take_cleared(pending, link);
         let is_cleared = cleared.is_some();
+        if is_cleared && shares_mounted_node(repository, state, &links, link).await? {
+            continue;
+        }
         let linked = if let Some(linked) = cleared {
             linked
         } else {
@@ -889,20 +891,74 @@ async fn settle_cleared_links(
         }
 
         let content = LinkedStagedContent::of(linked_state, linked_repository).await;
-        settle_linked_staged_state(
-            state,
-            repository.clone(),
-            node,
-            link.branch,
-            &linked,
-            content,
-            token,
-        )
-        .await
-        .forward::<StatusError>("repinning settled link")?;
+        settled.extend(
+            settle_linked_staged_state(
+                state,
+                repository.clone(),
+                sharing_mounts(linked_state, &[node]),
+                link.branch,
+                &linked,
+                content,
+                token,
+            )
+            .await
+            .forward::<StatusError>("repinning settled link")?,
+        );
         changed = true;
     }
     Ok(changed)
+}
+
+/// The state of `link`'s revision whose markers `--check-dirty` cleared, taken from `pending`. The
+/// mounts of one repository each verify their own copy of the revision they share, so where
+/// several cleared one, none is taken: a copy holds only the clears below its own mount, and
+/// persisting it would drop the others' markers.
+fn take_cleared(pending: &mut Vec<LinkedState>, link: LinkReference) -> Option<LinkedState> {
+    let of_link = |(linked, linked_state): &LinkedState| {
+        linked.id == link.repository() && linked_state.revision() == link.signature()
+    };
+    let mut found = pending
+        .iter()
+        .enumerate()
+        .filter(|(_, cleared)| of_link(cleared))
+        .map(|(index, _)| index);
+    match (found.next(), found.next()) {
+        (Some(index), None) => Some(pending.swap_remove(index)),
+        (Some(_), Some(_)) => {
+            pending.retain(|cleared| !of_link(cleared));
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Whether another mount in `links`, the registry of `state`, pins `link`'s revision and exposes
+/// the node `link` exposes: a marker cleared against one working tree copy of a folder may stand
+/// for a change in the other, so neither persists the clear.
+async fn shares_mounted_node(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    links: &[LinkReference],
+    link: LinkReference,
+) -> Result<bool, StatusError> {
+    let mounted = async |node| {
+        state
+            .node(repository.clone(), node)
+            .await
+            .forward::<StatusError>("reading a mount to settle")
+            .map(|node| node.child)
+    };
+    let others = links.iter().filter(|other| {
+        other.repository() == link.repository()
+            && other.signature() == link.signature()
+            && other.local_node() != link.local_node()
+    });
+    let (child, others) = futures::future::try_join(
+        mounted(link.local_node()),
+        futures::future::try_join_all(others.map(|other| mounted(other.local_node()))),
+    )
+    .await?;
+    Ok(others.contains(&child))
 }
 
 /// Compare a repository's own tree against its staged state below `path`, or the whole of it where

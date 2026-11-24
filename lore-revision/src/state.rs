@@ -7101,8 +7101,8 @@ impl State {
         .await
     }
 
-    /// Pins every row of `link_id` at `signature` on `branch`, keeping their flags, and answers
-    /// those rows.
+    /// Pins the rows of `link_id` that `only` selects at `signature` on `branch`, keeping their
+    /// flags, and answers those rows.
     #[lore_macro::test_pub]
     pub(crate) async fn link_repin(
         &self,
@@ -7110,12 +7110,13 @@ impl State {
         link_id: RepositoryId,
         branch: BranchId,
         signature: Hash,
+        only: impl Fn(&LinkReference) -> bool,
     ) -> Result<Vec<LinkReference>, StateError> {
         let mut rows = Vec::new();
         self.edit_link_list(repository, link_id, |link_list| {
             for link in link_list
                 .iter_mut()
-                .filter(|link| link.repository == link_id)
+                .filter(|link| link.repository == link_id && only(link))
             {
                 link.branch = branch;
                 link.signature = signature;

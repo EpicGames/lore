@@ -865,6 +865,7 @@ async fn commit_staged_with_layers(
             state_staged.revision()
         );
         'parent: {
+            let link_commits = Arc::default();
             let (committed, modified_times) = match commit_staged_revision(
                 operation,
                 repository.clone(),
@@ -881,6 +882,7 @@ async fn commit_staged_with_layers(
                 MissingPaths::Settle,
                 left_out,
                 Some(&mut left),
+                &link_commits,
             )
             .await
             {
@@ -890,7 +892,7 @@ async fn commit_staged_with_layers(
             };
             signature = committed;
 
-            finalize_commit(
+            if let Err(err) = finalize_commit(
                 repository.clone(),
                 &state_current,
                 &state_staged,
@@ -900,7 +902,13 @@ async fn commit_staged_with_layers(
                 token,
                 Some((operation, &modified_times)),
             )
-            .await?;
+            .await
+            {
+                link_commits
+                    .roll_back_unpublished((&repository, current_branch, signature))
+                    .await;
+                return Err(err);
+            }
 
             modified_times.store(repository.clone()).await;
 
@@ -977,6 +985,7 @@ async fn commit_staged_with_layers(
             layer.target_path.as_str(),
         )
         .await?;
+        let link_commits = Arc::default();
         let layer_result = commit_staged_revision(
             operation,
             layer_repository.clone(),
@@ -993,6 +1002,7 @@ async fn commit_staged_with_layers(
             MissingPaths::Settle,
             Vec::new(),
             None,
+            &link_commits,
         )
         .await;
 
@@ -1031,7 +1041,7 @@ async fn commit_staged_with_layers(
             let layer_previous = branch::load_latest(layer_repository.clone(), current_branch)
                 .await
                 .unwrap_or_default();
-            branch::store_latest(
+            if let Err(err) = branch::store_latest(
                 layer_repository.clone(),
                 current_branch,
                 layer_previous,
@@ -1039,7 +1049,11 @@ async fn commit_staged_with_layers(
                 BranchLatestStatus::Divergent,
             )
             .await
-            .forward::<CommitError>("Failed to store layer branch latest")?;
+            .forward::<CommitError>("Failed to store layer branch latest")
+            {
+                link_commits.roll_back().await;
+                return Err(err);
+            }
 
             layer::store_layer_current(
                 repository.clone(),
@@ -1178,6 +1192,7 @@ async fn commit_layer_only(
         layer.target_path.as_str(),
     )
     .await?;
+    let link_commits = Arc::default();
     let (layer_signature, layer_modified_times) = commit_staged_revision(
         operation,
         layer_state.repository.clone(),
@@ -1194,6 +1209,7 @@ async fn commit_layer_only(
         MissingPaths::Settle,
         Vec::new(),
         None,
+        &link_commits,
     )
     .await?;
 
@@ -1207,7 +1223,7 @@ async fn commit_layer_only(
             branch::load_latest(layer_state.repository.clone(), parent_current_branch)
                 .await
                 .unwrap_or_default();
-        branch::store_latest(
+        if let Err(err) = branch::store_latest(
             layer_state.repository.clone(),
             parent_current_branch,
             layer_previous,
@@ -1215,7 +1231,11 @@ async fn commit_layer_only(
             BranchLatestStatus::Divergent,
         )
         .await
-        .forward::<CommitError>("Failed to store layer branch latest")?;
+        .forward::<CommitError>("Failed to store layer branch latest")
+        {
+            link_commits.roll_back().await;
+            return Err(err);
+        }
 
         layer::store_layer_current(
             repository.clone(),
@@ -1250,6 +1270,9 @@ async fn commit_layer_only(
 ///
 /// After committing the link, updates the parent's link pin and stages the parent
 /// state so the updated pin is visible in `lore status`. The parent is not committed.
+///
+/// A commit that fails before it stages the parent moves back every linked branch it moved
+/// ([`LinkCommits::roll_back`]).
 #[allow(clippy::too_many_arguments)]
 async fn commit_link_only(
     operation: &Arc<InstanceOperationImpl>,
@@ -1261,6 +1284,37 @@ async fn commit_link_only(
     values: LoreArray<LoreString>,
     formats: LoreArray<LoreMetadataType>,
     reporting: CommitReporting,
+) -> Result<Hash, CommitError> {
+    let link_commits = Arc::default();
+    let committed = commit_link_only_moving(
+        operation,
+        repository,
+        token,
+        (message, link_path),
+        (keys, values, formats),
+        reporting,
+        &link_commits,
+    )
+    .await;
+    if committed.is_err() {
+        link_commits.roll_back().await;
+    }
+    committed
+}
+
+/// [`commit_link_only`], recording in `link_commits` each linked branch it moves.
+async fn commit_link_only_moving(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    token: RepositoryWriteToken,
+    (message, link_path): (String, String),
+    (keys, values, formats): (
+        LoreArray<LoreString>,
+        LoreArray<LoreString>,
+        LoreArray<LoreMetadataType>,
+    ),
+    reporting: CommitReporting,
+    link_commits: &Arc<LinkCommits>,
 ) -> Result<Hash, CommitError> {
     let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
         .await
@@ -1472,18 +1526,16 @@ async fn commit_link_only(
         MissingPaths::Settle,
         Vec::new(),
         None,
+        link_commits,
     )
     .await?;
 
-    finalize_commit(
-        link_repository.clone(),
-        &link_state_current,
-        &link_state_staged,
-        link_branch_latest,
-        link_signature,
-        link_branch,
+    commit_link_finalize(
+        link_commits,
+        (&link_repository, link_branch),
+        (&link_state_current, &link_state_staged),
+        (link_branch_latest, link_signature),
         &token,
-        None,
     )
     .await?;
 
@@ -1546,6 +1598,7 @@ async fn commit_link_only(
             MissingPaths::Refuse,
             Vec::new(),
             None,
+            link_commits,
         )
         .await?;
 
@@ -1553,15 +1606,12 @@ async fn commit_link_only(
             .await
             .unwrap_or_default();
 
-        finalize_commit(
-            child_repository.clone(),
-            &child_current,
-            &child_state,
-            child_branch_latest,
-            child_signature,
-            level.branch,
+        commit_link_finalize(
+            link_commits,
+            (&child_repository, level.branch),
+            (&child_current, &child_state),
+            (child_branch_latest, child_signature),
             &token,
-            None,
         )
         .await?;
 
@@ -1623,6 +1673,45 @@ async fn commit_link_only(
     }
 
     Ok(link_signature)
+}
+
+/// [`finalize_commit`] of `signature`, a linked repository's revision a link's commit commits on
+/// `branch` over `previous`, recorded in `link_commits`.
+async fn commit_link_finalize(
+    link_commits: &LinkCommits,
+    (repository, branch): (&Arc<RepositoryContext>, BranchId),
+    (state_current, state_staged): (&Arc<State>, &Arc<State>),
+    (previous, signature): (Hash, Hash),
+    token: &RepositoryWriteToken,
+) -> Result<(), CommitError> {
+    let divergent = branch::load_latest_divergent(repository.clone(), branch)
+        .await
+        .unwrap_or_default();
+    let finalized = finalize_commit(
+        repository.clone(),
+        state_current,
+        state_staged,
+        previous,
+        signature,
+        branch,
+        token,
+        None,
+    )
+    .await;
+    // The branch latest is stored first, so a finalize failing after it has moved the branch.
+    if !execution_context().globals().dry_run()
+        && (finalized.is_ok()
+            || branch::load_latest(repository.clone(), branch).await.ok() == Some(signature))
+    {
+        link_commits.record(MovedLinkBranch {
+            repository: repository.clone(),
+            branch,
+            previous,
+            signature,
+            divergent,
+        });
+    }
+    finalized
 }
 
 /// Settles the link merge rows `state_staged` keeps for the link `local_node`, linking
@@ -1934,6 +2023,7 @@ async fn commit_staged_revision(
     missing: MissingPaths,
     left_out: Vec<NodeID>,
     left: Option<&mut LeftToMark>,
+    link_commits: &Arc<LinkCommits>,
 ) -> Result<(Hash, Arc<RecordedModifiedTimes>), CommitError> {
     let context = execution_context();
     let globals = context.globals();
@@ -1987,6 +2077,7 @@ async fn commit_staged_revision(
 
     let work_tracker = tracker.clone();
     let operation = operation.clone();
+    let walk_link_commits = link_commits.clone();
     let work_result: Result<(Hash, Arc<RecordedModifiedTimes>), CommitError> = async move {
         let collected = Arc::new(RecordedModifiedTimes::below(
             operation.clock_floor(&repository).await,
@@ -2015,6 +2106,7 @@ async fn commit_staged_revision(
             reporting.stats.clone(),
             reporting.interval,
             gone,
+            walk_link_commits,
         )
         .await?;
         let changes = staged.to_aligned::<NodeDelta>();
@@ -2099,14 +2191,16 @@ async fn commit_staged_revision(
 
     // Original work errors take precedence; tracker drain errors surface only
     // when the work itself succeeded.
-    match work_result {
-        Ok(committed) => {
-            drain_result
-                .forward::<CommitError>("Background fragment upload task failed during commit")?;
-            Ok(committed)
-        }
+    let committed = match work_result {
+        Ok(committed) => drain_result
+            .forward::<CommitError>("Background fragment upload task failed during commit")
+            .map(|()| committed),
         Err(work_err) => Err(work_err),
+    };
+    if committed.is_err() {
+        link_commits.roll_back().await;
     }
+    committed
 }
 
 /// Publish `signature` as `branch`'s tip and anchor it as the current revision.
@@ -2610,6 +2704,7 @@ pub(crate) async fn commit_files_and_rehash(
     stats: Arc<CommitStats>,
     progress_interval: std::time::Duration,
     gone: Option<Arc<Gone>>,
+    link_commits: Arc<LinkCommits>,
 ) -> Result<StagedChanges, CommitError> {
     lore_info!("Fragmenting files and updating tree hashes");
 
@@ -2637,7 +2732,10 @@ pub(crate) async fn commit_files_and_rehash(
     );
     let committed_links = walk.committed_links.clone();
     let delta = commit_walks(
-        walk,
+        CommitWalk {
+            link_commits,
+            ..walk
+        },
         file_rx,
         relative_path.clone(),
         node_id,
@@ -3019,7 +3117,7 @@ fn repins(mut committed: Vec<CommittedLink>) -> Vec<CommittedLink> {
 /// Pins every mount of each repository in `committed` at the revision committed, so a commit through
 /// one mount moves the others with it: records each mount moved in `delta`, stages the directories
 /// above it for the rehash, and realizes it through `operation` where the walk from `walk_path` at
-/// `walk_node` materializes it.
+/// `walk_node` materializes it, once every such mount is verified.
 ///
 /// Runs once the walk is done: its tasks have cleared the directories they committed, so a mount
 /// moved from inside one would leave a directory above it the rehash doesn't visit.
@@ -3031,6 +3129,7 @@ async fn repin_committed_links(
     delta: &Arc<parking_lot::RwLock<BytesMut>>,
 ) -> Result<(), CommitError> {
     let committed = std::mem::take(&mut *committed.lock());
+    let mut pins = Vec::new();
     for link in repins(committed) {
         let moved = link::repin_repository(
             state,
@@ -3041,7 +3140,7 @@ async fn repin_committed_links(
         )
         .await
         .forward::<CommitError>("Failed to pin every mount of a committed repository")?;
-        let mut pins = Vec::with_capacity(moved.len());
+        let link_context = repository.to_link_context(link.repository).await;
         for mount in &moved {
             state
                 .node_mark(
@@ -3061,23 +3160,16 @@ async fn repin_committed_links(
                 .await
                 .forward::<CommitError>("Failed resolving the path of a mount")?
             {
-                pins.push(mount.pin(walk_path.join(below.as_str())));
+                pins.push((
+                    link_context.clone(),
+                    mount.pin(walk_path.join(below.as_str())),
+                ));
             }
         }
-        let link_context = repository.to_link_context(link.repository).await;
-        futures::future::try_join_all(pins.iter().map(|pin| {
-            link::realize_resolved_link_pin_in_operation(
-                operation,
-                repository.clone(),
-                link_context.clone(),
-                pin,
-                false,
-            )
-        }))
-        .await
-        .forward_any::<CommitError>("Failed to realize a mount the commit moved")?;
     }
-    Ok(())
+    link::realize_resolved_link_pins_in_operation(operation, repository.clone(), &pins)
+        .await
+        .forward_any::<CommitError>("Failed to realize a mount the commit moved")
 }
 
 /// Rehashes the whole of `state` under one filesystem operation, answering with the modified
@@ -3119,6 +3211,7 @@ pub(crate) async fn rehash_tree_in_operation(
             CommitStats::new(),
             execution_context().globals().event_interval(),
             None,
+            Arc::default(),
         )
         .await
     })
@@ -3419,10 +3512,91 @@ struct CommitWalk {
     link_commits: Arc<LinkCommits>,
 }
 
-/// The revision each staged revision of a linked repository commits as on a branch, shared by
-/// every walk of one commit, so that the links pinning one staged revision commit it once.
-type LinkCommits =
-    parking_lot::Mutex<HashMap<(RepositoryId, BranchId, Hash), Arc<tokio::sync::OnceCell<Hash>>>>;
+/// What one commit does to the linked repositories below it, shared by every walk of it.
+#[lore_macro::test_pub]
+#[derive(Default)]
+pub(crate) struct LinkCommits {
+    /// The revision each staged revision of a linked repository commits as on a branch, so that the
+    /// links pinning one staged revision commit it once.
+    revisions: parking_lot::Mutex<
+        HashMap<(RepositoryId, BranchId, Hash), Arc<tokio::sync::OnceCell<Hash>>>,
+    >,
+    /// Each linked branch the commit moved, in the order it moved them.
+    moved: parking_lot::Mutex<Vec<MovedLinkBranch>>,
+}
+
+/// A linked branch a commit moved from `previous` to `signature`, with whether its latest was
+/// divergent before.
+#[lore_macro::test_pub]
+pub(crate) struct MovedLinkBranch {
+    pub repository: Arc<RepositoryContext>,
+    pub branch: BranchId,
+    pub previous: Hash,
+    pub signature: Hash,
+    pub divergent: bool,
+}
+
+impl LinkCommits {
+    #[lore_macro::test_pub]
+    pub(crate) fn record(&self, moved: MovedLinkBranch) {
+        self.moved.lock().push(moved);
+    }
+
+    /// [`Self::roll_back`], unless the failed commit published `published`, its revision, as the
+    /// latest of `branch` of `repository`.
+    #[lore_macro::test_pub]
+    async fn roll_back_unpublished(
+        &self,
+        (repository, branch, published): (&Arc<RepositoryContext>, BranchId, Hash),
+    ) {
+        if branch::load_latest(repository.clone(), branch)
+            .await
+            .is_ok_and(|latest| latest != published)
+        {
+            self.roll_back().await;
+        }
+    }
+
+    /// Moves each linked branch the commit moved back to the latest it replaced, newest first,
+    /// with the latest status it had, for a commit that fails before it publishes the revision
+    /// pinning them: a push would otherwise publish revisions no parent pins. A branch moved since
+    /// is left where it is.
+    #[lore_macro::test_pub]
+    pub(crate) async fn roll_back(&self) {
+        let moved = std::mem::take(&mut *self.moved.lock());
+        for moved in moved.into_iter().rev() {
+            let status = if moved.divergent {
+                BranchLatestStatus::Divergent
+            } else {
+                BranchLatestStatus::Convergent
+            };
+            match branch::store_latest(
+                moved.repository.clone(),
+                moved.branch,
+                moved.signature,
+                moved.previous,
+                status,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(error) if error.is_branch_advanced() => lore_debug!(
+                    "Left branch {} of repository {}, which another commit moved past revision {}",
+                    moved.branch,
+                    moved.repository.id,
+                    moved.signature
+                ),
+                Err(error) => lore_warn!(
+                    "Left branch {} of repository {} at revision {}, which a failed commit \
+                     stored: {error}",
+                    moved.branch,
+                    moved.repository.id,
+                    moved.signature
+                ),
+            }
+        }
+    }
+}
 
 /// A link, at any depth below a staged state, pinning a revision of its repository that is not
 /// committed yet.
@@ -6328,6 +6502,7 @@ async fn commit_link_node(
     let branch_id = link_reference.resolve_branch(parent_branch);
     let built_on = link_state.committed_revision();
     let committed = link_commits
+        .revisions
         .lock()
         .entry((link.repository, branch_id, node.address.hash))
         .or_default()
@@ -6530,6 +6705,9 @@ async fn commit_link(
     let link_previous = branch::load_latest(repository.clone(), branch)
         .await
         .unwrap_or_default();
+    let link_divergent = branch::load_latest_divergent(repository.clone(), branch)
+        .await
+        .unwrap_or_default();
 
     // Graceful-drain pattern mirroring commit_staged_revision: run all
     // write-producing work under `work_tracker`, then ALWAYS drain so leaders
@@ -6538,6 +6716,7 @@ async fn commit_link(
     // case — no new revision, no event.
     let work_tracker = link_tracker.clone();
     let work_result: Result<Option<Hash>, CommitError> = {
+        let moves = link_commits.clone();
         let repository = repository.clone();
         let state = state.clone();
         let metadata = metadata.clone();
@@ -6640,6 +6819,13 @@ async fn commit_link(
                 )
                 .await
                 .forward::<CommitError>("Failed to store current branch latest")?;
+                moves.record(MovedLinkBranch {
+                    repository: repository.clone(),
+                    branch,
+                    previous: link_previous,
+                    signature,
+                    divergent: link_divergent,
+                });
             }
 
             Ok(Some(signature))

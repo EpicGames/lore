@@ -824,8 +824,22 @@ pub(crate) async fn stage_filesystem_path(
     if node_link.node == INVALID_NODE {
         return Ok(NodeLink::invalid());
     }
-    let (current_repository, node_state) =
-        linked.unwrap_or_else(|| (repository.clone(), state.clone()));
+    let (current_repository, node_state) = match (linked, link_tracker.as_ref()) {
+        // Every link crossed is tracked, so a delete nested two or more levels deep folds its pin
+        // up through all of them.
+        (Some(_), Some(tracker)) => {
+            let chain = crate::link::resolve_tracked_link_chain(
+                base.clone(),
+                state.clone(),
+                remainder_path.clone(),
+                tracker,
+            )
+            .await
+            .forward::<StageError>("Failed to resolve link chain")?;
+            (chain.innermost.repository, chain.innermost.state)
+        }
+        (linked, _) => linked.unwrap_or_else(|| (repository.clone(), state.clone())),
+    };
     // A block of its own, so the future holds the node only until the discard check.
     let (held, states) = {
         let Some((node, states)) = absent_named_node(
@@ -871,24 +885,6 @@ pub(crate) async fn stage_filesystem_path(
         } else {
             NodeLink::default()
         });
-    }
-
-    if let Some(ref tracker) = link_tracker
-        && node_link.repository != repository.id
-    {
-        // Record a tracker context for every link crossed to reach the
-        // deleted path, so a delete nested two or more levels deep folds
-        // its pin up through all intermediate links (not just one level).
-        let chain = crate::link::resolve_link_chain(
-            base.clone(),
-            state.clone(),
-            remainder_path.clone(),
-            BranchId::default(),
-        )
-        .await
-        .forward::<StageError>("Failed to resolve link chain")?;
-
-        chain.record_tracker_contexts(tracker, &node_state);
     }
 
     lore_debug!(
@@ -1279,30 +1275,19 @@ impl StageDescent {
                 );
 
                 let linked_repository = self.repository.to_link_context(link_repository_id).await;
-                let mut linked_state = State::deserialize(self.repository.clone(), link_revision)
-                    .await
-                    .forward::<StageError>("Failed to deserialize revision state")?;
-
-                // Track this link for potential reserialization
-                if let Some(tracker) = link_tracker {
-                    // Reuse potentially existing link state for same repository
-                    linked_state = if let Some(existing_context) =
-                        tracker.find_link_context(link_repository_id)
-                    {
-                        existing_context.link_state.clone()
-                    } else {
-                        linked_state.clone()
-                    };
-
-                    let link_context = link::LinkContext {
-                        link_repository_id,
-                        link_node_id: node_link.node,
-                        parent_repository_id: self.repository.id,
-                        link_state: linked_state.clone(),
-                    };
-
-                    tracker.add_link(link_context);
+                let linked_state = if let Some(tracker) = link_tracker {
+                    tracker
+                        .track(
+                            (&self.repository, &self.state),
+                            node_link.node,
+                            link_repository_id,
+                            link_revision,
+                        )
+                        .await
+                } else {
+                    State::deserialize(linked_repository.clone(), link_revision).await
                 }
+                .forward::<StageError>("Failed to deserialize revision state")?;
 
                 self.repository = linked_repository;
                 self.state = linked_state;
@@ -3325,29 +3310,19 @@ async fn stage_child_directory(
         let link = from_node.linked_node();
 
         let linked_repository = repository.to_link_context(link.repository).await;
-        let mut linked_state = State::deserialize(linked_repository.clone(), link.revision)
-            .await
-            .forward::<StageError>("Failed to deserialize linked state")?;
-
-        // Register link with tracker for deferred processing
-        if let Some(ref tracker) = link_tracker {
-            // Check for existing context and reuse state if available
-            linked_state =
-                if let Some(existing_context) = tracker.find_link_context(link.repository) {
-                    existing_context.link_state.clone()
-                } else {
-                    linked_state.clone()
-                };
-
-            let link_context = link::LinkContext {
-                link_repository_id: link.repository,
-                link_node_id: node_link.node,
-                parent_repository_id: repository.id,
-                link_state: linked_state.clone(),
-            };
-
-            tracker.add_link(link_context);
+        let linked_state = if let Some(ref tracker) = link_tracker {
+            tracker
+                .track(
+                    (&repository, &state),
+                    node_link.node,
+                    link.repository,
+                    link.revision,
+                )
+                .await
+        } else {
+            State::deserialize(linked_repository.clone(), link.revision).await
         }
+        .forward::<StageError>("Failed to deserialize linked state")?;
 
         let mut link_relative_path = relative_path.clone();
         // Scoped so the read lock drops before the recurse below.

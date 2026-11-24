@@ -1478,6 +1478,218 @@ async fn repinning_a_repository_refuses_mounts_with_different_flags() {
         .await;
 }
 
+/// A revision of `linked` staged on `pin`, which no commit holds, with a directory `name` added.
+async fn staged_on(linked: &Arc<RepositoryContext>, pin: Hash, name: &str) -> Hash {
+    let staged = in_memory::revision_state(linked, pin).await;
+    staged.reparent_onto(pin);
+    add(&staged, linked.clone(), ROOT_NODE, directory(name), name).await;
+    staged
+        .serialize(linked.clone(), &in_memory::token())
+        .await
+        .expect("serializing the staged revision")
+}
+
+/// The mounts of one repository in one parent stage into one state, and a mount of it in another
+/// parent into another.
+#[tokio::test]
+async fn tracking_shares_one_linked_state_per_parent_and_repository() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let linked = repository
+                .to_link_context(RepositoryId::from(uuid::Uuid::now_v7()))
+                .await;
+            let other_parent = repository
+                .to_link_context(RepositoryId::from(uuid::Uuid::now_v7()))
+                .await;
+            let pin = revision_with_directories(&linked, &["foo", "bar"]).await;
+            let (state, a, b) = mounting_foo_and_bar(&repository, &linked, pin).await;
+            let (other_state, other_a, _) = mounting_foo_and_bar(&other_parent, &linked, pin).await;
+            let tracker = LinkTracker::new();
+
+            let mut tracked = Vec::new();
+            for (parent, mount) in [
+                ((&repository, &state), a),
+                ((&repository, &state), b),
+                ((&other_parent, &other_state), other_a),
+            ] {
+                tracked.push(
+                    tracker
+                        .track(parent, mount, linked.id, pin)
+                        .await
+                        .expect("tracking the mount"),
+                );
+            }
+
+            assert!(Arc::ptr_eq(&tracked[0], &tracked[1]));
+            assert!(!Arc::ptr_eq(&tracked[0], &tracked[2]));
+            assert_eq!(tracker.all_links().len(), 3);
+        })
+        .await;
+}
+
+/// A mount at the committed pin, tracked first, stages into the uncommitted revision another
+/// mount of its repository pins.
+#[tokio::test]
+async fn tracking_a_mount_at_the_committed_pin_shares_the_uncommitted_revision() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let linked = repository
+                .to_link_context(RepositoryId::from(uuid::Uuid::now_v7()))
+                .await;
+            let pin = revision_with_directories(&linked, &["foo", "bar"]).await;
+            let staged = staged_on(&linked, pin, "baz").await;
+            let (state, a, b) = mounting_foo_and_bar(&repository, &linked, pin).await;
+            state
+                .link_update(
+                    repository.clone(),
+                    linked.id,
+                    BranchId::default(),
+                    staged,
+                    a,
+                )
+                .await
+                .expect("pinning one mount at the staged revision");
+
+            let tracked = LinkTracker::new()
+                .track((&repository, &state), b, linked.id, pin)
+                .await
+                .expect("tracking the mount at the committed pin");
+
+            assert_eq!(tracked.revision(), staged);
+        })
+        .await;
+}
+
+/// A change to a shared state moves the mounts holding it and those pinning the uncommitted
+/// revision it was opened at, each keeping the node it exposes, and leaves a mount at the
+/// committed pin there.
+#[tokio::test]
+async fn repinning_staged_mounts_moves_the_mounts_sharing_the_change() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let linked = repository
+                .to_link_context(RepositoryId::from(uuid::Uuid::now_v7()))
+                .await;
+            let pin = revision_with_directories(&linked, &["foo", "bar"]).await;
+            let staged = staged_on(&linked, pin, "baz").await;
+            let restaged = staged_on(&linked, pin, "qux").await;
+            let (state, a, b) = mounting_foo_and_bar(&repository, &linked, pin).await;
+            state
+                .link_update(
+                    repository.clone(),
+                    linked.id,
+                    BranchId::default(),
+                    staged,
+                    a,
+                )
+                .await
+                .expect("pinning one mount at the staged revision");
+            let opened = in_memory::revision_state(&linked, staged).await;
+            let children = [a, b].map(async |mount| {
+                state
+                    .node(repository.clone(), mount)
+                    .await
+                    .expect("reading the mount")
+                    .child
+            });
+            let children = futures::future::join_all(children).await;
+
+            let moved = repin_staged_mounts(
+                &state,
+                &repository,
+                linked.id,
+                BranchId::default(),
+                restaged,
+                sharing_mounts(&opened, &[]),
+            )
+            .await
+            .expect("repinning the mounts sharing the state");
+            assert_eq!(moved, [a]);
+            let held = repin_staged_mounts(
+                &state,
+                &repository,
+                linked.id,
+                BranchId::default(),
+                restaged,
+                sharing_mounts(&opened, &[b]),
+            )
+            .await
+            .expect("repinning the mount holding the change");
+            assert_eq!(held, [b]);
+
+            for (mount, child) in [a, b].into_iter().zip(children) {
+                let node = state
+                    .node(repository.clone(), mount)
+                    .await
+                    .expect("reading the mount");
+                assert_eq!((node.address.hash, node.child), (restaged, child));
+            }
+        })
+        .await;
+}
+
+/// Mounts pinning two uncommitted revisions, as staging wrote before every mount shared one, each
+/// stage into the state of their own revision, which every task tracking that mount shares.
+#[tokio::test]
+async fn tracking_mounts_on_unrelated_revisions_keeps_a_state_for_each() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let linked = repository
+                .to_link_context(RepositoryId::from(uuid::Uuid::now_v7()))
+                .await;
+            let pin = revision_with_directories(&linked, &["foo", "bar"]).await;
+            let (state, a, b) = mounting_foo_and_bar(&repository, &linked, pin).await;
+            let mut staged = Vec::new();
+            for (mount, name) in [(a, "baz"), (b, "qux")] {
+                let revision = staged_on(&linked, pin, name).await;
+                state
+                    .link_update(
+                        repository.clone(),
+                        linked.id,
+                        BranchId::default(),
+                        revision,
+                        mount,
+                    )
+                    .await
+                    .expect("pinning the mount at its staged revision");
+                staged.push(revision);
+            }
+            let tracker = LinkTracker::new();
+
+            let mut tracked = Vec::new();
+            for (mount, revision) in [(a, staged[0]), (b, staged[1]), (b, staged[1])] {
+                tracked.push(
+                    tracker
+                        .track((&repository, &state), mount, linked.id, revision)
+                        .await
+                        .expect("tracking the mount"),
+                );
+            }
+
+            assert_eq!(
+                tracked
+                    .iter()
+                    .map(|state| state.revision())
+                    .collect::<Vec<_>>(),
+                [staged[0], staged[1], staged[1]]
+            );
+            assert!(Arc::ptr_eq(&tracked[1], &tracked[2]));
+        })
+        .await;
+}
+
 /// A State of `repository` mounting `linked` at `a`, exposing `foo`, staged at a revision lacking
 /// `bar`, and at `b`, exposing `bar`, pinned at the revision before, as mounts that disagree from
 /// before every mount shared one pin can hold.

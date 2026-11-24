@@ -24,6 +24,7 @@ use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
+use crate::fs::realize::VerifiedChanges;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreNodeType;
@@ -190,6 +191,57 @@ impl std::hash::Hash for LinkContext {
 #[derive(Debug, Default)]
 pub struct LinkTracker {
     links: DashMap<LinkContext, bool>,
+    /// The state the mounts of a repository stage into, by parent and repository.
+    states: SharedByPin<(RepositoryId, RepositoryId), Arc<State>>,
+}
+
+/// What the mounts of one linked repository share, opened once: one for every mount, and one for
+/// each mount pinning a revision that one is not staged on, as mounts written before every mount
+/// shared one pin can.
+#[derive(Debug)]
+pub(crate) struct SharedByPin<K, V>(parking_lot::Mutex<OpenedOnce<K, V>>);
+
+type OpenedOnce<K, V> = HashMap<(K, Option<Hash>), Arc<tokio::sync::OnceCell<V>>>;
+
+impl<K, V> Default for SharedByPin<K, V> {
+    fn default() -> Self {
+        Self(parking_lot::Mutex::default())
+    }
+}
+
+impl<K: Copy + Eq + std::hash::Hash, V: Clone> SharedByPin<K, V> {
+    fn cell(&self, key: K, own: Option<Hash>) -> Arc<tokio::sync::OnceCell<V>> {
+        self.0.lock().entry((key, own)).or_default().clone()
+    }
+
+    /// The value of `key` for a mount pinning `pin`: the shared one, opened by `open_shared`, where
+    /// `pin` is its revision or the one it is staged on (`staged_on`), else the mount's own, opened
+    /// by `open_own`.
+    pub(crate) async fn get_or_open<E, Shared, Own>(
+        &self,
+        (key, pin): (K, Hash),
+        staged_on: impl Fn(&V) -> [Hash; 2],
+        open_shared: impl FnOnce() -> Shared,
+        open_own: impl FnOnce() -> Own,
+    ) -> Result<V, E>
+    where
+        Shared: Future<Output = Result<V, E>>,
+        Own: Future<Output = Result<V, E>>,
+    {
+        let shared = self
+            .cell(key, None)
+            .get_or_try_init(open_shared)
+            .await?
+            .clone();
+        if staged_on(&shared).contains(&pin) {
+            return Ok(shared);
+        }
+        Ok(self
+            .cell(key, Some(pin))
+            .get_or_try_init(open_own)
+            .await?
+            .clone())
+    }
 }
 
 impl LinkTracker {
@@ -197,8 +249,43 @@ impl LinkTracker {
         Arc::new(Self::default())
     }
 
-    pub fn add_link(&self, link_context: LinkContext) {
-        self.links.insert(link_context, false);
+    #[lore_macro::test_pub]
+    fn add_link(&self, link_context: LinkContext) {
+        // The guard dies at the `;`, so the shard lock is not held across an await. A link a task
+        // tracks again keeps the modification another task marked on it.
+        #[allow(clippy::disallowed_methods)]
+        self.links.entry(link_context).or_insert(false);
+    }
+
+    /// Tracks the link at `link_node` of `parent`, pinning `pin` of `link_repository_id`, and
+    /// answers the state it stages into, which every mount of it in `parent` shares
+    /// ([`open_shared_linked_state`]), so the tasks of one walk stage into one revision.
+    pub async fn track(
+        &self,
+        (parent_repository, parent_state): (&Arc<RepositoryContext>, &Arc<State>),
+        link_node: NodeID,
+        link_repository_id: RepositoryId,
+        pin: Hash,
+    ) -> Result<Arc<State>, StateError> {
+        // Boxed, as only a walk crossing a link reaches it, and inline it would grow the future of
+        // every directory the walk stages.
+        let link_state = Box::pin(self.states.get_or_open(
+            ((parent_repository.id, link_repository_id), pin),
+            |state| [state.revision(), state.committed_revision()],
+            || open_shared_linked_state(parent_repository, parent_state, link_repository_id, pin),
+            || async {
+                let link_context = parent_repository.to_link_context(link_repository_id).await;
+                State::deserialize(link_context, pin).await
+            },
+        ))
+        .await?;
+        self.add_link(LinkContext {
+            link_repository_id,
+            link_node_id: link_node,
+            parent_repository_id: parent_repository.id,
+            link_state: link_state.clone(),
+        });
+        Ok(link_state)
     }
 
     /// Stops tracking the link to `link_repository_id` at `link_node_id` in
@@ -250,19 +337,45 @@ impl LinkTracker {
         self.links.iter().any(|entry| *entry.value())
     }
 
-    pub fn find_link_context(&self, repository_id: RepositoryId) -> Option<LinkContext> {
-        self.links
-            .iter()
-            .find(|entry| entry.key().link_repository_id == repository_id)
-            .map(|entry| entry.key().clone())
-    }
-
     /// All tracked link contexts, regardless of whether they were marked as
     /// modified. Used to resolve parent states when folding a nested change up
     /// through intermediate links that were crossed but not directly modified.
     pub fn all_links(&self) -> Vec<LinkContext> {
         self.links.iter().map(|entry| entry.key().clone()).collect()
     }
+}
+
+/// The state of `link_repository_id` that the mounts of it in `parent_state` share, opened for a
+/// mount pinning `pin`: the first uncommitted revision a mount pins, as a stage leaves the mounts it
+/// changed at an uncommitted revision and the others at the committed pin, else `pin`.
+pub(crate) async fn open_shared_linked_state(
+    parent_repository: &Arc<RepositoryContext>,
+    parent_state: &State,
+    link_repository_id: RepositoryId,
+    pin: Hash,
+) -> Result<Arc<State>, StateError> {
+    let link_context = parent_repository.to_link_context(link_repository_id).await;
+    let mut pins: Vec<Hash> = parent_state
+        .link_list(parent_repository.clone())
+        .await?
+        .iter()
+        .filter(|row| row.repository == link_repository_id)
+        .map(|row| row.signature)
+        .chain([pin])
+        .collect();
+    pins.sort_unstable();
+    pins.dedup();
+    let mut opened = futures::future::try_join_all(
+        pins.iter()
+            .map(|&pinned| State::deserialize(link_context.clone(), pinned)),
+    )
+    .await?;
+    let shared = opened
+        .iter()
+        .position(|state| state.revision_number() == 0)
+        .or_else(|| pins.iter().position(|&pinned| pinned == pin))
+        .unwrap_or_default();
+    Ok(opened.swap_remove(shared))
 }
 
 /// Data for an event reporting a change to a link.
@@ -1246,7 +1359,13 @@ pub(crate) async fn repin_repository(
     branch: BranchId,
 ) -> Result<Vec<RepinnedMount>, StateError> {
     let rows = state
-        .link_repin(repository.clone(), link_repository_id, branch, signature)
+        .link_repin(
+            repository.clone(),
+            link_repository_id,
+            branch,
+            signature,
+            |_| true,
+        )
         .await?;
     state
         .check_link_rows_agree(
@@ -1291,6 +1410,75 @@ pub(crate) async fn repin_repository(
         });
     }
     Ok(repinned)
+}
+
+/// Pins at `signature` the mounts of `link_repository_id` in `state` that `only` selects, and
+/// answers their link nodes. `signature` is staged on the revisions they pin, so it keeps the node
+/// ids of each, and every mount keeps the node it exposes.
+#[lore_macro::test_pub]
+pub(crate) async fn repin_staged_mounts(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    link_repository_id: RepositoryId,
+    branch: BranchId,
+    signature: Hash,
+    only: impl Fn(&LinkReference) -> bool,
+) -> Result<Vec<NodeID>, StateError> {
+    let rows = state
+        .link_repin(
+            repository.clone(),
+            link_repository_id,
+            branch,
+            signature,
+            only,
+        )
+        .await?;
+    let mut mounts = Vec::with_capacity(rows.len());
+    for row in rows {
+        state
+            .node_set_link_target(repository, row.local_node(), LinkPin::Revision(signature))
+            .await?;
+        mounts.push(row.local_node());
+    }
+    Ok(mounts)
+}
+
+/// Selects the mounts a change to `linked`, the state its mounts share, moves: those of `holding`,
+/// and those pinning the revision it was opened at where that is uncommitted. The others keep the
+/// committed pin until a commit moves them, as a commit refuses two mounts pinning one revision that
+/// holds a change made through the working tree.
+#[lore_macro::test_pub]
+pub(crate) fn sharing_mounts<'a>(
+    linked: &State,
+    holding: &'a [NodeID],
+) -> impl Fn(&LinkReference) -> bool + 'a {
+    let uncommitted = (linked.revision_number() == 0).then(|| linked.revision());
+    move |row| holding.contains(&row.local_node()) || uncommitted == Some(row.signature())
+}
+
+/// The mounts of `walked`, link nodes of `parent_state` mounting `linked`, below which `linked`
+/// holds a staged or dirty node: a walk through a mount below which the shared state holds no
+/// change keeps its pin.
+pub(crate) async fn mounts_holding_changes(
+    (parent_repository, parent_state): (&Arc<RepositoryContext>, &State),
+    (linked_repository, linked): (&Arc<RepositoryContext>, &State),
+    walked: &[NodeID],
+) -> Result<Vec<NodeID>, StateError> {
+    let held = futures::future::try_join_all(walked.iter().map(async |&link_node| {
+        let mounted = parent_state
+            .node(parent_repository.clone(), link_node)
+            .await?
+            .child;
+        linked
+            .node_has_staged_or_dirty_children(linked_repository.clone(), mounted)
+            .await
+    }))
+    .await?;
+    Ok(walked
+        .iter()
+        .zip(held)
+        .filter_map(|(&link_node, held)| held.then_some(link_node))
+        .collect())
 }
 
 /// The mount of `link_repository_id` among `rows` of `state` that [`repin_repository`] couldn't
@@ -1406,20 +1594,22 @@ impl LinkedStagedContent {
     }
 }
 
-/// Pin the link at `link_node` in `state` by what `linked` holds.
+/// Pin the mounts of `linked` in `state` that `only` selects by what `linked` holds, and answer
+/// their link nodes.
 ///
 /// A state holding anything is serialized on the committed revision it derives from, so a commit
-/// can restore that revision from the pin alone, and the link keeps its dirty flag only while a
-/// marker remains. An empty state has nothing to pin, so the link goes back to that revision.
+/// can restore that revision from the pin alone, and a link keeps its dirty flag only while a
+/// marker remains below it. An empty state has nothing to pin, so the links go back to that
+/// revision.
 pub async fn settle_linked_staged_state(
     state: &Arc<State>,
     repository: Arc<RepositoryContext>,
-    link_node: NodeID,
+    only: impl Fn(&LinkReference) -> bool,
     branch: BranchId,
     (linked_repository, linked_state): &LinkedState,
     content: LinkedStagedContent,
     token: &RepositoryWriteToken,
-) -> Result<(), StateError> {
+) -> Result<Vec<NodeID>, StateError> {
     let committed = linked_state.committed_revision();
     let signature = if content == LinkedStagedContent::Empty {
         committed
@@ -1430,69 +1620,36 @@ pub async fn settle_linked_staged_state(
             .await?
     };
 
-    if content == LinkedStagedContent::Dirty {
-        return repin_link_node(
-            state,
-            repository,
-            linked_repository.id,
-            branch,
-            signature,
-            link_node,
-            NodeFlags::Dirty,
-        )
-        .await;
-    }
-    update_link_pin_by_node(
+    let mounts = repin_staged_mounts(
         state,
-        repository.clone(),
+        &repository,
         linked_repository.id,
         branch,
         signature,
-        link_node,
+        only,
     )
     .await?;
-    state.node_clear(&repository, link_node, Clear::Dirty).await
-}
-
-/// Reserializes a tracked link's state and updates the parent repository's
-/// block tree and link registry.
-///
-/// This is the shared workflow between `process_link_updates` (stage) and
-/// `process_link_unstage_updates` (unstage):
-/// 1. Get linked repository context via `to_link_context`
-/// 2. Reparent the linked state onto `parent_signature` ([`State::reparent_onto`])
-/// 3. Serialize the linked state
-/// 4. Update the block tree hash and link registry via `update_link_pin_by_node`
-///
-/// Returns the new signature so callers can use it for additional work.
-pub async fn reserialize_tracked_link(
-    state: &Arc<State>,
-    repository: Arc<RepositoryContext>,
-    token: &RepositoryWriteToken,
-    link_context: &LinkContext,
-    parent_signature: Hash,
-    branch: BranchId,
-) -> Result<Hash, StateError> {
-    let linked_repository = repository
-        .to_link_context(link_context.link_repository_id)
-        .await;
-
-    let linked_state = link_context.link_state.clone();
-    linked_state.reparent_onto(parent_signature);
-
-    let new_signature = linked_state.serialize(linked_repository, token).await?;
-
-    update_link_pin_by_node(
-        state,
-        repository,
-        link_context.link_repository_id,
-        branch,
-        new_signature,
-        link_context.link_node_id,
-    )
-    .await?;
-
-    Ok(new_signature)
+    for &mount in &mounts {
+        if content == LinkedStagedContent::Dirty
+            && linked_state
+                .node_has_dirty_children(
+                    linked_repository.clone(),
+                    state.node(repository.clone(), mount).await?.child,
+                )
+                .await?
+        {
+            state
+                .node_mark(
+                    &repository,
+                    mount,
+                    Mark::dirty(NodeFlags::Dirty, Ext::Set(NodeExtFlags::NoFlags), true),
+                )
+                .await?;
+        } else {
+            state.node_clear(&repository, mount, Clear::Dirty).await?;
+        }
+    }
+    Ok(mounts)
 }
 
 /// One level of a resolved link chain: a parent repository and the link node
@@ -1543,8 +1700,37 @@ pub struct ResolvedLinkChain {
 pub async fn resolve_link_chain(
     base: NodeMapping,
     state_current: Arc<State>,
+    remainder_path: RelativePath,
+    parent_branch: BranchId,
+) -> Result<ResolvedLinkChain, LinkError> {
+    resolve_link_chain_in(base, state_current, remainder_path, parent_branch, None).await
+}
+
+/// [`resolve_link_chain`] for a walk that stages through `tracker`: every link crossed is tracked,
+/// and each level reaches the state the tracker shares for its repository
+/// ([`LinkTracker::track`]), so the walk folds the change up through every intermediate link.
+pub async fn resolve_tracked_link_chain(
+    base: NodeMapping,
+    state_current: Arc<State>,
+    remainder_path: RelativePath,
+    tracker: &LinkTracker,
+) -> Result<ResolvedLinkChain, LinkError> {
+    resolve_link_chain_in(
+        base,
+        state_current,
+        remainder_path,
+        BranchId::default(),
+        Some(tracker),
+    )
+    .await
+}
+
+async fn resolve_link_chain_in(
+    base: NodeMapping,
+    state_current: Arc<State>,
     mut remainder_path: RelativePath,
     parent_branch: BranchId,
+    tracker: Option<&LinkTracker>,
 ) -> Result<ResolvedLinkChain, LinkError> {
     let mut levels: Vec<LinkChainLevel> = Vec::new();
     let mut seen: std::collections::HashSet<RepositoryId> = std::collections::HashSet::new();
@@ -1623,9 +1809,19 @@ pub async fn resolve_link_chain(
             };
 
             let child_repository = cur_repository.to_link_context(child_repository_id).await;
-            let child_state = State::deserialize(child_repository.clone(), link.revision)
-                .await
-                .forward::<LinkError>("Failed deserializing state")?;
+            let child_state = if let Some(tracker) = tracker {
+                tracker
+                    .track(
+                        (&cur_repository, &cur_state),
+                        cur_node,
+                        child_repository_id,
+                        link.revision,
+                    )
+                    .await
+            } else {
+                State::deserialize(child_repository.clone(), link.revision).await
+            }
+            .forward::<LinkError>("Failed deserializing state")?;
             let child_current_state = State::deserialize(child_repository.clone(), old_signature)
                 .await
                 .forward::<LinkError>("Failed deserializing state")?;
@@ -1744,30 +1940,6 @@ impl ResolvedLinkChain {
                 self.innermost.state.clone(),
                 self.innermost.repository.clone(),
             )
-        }
-    }
-
-    /// Register a `LinkContext` in `tracker` for every link crossed by this
-    /// chain, so a filesystem-walk operation (stage / unstage) folds a nested
-    /// change up through all intermediate links. Each level's child state is
-    /// the next level's parent state, or `innermost_state` for the last level.
-    ///
-    /// `innermost_state` must be the exact state instance the caller mutates
-    /// (the one the deep change is staged into), so the tracker reserializes
-    /// the changes rather than a fresh deserialization of the same revision.
-    pub fn record_tracker_contexts(&self, tracker: &LinkTracker, innermost_state: &Arc<State>) {
-        for (index, level) in self.levels.iter().enumerate() {
-            let child_state = if index + 1 < self.levels.len() {
-                self.levels[index + 1].state.clone()
-            } else {
-                innermost_state.clone()
-            };
-            tracker.add_link(LinkContext {
-                link_repository_id: level.child_repository_id,
-                link_node_id: level.link_node_id,
-                parent_repository_id: level.repository.id,
-                link_state: child_state,
-            });
         }
     }
 }
@@ -1895,8 +2067,9 @@ async fn drain_promoted_moves(
 /// Reserialize every link modified during a `stage`/`unstage` walk, folding
 /// each linked repository's new revision into its parent's pin. Processes
 /// innermost-first and closes over ancestors (if C changed, B must reserialize
-/// so A's pin updates). `mark_staged` re-marks link nodes on stage; unstage
-/// manages its own staged flags.
+/// so A's pin updates). The mounts of a repository in one parent share its state, which is
+/// reserialized once and pinned at each mount [`sharing_mounts`] selects. `mark_staged` re-marks
+/// the walked link nodes on stage; unstage manages its own staged flags.
 pub async fn drain_link_tracker(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -1911,18 +2084,21 @@ pub async fn drain_link_tracker(
 
     let all_contexts = link_tracker.all_links();
 
-    // Modified links plus their transitive ancestors.
+    // Modified links plus their transitive ancestors, each with every mount of it, which share
+    // its state.
     let mut selected: Vec<LinkContext> = link_tracker.get_links_needing_rehash();
     let mut i = 0;
     while i < selected.len() {
         let parent_repo_id = selected[i].parent_repository_id;
-        if parent_repo_id != repository.id
-            && let Some(parent_ctx) = all_contexts
+        if parent_repo_id != repository.id {
+            for parent_ctx in all_contexts
                 .iter()
-                .find(|other| other.link_repository_id == parent_repo_id)
-            && !selected.iter().any(|s| s == parent_ctx)
-        {
-            selected.push(parent_ctx.clone());
+                .filter(|other| other.link_repository_id == parent_repo_id)
+            {
+                if !selected.contains(parent_ctx) {
+                    selected.push(parent_ctx.clone());
+                }
+            }
         }
         i += 1;
     }
@@ -1951,7 +2127,14 @@ pub async fn drain_link_tracker(
     // Descending depth: deepest-nested links reserialize before their parents.
     contexts.sort_by_key(|ctx| std::cmp::Reverse(depth_of(ctx)));
 
-    for link_context in &contexts {
+    for (_, mounts) in group_by(&contexts, |ctx| {
+        (
+            ctx.parent_repository_id,
+            ctx.link_repository_id,
+            Arc::as_ptr(&ctx.link_state) as usize,
+        )
+    }) {
+        let link_context = mounts[0];
         // The parent state holding this link's pin: the top-level state, or the
         // tracked child state of the context mounting this one's parent.
         let (parent_state, parent_repository) =
@@ -1993,31 +2176,49 @@ pub async fn drain_link_tracker(
 
         lore_debug!("Setting link parent to {}", parent_signature);
 
-        let new_signature = reserialize_tracked_link(
+        let linked_state = &link_context.link_state;
+        let linked_repository = parent_repository
+            .to_link_context(link_context.link_repository_id)
+            .await;
+        let holding = mounts_holding_changes(
+            (&parent_repository, &parent_state),
+            (&linked_repository, linked_state),
+            &mounts
+                .iter()
+                .map(|ctx| ctx.link_node_id)
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        let only = sharing_mounts(linked_state, &holding);
+        linked_state.reparent_onto(parent_signature);
+        let new_signature = linked_state.serialize(linked_repository, token).await?;
+        let moved = repin_staged_mounts(
             &parent_state,
-            parent_repository.clone(),
-            token,
-            link_context,
-            parent_signature,
+            &parent_repository,
+            link_context.link_repository_id,
             staged_ref.branch,
+            new_signature,
+            only,
         )
         .await?;
 
         lore_debug!(
-            "Updating link node hash: node={}, old_hash={}, new_hash={}",
-            link_context.link_node_id,
+            "Updating link nodes {moved:?} of repository {}: old_hash={}, new_hash={}",
+            link_context.link_repository_id,
             staged_ref.signature,
             new_signature
         );
 
         if mark_staged {
-            parent_state
-                .node_mark(
-                    &parent_repository,
-                    link_context.link_node_id,
-                    Mark::staged(NodeFlags::Staged, true),
-                )
-                .await?;
+            for link_node in holding {
+                parent_state
+                    .node_mark(
+                        &parent_repository,
+                        link_node,
+                        Mark::staged(NodeFlags::Staged, true),
+                    )
+                    .await?;
+            }
         }
     }
 
@@ -2516,10 +2717,10 @@ async fn verify_link_pin_diff(
     new_sig: Hash,
     diff: LinkPinDiff,
     carries_modes: bool,
-) -> Result<crate::fs::realize::VerifiedChanges, LinkError> {
+) -> Result<VerifiedChanges, LinkError> {
     let LinkPinDiff { changes, current } = diff;
     if changes.is_empty() {
-        return Ok(crate::fs::realize::VerifiedChanges {
+        return Ok(VerifiedChanges {
             changes,
             kept: Vec::new(),
         });
@@ -2558,15 +2759,55 @@ async fn realize_link_pin_diff(
     diff: LinkPinDiff,
     overwrite_local: bool,
 ) -> Result<(), LinkError> {
-    let crate::fs::realize::VerifiedChanges { changes, kept } = if overwrite_local {
-        crate::fs::realize::VerifiedChanges {
+    let verified = if overwrite_local {
+        VerifiedChanges {
             changes: diff.changes,
             kept: Vec::new(),
         }
     } else {
         verify_link_pin_diff(operation, link_context, new_sig, diff, true).await?
     };
+    apply_link_pin_changes(operation, repository, verified).await
+}
 
+/// Realizes each of `pins`, a pin move of the linked repository its context names, verifying the
+/// working tree at every mount before it writes to any, so a local modification at one leaves
+/// every mount as it was.
+pub(crate) async fn realize_resolved_link_pins_in_operation(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    pins: &[(Arc<RepositoryContext>, ResolvedLinkPin)],
+) -> Result<(), LinkError> {
+    if operation.holds_state() {
+        return Ok(());
+    }
+    let verified = futures::future::try_join_all(pins.iter().map(async |(link_context, pin)| {
+        let diff = link_pin_diff(link_context, pin).await?;
+        verify_link_pin_diff(
+            operation,
+            link_context.clone(),
+            pin.new_signature,
+            diff,
+            true,
+        )
+        .await
+    }))
+    .await?;
+    futures::future::try_join_all(
+        verified
+            .into_iter()
+            .map(|changes| apply_link_pin_changes(operation, repository.clone(), changes)),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Realizes the verified changes of a pin move in the working tree.
+async fn apply_link_pin_changes(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    VerifiedChanges { changes, kept }: VerifiedChanges,
+) -> Result<(), LinkError> {
     // The realize deletes before it moves, so a directory whose files move out is still occupied
     // when its own delete runs. A path the realize writes again is left to what it wrote.
     let written: HashSet<&str> = changes

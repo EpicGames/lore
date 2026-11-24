@@ -2643,7 +2643,11 @@ A parent may link one repository at several paths, each mount exposing another f
 it. The mounts share one pin, branch and flags ([ADR-00043](../developing/decisions/00043-one-pin-per-linked-repository.md)):
 `link add` of a repository the parent already links takes the pin of its other mounts, and
 `link update` and a commit through any one mount move every mount together, as unstaging
-an update does in the top-level repository.
+an update does in the top-level repository. A stage, an unstage or a dirty walk through several
+mounts works on one state of the repository per parent, and pins it at each mount holding a
+change and each mount already on its uncommitted revision; the others keep the committed pin
+until the commit moves them. A commit that fails before it stores the parent's latest moves
+each linked branch it moved back, so a push publishes only revisions a parent pins.
 
 A branch create also reaches nested links, so the repositories those link to get the
 branch too, up to the link depth limit of 8. It follows three rules:

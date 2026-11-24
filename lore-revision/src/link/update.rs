@@ -207,7 +207,7 @@ pub(crate) async fn update(
             .iter()
             .find(|mount| mount.link_node == row.local_node())
         {
-            pins.push(mount.pin(mount_path.clone()));
+            pins.push((link.clone(), mount.pin(mount_path.clone())));
         }
         mount_paths.push(mount_path);
     }
@@ -215,16 +215,8 @@ pub(crate) async fn update(
     // The staged state is stored before the operation that realizes the new pin finalizes: an
     // SWFS instance serves the link from what is stored then (ADR-00042).
     with_operation::<_, LinkError, _>(repository.file_system(), async |operation| {
-        futures::future::try_join_all(pins.iter().map(|pin| {
-            link::realize_resolved_link_pin_in_operation(
-                &operation,
-                repository.clone(),
-                link.clone(),
-                pin,
-                false,
-            )
-        }))
-        .await?;
+        link::realize_resolved_link_pins_in_operation(&operation, repository.clone(), &pins)
+            .await?;
 
         // Fold nested link revisions up into the top-level state (no-op if flat).
         link::propagate_link_chain(&chain, token, link::LinkPinRealize::StateOnly).await?;

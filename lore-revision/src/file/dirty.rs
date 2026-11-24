@@ -27,8 +27,14 @@ use crate::interface::LoreNodeType;
 use crate::interface::LoreString;
 use crate::layer;
 use crate::link::LinkedStagedContent;
+use crate::link::SharedByPin;
+use crate::link::group_by;
+use crate::link::mounts_holding_changes;
+use crate::link::open_shared_linked_state;
 use crate::link::settle_linked_staged_state;
+use crate::link::sharing_mounts;
 use crate::lore::Hash;
+use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_trace;
@@ -748,13 +754,31 @@ struct DirtyWalk {
     stats: Arc<DirtyStats>,
     mask: Option<Arc<Vec<String>>>,
     link_references: Vec<LinkReference>,
-    linked: parking_lot::Mutex<Vec<(LinkReference, Arc<DirtyWalk>)>>,
+    linked: Arc<LinkedWalks>,
     /// Whether a file both the working tree and the current revision hold is marked only where it
     /// differs.
     compare: bool,
     /// Where a layer's or link's walk mounts its tree, `None` for the instance's own, whose paths
     /// the walk spells as the tree holds them.
     mount: Option<Box<Mount>>,
+}
+
+/// The walks of the links a tree holds, which the walks of every mount of that tree share.
+#[derive(Default)]
+struct LinkedWalks {
+    /// The trees each linked repository's mounts share, by repository.
+    trees: SharedByPin<RepositoryId, LinkedTrees>,
+    /// The walk of each mount, by its link row.
+    mounts: parking_lot::Mutex<Vec<(LinkReference, Arc<DirtyWalk>)>>,
+}
+
+/// The trees the walks of every mount of one linked repository mark.
+#[derive(Clone)]
+struct LinkedTrees {
+    repository: Arc<RepositoryContext>,
+    state_current: Arc<State>,
+    state_staged: Arc<State>,
+    linked: Arc<LinkedWalks>,
 }
 
 /// Where a layer's or link's walk mounts its tree: the path the walk spells for the node its paths
@@ -1152,7 +1176,7 @@ async fn tracks(
 }
 
 /// The walk marking the trees of the link `reference` names, pinned at `pin` and mounted at `at`,
-/// opened once per call, and the nodes it starts from.
+/// opened once per call and mount path, and the nodes it starts from.
 async fn linked_walk(
     walk: &DirtyWalk,
     reference: LinkReference,
@@ -1161,15 +1185,22 @@ async fn linked_walk(
 ) -> Result<(Arc<DirtyWalk>, DirtyNodes), DirtyError> {
     let cached = walk
         .linked
+        .mounts
         .lock()
         .iter()
-        .find(|(linked, _)| linked.local_node() == reference.local_node())
+        .find(|(linked, walk)| {
+            linked.local_node() == reference.local_node()
+                && walk
+                    .mount
+                    .as_ref()
+                    .is_some_and(|mount| mount.at.as_str() == at)
+        })
         .map(|(_, linked)| linked.clone());
     let linked = if let Some(linked) = cached {
         linked
     } else {
         let linked = Arc::new(Box::pin(open_linked_walk(walk, pin, at)).await?);
-        walk.linked.lock().push((reference, linked.clone()));
+        walk.linked.mounts.lock().push((reference, linked.clone()));
         linked
     };
 
@@ -1187,24 +1218,49 @@ async fn open_linked_walk(
     pin: NodeLink,
     at: &str,
 ) -> Result<DirtyWalk, DirtyError> {
-    let (repository, state_staged) = pin
-        .open(&walk.repository)
-        .await
-        .forward::<DirtyError>("Failed to deserialize linked staged state")?;
-    let committed = state_staged.committed_revision();
-    let state_current = if committed == pin.revision {
-        state_staged.clone()
-    } else {
-        State::deserialize(repository.clone(), committed)
-            .await
-            .forward::<DirtyError>("Failed to deserialize linked state")?
-    };
+    let trees = walk
+        .linked
+        .trees
+        .get_or_open(
+            (pin.repository, pin.revision),
+            |trees| {
+                [
+                    trees.state_staged.revision(),
+                    trees.state_staged.committed_revision(),
+                ]
+            },
+            || async {
+                let staged = open_shared_linked_state(
+                    &walk.repository,
+                    &walk.state_staged,
+                    pin.repository,
+                    pin.revision,
+                )
+                .await
+                .forward::<DirtyError>("Failed to deserialize linked staged state")?;
+                open_linked_trees(walk, pin.repository, staged).await
+            },
+            || async {
+                let (_, staged) = pin
+                    .open(&walk.repository)
+                    .await
+                    .forward::<DirtyError>("Failed to deserialize linked staged state")?;
+                open_linked_trees(walk, pin.repository, staged).await
+            },
+        )
+        .await?;
+    let LinkedTrees {
+        repository,
+        state_current,
+        state_staged,
+        linked,
+    } = trees;
     let source = state_staged
         .node_path_below(repository.clone(), pin.node, ROOT_NODE)
         .await
         .forward::<DirtyError>("Failed to read the path a link mounts")?
         .unwrap_or_default();
-    let mut linked = DirtyWalk::new(
+    let mut walk_linked = DirtyWalk::new(
         walk.operation()?.clone(),
         repository,
         state_current,
@@ -1213,36 +1269,78 @@ async fn open_linked_walk(
         None,
     )
     .await?;
-    linked.compare = walk.compare;
-    linked.mount = Some(Box::new(Mount {
+    walk_linked.compare = walk.compare;
+    walk_linked.linked = linked;
+    walk_linked.mount = Some(Box::new(Mount {
         at: RelativePath::new_from_clean_parts(at, ""),
         source,
     }));
-    Ok(linked)
+    Ok(walk_linked)
 }
 
-/// Pin each link the walk marked inside to its linked staged state, innermost first.
+/// The trees the mounts of `linked` marking `state_staged` mark, with the revision it is staged on.
+async fn open_linked_trees(
+    walk: &DirtyWalk,
+    linked: RepositoryId,
+    state_staged: Arc<State>,
+) -> Result<LinkedTrees, DirtyError> {
+    let repository = walk.repository.to_link_context(linked).await;
+    let committed = state_staged.committed_revision();
+    let state_current = if committed == state_staged.revision() {
+        state_staged.clone()
+    } else {
+        State::deserialize(repository.clone(), committed)
+            .await
+            .forward::<DirtyError>("Failed to deserialize linked state")?
+    };
+    Ok(LinkedTrees {
+        repository,
+        state_current,
+        state_staged,
+        linked: Arc::default(),
+    })
+}
+
+/// Pin the mounts of each repository the walk marked inside to its linked staged state, innermost
+/// first.
 async fn repin_dirty_links(walk: &DirtyWalk) -> Result<(), DirtyError> {
-    let linked = std::mem::take(&mut *walk.linked.lock());
-    if linked.is_empty() {
+    let mounts = std::mem::take(&mut *walk.linked.mounts.lock());
+    if mounts.is_empty() {
         return Ok(());
     }
     let token = walk
         .repository
         .try_write_token()
         .expect("dirty requires write access");
-    for (reference, linked) in linked {
-        Box::pin(repin_dirty_links(&linked)).await?;
+    for (_, mounts) in group_by(mounts, |(reference, linked)| {
+        (
+            reference.repository,
+            Arc::as_ptr(&linked.state_staged) as usize,
+        )
+    }) {
+        let (reference, linked) = &mounts[0];
+        // Every mount's walk marks the one tree its repository's mounts share.
+        Box::pin(repin_dirty_links(linked)).await?;
 
         if !linked.state_staged.is_dirty() {
             continue;
         }
 
+        let holding = mounts_holding_changes(
+            (&walk.repository, &walk.state_staged),
+            (&linked.repository, &linked.state_staged),
+            &mounts
+                .iter()
+                .map(|(reference, _)| reference.local_node())
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .forward::<DirtyError>("Failed to read the mounts the walk marked")?;
         // A walk only adds markers, so a state it mutated holds one.
         settle_linked_staged_state(
             &walk.state_staged,
             walk.repository.clone(),
-            reference.local_node(),
+            sharing_mounts(&linked.state_staged, &holding),
             reference.branch,
             &(linked.repository.clone(), linked.state_staged.clone()),
             LinkedStagedContent::Dirty,
