@@ -2025,6 +2025,9 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     report_serving_runtime();
     observe_task_lifecycles();
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    crate::telemetry::observe_file_descriptors(&lore_telemetry::meter("lore.server"));
+
     let up_gauge = lore_telemetry::meter("urc.server")
         .u64_gauge("urc.server.up")
         .build();

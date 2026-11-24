@@ -2827,6 +2827,7 @@ dependencies = [
  "hyper-util",
  "indexmap",
  "jsonwebtoken",
+ "libc",
  "lore-aws",
  "lore-base",
  "lore-credential",

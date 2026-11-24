@@ -13,6 +13,8 @@ mod guard;
 mod io_pool;
 mod log;
 mod metrics;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod process;
 #[cfg(not(feature = "test-util"))]
 mod protocol;
 #[cfg(feature = "test-util")]
@@ -40,6 +42,12 @@ use lore_telemetry::TelemetryError;
 pub use metrics::init_meter_provider;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use process::FILE_DESCRIPTOR_LIMIT;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use process::OPEN_FILE_DESCRIPTORS;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use process::observe_file_descriptors;
 pub use protocol::StorageProtocol;
 pub use protocol::Transport;
 pub use resource_provider::ResourceDetectorProvider;

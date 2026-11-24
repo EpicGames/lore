@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 mod io_pool;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod process;
 mod protocol;
 mod resource;
 mod trace;
