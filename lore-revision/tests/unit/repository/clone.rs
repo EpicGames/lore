@@ -632,9 +632,15 @@ fn tree_on_disk(root: &std::path::Path) -> Vec<String> {
 /// [`tree_on_disk`] lists it. An entry ending in `/` is a directory and any other an empty file,
 /// and every ancestor of an entry is a directory.
 async fn cloned_tree(rules: &[&str], entries: &[&str]) -> Vec<String> {
+    cloned_tree_and_stats(rules, entries).await.0
+}
+
+/// [`cloned_tree`], with the statistics of the clone.
+async fn cloned_tree_and_stats(rules: &[&str], entries: &[&str]) -> (Vec<String>, Arc<CloneStats>) {
     let temp = TempDir::new("lore-clone-view-directories-");
     let repository =
         working_tree_repository_filtered(temp.path(), crate::helper::test_filter(&[], rules)).await;
+    let stats = Arc::new(CloneStats::default());
     let state = State::new();
     let mut staged = Vec::<String>::new();
     for entry in entries {
@@ -678,14 +684,15 @@ async fn cloned_tree(rules: &[&str], entries: &[&str]) -> Vec<String> {
         repository,
         state,
         options: Arc::default(),
-        stats: Arc::default(),
+        stats: stats.clone(),
         modified_times: Arc::default(),
     };
     clone_in_path(ctx).await.expect("clone under the view");
-    tree_on_disk(temp.path())
+    let tree = tree_on_disk(temp.path())
         .into_iter()
         .filter(|path| !path.starts_with(".lore"))
-        .collect()
+        .collect();
+    (tree, stats)
 }
 
 /// Asserts that a clone of `entries` under each view in `cases` holds exactly what the case lists.
@@ -699,12 +706,12 @@ async fn assert_cloned_trees(cases: &[(&[&str], &[&str], &[&str])]) {
     }
 }
 
-/// The view `**`, `!/a/**/*.bat`, `!/a/b/`, `!/a/c/file.txt`: `/a/b`, which a line names, and
+/// The view `**`, `!/a/**/*.bat`, `!/a/b/`, `!/a/c/file.txt`: `/a/b`, which the view keeps, and
 /// `/a/c` and `/a/e/f`, which hold a file the view keeps, are created with `/a` above them, and
 /// `/a/d`, which the walk enters only because the `.bat` re-inclusion could match below it, is
 /// not.
 #[tokio::test]
-async fn a_clone_under_the_example_view_creates_what_it_names_or_keeps_and_not_a_d() {
+async fn a_clone_under_the_example_view_creates_what_it_keeps_and_not_a_d() {
     LORE_CONTEXT
         .scope(setup_test_execution(), async {
             assert_cloned_trees(&[(
@@ -734,26 +741,45 @@ async fn a_clone_under_the_example_view_creates_what_it_names_or_keeps_and_not_a
         .await;
 }
 
-/// A clone creates no directory the walk only passes through: one the view includes by its
-/// ancestor's verdict alone, or one it enters because a re-inclusion could match below it, when
-/// nothing below is created. Under a view of extension rules, nested directories holding only
-/// excluded files; under `/a/**`, `a` itself; under `/*` and `!*/Saved/Config/` with no
-/// `Saved/Config` in the revision, `Engine`.
+/// A clone creates each directory the view keeps, whatever it holds: nested directories holding
+/// only files extension rules exclude, `a` under `/a/*` and `/a/**`, which exclude what `a` holds
+/// and not `a`, and under `/foo/`, `!/foo/bar/`, `/foo/bar/something/specific/` the directory
+/// `foo/bar/something`, which holds only the excluded `specific`.
 #[tokio::test]
-async fn a_clone_creates_no_directory_it_only_passes_through() {
+async fn a_clone_creates_each_directory_the_view_keeps_whatever_it_holds() {
     LORE_CONTEXT
         .scope(setup_test_execution(), async {
             assert_cloned_trees(&[
                 (
                     &["*.bat", "*.uasset"],
                     &["a/b/c/x.bat", "a/b/y.uasset", "a/z.bat", "d/kept.txt"],
-                    &["d/", "d/kept.txt"],
+                    &["a/", "a/b/", "a/b/c/", "d/", "d/kept.txt"],
                 ),
-                (&["/a/**"], &["a/x.txt", "a/b/y.txt", "c.txt"], &["c.txt"]),
                 (
-                    &["/*", "!*/Saved/Config/"],
-                    &["Engine/Build/b.txt", "Engine/Saved/Logs/l.txt"],
-                    &[],
+                    &["/a/*"],
+                    &["a/x.txt", "a/b/y.txt", "c.txt"],
+                    &["a/", "c.txt"],
+                ),
+                (
+                    &["/a/**"],
+                    &["a/x.txt", "a/b/y.txt", "c.txt"],
+                    &["a/", "c.txt"],
+                ),
+                (
+                    &["/foo/", "!/foo/bar/", "/foo/bar/something/specific/"],
+                    &[
+                        "foo/top.txt",
+                        "foo/other/o.txt",
+                        "foo/bar/b.txt",
+                        "foo/bar/something/specific/s.txt",
+                        "foo/bar/something/specific/deep/d.txt",
+                    ],
+                    &["foo/", "foo/bar/", "foo/bar/b.txt", "foo/bar/something/"],
+                ),
+                (
+                    &["/foo/", "!/foo/bar/", "/foo/bar/*"],
+                    &["foo/bar/b.txt", "foo/bar/x/y.txt"],
+                    &["foo/", "foo/bar/"],
                 ),
             ])
             .await;
@@ -761,12 +787,86 @@ async fn a_clone_creates_no_directory_it_only_passes_through() {
         .await;
 }
 
-/// A clone creates a directory a view line names, though the view excludes everything in it:
-/// `!/a/b/` under `**`, a line naming a directory the view already includes, each directory a
-/// wildcard re-inclusion matches, and the how-to's view that keeps `Engine/Content` empty. Each
-/// ancestor is created as its parent.
+/// A clone tells a directory from what it holds. An exclusion of `/a` or `/a/` excludes `a` and
+/// everything in it, and one of `/a/*` or `/a/**` excludes what `a` holds and keeps `a`. Below
+/// `**`, a re-inclusion of `!/a` or `!/a/` keeps `a` and everything in it, `!/a/*` keeps the
+/// entries of `a` and nothing below them, and `!/a/**` keeps everything below `a`: under the last
+/// two `a` is created as the parent of what they keep, and not when it is empty. Below `/*`, which
+/// excludes only the top level, `!/a/*` keeps everything below `a`. Followed by `!/a/b/*`, `/a/*`
+/// lets what lies below `a/b/c` follow it, and `/a/**` still excludes it.
 #[tokio::test]
-async fn a_clone_creates_a_directory_a_view_line_names() {
+async fn a_clone_tells_a_directory_from_what_it_holds() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let entries: &[&str] = &["a/f.txt", "a/b/g.txt", "a/b/c/", "a/e/", "z.txt"];
+            let below_everything: &[&str] =
+                &["a/", "a/b/", "a/b/c/", "a/b/g.txt", "a/e/", "a/f.txt"];
+            assert_cloned_trees(&[
+                (&["/a"], entries, &["z.txt"]),
+                (&["/a/"], entries, &["z.txt"]),
+                (&["/a/*"], entries, &["a/", "z.txt"]),
+                (&["/a/**"], entries, &["a/", "z.txt"]),
+                (&["**", "!/a"], entries, below_everything),
+                (&["**", "!/a/"], entries, below_everything),
+                (
+                    &["**", "!/a/*"],
+                    entries,
+                    &["a/", "a/b/", "a/e/", "a/f.txt"],
+                ),
+                (&["**", "!/a/**"], entries, below_everything),
+                (&["/*", "!/a/*"], entries, below_everything),
+                (&["**", "!/a"], &["a/"], &["a/"]),
+                (&["**", "!/a/"], &["a/"], &["a/"]),
+                (&["**", "!/a/*"], &["a/"], &[]),
+                (&["**", "!/a/**"], &["a/"], &[]),
+                (
+                    &["/a/*", "!/a/b/*"],
+                    &["a/b/c/d.txt"],
+                    &["a/", "a/b/", "a/b/c/", "a/b/c/d.txt"],
+                ),
+                (
+                    &["/a/**", "!/a/b/*"],
+                    &["a/b/c/d.txt"],
+                    &["a/", "a/b/", "a/b/c/"],
+                ),
+            ])
+            .await;
+        })
+        .await;
+}
+
+/// A clone creates a directory the view excludes only as the parent of what it creates below it:
+/// not `Engine` under `/*`, `!*/Saved/Config/` with no `Saved/Config` in the revision, not `a/b`
+/// under `**`, `!/a/**/*.bat` when it holds no `.bat` file, and not `a` under `**`, `!/a/b/c/`
+/// with no `a/b/c` in the revision.
+#[tokio::test]
+async fn a_clone_creates_a_directory_the_view_excludes_only_above_what_it_keeps() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            assert_cloned_trees(&[
+                (
+                    &["/*", "!*/Saved/Config/"],
+                    &["Engine/Build/b.txt", "Engine/Saved/Logs/l.txt"],
+                    &[],
+                ),
+                (
+                    &["**", "!/a/**/*.bat"],
+                    &["a/b/x.txt", "a/c/y.bat"],
+                    &["a/", "a/c/", "a/c/y.bat"],
+                ),
+                (&["**", "!/a/b/c/"], &["a/b/x.txt"], &[]),
+            ])
+            .await;
+        })
+        .await;
+}
+
+/// A clone creates a directory the view keeps, though the view excludes everything in it: `!/a/b/`
+/// under `**`, a line keeping a directory the view already keeps, each directory a wildcard
+/// re-inclusion matches, and the how-to's view that keeps `Engine/Content` empty. Each ancestor is
+/// created as its parent.
+#[tokio::test]
+async fn a_clone_creates_a_kept_directory_whose_entries_the_view_excludes() {
     LORE_CONTEXT
         .scope(setup_test_execution(), async {
             assert_cloned_trees(&[
@@ -808,8 +908,8 @@ async fn a_clone_creates_a_directory_a_view_line_names() {
 }
 
 /// A clone creates every directory that holds, at any depth, an entry it creates: the chain above
-/// a kept file deep below directories no line names, the parent of a file a line names, and a
-/// directory the repository holds empty with the chain above it.
+/// a kept file, the excluded directories above a file a re-inclusion keeps, and a directory the
+/// repository holds empty with the chain above it.
 #[tokio::test]
 async fn a_clone_creates_each_directory_holding_what_it_keeps() {
     LORE_CONTEXT
@@ -828,6 +928,87 @@ async fn a_clone_creates_each_directory_holding_what_it_keeps() {
                 (&["*.bat"], &["e/f/", "e/g.bat"], &["e/", "e/f/"]),
             ])
             .await;
+        })
+        .await;
+}
+
+/// A clone creates the directories above a file it keeps with the file, in one call for the file's
+/// parent: under `!/a/**`, which keeps every directory below `a`, two files in sibling directories
+/// cost one call each, and the clone holds the same tree.
+#[tokio::test]
+async fn a_clone_creates_the_directories_above_a_file_with_the_file() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (tree, stats) =
+                cloned_tree_and_stats(&["**", "!/a/**"], &["a/b/c/f.txt", "a/b/d/g.txt"]).await;
+            assert_eq!(
+                tree,
+                [
+                    "a/",
+                    "a/b/",
+                    "a/b/c/",
+                    "a/b/c/f.txt",
+                    "a/b/d/",
+                    "a/b/d/g.txt"
+                ]
+            );
+            assert_eq!(
+                stats.created_parents.len(),
+                2,
+                "one directory call per file"
+            );
+        })
+        .await;
+}
+
+/// A clone creates a chain of directories the view keeps and no file is written in with one call
+/// for its deepest directory: under `*.bat`, `a/b/c` holding only a `.bat` file costs one call
+/// for `a`, `a/b` and `a/b/c`. Under `/foo/`, `!/foo/bar/`, `/foo/bar/something/specific/`, the
+/// file written in `foo/bar` creates it with `foo`, and `foo/bar/something` costs one more call.
+#[tokio::test]
+async fn a_clone_creates_a_chain_of_kept_directories_with_one_call() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            type Case = (
+                &'static [&'static str],
+                &'static [&'static str],
+                &'static [&'static str],
+                usize,
+            );
+            let cases: &[Case] = &[
+                (&["*.bat"], &["a/b/c/x.bat"], &["a/", "a/b/", "a/b/c/"], 1),
+                (
+                    &["/foo/", "!/foo/bar/", "/foo/bar/something/specific/"],
+                    &["foo/bar/b.txt", "foo/bar/something/specific/s.txt"],
+                    &["foo/", "foo/bar/", "foo/bar/b.txt", "foo/bar/something/"],
+                    2,
+                ),
+            ];
+            for (rules, entries, expected, calls) in cases {
+                let (tree, stats) = cloned_tree_and_stats(rules, entries).await;
+                assert_eq!(tree, *expected, "a clone of {entries:?} under {rules:?}");
+                assert_eq!(
+                    stats.created_parents.len(),
+                    *calls,
+                    "the directory calls of a clone of {entries:?} under {rules:?}"
+                );
+            }
+        })
+        .await;
+}
+
+/// A clone creates a directory the view keeps, though the view excludes everything in it, when its
+/// entries continue into another node block: the walk carries the directory into the block it
+/// continues in and creates it after the last entry there.
+#[tokio::test]
+async fn a_clone_creates_a_kept_directory_whose_excluded_entries_span_blocks() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let entries: Vec<String> = (0..SPANNING_ROOT_FILES)
+                .map(|index| format!("d/f{index:04}"))
+                .collect();
+            let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
+            assert_cloned_trees(&[(&["!/d/", "/d/*"], &entries, &["d/"])]).await;
         })
         .await;
 }

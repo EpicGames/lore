@@ -684,56 +684,102 @@ fn walked_directory_state(filter: &FilterInstance, directory: &str) -> FilterSta
     state
 }
 
-/// A directory is named where the last line to decide it is an inclusion matching the directory
-/// itself, whether it flips the verdict or meets a directory already included, and in no other
-/// case: not by an ancestor's verdict, not by an inclusion's subtree companion, not by an
-/// exclusion, and not where a later line excludes it. A walk and a whole-path query agree, and
-/// so does a step that reads the lines through the index.
+/// The view creates each directory it keeps and none it excludes, whatever the directory holds:
+/// `/a` and `/a/` exclude `a` with everything in it, `/a/*` and `/a/**` exclude what `a` holds and
+/// keep `a`. A re-inclusion of `a` itself, `!/a` or `!/a/`, keeps `a` and everything in it, past
+/// `**` too; `!/a/*` and `!/a/**` keep what `a` holds and leave `a` excluded, and `!/a/*` reaches
+/// deeper only where no earlier line matches the deeper path itself. A later exclusion takes a
+/// directory out again. A walk and a whole-path query agree, and so does a step that reads the
+/// lines through the index.
 #[test]
-fn a_directory_is_named_only_by_an_inclusion_matching_it() {
-    let example: &[&str] = &["**", "!/a/**/*.bat", "!/a/b/", "!/a/c/file.txt"];
-    // Rules, directory, named.
+fn the_view_creates_each_directory_it_keeps_and_none_it_excludes() {
+    // Rules, directory, created.
     let cases: &[(&[&str], &str, bool)] = &[
-        (example, "a", false),
-        (example, "a/b", true),
-        (example, "a/b/x", false),
-        (example, "a/c", false),
-        (example, "a/d", false),
-        (&["!/a/b/", "/a/b/*"], "a/b", true),
-        (&["!/a/b/", "/a/b/*"], "a", false),
-        (&["/*", "!*/Saved/Config/"], "engine", false),
-        (&["/*", "!*/Saved/Config/"], "engine/saved", false),
-        (&["/*", "!*/Saved/Config/"], "engine/saved/config", true),
-        (&["/*", "!*/Saved/Config/"], "game/saved/config", true),
+        (&["/a"], "a", false),
+        (&["/a"], "a/b", false),
+        (&["/a/"], "a", false),
+        (&["/a/"], "a/b", false),
+        (&["/a/*"], "a", true),
+        (&["/a/*"], "a/b", false),
+        (&["/a/*"], "a/b/c", false),
+        (&["/a/**"], "a", true),
+        (&["/a/**"], "a/b", false),
+        (&["/a/**"], "a/b/c", false),
+        (&["/*", "!/a"], "a", true),
+        (&["/*", "!/a"], "a/b", true),
+        (&["/*", "!/a/"], "a", true),
+        (&["/*", "!/a/"], "a/b/c", true),
+        (&["/*", "!/a/"], "b", false),
+        (&["/*", "!/a/*"], "a", false),
+        (&["/*", "!/a/*"], "a/b", true),
+        (&["/*", "!/a/*"], "a/b/c", true),
+        (&["/*", "!/a/**"], "a", false),
+        (&["/*", "!/a/**"], "a/b", true),
+        (&["/*", "!/a/**"], "a/b/c", true),
+        (&["**", "!/a"], "a", true),
+        (&["**", "!/a"], "a/b/c", true),
+        (&["**", "!/a/"], "a", true),
+        (&["**", "!/a/"], "a/b/c", true),
+        (&["**", "!/a/*"], "a", false),
+        (&["**", "!/a/*"], "a/b", true),
+        (&["**", "!/a/*"], "a/b/c", false),
+        (&["**", "!/a/**"], "a", false),
+        (&["**", "!/a/**"], "a/b", true),
+        (&["**", "!/a/**"], "a/b/c", true),
+        (&["/a/*", "!/a/b/*"], "a/b", false),
+        (&["/a/*", "!/a/b/*"], "a/b/c", true),
+        (&["/a/*", "!/a/b/*"], "a/b/c/d", true),
+        (&["/a/**", "!/a/b/*"], "a/b", false),
+        (&["/a/**", "!/a/b/*"], "a/b/c", true),
+        (&["/a/**", "!/a/b/*"], "a/b/c/d", false),
         (
-            &["/*", "!/Engine/Content/", "/Engine/Content/*"],
-            "engine",
+            &["/foo/", "!/foo/bar/", "/foo/bar/something/specific/"],
+            "foo",
             false,
         ),
         (
-            &["/*", "!/Engine/Content/", "/Engine/Content/*"],
-            "engine/content",
+            &["/foo/", "!/foo/bar/", "/foo/bar/something/specific/"],
+            "foo/bar",
             true,
         ),
-        (&["*.bat", "*.uasset"], "a", false),
-        (&["*.bat", "*.uasset"], "a/b", false),
-        (&["/a/**"], "a", false),
+        (
+            &["/foo/", "!/foo/bar/", "/foo/bar/something/specific/"],
+            "foo/bar/something",
+            true,
+        ),
+        (
+            &["/foo/", "!/foo/bar/", "/foo/bar/something/specific/"],
+            "foo/bar/something/specific",
+            false,
+        ),
+        (
+            &["/foo/", "!/foo/bar/", "/foo/bar/something/specific/"],
+            "foo/bar/something/specific/deep",
+            false,
+        ),
+        (&["/foo/", "!/foo/bar/", "/foo/bar/*"], "foo/bar", true),
+        (&["/foo/", "!/foo/bar/", "/foo/bar/*"], "foo/bar/x", false),
+        (&["/foo/", "!/foo/bar/", "/foo/bar/**"], "foo/bar/x", false),
+        (&["*.bat", "*.uasset"], "a", true),
+        (&["*.bat", "*.uasset"], "a/b", true),
+        (&["/*", "!*/Saved/Config/"], "engine", false),
+        (&["/*", "!*/Saved/Config/"], "engine/saved", false),
+        (&["/*", "!*/Saved/Config/"], "engine/saved/config", true),
+        (&["/*", "!*/Saved/Config/"], "engine/saved/config/sub", true),
+        (&["!/a/b/", "**", "!/a/"], "a/b", true),
         (&["!/a/", "/a/"], "a", false),
-        (&["**", "!/a/", "*.bat"], "a", true),
-        (&["**", "!/a/", "*.bat"], "a/x", false),
-        (&["!/a/b/", "**", "!/a/"], "a/b", false),
-        (&["!/a/b/", "/a/b/x"], "a/b", true),
-        (&["!config/"], "engine/config", true),
-        (&["**", "!/a/*/"], "a/x", true),
-        (&["**", "!/a/*/"], "a/x/y", false),
     ];
-    for (rules, directory, named) in cases {
+    for (rules, directory, created) in cases {
         for (layout, filter) in layouts(|filter| add_rules(filter, rules)) {
             let walked = walked_directory_state(&filter, directory);
+            let states = FilterStates {
+                ignore: FilterState::ROOT,
+                view: walked,
+            };
             assert_eq!(
-                walked.named(),
-                *named,
-                "{rules:?} {layout} names {directory}: {walked:?}"
+                states.creates_directory(),
+                *created,
+                "{rules:?} {layout} creates {directory}: {walked:?}"
             );
             assert_eq!(
                 filter.exclusion_state(&path(directory), true),
@@ -744,69 +790,28 @@ fn a_directory_is_named_only_by_an_inclusion_matching_it() {
     }
 }
 
-/// A file is never named, though the line that decides it names it.
+/// The directory rule reads the view slot alone: a directory the ignore file excludes and the
+/// view keeps is created, and one the view excludes is not, whatever the ignore file says.
 #[test]
-fn a_file_is_never_named() {
-    let mut filter = FilterInstance::default();
-    filter.add_exclusion("**").expect("exclude");
-    filter.add_inclusion("/a/c/file.txt").expect("include");
-    let state = filter.child_exclusion_state(
-        walked_directory_state(&filter, "a/c"),
-        &path("a/c/file.txt"),
-        false,
-    );
-    assert!(!state.excluded(), "the line includes the file");
-    assert!(!state.named(), "and names no directory");
-}
-
-/// The view creates a directory it includes that a line names or the repository holds empty,
-/// and no other.
-#[test]
-fn the_view_creates_a_directory_it_names_or_the_repository_holds_empty() {
-    let mut filter = Filter::default();
-    add_rules(
-        &mut filter.view,
-        &["**", "!/a/**/*.bat", "!/a/b/", "!/a/c/file.txt"],
-    );
-    // Directory, held empty, created.
-    for (directory, empty, created) in [
-        ("a", false, false),
-        ("a", true, false),
-        ("a/b", false, true),
-        ("a/c", false, false),
-        ("a/d", false, false),
-        ("a/b/x", true, true),
-        ("a/b/x", false, false),
-    ] {
+fn the_view_creates_a_directory_whatever_the_ignore_file_says() {
+    let mut ignore = FilterInstance::default();
+    add_rules(&mut ignore, &["/a/"]);
+    let mut view = FilterInstance::default();
+    add_rules(&mut view, &["/b/"]);
+    let filter = from_instances(ignore, view).expect("the filter");
+    for (directory, created) in [("a", true), ("b", false), ("c", true)] {
         assert_eq!(
             filter
                 .exclusion_states(&path(directory))
-                .creates_directory(empty),
+                .creates_directory(),
             created,
-            "{directory}, held empty: {empty}"
+            "{directory}"
         );
     }
     assert!(
-        FilterStates::ROOT.creates_directory(true) && !FilterStates::ROOT.creates_directory(false),
-        "with no view, the check creates only a directory the repository holds empty"
+        FilterStates::ROOT.creates_directory(),
+        "with no view, every directory is created"
     );
-}
-
-/// An ignore file's inclusion names no directory: only the view's directory rule reads the
-/// naming, so the ignore slot never matches an inclusion against a directory it includes.
-#[test]
-fn an_ignore_inclusion_names_no_directory() {
-    let mut ignore = FilterInstance::default();
-    add_rules(&mut ignore, &["**", "!/a/", "!*.ini"]);
-    let mut view = FilterInstance::default();
-    add_rules(&mut view, &["**", "!/a/", "!*.ini"]);
-    let filter = from_instances(ignore, view).expect("the filter");
-    for directory in ["a", "b.ini"] {
-        let states = filter.exclusion_states(&path(directory));
-        assert!(!states.ignore.excluded(), "{directory} is re-included");
-        assert!(!states.ignore.named(), "the ignore slot names {directory}");
-        assert!(states.view.named(), "the view names {directory}");
-    }
 }
 
 /// A name rule of `*` and literal text, decided as the ending of the name, matches what the glob

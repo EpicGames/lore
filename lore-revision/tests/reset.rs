@@ -882,45 +882,104 @@ mod tests {
         }
     }
 
-    /// A reset of a working tree that holds every directory a view line names creates none of
-    /// them: it creates a directory the view names only where the working tree lacks it.
+    /// Resets the root of `fixture` under `view`, forced where `force` says, through a context over
+    /// [`CountingCreates`], and answers how many directory creates it asked for.
+    async fn reset_counting_creates(fixture: &TestRepository, view: &[&str], force: bool) -> usize {
+        let creates = Arc::new(AtomicUsize::new(0));
+        let counting = Arc::new(
+            RepositoryContext::new(
+                default_repository_creation_args(
+                    fixture.repository.immutable_store(),
+                    fixture.repository.mutable_store.clone(),
+                )
+                .with_path(&fixture.path)
+                .with_id(fixture.repository.id)
+                .with_instance_id(fixture.repository.instance_id)
+                .with_filter(Arc::new(test_filter(&[], view)))
+                .with_filesystem_provider(Arc::new(CountingCreates {
+                    root: fixture.path.clone(),
+                    creates: creates.clone(),
+                })),
+            )
+            .with_write_token(fixture.write_token.share()),
+        );
+        let execution = Arc::new(ExecutionContext::new_client(
+            LoreGlobalArgs {
+                force: u8::from(force),
+                ..Default::default()
+            },
+            EventDispatcher::new(None),
+        ));
+
+        LORE_CONTEXT
+            .scope(
+                execution,
+                reset::reset(
+                    counting,
+                    &fixture.write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&fixture.path)]),
+                    LoreString::default(),
+                    ResetOptions::default(),
+                ),
+            )
+            .await
+            .expect("A reset must succeed");
+        creates.load(Ordering::Relaxed)
+    }
+
+    /// A reset of a working tree that holds every directory the view keeps creates none of them:
+    /// it creates a directory the view keeps only where the working tree lacks it.
     #[tokio::test]
-    async fn a_reset_creates_no_named_directory_the_working_tree_holds() {
+    async fn a_reset_creates_no_kept_directory_the_working_tree_holds() {
         with_fixture(async |fixture| {
             test_directory_create(&fixture.path.join("a/b/c"));
             test_file_write(&fixture.path.join("a/b/c/x.txt"), b"x");
             test_commit_tree(&fixture, "Initial").await;
-            let creates = Arc::new(AtomicUsize::new(0));
-            let counting = Arc::new(
-                RepositoryContext::new(
-                    default_repository_creation_args(
-                        fixture.repository.immutable_store(),
-                        fixture.repository.mutable_store.clone(),
-                    )
-                    .with_path(&fixture.path)
-                    .with_id(fixture.repository.id)
-                    .with_instance_id(fixture.repository.instance_id)
-                    .with_filter(Arc::new(test_filter(&[], &["**", "!/a/", "!/a/**"])))
-                    .with_filesystem_provider(Arc::new(CountingCreates {
-                        root: fixture.path.clone(),
-                        creates: creates.clone(),
-                    })),
-                )
-                .with_write_token(fixture.write_token.share()),
-            );
 
-            reset::reset(
-                counting,
-                &fixture.write_token,
-                LoreArray::from_vec(vec![LoreString::from(&fixture.path)]),
-                LoreString::default(),
-                ResetOptions::default(),
-            )
-            .await
-            .expect("A reset must succeed");
+            let creates = reset_counting_creates(&fixture, &["**", "!/a/", "!/a/**"], false).await;
 
-            assert_eq!(creates.load(Ordering::Relaxed), 0);
+            assert_eq!(creates, 0);
             assert_working_files(&fixture, &[("a/b/c/x.txt", Some(b"x"))]);
+        })
+        .await;
+    }
+
+    /// A reset of a working tree that lacks directories the view keeps creates each of them,
+    /// whatever it holds, and a chain of them in one call: `bin`, which holds only a file the view
+    /// excludes, and `c` with `c/d`, which holds only an excluded file, in one create each once
+    /// their entries are walked, and `foo` with `foo/bar` by the write of the file in it. A forced
+    /// reset, which writes every file, creates each chain by the write of the file in it.
+    #[tokio::test]
+    async fn a_reset_creates_each_missing_chain_of_kept_directories_in_one_call() {
+        with_fixture(async |fixture| {
+            for (directory, file) in [
+                ("bin", "bin/y.bat"),
+                ("c/d", "c/d/e.bat"),
+                ("foo/bar", "foo/bar/z.txt"),
+            ] {
+                test_directory_create(&fixture.path.join(directory));
+                test_file_write(&fixture.path.join(file), b"x");
+            }
+            test_commit_tree(&fixture, "Initial").await;
+            for (force, expected, excluded) in [(false, 2, None), (true, 0, Some(&b"x"[..]))] {
+                for top in ["bin", "c", "foo"] {
+                    std::fs::remove_dir_all(fixture.path.join(top)).expect("Remove failed");
+                }
+
+                let creates = reset_counting_creates(&fixture, &["*.bat"], force).await;
+
+                assert_eq!(creates, expected, "forced {force}");
+                assert!(fixture.path.join("bin").is_dir(), "bin is missing");
+                assert!(fixture.path.join("c/d").is_dir(), "c/d is missing");
+                assert_working_files(
+                    &fixture,
+                    &[
+                        ("bin/y.bat", excluded),
+                        ("c/d/e.bat", excluded),
+                        ("foo/bar/z.txt", Some(b"x")),
+                    ],
+                );
+            }
         })
         .await;
     }

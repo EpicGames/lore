@@ -33,6 +33,7 @@ use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::create_empty_directory;
 use crate::fs::filesystem_provider::with_operation;
+use crate::fs::realize::keeps_entry;
 use crate::hash::hash_string;
 use crate::hash::hash_string_bytes;
 use crate::interface::LoreArray;
@@ -3280,9 +3281,12 @@ async fn reset_walk_link(
 /// Walk the children of a directory node, dispatching each to `reset_walk_node`. Subdirectory
 /// walks are gated by the `directory_inflight` counter: spawn when under `RESET_DIRECTORY_MAX`, run
 /// inline (degrade to sync) once over. A file standing at the directory's path is deleted first. A
-/// directory the view creates ([`FilterStates::creates_directory`]) is created here where the
-/// working tree lacks it, and purge (when enabled) runs for every directory once its child walks
-/// have completed. The purge is boxed, so a walk that does not purge holds no room for it.
+/// directory the working tree lacks that the view keeps is created here once its child walks have
+/// completed, where none of its entries is a file or directory the view keeps ([`keeps_entry`]),
+/// or, in a forced reset, which writes every entry, none is a file or directory, and otherwise
+/// with what the walk creates below it. Purge (when enabled) runs for every directory
+/// once its child walks have completed. The purge is boxed, so a walk that does not purge holds no
+/// room for it.
 ///
 /// A child the working tree holds in another spelling, of its kind, is walked from the entry
 /// paired with it, and every other child from its name in the revision. The directory's entries
@@ -3346,12 +3350,14 @@ fn reset_walk_directory(
         )
         .await?;
 
+        let mut creates = absent && states.creates_directory();
+        let force = execution_context().globals().force();
         let mut child_node_iter = node.child();
 
-        if absent && states.creates_directory(child_node_iter.is_none()) {
-            create_empty_directory::<ResetError>(&operation, &directory_path).await?;
-        }
         if child_node_iter.is_none() {
+            if creates {
+                create_empty_directory::<ResetError>(&operation, &directory_path).await?;
+            }
             if !options.purge {
                 return Ok(());
             }
@@ -3429,6 +3435,10 @@ fn reset_walk_directory(
             let child_node_path = spellings
                 .child_path(&operation, &directory_path, &child_node_name, &child_node)
                 .await;
+            if creates && !child_node.is_link() {
+                creates = !(force
+                    || keeps_entry(&repository.filter, states, &child_node_path, &child_node));
+            }
             if options.purge {
                 held.push(HeldChild {
                     folded: child_node.name_hash,
@@ -3555,6 +3565,9 @@ fn reset_walk_directory(
         }
         if let Some(err) = failure {
             return Err(err);
+        }
+        if creates {
+            create_empty_directory::<ResetError>(&operation, &directory_path).await?;
         }
         stats
             .discards

@@ -1423,7 +1423,7 @@ async fn replace_file_on_chain(
         "",
     );
     lore_trace!("Dirty delete of a file a directory replaced: {file_path}");
-    dirty_delete_node(walk, file, &file_path, None, &mut String::new()).await?;
+    dirty_delete_node(walk, file, &file_path, false, &mut String::new()).await?;
     let directory = dirty_add_directory(walk, parent, file_path.name(), file_path.as_str()).await?;
     ensure_dirty_parent_dirs(
         &walk.repository,
@@ -1930,9 +1930,9 @@ async fn file_matches_current(
 /// holds it, the node keeps its move, for the commit to return it once the place frees
 /// ([`State::node_return_unstaged_move`]). `name` is a buffer the walk keeps across nodes.
 ///
-/// A directory below, and with `absent` the node itself, that the view does not create
-/// ([`FilterStates::creates_directory`]) stands in the working tree only for what is
-/// created below it, so it is marked only where something below it is.
+/// A directory below, and with `absent` the node itself, that the view excludes
+/// ([`FilterStates::creates_directory`]) stands in the working tree only for what is placed below
+/// it, so it is marked only where something below it is.
 async fn dirty_delete(
     walk: &DirtyWalk,
     node_id: NodeID,
@@ -1941,34 +1941,11 @@ async fn dirty_delete(
     name: &mut String,
     absent: bool,
 ) -> Result<(), DirtyError> {
-    let creates = absent.then(|| Creation::of(states));
-    if let (_, Some(below)) = dirty_delete_node(walk, node_id, path, creates, name).await? {
+    let uncreated = absent && !states.creates_directory();
+    if let (_, Some(below)) = dirty_delete_node(walk, node_id, path, uncreated, name).await? {
         dirty_delete_below(walk, below, path, states, name).await?;
     }
     Ok(())
-}
-
-/// Whether the view creates a directory ([`FilterStates::creates_directory`]) where the repository
-/// holds it empty, and where it holds children: what [`dirty_delete_node`] keeps of the view's
-/// states at a node the working tree lacks.
-#[derive(Clone, Copy)]
-struct Creation {
-    empty: bool,
-    holding: bool,
-}
-
-impl Creation {
-    fn of(states: FilterStates) -> Self {
-        Self {
-            empty: states.creates_directory(true),
-            holding: states.creates_directory(false),
-        }
-    }
-
-    /// Whether the view creates the directory, which the repository holds `empty` or not.
-    fn of_directory(self, empty: bool) -> bool {
-        if empty { self.empty } else { self.holding }
-    }
 }
 
 /// A directory [`dirty_delete_node`] marked deleted, or left to mark once something below it is,
@@ -1984,14 +1961,14 @@ struct DeletedDirectory {
 /// [`dirty_delete`] of `node_id`, which stands at `path`, without its children: answers whether the
 /// node is marked, or was already, and the directory to walk below where it holds children to mark.
 ///
-/// With `absent`, what the view creates of a node the working tree lacks, a directory the view does
-/// not create is not marked: one holding children is answered deferred, for its walk to mark once
-/// it marks something below it.
+/// With `uncreated`, the working tree lacks the node and the view excludes it
+/// ([`FilterStates::creates_directory`]): such a directory is not marked, and one holding children
+/// is answered deferred, for its walk to mark once it marks something below it.
 async fn dirty_delete_node(
     walk: &DirtyWalk,
     node_id: NodeID,
     path: &RelativePath,
-    absent: Option<Creation>,
+    uncreated: bool,
     name: &mut String,
 ) -> Result<(bool, Option<DeletedDirectory>), DirtyError> {
     let DirtyWalk {
@@ -2032,10 +2009,7 @@ async fn dirty_delete_node(
         Box::pin(discard_dirty_add(walk, added, false, name)).await?;
         return Ok((false, None));
     }
-    if !moved
-        && is_directory
-        && absent.is_some_and(|creates| !creates.of_directory(first_child.is_none()))
-    {
+    if !moved && is_directory && uncreated {
         return Ok((
             false,
             first_child.map(|first_child| DeletedDirectory {
@@ -2149,7 +2123,7 @@ fn dirty_delete_below<'a>(
                 walk,
                 child_node_id,
                 &child_path,
-                Some(Creation::of(child_states)),
+                !child_states.creates_directory(),
                 name,
             )
             .await?

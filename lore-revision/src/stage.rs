@@ -1899,7 +1899,8 @@ async fn stage_replaced_node(
 }
 
 /// What staging the deletion of a node the working tree lacks makes of it.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[lore_macro::test_pub]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Absence {
     /// The working tree held the node, and its deletion is staged with everything below it.
     Deleted,
@@ -1961,10 +1962,10 @@ impl AbsentChildren {
 /// A mount stays absent while the linked repository cannot be read, so the link stays. A node the
 /// view leaves out is not on disk, so its absence alone deletes nothing. The ignore file has no say
 /// over a node the tree tracks, and leaves out only an add marked dirty, which was never staged. A
-/// directory the working tree held, one the view creates ([`FilterStates::creates_directory`]) or
+/// directory the working tree held, one the view keeps ([`FilterStates::creates_directory`]) or
 /// one holding a node it held, is staged as deleted with everything below it, what the filter
-/// leaves out included, which committing drops with it, and one the view creates is staged so at
-/// once, its subtree walked only for what the view shows ([`report_shown_deletions`]). Where
+/// leaves out included, which committing drops with it, and one the view keeps and hides everything
+/// below ([`Filter::view_hides_below`]) is staged so at once, what it holds unread. Where
 /// `keeps_partial`, as in a tree that registers a link, and in a directory that may hold a pending
 /// merge's change ([`holds_pending_merge_change`]), a directory stays with every directory on its
 /// path wherever staging keeps or leaves out a node below it, as [`AbsentChildren`] says. A node
@@ -1975,6 +1976,7 @@ impl AbsentChildren {
 /// is forced past the ignore file. A child is asked about in the tracked mode.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
 fn stage_absent_delete(
     repository: Arc<RepositoryContext>,
@@ -2002,7 +2004,11 @@ fn stage_absent_delete(
         }
 
         let keeps_partial = keeps_partial || holds_pending_merge_change(&state, held);
-        if held.is_directory() && (keeps_partial || !states.creates_directory(false)) {
+        if held.is_directory()
+            && (keeps_partial
+                || !states.creates_directory()
+                || !repository.filter.view_hides_below(states, &relative_path))
+        {
             match stage_absent_children(
                 &repository,
                 &state,
@@ -2021,17 +2027,6 @@ fn stage_absent_delete(
                 Absence::Deleted => {}
                 absence => return Ok(absence),
             }
-        } else if held.is_directory() {
-            report_shown_deletions(
-                &repository,
-                &state,
-                &relative_path,
-                node_id,
-                states,
-                node_flags,
-                &stats,
-            )
-            .await?;
         }
 
         stage_delete_node(
@@ -2046,64 +2041,6 @@ fn stage_absent_delete(
         .await?;
         Ok(Absence::Deleted)
     }
-}
-
-/// Reports the deletion of each node below the absent directory `directory` that the view shows, as
-/// [`report_staged_delete`] reports one staged: a Delete event and a count for each file, and a
-/// count for each directory. A subtree the view leaves out is passed over unread, and so is a node
-/// whose deletion is staged already, as [`deletion_staged_already`] says for `node_flags`. A
-/// directory the view hides everything below ([`Filter::view_hides_below`]) is not listed. Marks
-/// nothing, as the directory's staged deletion takes what it holds.
-#[lore_macro::test_pub]
-async fn report_shown_deletions(
-    repository: &Arc<RepositoryContext>,
-    state: &Arc<State>,
-    relative_path: &RelativePath,
-    directory: NodeID,
-    states: FilterStates,
-    node_flags: NodeFlags,
-    stats: &StageStats,
-) -> Result<(), StageError> {
-    let mut pending = vec![(directory, relative_path.clone(), states)];
-    while let Some((node_id, path, states)) = pending.pop() {
-        if repository.filter.view_hides_below(states, &path) {
-            continue;
-        }
-        let mut children =
-            StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), node_id)
-                .await
-                .forward::<StageError>("Failed to list directory node children")?;
-        let mut child_path = path.push_into_buf("");
-        loop {
-            let Some((child_id, child, child_name)) = children
-                .next()
-                .await
-                .forward::<StageError>("Failed to list directory node children")?
-            else {
-                break;
-            };
-            child_path.push(child_name);
-            let (child_states, excluded) = repository.filter.child_excludes_tree(
-                states,
-                &child_path,
-                !child.is_file(),
-                FilterMode::View,
-            );
-            if !excluded
-                && !deletion_staged_already(NodeFlags::from_bits_retain(child.flags), node_flags)
-            {
-                let shown = child_path.clone().freeze();
-                if !child.is_directory() || !child_states.excluded(FilterMode::View) {
-                    report_staged_delete(stats, &child, &shown);
-                }
-                if child.is_directory() {
-                    pending.push((child_id, shown, child_states));
-                }
-            }
-            child_path.pop();
-        }
-    }
-    Ok(())
 }
 
 /// Stages the deletion of the children of the absent directory `node_id` that the working tree
@@ -2188,7 +2125,7 @@ async fn stage_absent_children(
     {
         return Ok(Absence::NeverHeld);
     }
-    Ok(settled.settle(states.creates_directory(!had_child)))
+    Ok(settled.settle(states.creates_directory()))
 }
 
 #[allow(clippy::too_many_arguments)]

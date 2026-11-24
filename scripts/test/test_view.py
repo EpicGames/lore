@@ -148,17 +148,17 @@ def test_view(new_lore_repo, scratch_dir):
 
 
 @pytest.mark.smoke
-def test_view_clone_creates_a_directory_emptied_by_filter_only_where_a_line_names_it(
+def test_view_clone_creates_a_directory_whose_children_the_view_excludes(
     new_lore_repo, scratch_dir
 ):
     """A clone under a view that excludes every child of a directory, but not the
-    directory itself, creates the directory only where a view line names it.
+    directory itself, creates the directory empty.
 
     The committed tree holds `data` with two files and a nested subdirectory, and
-    an unrelated top-level file. Under `data/**` the view includes `data` by its
-    parent's verdict alone, and the clone leaves it out with everything below it.
-    Under `!/data/` and `/data/**` a line names `data`, and the clone creates it
-    empty. Either way the clone holds `keep.txt`, and a scan reports no changes.
+    an unrelated top-level file. Under `data/**`, and under `!/data/` and
+    `/data/**`, the view keeps `data` and excludes what it holds, and the clone
+    creates it empty. Either way the clone holds `keep.txt`, and a scan reports no
+    changes.
     """
     repo: Lore = new_lore_repo()
 
@@ -181,8 +181,8 @@ def test_view_clone_creates_a_directory_emptied_by_filter_only_where_a_line_name
 
     view_dir = scratch_dir("view", create=True)
     for name, rules, created in [
-        ("inherited", ["data/**"], [keep]),
-        ("named", ["!/data/", "/data/**"], [emptied_dir, keep]),
+        ("below", ["data/**"], [emptied_dir, keep]),
+        ("re-included", ["!/data/", "/data/**"], [emptied_dir, keep]),
     ]:
         view_path = os.path.join(view_dir, f"{name}.txt")
         with open(view_path, "w+") as view_file:

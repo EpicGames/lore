@@ -1014,12 +1014,6 @@ pub(crate) async fn sync_in_operation(
     .await;
     let target =
         drawn_subtree_state(&repository_target, &state_target, &source_path, &mount_path).await;
-    let looked_up = (options.view.is_some() || options.reset).then(|| NodeMapping {
-        repository: target.mapping.repository.clone(),
-        state: target.mapping.state.clone(),
-        path: mount_path.clone(),
-        node: target.mapping.node,
-    });
     let current_tree = NodeMapping {
         repository: current.mapping.repository.clone(),
         state: current.mapping.state.clone(),
@@ -1134,10 +1128,11 @@ pub(crate) async fn sync_in_operation(
             &repository_target,
             &changes,
             &mount_path,
-            &looked_up.map_or(
-                crate::fs::realize::EmptiedDirectories::Unplaced,
-                crate::fs::realize::EmptiedDirectories::Target,
-            ),
+            if options.view.is_some() || options.reset {
+                &crate::fs::realize::EmptiedDirectories::Target
+            } else {
+                &crate::fs::realize::EmptiedDirectories::Unplaced
+            },
             &stats,
         )
         .await;

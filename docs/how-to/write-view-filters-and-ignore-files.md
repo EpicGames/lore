@@ -51,17 +51,24 @@ Samples/Demo/docs
 
 A path no rule matches keeps its directory's verdict.
 
-## Directories: `/a`, `/a/`, and `/a/**`
+## Name a directory or what it holds
+
+A rule ending in a name, or in a name and `/`, matches that directory itself. A rule ending in `/*` or `/**` matches what the directory holds, and not the directory.
 
 | Rule | As an exclusion | As a re-inclusion |
 | --- | --- | --- |
 | `/a` | Drops `a` and everything in it | Brings back `a` and everything in it |
 | `/a/` | The same, if `a` is a directory | The same, if `a` is a directory |
-| `/a/**` | Drops everything in `a`. Under a view, leaves `a/` off the disk unless a rule names it, and under an ignore file, stages it empty. | Brings back everything in `a` |
+| `/a/*` | Drops everything in `a`, and keeps `a` | Brings back the entries of `a`, and leaves `a` excluded. After `**`, what lies below the entries stays excluded. |
+| `/a/**` | Drops everything in `a`, and keeps `a` | Brings back everything in `a`, and leaves `a` excluded |
 
-Write `/a/` and `!/a/` for a directory.
+Write `/a/` and `!/a/` for a directory, and `/a/*` to drop what a directory holds and keep the directory. Under an ignore file, `/a/*` and `/a/**` leave `a` itself unignored, so staging takes it empty.
 
-Under a view, Lore creates a directory where the last rule matching the directory itself re-includes it, where the directory holds something the view keeps at any depth, and where the repository holds it empty. `!/Engine/` names `Engine/`, not the directories below it. A directory the view keeps only because its parent is kept, or that Lore looks into only because a re-inclusion could match below it, stays off the disk while nothing below it is kept, and `lore status` doesn't report it missing. Cloning, sync, branch switch, merging, cherry-picking, reverting, `lore sync --view`, `lore reset`, `lore layer add`, and `lore link add` follow this. A sync, branch switch, merge, cherry-pick, or revert removes a directory the view no longer creates once nothing is left in it, and keeps one holding an untracked or ignored file. Inside a link's mount, a sync that doesn't reset the working tree and a branch switch keep each directory the view includes. A virtual instance lists these directories too. A directory Lore creates is one `lore stage` sees, so deleting it is a deletion like any other: `lore status` lists the directory as deleted, `lore stage` stages it as deleted, and everything below it goes with it, the files the view leaves out included, as part of the directory's deletion rather than for being absent. Committing removes them all from the revision. In a repository that holds a link, staging deletes only what the view keeps below such a directory, and the directory stays while it holds a link or anything the view leaves out, so `lore status` goes on listing its deletion. `lore unstage` takes the deletion back, and `lore reset` creates the directory again.
+As exclusions, `/a/*` and `/a/**` differ only below a later re-inclusion that brings back the entries of a directory in `a` without what lies below them: `/a/**` matches at every depth, so after `/a/**` and `!/a/b/*` the entries of `a/b` are kept and what lies below them is not, where after `/a/*` it is.
+
+Under a view, Lore creates every directory the view keeps, whatever it holds. A directory the view excludes is on disk only as the parent of what Lore creates below it: a file or directory the view keeps, or a link or layer mount. Lore walks such a directory only where a later re-inclusion could match below it, and creates it only where it finds something kept, so after `/*` and `!/a/**` the directory `a` stays off the disk while it is empty. `lore clone`, `lore sync`, `lore branch switch`, `lore branch merge`, `lore revision cherry-pick`, `lore revision revert`, `lore sync --view`, `lore reset`, `lore layer add`, and `lore link add` follow this, and `lore status` lists a directory as deleted only where they create it. A sync, branch switch, merge, cherry-pick, or revert removes an excluded directory once nothing Lore creates is left in it, and keeps one holding an untracked or ignored file. Inside a link's mount, a sync that doesn't reset the working tree and a branch switch keep every directory. A virtual instance lists every directory the view keeps, and every excluded directory Lore walks.
+
+A directory the view keeps is one `lore stage` sees, so deleting it is a deletion like any other: `lore status` lists the directory as deleted, `lore stage` stages it as deleted, and everything below it goes with it, the files the view leaves out included, as part of the directory's deletion rather than for being absent. Committing removes them all from the revision. In a repository that holds a link, staging deletes only what the view keeps below such a directory, and the directory stays while it holds a link or anything the view leaves out, so `lore status` goes on listing its deletion. `lore unstage` takes the deletion back, and `lore reset` creates the directory again.
 
 ## Differences from `.gitignore`
 
@@ -174,7 +181,7 @@ Engine/Source/Runtime/
 Engine/Source/Runtime/core.cpp
 ```
 
-`!/Engine/Source/Runtime/*` alone brings `Private/impl.cpp` too.
+`!/Engine/Source/Runtime/*` alone brings `Private/impl.cpp` too: below `/*`, which excludes only the top level, what lies below a re-included entry follows the entry.
 
 ### Keep an otherwise empty directory
 
@@ -189,7 +196,7 @@ Engine/
 Engine/Content/
 ```
 
-`!/Engine/Content/` names the directory, so the instance holds it though `/Engine/Content/*` excludes everything in it.
+`!/Engine/Content/` keeps the directory, so the instance holds it though `/Engine/Content/*` excludes everything in it.
 
 ### Exclude a directory without leaving it behind
 
@@ -205,7 +212,7 @@ Engine/Content/
 Engine/Content/a.uasset
 ```
 
-`/Engine/Content/Deep/*` leaves `Deep/` out too, since no rule names it, but stages `Deep/` empty under an ignore file.
+`/Engine/Content/Deep/*` excludes what `Deep/` holds and keeps `Deep/`, so the instance holds it empty, and an ignore file leaves it to stage empty.
 
 ### Re-include one file deep inside an excluded tree
 

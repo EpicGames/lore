@@ -1317,7 +1317,7 @@ async fn flush_pending_dir_deletes(
 ///
 /// Materialization follows the view's directory rule: excluded children are pruned (never
 /// written), a non-excluded file or link materializes, and a directory materializes where the
-/// view creates it ([`FilterStates::creates_directory`]) or a descendant materializes.
+/// view keeps it ([`FilterStates::creates_directory`]) or a descendant materializes.
 ///
 /// Any other directory stands on disk only for what materializes below it, so its delete record
 /// is buffered in `pending` and emitted only once a materializing descendant proves it existed on
@@ -1390,10 +1390,8 @@ async fn emit_filesystem_subtree_deletes(
 
     let mut children =
         StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), node_id).await?;
-    let mut had_child = false;
     let mut any_materialized = false;
     while let Some((child_id, child_node, child_name)) = children.next().await? {
-        had_child = true;
         let child_path = path.push_into_buf(&child_name).freeze();
         // Release the block read lock before recursing (see NodeNameLock docs).
         drop(child_name);
@@ -1430,7 +1428,7 @@ async fn emit_filesystem_subtree_deletes(
         return Ok(true);
     }
 
-    if !states.excluded(filter_mode) && states.creates_directory(!had_child) {
+    if !states.excluded(filter_mode) && states.creates_directory() {
         flush_pending_dir_deletes(&state, &repository, changes, pending, intent).await?;
         return Ok(true);
     }
@@ -1447,9 +1445,10 @@ async fn emit_filesystem_subtree_deletes(
 ///
 /// A link stays while its mount is absent, and so does every directory on its path. A node the view
 /// excludes is not on disk, so its absence alone deletes nothing. A directory the working tree
-/// held, one the view creates ([`FilterStates::creates_directory`]) or one holding a node it held,
-/// is deleted with everything below it, what the view excludes included, which committing drops
-/// with it, and one the view creates is deleted at once, without a walk of what it holds. Where
+/// held, one the view keeps ([`FilterStates::creates_directory`]) or one holding a node it held, is
+/// deleted with everything below it, what the view excludes included, which committing drops with
+/// it, and one the view keeps and hides everything below ([`Filter::view_hides_below`]) is deleted
+/// at once, without a walk of what it holds. Where
 /// `keeps_partial`, as in a tree that registers a link, and in a directory that may hold a pending
 /// merge's change ([`holds_pending_merge_change`]), a directory stays wherever staging keeps or
 /// leaves out a node below it, as [`AbsentChildren`] says, or a link of `link_mounts` lies below
@@ -1474,7 +1473,11 @@ async fn stage_absent_subtree(
     }
     let keeps_partial = keeps_partial
         || holds_pending_merge_change(&state, NodeFlags::from_bits_retain(node.flags));
-    if node.is_directory() && (keeps_partial || !states.creates_directory(false)) {
+    if node.is_directory()
+        && (keeps_partial
+            || !states.creates_directory()
+            || !repository.filter.view_hides_below(states, path))
+    {
         match stage_absent_children(
             &state,
             &repository,
@@ -1555,7 +1558,7 @@ async fn stage_absent_children(
     if keeps_partial && !had_child && states.excluded(filter_mode) {
         return Ok(Absence::NeverHeld);
     }
-    Ok(settled.settle(states.creates_directory(!had_child)))
+    Ok(settled.settle(states.creates_directory()))
 }
 
 /// Whether staging leaves the name alone: a scratch file of the client's own making, or the

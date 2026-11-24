@@ -23,6 +23,7 @@ use crate::change::NodeChangeState;
 use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::filter::Scope;
 use crate::filter::query_depth;
 #[cfg(target_os = "linux")]
 use crate::fs::filesystem_provider::FileInfo;
@@ -206,9 +207,8 @@ bitflags! {
         /// read the linked repository.
         const ReportsLinkNodes = 0b10000;
         /// The walk's changes are realized into a working tree under the to side's view, so a
-        /// paired directory whose emptiness changes whether that view creates it is reported, as
-        /// one the two views place differently is ([`presence_change`]), and a delete beside a
-        /// file the view keeps carries [`change::Flags::KeptBeside`].
+        /// delete in a directory that view excludes and that holds something it places carries
+        /// [`change::Flags::KeptBeside`] ([`deletes_kept_beside`]).
         const PlacesDirectories = 0b100000;
     }
 }
@@ -1087,11 +1087,11 @@ fn moved_since_listed(
 /// Whether the deletes a walk reports in its to directory carry [`change::Flags::KeptBeside`]:
 /// where it places directories, the directory holds something its view places
 /// ([`holds_a_placed_entry`]), which `keeps_a_file` caches for the directory. The root, which no
-/// realize removes, and a directory a view line names, which stays on disk, aren't read.
+/// realize removes, and a directory the view keeps, which stays on disk, aren't read.
 async fn deletes_kept_beside(context: DiffContext<'_>, keeps_a_file: &mut Option<bool>) -> bool {
     context.flags.contains(DiffFlags::PlacesDirectories)
         && !context.paths.to.is_empty()
-        && !context.states.to.creates_directory(false)
+        && !context.states.to.creates_directory()
         && *match keeps_a_file {
             Some(keeps) => keeps,
             None => keeps_a_file.insert(holds_a_placed_entry(context).await),
@@ -1185,10 +1185,10 @@ async fn add_change_for_solo_from_node(
 }
 
 /// Whether the to directory the walk stands in holds something its view places without reading
-/// below it: a file it keeps ([`keeps_file`]), a link it keeps, or a directory a view line names,
-/// reading its listed children until one turns up: one name read and one filter verdict for each
-/// child read. A walk standing at a file holds none, and a child whose name the state cannot read
-/// is passed over.
+/// below it: a file it keeps ([`keeps_file`]), a link it keeps, or a directory it keeps, reading
+/// its listed children until one turns up: one name read and one filter verdict for each child
+/// read. A walk standing at a file holds none, and a child whose name the state cannot read is
+/// passed over.
 async fn holds_a_placed_entry(context: DiffContext<'_>) -> bool {
     let to_nodes = context.to_nodes;
     if context.to_parent.is_none() {
@@ -1223,9 +1223,15 @@ async fn holds_a_placed_entry(context: DiffContext<'_>) -> bool {
                 !filter.excludes_tree(&*spelled, true, FilterMode::View)
             } else {
                 filter
-                    .child_excludes_tree(context.states.to, &*spelled, true, FilterMode::View)
+                    .child_exclude_reason(
+                        context.states.to,
+                        &*spelled,
+                        true,
+                        FilterMode::View,
+                        Scope::Node,
+                    )
                     .0
-                    .creates_directory(false)
+                    .creates_directory()
             }
         };
         if placed {
@@ -1469,65 +1475,42 @@ fn views_diverge_below(
     !(covers(from_filter, states.from) && covers(to_filter, states.to))
 }
 
-/// The add or the delete of a paired directory alone, where one view creates it
-/// ([`FilterStates::creates_directory`]) and the other does not place it on disk that way. Under
-/// one view the two sides differ only where the directory's emptiness does, and are compared only
-/// under [`DiffFlags::PlacesDirectories`].
+/// The add or the delete of a paired directory alone, where one view keeps it
+/// ([`FilterStates::creates_directory`]) and the other excludes it.
 ///
-/// A view places a directory it creates, and one it includes whose subtree it covers, since then
-/// everything below stands. Any other directory stands on disk only for content below it: the walk
-/// below reports that content, its writes create the directory, and the realize removes one its
-/// deletes leave empty. So a paired directory is reported added where the target view creates it
-/// and the source view does not place it, and deleted where the source view created it and the
-/// target view does not place it. A delete of a directory still holding
-/// something keeps it, and an add of one standing for its content finds it there. Two equal
-/// verdicts place it alike, as one view does. The change carries no hierarchy, and comes with
-/// whether the two verdicts are one view's.
-#[allow(clippy::too_many_arguments)]
+/// A view keeps a directory it includes on disk whatever it holds. One it excludes stands on disk
+/// only for what is placed below it: the walk below reports that content, its writes create the
+/// directory, and the realize removes one its deletes leave empty. So a paired directory is added
+/// where the target view keeps it and the source view excludes it, and deleted the other way
+/// round, where the view excluding it places nothing below it ([`directory_places_content`]),
+/// which its caller reads. The change carries no hierarchy.
 fn presence_change(
-    from_filter: &Filter,
-    to_filter: &Filter,
-    path: &RelativePath,
-    depth: u32,
-    from_node: &Node,
-    to_node: &Node,
     from_states: FilterStates,
     to_states: FilterStates,
     mode: FilterMode,
-    flags: DiffFlags,
-) -> Option<(change::FileAction, bool)> {
+) -> Option<change::FileAction> {
     if !mode.contains(FilterMode::View) {
         return None;
     }
-    let one_view = from_states.view == to_states.view;
-    if one_view
-        && (!flags.contains(DiffFlags::PlacesDirectories)
-            || from_node.child().is_none() == to_node.child().is_none())
-    {
-        return None;
-    }
-    let from_creates = from_states.creates_directory(from_node.child().is_none());
-    let to_creates = to_states.creates_directory(to_node.child().is_none());
-    let covers = |filter: &Filter, states: FilterStates| {
-        filter.covers_subtree(states, path, depth, FilterMode::View)
-    };
-    if to_creates && !from_creates && !covers(from_filter, from_states) {
-        Some((change::FileAction::Add, one_view))
-    } else if from_creates && !to_creates && !covers(to_filter, to_states) {
-        Some((change::FileAction::Delete, one_view))
-    } else {
-        None
+    match (
+        from_states.creates_directory(),
+        to_states.creates_directory(),
+    ) {
+        (false, true) => Some(change::FileAction::Add),
+        (true, false) => Some(change::FileAction::Delete),
+        _ => None,
     }
 }
 
 /// Whether the directory `node` of `nodes` at `path`, with the view verdicts `states`, holds
 /// something the view places: a file it keeps ([`keeps_file`]), a link it keeps, or a directory it
-/// creates, at any depth, reading directories one after another until one turns up. Under one view
-/// such a directory stands for what it holds, so the walk reports no delete of it.
+/// keeps, at any depth, reading directories one after another until one turns up. A directory the
+/// view excludes stands on disk for what it holds, so the walk reports no add or delete of it where
+/// it holds such an entry.
 ///
-/// Its caller boxes it: only a directory a revision fills where it held it empty reaches it, so
-/// what it reads is what the revision adds, and inline it would make the future of every paired
-/// node as large as its own.
+/// Its caller boxes it: only a paired directory one view keeps and the other excludes reaches it,
+/// as on a change of view, and inline it would make the future of every paired node as large as its
+/// own.
 async fn directory_places_content(
     nodes: &StateChildrenNodes,
     node: NodeID,
@@ -1567,7 +1550,7 @@ async fn directory_places_content(
             if excluded {
                 continue;
             }
-            if child_states.creates_directory(child.child().is_none()) {
+            if child_states.creates_directory() {
                 return Ok(true);
             }
             pending.push((child_id, child_path, child_states));
@@ -1833,27 +1816,23 @@ async fn add_change_for_paired_nodes(
             let child_depth = paths.depth + 1;
 
             if to_type == LoreNodeType::Directory
-                && let Some((action, one_view)) = presence_change(
-                    &from_nodes.repository.filter,
-                    &to_nodes.repository.filter,
-                    &subpath,
-                    child_depth,
-                    from_node,
-                    &to_node,
-                    from_node_states,
-                    to_subtree_states,
-                    filter_mode,
-                    flags,
-                )
-                && !(one_view
-                    && matches!(action, change::FileAction::Delete)
-                    && Box::pin(directory_places_content(
+                && let Some(action) =
+                    presence_change(from_node_states, to_subtree_states, filter_mode)
+                && !Box::pin(match action {
+                    change::FileAction::Add => directory_places_content(
+                        from_nodes,
+                        from_node_id,
+                        from_path,
+                        from_node_states,
+                    ),
+                    _ => directory_places_content(
                         to_nodes,
                         to_named_node.node,
                         &subpath,
                         to_subtree_states,
-                    ))
-                    .await?)
+                    ),
+                })
+                .await?
             {
                 emit(changes, || NodeChange {
                     action,

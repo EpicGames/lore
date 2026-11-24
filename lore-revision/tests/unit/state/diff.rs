@@ -1099,84 +1099,52 @@ async fn deletes_marked(
     deletes
 }
 
-/// Under one view, a walk placing directories reports a directory the revision empties, whose
-/// content the view excluded, added, since the view creates an empty directory, and a directory
-/// the revision fills with what the view excludes deleted, but not one it fills with a file the
-/// view keeps at any depth, which stands for that file. A walk not placing directories reports neither, and
-/// neither is reported where a line names the directory or no view is set.
+/// Under one view, a walk reports no add or delete of a directory whose emptiness the revision
+/// changes, placing directories or not: the view keeps a directory or excludes it whatever it
+/// holds, as under `*.bat`, which keeps `a/b`, and under `/*/` and `!/*/**/*.txt`, which
+/// excludes it.
 #[tokio::test]
-async fn a_walk_placing_directories_reports_where_emptiness_changes_their_place() {
+async fn a_walk_under_one_view_reports_no_directory_whose_emptiness_changes() {
     let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
     LORE_CONTEXT
         .scope(execution, async move {
             let held = (&["a/b/y.bat", "top.txt"][..], &[][..]);
             let emptied = (&["top.txt"][..], &["a/b"][..]);
-            let kept = (&["a/b/x.txt", "top.txt"][..], &[][..]);
             let kept_below = (&["a/b/sub/x.txt", "top.txt"][..], &[][..]);
             let cases = [
-                (&["*.bat"][..], held, emptied, &[("A", "a/b")][..]),
-                (&["*.bat"][..], emptied, held, &[("D", "a/b")][..]),
-                (&["*.bat"][..], emptied, kept, &[][..]),
-                (&["*.bat"][..], emptied, kept_below, &[][..]),
-                (&["*.bat", "!/a/b/"][..], held, emptied, &[][..]),
-                (&[][..], held, emptied, &[][..]),
+                (&["*.bat"][..], held, emptied),
+                (&["*.bat"][..], emptied, held),
+                (&["/*/", "!/*/**/*.txt"][..], held, emptied),
+                (&["/*/", "!/*/**/*.txt"][..], emptied, held),
+                (&["/*/", "!/*/**/*.txt"][..], emptied, kept_below),
+                (&[][..], held, emptied),
             ];
-            for (index, (rules, from, to, placed)) in cases.into_iter().enumerate() {
+            for (index, (rules, from, to)) in cases.into_iter().enumerate() {
                 let repository = repository_under_view(&immutable, &mutable, rules);
                 let from = committed_tree(&repository, from.0, from.1).await;
                 let to = committed_tree(&repository, to.0, to.1).await;
-                let directories = |reported: Vec<(String, String)>| {
-                    reported
-                        .into_iter()
-                        .filter(|(_, path)| path == "a/b")
-                        .collect::<Vec<_>>()
-                };
-                let expected: Vec<(String, String)> = placed
-                    .iter()
-                    .map(|(action, path)| (action.to_string(), path.to_string()))
-                    .collect();
-                assert_eq!(
-                    directories(
-                        walk_flagged(
-                            &repository,
-                            &from,
-                            &to,
-                            DiffFlags::PlacesDirectories,
-                            FilterMode::Full,
-                        )
-                        .await
-                    ),
-                    expected,
-                    "case {index}, placing directories"
-                );
-                assert_eq!(
-                    directories(
-                        walk_flagged(
-                            &repository,
-                            &from,
-                            &to,
-                            DiffFlags::empty(),
-                            FilterMode::Full
-                        )
-                        .await
-                    ),
-                    [],
-                    "case {index}, not placing directories"
-                );
+                for flags in [DiffFlags::PlacesDirectories, DiffFlags::empty()] {
+                    let reported =
+                        walk_flagged(&repository, &from, &to, flags, FilterMode::Full).await;
+                    assert!(
+                        reported.iter().all(|(_, path)| path != "a/b"),
+                        "case {index}, {flags:?}: {reported:?}"
+                    );
+                }
             }
         })
         .await;
 }
 
-/// A walk placing directories marks a delete in a directory that still holds a file the view
-/// keeps, and no delete in one holding only what the view excludes. A walk not placing
-/// directories marks none.
+/// A walk placing directories marks a delete in a directory the view excludes that still holds a
+/// file the view keeps, and no delete in one holding only what the view excludes. A walk not
+/// placing directories marks none.
 #[tokio::test]
 async fn a_walk_placing_directories_marks_a_delete_beside_a_kept_file() {
     let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
     LORE_CONTEXT
         .scope(execution, async move {
-            let repository = repository_under_view(&immutable, &mutable, &["*.bat"]);
+            let repository = repository_under_view(&immutable, &mutable, &["/*/", "!/*/**/*.txt"]);
             let from = committed_tree(
                 &repository,
                 &["a/b/x.txt", "a/b/z.txt", "c/x.txt", "c/y.bat"],
@@ -1203,13 +1171,14 @@ async fn a_walk_placing_directories_marks_a_delete_beside_a_kept_file() {
 }
 
 /// A walk placing directories reads no kept file for a delete at the root, which no realize
-/// removes, nor for one in a directory a view line names, which stays on disk.
+/// removes, nor for one in a directory the view keeps, which stays on disk.
 #[tokio::test]
 async fn a_walk_placing_directories_reads_no_kept_file_where_the_directory_stays() {
     let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
     LORE_CONTEXT
         .scope(execution, async move {
-            let repository = repository_under_view(&immutable, &mutable, &["*.bat", "!/n/"]);
+            let repository =
+                repository_under_view(&immutable, &mutable, &["/*/", "!/*/**/*.txt", "!/n/"]);
             let from = committed_tree(
                 &repository,
                 &["n/x.txt", "n/z.txt", "r.txt", "top.txt"],
@@ -1225,14 +1194,15 @@ async fn a_walk_placing_directories_reads_no_kept_file_where_the_directory_stays
         .await;
 }
 
-/// A walk placing directories marks a delete in a directory that still holds a link or a directory
-/// the view places, as one holding a file it keeps.
+/// A walk placing directories marks a delete in a directory the view excludes that still holds a
+/// directory the view keeps, as one holding a file it keeps.
 #[tokio::test]
 async fn a_walk_placing_directories_marks_a_delete_beside_a_placed_directory() {
     let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
     LORE_CONTEXT
         .scope(execution, async move {
-            let repository = repository_under_view(&immutable, &mutable, &["*.bat", "!/a/b/c/"]);
+            let repository =
+                repository_under_view(&immutable, &mutable, &["/*/", "!/*/**/*.txt", "!/a/b/c/"]);
             let from = committed_tree(&repository, &["a/b/x.txt", "a/b/c/k.bat"], &[]).await;
             let to = committed_tree(&repository, &["a/b/c/k.bat"], &[]).await;
             assert_eq!(

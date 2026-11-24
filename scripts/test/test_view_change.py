@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 # The tree every test here commits. `assets/drop` is what a narrowing view drops,
 # `assets/keep` is what it keeps, and `keep.txt` is at the top level so a view
-# rooted at `/*` drops it while a view naming `assets/drop` does not.
+# rooted at `/*` drops it while a view excluding only `assets/drop` keeps it.
 TOP_LEVEL = "keep.txt"
 KEPT = os.path.join("assets", "keep", "keep.uasset")
 DROPPED = os.path.join("assets", "drop", "one.uasset")
@@ -41,12 +41,11 @@ FILE_BYTES = 256
 
 # Excludes the dropped directory and everything below it.
 NARROW_VIEW = ["/assets/drop"]
-# Excludes what the directory holds while leaving the directory itself in view by
-# its parent's verdict, so neither a clone nor a sync creates it.
+# Excludes what the directory holds and keeps the directory, so a clone and a sync
+# create it empty.
 EMPTIED_VIEW = ["/assets/drop/**"]
-# Excludes what the directory holds while a line names the directory, so a clone
-# and a sync create it empty.
-NAMED_EMPTIED_VIEW = ["!/assets/drop/", "/assets/drop/**"]
+# The same, with a line that keeps the directory before the exclusion.
+RE_INCLUDED_EMPTIED_VIEW = ["!/assets/drop/", "/assets/drop/**"]
 # The canonical shape of an authored view: drop everything at the top, re-include
 # the one tree wanted, then narrow within it. `*` cannot match below depth one, so
 # the re-included subtree's own children were never excluded.
@@ -267,22 +266,24 @@ def test_sync_view_narrows_to_a_re_including_view(new_lore_repo, scratch_dir):
 
 
 @pytest.mark.smoke
-def test_sync_view_removes_a_directory_its_children_leave_unless_a_line_names_it(
+def test_sync_view_keeps_a_directory_its_children_leave_unless_the_view_excludes_it(
     new_lore_repo, scratch_dir
 ):
-    """A view that drops what a directory holds removes the directory once its
-    children leave, unless a line of the view names it, and the tree then holds
-    what a clone with that view does.
+    """A view that drops what a directory holds keeps the directory once its
+    children leave, unless the view excludes the directory too, and the tree then
+    holds what a clone with that view does.
 
-    Under `/assets/drop/**` the view includes `assets/drop` by its parent's
-    verdict alone, so the sync deletes the two files and the directory they leave
-    empty. Under `!/assets/drop/` and `/assets/drop/**` a line names it, so the
-    sync deletes the two files and keeps it empty. A scan reports no changes.
+    Under `/assets/drop` the view excludes `assets/drop`, so the sync deletes the
+    two files and the directory. Under `/assets/drop/**`, with or without a line
+    keeping `assets/drop` before it, the view excludes only what the directory
+    holds, so the sync deletes the two files and keeps it empty. A scan reports no
+    changes.
     """
     repo = committed_repository(new_lore_repo)
     for name, rules, deleted, kept in [
-        ("emptied", EMPTIED_VIEW, 3, False),
-        ("named", NAMED_EMPTIED_VIEW, 2, True),
+        ("excluded", NARROW_VIEW, 3, False),
+        ("emptied", EMPTIED_VIEW, 2, True),
+        ("re-included", RE_INCLUDED_EMPTIED_VIEW, 2, True),
     ]:
         instance = repo.clone()
         view = view_file(scratch_dir, name, rules)
@@ -294,7 +295,7 @@ def test_sync_view_removes_a_directory_its_children_leave_unless_a_line_names_it
         assert realized == Realized(
             files_written=0, bytes_written=0, files_deleted=deleted
         ), (
-            f"under {rules}, the two files leave, and the directory where no line names it"
+            f"under {rules}, the two files leave, and the directory where the view excludes it"
         )
         assert_status_clean(instance, f"{rules}: the tree agrees with the view")
         assert materialized(instance) == materialized(repo.clone(view=view)), (

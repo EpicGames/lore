@@ -1250,12 +1250,12 @@ async fn deleted_under_view(view: &[&str], files: &[&str], removed: &[&str]) -> 
     marked
 }
 
-/// `lore dirty .` marks nothing deleted for a directory the view does not create and the working
-/// tree lacks: one a wildcard re-inclusion only could reach below, as with `/*` and
-/// `!*/Saved/Config/` and no `Saved/Config` in the revision, and nested directories holding only
-/// files a view of extension rules excludes.
+/// `lore dirty .` marks nothing deleted for a directory the view excludes that the working tree
+/// lacks and that holds nothing the view keeps: one a wildcard re-inclusion only could reach
+/// below, as with `/*` and `!*/Saved/Config/` and no `Saved/Config` in the revision, and one
+/// holding only files a re-inclusion of an extension leaves out.
 #[tokio::test]
-async fn a_walk_marks_nothing_for_a_directory_the_view_does_not_create() {
+async fn a_walk_marks_nothing_for_an_excluded_directory_holding_nothing_kept() {
     assert_eq!(
         deleted_under_view(
             &["/*", "!*/Saved/Config/"],
@@ -1267,49 +1267,63 @@ async fn a_walk_marks_nothing_for_a_directory_the_view_does_not_create() {
         "under a wildcard re-inclusion"
     );
     assert_eq!(
-        deleted_under_view(
-            &["*.bat"],
-            &["a/b/c/x.bat", "a/b/y.bat", "a/kept.txt"],
-            &["a/b"]
-        )
-        .await,
+        deleted_under_view(&["**", "!/a/**/*.bat"], &["a/b/x.txt", "a/y.bat"], &["a/b"]).await,
         Vec::<String>::new(),
-        "under a view of extension rules"
+        "under a re-inclusion of an extension"
     );
 }
 
-/// A walk marks deleted a directory the working tree lacks that the view creates: one a line
-/// names, below a parent the walk removes too or one that stands, and one holding a kept file
-/// below directories no line names, with each of them.
+/// A walk marks deleted a directory the working tree lacks that the view keeps, whatever it holds,
+/// and one the view excludes holding a kept file, with each directory below them: one a line
+/// keeps, below a parent the walk removes too or one that stands, nested directories holding only
+/// files extension rules exclude, `a` under `/a/**`, and `foo/bar/something` under `/foo/`,
+/// `!/foo/bar/`, `/foo/bar/something/specific/`, which holds only the excluded `specific`.
 #[tokio::test]
-async fn a_walk_marks_deleted_a_directory_the_view_creates() {
-    assert_eq!(
-        deleted_under_view(&["**", "!/a/b/", "/a/b/*"], &["a/b/x.txt"], &["a"]).await,
-        vec!["a".to_string(), "a/b".to_string()],
-        "the directory a line names, and its parent"
+async fn a_walk_marks_deleted_a_kept_directory_and_one_holding_a_kept_file() {
+    type Case = (
+        &'static [&'static str],
+        &'static [&'static str],
+        &'static [&'static str],
+        &'static [&'static str],
     );
-    assert_eq!(
-        deleted_under_view(
+    let cases: &[Case] = &[
+        (
+            &["**", "!/a/b/", "/a/b/*"],
+            &["a/b/x.txt"],
+            &["a"],
+            &["a", "a/b"],
+        ),
+        (
             &["*.bat"],
             &["a/b/kept.txt", "a/b/y.bat", "a/z.bat"],
-            &["a"]
-        )
-        .await,
-        vec![
-            "a".to_string(),
-            "a/b".to_string(),
-            "a/b/kept.txt".to_string()
-        ],
-        "the chain above a kept file"
-    );
-    assert_eq!(
-        deleted_under_view(
+            &["a"],
+            &["a", "a/b", "a/b/kept.txt"],
+        ),
+        (
             &["**", "!/a/b/", "/a/b/*"],
             &["a/b/x.txt", "a/z.txt"],
-            &["a/b"]
-        )
-        .await,
-        vec!["a/b".to_string()],
-        "the directory a line names, below a parent that stands"
-    );
+            &["a/b"],
+            &["a/b"],
+        ),
+        (
+            &["*.bat"],
+            &["a/b/c/x.bat", "a/b/y.bat", "a/kept.txt"],
+            &["a/b"],
+            &["a/b", "a/b/c"],
+        ),
+        (&["/a/**"], &["a/x.txt", "c.txt"], &["a"], &["a"]),
+        (
+            &["/foo/", "!/foo/bar/", "/foo/bar/something/specific/"],
+            &["foo/bar/b.txt", "foo/bar/something/specific/s.txt"],
+            &["foo/bar/something"],
+            &["foo/bar/something"],
+        ),
+    ];
+    for (view, files, removed, deleted) in cases {
+        assert_eq!(
+            deleted_under_view(view, files, removed).await,
+            *deleted,
+            "{view:?} with {removed:?} removed"
+        );
+    }
 }

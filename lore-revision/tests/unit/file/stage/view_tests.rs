@@ -23,9 +23,10 @@ use lore_revision::node::NodeBlock;
 use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
 use lore_revision::relay::EventDispatcher;
+use lore_revision::stage::Absence;
 use lore_revision::stage::StageOptions;
 use lore_revision::stage::StageStats;
-use lore_revision::stage::report_shown_deletions;
+use lore_revision::stage::stage_absent_delete;
 use lore_revision::state::State;
 use lore_revision::util::path::RelativePath;
 use parking_lot::Mutex;
@@ -45,10 +46,11 @@ use crate::helper::test_commit;
 use crate::helper::test_filter;
 use crate::helper::test_staged_by_intent;
 
-/// A view that names `a/b` and leaves out everything in it, keeping `k.txt` and `o` beside it.
-const NAMED_VIEW: &[&str] = &["**", "!/a/b/", "/a/b/*", "!/k.txt", "!/o/"];
-/// The files [`NAMED_VIEW`] is cloned over: it leaves out those in `a/b`, `a/h.txt` and `h/z.txt`.
-const NAMED_FILES: &[&str] = &[
+/// A view that keeps `a/b` and leaves out everything in it, keeping `k.txt` and `o` beside it.
+const EMPTIED_VIEW: &[&str] = &["**", "!/a/b/", "/a/b/*", "!/k.txt", "!/o/"];
+/// The files [`EMPTIED_VIEW`] is cloned over: it leaves out those in `a/b`, `a/h.txt` and
+/// `h/z.txt`.
+const EMPTIED_FILES: &[&str] = &[
     "a/b/x.txt",
     "a/b/c/y.txt",
     "a/h.txt",
@@ -56,28 +58,34 @@ const NAMED_FILES: &[&str] = &[
     "k.txt",
     "o/p.txt",
 ];
-/// What cloning under [`NAMED_VIEW`] leaves out of the working tree of [`NAMED_FILES`].
-const NAMED_LEFT_OUT: &[&str] = &["a/b/x.txt", "a/b/c", "a/h.txt", "h"];
+/// What cloning under [`EMPTIED_VIEW`] leaves out of the working tree of [`EMPTIED_FILES`].
+const EMPTIED_LEFT_OUT: &[&str] = &["a/b/x.txt", "a/b/c", "a/h.txt", "h"];
 
 /// A directory the instance holds under a view, which a test removes from the working tree: `a`,
-/// which holds the named `a/b`, `a/b` itself, `a` holding the kept `a/v.txt` beside `a/b`, `src`,
-/// which holds `src/x.txt`, which the view keeps, and `src/y.bat`, which `*.bat` leaves out, and
-/// `a/b` replaced by a file the view leaves out.
+/// which the view excludes and which holds the kept `a/b`, `a/b` itself, `a` holding the kept
+/// `a/v.txt` beside `a/b`, `src`, which holds `src/x.txt`, which the view keeps, and `src/y.bat`,
+/// which `*.bat` leaves out, `bin`, which the view keeps and which holds only `bin/y.bat`, which
+/// `*.bat` leaves out, `foo/bar/something`, which the view keeps and which holds only the excluded
+/// `specific`, and `a/b` replaced by a file the view leaves out.
 #[derive(Clone, Copy, Debug)]
 enum Removed {
-    NamedParent,
-    Named,
-    BesideNamed,
-    NotNamed,
+    ExcludedParent,
+    Emptied,
+    ExcludedHoldingFile,
+    Kept,
+    OnlyHiddenFiles,
+    OnlyHiddenDirectory,
     ReplacedByFile,
 }
 
 impl Removed {
-    const EACH: [Self; 4] = [
-        Self::NamedParent,
-        Self::Named,
-        Self::BesideNamed,
-        Self::NotNamed,
+    const EACH: [Self; 6] = [
+        Self::ExcludedParent,
+        Self::Emptied,
+        Self::ExcludedHoldingFile,
+        Self::Kept,
+        Self::OnlyHiddenFiles,
+        Self::OnlyHiddenDirectory,
     ];
 
     /// The view, the files committed, what cloning under the view leaves out of the working tree,
@@ -91,29 +99,46 @@ impl Removed {
         &'static str,
     ) {
         match self {
-            Self::NamedParent => (
-                NAMED_VIEW.to_vec(),
-                NAMED_FILES.to_vec(),
-                NAMED_LEFT_OUT,
+            Self::ExcludedParent => (
+                EMPTIED_VIEW.to_vec(),
+                EMPTIED_FILES.to_vec(),
+                EMPTIED_LEFT_OUT,
                 "a",
             ),
-            Self::Named | Self::ReplacedByFile => (
-                NAMED_VIEW.to_vec(),
-                NAMED_FILES.to_vec(),
-                NAMED_LEFT_OUT,
+            Self::Emptied | Self::ReplacedByFile => (
+                EMPTIED_VIEW.to_vec(),
+                EMPTIED_FILES.to_vec(),
+                EMPTIED_LEFT_OUT,
                 "a/b",
             ),
-            Self::BesideNamed => (
-                [NAMED_VIEW, &["!/a/v.txt"]].concat(),
-                [NAMED_FILES, &["a/v.txt"]].concat(),
-                NAMED_LEFT_OUT,
+            Self::ExcludedHoldingFile => (
+                [EMPTIED_VIEW, &["!/a/v.txt"]].concat(),
+                [EMPTIED_FILES, &["a/v.txt"]].concat(),
+                EMPTIED_LEFT_OUT,
                 "a",
             ),
-            Self::NotNamed => (
+            Self::Kept => (
                 vec!["*.bat"],
                 vec!["src/x.txt", "src/y.bat", "k.txt"],
                 &["src/y.bat"],
                 "src",
+            ),
+            Self::OnlyHiddenFiles => (
+                vec!["*.bat"],
+                vec!["bin/y.bat", "k.txt"],
+                &["bin/y.bat"],
+                "bin",
+            ),
+            Self::OnlyHiddenDirectory => (
+                vec!["/foo/", "!/foo/bar/", "/foo/bar/something/specific/"],
+                vec![
+                    "foo/bar/b.txt",
+                    "foo/bar/something/specific/s.txt",
+                    "foo/top.txt",
+                    "k.txt",
+                ],
+                &["foo/top.txt", "foo/bar/something/specific"],
+                "foo/bar/something",
             ),
         }
     }
@@ -131,18 +156,18 @@ impl Reached {
     const EACH: [Self; 2] = [Self::Marked, Self::Scanned];
 }
 
-/// A removed directory in a tree that registers a link: `a` under [`NAMED_VIEW`] and `src` under
+/// A removed directory in a tree that registers a link: `a` under [`EMPTIED_VIEW`] and `src` under
 /// `*.bat`, each beside a link at `z/deep/lib`, which the view leaves out, and `a` holding a link
 /// at `a/lib` beside `a/v.txt`, both of which the view keeps.
 #[derive(Clone, Copy, Debug)]
 enum Linked {
-    NamedParent,
-    NotNamed,
+    ExcludedParent,
+    Kept,
     LinkBelow,
 }
 
 impl Linked {
-    const EACH: [Self; 3] = [Self::NamedParent, Self::NotNamed, Self::LinkBelow];
+    const EACH: [Self; 3] = [Self::ExcludedParent, Self::Kept, Self::LinkBelow];
 
     /// The view, the files committed, what cloning under the view leaves out of the working tree,
     /// the directory removed, the link's mount path, and the deletions staging the removal stages
@@ -159,15 +184,15 @@ impl Linked {
         Vec<&'static str>,
     ) {
         match self {
-            Self::NamedParent => (
-                NAMED_VIEW.to_vec(),
-                [NAMED_FILES, &["z/deep/f.txt"]].concat(),
+            Self::ExcludedParent => (
+                EMPTIED_VIEW.to_vec(),
+                [EMPTIED_FILES, &["z/deep/f.txt"]].concat(),
                 &["a/b/x.txt", "a/b/c", "a/h.txt", "h", "z"],
                 "a",
                 "z/deep/lib",
                 vec![],
             ),
-            Self::NotNamed => (
+            Self::Kept => (
                 vec!["*.bat", "/z/"],
                 vec!["src/x.txt", "src/y.bat", "k.txt", "z/deep/f.txt"],
                 &["src/y.bat", "z"],
@@ -553,11 +578,11 @@ async fn stage_report(instance: &TestRepository, reached: Reached) -> StageRepor
     report
 }
 
-/// Staging a removed directory a view line names, `a` under `**`, `!/a/`, `!/k.txt`, reports each
+/// Staging a removed directory the view keeps, `a` under `**`, `!/a/`, `!/k.txt`, reports each
 /// file the view shows below it deleted, `a/v.txt`, `a/w.txt` and `a/s/z.txt`, by a delete event
 /// and in the count, with `a` and `a/s` counted as deleted directories.
 #[tokio::test]
-async fn staging_a_removed_named_directory_reports_each_file_the_view_shows() {
+async fn staging_a_removed_kept_directory_reports_each_file_the_view_shows() {
     for reached in Reached::EACH {
         with_instance(|mut instance| async move {
             committed(&instance, &["a/v.txt", "a/w.txt", "a/s/z.txt", "k.txt"]).await;
@@ -589,11 +614,11 @@ async fn staging_a_removed_named_directory_reports_each_file_the_view_shows() {
     }
 }
 
-/// Staging a removed directory a view line names, `a` under `**`, `!/a/`, `/a/s/h.txt`, `!/k.txt`,
+/// Staging a removed directory the view keeps, `a` under `**`, `!/a/`, `/a/s/h.txt`, `!/k.txt`,
 /// counts `a/s` as a deleted directory though it holds `a/s/h.txt`, which the view leaves out, as
 /// committing removes it with `a`; `a/s/h.txt` is deleted without an event.
 #[tokio::test]
-async fn staging_a_removed_named_directory_counts_a_shown_directory_holding_what_the_view_hides() {
+async fn staging_a_removed_kept_directory_counts_a_shown_directory_holding_what_the_view_hides() {
     for reached in Reached::EACH {
         with_instance(|mut instance| async move {
             committed(&instance, &["a/v.txt", "a/s/z.txt", "a/s/h.txt", "k.txt"]).await;
@@ -621,11 +646,11 @@ async fn staging_a_removed_named_directory_counts_a_shown_directory_holding_what
     }
 }
 
-/// Staging a removed directory a view line names by a scan reports no deletion below it that is
+/// Staging a removed directory the view keeps by a scan reports no deletion below it that is
 /// staged already: with `a/s` removed and staged first, removing `a` under `**`, `!/a/`, `!/k.txt`
 /// reports `a/v.txt` alone, and `a` as the one deleted directory.
 #[tokio::test]
-async fn staging_a_removed_named_directory_reports_no_deletion_staged_already() {
+async fn staging_a_removed_kept_directory_reports_no_deletion_staged_already() {
     let reached = Reached::Scanned;
     with_instance(|mut instance| async move {
         committed(&instance, &["a/v.txt", "a/s/z.txt", "a/s/y.txt", "k.txt"]).await;
@@ -680,17 +705,17 @@ async fn a_staging_scan_walk_settles_a_removed_directory_as_staging_does() {
     }
 }
 
-/// Reporting the deletion of a directory the view hides everything below, `a/b` under
-/// [`NAMED_VIEW`], reads nothing of what it holds: no block holding a node below `a/b` has its
-/// names read, and nothing is reported.
+/// Staging the deletion of a directory the view keeps and hides everything below, `a/b` under
+/// [`EMPTIED_VIEW`], stages it at once and reads nothing of what it holds: no block holding a node
+/// below `a/b` has its names read, and `a/b` alone is counted.
 #[tokio::test]
-async fn reporting_a_removed_directory_the_view_hides_everything_below_reads_nothing_below_it() {
+async fn staging_a_removed_directory_the_view_hides_everything_below_reads_nothing_below_it() {
     with_instance(|mut instance| async move {
-        let first = committed(&instance, NAMED_FILES).await;
+        let first = committed(&instance, EMPTIED_FILES).await;
         instance.repository = Arc::new(
             instance
                 .repository
-                .to_filter_context(Arc::new(test_filter(&[], NAMED_VIEW))),
+                .to_filter_context(Arc::new(test_filter(&[], EMPTIED_VIEW))),
         );
         let paths = tree_paths(&instance, &first).await;
         let below: Vec<NodeID> = paths
@@ -703,19 +728,30 @@ async fn reporting_a_removed_directory_the_view_hides_everything_below_reads_not
         let state = State::deserialize(instance.repository.clone(), first.revision())
             .await
             .expect("the revision");
-        let stats = StageStats::default();
+        let stats = Arc::new(StageStats::default());
+        let held = state
+            .node(instance.repository.clone(), paths["a/b"])
+            .await
+            .expect("the node")
+            .flags;
 
-        report_shown_deletions(
-            &instance.repository,
-            &state,
-            &directory,
+        let absence = stage_absent_delete(
+            instance.repository.clone(),
+            state.clone(),
+            directory.clone(),
             paths["a/b"],
-            instance.repository.filter.exclusion_states(&directory),
+            NodeFlags::from_bits_retain(held),
             NodeFlags::NoFlags,
-            &stats,
+            stats.clone(),
+            None,
+            instance.repository.filter.exclusion_states(&directory),
+            false,
+            false,
         )
         .await
-        .expect("the report");
+        .expect("the stage");
+
+        assert_eq!(absence, Absence::Deleted);
 
         for node in below {
             assert!(
@@ -726,7 +762,7 @@ async fn reporting_a_removed_directory_the_view_hides_everything_below_reads_not
             );
         }
         assert_eq!(stats.file_delete_count.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.directory_delete_count.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.directory_delete_count.load(Ordering::Relaxed), 1);
     })
     .await;
 }

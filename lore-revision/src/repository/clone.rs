@@ -408,17 +408,22 @@ struct BlockDiscoverItem {
     depth: u32,
     /// Cycle detector state, carried across block boundaries.
     cycle: SiblingCycleGuard,
+    /// In tree walk mode, whether the walk creates `repository_path` after its last entry: true
+    /// where the view keeps the directory and no entry walked so far creates it as an ancestor.
+    creates_after_walk: bool,
 }
 
 impl BlockDiscoverItem {
     /// The item walking the children of directory `parent` from `first_child`, at `path`, with the
-    /// view filter's verdict `states` for it, one level below `depth`.
+    /// view filter's verdict `states` for it, one level below `depth`. `creates_after_walk` is
+    /// whether the walk creates `path` unless one of its entries does.
     fn children(
         first_child: NodeID,
         parent: NodeID,
         path: RelativePath,
         states: FilterStates,
         depth: u32,
+        creates_after_walk: bool,
     ) -> Self {
         Self {
             node_id: first_child,
@@ -429,6 +434,7 @@ impl BlockDiscoverItem {
             follow_deps: false,
             depth: depth.saturating_add(1),
             cycle: SiblingCycleGuard::new(parent),
+            creates_after_walk,
         }
     }
 }
@@ -690,9 +696,15 @@ async fn block_discover_task(
 /// Walks the nodes of `block` from `item`, sending each file the view keeps to the clone's
 /// writers and dispatching each directory and link it enters.
 ///
-/// The walk creates a directory itself only where the view creates it
-/// ([`FilterStates::creates_directory`]); every other directory the clone holds is created as an
-/// ancestor of a file it writes, of a link it mounts, or of a directory the walk creates.
+/// The walk creates a directory the view keeps ([`FilterStates::creates_directory`]) only where
+/// none of its entries is a file or directory the view keeps: as it reaches one the revision holds
+/// empty, and after walking the last entry of any other. One with a kept file among its entries is
+/// created with the file, whose writer creates the file's parent and each directory above it
+/// before writing it, and one with a kept directory among them with that directory. A directory
+/// the view excludes is created only as an ancestor of what the clone creates below it. So a chain
+/// of directories the view keeps, each an entry of the one above, is created in one call, with the
+/// first file written below it, which NTFS logs together with the file, or with the deepest
+/// directory of the chain.
 #[allow(clippy::too_many_arguments)]
 async fn process_block_item(
     dispatcher: &Arc<BlockDiscoverDispatcher>,
@@ -712,6 +724,7 @@ async fn process_block_item(
     let mut current_node_id = item.node_id;
     let expected_parent = item.expected_parent;
     let mut cycle = item.cycle;
+    let mut creates_after_walk = item.creates_after_walk;
 
     loop {
         let node_index = Node::index(current_node_id);
@@ -752,10 +765,12 @@ async fn process_block_item(
                                 node_path,
                                 node_states,
                                 item.depth,
+                                false,
                             ));
                         }
                     }
                     Walk::Clone(clone) if node.is_file() => {
+                        creates_after_walk = false;
                         clone
                             .stats
                             .discovery
@@ -806,23 +821,27 @@ async fn process_block_item(
                     }
                     Walk::Clone(clone) if node.is_directory() => {
                         let first_child = node.child();
-                        if node_states.creates_directory(first_child.is_none()) {
-                            ensure_directory(
-                                &node_path,
-                                &clone.operation,
-                                &clone.stats,
-                                execution_context().globals().dry_run(),
-                            )
-                            .await?;
-                        }
-                        if let Some(first_child) = first_child {
-                            dispatcher.dispatch(BlockDiscoverItem::children(
+                        let child_creates = node_states.creates_directory();
+                        creates_after_walk &= !child_creates;
+                        match first_child {
+                            Some(first_child) => dispatcher.dispatch(BlockDiscoverItem::children(
                                 first_child,
                                 current_node_id,
                                 node_path,
                                 node_states,
                                 item.depth,
-                            ));
+                                child_creates,
+                            )),
+                            None if child_creates => {
+                                ensure_directory(
+                                    &node_path,
+                                    &clone.operation,
+                                    &clone.stats,
+                                    execution_context().globals().dry_run(),
+                                )
+                                .await?;
+                            }
+                            None => {}
                         }
                     }
                     Walk::Clone(_) => {}
@@ -847,10 +866,22 @@ async fn process_block_item(
                     follow_deps: false,
                     depth: item.depth,
                     cycle,
+                    creates_after_walk,
                 });
                 break;
             }
-            None => break,
+            None => {
+                if creates_after_walk && let Walk::Clone(clone) = &dispatcher.walk {
+                    ensure_directory(
+                        &item.repository_path,
+                        &clone.operation,
+                        &clone.stats,
+                        execution_context().globals().dry_run(),
+                    )
+                    .await?;
+                }
+                break;
+            }
         }
     }
 
@@ -973,6 +1004,7 @@ async fn process_block_item_dependency(
                 follow_deps: dep_ctx.recursive,
                 depth: item.depth + 1,
                 cycle: SiblingCycleGuard::new(INVALID_NODE),
+                creates_after_walk: false,
             });
         }
     }
@@ -1780,6 +1812,7 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
                 RelativePath::new(),
                 FilterStates::ROOT,
                 0,
+                false,
             ));
         }
     } else {
@@ -1819,6 +1852,7 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
                 follow_deps: true,
                 depth: 0,
                 cycle: SiblingCycleGuard::new(INVALID_NODE),
+                creates_after_walk: false,
             });
         }
 
@@ -1902,6 +1936,7 @@ pub async fn warm_tree(
                 RelativePath::new(),
                 FilterStates::ROOT,
                 0,
+                false,
             ));
         }
     }
@@ -1963,6 +1998,7 @@ async fn clone_discover_link(
                     link_path,
                     link_states,
                     0,
+                    false,
                 ));
             }
 
@@ -2065,15 +2101,30 @@ pub async fn clone_execute(
     }
 }
 
-/// `states` is the view filter's verdict for `repository_path`, which each child
-/// steps from rather than folding its whole path.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn clone_node(
+/// Clones what the directory `node` at `repository_path` holds, where the directory stands.
+/// `states` is the view filter's verdict for `repository_path`, which each child steps from rather
+/// than folding its whole path.
+pub(crate) fn clone_node(
     ctx: CloneContext,
     storage: Arc<lore_transport::StorageSession>,
     repository_path: RelativePath,
     node: NodeID,
     states: FilterStates,
+) -> impl Future<Output = Result<(), CloneError>> {
+    clone_directory(ctx, storage, repository_path, node, states, false)
+}
+
+/// [`clone_node`], which with `creates` creates the directory after walking its entries where it
+/// holds no file or directory the view keeps ([`FilterStates::creates_directory`]). One that holds
+/// a kept file is created with the file's parent, and one that holds a kept directory with that
+/// directory.
+async fn clone_directory(
+    ctx: CloneContext,
+    storage: Arc<lore_transport::StorageSession>,
+    repository_path: RelativePath,
+    node: NodeID,
+    states: FilterStates,
+    mut creates: bool,
 ) -> Result<(), CloneError> {
     let repository = ctx.repository.clone();
     let state = ctx.state.clone();
@@ -2107,10 +2158,13 @@ pub(crate) async fn clone_node(
         );
         if !excluded {
             if child_node.is_file() {
+                creates = false;
                 spawn_clone_file(&mut tasks, ctx.clone(), child_node, child_repository_path).await;
             } else if child_node.is_link() {
                 spawn_clone_link(&mut tasks, ctx.clone(), child_node, child_repository_path);
             } else if child_node.is_directory() {
+                let child_creates = child_states.creates_directory();
+                creates &= !child_creates;
                 let result = spawn_clone_directory(
                     &mut tasks,
                     ctx.clone(),
@@ -2118,7 +2172,7 @@ pub(crate) async fn clone_node(
                     child_id,
                     child_repository_path,
                     child_states,
-                    child_states.creates_directory(child_node.child().is_none()),
+                    child_creates,
                 )
                 .await;
                 failure = failure.or(result
@@ -2160,10 +2214,18 @@ pub(crate) async fn clone_node(
     }
 
     if let Some(err) = failure {
-        Err(err)
-    } else {
-        Ok(())
+        return Err(err);
     }
+    if creates {
+        ensure_directory(
+            &repository_path,
+            &ctx.operation,
+            &ctx.stats,
+            execution_context().globals().dry_run(),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2173,8 +2235,16 @@ fn clone_child_node(
     repository_path: RelativePath,
     node: NodeID,
     states: FilterStates,
+    creates: bool,
 ) -> Pin<Box<dyn Future<Output = Result<(), CloneError>> + Send>> {
-    Box::pin(clone_node(ctx, storage, repository_path, node, states))
+    Box::pin(clone_directory(
+        ctx,
+        storage,
+        repository_path,
+        node,
+        states,
+        creates,
+    ))
 }
 
 /// Creates `directory` and its ancestors, and records it in `stats`, so a later call for it makes
@@ -2460,6 +2530,7 @@ fn spawn_clone_link(
                     repository_path,
                     link_node,
                     link_states,
+                    false,
                 )
                 .await?;
             } else {
@@ -2473,8 +2544,7 @@ fn spawn_clone_link(
 }
 
 /// Clones the directory `node` at `repository_path`, whose view verdict is `states`, creating it
-/// first where `creates` says the view creates it ([`FilterStates::creates_directory`]); otherwise
-/// what is cloned below it creates it.
+/// with `creates`, which says the view keeps it, as [`clone_directory`] describes.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_clone_directory(
     tasks: &mut JoinSet<Result<(), CloneError>>,
@@ -2491,22 +2561,7 @@ async fn spawn_clone_directory(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let future = async move {
-        if creates
-            && let Err(err) = ensure_directory(
-                &repository_path,
-                &ctx.operation,
-                &stats,
-                execution_context().globals().dry_run(),
-            )
-            .await
-        {
-            stats
-                .directory_inflight
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            return Err(err);
-        }
-
-        let result = clone_child_node(ctx, storage, repository_path, node, states).await;
+        let result = clone_child_node(ctx, storage, repository_path, node, states, creates).await;
 
         stats
             .directory_inflight

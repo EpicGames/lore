@@ -9057,46 +9057,7 @@ pub(crate) struct DiffSide {
     pub(crate) node: NodeID,
 }
 
-/// The live children of a directory by name hash, sorted, read once for every name looked up in it.
-pub(crate) struct ChildIndex(Vec<StateNamedNode>);
-
-/// What a [`ChildIndex`] holds at a name.
-pub(crate) enum IndexedChild {
-    /// No child.
-    Absent,
-    /// The one child carrying the name's hash.
-    One(NodeID),
-    /// Two or more children sharing the name's hash, which a find by path tells apart.
-    Several,
-}
-
-impl ChildIndex {
-    /// The child named `name`.
-    pub(crate) fn find(&self, name: &str) -> IndexedChild {
-        let name_hash = hash::hash_string(name);
-        let first = self.0.partition_point(|child| child.name < name_hash);
-        match self.0.get(first..).unwrap_or_default() {
-            [child, next, ..] if child.name == name_hash && next.name == name_hash => {
-                IndexedChild::Several
-            }
-            [child, ..] if child.name == name_hash => IndexedChild::One(child.node),
-            _ => IndexedChild::Absent,
-        }
-    }
-}
-
 impl DiffSide {
-    /// The live children of this side's directory `node`, indexed by name.
-    pub(crate) async fn child_index(&self, node: NodeID) -> Result<ChildIndex, StateError> {
-        let mut children = self
-            .state
-            .collect_children_unsorted(self.repository.clone(), node, false, false)
-            .await?
-            .children;
-        children.sort_unstable_by_key(|child| (child.name, child.node));
-        Ok(ChildIndex(children))
-    }
-
     /// Where `path` below this side's node stops.
     pub(crate) async fn stop(&self, path: &str) -> Result<PathStop, StateError> {
         if !self.node.is_valid_or_root_node_id() {

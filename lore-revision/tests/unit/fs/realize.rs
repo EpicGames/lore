@@ -31,6 +31,7 @@ use lore_revision::state;
 use lore_revision::state::Mark;
 use lore_revision::state::NodeMapping;
 use lore_revision::state::State;
+use lore_revision::state::step_counting;
 use lore_revision::util;
 use lore_revision::util::path::RelativePath;
 use lore_revision::util::path::RelativePathBuf;
@@ -2451,8 +2452,8 @@ async fn a_merge_moves_the_other_spelling_of_a_source_edited_since_the_base() {
     .await;
 }
 
-/// A move into a directory the sync adds carries the file there, though no view line names the
-/// directory and the realize of its add creates nothing: the rename creates the directory it
+/// A move into a directory the sync adds carries the file there, though the realize of the
+/// directory's add creates nothing ahead of the file it holds: the rename creates the directory it
 /// lands in.
 #[tokio::test]
 async fn a_move_into_an_added_directory_creates_it() {
@@ -3325,9 +3326,9 @@ fn directories_below(root: &std::path::Path) -> Vec<String> {
 }
 
 /// One case of [`remove_emptied_directories`]: the view the working tree is under, the tree the
-/// target revision holds, the files deleted and written, what the working tree holds once the
-/// deletes are done, which directories the realize removes, and the directories the working tree
-/// holds after the removal.
+/// target revision holds, the files deleted, written and moved, what the working tree holds once
+/// the deletes are done, which directories the realize removes, and the directories the working
+/// tree holds after the removal.
 struct Removal {
     view: &'static [&'static str],
     target_files: &'static [&'static str],
@@ -3340,30 +3341,15 @@ struct Removal {
     written: &'static [&'static str],
     /// The files moved, each from its source to its destination.
     moved: &'static [(&'static str, &'static str)],
-    /// The paths of the target revision, a merged tree, that it holds staged for deletion.
-    staged_deleted: &'static [&'static str],
-    /// The files and empty directories the working tree's current revision holds, for a merge;
-    /// `None` for the target's, with the files deleted and without those added.
-    current: Option<(&'static [&'static str], &'static [&'static str])>,
     on_disk: &'static [&'static str],
     local_files: &'static [&'static str],
-    emptied: Emptied,
+    emptied: EmptiedDirectories,
     left: &'static [&'static str],
 }
 
-/// The [`EmptiedDirectories`] of a [`Removal`], the change of view and the merge carrying the
-/// target revision.
-#[derive(Clone, Copy)]
-enum Emptied {
-    Unplaced,
-    Target,
-    Merged,
-}
-
 /// The directories the working tree of `case` holds after [`remove_emptied_directories`] at the
-/// root, the directories it tried to remove, in the order it tried them, and how many directory
-/// creates it asked for.
-async fn directories_left(case: &Removal) -> (Vec<String>, Vec<String>, usize) {
+/// root, and the directories it tried to remove, in the order it tried them.
+async fn directories_left(case: &Removal) -> (Vec<String>, Vec<String>) {
     let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
     let mut filter = Filter::default();
     for rule in case.view {
@@ -3374,27 +3360,7 @@ async fn directories_left(case: &Removal) -> (Vec<String>, Vec<String>, usize) {
     }
     let provider = Arc::new(TestFilesystemProvider::reading(dir.path()));
     let repository = working_tree_repository_over(dir.path(), filter, Some(provider.clone())).await;
-    let target = NodeMapping::root(
-        repository.clone(),
-        tree_holding(&repository, case.target_files, case.target_empty).await,
-    );
-    for path in case.staged_deleted {
-        let node = target
-            .state
-            .find_node_link(repository.clone(), path)
-            .await
-            .unwrap()
-            .node;
-        target
-            .state
-            .node_mark(
-                &repository,
-                node,
-                Mark::staged_and_dirty(NodeFlags::StagedDelete, NodeFlags::DirtyDelete),
-            )
-            .await
-            .unwrap();
-    }
+    let target = tree_holding(&repository, case.target_files, case.target_empty).await;
     for directory in case.on_disk {
         std::fs::create_dir_all(dir.path().join(directory)).unwrap();
     }
@@ -3405,7 +3371,7 @@ async fn directories_left(case: &Removal) -> (Vec<String>, Vec<String>, usize) {
         .deleted
         .iter()
         .map(|path| {
-            let mut delete = file_delete_at(&repository, &target.state, path);
+            let mut delete = file_delete_at(&repository, &target, path);
             if case.kept_beside.contains(path) {
                 delete.flags = change::Flags::KeptBeside;
             }
@@ -3417,7 +3383,7 @@ async fn directories_left(case: &Removal) -> (Vec<String>, Vec<String>, usize) {
                 None => (FileAction::Add, *written),
             };
             let directory = path.strip_suffix('/');
-            let mut write = file_delete_at(&repository, &target.state, directory.unwrap_or(path));
+            let mut write = file_delete_at(&repository, &target, directory.unwrap_or(path));
             write.action = action;
             std::mem::swap(&mut write.from, &mut write.to);
             if directory.is_some() {
@@ -3430,7 +3396,7 @@ async fn directories_left(case: &Removal) -> (Vec<String>, Vec<String>, usize) {
             write
         }))
         .chain(case.moved.iter().map(|(from, to)| {
-            let mut moved = file_delete_at(&repository, &target.state, from);
+            let mut moved = file_delete_at(&repository, &target, from);
             if case.kept_beside.contains(from) {
                 moved.flags = change::Flags::KeptBeside;
             }
@@ -3441,173 +3407,206 @@ async fn directories_left(case: &Removal) -> (Vec<String>, Vec<String>, usize) {
         }))
         .collect();
     change::sort_by_path(&mut changes);
-    let emptied = match case.emptied {
-        Emptied::Unplaced => EmptiedDirectories::Unplaced,
-        Emptied::Target => EmptiedDirectories::Target(target),
-        Emptied::Merged => {
-            let (files, empty): (Vec<&str>, &[&str]) = match case.current {
-                Some((files, empty)) => (files.to_vec(), empty),
-                None => (
-                    case.target_files
-                        .iter()
-                        .chain(case.deleted)
-                        .filter(|path| !case.written.contains(path))
-                        .copied()
-                        .collect(),
-                    case.target_empty,
-                ),
-            };
-            let current = NodeMapping::root(
-                repository.clone(),
-                tree_holding(&repository, &files, empty).await,
-            );
-            EmptiedDirectories::Merged {
-                merged: target,
-                current,
-            }
-        }
-    };
     let operation = repository.file_system().begin_operation().await.unwrap();
     remove_emptied_directories(
         &operation,
         &repository,
         &changes,
         &RelativePath::new(),
-        &emptied,
+        &case.emptied,
         &Arc::default(),
     )
     .await;
     let attempted = provider.empty_directory_removals.lock().clone();
-    let created = provider.directory_creates.load(Ordering::Relaxed);
-    (directories_below(dir.path()), attempted, created)
+    (directories_below(dir.path()), attempted)
 }
 
-/// A change of view removes each directory its deletes leave empty that the new view leaves off
-/// the disk, and keeps one holding a local file, one the target revision holds empty, one a line
-/// names, and one whose subtree the view covers. One the target revision doesn't hold keeps none
-/// above it.
+/// A change of view removes each directory its deletes leave empty that the new view excludes,
+/// and keeps one the view keeps, whatever it holds, such as `foo/bar/something` under `/foo/`,
+/// `!/foo/bar/`, `/foo/bar/something/specific/`, and one holding a local file. Without a change of
+/// view, as in a merge, the realize removes only directories a view that re-includes below an
+/// excluded directory excludes.
 #[tokio::test]
-async fn a_view_change_removes_the_directories_the_new_view_does_not_create() {
+async fn a_view_change_removes_the_directories_the_new_view_excludes() {
+    let base = Removal {
+        view: &["/a/b/"],
+        target_files: &["a/b/x.txt"],
+        target_empty: &[],
+        deleted: &["a/b/x.txt"],
+        kept_beside: &[],
+        written: &[],
+        moved: &[],
+        on_disk: &["a/b"],
+        local_files: &[],
+        emptied: EmptiedDirectories::Target,
+        left: &["a"],
+    };
     let cases = [
-        Removal {
-            view: &["*.bat"],
-            target_files: &["a/b/y.bat"],
-            target_empty: &[],
-            deleted: &["a/b/c/x.txt"],
-            kept_beside: &[],
-            written: &[],
-            moved: &[],
-            staged_deleted: &[],
-            current: None,
-            on_disk: &["a/b"],
-            local_files: &[],
-            emptied: Emptied::Target,
-            left: &[],
-        },
         Removal {
             view: &["*.txt"],
             target_files: &["a/b/x.txt", "a/c/y.txt"],
-            target_empty: &[],
             deleted: &["a/b/x.txt", "a/c/y.txt"],
-            kept_beside: &[],
-            written: &[],
-            moved: &[],
-            staged_deleted: &[],
-            current: None,
             on_disk: &["a/b", "a/c"],
-            local_files: &["a/c/local.dat"],
-            emptied: Emptied::Target,
+            left: &["a", "a/b", "a/c"],
+            ..base
+        },
+        Removal {
+            target_files: &["a/b/x.txt", "a/c/y.txt"],
+            on_disk: &["a/b", "a/c"],
             left: &["a", "a/c"],
+            ..base
         },
         Removal {
-            view: &["*.txt"],
-            target_files: &["a/x.txt"],
-            target_empty: &["a/e"],
-            deleted: &["a/e/z.txt", "a/x.txt"],
-            kept_beside: &[],
-            written: &[],
-            moved: &[],
-            staged_deleted: &[],
-            current: None,
-            on_disk: &["a/e"],
-            local_files: &[],
-            emptied: Emptied::Target,
-            left: &["a", "a/e"],
-        },
-        Removal {
-            view: &["**", "!/a/b/", "/a/b/*"],
-            target_files: &["a/b/x.txt"],
-            target_empty: &[],
-            deleted: &["a/b/x.txt"],
-            kept_beside: &[],
-            written: &[],
-            moved: &[],
-            staged_deleted: &[],
-            current: None,
-            on_disk: &["a/b"],
-            local_files: &[],
-            emptied: Emptied::Target,
+            local_files: &["a/b/local.dat"],
             left: &["a", "a/b"],
+            ..base
         },
         Removal {
-            view: &["/z/*.txt"],
-            target_files: &["a/b/x.txt"],
-            target_empty: &[],
-            deleted: &["a/b/x.txt"],
-            kept_beside: &[],
-            written: &[],
-            moved: &[],
-            staged_deleted: &[],
-            current: None,
-            on_disk: &["a/b"],
-            local_files: &[],
-            emptied: Emptied::Target,
+            view: &["/a/**"],
+            ..base
+        },
+        Removal {
+            view: &["/foo/", "!/foo/bar/", "/foo/bar/something/specific/"],
+            target_files: &[
+                "foo/top.txt",
+                "foo/bar/b.txt",
+                "foo/bar/something/specific/s.txt",
+            ],
+            deleted: &["foo/top.txt", "foo/bar/something/specific/s.txt"],
+            on_disk: &["foo/bar/something/specific"],
+            left: &["foo", "foo/bar", "foo/bar/something"],
+            ..base
+        },
+        Removal {
+            view: &["**", "!/a/c/y.txt"],
+            target_files: &["a/b/x.txt", "a/c/y.txt"],
+            on_disk: &["a/b", "a/c"],
+            emptied: EmptiedDirectories::Excluded,
+            left: &["a", "a/c"],
+            ..base
+        },
+        Removal {
+            emptied: EmptiedDirectories::Excluded,
             left: &["a", "a/b"],
-        },
-        Removal {
-            view: &["*.bat"],
-            target_files: &["a/b/y.bat"],
-            target_empty: &[],
-            deleted: &["a/b/x.txt"],
-            kept_beside: &[],
-            written: &[],
-            moved: &[],
-            staged_deleted: &[],
-            current: None,
-            on_disk: &["a/b"],
-            local_files: &[],
-            emptied: Emptied::Target,
-            left: &[],
+            ..base
         },
     ];
     for (index, case) in cases.iter().enumerate() {
-        let (left, _, _) = Box::pin(with_execution(directories_left(case))).await;
+        let (left, _) = Box::pin(with_execution(directories_left(case))).await;
         assert_eq!(left, case.left, "case {index}");
     }
 }
 
+/// A write creates a directory ahead of what it holds only where the view keeps it and it holds no
+/// file or directory the view keeps: without a view, an empty directory; under `*.bat`, one holding
+/// only `.bat` files; under `/foo/`, `!/foo/bar/`, `/foo/bar/something/specific/`, the directory
+/// `foo/bar/something`, which holds only the excluded `specific`. A directory holding a kept file or
+/// a kept directory, and one the view excludes, is not. Its entries are read only where it holds
+/// any, under a view that keeps it and doesn't hide everything below it, as `/a/**` does below `a`.
+#[tokio::test]
+async fn a_write_creates_a_directory_ahead_only_where_it_holds_nothing_kept() {
+    let files = &[
+        "a/b/x.bat",
+        "a/k.txt",
+        "c/d/y.bat",
+        "foo/bar/b.txt",
+        "foo/bar/something/specific/s.txt",
+    ];
+    let empty = &["e"];
+    // View, directory, created ahead, entries read.
+    let cases: &[(&[&str], &str, bool, bool)] = &[
+        (&[], "e", true, false),
+        (&[], "a", false, false),
+        (&[], "a/b", false, false),
+        (&["*.bat"], "a/b", true, true),
+        (&["*.bat"], "a", false, true),
+        (&["*.bat"], "c", false, true),
+        (&["*.bat"], "c/d", true, true),
+        (&["*.bat"], "e", true, false),
+        (&["/a/**"], "a", true, false),
+        (&["/a/"], "a", false, false),
+        (
+            &["/foo/", "!/foo/bar/", "/foo/bar/something/specific/"],
+            "foo",
+            false,
+            false,
+        ),
+        (
+            &["/foo/", "!/foo/bar/", "/foo/bar/something/specific/"],
+            "foo/bar",
+            false,
+            true,
+        ),
+        (
+            &["/foo/", "!/foo/bar/", "/foo/bar/something/specific/"],
+            "foo/bar/something",
+            true,
+            true,
+        ),
+    ];
+    step_counting::set_chain_step_counting(true);
+    Box::pin(with_execution(async {
+        for (view, directory, ahead, read) in cases {
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+            let repository =
+                working_tree_repository_filtered(dir.path(), crate::helper::test_filter(&[], view))
+                    .await;
+            let state = tree_holding(&repository, files, empty).await;
+            let node_id = state
+                .find_relative_node_link(repository.clone(), ROOT_NODE, directory)
+                .await
+                .expect("the directory")
+                .node;
+            let node = state
+                .node(repository.clone(), node_id)
+                .await
+                .expect("the node");
+            let path = relative(directory);
+            let states = repository.filter.exclusion_states(&path);
+            let before = step_counting::thread_walk_steps();
+
+            let created = creates_directory_ahead(
+                &repository.filter,
+                &state,
+                &repository,
+                node_id,
+                &node,
+                &path,
+                states,
+            )
+            .await
+            .expect("the entries");
+
+            assert_eq!(created, *ahead, "{directory} under {view:?}");
+            assert_eq!(
+                step_counting::thread_walk_steps() > before,
+                *read,
+                "{directory}'s entries read under {view:?}"
+            );
+        }
+    }))
+    .await;
+}
+
 /// Under one view, a sync to another revision removes each directory its deletes leave empty
-/// that the view leaves off the disk, as cloning that revision does, and keeps one holding a
-/// local file, one a line names, one whose subtree the view covers and one a write lands in. It
-/// tries no directory the view places, none beside a delete or a move's source the walk found a
-/// kept file beside, nor one above a directory that stays, and with no view it tries none. A
-/// directory added that no line names, which only what lands in it creates, keeps nothing above
-/// it, nor does one missing from the disk.
+/// that the view excludes, as cloning that revision does, and keeps one holding a local file, one
+/// the view keeps and one a write lands in. It tries no directory the view keeps, none beside a
+/// delete or a move's source the walk found a kept file beside, nor one above a directory that
+/// stays, and with no view it tries none. A directory added that the view excludes, which only
+/// what lands in it creates, keeps nothing above it, nor does one missing from the disk.
 #[tokio::test]
 async fn a_sync_under_one_view_removes_the_directories_cloning_does_not_create() {
     let base = Removal {
-        view: &["*.bat"],
+        view: &["/*/", "!/*/**/*.txt"],
         target_files: &["a/b/y.bat", "top.txt"],
         target_empty: &[],
         deleted: &["a/b/x.txt"],
         kept_beside: &[],
         written: &[],
         moved: &[],
-        staged_deleted: &[],
-        current: None,
         on_disk: &["a/b"],
         local_files: &[],
-        emptied: Emptied::Unplaced,
+        emptied: EmptiedDirectories::Unplaced,
         left: &[],
     };
     let cases: [(Removal, &[&str]); 13] = [
@@ -3632,7 +3631,7 @@ async fn a_sync_under_one_view_removes_the_directories_cloning_does_not_create()
         ),
         (
             Removal {
-                view: &["*.bat", "!/a/sub/"],
+                view: &["/*/", "!/*/**/*.txt", "!/a/sub/"],
                 target_files: &["a/sub/y.bat"],
                 deleted: &["a/x.txt"],
                 written: &["a/sub/"],
@@ -3647,8 +3646,6 @@ async fn a_sync_under_one_view_removes_the_directories_cloning_does_not_create()
                 target_files: &["a/b/y.bat", "a/b/z.txt", "c/x.txt"],
                 deleted: &[],
                 moved: &[("a/b/x.txt", "c/x.txt")],
-                staged_deleted: &[],
-                current: None,
                 kept_beside: &["a/b/x.txt"],
                 on_disk: &["a/b", "c"],
                 local_files: &["a/b/z.txt"],
@@ -3672,7 +3669,6 @@ async fn a_sync_under_one_view_removes_the_directories_cloning_does_not_create()
             Removal {
                 target_files: &["a/b/c/y.bat", "a/k.bat"],
                 deleted: &["a/b/c/x.txt"],
-                kept_beside: &[],
                 on_disk: &["a/b/c"],
                 ..base
             },
@@ -3688,7 +3684,7 @@ async fn a_sync_under_one_view_removes_the_directories_cloning_does_not_create()
         ),
         (
             Removal {
-                view: &["*.bat", "!/a/b/"],
+                view: &["/*/", "!/*/**/*.txt", "!/a/b/"],
                 left: &["a", "a/b"],
                 ..base
             },
@@ -3696,7 +3692,7 @@ async fn a_sync_under_one_view_removes_the_directories_cloning_does_not_create()
         ),
         (
             Removal {
-                view: &["/z/*.bat"],
+                view: &["/z/", "!/z/*.txt"],
                 left: &["a", "a/b"],
                 ..base
             },
@@ -3705,9 +3701,6 @@ async fn a_sync_under_one_view_removes_the_directories_cloning_does_not_create()
         (
             Removal {
                 written: &["a/b/z.txt"],
-                moved: &[],
-                staged_deleted: &[],
-                current: None,
                 left: &["a", "a/b"],
                 ..base
             },
@@ -3717,7 +3710,6 @@ async fn a_sync_under_one_view_removes_the_directories_cloning_does_not_create()
             Removal {
                 target_files: &["a/b/c/y.bat", "a/b/d/y.bat"],
                 deleted: &["a/b/c/x.txt", "a/b/d/x.txt"],
-                kept_beside: &[],
                 on_disk: &["a/b/c", "a/b/d"],
                 local_files: &["a/b/c/local.dat"],
                 left: &["a", "a/b", "a/b/c"],
@@ -3735,7 +3727,7 @@ async fn a_sync_under_one_view_removes_the_directories_cloning_does_not_create()
         ),
     ];
     for (index, (case, attempted)) in cases.iter().enumerate() {
-        let (left, tried, _) = Box::pin(with_execution(directories_left(case))).await;
+        let (left, tried) = Box::pin(with_execution(directories_left(case))).await;
         assert!(
             left == case.left && tried == *attempted,
             "case {index}: left {left:?}, tried {tried:?}"
@@ -3744,13 +3736,15 @@ async fn a_sync_under_one_view_removes_the_directories_cloning_does_not_create()
 }
 
 /// Under one view, the directories above a delete in a linked tree stay, as the link's mount
-/// does, also where the link leads back into the instance's own repository.
+/// does, also where the link leads back into the instance's own repository and the view excludes
+/// them.
 #[tokio::test]
 async fn a_sync_under_one_view_keeps_the_directories_above_a_delete_in_a_linked_tree() {
     Box::pin(with_execution(async {
         let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
         let mut filter = Filter::default();
-        filter.view.add_exclusion("*.bat").unwrap();
+        filter.view.add_exclusion("**").unwrap();
+        filter.view.add_inclusion("*.txt").unwrap();
         let provider = Arc::new(TestFilesystemProvider::reading(dir.path()));
         let repository =
             working_tree_repository_over(dir.path(), filter, Some(provider.clone())).await;
@@ -3788,132 +3782,6 @@ async fn a_sync_under_one_view_keeps_the_directories_above_a_delete_in_a_linked_
     .await;
 }
 
-/// After a merge, a directory a delete or an add the view hides leaves holding nothing the view
-/// places is removed, one the merged tree holds empty is created, and one the merged tree holds a
-/// kept file in stays with no `rmdir`, and one the merged tree holds staged for deletion is passed
-/// over as one it holds nothing at, which the merge's delete removes, not created as one it holds
-/// empty. A modification the view hides
-/// makes no directory tried, nor does an add into a directory the view excludes with nothing
-/// re-included below it, nor one into a directory the current revision doesn't hold, which was
-/// never on disk; a directory the merged tree empties isn't created where the current revision
-/// holds it empty or with a child the view places, which puts it on disk.
-#[tokio::test]
-async fn a_merge_under_one_view_leaves_the_directories_cloning_creates() {
-    let base = Removal {
-        view: &["*.bat"],
-        target_files: &["a/b/y.bat", "top.txt"],
-        target_empty: &[],
-        deleted: &["a/b/x.txt"],
-        kept_beside: &[],
-        written: &[],
-        moved: &[],
-        staged_deleted: &[],
-        current: None,
-        on_disk: &["a/b"],
-        local_files: &[],
-        emptied: Emptied::Merged,
-        left: &[],
-    };
-    let cases: [(Removal, &[&str], usize); 9] = [
-        (
-            Removal {
-                target_files: &["n/z.bat", "top.txt"],
-                deleted: &[],
-                written: &["n/z.bat"],
-                on_disk: &[],
-                ..base
-            },
-            &[],
-            0,
-        ),
-        (
-            Removal {
-                target_files: &["a/b/x.txt", "a/b/y.bat", "top.txt"],
-                staged_deleted: &["a/b", "a/b/x.txt", "a/b/y.bat"],
-                deleted: &["a/b/x.txt", "a/b/y.bat"],
-                on_disk: &["a"],
-                left: &["a"],
-                ..base
-            },
-            &[],
-            1,
-        ),
-        (
-            Removal {
-                view: &["/e/"],
-                target_files: &["e/d/x.txt"],
-                deleted: &[],
-                written: &["e/d/x.txt"],
-                on_disk: &[],
-                ..base
-            },
-            &[],
-            0,
-        ),
-        (
-            Removal {
-                deleted: &[],
-                written: &["~a/b/y.bat"],
-                left: &["a", "a/b"],
-                ..base
-            },
-            &[],
-            0,
-        ),
-        (Removal { ..base }, &["a/b", "a"], 0),
-        (
-            Removal {
-                target_files: &["top.txt"],
-                target_empty: &["a/b"],
-                deleted: &["a/b/x.txt", "a/b/y.bat"],
-                left: &["a", "a/b"],
-                ..base
-            },
-            &[],
-            0,
-        ),
-        (
-            Removal {
-                target_files: &["top.txt"],
-                target_empty: &["a/b"],
-                deleted: &["a/b/y.bat"],
-                on_disk: &[],
-                left: &["a", "a/b"],
-                ..base
-            },
-            &[],
-            1,
-        ),
-        (
-            Removal {
-                deleted: &[],
-                written: &["a/b/y.bat"],
-                current: Some((&["top.txt"], &["a/b"])),
-                ..base
-            },
-            &["a/b", "a"],
-            0,
-        ),
-        (
-            Removal {
-                target_files: &["a/b/y.bat", "a/b/z.txt"],
-                local_files: &["a/b/z.txt"],
-                left: &["a", "a/b"],
-                ..base
-            },
-            &[],
-            0,
-        ),
-    ];
-    for (index, (case, attempted, creates)) in cases.iter().enumerate() {
-        let (left, tried, created) = Box::pin(with_execution(directories_left(case))).await;
-        assert!(
-            left == case.left && tried == *attempted && created == *creates,
-            "case {index}: left {left:?}, tried {tried:?}, created {created}"
-        );
-    }
-}
-
 /// A move out of a directory the new view excludes leaves it empty, and the realize removes it
 /// once the move is done, with the directories above it.
 #[tokio::test]
@@ -3926,14 +3794,12 @@ async fn a_view_change_removes_an_excluded_directory_a_move_empties() {
         kept_beside: &[],
         written: &[],
         moved: &[("old/sub/f.txt", "new/f.txt")],
-        staged_deleted: &[],
-        current: None,
         on_disk: &["old/sub", "new"],
         local_files: &["new/f.txt"],
-        emptied: Emptied::Target,
+        emptied: EmptiedDirectories::Target,
         left: &["new"],
     };
-    let (left, tried, _) = Box::pin(with_execution(directories_left(&case))).await;
+    let (left, tried) = Box::pin(with_execution(directories_left(&case))).await;
     assert_eq!(
         (left, tried),
         (
@@ -3943,78 +3809,50 @@ async fn a_view_change_removes_an_excluded_directory_a_move_empties() {
     );
 }
 
-/// Below a link's mount, a change of view and a merge find each directory in the linked tree and
-/// remove the ones the view leaves off the disk, but not the mount, which stands for the link.
+/// Below a link's mount, a change of view removes the directories in the linked tree that the new
+/// view excludes, but not the mount, which stands for the link.
 #[tokio::test]
 async fn a_view_change_removes_directories_below_a_link_mount_but_not_the_mount() {
-    for merges in [false, true] {
-        Box::pin(with_execution(async {
-            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
-            let mut filter = Filter::default();
-            filter.view.add_exclusion("*.txt").unwrap();
-            filter.view.add_exclusion("*.bat").unwrap();
-            let repository = working_tree_repository_filtered(dir.path(), filter).await;
-            let (state, _) =
-                linked_plugin_tree(&repository, SOURCE, &[("b/x.txt", b"x"), ("s.bat", b"s")])
-                    .await;
-            std::fs::create_dir_all(dir.path().join(SOURCE).join("b")).unwrap();
-            let target = NodeMapping::root(repository.clone(), state.clone());
-            let changes = [file_delete_at(
-                &repository,
-                &state,
-                &format!("{SOURCE}/b/x.txt"),
-            )];
-            let emptied = if merges {
-                EmptiedDirectories::Merged {
-                    merged: target.clone(),
-                    current: target,
-                }
-            } else {
-                EmptiedDirectories::Target(target)
-            };
-            let operation = repository.file_system().begin_operation().await.unwrap();
-
-            remove_emptied_directories(
-                &operation,
-                &repository,
-                &changes,
-                &RelativePath::new(),
-                &emptied,
-                &Arc::default(),
-            )
-            .await;
-
-            assert_eq!(
-                directories_below(dir.path()),
-                [PLUGIN, SOURCE],
-                "merges: {merges}"
-            );
-        }))
-        .await;
-    }
-}
-
-/// Below a layer's mount, a change of view looks each directory up below the layer's source
-/// path, the mount standing for the layer.
-#[tokio::test]
-async fn a_view_change_removes_directories_below_a_layer_mount_from_its_source_path() {
     Box::pin(with_execution(async {
         let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
         let mut filter = Filter::default();
-        filter.view.add_exclusion("*.txt").unwrap();
+        filter.view.add_exclusion("b/").unwrap();
+        let repository = working_tree_repository_filtered(dir.path(), filter).await;
+        let (state, _) =
+            linked_plugin_tree(&repository, SOURCE, &[("b/x.txt", b"x"), ("s.bat", b"s")]).await;
+        std::fs::create_dir_all(dir.path().join(SOURCE).join("b")).unwrap();
+        let changes = [file_delete_at(
+            &repository,
+            &state,
+            &format!("{SOURCE}/b/x.txt"),
+        )];
+        let operation = repository.file_system().begin_operation().await.unwrap();
+
+        remove_emptied_directories(
+            &operation,
+            &repository,
+            &changes,
+            &RelativePath::new(),
+            &EmptiedDirectories::Target,
+            &Arc::default(),
+        )
+        .await;
+
+        assert_eq!(directories_below(dir.path()), [PLUGIN, SOURCE]);
+    }))
+    .await;
+}
+
+/// Below a layer's mount, a change of view removes the directories the new view excludes, but not
+/// the mount, which stands for the layer.
+#[tokio::test]
+async fn a_view_change_removes_directories_below_a_layer_mount_but_not_the_mount() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let mut filter = Filter::default();
+        filter.view.add_exclusion("/layer/b/").unwrap();
         let repository = working_tree_repository_filtered(dir.path(), filter).await;
         let layered = tree_holding(&repository, &["src/b/x.txt", "src/c/y.txt"], &[]).await;
-        let source = layered
-            .find_node_link(repository.clone(), "src")
-            .await
-            .unwrap()
-            .node;
-        let target = NodeMapping {
-            repository: repository.clone(),
-            state: layered.clone(),
-            path: relative("layer"),
-            node: source,
-        };
         std::fs::create_dir_all(dir.path().join("layer/b")).unwrap();
         let changes = [file_delete_at(&repository, &layered, "layer/b/x.txt")];
         let operation = repository.file_system().begin_operation().await.unwrap();
@@ -4024,7 +3862,7 @@ async fn a_view_change_removes_directories_below_a_layer_mount_from_its_source_p
             &repository,
             &changes,
             &relative("layer"),
-            &EmptiedDirectories::Target(target),
+            &EmptiedDirectories::Target,
             &Arc::default(),
         )
         .await;
@@ -4063,57 +3901,6 @@ async fn a_coalesced_move_keeps_the_mark_of_a_kept_file_beside_its_source() {
                 ))
                 .collect::<Vec<_>>(),
             [(FileAction::Move, true)]
-        );
-    }))
-    .await;
-}
-
-/// After a merge, the directories looked up in the merged tree under one parent read the parent's
-/// children once: the steps the lookups take grow with the children, not with their square.
-#[tokio::test]
-async fn a_merge_reads_a_parent_once_for_the_directories_it_looks_up_below_it() {
-    const SIBLINGS: usize = 400;
-    Box::pin(with_execution(async {
-        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
-        let mut filter = Filter::default();
-        filter.view.add_exclusion("*.bat").unwrap();
-        let repository = working_tree_repository_filtered(dir.path(), filter).await;
-        let files: Vec<String> = (0..SIBLINGS).map(|i| format!("p/d{i:03}/y.bat")).collect();
-        let files: Vec<&str> = files.iter().map(String::as_str).collect();
-        let target = NodeMapping::root(
-            repository.clone(),
-            tree_holding(&repository, &files, &[]).await,
-        );
-        let deleted: Vec<String> = (0..SIBLINGS).map(|i| format!("p/d{i:03}/x.txt")).collect();
-        let mut changes: Vec<NodeChange> = deleted
-            .iter()
-            .map(|path| file_delete_at(&repository, &target.state, path))
-            .collect();
-        change::sort_by_path(&mut changes);
-        let operation = repository.file_system().begin_operation().await.unwrap();
-        state::step_counting::set_chain_step_counting(true);
-        let before =
-            state::step_counting::thread_chain_steps() + state::step_counting::thread_walk_steps();
-
-        remove_emptied_directories(
-            &operation,
-            &repository,
-            &changes,
-            &RelativePath::new(),
-            &EmptiedDirectories::Merged {
-                merged: target.clone(),
-                current: target,
-            },
-            &Arc::default(),
-        )
-        .await;
-
-        let steps = state::step_counting::thread_chain_steps()
-            + state::step_counting::thread_walk_steps()
-            - before;
-        assert!(
-            steps < 20 * SIBLINGS as u64,
-            "{steps} steps for {SIBLINGS} directories below one parent"
         );
     }))
     .await;

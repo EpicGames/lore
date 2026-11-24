@@ -98,7 +98,7 @@ bitflags! {
         // `ChangeStream::spawn_subtrees`, and on the directories that expansion deletes.
         const Subtree = 0b100000000000;
         // A delete, or a move's source, beside which its directory holds, in the target
-        // revision, a file the view keeps. Set by a walk placing directories, see
+        // revision, something the view places. Set by a walk placing directories, see
         // `DiffFlags::PlacesDirectories`.
         const KeptBeside = 0b1000000000000;
     }

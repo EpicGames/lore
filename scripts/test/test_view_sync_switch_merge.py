@@ -4,8 +4,8 @@
 unchanged view.
 
 An operation that moves the working tree to another revision under the same view
-leaves the directories an instance cloned at that revision with that view holds: one a
-view line names, one the repository holds empty, and one holding what the
+leaves the directories an instance cloned at that revision with that view holds:
+every directory the view keeps, and one it excludes only where it holds what the
 operation keeps. It keeps every directory holding anything, an untracked or an
 ignored file included.
 """
@@ -18,9 +18,9 @@ from test_utils import status_revisions, view_file, working_tree_files
 
 from lore import Lore
 
-# A view of an extension rule: every directory is included by its parent's
-# verdict, and none is named.
-VIEW = ["*.bat"]
+# A view that leaves out `.bat` files and excludes `a` while re-including the `.txt`
+# files below it, so a directory in `a` stands on disk only for a `.txt` file in it.
+VIEW = ["*.bat", "/a/", "!/a/**/*.txt"]
 # The file each case commits beside its own, so no tree is empty.
 TOP_LEVEL = "top.txt"
 # The file a merge's other side commits, so the merge is not a fast-forward.
@@ -55,7 +55,7 @@ CASES = [
         ["a/b/c/x.txt"],
         [],
     ),
-    # R deletes the kept file and the `.bat` of `a/b`, so an instance cloned at R holds it empty.
+    # R deletes the kept file and the `.bat` of `a/b`, so an instance cloned at R holds no `a`.
     Case(
         "kept_and_excluded_content_deleted",
         ["a/b/x.txt", "a/b/y.bat"],
@@ -63,10 +63,12 @@ CASES = [
         ["a/b/x.txt", "a/b/y.bat"],
         [],
     ),
-    # R empties `a/b`, which held only a `.bat`, so an instance cloned at R holds it.
+    # R empties `a/b`, which held only a `.bat`, so no instance holds `a` before or after.
     Case("excluded_content_deleted", ["a/b/y.bat"], [], ["a/b/y.bat"], []),
-    # R adds a `.bat` to the empty `a/b`, so an instance cloned at R doesn't hold it.
+    # R adds a `.bat` to the empty `a/b`, so no instance holds `a` before or after.
     Case("excluded_content_added", [], ["a/b"], [], ["a/b/y.bat"]),
+    # R deletes the one file of `k`, which the view keeps, so `k` stays.
+    Case("kept_directory_emptied", ["k/x.txt"], [], ["k/x.txt"], []),
 ]
 
 
@@ -268,8 +270,8 @@ def test_a_reset_sync_under_a_view_leaves_what_cloning_creates(
     new_lore_repo, scratch_dir, case
 ):
     """A sync that resets the working tree from R-1 to R under one view removes a
-    directory R leaves holding only what the view excludes, and creates one R
-    holds empty, as an instance cloned at R does."""
+    directory the view excludes that R leaves holding nothing it keeps, as an
+    instance cloned at R holds none."""
     repo: Lore = new_lore_repo()
     before = commit_case(repo, case)
     view = view_file(scratch_dir, "view", VIEW)
