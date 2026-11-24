@@ -54,12 +54,14 @@ use crate::global::external_dir::resolve::Lookup;
 use crate::global::external_dir::resolve::RootState;
 use crate::global::external_dir::resolve::resolve;
 use crate::hash;
+use crate::immutable::ImmutableError;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lore::BranchId;
 use crate::lore_debug;
 use crate::lore_warn;
 use crate::metadata::Metadata;
+use crate::metadata::MetadataError;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryContextCreationArgs;
 use crate::repository::VfsType;
@@ -383,6 +385,71 @@ async fn remove_instance_keys(
     true
 }
 
+/// Zero each of the `lost` registrations ([`Registrations::lost`]) that still holds the value it
+/// was listed with, so one written again since the listing stays, then, outside a dry run,
+/// register the instance of `repository` again where it has a non-zero id and a path and its key
+/// holds no registration or fails to load. The anchors of a removed registration stay behind, since
+/// only its blob names the instance id they derive from. Answers how many it removed and how many
+/// removals the store failed, or `None` where the repository can't write, and warns of each failed
+/// removal and of a failed registration.
+///
+/// The registration is stored without [`register_instance`], which lists the registrations again:
+/// the staleness pass of [`reconcile_instances`] that follows retires any other registration at
+/// the path.
+///
+/// A cold path, which a caller boxes rather than holding a registration write in its own future.
+async fn remove_lost_registrations(
+    repository: &Arc<RepositoryContext>,
+    lost: &[(Hash, Hash)],
+) -> Option<(usize, usize)> {
+    let handle = repository.try_write_mutable_store()?;
+    let mut removed = 0usize;
+    let mut failed = 0usize;
+    for &(key, value) in lost {
+        match handle
+            .compare_and_swap(
+                repository.id,
+                key,
+                value,
+                Hash::default(),
+                KeyType::Instance,
+            )
+            .await
+        {
+            Ok(held) if held == value => removed += 1,
+            Ok(_) => {}
+            Err(err) => {
+                failed += 1;
+                lore_warn!(
+                    "Failed to remove an instance registration whose data is missing from the \
+                     local store or malformed: {err}"
+                );
+            }
+        }
+    }
+    let (key, key_type) = instance_key(repository.salt(), repository.instance_id);
+    if !crate::repository::discards_mutable_writes()
+        && !repository.instance_id.is_zero()
+        && let Some(path) = repository.path()
+        && handle
+            .load(repository.id, key, key_type)
+            .await
+            .map_or(true, |hash| hash.is_zero())
+        && let Err(err) = store_normalized_registration(
+            repository,
+            repository.instance_id,
+            &crate::util::path::clean(path.display().to_string()),
+        )
+        .await
+    {
+        lore_warn!(
+            "Failed to register instance {} again: {err}",
+            repository.instance_id
+        );
+    }
+    Some((removed, failed))
+}
+
 /// A registration that no longer describes a live checkout.
 struct StaleInstance {
     metadata: InstanceMetadata,
@@ -392,13 +459,30 @@ struct StaleInstance {
     retired_anchors: Option<(BranchId, String, Hash)>,
 }
 
+impl StaleInstance {
+    /// A removed lost registration ([`Registrations::lost`]). It names no instance, so its id,
+    /// path and anchor state are zero or empty.
+    fn lost() -> Self {
+        Self {
+            metadata: InstanceMetadata {
+                instance_id: InstanceId::default(),
+                path: String::new(),
+                created: 0,
+            },
+            staleness: InstanceStaleness::Lost,
+            retired_anchors: Some((BranchId::default(), String::new(), Hash::default())),
+        }
+    }
+}
+
 /// Which stale registrations a reader retires as it reads.
 enum RetirePolicy {
     /// Only one the path's own `.lore/instance` contradicts. A path that holds
     /// no checkout may be a filesystem that is not mounted at the moment, so
     /// clearing it is left to an explicit prune.
     Contradicted,
-    /// Every registration that describes no live checkout.
+    /// Every registration that describes no live checkout, and every lost one
+    /// ([`Registrations::lost`]).
     Stale,
 }
 
@@ -419,18 +503,42 @@ enum StaleReport {
 /// classified: a checkout cannot conclude that it is itself gone, and an ID that
 /// could not be read names no keys to remove. A read-only reader retires
 /// nothing and reports what it found.
+///
+/// The registrations whose blob can't be read are left out, with a warning. Under
+/// [`RetirePolicy::Stale`] a writer first removes the lost ones among them
+/// ([`remove_lost_registrations`]), which also registers the current instance
+/// again where it has no registration, and, as `report` asks, reports each one
+/// it removed as a [`StaleInstance::lost`]; it warns of the others, and of the
+/// lost ones it doesn't remove because it can't write or the store fails the
+/// removal.
 async fn reconcile_instances(
     repository: &Arc<RepositoryContext>,
     policy: RetirePolicy,
     report: StaleReport,
 ) -> Result<(Vec<InstanceMetadata>, Vec<StaleInstance>), InstanceError> {
-    let instances = list_instances(repository)
-        .await
-        .forward::<InstanceError>("listing registered instances")?;
     let state = resolve().forward::<InstanceError>("resolving the external root")?;
-    let mut live = Vec::with_capacity(instances.len());
     let mut stale = Vec::new();
-    let mut retired_any = false;
+    let (instances, mut retired_any) = {
+        let Registrations {
+            instances,
+            lost,
+            failed,
+        } = registrations(repository)
+            .await
+            .forward::<InstanceError>("listing registered instances")?;
+        let removal = if matches!(policy, RetirePolicy::Stale) && !lost.is_empty() {
+            Box::pin(remove_lost_registrations(repository, &lost)).await
+        } else {
+            None
+        };
+        let (removed, left_out) = removal.unwrap_or((0, lost.len()));
+        warn_left_out(left_out, failed);
+        if report == StaleReport::Return {
+            stale.extend(std::iter::repeat_with(StaleInstance::lost).take(removed));
+        }
+        (instances, removal.is_some())
+    };
+    let mut live = Vec::with_capacity(instances.len());
     for instance in instances {
         if instance.instance_id == repository.instance_id || instance.instance_id.is_zero() {
             live.push(instance);
@@ -473,17 +581,6 @@ async fn reconcile_instances(
     Ok((live, stale))
 }
 
-/// Load instance metadata from the immutable store given the metadata hash.
-pub async fn load_instance_metadata(
-    repository: &Arc<RepositoryContext>,
-    metadata_hash: Hash,
-) -> Result<InstanceMetadata, InstanceRegistryError> {
-    let metadata = Metadata::deserialize(repository.clone(), metadata_hash)
-        .await
-        .forward::<InstanceRegistryError>("failed to deserialize instance metadata")?;
-    Ok(instance_metadata_of(&metadata))
-}
-
 /// The registration that the blob `metadata` holds. A missing or corrupt field reads as its
 /// default, and [`instance_staleness`] reads an empty path as active.
 fn instance_metadata_of(metadata: &Metadata) -> InstanceMetadata {
@@ -520,14 +617,6 @@ pub async fn recover_instance_id(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     current_path: &str,
 ) -> Option<InstanceId> {
-    use futures::StreamExt;
-
-    let mut stream = mutable_store
-        .clone()
-        .list(repository_id, KeyType::Instance)
-        .await
-        .ok()?;
-
     // Build a temporary repository context for metadata deserialization
     let temp_repo = Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
         paths: None,
@@ -540,40 +629,52 @@ pub async fn recover_instance_id(
         filesystem_provider: None,
     }));
 
+    let registered = registrations(&temp_repo).await.ok()?;
     let normalized_current = crate::util::path::clean(current_path.to_owned());
-
-    let mut newest: Option<InstanceMetadata> = None;
     let mut scratch = String::new();
-    while let Some((_key, metadata_hash)) = stream.next().await {
-        if metadata_hash.is_zero() {
-            continue;
-        }
-        if let Ok(metadata) = load_instance_metadata(&temp_repo, metadata_hash).await
-            && !metadata.instance_id.is_zero()
-            && names_same_path(&metadata.path, &normalized_current, &mut scratch)
-            && newest.as_ref().is_none_or(|best| {
-                (metadata.created, metadata.instance_id) > (best.created, best.instance_id)
-            })
-        {
-            newest = Some(metadata);
-        }
-    }
-
-    newest.map(|metadata| {
-        lore_debug!(
-            "Recovered instance ID {} from path match",
-            metadata.instance_id
-        );
-        metadata.instance_id
-    })
+    let newest = registered
+        .instances
+        .into_iter()
+        .filter(|metadata| {
+            !metadata.instance_id.is_zero()
+                && names_same_path(&metadata.path, &normalized_current, &mut scratch)
+        })
+        .max_by_key(|metadata| (metadata.created, metadata.instance_id))?;
+    lore_debug!(
+        "Recovered instance ID {} from path match",
+        newest.instance_id
+    );
+    Some(newest.instance_id)
 }
 
-/// List all registered instances for a repository by querying the mutable store.
-///
-/// Returns a list of `InstanceMetadata` for each registered instance.
-pub async fn list_instances(
+/// The registrations in the mutable store of a repository, as [`registrations`] reads them.
+#[lore_macro::test_pub]
+#[derive(Debug)]
+pub(crate) struct Registrations {
+    /// The instance each registration with a readable blob names.
+    pub(crate) instances: Vec<InstanceMetadata>,
+    /// The key and value of each lost registration: one whose blob the local store doesn't hold,
+    /// or holds as bytes that aren't metadata or exceed
+    /// [`METADATA_MAX_SIZE`](crate::metadata::METADATA_MAX_SIZE). Each key is as the
+    /// listing of the repository's partition returns it. A local store lists a key with its key
+    /// type already applied, and applies it again on a store or swap without changing the key, so
+    /// the key names the same entry in that partition.
+    pub(crate) lost: Vec<(Hash, Hash)>,
+    /// How many registrations have a blob the local store failed to read for another reason, such
+    /// as an I/O error, a payload that doesn't decompress, or metadata of a version this build
+    /// doesn't read. Such a registration may name a live instance.
+    pub(crate) failed: usize,
+}
+
+/// The registrations in the mutable store of `repository`, each blob read from its local store
+/// alone. A registration whose blob can't be read is left out of the instances, as a lost one
+/// ([`Registrations::lost`]) or as a failed one, so one bad registration keeps none of the others
+/// from the list. Logs no warning: a caller warns with [`warn_left_out`]. Fails only where the
+/// mutable store can't be listed.
+#[lore_macro::test_pub]
+pub(crate) async fn registrations(
     repository: &Arc<RepositoryContext>,
-) -> Result<Vec<InstanceMetadata>, InstanceRegistryError> {
+) -> Result<Registrations, InstanceRegistryError> {
     use futures::StreamExt;
 
     let mut stream = repository
@@ -582,13 +683,59 @@ pub async fn list_instances(
         .await
         .forward::<InstanceRegistryError>("failed to list instances")?;
 
-    let mut instances = Vec::new();
-    while let Some((_key, metadata_hash)) = stream.next().await {
+    let mut registrations = Registrations {
+        instances: Vec::new(),
+        lost: Vec::new(),
+        failed: 0,
+    };
+    loop {
+        let Some((key, metadata_hash)) = stream.next().await else {
+            return Ok(registrations);
+        };
         if metadata_hash.is_zero() {
             continue;
         }
-        instances.push(load_instance_metadata(repository, metadata_hash).await?);
+        let read = read_registration_blob(repository, metadata_hash).await;
+        match registration_read(read, metadata_hash) {
+            RegistrationRead::Read(registration) => registrations
+                .instances
+                .push(instance_metadata_of(&registration)),
+            RegistrationRead::Lost => registrations.lost.push((key, metadata_hash)),
+            RegistrationRead::Failed => registrations.failed += 1,
+        }
     }
+}
+
+/// Warn, once for each kind with its count, of the registrations a listing left out: `lost`
+/// ([`Registrations::lost`]), which `lore repository instance prune` removes, and `failed`.
+pub(crate) fn warn_left_out(lost: usize, failed: usize) {
+    if lost > 0 {
+        lore_warn!(
+            "Leaving out {lost} instance registration(s) whose data is missing from the local \
+             store or malformed; `lore repository instance prune` removes them"
+        );
+    }
+    if failed > 0 {
+        lore_warn!(
+            "Leaving out {failed} instance registration(s) whose data the local store failed to \
+             read"
+        );
+    }
+}
+
+/// The instances registered in the mutable store of `repository`, each registration read from its
+/// local store alone. A registration whose data can't be read is left out, with one warning for
+/// each kind of failure, so one bad registration keeps none of the others from the list. Fails only
+/// where the mutable store can't be listed.
+pub async fn list_instances(
+    repository: &Arc<RepositoryContext>,
+) -> Result<Vec<InstanceMetadata>, InstanceRegistryError> {
+    let Registrations {
+        instances,
+        lost,
+        failed,
+    } = registrations(repository).await?;
+    warn_left_out(lost.len(), failed);
     Ok(instances)
 }
 
@@ -663,9 +810,10 @@ pub struct InstanceRecord {
 ///
 /// Lists the registrations once and reads each one's blob, from the local store alone, and its
 /// current branch, then, for each instance with a current branch, its current revision and its
-/// staleness ([`instance_staleness`]). Retires nothing. A failed store read fails the lookup rather
-/// than leaving the instance out. A registration blob the store doesn't hold is skipped, and so is
-/// one that names no usable instance id.
+/// staleness ([`instance_staleness`]). Retires nothing. A registration whose blob can't be read is
+/// left out with the warnings [`list_instances`] gives, and one that names no usable instance id
+/// is left out without one. A failed read of an instance's current branch or revision fails the
+/// lookup.
 pub async fn records_by_branch(
     repository: &Arc<RepositoryContext>,
 ) -> Result<HashMap<BranchId, Vec<InstanceRecord>>, InstanceError> {
@@ -694,7 +842,9 @@ pub async fn records_on_branch(
 /// `visit`, or only of those on `only`, reading as [`records_by_branch`] describes.
 ///
 /// Every registration's blob is read, since only the blob holds the instance id the anchor keys
-/// derive from. The instance of `repository` is visited as any other.
+/// derive from. A blob that names no usable instance id ([`registered_id`]) is skipped: the anchors
+/// under the zero id are any that a context with a zero instance id wrote. The instance of
+/// `repository` is visited as any other.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
@@ -712,15 +862,31 @@ fn visit_records<'a>(
             .await
             .forward::<InstanceError>("listing registered instances")?;
         let state = resolve().forward::<InstanceError>("resolving the external root")?;
+        let (mut lost, mut failed) = (0, 0);
         loop {
             let Some((_, metadata_hash)) = registrations.next().await else {
+                warn_left_out(lost, failed);
                 return Ok(());
             };
-            let Some((registration, instance_id)) =
-                read_registration(repository, metadata_hash).await?
-            else {
+            if metadata_hash.is_zero() {
                 continue;
+            }
+            let read = read_registration_blob(repository, metadata_hash).await;
+            let registration = match registration_read(read, metadata_hash) {
+                RegistrationRead::Read(registration) => registration,
+                RegistrationRead::Lost => {
+                    lost += 1;
+                    continue;
+                }
+                RegistrationRead::Failed => {
+                    failed += 1;
+                    continue;
+                }
             };
+            let instance_id = registered_id(&registration);
+            if instance_id.is_zero() {
+                continue;
+            }
             if let Some((branch, record)) =
                 instance_record(repository, &state, only, registration, instance_id).await?
             {
@@ -772,43 +938,59 @@ fn instance_record<'a>(
     }
 }
 
-/// The registration blob that `metadata_hash` names and the instance id it holds, read from the
-/// local store alone with strict local reads, or `None` where `metadata_hash` is zero, as the key
-/// of a retired registration holds, the store doesn't hold the blob, or the blob names no usable
-/// instance id ([`registered_id`]). The anchors under the zero id are any that a context with a
-/// zero instance id wrote, not that registration's.
+/// What a read of a registration blob ([`read_registration_blob`]) found, as
+/// [`registration_read`] classifies it.
+enum RegistrationRead {
+    /// The blob, read as metadata.
+    Read(Metadata),
+    /// A lost registration ([`Registrations::lost`]).
+    Lost,
+    /// A registration whose blob the local store failed to read for another reason
+    /// ([`Registrations::failed`]).
+    Failed,
+}
+
+/// Read the registration blob that `metadata_hash` names as [`Metadata::read_with`] reads it,
+/// from the local store alone, since a registration is written there alone, and strictly, so a
+/// failed read or a payload that doesn't decompress is never taken for a blob the store doesn't
+/// hold ([`registration_read`]).
 ///
-/// Not an `async fn`, which would hold a second copy of its arguments.
-#[allow(clippy::manual_async_fn)]
-fn read_registration(
+/// Returns the read's future, without a future of its own. A caller classifies what it answers
+/// with [`registration_read`] once it is read, so the future holds no second copy of the hash.
+#[inline]
+fn read_registration_blob(
     repository: &Arc<RepositoryContext>,
     metadata_hash: Hash,
-) -> impl Future<Output = Result<Option<(Metadata, InstanceId)>, InstanceError>> + '_ {
-    async move {
-        if metadata_hash.is_zero() {
-            return Ok(None);
+) -> impl Future<Output = Result<Result<Metadata, MetadataError>, ImmutableError>> {
+    let options = ReadOptions::default().no_remote().with_strict_local();
+    Metadata::read_with(repository.clone(), metadata_hash, options)
+}
+
+/// What the read `read` of the registration blob `metadata_hash` found: lost where the store
+/// doesn't hold the blob, holds more than metadata can be, or holds bytes that aren't metadata,
+/// and failed where the read failed otherwise or the metadata is of a version this build doesn't
+/// read.
+fn registration_read(
+    read: Result<Result<Metadata, MetadataError>, ImmutableError>,
+    metadata_hash: Hash,
+) -> RegistrationRead {
+    match read {
+        Ok(Ok(registration)) => RegistrationRead::Read(registration),
+        Ok(Err(err)) if err.is_not_supported() => {
+            lore_debug!("Failed to read instance registration {metadata_hash}: {err}");
+            RegistrationRead::Failed
         }
-        let options = ReadOptions::default().no_remote().with_strict_local();
-        match Metadata::deserialize_with(repository.clone(), metadata_hash, options).await {
-            Err(err) if err.is_address_not_found() => {
-                lore_debug!(
-                    "Skipping instance registration {metadata_hash}, whose blob the store doesn't \
-                     hold"
-                );
-                Ok(None)
-            }
-            Ok(registration) => {
-                let instance_id = registered_id(&registration);
-                if instance_id.is_zero() {
-                    lore_debug!(
-                        "Skipping instance registration {metadata_hash}, whose blob names no \
-                         usable instance id"
-                    );
-                    return Ok(None);
-                }
-                Ok(Some((registration, instance_id)))
-            }
-            Err(err) => Err(err).forward::<InstanceError>("reading an instance registration"),
+        Ok(Err(err)) => {
+            lore_debug!("Instance registration {metadata_hash} holds no registration: {err}");
+            RegistrationRead::Lost
+        }
+        Err(err) if err.is_address_not_found() || err.is_oversized() => {
+            lore_debug!("Instance registration {metadata_hash} holds no registration: {err}");
+            RegistrationRead::Lost
+        }
+        Err(err) => {
+            lore_debug!("Failed to read instance registration {metadata_hash}: {err}");
+            RegistrationRead::Failed
         }
     }
 }
@@ -1142,7 +1324,9 @@ impl EventError for InstanceError {
     }
 }
 
-/// Whether a registered instance still describes a live checkout.
+/// Whether a registered instance still describes a live checkout. [`Lost`](Self::Lost) marks a
+/// removed registration that names no instance: only prune reports it, and
+/// [`instance_staleness`] never answers it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstanceStaleness {
     /// The path exists and nothing there contradicts the registration.
@@ -1156,6 +1340,9 @@ pub enum InstanceStaleness {
     /// The path exists but holds no readable `.lore/instance`, so no checkout
     /// the registration could describe.
     CheckoutMissing,
+    /// The registration's data is missing from the local store or malformed
+    /// ([`Registrations::lost`]), so it names no instance.
+    Lost,
 }
 
 impl InstanceStaleness {
@@ -1170,6 +1357,7 @@ impl InstanceStaleness {
             Self::PathMissing => 1,
             Self::Superseded => 2,
             Self::CheckoutMissing => 3,
+            Self::Lost => 4,
         }
     }
 }
@@ -1351,7 +1539,7 @@ use lore_storage::FlushOptions;
 
 use crate::event::LoreEvent;
 
-/// Event data describing an instance — used for both listing and prune notifications.
+/// Event data describing an instance registration, for listing and prune notifications.
 #[repr(C)]
 #[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1370,7 +1558,8 @@ pub struct LoreRepositoryInstanceEventData {
     /// the path no longer exists on disk, 2 when the path holds a repository
     /// whose `.lore/instance` names a different instance (superseded by a
     /// re-create or re-clone), 3 when the path holds no readable
-    /// `.lore/instance` at all
+    /// `.lore/instance` at all, 4 when the registration's data is missing from
+    /// the local store or malformed, which leaves every other field zero or empty
     pub stale: u8,
 }
 
@@ -1614,9 +1803,9 @@ async fn send_stale_instance_event(repository: &Arc<RepositoryContext>, entry: &
     );
 }
 
-/// List all registered instances, emitting events for each entry. The stale ones
-/// are reported with their `stale` flag; being a read-only command, this leaves
-/// removing them to [`instance_prune`].
+/// List the registered instances whose registration the local store reads, emitting
+/// an event for each. The stale ones are reported with their `stale` flag; being a
+/// read-only command, this leaves removing them to [`instance_prune`].
 pub async fn instance_list(repository: Arc<RepositoryContext>) -> Result<(), InstanceError> {
     let (live, stale) =
         reconcile_instances(&repository, RetirePolicy::Contradicted, StaleReport::Return).await?;
@@ -1641,7 +1830,11 @@ pub async fn instance_list(repository: Arc<RepositoryContext>) -> Result<(), Ins
 /// now holds a repository with a different current instance, and those whose
 /// path holds no checkout at all. An SWFS instance with an external `.lore` is
 /// kept whether or not it is mounted; see [`instance_staleness`].
-/// Emits a `RepositoryInstance` event for each pruned instance.
+/// Also removes each registration whose data is missing from the local store or
+/// malformed, and, where it finds any, then registers the current instance again
+/// where it has no registration. Emits a `RepositoryInstance` event for each
+/// registration it removes, [`InstanceStaleness::Lost`] for one whose data is
+/// missing or malformed, and answers their count.
 pub async fn instance_prune(repository: Arc<RepositoryContext>) -> Result<u32, InstanceError> {
     if repository.try_write_token().is_none() {
         return Err(WriteRequired.into());

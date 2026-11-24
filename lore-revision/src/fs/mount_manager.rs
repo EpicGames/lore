@@ -36,7 +36,9 @@ use crate::global::external_dir::resolve::resolve;
 use crate::instance::InstanceId;
 #[cfg(target_os = "linux")]
 use crate::instance::InstanceMetadata;
-use crate::instance::list_instances;
+use crate::instance::Registrations;
+use crate::instance::registrations;
+use crate::instance::warn_left_out;
 use crate::lore_warn;
 use crate::repository::DOT_LORE;
 #[cfg(target_os = "linux")]
@@ -84,7 +86,7 @@ struct PendingFuseMount;
 type FoundSwfsMounts = Vec<(MountPath, SwfsMount)>;
 
 /// The instances registered in the shared stores a start found, `None` where a store could not be
-/// opened or listed, so some are unknown.
+/// opened or listed, or holds a registration that can't be read, so some are unknown.
 type RegisteredInstances = Option<BTreeSet<InstanceId>>;
 
 pub struct MountManager {
@@ -96,9 +98,10 @@ pub struct MountManager {
 impl MountManager {
     /// Mounts the SWFS instances of every store in `entries` and finds its FUSE instances, which
     /// are mounted once the manager exists, and the instances registered in them, in the external
-    /// root `state` a start resolved once for them all. A store that cannot be opened or listed, and an
-    /// instance whose external directory is unknown or whose config cannot be read, are logged
-    /// and skipped rather than stopping the rest, and no external directory is removed for them.
+    /// root `state` a start resolved once for them all. A store that cannot be opened or listed, a
+    /// registration that can't be read, and an instance whose external directory is unknown or
+    /// whose config cannot be read, are logged and skipped rather than stopping the rest, and no
+    /// external directory is removed for them.
     ///
     /// At the first virtual instance found, `state` is resolved again under shared access, and
     /// whether it was is returned. Where shared access is refused, no virtual instance is mounted,
@@ -144,8 +147,18 @@ impl MountManager {
                     continue;
                 }
             };
-            let instances = match list_instances(&entry_repository).await {
-                Ok(instances) => instances,
+            let instances = match registrations(&entry_repository).await {
+                Ok(Registrations {
+                    instances,
+                    lost,
+                    failed,
+                }) => {
+                    warn_left_out(lost.len(), failed);
+                    if !lost.is_empty() || failed > 0 {
+                        registered = None;
+                    }
+                    instances
+                }
                 Err(error) => {
                     lore_warn!(
                         "Unable to list instances of shared store at {}: {error}",

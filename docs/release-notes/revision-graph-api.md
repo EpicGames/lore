@@ -27,6 +27,9 @@ type: feature
   at each location, the remote first, and keeps the branch reachable by its ID. It refuses a
   protected branch and the default branch, and refuses a branch a live repository instance
   registered in the local store has as its current branch before it changes either location.
+  Branch resolve, list, archive and a local sync with an all-zero target leave out an instance
+  whose registration the local store can't read, which a `LORE_EVENT_LOG` warning counts, and
+  such an instance refuses no archive.
   `lore_revision_graph_branch_sync` moves a branch's local latest to a revision, or to the remote
   latest, where it fast-forwards, or anywhere with `force`, and only while the local latest is the
   one the caller expects where it names one. It records the branch in sync with the remote where

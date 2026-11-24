@@ -593,10 +593,11 @@ Instance management
 
 ###### **Subcommands:**
 
-* `list` — List all registered instances for this repository
-* `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no revision, and paths that now
-  hold a different instance. An SWFS instance is kept while its `.lore` remains in the external root, even when it's not
-  mounted, and so is an instance whose external directory can't be checked, as while the external root is unavailable
+* `list` — List the registered instances of this repository that the local store can read
+* `prune` — Remove stale instance registrations: paths that no longer exist, paths that hold no revision, paths that now
+  hold a different instance, and registrations whose data is missing from the local store or malformed. An SWFS instance
+  is kept while its `.lore` remains in the external root, even when it's not mounted, and so is an instance whose
+  external directory can't be checked, as while the external root is unavailable
 * `delete` — Delete the current instance: unmount (if a virtual instance), deregister from mutable store, and delete
   associated directories
 * `move` — Move the current instance to a new path
@@ -612,15 +613,16 @@ Instance management
 
 ## `lore repository instance list`
 
-List all registered instances for this repository
+List the registered instances of this repository that the local store can read
 
 **Usage:** `lore repository instance list`
 
 ## `lore repository instance prune`
 
-Remove stale instance entries: paths that no longer exist, paths that hold no revision, and paths that now hold a
-different instance. An SWFS instance is kept while its `.lore` remains in the external root, even when it's not mounted,
-and so is an instance whose external directory can't be checked, as while the external root is unavailable
+Remove stale instance registrations: paths that no longer exist, paths that hold no revision, paths that now hold a
+different instance, and registrations whose data is missing from the local store or malformed. An SWFS instance is kept
+while its `.lore` remains in the external root, even when it's not mounted, and so is an instance whose external
+directory can't be checked, as while the external root is unavailable
 
 **Usage:** `lore repository instance prune`
 

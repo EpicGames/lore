@@ -16,7 +16,6 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::SystemTime;
 
-    use lore_base::log::LoreLogLevel;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Context;
@@ -1002,16 +1001,6 @@ mod tests {
         options: ResetOptions,
         case_lookup: CaseLookup,
     ) -> RefusedReset {
-        fn log_to_context(level: LoreLogLevel, _: &str, message: &str) {
-            if let Some(execution) = lore_revision::lore::try_execution_context() {
-                execution
-                    .dispatcher
-                    .send(LoreEvent::Log(EventDispatcher::make_log(
-                        level,
-                        message.to_string(),
-                    )));
-            }
-        }
         let removed = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let directory_reads = Arc::new(AtomicUsize::new(0));
         let refusing = Arc::new(
@@ -1032,37 +1021,14 @@ mod tests {
             )
             .with_write_token(fixture.write_token.share()),
         );
-        let warnings = Arc::new(Mutex::new(Vec::new()));
-        let logged = warnings.clone();
-        let execution = Arc::new(ExecutionContext::new_client(
-            LoreGlobalArgs::default(),
-            EventDispatcher::new(Some(Box::new(move |event: &LoreEvent| {
-                if let LoreEvent::Log(log) = event
-                    && log.level == LoreLogLevel::Warn
-                {
-                    logged
-                        .lock()
-                        .expect("Failed to record a warning")
-                        .push(log.message.to_string());
-                }
-            }))),
-        ));
-        static LOG_TO_CONTEXT: std::sync::Once = std::sync::Once::new();
-        LOG_TO_CONTEXT.call_once(|| lore_base::log::set_log_callback(Some(log_to_context)));
-        let result = LORE_CONTEXT
-            .scope(execution.clone(), async {
-                reset::reset(
-                    refusing,
-                    &fixture.write_token,
-                    LoreArray::from_vec(vec![LoreString::from(&fixture.path)]),
-                    LoreString::default(),
-                    options,
-                )
-                .await
-            })
-            .await;
-        execution.dispatcher.drain().await;
-        let warnings = std::mem::take(&mut *warnings.lock().expect("Failed to read the warnings"));
+        let (result, warnings) = warned(Box::pin(reset::reset(
+            refusing,
+            &fixture.write_token,
+            LoreArray::from_vec(vec![LoreString::from(&fixture.path)]),
+            LoreString::default(),
+            options,
+        )))
+        .await;
         #[cfg(target_os = "linux")]
         let removed = std::mem::take(&mut *removed.lock());
         RefusedReset {

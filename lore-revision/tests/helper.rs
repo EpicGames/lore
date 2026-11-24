@@ -767,6 +767,80 @@ pub fn test_execution_with(
     )
 }
 
+/// Runs `body` in a client execution of its own with `globals`, answering what it answers and each
+/// event it sent. Routes the log of the process to the execution of the logging task, holding
+/// [`LOG_CAPTURE`] until every event has been recorded and the log callback is cleared again.
+#[allow(dead_code)]
+pub async fn recorded<F: std::future::Future>(
+    globals: lore_revision::interface::LoreGlobalArgs,
+    body: F,
+) -> (F::Output, Vec<lore_revision::interface::LoreEvent>) {
+    fn log_to_context(level: lore_base::log::LoreLogLevel, _: &str, message: &str) {
+        if let Some(execution) = lore_revision::lore::try_execution_context() {
+            execution
+                .dispatcher
+                .send(lore_revision::interface::LoreEvent::Log(
+                    lore_revision::relay::EventDispatcher::make_log(level, message.to_string()),
+                ));
+        }
+    }
+    let capture = LOG_CAPTURE.lock().await;
+    lore_base::log::set_log_callback(Some(log_to_context));
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recording = events.clone();
+    let execution = std::sync::Arc::new(
+        lore_revision::interface::ExecutionContext::new_client_with_user_id(
+            globals,
+            lore_revision::relay::EventDispatcher::new(Some(Box::new(
+                move |event: &lore_revision::interface::LoreEvent| {
+                    recording
+                        .lock()
+                        .expect("Failed to record an event")
+                        .push(event.clone());
+                },
+            ))),
+            "test-user".to_string(),
+        ),
+    );
+    let output = lore_base::runtime::LORE_CONTEXT
+        .scope(execution.clone(), body)
+        .await;
+    execution.dispatcher.drain().await;
+    lore_base::log::set_log_callback(None);
+    drop(capture);
+    let events = std::mem::take(&mut *events.lock().expect("Failed to read the events"));
+    (output, events)
+}
+
+/// [`recorded`] with the default global arguments, answering the message of each warning it
+/// logged. Maps the future of [`recorded`] rather than awaiting it, so it adds no state machine
+/// around `body`.
+#[allow(dead_code)]
+pub fn warned<F: std::future::Future>(
+    body: F,
+) -> impl std::future::Future<Output = (F::Output, Vec<String>)> {
+    futures::FutureExt::map(
+        recorded(lore_revision::interface::LoreGlobalArgs::default(), body),
+        |(output, events)| (output, warning_messages(&events)),
+    )
+}
+
+/// The message of each warning among `events`, in the order they were sent.
+#[allow(dead_code)]
+pub fn warning_messages(events: &[lore_revision::interface::LoreEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            lore_revision::interface::LoreEvent::Log(log)
+                if log.level == lore_base::log::LoreLogLevel::Warn =>
+            {
+                Some(log.message.to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// The action letter against the path for each change, as a walk's consumers read it.
 ///
 /// The action is carried because two sides route a path by which of them admits it, and a path

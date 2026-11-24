@@ -27,10 +27,10 @@ use lore_base::types::BranchId;
 use lore_base::types::BranchPoint;
 use lore_base::types::Context;
 use lore_base::types::Partition;
-use lore_error_set::Internal;
 use lore_revision::branch;
 use lore_revision::branch::BranchLatestStatus;
 use lore_revision::event::LoreEvent;
+use lore_revision::instance::instance_key;
 use lore_revision::interface::LoreBranchLocation;
 use lore_revision::interface::LoreString;
 use lore_storage::StoreError;
@@ -473,16 +473,16 @@ async fn a_live_instance_on_a_locally_archived_branch_does_not_refuse() {
     close_handle(handle).await;
 }
 
-/// A failed read of an instance registration fails the archive in the local store: its complete
-/// event carries the read's code, which isn't `DeleteCurrent`, and the name still maps.
+/// An instance whose registration the local store fails to read refuses nothing: the archive
+/// archives the branch in the local store and sends no instance record.
 #[tokio::test]
-async fn a_failed_registration_read_fails_the_local_archive() {
+async fn an_unreadable_instance_registration_does_not_refuse_the_local_archive() {
     let (store, handle) = open_in_memory_handle().await;
     let repository = new_repository();
     let feature = new_branch();
     create_in_store(&store, repository, feature, "feature", "ana", hash(2)).await;
     let dir = TempDir::new("graph-archive-unreadable-");
-    in_setup_context(register_live_instance(
+    let instance = in_setup_context(register_live_instance(
         &store,
         repository,
         feature,
@@ -490,16 +490,12 @@ async fn a_failed_registration_read_fails_the_local_archive() {
         &dir,
     ))
     .await;
-    let metadata = in_setup_context(branch::mutable_value(
-        local_read_context(&store, repository),
-        branch::METADATA,
-        feature,
-    ))
-    .await
-    .expect("loads the metadata key")
-    .expect("the branch has metadata");
+    let (key, key_type) = instance_key(local_read_context(&store, repository).salt(), instance);
+    let registration = in_setup_context(store.mutable.clone().load(repository, key, key_type))
+        .await
+        .expect("loads the registration");
     let failing = HookedImmutableStore::wrap(store.immutable.clone(), move |call, _, address| {
-        if call == ImmutableCall::Get && address.hash != metadata {
+        if call == ImmutableCall::Get && address.hash == registration {
             return Err(StoreError::internal("the test fails this read"));
         }
         Ok(())
@@ -512,12 +508,14 @@ async fn a_failed_registration_read_fails_the_local_archive() {
 
     let (status, events) = archive_branch(failing, repository, feature).await;
 
-    assert_eq!(status, Internal::FFI_CODE);
-    assert_eq!(
-        location_outcomes(&events, CALL_ID),
-        [(LoreBranchLocation::Local, 0, Internal::FFI_CODE)]
+    assert_eq!(status, 0);
+    assert_archived_locally(&events, feature);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, LoreEvent::RevisionGraphInstance(_)))
     );
-    assert_eq!(mapped(&store, repository, "feature").await, Some(feature));
+    assert_eq!(mapped(&store, repository, "feature").await, None);
     close_handle(failing).await;
     close_handle(handle).await;
 }

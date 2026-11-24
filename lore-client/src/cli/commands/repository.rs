@@ -417,12 +417,13 @@ pub struct RepositoryInstanceArgs {
 
 #[derive(Subcommand)]
 pub enum RepositoryInstanceCommands {
-    /// List all registered instances for this repository
+    /// List the registered instances of this repository that the local store can read
     List,
-    /// Remove stale instance entries: paths that no longer exist, paths that hold no revision, and
-    /// paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains
-    /// in the external root, even when it's not mounted, and so is an instance whose external
-    /// directory can't be checked, as while the external root is unavailable.
+    /// Remove stale instance registrations: paths that no longer exist, paths that hold no
+    /// revision, paths that now hold a different instance, and registrations whose data is missing
+    /// from the local store or malformed. An SWFS instance is kept while its `.lore` remains in the
+    /// external root, even when it's not mounted, and so is an instance whose external directory
+    /// can't be checked, as while the external root is unavailable.
     Prune,
     /// Delete the current instance: unmount (if a virtual instance), deregister from mutable store, and delete associated directories
     Delete,
@@ -1868,12 +1869,19 @@ fn handle_repository_instance_prune(globals: LoreGlobalArgs) -> u8 {
             }
             LoreEvent::RepositoryInstance(data) => {
                 pruned_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                println!(
-                    "  Pruned {} {}{}",
-                    data.instance_id,
-                    data.path,
-                    instance_stale_suffix(data.stale)
-                );
+                if data.stale == 4 {
+                    println!(
+                        "  Pruned a registration whose data is missing from the local store or \
+                         malformed"
+                    );
+                } else {
+                    println!(
+                        "  Pruned {} {}{}",
+                        data.instance_id,
+                        data.path,
+                        instance_stale_suffix(data.stale)
+                    );
+                }
             }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);

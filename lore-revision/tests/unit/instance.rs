@@ -51,7 +51,6 @@ use crate::helper::default_repository_creation_args;
 use crate::helper::execution_in;
 use crate::helper::in_memory;
 use crate::helper::test_store_create;
-use crate::paged_remote::counted_client_stores;
 use crate::repository::test_helpers::built_context;
 use crate::repository::test_helpers::counted_endpoint;
 
@@ -775,41 +774,6 @@ async fn records_by_branch_groups_instances_and_lists_once() {
                 .await
                 .expect("look up the shared branch");
             assert_eq!(sorted(on_shared), expected[&shared]);
-        })
-        .await;
-}
-
-/// A registration whose blob the store fails to read fails both lookups, on a context whose own
-/// reads take a failed read for a miss, so a caller never takes a registration it can't read for
-/// one on another branch.
-#[tokio::test]
-async fn records_on_branch_fails_on_an_unreadable_registration() {
-    let global = TempDir::new("lore-records-on-branch-unreadable-global-");
-    LORE_CONTEXT
-        .scope(execution_in(global.path()), async {
-            let (stores, counting) = counted_client_stores().await;
-            let repository = in_memory::repository(
-                stores.writer.immutable_store(),
-                stores
-                    .writer
-                    .try_mutable_store_arc()
-                    .expect("a null context holds a write token"),
-            );
-            let parent = TempDir::new("lore-records-on-branch-unreadable-");
-            let branch = BranchId::from([1; 16]);
-            let path = parent.path().join("unreadable");
-            write_checkout(&path, repository.instance_id);
-            register_on(&repository, &path, branch, Hash::from([2; 32])).await;
-
-            counting.fail_reads();
-            let error = records_on_branch(&repository, branch)
-                .await
-                .expect_err("an unreadable registration fails the lookup");
-            assert!(error.is_disconnected(), "{error}");
-            let error = records_by_branch(&repository)
-                .await
-                .expect_err("an unreadable registration fails the lookup");
-            assert!(error.is_disconnected(), "{error}");
         })
         .await;
 }

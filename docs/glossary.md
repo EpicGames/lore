@@ -384,6 +384,12 @@ Also see: metadata, merge.
 
 See repository instance.
 
+### Instance registration
+
+The entry in the mutable store that points to a repository instance's ID and path, kept in a metadata blob in the local store, so each instance over the store can find the others. `lore repository instance list` lists the registered instances, and `lore repository instance prune` removes the registrations whose instance is gone or whose data is missing from the local store or malformed.
+
+Also see: repository instance, mutable store.
+
 ## J
 
 ### JWT

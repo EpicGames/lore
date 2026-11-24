@@ -147,8 +147,10 @@ fn branch_archive_impl(
 
 /// Refuses an archive of `branch` that would archive it in the local store, which `ctx` reads,
 /// while a live repository instance over the store has it as its current branch: the call `id`
-/// sends the instance record of each live one, and the refusal is `DeleteCurrent`. An archive that
-/// finds the branch absent or archived already in the local store reads no instance.
+/// sends the instance record of each live one, and the refusal is `DeleteCurrent`. An instance
+/// whose registration the local store can't read refuses nothing ([`instance::records_on_branch`]).
+/// An archive that finds the branch absent or archived already in the local store reads no
+/// instance.
 async fn refuse_live_instances(
     ctx: &Arc<RepositoryContext>,
     id: u64,

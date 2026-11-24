@@ -29,7 +29,6 @@ use lore_revision::repository::CONFIG;
 use lore_revision::repository::DOT_LORE;
 use lore_revision::shared_store::SHARED_STORE_DIR;
 use lore_revision::shared_store::registry::SharedStoreRegistry;
-#[cfg(target_os = "linux")]
 use lore_revision::shared_store::registry::SharedStoreRegistryEntry;
 use lore_storage::FlushOptions;
 
@@ -103,6 +102,46 @@ fn opened(path: &Path) -> bool {
     path.join(SHARED_STORE_DIR).exists()
 }
 
+/// Stores a registration whose blob the store of `entry` doesn't hold, flushed to disk, and checks
+/// that the store, opened again, lists it as lost.
+async fn store_registration_with_missing_blob(entry: &SharedStoreRegistryEntry) {
+    let repository = entry
+        .create_null_repository_context()
+        .await
+        .expect("store opens");
+    let (key, key_type) =
+        lore_revision::instance::instance_key(repository.salt(), InstanceId::generate());
+    repository
+        .try_write_mutable_store()
+        .expect("the store takes writes")
+        .store(
+            repository.id,
+            key,
+            lore_base::types::Hash::from_u64(1),
+            key_type,
+        )
+        .await
+        .expect("the dangling registration is stored");
+    repository
+        .flush(FlushOptions::default())
+        .await
+        .expect("the registration flushes");
+    drop(repository);
+    let reopened = entry
+        .create_null_repository_context()
+        .await
+        .expect("store reopens");
+    assert_eq!(
+        lore_revision::instance::registrations(&reopened)
+            .await
+            .expect("the store's instances list")
+            .lost
+            .len(),
+        1,
+        "the registration whose blob the store lacks is lost"
+    );
+}
+
 /// A store that cannot be opened is skipped, and the walk goes on to open the next store.
 #[tokio::test]
 async fn a_store_that_cannot_be_opened_is_skipped() {
@@ -141,48 +180,17 @@ async fn a_store_that_cannot_be_opened_is_skipped() {
         .await;
 }
 
-/// A store holding an instance registration whose metadata is missing cannot list its
-/// instances. It is skipped, and the walk goes on to open the next store.
+/// A store holding an instance registration whose blob is missing leaves the registered instances
+/// unknown, so no external directory marked as being cloned is removed. The walk goes on to open
+/// the next store.
 #[tokio::test]
-async fn a_store_whose_instances_cannot_be_listed_is_skipped() {
+async fn a_registration_whose_blob_is_missing_leaves_the_registered_instances_unknown() {
     LORE_CONTEXT
         .scope(setup_test_execution(), async {
-            let broken_store = TempDir::new("lore-mount-manager-unlisted-store-");
-            let readable_store = TempDir::new("lore-mount-manager-listed-store-");
+            let broken_store = TempDir::new("lore-mount-manager-missing-blob-store-");
+            let readable_store = TempDir::new("lore-mount-manager-next-store-");
             let registry = registry_of(&[broken_store.path(), readable_store.path()]);
-            let broken = registry.entries()[0]
-                .create_null_repository_context()
-                .await
-                .expect("store opens");
-            let (key, key_type) =
-                lore_revision::instance::instance_key(broken.salt(), InstanceId::generate());
-            broken
-                .try_write_mutable_store()
-                .expect("the store takes writes")
-                .store(
-                    broken.id,
-                    key,
-                    lore_base::types::Hash::from_u64(1),
-                    key_type,
-                )
-                .await
-                .expect("the dangling registration is stored");
-            broken
-                .flush(FlushOptions::default())
-                .await
-                .expect("the registration flushes");
-            drop(broken);
-            let reopened = registry.entries()[0]
-                .create_null_repository_context()
-                .await
-                .expect("store reopens");
-            assert!(
-                lore_revision::instance::list_instances(&reopened)
-                    .await
-                    .is_err(),
-                "listing the store's instances fails"
-            );
-            drop(reopened);
+            store_registration_with_missing_blob(&registry.entries()[0]).await;
             assert!(!opened(readable_store.path()));
 
             let (mounted, pending, registered, _) = MountManager::mounts_of_entries(
@@ -191,16 +199,16 @@ async fn a_store_whose_instances_cannot_be_listed_is_skipped() {
                     .expect("resolve the external root"),
             )
             .await
-            .expect("mounting past the unlisted store succeeds");
+            .expect("mounting past the missing blob succeeds");
 
             assert!(mounted.is_empty() && pending.is_empty());
             assert_eq!(
                 registered, None,
-                "the instances of a store that cannot be listed are unknown"
+                "the instances of a store holding a registration whose blob is missing are unknown"
             );
             assert!(
                 opened(readable_store.path()),
-                "the walk opens the store after the skipped one"
+                "the walk opens the next store"
             );
         })
         .await;
@@ -304,54 +312,27 @@ async fn an_unlistable_store_does_not_stop_the_others() {
     assert_eq!(pending[0].instance.instance_id, instance_id);
 }
 
-/// A store that opens but whose instances cannot be listed, as a registration naming
-/// metadata the store does not hold leaves it, is skipped, and the next store's instances
-/// are still mounted.
+/// A store holding a registration whose blob the store doesn't hold still mounts its other
+/// instances, and the next store's instances are mounted too.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn a_store_whose_instances_cannot_be_listed_does_not_stop_the_others() {
-    let broken_store = TempDir::new("lore-mount-manager-unlisted-store-");
-    let readable_store = TempDir::new("lore-mount-manager-listed-store-");
+async fn a_store_with_a_registration_whose_blob_is_missing_mounts_its_other_instances() {
+    let broken_store = TempDir::new("lore-mount-manager-missing-blob-store-");
+    let readable_store = TempDir::new("lore-mount-manager-next-store-");
     let mut registry = SharedStoreRegistry::default();
     registry
-        .register("lore://unlisted".to_string(), broken_store.path())
-        .expect("register accepts the unlisted store");
+        .register("lore://missing-blob".to_string(), broken_store.path())
+        .expect("register accepts the store with the missing blob");
     registry
-        .register("lore://listed".to_string(), readable_store.path())
-        .expect("register accepts the listed store");
+        .register("lore://next".to_string(), readable_store.path())
+        .expect("register accepts the next store");
 
-    let broken = registry.entries()[0]
-        .create_null_repository_context()
-        .await
-        .expect("the unlisted store opens");
-    let (key, key_type) =
-        lore_revision::instance::instance_key(broken.salt(), InstanceId::generate());
-    broken
-        .try_write_mutable_store()
-        .expect("the store takes writes")
-        .store(
-            broken.id,
-            key,
-            lore_base::types::Hash::from_u64(1),
-            key_type,
-        )
-        .await
-        .expect("the dangling registration is stored");
-    broken
-        .flush(FlushOptions::default())
-        .await
-        .expect("the registration flushes");
-    let reopened = registry.entries()[0]
-        .create_null_repository_context()
-        .await
-        .expect("the unlisted store opens");
-    assert!(
-        lore_revision::instance::list_instances(&reopened)
-            .await
-            .is_err(),
-        "the unlisted store's instances list"
-    );
-    let instance_id = register_fuse_instance(&registry.entries()[1], "").await;
+    store_registration_with_missing_blob(&registry.entries()[0]).await;
+    let mut expected = vec![
+        register_fuse_instance(&registry.entries()[0], "").await,
+        register_fuse_instance(&registry.entries()[1], "").await,
+    ];
+    expected.sort();
 
     let (mounted, pending, _, _) = MountManager::mounts_of_entries(
         registry.entries(),
@@ -359,11 +340,18 @@ async fn a_store_whose_instances_cannot_be_listed_does_not_stop_the_others() {
             .expect("resolve the external root"),
     )
     .await
-    .expect("mounting past the unlisted store succeeds");
+    .expect("mounting past the missing blob succeeds");
 
     assert!(mounted.is_empty());
-    assert_eq!(pending.len(), 1, "the listed store's instance is pending");
-    assert_eq!(pending[0].instance.instance_id, instance_id);
+    let mut pending: Vec<_> = pending
+        .iter()
+        .map(|mount| mount.instance.instance_id)
+        .collect();
+    pending.sort();
+    assert_eq!(
+        pending, expected,
+        "the instances of both stores are pending"
+    );
 }
 
 #[cfg(target_os = "linux")]

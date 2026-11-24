@@ -23,7 +23,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lore_base::log::LoreLogLevel;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Hash;
 use lore_revision::change::FileAction;
@@ -204,46 +203,9 @@ async fn assert_nothing_dirty(instance: &TestRepository) {
     }
 }
 
-/// Sends each message logged to the execution context it is logged under, as an event, as the
-/// library's log dispatch does.
-fn log_to_context(level: LoreLogLevel, _: &str, message: &str) {
-    if let Some(execution) = lore_revision::lore::try_execution_context() {
-        execution
-            .dispatcher
-            .send(LoreEvent::Log(EventDispatcher::make_log(
-                level,
-                message.to_string(),
-            )));
-    }
-}
-
-/// Runs `body` in an execution context of its own, answering what it answers and the warnings it
-/// logged.
-async fn warned<F: Future>(body: F) -> (F::Output, Vec<String>) {
-    lore_base::log::set_log_callback(Some(log_to_context));
-    let warnings = Arc::new(Mutex::new(Vec::new()));
-    let logged = warnings.clone();
-    let callback: LoreEventCallback = Some(Box::new(move |event| {
-        if let LoreEvent::Log(log) = event
-            && log.level == LoreLogLevel::Warn
-        {
-            logged.lock().push(log.message.to_string());
-        }
-    }));
-    let execution = Arc::new(ExecutionContext::new_client_with_user_id(
-        LoreGlobalArgs::default(),
-        EventDispatcher::new(callback),
-        "test-user".to_string(),
-    ));
-    let output = LORE_CONTEXT.scope(execution.clone(), body).await;
-    execution.dispatcher.drain().await;
-    let warnings = std::mem::take(&mut *warnings.lock());
-    (output, warnings)
-}
-
-/// [`warned`], answering how many warnings `body` logged.
+/// [`warned`](crate::helper::warned), answering how many warnings `body` logged.
 async fn warnings_of<F: Future>(body: F) -> (F::Output, usize) {
-    let (output, warnings) = warned(body).await;
+    let (output, warnings) = crate::helper::warned(body).await;
     (output, warnings.len())
 }
 
@@ -1105,13 +1067,14 @@ async fn rebased_through_a_file(
     .await
     .expect("the marks on the first revision");
 
-    let (rebased, warnings) = warned(Box::pin(lore_revision::state::rebase_staged_state(
-        instance.repository.clone(),
-        marked,
-        second.revision(),
-        false,
-    )))
-    .await;
+    let (rebased, warnings) =
+        crate::helper::warned(Box::pin(lore_revision::state::rebase_staged_state(
+            instance.repository.clone(),
+            marked,
+            second.revision(),
+            false,
+        )))
+        .await;
     let rebased = rebased
         .expect("the rebase completes")
         .expect("a mark carries over");

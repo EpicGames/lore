@@ -4251,6 +4251,7 @@ pub type LoreRepositoryCloneArgs = crate::repository::LoreRepositoryCloneArgs;
 /// | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when clone begins, includes remote URL and target path |
 /// | `LORE_EVENT_REPOSITORY_CLONE_PROGRESS` | `lore_repository_clone_progress_event_data_t` | Emitted periodically during clone with progress data |
 /// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted only when the clone succeeds; `LORE_EVENT_COMPLETE` reports the outcome of every clone |
+/// | `LORE_EVENT_REPOSITORY_INSTANCE` | `lore_repository_instance_event_data_t` | Over a shared store, one for each instance registration the clone prunes, as `lore_repository_instance_prune` reports it |
 /// | `LORE_EVENT_REVISION_SYNC_TARGET` | `lore_revision_sync_target_event_data_t` | Emitted after resolving the target revision to sync during clone |
 /// | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file written during initial sync |
 /// | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during initial file sync |
@@ -4290,6 +4291,7 @@ pub extern "C" fn lore_repository_clone(
 /// | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when clone begins, includes remote URL and target path |
 /// | `LORE_EVENT_REPOSITORY_CLONE_PROGRESS` | `lore_repository_clone_progress_event_data_t` | Emitted periodically during clone with progress data |
 /// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted only when the clone succeeds; `LORE_EVENT_COMPLETE` reports the outcome of every clone |
+/// | `LORE_EVENT_REPOSITORY_INSTANCE` | `lore_repository_instance_event_data_t` | Over a shared store, one for each instance registration the clone prunes, as `lore_repository_instance_prune` reports it |
 /// | `LORE_EVENT_REVISION_SYNC_TARGET` | `lore_revision_sync_target_event_data_t` | Emitted after resolving the target revision to sync during clone |
 /// | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file written during initial sync |
 /// | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during initial file sync |
@@ -6811,7 +6813,7 @@ pub type LoreSharedStoreListArgs = crate::shared_store::LoreSharedStoreListArgs;
 ///
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
-/// | `LORE_EVENT_SHARED_STORE_LIST` | `lore_shared_store_list_event_data_t` | Emitted on success carrying every registered shared store, and the instances using each when `include_instances` is set |
+/// | `LORE_EVENT_SHARED_STORE_LIST` | `lore_shared_store_list_event_data_t` | Emitted on success carrying every registered shared store, and the instances using each when `include_instances` is set, leaving out an instance registration the store can't read, which a `LORE_EVENT_LOG` warning counts |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_shared_store_list(
     globals: &LoreGlobalArgs,
@@ -6842,7 +6844,7 @@ pub extern "C" fn lore_shared_store_list(
 ///
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
-/// | `LORE_EVENT_SHARED_STORE_LIST` | `lore_shared_store_list_event_data_t` | Emitted on success carrying every registered shared store, and the instances using each when `include_instances` is set |
+/// | `LORE_EVENT_SHARED_STORE_LIST` | `lore_shared_store_list_event_data_t` | Emitted on success carrying every registered shared store, and the instances using each when `include_instances` is set, leaving out an instance registration the store can't read, which a `LORE_EVENT_LOG` warning counts |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_shared_store_list_async(
     globals: &LoreGlobalArgs,
@@ -8398,7 +8400,10 @@ pub extern "C" fn lore_repository_metadata_clear_async(
 
 pub type LoreRepositoryInstanceListArgs = crate::repository::LoreRepositoryInstanceListArgs;
 
-/// List the tracked instances of the repository.
+/// List the registered instances of the repository, each through a
+/// `LORE_EVENT_REPOSITORY_INSTANCE` event. A registration whose data is missing
+/// from the local store, malformed, or can't be read is left out, and a
+/// `LORE_EVENT_LOG` warning counts those left out of each kind.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_repository_instance_list(
     globals: &LoreGlobalArgs,
@@ -8423,8 +8428,13 @@ pub type LoreRepositoryInstancePruneArgs = crate::repository::LoreRepositoryInst
 /// Remove stale instances of the repository: those whose path no longer
 /// exists, those whose path holds no checkout, and those whose path now holds
 /// a repository naming a different current instance. Each removed instance is
-/// reported through a `RepositoryInstance` event whose `stale` field gives the
-/// reason.
+/// reported through a `LORE_EVENT_REPOSITORY_INSTANCE` event whose `stale` field
+/// gives the reason. Also removes each registration whose data is missing from
+/// the local store or malformed, reported with `stale` 4, and, where it finds any,
+/// then registers the current instance again where it has no registration. Under
+/// `globals.dry_run`
+/// the call removes and registers nothing and still reports each such
+/// registration.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_repository_instance_prune(
     globals: &LoreGlobalArgs,
@@ -8518,8 +8528,9 @@ pub type LoreRepositoryInstanceCloneArgs = crate::repository::LoreRepositoryInst
 /// - error code 3 (invalid arguments) for a destination that exists before the clone moves into
 ///   place, names no directory, has no parent directory that can be resolved, has a name too
 ///   long for the directory the clone writes beside it, is nested in another instance or a
-///   virtual clone's mount, or is where another live instance is registered, and where a path
-///   inside the copy is taken while the clone writes it;
+///   virtual clone's mount, or is where another live instance is registered (a registration the
+///   local store can't read, which a `LORE_EVENT_LOG` warning counts, names none), and where a
+///   path inside the copy is taken while the clone writes it;
 /// - error code 4 (invalid path) where the instance's Lore directory lies outside its tree;
 /// - error code 118 (oversized) for a copy the destination has no room for, and where a volume the
 ///   clone writes fills while it runs;
@@ -9381,9 +9392,10 @@ pub type LoreRevisionGraphBranchResolveArgs =
 /// `lore_revision_graph_revision_resolve` describes. It sends a `LORE_EVENT_REVISION_GRAPH_BRANCH`
 /// for each location where the name names a branch. The local store's record is followed by a
 /// `LORE_EVENT_REVISION_GRAPH_INSTANCE` for each repository instance registered in the local store
-/// whose current branch it is, stale ones included; the call retires no registration. Each location
-/// the call consults ends with its `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE`, whose `records`
-/// counts the instance records too.
+/// whose current branch it is, stale ones included; the call retires no registration, and leaves
+/// out each instance whose registration the local store can't read, which a `LORE_EVENT_LOG`
+/// warning counts. Each location the call consults ends with its
+/// `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE`, whose `records` counts the instance records too.
 ///
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
@@ -9798,12 +9810,14 @@ pub type LoreRevisionGraphBranchArchiveArgs =
 /// instances registered in the local store have the branch as their current branch. A live one, an
 /// instance record with `stale` 0, refuses the call before either location changes: the call sends
 /// a `LORE_EVENT_REVISION_GRAPH_INSTANCE` for each live one and fails, with no location complete
-/// event. At the remote, the call refuses a protected branch, the repository's default branch and a
-/// branch without a branch point before it archives anything, also with no location complete event,
-/// and then archives the branch at the remote. In the local store, it settles a restore that
-/// stopped part way, then archives the branch, refusing a protected branch, the default branch and
-/// a branch without a branch point there too. A location where the branch is archived already,
-/// once such a restore is settled, reports it archived and writes nothing more.
+/// event. An instance whose registration the local store can't read refuses nothing; a
+/// `LORE_EVENT_LOG` warning counts such instances. At the remote, the call refuses a protected
+/// branch, the repository's default branch and a branch without a branch point before it archives
+/// anything, also with no location complete event, and then archives the branch at the remote. In
+/// the local store, it settles a restore that stopped part way, then archives the branch, refusing
+/// a protected branch, the default branch and a branch without a branch point there too. A
+/// location where the branch is archived already, once such a restore is settled, reports it
+/// archived and writes nothing more.
 ///
 /// Each location that holds the branch sends a `LORE_EVENT_REVISION_GRAPH_BRANCH` with the branch's
 /// record and `archived` set, then its `LORE_EVENT_REVISION_GRAPH_LOCATION_COMPLETE`, which carries
@@ -9908,8 +9922,9 @@ pub type LoreRevisionGraphBranchSyncArgs =
 /// point, or a hash whose revision number on the branch the remote's revision list answers with
 /// that hash, which takes one more request. A local sync with an all-zero target writes nothing,
 /// and sends a `LORE_EVENT_REVISION_GRAPH_INSTANCE` for each repository instance registered in the
-/// local store whose current branch is `args->branch`. The call ignores `globals.force` and
-/// `globals.dry_run`, and `lore_storage_close` waits for it.
+/// local store whose current branch is `args->branch`, leaving out each instance whose
+/// registration the local store can't read, which a `LORE_EVENT_LOG` warning counts. The call
+/// ignores `globals.force` and `globals.dry_run`, and `lore_storage_close` waits for it.
 ///
 /// `LORE_EVENT_REVISION_GRAPH_BRANCH_SYNCED` fires before `LORE_EVENT_COMPLETE` once the call has
 /// read the local latest, on success and on failure alike. On success its `local_latest` is the new

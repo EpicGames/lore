@@ -182,8 +182,8 @@ async fn mount_at_current(
 ///   the instances of every shared store the service knows, with the empty mount point its mark
 ///   names. A marked one whose instance is registered was registered before cloning stopped,
 ///   so only its mark is removed, and the start mounts it as it mounts any registered instance.
-///   With `registered` `None`, as where a store could not be listed, no marked directory is
-///   removed;
+///   With `registered` `None`, as where a store could not be listed or holds a registration that
+///   can't be read, no marked directory is removed;
 /// - a lock file that cloning left with no marked directory.
 ///
 /// The external directories are those in the external root `state` found available. Cold: runs

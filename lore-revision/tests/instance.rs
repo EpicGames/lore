@@ -4,12 +4,18 @@
 mod tests {
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use bytes::Bytes;
     use futures::StreamExt;
+    use lore_base::error::Disconnected;
     use lore_base::error::NotSupported;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
+    use lore_base::types::Address;
     use lore_base::types::Context;
     use lore_revision::branch;
     use lore_revision::fs::filesystem_provider::CloneAnswer;
@@ -25,13 +31,18 @@ mod tests {
     use lore_revision::instance::InstanceId;
     use lore_revision::instance::InstanceMetadata;
     use lore_revision::instance::InstanceStaleness;
+    use lore_revision::instance::LoreRepositoryInstanceEventData;
     use lore_revision::instance::anchor_key;
     use lore_revision::instance::instance_key;
     use lore_revision::instance::instance_staleness;
     use lore_revision::instance::list_instances;
     use lore_revision::instance::{self};
+    use lore_revision::interface::LoreEvent;
+    use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::lore::BranchId;
     use lore_revision::lore::RepositoryId;
+    use lore_revision::metadata::METADATA_MAX_SIZE;
+    use lore_revision::metadata::MetadataHeader;
     use lore_revision::repository;
     use lore_revision::repository::CONFIG;
     use lore_revision::repository::DOT_LORE;
@@ -43,7 +54,15 @@ mod tests {
     use lore_revision::repository::SALT_LORE;
     use lore_revision::repository::SharedStoreToUseConfig;
     use lore_storage::Hash;
+    use lore_storage::ReadOptions;
+    use lore_storage::StoreError;
+    use lore_storage::WriteOptions;
     use lore_storage::store_types::KeyType;
+    use lore_storage::test_util::HookedImmutableStore;
+    use lore_storage::test_util::HookedStore;
+    use lore_storage::test_util::ImmutableCall;
+    use lore_storage::test_util::StoreCall;
+    use lore_storage::test_util::answered;
 
     include!("helper.rs");
 
@@ -139,6 +158,150 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Point the registration key of `instance_id` at `blob`, directly in the store.
+    async fn store_registration_key(
+        mutable_store: &Arc<dyn lore_storage::MutableStore>,
+        repository_id: RepositoryId,
+        instance_id: InstanceId,
+        blob: Hash,
+    ) {
+        let (key, key_type) = instance_key(SALT_LORE, instance_id);
+        mutable_store
+            .clone()
+            .store(repository_id, key, blob, key_type)
+            .await
+            .expect("store registration key failed");
+    }
+
+    /// The hash of `bytes`, written to the local store of `repository` alone, as a registration is.
+    async fn write_local_blob(repository: &Arc<RepositoryContext>, bytes: Bytes) -> Hash {
+        lore_revision::immutable::write(
+            repository.clone(),
+            Context::default(),
+            bytes,
+            WriteOptions::default().no_remote_write(),
+        )
+        .await
+        .expect("write a blob to the local store")
+        .hash
+    }
+
+    /// The hashes of three registration blobs that hold no registration: one the store of
+    /// `repository` doesn't hold, one it holds as bytes that aren't metadata, and one it holds as
+    /// bytes larger than `METADATA_MAX_SIZE`.
+    async fn lost_registration_blobs(repository: &Arc<RepositoryContext>) -> [Hash; 3] {
+        [
+            Hash::hash_buffer(b"a registration blob the store doesn't hold"),
+            write_local_blob(repository, Bytes::from_static(b"not registration metadata")).await,
+            write_local_blob(repository, Bytes::from(vec![0u8; METADATA_MAX_SIZE + 1])).await,
+        ]
+    }
+
+    /// `immutable_store`, failing each read of the blob the returned cell is set to with
+    /// `Disconnected`, as a store fails a read for a time.
+    fn failing_blob_reads(
+        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    ) -> (
+        Arc<dyn lore_storage::ImmutableStore>,
+        Arc<std::sync::OnceLock<Hash>>,
+    ) {
+        let failing = Arc::new(std::sync::OnceLock::new());
+        let hooked = failing.clone();
+        let store: Arc<dyn lore_storage::ImmutableStore> =
+            HookedImmutableStore::wrap(immutable_store, move |call, _, address| {
+                if call == ImmutableCall::Get && hooked.get() == Some(&address.hash) {
+                    return Err(StoreError::from(Disconnected));
+                }
+                Ok(())
+            });
+        (store, failing)
+    }
+
+    /// Register `instance_id` at `path`, then set `failing` ([`failing_blob_reads`]) to its blob,
+    /// so the store fails each read of it.
+    async fn register_with_failing_reads(
+        repository: &Arc<RepositoryContext>,
+        mutable_store: &Arc<dyn lore_storage::MutableStore>,
+        failing: &std::sync::OnceLock<Hash>,
+        instance_id: InstanceId,
+        path: &str,
+    ) {
+        instance::store_instance_registration(repository, instance_id, path)
+            .await
+            .expect("register instance failed");
+        let (key, key_type) = instance_key(SALT_LORE, instance_id);
+        let blob = mutable_store
+            .clone()
+            .load(repository.id, key, key_type)
+            .await
+            .expect("load registration key failed");
+        failing.set(blob).expect("the failing blob is set once");
+    }
+
+    /// Register `instance_id` at `path` in the metadata version after the one this build writes,
+    /// as a later build would, in the local store alone.
+    async fn register_in_a_later_metadata_version(
+        repository: &Arc<RepositoryContext>,
+        mutable_store: &Arc<dyn lore_storage::MutableStore>,
+        instance_id: InstanceId,
+        path: &str,
+    ) {
+        instance::store_instance_registration(repository, instance_id, path)
+            .await
+            .expect("register instance failed");
+        let (key, key_type) = instance_key(SALT_LORE, instance_id);
+        let hash = mutable_store
+            .clone()
+            .load(repository.id, key, key_type)
+            .await
+            .expect("load registration key failed");
+        let address = Address {
+            hash,
+            context: Context::default(),
+        };
+        let mut blob = lore_revision::immutable::read(
+            repository.clone(),
+            address,
+            None,
+            ReadOptions::default().no_remote(),
+        )
+        .await
+        .expect("read the registration blob")
+        .to_vec();
+        let version = std::mem::offset_of!(MetadataHeader, version);
+        let field = &mut blob[version..version + 4];
+        let later = u32::from_ne_bytes((&*field).try_into().expect("a metadata header")) + 1;
+        field.copy_from_slice(&later.to_ne_bytes());
+        let later = write_local_blob(repository, Bytes::from(blob)).await;
+        store_registration_key(mutable_store, repository.id, instance_id, later).await;
+    }
+
+    /// The `RepositoryInstance` events of `events` that report a removed registration whose data is
+    /// missing or malformed.
+    fn lost_reports(events: &[LoreEvent]) -> Vec<&LoreRepositoryInstanceEventData> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                LoreEvent::RepositoryInstance(data)
+                    if data.stale == InstanceStaleness::Lost.as_event_flag() =>
+                {
+                    Some(data)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether `report` names no instance: a zero id, branch and revision, and an empty path and
+    /// branch name.
+    fn names_no_instance(report: &LoreRepositoryInstanceEventData) -> bool {
+        report.instance_id.is_zero()
+            && report.path.as_str().is_empty()
+            && report.branch.is_zero()
+            && report.branch_name.as_str().is_empty()
+            && report.revision.is_zero()
+    }
+
     /// Make `root` look like a checkout whose `.lore/instance` names `instance_id`.
     fn write_instance_file(root: &Path, instance_id: InstanceId) {
         let dot_lore = root.join(DOT_LORE);
@@ -190,9 +353,10 @@ mod tests {
                     .expect("instance key not found in mutable store");
                 assert!(!metadata_hash.is_zero());
 
-                let metadata = instance::load_instance_metadata(&repository, metadata_hash)
-                    .await
-                    .expect("load_instance_metadata failed");
+                let instances = list_instances(&repository).await.expect("list failed");
+                let [metadata] = instances.as_slice() else {
+                    panic!("one registration is listed: {instances:?}");
+                };
                 assert_eq!(metadata.instance_id, id);
                 assert_eq!(metadata.path, "/tmp/test-instance");
                 assert!(metadata.created > 0);
@@ -267,6 +431,68 @@ mod tests {
             }))
             .await
             .expect("Test failed");
+    }
+
+    /// A registration whose blob the store doesn't hold, one whose blob isn't metadata, one whose
+    /// blob is larger than metadata can be, one whose blob the store fails to read, and one in a
+    /// later metadata version are left out of the list, the first three as lost and the others as
+    /// failed, with one warning for each kind, and the others are listed.
+    #[tokio::test]
+    async fn list_instances_leaves_out_registrations_it_cannot_read_with_a_warning_for_each_kind() {
+        let (immutable_store, mutable_store, _) =
+            test_store_create().await.expect("Failed to create stores");
+        let (immutable_store, failing) = failing_blob_reads(immutable_store);
+
+        #[allow(clippy::disallowed_methods)]
+        let ((), warnings) = runtime()
+            .spawn(warned(async move {
+                let listed = InstanceId::generate();
+                let repository =
+                    test_repository(immutable_store, mutable_store.clone(), listed).await;
+                instance::store_instance_registration(&repository, listed, "/tmp/instance-listed")
+                    .await
+                    .expect("register instance failed");
+                for blob in lost_registration_blobs(&repository).await {
+                    store_registration_key(
+                        &mutable_store,
+                        repository.id,
+                        InstanceId::generate(),
+                        blob,
+                    )
+                    .await;
+                }
+                register_with_failing_reads(
+                    &repository,
+                    &mutable_store,
+                    &failing,
+                    InstanceId::generate(),
+                    "/tmp/instance-failing",
+                )
+                .await;
+                register_in_a_later_metadata_version(
+                    &repository,
+                    &mutable_store,
+                    InstanceId::generate(),
+                    "/tmp/instance-later",
+                )
+                .await;
+
+                assert_eq!(
+                    instance_ids(&list_instances(&repository).await.expect("list failed")),
+                    vec![listed]
+                );
+                let registrations = instance::registrations(&repository)
+                    .await
+                    .expect("list failed");
+                assert_eq!(
+                    (registrations.lost.len(), registrations.failed),
+                    (3, 2),
+                    "{registrations:?}"
+                );
+            }))
+            .await
+            .expect("Test failed");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
     }
 
     #[tokio::test]
@@ -658,11 +884,13 @@ mod tests {
         assert_eq!(InstanceStaleness::PathMissing.as_event_flag(), 1);
         assert_eq!(InstanceStaleness::Superseded.as_event_flag(), 2);
         assert_eq!(InstanceStaleness::CheckoutMissing.as_event_flag(), 3);
+        assert_eq!(InstanceStaleness::Lost.as_event_flag(), 4);
         assert!(!InstanceStaleness::Active.is_stale());
         for staleness in [
             InstanceStaleness::PathMissing,
             InstanceStaleness::Superseded,
             InstanceStaleness::CheckoutMissing,
+            InstanceStaleness::Lost,
         ] {
             assert!(staleness.is_stale(), "{staleness:?}");
         }
@@ -879,6 +1107,329 @@ mod tests {
             }))
             .await
             .expect("Test failed");
+    }
+
+    /// Prune removes the registrations whose blob the store doesn't hold or holds as bytes that
+    /// aren't metadata or are larger than metadata can be, the current instance's own among them,
+    /// and reports each with an event that names no instance, not even the anchors stored under
+    /// the zero instance id. It keeps one whose blob the store fails to read and one in a later
+    /// metadata version, and registers the current instance again at its path.
+    #[tokio::test]
+    async fn instance_prune_removes_and_reports_only_lost_registrations_and_registers_the_current_instance()
+     {
+        let (immutable_store, mutable_store, _) =
+            test_store_create().await.expect("Failed to create stores");
+        let (immutable_store, failing) = failing_blob_reads(immutable_store);
+
+        #[allow(clippy::disallowed_methods)]
+        let ((), events) = runtime()
+            .spawn(recorded(LoreGlobalArgs::default(), async move {
+                let elsewhere = TempDir::new("lore-instance-prune-lost-");
+                let current = InstanceId::generate();
+                let live = InstanceId::generate();
+                write_instance_file(&elsewhere, live);
+                let repository =
+                    test_repository(immutable_store, mutable_store.clone(), current).await;
+                instance::store_instance_registration(
+                    &repository,
+                    live,
+                    &elsewhere.display().to_string(),
+                )
+                .await
+                .expect("register live instance failed");
+                let [missing, not_metadata, oversized] = lost_registration_blobs(&repository).await;
+                for (instance, blob) in [
+                    (current, missing),
+                    (InstanceId::generate(), not_metadata),
+                    (InstanceId::generate(), oversized),
+                ] {
+                    store_registration_key(&mutable_store, repository.id, instance, blob).await;
+                }
+                store_current_branch_for(
+                    &mutable_store,
+                    repository.id,
+                    InstanceId::default(),
+                    BranchId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                store_current_anchor_for(
+                    &mutable_store,
+                    repository.id,
+                    InstanceId::default(),
+                    Hash::hash_buffer(b"an anchor under the zero instance id"),
+                )
+                .await;
+                register_with_failing_reads(
+                    &repository,
+                    &mutable_store,
+                    &failing,
+                    InstanceId::generate(),
+                    "/tmp/instance-failing",
+                )
+                .await;
+                register_in_a_later_metadata_version(
+                    &repository,
+                    &mutable_store,
+                    InstanceId::generate(),
+                    "/tmp/instance-later",
+                )
+                .await;
+
+                let pruned = instance::instance_prune(repository.clone())
+                    .await
+                    .expect("prune failed");
+                assert_eq!(pruned, 3, "each lost registration is pruned");
+
+                let registrations = instance::registrations(&repository)
+                    .await
+                    .expect("list failed");
+                assert!(registrations.lost.is_empty(), "{registrations:?}");
+                assert_eq!(
+                    registrations.failed, 2,
+                    "the registrations the store fails to read are kept: {registrations:?}"
+                );
+                let mut ids = instance_ids(&registrations.instances);
+                ids.sort();
+                let mut expected = vec![current, live];
+                expected.sort();
+                assert_eq!(ids, expected);
+                let path = repository.path().expect("the repository has a path");
+                assert!(
+                    registrations
+                        .instances
+                        .iter()
+                        .any(|instance| instance.instance_id == current
+                            && Path::new(&instance.path) == path),
+                    "the current instance is registered at its path: {registrations:?}"
+                );
+            }))
+            .await
+            .expect("Test failed");
+        let reports = lost_reports(&events);
+        assert_eq!(reports.len(), 3);
+        assert!(reports.iter().all(|report| names_no_instance(report)));
+    }
+
+    /// Prune removes a lost registration only while its key holds the value it was listed with.
+    /// Once it removes the first, the other two are written again, and those stay unreported.
+    #[tokio::test]
+    async fn instance_prune_keeps_a_lost_registration_written_again_since_the_listing() {
+        let (immutable_store, mutable_store, _) =
+            test_store_create().await.expect("Failed to create stores");
+        let lost: [InstanceId; 3] = std::array::from_fn(|_| InstanceId::generate());
+        let written_again = Hash::hash_buffer(b"a registration written again");
+        let fired = AtomicBool::new(false);
+        let hooked: Arc<dyn lore_storage::MutableStore> = HookedStore::wrap(
+            mutable_store.clone(),
+            |_, _, _| Ok(()),
+            answered(move |inner, partition, call, _, key_type| {
+                let first = call == StoreCall::CompareAndSwap
+                    && key_type == KeyType::Instance
+                    && !fired.swap(true, Ordering::Relaxed);
+                async move {
+                    if first {
+                        for id in lost {
+                            let (key, key_type) = instance_key(SALT_LORE, id);
+                            let held = inner.clone().load(partition, key, key_type).await;
+                            if held.is_ok_and(|value| !value.is_zero()) {
+                                inner
+                                    .clone()
+                                    .store(partition, key, written_again, key_type)
+                                    .await?;
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+            }),
+        );
+
+        #[allow(clippy::disallowed_methods)]
+        let ((), events) = runtime()
+            .spawn(recorded(LoreGlobalArgs::default(), async move {
+                let repository =
+                    test_repository(immutable_store, hooked, InstanceId::generate()).await;
+                let blobs = lost_registration_blobs(&repository).await;
+                for (instance, blob) in lost.into_iter().zip(blobs) {
+                    store_registration_key(&mutable_store, repository.id, instance, blob).await;
+                }
+
+                let pruned = instance::instance_prune(repository.clone())
+                    .await
+                    .expect("prune failed");
+                assert_eq!(pruned, 1, "only the registration removed first is pruned");
+
+                let mut held = Vec::new();
+                for instance in lost {
+                    let (key, key_type) = instance_key(SALT_LORE, instance);
+                    held.push(
+                        mutable_store
+                            .clone()
+                            .load(repository.id, key, key_type)
+                            .await
+                            .unwrap_or_default(),
+                    );
+                }
+                assert_eq!(
+                    held.iter().filter(|value| value.is_zero()).count(),
+                    1,
+                    "the registration removed first is gone: {held:?}"
+                );
+                assert_eq!(
+                    held.iter().filter(|value| **value == written_again).count(),
+                    2,
+                    "a registration written again since the listing stays: {held:?}"
+                );
+            }))
+            .await
+            .expect("Test failed");
+        assert_eq!(lost_reports(&events).len(), 1);
+    }
+
+    /// A lost registration whose removal the store fails stays, and prune warns of the failure and
+    /// counts the registration in the listing's warning rather than reporting it.
+    #[tokio::test]
+    async fn a_lost_registration_prune_fails_to_remove_stays_with_a_warning() {
+        let (immutable_store, mutable_store, _) =
+            test_store_create().await.expect("Failed to create stores");
+        let lost = InstanceId::generate();
+        let refused = Arc::new(AtomicUsize::new(0));
+        let refusing = refused.clone();
+        let hooked: Arc<dyn lore_storage::MutableStore> = HookedStore::wrap(
+            mutable_store.clone(),
+            move |call, _, key_type| {
+                if call == StoreCall::CompareAndSwap && key_type == KeyType::Instance {
+                    refusing.fetch_add(1, Ordering::Relaxed);
+                    return Err(StoreError::from(Disconnected));
+                }
+                Ok(())
+            },
+            None,
+        );
+
+        #[allow(clippy::disallowed_methods)]
+        let ((pruned, kept), events) = runtime()
+            .spawn(recorded(LoreGlobalArgs::default(), async move {
+                let repository =
+                    test_repository(immutable_store, hooked, InstanceId::generate()).await;
+                let [missing, ..] = lost_registration_blobs(&repository).await;
+                store_registration_key(&mutable_store, repository.id, lost, missing).await;
+
+                let pruned = instance::instance_prune(repository.clone())
+                    .await
+                    .expect("prune failed");
+                let (key, key_type) = instance_key(SALT_LORE, lost);
+                let held = mutable_store
+                    .clone()
+                    .load(repository.id, key, key_type)
+                    .await
+                    .expect("load registration key failed");
+                (pruned, held == missing)
+            }))
+            .await
+            .expect("Test failed");
+        let caught = serde_json::to_string(&events).expect("Failed to print the events");
+        let warnings = warning_messages(&events);
+        assert_eq!(
+            pruned, 0,
+            "a registration prune fails to remove is not reported: {caught}"
+        );
+        assert!(kept, "a registration prune fails to remove stays: {caught}");
+        assert_eq!(
+            refused.load(Ordering::Relaxed),
+            1,
+            "prune tries once to remove the lost registration: {caught}"
+        );
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|warning| warning.starts_with("Failed to remove an instance registration"))
+                .count(),
+            1,
+            "{caught}"
+        );
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|warning| warning
+                    .starts_with("Leaving out 1 instance registration(s) whose data is missing"))
+                .count(),
+            1,
+            "{caught}"
+        );
+    }
+
+    /// A prune in a dry run reports each lost registration it would remove, removes none, and
+    /// registers the current instance nowhere, writing no registration blob either.
+    #[tokio::test]
+    async fn a_dry_run_prune_reports_lost_registrations_and_removes_and_registers_nothing() {
+        let (immutable_store, mutable_store, _) =
+            test_store_create().await.expect("Failed to create stores");
+        let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = puts.clone();
+        let immutable_store: Arc<dyn lore_storage::ImmutableStore> =
+            HookedImmutableStore::wrap(immutable_store, move |call, _, _| {
+                if call == ImmutableCall::Put {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            });
+        let lost: [InstanceId; 3] = std::array::from_fn(|_| InstanceId::generate());
+        let dry_run = LoreGlobalArgs {
+            dry_run: 1,
+            ..Default::default()
+        };
+
+        #[allow(clippy::disallowed_methods)]
+        let ((), events) = runtime()
+            .spawn(recorded(dry_run, async move {
+                let current = InstanceId::generate();
+                let repository =
+                    test_repository(immutable_store, mutable_store.clone(), current).await;
+                let blobs = lost_registration_blobs(&repository).await;
+                for (instance, blob) in lost.into_iter().zip(blobs) {
+                    store_registration_key(&mutable_store, repository.id, instance, blob).await;
+                }
+
+                let written = puts.load(Ordering::Relaxed);
+                let pruned = instance::instance_prune(repository.clone())
+                    .await
+                    .expect("prune failed");
+                assert_eq!(pruned, 3);
+                assert_eq!(
+                    puts.load(Ordering::Relaxed),
+                    written,
+                    "a dry run writes no registration blob"
+                );
+
+                for (instance, blob) in lost.into_iter().zip(blobs) {
+                    let (key, key_type) = instance_key(SALT_LORE, instance);
+                    assert_eq!(
+                        mutable_store
+                            .clone()
+                            .load(repository.id, key, key_type)
+                            .await
+                            .expect("load registration key failed"),
+                        blob,
+                        "a dry run removes no lost registration"
+                    );
+                }
+                let (key, key_type) = instance_key(SALT_LORE, current);
+                assert!(
+                    mutable_store
+                        .clone()
+                        .load(repository.id, key, key_type)
+                        .await
+                        .unwrap_or_default()
+                        .is_zero(),
+                    "a dry run registers no instance"
+                );
+            }))
+            .await
+            .expect("Test failed");
+        let reports = lost_reports(&events);
+        assert_eq!(reports.len(), 3);
+        assert!(reports.iter().all(|report| names_no_instance(report)));
     }
 
     /// `repository create --force` and a re-clone on a shared store both wipe
@@ -1133,6 +1684,135 @@ mod tests {
             }))
             .await
             .expect("Test failed");
+    }
+
+    /// A writer reading the list for a branch, as a branch switch or sync does, finds the other
+    /// instance on the branch past lost registrations, and leaves them for an explicit prune.
+    #[tokio::test]
+    async fn a_branch_lookup_finds_the_instance_on_the_branch_and_keeps_lost_registrations() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let root = TempDir::new("lore-instance-branch-lost-");
+                let current = InstanceId::generate();
+                let other = InstanceId::generate();
+                write_instance_file(&root, other);
+                let repository =
+                    test_repository(immutable_store, mutable_store.clone(), current).await;
+                let shared = BranchId::from(uuid::Uuid::now_v7());
+                instance::store_instance_registration(
+                    &repository,
+                    other,
+                    &root.display().to_string(),
+                )
+                .await
+                .expect("register instance failed");
+                store_current_branch_for(&mutable_store, repository.id, other, shared).await;
+                for blob in lost_registration_blobs(&repository).await {
+                    store_registration_key(
+                        &mutable_store,
+                        repository.id,
+                        InstanceId::generate(),
+                        blob,
+                    )
+                    .await;
+                }
+
+                let on_branch = instance::instances_on_branch(&repository, shared)
+                    .await
+                    .expect("instances on branch failed");
+                assert_eq!(instance_ids(&on_branch), vec![other]);
+                let registrations = instance::registrations(&repository)
+                    .await
+                    .expect("list failed");
+                assert_eq!(
+                    registrations.lost.len(),
+                    3,
+                    "the lookup removes no lost registration: {registrations:?}"
+                );
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// Both branch lookups leave out the registrations whose blob the store doesn't hold, isn't
+    /// metadata, is larger than metadata can be, fails to read, or is in a later metadata version,
+    /// with one warning for each kind, and report the instance on the branch.
+    #[tokio::test]
+    async fn branch_lookups_leave_out_registrations_they_cannot_read_with_a_warning_for_each_kind()
+    {
+        let (immutable_store, mutable_store, _) =
+            test_store_create().await.expect("Failed to create stores");
+        let (immutable_store, failing) = failing_blob_reads(immutable_store);
+
+        #[allow(clippy::disallowed_methods)]
+        let ((), warnings) = runtime()
+            .spawn(warned(async move {
+                let root = TempDir::new("lore-instance-branch-unreadable-");
+                let other = InstanceId::generate();
+                write_instance_file(&root, other);
+                let repository = test_repository(
+                    immutable_store,
+                    mutable_store.clone(),
+                    InstanceId::generate(),
+                )
+                .await;
+                let shared = BranchId::from(uuid::Uuid::now_v7());
+                instance::store_instance_registration(
+                    &repository,
+                    other,
+                    &root.display().to_string(),
+                )
+                .await
+                .expect("register instance failed");
+                store_current_branch_for(&mutable_store, repository.id, other, shared).await;
+                for blob in lost_registration_blobs(&repository).await {
+                    store_registration_key(
+                        &mutable_store,
+                        repository.id,
+                        InstanceId::generate(),
+                        blob,
+                    )
+                    .await;
+                }
+                register_with_failing_reads(
+                    &repository,
+                    &mutable_store,
+                    &failing,
+                    InstanceId::generate(),
+                    "/tmp/instance-failing",
+                )
+                .await;
+                register_in_a_later_metadata_version(
+                    &repository,
+                    &mutable_store,
+                    InstanceId::generate(),
+                    "/tmp/instance-later",
+                )
+                .await;
+
+                let on_branch = instance::records_on_branch(&repository, shared)
+                    .await
+                    .expect("look up the branch");
+                assert_eq!(
+                    on_branch
+                        .iter()
+                        .map(|record| record.instance_id)
+                        .collect::<Vec<_>>(),
+                    vec![other]
+                );
+                let by_branch = instance::records_by_branch(&repository)
+                    .await
+                    .expect("look up every branch");
+                assert_eq!(by_branch.len(), 1, "{by_branch:?}");
+                assert_eq!(by_branch[&shared], on_branch);
+            }))
+            .await
+            .expect("Test failed");
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
     }
 
     /// A read-only command reports a stale registration and leaves it in the
