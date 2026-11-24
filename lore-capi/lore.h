@@ -3806,6 +3806,10 @@ typedef struct lore_revision_graph_branch_pushed_event_data_t {
 
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
+//
+// A new variant goes last, so that every other variant keeps its value, and
+// its encoding in the messages of the Lore service, which name an event by
+// its position in this list.
 enum lore_event_id_t {
   // A progress update.
   LORE_EVENT_PROGRESS,

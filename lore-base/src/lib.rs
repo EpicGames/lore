@@ -5,6 +5,7 @@ extern crate self as lore_base;
 
 pub mod allocator;
 pub mod directories;
+pub mod encoding;
 pub mod env;
 pub mod error;
 pub mod fs;

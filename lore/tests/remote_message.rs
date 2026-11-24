@@ -36,6 +36,7 @@ use lore::revision_tree::modify::LoreRevisionTreeModifyArgs;
 use lore::revision_tree::modify::LoreRevisionTreeModifyEntry;
 use lore::revision_tree::move_node::LoreRevisionTreeMoveArgs;
 use lore::revision_tree::move_node::LoreRevisionTreeMoveEntry;
+use lore_base::encoding::encode_position;
 use lore_base::env::CallEnvironment;
 use lore_base::types::Address;
 use lore_base::types::Context;
@@ -47,10 +48,9 @@ use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::interface::LoreString;
 
-/// `message` as a peer reads it back from the bytes written for it, beside the payload it views.
-fn read_back<Message: bitcode::Encode + bitcode::DecodeOwned>(
-    message: &Message,
-) -> (Message, Bytes) {
+/// `message` as a peer reads it back, as a `Message`, from the bytes written for it, beside the
+/// payload it views.
+fn read_back<Message: bitcode::DecodeOwned>(message: &impl bitcode::Encode) -> (Message, Bytes) {
     let mut written = Vec::new();
     write_message(&mut written, message).expect("a message must write");
     blocking_read_message(&mut written.as_slice())
@@ -65,7 +65,7 @@ fn relayed(command: LoreCommand) -> LoreCommand {
         command,
         environment: CallEnvironment::default(),
     };
-    read_back(&message).0.command
+    read_back::<MessageToServer>(&message).0.command
 }
 
 #[test]
@@ -458,7 +458,7 @@ async fn message_to_server_to_and_from_bytes() {
         environment: environment.clone(),
     };
 
-    let (read, _payload) = read_back(&message);
+    let (read, _payload) = read_back::<MessageToServer>(&message);
 
     assert_eq!(read.globals.repository_path, path);
     assert_eq!(read.environment, environment);
@@ -486,7 +486,13 @@ fn text_that_is_not_utf8_crosses_unchanged() {
         environment: CallEnvironment::default(),
     };
 
-    assert_eq!(read_back(&message).0.globals.repository_path, path);
+    assert_eq!(
+        read_back::<MessageToServer>(&message)
+            .0
+            .globals
+            .repository_path,
+        path
+    );
 }
 
 /// The service refuses text that is not UTF-8 with the error the caller's own entry point gives,
@@ -502,7 +508,7 @@ async fn the_service_refuses_text_that_is_not_utf8() {
         environment: CallEnvironment::default(),
     };
 
-    let status = Box::pin(read_back(&message).0.invoke(None)).await;
+    let status = Box::pin(read_back::<MessageToServer>(&message).0.invoke(None)).await;
 
     assert_eq!(
         status,
@@ -544,7 +550,7 @@ fn a_put_carries_its_bytes_to_the_service() {
         environment: CallEnvironment::default(),
     };
 
-    let (read, payload) = read_back(&message);
+    let (read, payload) = read_back::<MessageToServer>(&message);
 
     let LoreCommand::StoragePut(args) = read.command else {
         panic!("Unexpected command");
@@ -579,16 +585,7 @@ fn a_borrowed_data_event_reaches_a_client_as_itself() {
         },
     });
 
-    let mut written = Vec::new();
-    write_payload(
-        &mut written,
-        &encode_message(&MessageToClient::Event(&event)),
-    )
-    .unwrap();
-    let (read, _payload): (MessageToClient, Bytes) = blocking_read_message(&mut written.as_slice())
-        .expect("an event must read back")
-        .expect("a whole message must be present");
-
+    let (read, _payload) = read_back::<MessageToClient>(&MessageToClient::Event(&event));
     match read {
         MessageToClient::Event(LoreEvent::StorageGetData(data)) => {
             assert_eq!((data.id, data.offset), (3, 64));
@@ -596,6 +593,42 @@ fn a_borrowed_data_event_reaches_a_client_as_itself() {
             assert_eq!(unsafe { data.bytes.as_slice() }, contents);
         }
         _ => panic!("expected a data event"),
+    }
+}
+
+/// The event of the variant at `position`, decoded from the position followed by the fewest zero
+/// bytes its payload decodes from, which hold empty text and arrays, zero numbers and the first
+/// variant of each enum.
+fn zero_event(position: u32) -> LoreEvent {
+    let mut encoded = Vec::new();
+    encode_position(position, &mut encoded);
+    for _ in 0..4096 {
+        if let Ok(event) = bitcode::decode(&encoded) {
+            return event;
+        }
+        encoded.push(0);
+    }
+    panic!("the payload of the variant at {position} must decode from zero bytes");
+}
+
+/// Every event reaches a client as itself, each variant at a position of its own.
+#[test]
+fn every_event_reaches_a_client_as_itself() {
+    let mut kinds = std::collections::BTreeSet::new();
+    for position in 0..LoreEvent::VARIANTS {
+        let event = zero_event(position);
+        assert!(
+            kinds.insert(event.discriminant()),
+            "the variant at {position} must be the only one there"
+        );
+        let (read, _payload) = read_back::<MessageToClient>(&MessageToClient::Event(&event));
+        match read {
+            MessageToClient::Event(read) => assert!(
+                read == event,
+                "the variant at {position} must read back as itself"
+            ),
+            _ => panic!("expected the event at {position}"),
+        }
     }
 }
 
@@ -859,7 +892,7 @@ async fn a_metadata_event_carries_a_binary_value_to_a_client() {
         value: value.clone(),
     });
 
-    match read_back(&MessageToClient::Event(event)).0 {
+    match read_back::<MessageToClient>(&MessageToClient::Event(event)).0 {
         MessageToClient::Event(LoreEvent::Metadata(data)) => {
             assert_eq!(data.key.as_str(), "thumbnail");
             assert_eq!(

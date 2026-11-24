@@ -7,6 +7,7 @@ pub mod metadata;
 pub mod revision_graph;
 pub mod revision_tree;
 
+use lore_macro::PositionBitcode;
 use lore_macro::VariantTypeSize;
 use serde::Serialize;
 
@@ -949,16 +950,12 @@ pub struct LoreServiceMessageEventData {
 /// cbindgen:rename-all=ScreamingSnakeCase
 /// An event delivered to a callback. Each variant names a kind of event and
 /// carries the data for that event.
+///
+/// A new variant goes last, so that every other variant keeps its value, and
+/// its encoding in the messages of the Lore service, which name an event by
+/// its position in this list.
 #[repr(C, u32)]
-#[derive(
-    Clone,
-    PartialEq,
-    Serialize,
-    VariantTypeSize,
-    bitcode::Encode,
-    bitcode::Decode,
-    lore_macro::WireSchema,
-)]
+#[derive(Clone, PartialEq, Serialize, VariantTypeSize, PositionBitcode)]
 #[serde(tag = "tagName", content = "data", rename_all = "camelCase")]
 pub enum LoreEvent {
     // Standard events

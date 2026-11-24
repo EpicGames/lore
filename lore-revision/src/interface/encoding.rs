@@ -15,6 +15,7 @@ use bitcode::__private::Result;
 use bitcode::__private::View;
 use bitcode::Decode;
 use bitcode::Encode;
+use lore_base::encoding::truncated;
 use lore_base::wire_schema::WireSchema;
 use lore_base::wire_schema::schema_leaf;
 
@@ -100,13 +101,6 @@ fn take<'a>(input: &mut &'a [u8], count: usize) -> Result<&'a [u8]> {
     let (taken, rest) = input.split_at_checked(count).ok_or_else(truncated)?;
     *input = rest;
     Ok(taken)
-}
-
-/// The error for input that ends before the values it describes. Bitcode constructs its error
-/// only inside its own decoders, so it is taken from a decode that fails the same way.
-#[cold]
-fn truncated() -> bitcode::Error {
-    bitcode::decode::<u8>(&[]).expect_err("an empty input holds no byte")
 }
 
 impl<'a> View<'a> for BytesDecoder<'a> {

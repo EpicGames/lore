@@ -9,13 +9,20 @@ use syn::parse_quote;
 
 /// A `lore_base::wire_schema::WireSchema` implementation that hashes the type's fields, or its
 /// variants and theirs, in declaration order, as bitcode's derive encodes them.
-///
-/// A struct mixes in a tag, its field count, and each field's name and schema. An enum mixes in a
-/// tag, its variant count, and for each variant its name, the kind and count of its fields, and
-/// each field's name, or its position where the fields are unnamed, and schema. A field bitcode
-/// skips is left out, as bitcode leaves it out of the encoding. The type's own name is left out,
-/// since the encoding doesn't carry it. A type parameter must implement the trait itself.
 pub fn get_wire_schema_impl(input: &DeriveInput) -> proc_macro::TokenStream {
+    wire_schema_impl(input, "enum").into()
+}
+
+/// A `lore_base::wire_schema::WireSchema` implementation that hashes the type's fields, or its
+/// variants and theirs, in declaration order.
+///
+/// A struct mixes in a tag, its field count, and each field's name and schema. An enum mixes in
+/// `enum_tag`, which names how its variants are encoded, its variant count, and for each variant
+/// its name, the kind and count of its fields, and each field's name, or its position where the
+/// fields are unnamed, and schema. A field bitcode skips is left out, as bitcode leaves it out of
+/// the encoding. The type's own name is left out, since the encoding doesn't carry it. A type
+/// parameter must implement the trait itself.
+pub fn wire_schema_impl(input: &DeriveInput, enum_tag: &str) -> TokenStream {
     let name = &input.ident;
     let mut generics = input.generics.clone();
     for parameter in generics.type_params_mut() {
@@ -44,7 +51,7 @@ pub fn get_wire_schema_impl(input: &DeriveInput) -> proc_macro::TokenStream {
                 }
             });
             quote! {
-                let hash = ::lore_base::wire_schema::schema_leaf("enum");
+                let hash = ::lore_base::wire_schema::schema_leaf(#enum_tag);
                 let hash = ::lore_base::wire_schema::schema_u64(hash, #count);
                 #(#variants)*
             }
@@ -62,7 +69,6 @@ pub fn get_wire_schema_impl(input: &DeriveInput) -> proc_macro::TokenStream {
             };
         }
     }
-    .into()
 }
 
 /// Statements that mix the kind and count of `fields` into `hash`, then each field's name, or

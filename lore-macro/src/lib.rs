@@ -3,6 +3,7 @@
 mod lore_args;
 mod lore_command;
 mod lore_instrument;
+mod position_bitcode;
 mod test_pub;
 mod validate_text;
 mod variant;
@@ -17,6 +18,17 @@ pub fn variant_type_size(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
 
     variant::get_variant_type_sizes(&ast)
+}
+
+/// Derives bitcode's `Encode` and `Decode` for an enum whose variants each hold one value, as each
+/// value's position among the variants followed by the value its variant holds, for fewer than
+/// 2^32 variants, and `lore_base::wire_schema::WireSchema` for that encoding. The deriving crate
+/// depends on `bitcode` and `lore-base`, and has a `test-util` feature.
+#[proc_macro_derive(PositionBitcode)]
+pub fn position_bitcode(input: TokenStream) -> TokenStream {
+    let ast = parse_macro_input!(input as DeriveInput);
+
+    position_bitcode::get_position_bitcode_impl(&ast)
 }
 
 #[proc_macro_derive(LoreArgs, attributes(handler, requires_service))]
