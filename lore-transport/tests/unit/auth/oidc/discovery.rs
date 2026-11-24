@@ -15,6 +15,11 @@ const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
 
 use super::provider::*;
 
+/// Answers every request with a `302 Found` to `target`.
+fn redirect_to(target: String) -> impl Fn(&str, usize) -> Response + Clone + Send + Sync + 'static {
+    move |_, _| (StatusCode::FOUND, [(header::LOCATION, target.clone())]).into_response()
+}
+
 #[tokio::test]
 async fn reads_the_endpoints_from_the_document() {
     let provider = spawn_provider(conforming).await;
@@ -96,11 +101,8 @@ async fn the_issuer_must_match_exactly() {
 #[tokio::test]
 async fn a_redirect_to_another_origin_is_refused_and_not_followed() {
     let elsewhere = spawn_provider(conforming).await;
-    let target = format!("{}{DISCOVERY_PATH}", elsewhere.issuer);
-    let provider = spawn_provider(move |_, _| {
-        (StatusCode::FOUND, [(header::LOCATION, target.clone())]).into_response()
-    })
-    .await;
+    let provider =
+        spawn_provider(redirect_to(format!("{}{DISCOVERY_PATH}", elsewhere.issuer))).await;
 
     let result = discover(&provider.issuer).await;
 
@@ -122,10 +124,7 @@ async fn a_cross_origin_redirect_reports_only_the_target_origin() {
             .issuer
             .replacen("http://", "http://client:secret@", 1)
     );
-    let provider = spawn_provider(move |_, _| {
-        (StatusCode::FOUND, [(header::LOCATION, target.clone())]).into_response()
-    })
-    .await;
+    let provider = spawn_provider(redirect_to(target)).await;
 
     let result = discover(&provider.issuer).await;
 
@@ -133,6 +132,24 @@ async fn a_cross_origin_redirect_reports_only_the_target_origin() {
         panic!("{result:?}");
     };
     assert_eq!(target_origin, origin(&elsewhere.issuer));
+}
+
+/// A redirect to a `blob:` URL nested deeper than a thread's stack can recurse through is
+/// refused as cross-origin, without overflowing the stack.
+#[tokio::test]
+async fn a_redirect_to_a_deeply_nested_blob_url_is_refused() {
+    let provider = spawn_provider(redirect_to(format!(
+        "{}https://idp.example.com/",
+        "blob:".repeat(16_000)
+    )))
+    .await;
+
+    let result = discover(&provider.issuer).await;
+
+    assert!(
+        matches!(result, Err(DiscoveryError::CrossOriginRedirect { .. })),
+        "{result:?}"
+    );
 }
 
 #[tokio::test]
