@@ -11,6 +11,7 @@ import sys
 import pytest
 from error_types import CommitFailed, LocalChanges
 from lore_parsers import parse_status_json
+from test_utils import status_revisions
 
 from lore import Lore
 
@@ -1648,3 +1649,118 @@ def test_merge_of_a_move_of_a_locally_edited_file_refuses(new_lore_repo):
     with repo.open_file("moved/from.txt") as f:
         assert f.read() == "locally edited\n", "the refused merge should keep the edit"
     assert not repo.file_exists("moved/to.txt")
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("placement", ["on-disk", "out-of-view"])
+def test_a_merge_takes_a_file_added_again(new_lore_repo, scratch_dir, placement):
+    """A merge into a branch that never changed a file takes the file the merged branch
+    deleted and then added again with the same content: the merge revision holds it with
+    the merged branch's file ID, and a diff of that branch's latest and the merge reports
+    no change of it. This holds with the file on disk, and with it outside the view where
+    the branch edited another file in its directory, so the merge takes the directory file
+    by file."""
+    repo: Lore = new_lore_repo()
+    added_again = "Dir/Sub/c.txt"
+    repo.write_commit_push(
+        "Base",
+        {
+            added_again: "c\n",
+            "Dir/Sub/d.txt": "d\n",
+            "Dir/a.txt": "a\n",
+            "Top.txt": "top\n",
+        },
+    )
+    repo.branch_create("feature")
+    feature_edits = {"Top.txt": "feature\n"}
+    if placement == "out-of-view":
+        feature_edits["Dir/Sub/d.txt"] = "feature\n"
+    repo.write_commit_push("Feature", feature_edits)
+    repo.branch_switch("main")
+    repo.remove_file(added_again)
+    repo.stage(scan=True)
+    repo.commit("Delete")
+    repo.write_commit_push("Add again", {added_again: "c\n"})
+    main = status_revisions(repo)["revision"]
+
+    merged = repo
+    if placement == "out-of-view":
+        view = os.path.join(scratch_dir("view", create=True), "view.txt")
+        with open(view, "w") as output_file:
+            output_file.write("/Dir/Sub\n")
+        merged = repo.clone(view=view)
+        assert not merged.file_exists(added_again)
+    merged.branch_switch("feature")
+    merged.branch_merge("main", message="Merge main")
+    merge = status_revisions(merged)["revision"]
+
+    [incoming] = merged.file_info(added_again, revision=main)
+    [result] = merged.file_info(added_again, revision=merge)
+    assert (result.context, result.hash) == (incoming.context, incoming.hash)
+    assert added_again not in merged.revision_diff(main, target=merge)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("operation", ["sync", "fast-forward-merge", "cherry-pick"])
+def test_joining_a_file_added_again(new_lore_repo, operation):
+    """Each operation that joins two lines of history takes the file one line deleted and
+    then added again with the same content, where the other line never changed the file:
+    the joined revision holds it with that line's file ID. The unit tests cover the other
+    line editing the file, or deleting it and adding it again too. A diverged sync joins
+    the delete and the add; a fast-forward merge and a cherry-pick join one revision that
+    replaces the file, made by cherry-picking the add onto a branch holding the old
+    file."""
+    repo: Lore = new_lore_repo()
+    added_again = "Dir/Sub/c.txt"
+    repo.write_commit_push(
+        "Base", {added_again: "c\n", "Dir/a.txt": "a\n", "Top.txt": "top\n"}
+    )
+
+    def delete_and_add_again(instance: Lore) -> str:
+        instance.remove_file(added_again)
+        instance.stage(scan=True)
+        instance.commit("Delete")
+        instance.write_files({added_again: "c\n"})
+        instance.stage(scan=True)
+        instance.commit("Add again")
+        return status_revisions(instance)["revision"]
+
+    def replacement(instance: Lore, branch: str) -> str:
+        instance.branch_create("added-again")
+        added = delete_and_add_again(instance)
+        instance.branch_switch(branch)
+        instance.revision_cherry_pick(revision=added, message="Replace")
+        return status_revisions(instance)["revision"]
+
+    def change(instance: Lore):
+        """Makes the other line's change, an edit of another file."""
+        instance.write_files({"Top.txt": "edited\n"})
+        instance.stage(scan=True)
+        instance.commit("Other")
+
+    joined = repo
+    if operation == "sync":
+        other = repo.clone()
+        change(other)
+        incoming = delete_and_add_again(repo)
+        repo.push()
+        other.sync()
+        joined = other
+    elif operation == "fast-forward-merge":
+        other = repo.clone()
+        incoming = replacement(repo, "main")
+        change(other)
+        other.push()
+        repo.push(fast_forward_merge=True)
+        joined = repo.clone()
+    else:
+        repo.branch_create("replaced")
+        incoming = replacement(repo, "replaced")
+        repo.branch_switch("main")
+        change(repo)
+        repo.revision_cherry_pick(revision=incoming, message="Pick")
+
+    result = status_revisions(joined)["revision"]
+    [expected_file] = joined.file_info(added_again, revision=incoming)
+    [held] = joined.file_info(added_again, revision=result)
+    assert (held.context, held.hash) == (expected_file.context, expected_file.hash)

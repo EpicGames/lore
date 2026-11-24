@@ -3309,6 +3309,26 @@ impl State {
         self.node_delta(repository, node, true).await
     }
 
+    /// The entries the delta of this revision records for changes other than deletions, sorted by
+    /// node: those [`Self::node_change`] finds.
+    pub async fn changed_nodes(
+        &self,
+        repository: Arc<RepositoryContext>,
+    ) -> Result<Vec<NodeDelta>, StateError> {
+        let delta_block = self
+            .delta_block(repository)
+            .await?
+            .to_aligned::<NodeDelta>();
+        let mut entries: Vec<NodeDelta> = delta_block
+            .as_type_slice::<NodeDelta>()
+            .iter()
+            .filter(|entry| entry.action != FileAction::Delete as u16)
+            .copied()
+            .collect();
+        entries.sort_unstable_by_key(|entry| entry.node);
+        Ok(entries)
+    }
+
     /// The entry the delta of this revision records for `node` that is a deletion where `deletion`
     /// says, and one that isn't otherwise.
     async fn node_delta(

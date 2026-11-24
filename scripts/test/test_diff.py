@@ -2063,3 +2063,25 @@ def test_diff3_move_shown_as_move(new_lore_repo):
         "diff3 did not show the source branch's edit as an added line.\nOutput:\n"
         + output
     )
+
+
+@pytest.mark.smoke
+def test_branch_diff_lists_a_file_the_branch_added_again(new_lore_repo):
+    """`lore branch diff` of a branch that deleted a file and added it again with the
+    same content lists the file, as a merge of the branch takes the added file, and
+    lists nothing for a file the branch left alone."""
+    repo: Lore = new_lore_repo()
+    added_again = "Dir/Sub/c.txt"
+    repo.write_commit_push(
+        "Base", {added_again: "c\n", "Top.txt": "top\n"}, offline=True
+    )
+    repo.branch_create("feature", offline=True)
+    repo.remove_file(added_again)
+    repo.stage(scan=True, offline=True)
+    repo.commit("Delete", offline=True)
+    repo.write_commit_push("Add again", {added_again: "c\n"}, offline=True)
+
+    output = repo.branch_diff("main", source="feature", offline=True)
+
+    assert added_again in output, output
+    assert "Top.txt" not in output, output

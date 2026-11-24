@@ -153,13 +153,21 @@ fn differing<T: PartialEq + std::fmt::Debug>(
 }
 
 /// Merges `source` into `target`, both made on `base`, as the server's fast-forward merge does,
-/// and answers the stored revision.
-async fn fast_forward_merge(instance: &Instance, base: Hash, source: Hash, target: Hash) -> Hash {
+/// leaving out the changes at `dropped`, and answers the stored revision.
+pub(super) async fn fast_forward_merge(
+    instance: &Instance,
+    base: Hash,
+    source: Hash,
+    target: Hash,
+    dropped: &[&str],
+) -> Hash {
     let repository = instance.repository.clone();
     let mut diff = diff3_collect(repository.clone(), base, source, target, None, true)
         .await
         .expect("Failed to diff the revisions");
     assert!(diff.conflicts.is_empty(), "{:?}", diff.conflicts);
+    diff.changes
+        .retain(|change| !dropped.contains(&change.path().as_str()));
     let merged = revision_state(instance, target).await;
     merge_tree_changes(
         repository.clone(),
@@ -226,7 +234,7 @@ async fn commit_main(instance: &Instance, main: &[Edit]) -> Hash {
 /// nodes the fast-forward merge holds and that the 2-way diff from `base` reports the same changes
 /// across both, and answers the fast-forward merge's revision.
 async fn assert_recorded(instance: &Instance, base: Hash, source: Hash, target: Hash) -> Hash {
-    let merged = fast_forward_merge(instance, base, source, target).await;
+    let merged = fast_forward_merge(instance, base, source, target, &[]).await;
     assert!(
         merge_branch(instance, "feature").await,
         "the merge committed"

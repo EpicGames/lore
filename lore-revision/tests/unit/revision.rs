@@ -23,11 +23,13 @@ mod case_rename;
 mod deletion_walk;
 mod diff;
 mod fast_forward_merge;
+mod held_before_replacement;
 pub(crate) mod instance;
 mod interrupted_commit;
 mod interrupted_push;
 mod last_merged;
 mod merge_deletions;
+mod merge_file_ids;
 mod merge_local_work;
 #[cfg(unix)]
 mod merge_modes;

@@ -418,3 +418,31 @@ pub(super) async fn names_along(instance: &Instance, revision: Hash, path: &str)
     names.reverse();
     names
 }
+
+/// Keeps `directory` out of the working tree: names it in the view and removes it from disk, as a
+/// sync to the view does.
+pub(super) fn exclude(instance: &mut Instance, directory: &str) {
+    let dot = instance.path.join(repository::DOT_LORE);
+    std::fs::write(dot.join(repository::VIEW_FILTER), format!("/{directory}\n"))
+        .expect("Failed to write the view");
+    let filter = repository::load_filter(&instance.path).expect("Failed to load the filter");
+    instance.repository = Arc::new(instance.repository.to_filter_context(filter));
+    std::fs::remove_dir_all(instance.path.join(directory)).expect("Failed to remove the directory");
+}
+
+/// Cherry-picks `revision` onto the current branch and commits it with `message`, answering the
+/// revision committed.
+pub(super) async fn cherry_pick(instance: &Instance, revision: Hash, message: &str) -> Hash {
+    lore_revision::revision::cherry_pick::cherry_pick_boxed(
+        instance.repository.clone(),
+        &instance.write_token,
+        revision,
+        lore_revision::revision::cherry_pick::CherryPickOptions {
+            message: message.to_string(),
+            no_commit: false,
+            inherit_metadata: MetadataInherit::default(),
+        },
+    )
+    .await
+    .expect("Failed to cherry-pick")
+}

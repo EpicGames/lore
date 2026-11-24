@@ -2455,12 +2455,12 @@ async fn an_edit_against_a_case_only_rename_that_adds_the_file_again_follows_the
 }
 
 /// A file deleted and added again with the content it held, below a directory the same side renames
-/// only in case, is no change, as it is no change where no rename comes with it: the diff lists
-/// nothing of it, whichever side makes it. The other side's change of the file merges with the
-/// rename, an edit where that side renames `Dir/Sub` only in case as well and a move within the
-/// renamed directory.
+/// only in case, gives way to the other side's change of the file, as it gives way where no rename
+/// comes with it: the diff lists nothing of it, whichever side makes it. The other side's change of
+/// the file merges with the rename, an edit where that side renames `Dir/Sub` only in case as well
+/// and a move within the renamed directory.
 #[tokio::test]
-async fn a_file_added_again_below_a_case_only_rename_is_no_change() {
+async fn a_file_added_again_below_a_case_only_rename_gives_way_to_a_change_of_it() {
     run(|repository| async move {
         let base = base(&repository).await;
         for (renaming, added_at, other, expected_edits, at, changes) in [
@@ -2513,6 +2513,41 @@ async fn a_file_added_again_below_a_case_only_rename_is_no_change() {
                     )
                 );
                 assert_merged_spelling(&repository, &diff, &expected, at, &[]).await;
+            }
+        }
+    })
+    .await;
+}
+
+/// A file deleted and added again with the content it held, below a directory the same side renames
+/// only in case, stands where the other side changes another file: the merged tree holds the added
+/// file below the new spelling, whichever side makes it.
+#[tokio::test]
+async fn a_file_added_again_below_a_case_only_rename_stands_where_the_other_side_leaves_it() {
+    run(|repository| async move {
+        let base = base(&repository).await;
+        let address_at = async |revision: Hash, path: &str| {
+            let state = revision_state(&repository, revision).await;
+            let node = node_at(&repository, &state, path).await;
+            state
+                .node(repository.clone(), node)
+                .await
+                .expect("reading the node")
+                .address
+        };
+        for (renaming, added_at) in [(RENAME_DIR, "dir/Sub/c.txt"), (RENAME_SUB, "Dir/sub/c.txt")] {
+            let deleted = edited(&repository, base, &[renaming, Edit::Delete(added_at)]).await;
+            let added_again = edited(&repository, deleted, &[Edit::Add(added_at, 1)]).await;
+            let other = edited(&repository, base, &[Edit::Write("Other.txt", 2)]).await;
+            let added = address_at(added_again, added_at).await;
+            assert_ne!(address_at(base, "Dir/Sub/c.txt").await, added);
+            for (source, target) in [(added_again, other), (other, added_again)] {
+                let diff = diff3_collect(repository.clone(), base, source, target, None, false)
+                    .await
+                    .expect("diffing the revisions");
+                assert_eq!(outcome(&diff).1, vec![], "{added_at}: no conflict");
+                let merged = apply(&repository, &diff).await;
+                assert_eq!(address_at(merged, added_at).await, added, "{added_at}");
             }
         }
     })
