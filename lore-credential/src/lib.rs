@@ -5,6 +5,7 @@ pub mod token_store;
 pub mod util;
 
 // Re-export key types at the crate root for convenience
+pub use jwt::EARLY_REFRESH_MARGIN_MS;
 pub use jwt::IDENTITY_CLAIM;
 pub use jwt::IDENTITY_CLAIM_NAMESPACED;
 pub use jwt::JWTUserInfo;
@@ -14,12 +15,18 @@ pub use jwt::domain_in_root_domains;
 pub use jwt::identity_from_token;
 pub use jwt::insecure_decode_claims;
 pub use jwt::insecure_decode_token;
+pub use jwt::is_expired;
+pub use jwt::is_token_expired;
+pub use jwt::is_token_expired_at;
+pub use jwt::now_ms;
 pub use jwt::unsigned_identity_token;
 pub use jwt::user_info;
 pub use jwt::user_info_from_token;
 pub use jwt::verify_jwt_usage_for_remote;
 pub use token_store::IdentityToken;
 pub use token_store::StoredIdentityInfo;
+pub use token_store::StoredToken;
+pub use token_store::TokenReceipt;
 pub use token_store::TokenStoreError;
 pub use util::domain_from_url_or_url;
 pub use util::domain_from_url_str_or_url;

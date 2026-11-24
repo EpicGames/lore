@@ -619,6 +619,70 @@ mod refused {
         assert_eq!(authorized, AUTHZ_TWO);
         assert_eq!(stub.exchanges(), 3);
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_clock_ahead_succeeds_after_one_refresh_on_quic_session_start() {
+        const AUTH_URL: &str = "oidc+https://quic-clock-ahead.test.invalid";
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Client clock is 2 hours ahead of server: both old and newly refreshed tokens have `exp`
+        // in the past on the local wall clock, but the refreshed token has a 1-hour `exp - iat`
+        // lifetime and was just received.
+        let expired_authn = super::jwt("alice", "example.com", super::EXPIRED);
+        let drifted_fresh_authn =
+            super::jwt_with_iat("alice", "example.com", now_secs - 7200, now_secs - 3600);
+        let drifted_authz =
+            super::jwt_with_iat("alice", "example.com", now_secs - 7200, now_secs - 6600);
+
+        token_store::store_user_token_and_refresh_token(
+            AUTH_URL,
+            "alice",
+            &expired_authn,
+            vec!["example.com".to_owned()],
+            Some("refresh-1"),
+            0,
+            None,
+        )
+        .await
+        .expect("store login");
+
+        let drifted_authn_expected = drifted_fresh_authn.clone();
+        let drifted_authz_resp = drifted_authz.clone();
+        let stub = StubAuthentication::with_exchange(
+            move |authn_token, _| {
+                assert_eq!(authn_token, drifted_authn_expected);
+                Ok(drifted_authz_resp.clone())
+            },
+            Some(Box::new(move |_| {
+                Ok(super::refreshed(&drifted_fresh_authn, "refresh-2"))
+            })),
+        );
+        let endpoint = AuthEndpoint::new(AUTH_URL.to_string(), stub.clone());
+        let server = TestStorageServer::start_refusing_authorizations(&[]);
+        let client = connect(
+            &server,
+            &endpoint,
+            &Arc::new(SuppliedCredentials::default()),
+        )
+        .await;
+
+        let first = client.session_start(test_partition(), "test-1").await;
+        let second = client.session_start(test_partition(), "test-2").await;
+
+        assert!(first.is_ok(), "first session must start: {first:?}");
+        assert!(
+            second.is_ok(),
+            "second session must reuse cached token: {second:?}"
+        );
+        assert_eq!(stub.presented(), ["refresh-1"]);
+        assert_eq!(stub.exchanges(), 1);
+        assert_eq!(
+            server.presented_authorizations(),
+            [drifted_authz.clone(), drifted_authz]
+        );
+    }
 }
 
 /// An implementation that refuses the login token reports `NotAuthenticated`, and the
@@ -799,6 +863,23 @@ fn jwt(subject: &str, audience: &str, exp: u64) -> String {
     )
 }
 
+fn jwt_with_iat(subject: &str, audience: &str, iat: u64, exp: u64) -> String {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let claims = serde_json::json!({
+        "iss": "lore",
+        "sub": subject,
+        "aud": [audience],
+        "iat": iat,
+        "exp": exp,
+    });
+    format!(
+        "{}.{}.signature",
+        URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#),
+        URL_SAFE_NO_PAD.encode(claims.to_string())
+    )
+}
+
 const EXPIRED: u64 = 1_000_000_000;
 const REFRESHED_REFRESH_EXPIRES: u64 = 1_950_000_000_000;
 
@@ -808,6 +889,7 @@ fn refreshed(token: &str, refresh_token: &str) -> lore_transport::types::Authent
         user_id: "alice".to_owned(),
         user_name: String::new(),
         expires_ms: 2_000_000_000_000,
+        lifetime_ms: None,
         acceptable_root_domains: Vec::new(),
         refresh_token: Some(refresh_token.to_owned()),
         refresh_expires_ms: REFRESHED_REFRESH_EXPIRES,
@@ -1426,4 +1508,188 @@ async fn an_exchange_whose_refresh_is_unsent_is_disconnected() {
     assert!(err.is_disconnected(), "{err}");
     assert_eq!(stub.presented(), ["refresh-1", "refresh-1"]);
     assert_eq!(stub.exchanges(), 0);
+}
+
+#[tokio::test]
+async fn exchange_succeeds_after_one_refresh_when_client_clock_is_ahead() {
+    const AUTH_URL: &str = "oidc+https://exchange-clock-ahead.test.invalid";
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Client clock is 2 hours ahead of the issuer: the refreshed login token and the exchanged
+    // authz token both have `exp` in the past according to the local wall clock, but have a
+    // 1-hour `exp - iat` lifetime.
+    let old_authn = jwt("alice", "example.com", EXPIRED);
+    let drifted_authn = jwt_with_iat("alice", "example.com", now_secs - 7200, now_secs - 3600);
+    let drifted_authz = jwt_with_iat("alice", "example.com", now_secs - 7200, now_secs - 6600);
+
+    token_store::store_user_token_and_refresh_token(
+        AUTH_URL,
+        "alice",
+        &old_authn,
+        vec!["example.com".to_owned()],
+        Some("refresh-1"),
+        0,
+        None,
+    )
+    .await
+    .expect("store login");
+
+    let expected_authn = drifted_authn.clone();
+    let expected_authz = drifted_authz.clone();
+    let stub = StubAuthentication::with_exchange(
+        move |authn_token, _| {
+            assert_eq!(authn_token, expected_authn);
+            Ok(expected_authz.clone())
+        },
+        Some(Box::new(move |_| {
+            Ok(refreshed(&drifted_authn, "refresh-2"))
+        })),
+    );
+    let endpoint = AuthEndpoint::new(AUTH_URL.to_string(), stub.clone());
+
+    for _ in 0..2 {
+        let token = exchange(
+            &endpoint,
+            "alice",
+            a_repository(),
+            "example.com".to_string(),
+            "",
+            "",
+        )
+        .await
+        .expect("exchange succeeds despite client clock ahead");
+        assert_eq!(token, drifted_authz);
+    }
+
+    assert_eq!(stub.presented(), ["refresh-1"]);
+    assert_eq!(stub.exchanges(), 1);
+}
+
+#[tokio::test]
+async fn exchange_refreshes_when_client_clock_is_behind_and_lifetime_elapsed() {
+    const AUTH_URL: &str = "oidc+https://exchange-clock-behind-elapsed.test.invalid";
+    let now_ms = lore_credential::now_ms();
+    let now_secs = now_ms / 1000;
+    // Client clock is 2 hours behind the issuer: exp is far in the future on the local clock,
+    // but the token had a 1-hour lifetime and was stored 61 minutes ago.
+    let stale_authn = jwt_with_iat("alice", "example.com", now_secs + 3600, now_secs + 7200);
+    let fresh_authn = jwt_with_iat("alice", "example.com", now_secs + 7200, now_secs + 10800);
+    let fresh_authz = jwt_with_iat("alice", "example.com", now_secs + 7200, now_secs + 7800);
+
+    token_store::store_user_token_and_refresh_token_with_receipt(
+        AUTH_URL,
+        "alice",
+        &stale_authn,
+        vec!["example.com".to_owned()],
+        Some("refresh-1"),
+        0,
+        None,
+        token_store::TokenReceipt {
+            received_at: Some(now_ms - 3_660_000),
+            lifetime_ms: None,
+        },
+    )
+    .await
+    .expect("store login");
+
+    let expected_authn = fresh_authn.clone();
+    let expected_authz = fresh_authz.clone();
+    let stub = StubAuthentication::with_exchange(
+        move |authn_token, _| {
+            assert_eq!(authn_token, expected_authn);
+            Ok(expected_authz.clone())
+        },
+        Some(Box::new(move |_| Ok(refreshed(&fresh_authn, "refresh-2")))),
+    );
+    let endpoint = AuthEndpoint::new(AUTH_URL.to_string(), stub.clone());
+
+    let token = exchange(
+        &endpoint,
+        "alice",
+        a_repository(),
+        "example.com".to_string(),
+        "",
+        "",
+    )
+    .await
+    .expect("exchange refreshes once lifetime elapsed");
+
+    assert_eq!(token, fresh_authz);
+    assert_eq!(stub.presented(), ["refresh-1"]);
+    assert_eq!(stub.exchanges(), 1);
+}
+
+#[tokio::test]
+async fn tier1_unexchanged_authz_inherits_login_receipt_for_repo_and_custom_resource() {
+    const AUTH_URL: &str = "oidc+https://tier1-receipt.test.invalid";
+    let now_ms = lore_credential::now_ms();
+    let now_secs = now_ms / 1000;
+    // Login token with 1-hour lifetime received 30 minutes ago, while client clock is 2 hours behind.
+    let login_receipt = token_store::TokenReceipt {
+        received_at: Some(now_ms - 1_800_000),
+        lifetime_ms: Some(3_600_000),
+    };
+    let login_token = jwt_with_iat("alice", "example.com", now_secs + 7200, now_secs + 10800);
+
+    token_store::store_user_token_and_refresh_token_with_receipt(
+        AUTH_URL,
+        "alice",
+        &login_token,
+        vec!["example.com".to_owned()],
+        Some("refresh-1"),
+        0,
+        None,
+        login_receipt,
+    )
+    .await
+    .expect("store login");
+
+    // Tier 1 returns the login token itself as the authorization token.
+    let stub =
+        StubAuthentication::with_exchange(|authn_token, _| Ok(authn_token.to_string()), None);
+    let endpoint = AuthEndpoint::new(AUTH_URL.to_string(), stub);
+    let repo = a_repository();
+
+    let token = exchange(&endpoint, "alice", repo, "example.com".to_string(), "", "")
+        .await
+        .expect("tier 1 repo exchange succeeds");
+    assert_eq!(token, login_token);
+
+    let stored_authz = token_store::load_stored_token_from_store(
+        &authorization_store_key(&endpoint, &repo.to_string()),
+        "alice",
+        token_store::vulnerable_all_tokens(),
+    )
+    .await
+    .expect("stored repo authz entry");
+    assert_eq!(
+        stored_authz.receipt, login_receipt,
+        "tier 1 repo authz must inherit the login token's receipt rather than resetting its lifetime"
+    );
+
+    let custom_token = exchange_custom_resource(
+        &endpoint,
+        "alice",
+        "urc-user-service",
+        "example.com".to_string(),
+        "",
+        "",
+    )
+    .await
+    .expect("tier 1 custom resource exchange succeeds");
+    assert_eq!(custom_token, login_token);
+
+    let stored_custom = token_store::load_stored_token_from_store(
+        &authorization_store_key(&endpoint, "urc-user-service"),
+        "alice",
+        token_store::vulnerable_all_tokens(),
+    )
+    .await
+    .expect("stored custom resource authz entry");
+    assert_eq!(
+        stored_custom.receipt, login_receipt,
+        "tier 1 custom resource authz must inherit the login token's receipt"
+    );
 }

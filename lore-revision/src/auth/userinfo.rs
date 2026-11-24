@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use lore_credential::get_domain_or_empty;
 use lore_credential::insecure_decode_token;
+use lore_credential::is_expired;
+use lore_credential::is_token_expired;
 use lore_credential::token_store::vulnerable_all_tokens;
 use lore_credential::verify_jwt_usage_for_remote;
 use lore_error_set::prelude::*;
 use lore_transport::Connection;
 use lore_transport::UserService;
-use lore_transport::auth::exchange::is_expired;
 use serde::Serialize;
 
 use crate::errors::*;
@@ -343,7 +344,7 @@ fn access_token_event(
     let (authorized_domains, expires) = match lore_credential::insecure_decode_token(&token) {
         Ok(decoded) => (
             decoded.claims.acceptable_root_domains().join(", "),
-            decoded.claims.expires * 1000,
+            decoded.claims.expires.saturating_mul(1000),
         ),
         Err(_) => (String::new(), 0),
     };
@@ -442,15 +443,20 @@ impl ResolvedIdentity {
     pub fn session_valid(&self) -> bool {
         self.local_user_info
             .as_ref()
-            .is_some_and(|info| session_valid(info.expires, self.refresh_expires))
+            .is_some_and(|info| token_session_valid(info, self.refresh_expires))
     }
 }
 
-/// Whether a login is still usable: its token, expiring at `expires`, has not expired, or a
-/// refresh token can still renew it. `refresh_expires` is `None` without a refresh token, and
-/// `Some(0)` for one with no deadline.
-pub fn session_valid(expires: u64, refresh_expires: Option<u64>) -> bool {
-    if !is_expired(expires) {
+/// Whether a login described by `info` is still usable: its token has not expired (measured
+/// against `lifetime_ms` or `iat` and `received_at` when available), or a refresh token can still
+/// renew it.
+pub fn token_session_valid(info: &lore_credential::UserInfo, refresh_expires: Option<u64>) -> bool {
+    if !is_token_expired(
+        info.issued_at,
+        info.expires,
+        info.received_at,
+        info.lifetime_ms,
+    ) {
         return true;
     }
     match refresh_expires {

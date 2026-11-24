@@ -927,6 +927,7 @@ fn authentication_token_with_refresh() {
         user_id: "user-1".into(),
         user_name: "Alice".into(),
         expires_ms: 1700000000000,
+        lifetime_ms: None,
         acceptable_root_domains: vec!["example.com".into()],
         refresh_token: Some("refresh-abc".into()),
         refresh_expires_ms: 0,
@@ -948,6 +949,7 @@ fn authentication_token_without_refresh() {
         user_id: "user-1".into(),
         user_name: "Alice".into(),
         expires_ms: 1700000000000,
+        lifetime_ms: None,
         acceptable_root_domains: vec![],
         refresh_token: None,
         refresh_expires_ms: 0,
@@ -961,6 +963,7 @@ fn authorization_token_fields() {
     let token = AuthorizationToken {
         token: "authz-jwt".into(),
         expires_ms: 1700000060000,
+        lifetime_ms: None,
         acceptable_root_domains: vec!["repo.example.com".into(), "cdn.example.com".into()],
     };
     assert_eq!(token.token, "authz-jwt");

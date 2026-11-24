@@ -45,6 +45,7 @@ use tokio::sync::MutexGuard;
 use toml;
 
 use crate::jwt::domain_in_root_domains;
+use crate::jwt::now_ms;
 use crate::util::get_domain_or_empty;
 
 /// Secure-store service these secrets live under.
@@ -89,6 +90,45 @@ pub struct IdentityToken {
     /// The scope the issuer granted, space-delimited as RFC 6749 §3.3 has it.
     #[serde(default)]
     scope: Option<String>,
+    /// Local wall-clock time when `token` was received, in milliseconds since the UNIX epoch.
+    /// Zero for entries written before this field existed or imported without a known receipt time.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    received_at: u64,
+    /// Remaining lifetime reported by the issuer at receipt (`expires_in`), in milliseconds.
+    /// Zero when the issuer did not report a relative lifetime.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    lifetime_ms: u64,
+}
+
+/// Maximum integer TOML can serialize (`i64::MAX`).
+const MAX_TOML_U64: u64 = i64::MAX as u64;
+
+/// Receipt metadata persisted beside a stored token for clock-skew-tolerant expiry checks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TokenReceipt {
+    /// Local wall-clock time when the token was received, in milliseconds since the UNIX epoch.
+    pub received_at: Option<u64>,
+    /// Remaining lifetime reported by the issuer at receipt (`expires_in`), in milliseconds.
+    pub lifetime_ms: Option<u64>,
+}
+
+impl TokenReceipt {
+    /// Receipt stamped at the current local wall clock with an optional issuer-reported lifetime.
+    pub fn now(lifetime_ms: Option<u64>) -> Self {
+        Self {
+            received_at: Some(now_ms().min(MAX_TOML_U64)),
+            lifetime_ms: lifetime_ms
+                .filter(|&ms| ms > 0)
+                .map(|ms| ms.min(MAX_TOML_U64)),
+        }
+    }
+}
+
+/// A token loaded from the store along with its receipt metadata, when known.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredToken {
+    pub token: String,
+    pub receipt: TokenReceipt,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -558,8 +598,34 @@ pub async fn store_user_token(
     token: &str,
     acceptable_root_domains: Vec<String>,
 ) -> Result<(), TokenStoreError> {
-    let identity_token =
-        new_identity_token(auth_endpoint, identity, token, acceptable_root_domains).await?;
+    store_user_token_with_receipt(
+        auth_endpoint,
+        identity,
+        token,
+        acceptable_root_domains,
+        TokenReceipt::now(None),
+    )
+    .await
+}
+
+/// Stores `token` with explicit [`TokenReceipt`] metadata, keeping any stored refresh token and
+/// scope. Pass an inherited receipt when storing an unexchanged copy of an existing token, or
+/// [`TokenReceipt::default`] when the receipt time is unknown.
+pub async fn store_user_token_with_receipt(
+    auth_endpoint: &str,
+    identity: &str,
+    token: &str,
+    acceptable_root_domains: Vec<String>,
+    receipt: TokenReceipt,
+) -> Result<(), TokenStoreError> {
+    let identity_token = new_identity_token(
+        auth_endpoint,
+        identity,
+        token,
+        acceptable_root_domains,
+        receipt,
+    )
+    .await?;
     store_identity_token(auth_endpoint, identity_token, RefreshToken::Keep).await
 }
 
@@ -576,8 +642,40 @@ pub async fn store_user_token_and_refresh_token(
     refresh_expires: u64,
     scope: Option<&str>,
 ) -> Result<(), TokenStoreError> {
-    let mut identity_token =
-        new_identity_token(auth_endpoint, identity, token, acceptable_root_domains).await?;
+    store_user_token_and_refresh_token_with_receipt(
+        auth_endpoint,
+        identity,
+        token,
+        acceptable_root_domains,
+        refresh_token,
+        refresh_expires,
+        scope,
+        TokenReceipt::now(None),
+    )
+    .await
+}
+
+/// Like [`store_user_token_and_refresh_token`], recording explicit [`TokenReceipt`] metadata
+/// (`TokenReceipt::default()` for externally supplied tokens whose receipt age is unknown).
+#[allow(clippy::too_many_arguments)]
+pub async fn store_user_token_and_refresh_token_with_receipt(
+    auth_endpoint: &str,
+    identity: &str,
+    token: &str,
+    acceptable_root_domains: Vec<String>,
+    refresh_token: Option<&str>,
+    refresh_expires: u64,
+    scope: Option<&str>,
+    receipt: TokenReceipt,
+) -> Result<(), TokenStoreError> {
+    let mut identity_token = new_identity_token(
+        auth_endpoint,
+        identity,
+        token,
+        acceptable_root_domains,
+        receipt,
+    )
+    .await?;
     if let Some(refresh_token) = refresh_token {
         identity_token.refresh_token = Some(encrypt_token(refresh_token).await?);
         identity_token.refresh_expires = refresh_expires;
@@ -601,6 +699,7 @@ async fn new_identity_token(
     identity: &str,
     token: &str,
     mut acceptable_root_domains: Vec<String>,
+    receipt: TokenReceipt,
 ) -> Result<IdentityToken, TokenStoreError> {
     // A work-around for Auth Service's issuer being a keyword rather than a domain.
     acceptable_root_domains.push(get_domain_or_empty(auth_endpoint.trim_end_matches('/')));
@@ -611,6 +710,8 @@ async fn new_identity_token(
         refresh_token: None,
         refresh_expires: 0,
         scope: None,
+        received_at: receipt.received_at.unwrap_or(0).min(MAX_TOML_U64),
+        lifetime_ms: receipt.lifetime_ms.unwrap_or(0).min(MAX_TOML_U64),
     })
 }
 
@@ -694,8 +795,23 @@ async fn store_identity_token(
 pub async fn load_user_token_from_store<P>(
     auth_endpoint: &str,
     identity: &str,
-    mut base_filter: P,
+    base_filter: P,
 ) -> Result<String, TokenStoreError>
+where
+    P: FnMut(&&IdentityToken) -> bool,
+{
+    load_stored_token_from_store(auth_endpoint, identity, base_filter)
+        .await
+        .map(|stored| stored.token)
+}
+
+/// Loads the first suitable token and its recorded receipt timestamp for `identity` from the
+/// shared store.
+pub async fn load_stored_token_from_store<P>(
+    auth_endpoint: &str,
+    identity: &str,
+    mut base_filter: P,
+) -> Result<StoredToken, TokenStoreError>
 where
     P: FnMut(&&IdentityToken) -> bool,
 {
@@ -711,7 +827,7 @@ where
     }
     lore_trace!("Load user {identity} token for auth_endpoint {auth_endpoint}");
 
-    let encrypted_token = {
+    let found = {
         let mut store = cached_token_map().await;
         if store.is_none()
             && let Ok(guard) = lock_token_map().await
@@ -732,7 +848,15 @@ where
                 lore_trace!(
                     "Found user {identity} token for auth_endpoint {auth_endpoint}, loading"
                 );
-                Some(token_identity.token.clone())
+                Some((
+                    token_identity.token.clone(),
+                    TokenReceipt {
+                        received_at: (token_identity.received_at != 0)
+                            .then_some(token_identity.received_at),
+                        lifetime_ms: (token_identity.lifetime_ms != 0)
+                            .then_some(token_identity.lifetime_ms),
+                    },
+                ))
             } else {
                 None
             }
@@ -740,10 +864,43 @@ where
             None
         }
     };
-    match encrypted_token {
-        Some(token) => decrypt_token(token).await,
+    match found {
+        Some((token, receipt)) => Ok(StoredToken {
+            token: decrypt_token(token).await?,
+            receipt,
+        }),
         None => Err(TokenNotFound.into()),
     }
+}
+
+/// Loads the authentication token and its receipt metadata for `identity`, preferring a
+/// caller-supplied `identity_token` (with an empty receipt) over the shared store.
+pub async fn load_stored_token<P>(
+    auth_endpoint: &str,
+    identity: &str,
+    base_filter: P,
+    identity_token: &str,
+    access_token: &str,
+) -> Result<StoredToken, TokenStoreError>
+where
+    P: FnMut(&&IdentityToken) -> bool,
+{
+    if !identity_token.is_empty() {
+        lore_debug!("Using the supplied identity token for {identity}");
+        return Ok(StoredToken {
+            token: identity_token.to_string(),
+            receipt: TokenReceipt::default(),
+        });
+    }
+
+    if !access_token.is_empty() {
+        lore_debug!(
+            "Only an access token was supplied, not reading an authentication token from the store for {identity}"
+        );
+        return Err(TokenNotFound.into());
+    }
+
+    load_stored_token_from_store(auth_endpoint, identity, base_filter).await
 }
 
 /// Load the authentication token for `identity`, preferring one the caller
@@ -758,19 +915,15 @@ pub async fn load_user_token<P>(
 where
     P: FnMut(&&IdentityToken) -> bool,
 {
-    if !identity_token.is_empty() {
-        lore_debug!("Using the supplied identity token for {identity}");
-        return Ok(identity_token.to_string());
-    }
-
-    if !access_token.is_empty() {
-        lore_debug!(
-            "Only an access token was supplied, not reading an authentication token from the store for {identity}"
-        );
-        return Err(TokenNotFound.into());
-    }
-
-    load_user_token_from_store(auth_endpoint, identity, base_filter).await
+    load_stored_token(
+        auth_endpoint,
+        identity,
+        base_filter,
+        identity_token,
+        access_token,
+    )
+    .await
+    .map(|stored| stored.token)
 }
 
 /// Returns true if `remote` is the base `auth_url` or a resource-scoped entry
@@ -1074,6 +1227,7 @@ pub enum Refreshed<E> {
     /// moves the idle deadline: milliseconds since the UNIX epoch, or 0 for unknown.
     Token {
         token: String,
+        lifetime_ms: Option<u64>,
         refresh_token: Option<String>,
         refresh_expires: u64,
         scope: Option<String>,
@@ -1158,6 +1312,7 @@ where
     let result = match refreshed {
         Refreshed::Token {
             token,
+            lifetime_ms,
             refresh_token,
             refresh_expires,
             scope,
@@ -1169,6 +1324,8 @@ where
                     acceptable_root_domains.push(get_domain_or_empty(auth_endpoint));
                     entry.token = seal_token(&key, &token)
                         .forward::<RefreshError>("sealing the refreshed token")?;
+                    entry.received_at = now_ms().min(MAX_TOML_U64);
+                    entry.lifetime_ms = lifetime_ms.unwrap_or(0).min(MAX_TOML_U64);
                     entry.acceptable_root_domains = acceptable_root_domains;
                     entry.refresh_token = match refresh_token {
                         Some(refresh_token) => Some(
@@ -1715,6 +1872,8 @@ pub mod test_util {
                 refresh_token,
                 refresh_expires: 0,
                 scope,
+                received_at: 0,
+                lifetime_ms: 0,
             }
         }
 

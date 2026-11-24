@@ -309,6 +309,9 @@ pub struct AuthenticationToken {
     pub user_name: String,
     /// Expiry as milliseconds since UNIX epoch.
     pub expires_ms: u64,
+    /// Remaining lifetime reported by the issuer at receipt (`expires_in`), in milliseconds,
+    /// when the protocol reports one.
+    pub lifetime_ms: Option<u64>,
     /// Root domains this token is valid for.
     pub acceptable_root_domains: Vec<String>,
     /// One-time-use refresh token for obtaining a new authentication token
@@ -334,6 +337,9 @@ pub struct AuthorizationToken {
     pub token: String,
     /// Expiry as milliseconds since UNIX epoch.
     pub expires_ms: u64,
+    /// Remaining lifetime reported by the issuer at receipt (`expires_in`), in milliseconds,
+    /// when the protocol reports one.
+    pub lifetime_ms: Option<u64>,
     /// Root domains this token is valid for.
     pub acceptable_root_domains: Vec<String>,
 }

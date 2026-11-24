@@ -42,6 +42,7 @@ mod tests {
                     Ok(AuthorizationToken {
                         token: "authz-token".into(),
                         expires_ms: u64::MAX,
+                        lifetime_ms: None,
                         acceptable_root_domains: vec![],
                     })
                 }),

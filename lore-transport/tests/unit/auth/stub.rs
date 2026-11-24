@@ -23,20 +23,18 @@ pub(crate) const AUTHN_TWO: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3M
 pub(crate) const AUTHZ_ONE: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJuYW1lIjoiQWxpY2UiLCJhdXRoeiI6Im9uZSJ9.signature";
 pub(crate) const AUTHZ_TWO: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJuYW1lIjoiQWxpY2UiLCJhdXRoeiI6InR3byJ9.signature";
 
-/// Names the authorization for the authentication token traded in and the number of exchanges
-/// served before it.
-type Authorize = Box<dyn Fn(&str, usize) -> &'static str + Send + Sync>;
+/// Answers an authorization exchange for the authentication token traded in and the number of
+/// exchanges served before it.
+type Exchange = Box<dyn Fn(&str, usize) -> Result<String, ProtocolError> + Send + Sync>;
 
 /// Answers a refresh grant for the refresh token presented.
 type Refresh = Box<dyn Fn(&str) -> Result<AuthenticationToken, ProtocolError> + Send + Sync>;
 
-/// Hands out the authorization `authorize` names, or fails every exchange with `exchange_error`,
-/// and counts the exchanges. Refreshes are answered by `refresh`, and fail as `Internal` without
-/// one.
+/// Hands out the authorization `exchange` returns, and counts the exchanges. Refreshes are
+/// answered by `refresh`, and fail as `Internal` without one.
 pub(crate) struct StubAuthentication {
     exchanges: AtomicUsize,
-    authorize: Authorize,
-    exchange_error: Option<fn() -> ProtocolError>,
+    exchange: Exchange,
     refresh: Option<Refresh>,
     refresh_delay: std::time::Duration,
     presented: parking_lot::Mutex<Vec<String>>,
@@ -46,11 +44,20 @@ impl StubAuthentication {
     pub(crate) fn new(
         authorize: impl Fn(&str, usize) -> &'static str + Send + Sync + 'static,
     ) -> Arc<Self> {
+        Self::with_exchange(
+            move |authn_token, served| Ok(authorize(authn_token, served).to_string()),
+            None,
+        )
+    }
+
+    pub(crate) fn with_exchange(
+        exchange: impl Fn(&str, usize) -> Result<String, ProtocolError> + Send + Sync + 'static,
+        refresh: Option<Refresh>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             exchanges: AtomicUsize::new(0),
-            authorize: Box::new(authorize),
-            exchange_error: None,
-            refresh: None,
+            exchange: Box::new(exchange),
+            refresh,
             refresh_delay: std::time::Duration::ZERO,
             presented: parking_lot::Mutex::default(),
         })
@@ -71,14 +78,14 @@ impl StubAuthentication {
     ) -> Arc<Self> {
         Arc::new(Self {
             exchanges: AtomicUsize::new(0),
-            authorize: Box::new(|authn_token, _| {
-                if authn_token == AUTHN_ONE {
+            exchange: Box::new(|authn_token, _| {
+                Ok(if authn_token == AUTHN_ONE {
                     AUTHZ_ONE
                 } else {
                     AUTHZ_TWO
                 }
+                .to_string())
             }),
-            exchange_error: None,
             refresh: Some(Box::new(refresh)),
             refresh_delay: delay,
             presented: parking_lot::Mutex::default(),
@@ -88,14 +95,7 @@ impl StubAuthentication {
     /// A stub that fails every exchange with the error `exchange_error` makes, and every refresh
     /// as `Internal`.
     pub(crate) fn failing_exchanges(exchange_error: fn() -> ProtocolError) -> Arc<Self> {
-        Arc::new(Self {
-            exchanges: AtomicUsize::new(0),
-            authorize: Box::new(|_, _| ""),
-            exchange_error: Some(exchange_error),
-            refresh: None,
-            refresh_delay: std::time::Duration::ZERO,
-            presented: parking_lot::Mutex::default(),
-        })
+        Self::with_exchange(move |_, _| Err(exchange_error()), None)
     }
 
     /// Repository exchanges served so far.
@@ -119,12 +119,11 @@ impl Authentication for StubAuthentication {
         _correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
         let served = self.exchanges.fetch_add(1, Ordering::AcqRel);
-        if let Some(exchange_error) = self.exchange_error {
-            return Err(exchange_error());
-        }
+        let token = (self.exchange)(authn_token, served)?;
         Ok(AuthorizationToken {
-            token: (self.authorize)(authn_token, served).to_string(),
+            token,
             expires_ms: 0,
+            lifetime_ms: None,
             acceptable_root_domains: vec!["example.com".to_string()],
         })
     }

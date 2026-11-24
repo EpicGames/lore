@@ -44,6 +44,25 @@ struct ExchangeResponse {
     access_token: String,
     issued_token_type: Option<String>,
     token_type: String,
+    #[serde(default, deserialize_with = "lenient_expires_in")]
+    expires_in: Option<u64>,
+}
+
+/// Leniently decodes an optional `expires_in` seconds field so a provider returning a float or
+/// unexpected type falls back to `None` instead of failing the exchange.
+fn lenient_expires_in<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let seconds = match value {
+        serde_json::Value::Number(num) => num.as_u64().or_else(|| {
+            let f = num.as_f64()?.floor();
+            (f.is_finite() && f >= 0.0 && f < (u64::MAX as f64)).then_some(f as u64)
+        }),
+        _ => None,
+    };
+    Ok(seconds)
 }
 
 /// The target naming `repository` under the template the server advertises, or `None` when
@@ -88,7 +107,8 @@ pub fn unexchanged(subject_token: &str) -> Result<AuthorizationToken, ProtocolEr
         .claims;
     Ok(AuthorizationToken {
         token: subject_token.to_owned(),
-        expires_ms: claims.expires * 1000,
+        expires_ms: claims.expires.saturating_mul(1000),
+        lifetime_ms: None,
         // Populated by the orchestration layer from the token's claims.
         acceptable_root_domains: Vec::new(),
     })
@@ -246,6 +266,7 @@ fn authorization_token(response: ExchangeResponse) -> Result<AuthorizationToken,
         access_token,
         issued_token_type,
         token_type,
+        expires_in,
     } = response;
     if let Some(issued) = issued_token_type
         && issued != ACCESS_TOKEN_TYPE
@@ -270,7 +291,8 @@ fn authorization_token(response: ExchangeResponse) -> Result<AuthorizationToken,
     };
     Ok(AuthorizationToken {
         token: access_token,
-        expires_ms: decoded.claims.expires * 1000,
+        expires_ms: decoded.claims.expires.saturating_mul(1000),
+        lifetime_ms: token::lifetime_ms(expires_in),
         // Populated by the orchestration layer from the token's claims.
         acceptable_root_domains: Vec::new(),
     })

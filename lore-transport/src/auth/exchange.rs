@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::time::Instant;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use lore_base::error::AddressNotFound;
 use lore_base::error::Disconnected;
@@ -22,8 +20,11 @@ use lore_base::lore_warn;
 use lore_base::types::RepositoryId;
 use lore_credential::get_domain_or_empty;
 use lore_credential::insecure_decode_token;
+use lore_credential::is_token_expired;
 use lore_credential::token_store;
 use lore_credential::token_store::Refreshed;
+use lore_credential::token_store::StoredToken;
+use lore_credential::token_store::TokenReceipt;
 use lore_credential::token_store::tokens_only_for_recipient_domain;
 use lore_credential::unsigned_identity_token;
 use lore_credential::verify_jwt_usage_for_remote;
@@ -61,7 +62,7 @@ type AuthzCacheKey = (
     CredentialFingerprint,
     CredentialStore,
 );
-type AuthzCache = Mutex<HashMap<AuthzCacheKey, String>>;
+type AuthzCache = Mutex<HashMap<AuthzCacheKey, StoredToken>>;
 
 static AUTHZ_CACHE: std::sync::OnceLock<AuthzCache> = std::sync::OnceLock::new();
 
@@ -122,7 +123,10 @@ pub(crate) async fn forget_refused_authorization(
         identity_token,
     );
     let mut cache = cache().lock().await;
-    if cache.get(&cache_key).is_some_and(|token| token == refused) {
+    if cache
+        .get(&cache_key)
+        .is_some_and(|entry| entry.token == refused)
+    {
         cache.remove(&cache_key);
     }
     if identity_token.is_empty() {
@@ -133,21 +137,32 @@ pub(crate) async fn forget_refused_authorization(
     }
 }
 
-pub fn is_expired(expires: u64) -> bool {
-    let expires = expires as u128;
-    let current_time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    current_time >= expires
+fn has_expired(token: &str, receipt: TokenReceipt) -> bool {
+    lore_credential::user_info_from_token(token.to_owned()).is_some_and(|info| {
+        is_token_expired(
+            info.issued_at,
+            info.expires,
+            receipt.received_at,
+            receipt.lifetime_ms,
+        )
+    })
 }
 
-fn has_expired(token: &str) -> bool {
-    lore_credential::user_info_from_token(token.to_owned())
-        .is_some_and(|info| is_expired(info.expires))
+/// Receipt metadata for an exchanged authorization token. On OIDC Tier 1 the exchange returns the
+/// login token itself, so inheriting its original receipt keeps its lifetime from resetting.
+fn exchanged_receipt(
+    authz_token: &str,
+    authz_lifetime_ms: Option<u64>,
+    authn: &StoredToken,
+) -> TokenReceipt {
+    if authz_token == authn.token {
+        authn.receipt
+    } else {
+        TokenReceipt::now(authz_lifetime_ms)
+    }
 }
 
-/// `token`, `identity`'s authentication token from the store, or the token that replaces it
+/// `stored`, `identity`'s authentication token from the store, or the token that replaces it
 /// when it has expired: one obtained with the stored refresh token, or one another caller has
 /// stored meanwhile.
 ///
@@ -160,12 +175,13 @@ fn has_expired(token: &str) -> bool {
 async fn refresh_if_expired(
     auth_endpoint: &AuthEndpoint,
     identity: &str,
-    token: String,
+    stored: StoredToken,
     remote_domain: &str,
-) -> Result<String, ExchangeError> {
-    if !has_expired(&token) {
-        return Ok(token);
+) -> Result<StoredToken, ExchangeError> {
+    if !has_expired(&stored.token, stored.receipt) {
+        return Ok(stored);
     }
+    let token = stored.token;
     // The refresh runs in a guarded task, so neither a caller that gives up, such as a
     // connection being cancelled, nor the process shutting down stops it part way, which
     // would lose the refresh token the issuer has consumed.
@@ -185,6 +201,7 @@ async fn refresh_if_expired(
                     {
                         Ok(authn) => Refreshed::Token {
                             token: authn.token,
+                            lifetime_ms: authn.lifetime_ms,
                             refresh_token: authn.refresh_token,
                             refresh_expires: authn.refresh_expires_ms,
                             scope: authn.scope,
@@ -218,15 +235,15 @@ async fn refresh_if_expired(
         lore_debug!("Skipping identity {identity}, authn token is expired: {err}");
         return Err(err).forward_any("refreshing the login token");
     }
-    let token = token_store::load_user_token_from_store(
+    let stored = token_store::load_stored_token_from_store(
         &auth_endpoint.url,
         identity,
         tokens_only_for_recipient_domain(remote_domain.to_string()),
     )
     .await
     .ok()
-    .filter(|token| !has_expired(token));
-    token.ok_or_else(|| {
+    .filter(|stored| !has_expired(&stored.token, stored.receipt));
+    stored.ok_or_else(|| {
         lore_debug!("Skipping identity {identity}, no unexpired authn token for {remote_domain}");
         NotAuthenticated.into()
     })
@@ -239,14 +256,17 @@ async fn login_token_for_auth_service(
     auth_endpoint: &AuthEndpoint,
     identity: &str,
     identity_token: &str,
-) -> Result<String, ExchangeError> {
+) -> Result<StoredToken, ExchangeError> {
     if !identity_token.is_empty() {
         return lore_credential::user_info_from_token(identity_token.to_owned())
-            .map(|info| info.token)
+            .map(|info| StoredToken {
+                token: info.token,
+                receipt: TokenReceipt::default(),
+            })
             .ok_or_else(|| NotAuthenticated.into());
     }
     let auth_domain = get_domain_or_empty(&auth_endpoint.url);
-    let token = token_store::load_user_token_from_store(
+    let stored = token_store::load_stored_token_from_store(
         &auth_endpoint.url,
         identity,
         tokens_only_for_recipient_domain(auth_domain.clone()),
@@ -261,7 +281,7 @@ async fn login_token_for_auth_service(
             ExchangeError::internal_with_context(err, "loading the login token")
         }
     })?;
-    refresh_if_expired(auth_endpoint, identity, token, &auth_domain).await
+    refresh_if_expired(auth_endpoint, identity, stored, &auth_domain).await
 }
 
 /// Exchanges an authentication token for a repository-scoped authorization
@@ -330,30 +350,37 @@ pub async fn exchange(
         cache.len()
     );
 
-    let mut token = cache.get(&cache_key).cloned().unwrap_or_default();
+    let mut cached = cache.get(&cache_key).cloned();
 
     let token_store_key = authorization_store_key(auth_endpoint, &repo_id_str);
 
-    if !token.is_empty() {
+    if cached.is_some() {
         lore_trace!("Found cached authz token for {cache_key:?}");
     } else if !supplied_credentials {
         lore_trace!("Check for token store authz token for {token_store_key:?}");
-        token = token_store::load_user_token_from_store(
+        if let Ok(stored) = token_store::load_stored_token_from_store(
             &token_store_key,
             identity,
             tokens_only_for_recipient_domain(recipient_domain.clone()),
         )
         .await
-        .unwrap_or_default();
+        {
+            cached = Some(stored);
+        }
     }
 
-    if !token.is_empty() {
+    if let Some(entry) = cached {
         lore_trace!("Validating token expiry");
-        if let Some(user_info) = lore_credential::user_info_from_token(token.clone()) {
-            if !is_expired(user_info.expires) {
+        if let Some(user_info) = lore_credential::user_info_from_token(entry.token.clone()) {
+            if !is_token_expired(
+                user_info.issued_at,
+                user_info.expires,
+                entry.receipt.received_at,
+                entry.receipt.lifetime_ms,
+            ) {
                 lore_trace!("Using authz token for {cache_key:?}");
-                cache.insert(cache_key, token.clone());
-                return Ok(token.clone());
+                cache.insert(cache_key, entry.clone());
+                return Ok(entry.token);
             } else {
                 lore_debug!("Authz token for {cache_key:?} has expired");
             }
@@ -366,10 +393,9 @@ pub async fn exchange(
 
     // Load authn token for the auth service domain
     lore_trace!("Authorizing using authn identity: {identity}");
-    let auth_service_only_token =
-        login_token_for_auth_service(auth_endpoint, identity, identity_token)
-            .await
-            .inspect_err(|err| lore_debug!("Unable to perform authz exchange: {err}"))?;
+    let auth_service_only = login_token_for_auth_service(auth_endpoint, identity, identity_token)
+        .await
+        .inspect_err(|err| lore_debug!("Unable to perform authz exchange: {err}"))?;
     lore_trace!("Authorizing using endpoint: {auth_endpoint}");
 
     let time_start = Instant::now();
@@ -384,7 +410,7 @@ pub async fn exchange(
     let authz = auth_impl
         .exchange_for_repository(
             &auth_url,
-            &auth_service_only_token,
+            &auth_service_only.token,
             repository,
             &correlation_id,
         )
@@ -411,16 +437,25 @@ pub async fn exchange(
         time_start.elapsed().as_millis()
     );
 
+    let receipt = exchanged_receipt(&token, authz.lifetime_ms, &auth_service_only);
+
     lore_trace!("Cached authz token for {cache_key:?}");
 
-    cache.insert(cache_key, token.clone());
+    cache.insert(
+        cache_key,
+        StoredToken {
+            token: token.clone(),
+            receipt,
+        },
+    );
 
     if !supplied_credentials {
-        let _ = token_store::store_user_token(
+        let _ = token_store::store_user_token_with_receipt(
             &token_store_key,
             identity,
             &token,
             decoded_token.claims.acceptable_root_domains(),
+            receipt,
         )
         .await
         .map_err(|err| {
@@ -488,30 +523,37 @@ pub async fn exchange_custom_resource(
         cache.len()
     );
 
-    let mut token = cache.get(&cache_key).cloned().unwrap_or_default();
+    let mut cached = cache.get(&cache_key).cloned();
 
     let token_store_key = authorization_store_key(auth_endpoint, resource_id);
 
-    if !token.is_empty() {
+    if cached.is_some() {
         lore_trace!("Found cached authz token for {cache_key:?}");
     } else if !supplied_credentials {
         lore_trace!("Check for token store authz token for {token_store_key:?}");
-        token = token_store::load_user_token_from_store(
+        if let Ok(stored) = token_store::load_stored_token_from_store(
             &token_store_key,
             identity,
             tokens_only_for_recipient_domain(recipient_domain.clone()),
         )
         .await
-        .unwrap_or_default();
+        {
+            cached = Some(stored);
+        }
     }
 
-    if !token.is_empty() {
+    if let Some(entry) = cached {
         lore_trace!("Validating token expiry");
-        if let Some(user_info) = lore_credential::user_info_from_token(token.clone()) {
-            if !is_expired(user_info.expires) {
+        if let Some(user_info) = lore_credential::user_info_from_token(entry.token.clone()) {
+            if !is_token_expired(
+                user_info.issued_at,
+                user_info.expires,
+                entry.receipt.received_at,
+                entry.receipt.lifetime_ms,
+            ) {
                 lore_trace!("Using authz token for {cache_key:?}");
-                cache.insert(cache_key, token.clone());
-                return Ok(token.clone());
+                cache.insert(cache_key, entry.clone());
+                return Ok(entry.token);
             } else {
                 lore_debug!("Authz token for {cache_key:?} has expired");
             }
@@ -523,10 +565,9 @@ pub async fn exchange_custom_resource(
     }
 
     lore_trace!("Authorizing using authn identity: {identity}");
-    let auth_service_only_token =
-        login_token_for_auth_service(auth_endpoint, identity, identity_token)
-            .await
-            .inspect_err(|err| lore_debug!("Unable to perform authz exchange: {err}"))?;
+    let auth_service_only = login_token_for_auth_service(auth_endpoint, identity, identity_token)
+        .await
+        .inspect_err(|err| lore_debug!("Unable to perform authz exchange: {err}"))?;
     lore_trace!("Authorizing using endpoint: {auth_endpoint}");
 
     let time_start = Instant::now();
@@ -540,7 +581,7 @@ pub async fn exchange_custom_resource(
     let authz = auth_impl
         .exchange_for_custom_resources(
             &auth_url,
-            &auth_service_only_token,
+            &auth_service_only.token,
             &[resource_id],
             &correlation_id,
         )
@@ -567,16 +608,25 @@ pub async fn exchange_custom_resource(
         time_start.elapsed().as_millis()
     );
 
+    let receipt = exchanged_receipt(&token, authz.lifetime_ms, &auth_service_only);
+
     lore_trace!("Cached authz token for {cache_key:?}");
 
-    cache.insert(cache_key, token.clone());
+    cache.insert(
+        cache_key,
+        StoredToken {
+            token: token.clone(),
+            receipt,
+        },
+    );
 
     if !supplied_credentials {
-        let _ = token_store::store_user_token(
+        let _ = token_store::store_user_token_with_receipt(
             &token_store_key,
             identity,
             &token,
             decoded_token.claims.acceptable_root_domains(),
+            receipt,
         )
         .await
         .map_err(|err| {
@@ -709,7 +759,7 @@ async fn auth_exchange_for_identity(
 ) -> ((String, String, String), Option<ExchangeError>) {
     let unresolved =
         |err: ExchangeError| ((String::new(), String::new(), String::new()), Some(err));
-    let authentication_token = match token_store::load_user_token(
+    let stored_authentication = match token_store::load_stored_token(
         &auth_endpoint.url,
         identity,
         tokens_only_for_recipient_domain(remote_domain.to_string()),
@@ -718,12 +768,15 @@ async fn auth_exchange_for_identity(
     )
     .await
     {
-        Ok(token) => token,
+        Ok(stored) => stored,
         // A supplied access token authorizes on its own, so carry on without an
         // authentication token: the repository service is sent the access token
         // instead, any other service that needs an authentication token fails
         // where it uses it, and the ones that only need authorization still work.
-        Err(_) if !access_token.is_empty() => String::new(),
+        Err(_) if !access_token.is_empty() => StoredToken {
+            token: String::new(),
+            receipt: TokenReceipt::default(),
+        },
         Err(err) if err.is_token_not_found() => {
             lore_debug!(
                 "Auth exchange failed, no authentication token stored for {identity} that may be sent to {remote_domain}"
@@ -747,13 +800,19 @@ async fn auth_exchange_for_identity(
     // server to reject, so the caller sees an authentication failure rather
     // than requests going out carrying no credential at all.
     let authentication_token = if identity_token.is_empty() && access_token.is_empty() {
-        match refresh_if_expired(auth_endpoint, identity, authentication_token, remote_domain).await
+        match refresh_if_expired(
+            auth_endpoint,
+            identity,
+            stored_authentication,
+            remote_domain,
+        )
+        .await
         {
-            Ok(token) => token,
+            Ok(stored) => stored.token,
             Err(err) => return unresolved(err),
         }
     } else {
-        authentication_token
+        stored_authentication.token
     };
 
     // This will return the cached authz token if it is still valid,
@@ -896,7 +955,7 @@ async fn auth_exchange_custom_resource_for_identity(
     identity_token: &str,
     access_token: &str,
 ) -> (String, String, String) {
-    let authentication_token = token_store::load_user_token(
+    let stored_authentication = token_store::load_stored_token(
         &auth_endpoint.url,
         identity,
         tokens_only_for_recipient_domain(remote_domain.to_string()),
@@ -904,12 +963,15 @@ async fn auth_exchange_custom_resource_for_identity(
         access_token,
     )
     .await
-    .unwrap_or_default();
+    .unwrap_or(StoredToken {
+        token: String::new(),
+        receipt: TokenReceipt::default(),
+    });
 
     // A supplied access token authorizes on its own, so carry on without an
     // authentication token: the services that need one fail where they use it,
     // and the ones that only need authorization still work.
-    if authentication_token.is_empty() && access_token.is_empty() {
+    if stored_authentication.token.is_empty() && access_token.is_empty() {
         lore_debug!(
             "Auth exchange failed, no authentication token stored for {identity} that may be sent to {remote_domain}"
         );
@@ -920,13 +982,19 @@ async fn auth_exchange_custom_resource_for_identity(
     // refreshed or skipped for expiry. A supplied credential is handed over
     // regardless.
     let authentication_token = if identity_token.is_empty() && access_token.is_empty() {
-        match refresh_if_expired(auth_endpoint, identity, authentication_token, remote_domain).await
+        match refresh_if_expired(
+            auth_endpoint,
+            identity,
+            stored_authentication,
+            remote_domain,
+        )
+        .await
         {
-            Ok(token) => token,
+            Ok(stored) => stored.token,
             Err(_) => return (String::new(), String::new(), String::new()),
         }
     } else {
-        authentication_token
+        stored_authentication.token
     };
 
     let authorization_token = exchange_custom_resource(

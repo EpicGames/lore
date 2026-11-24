@@ -93,6 +93,7 @@ async fn the_refresh_token_is_traded_for_a_new_token_and_its_successor() {
         access_token(&provider.issuer, "alice", "Alice")
     );
     assert_eq!(authn.user_id, "alice");
+    assert_eq!(authn.lifetime_ms, Some(300_000));
     assert_eq!(authn.refresh_token.as_deref(), Some("refresh-2"));
     assert_eq!(authn.scope.as_deref(), Some("openid offline_access"));
 }

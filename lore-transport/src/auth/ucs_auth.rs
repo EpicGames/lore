@@ -178,6 +178,7 @@ impl Authentication for UcsAuthentication {
                 user_id: token.user_id,
                 user_name: token.user_name,
                 expires_ms: seconds_to_ms(token.expires_at),
+                lifetime_ms: None,
                 // Populated by orchestration layer via JWT decode, not the proto response
                 acceptable_root_domains: Vec::new(),
                 refresh_token: None,
@@ -216,6 +217,7 @@ impl Authentication for UcsAuthentication {
             user_id: user_token.user_id,
             user_name: user_token.user_name,
             expires_ms: seconds_to_ms(user_token.expires_at),
+            lifetime_ms: None,
             // Populated by orchestration layer via JWT decode, not the proto response
             acceptable_root_domains: Vec::new(),
             refresh_token: None,
@@ -302,6 +304,7 @@ impl Authentication for UcsAuthentication {
         Ok(AuthorizationToken {
             token: token.user_token,
             expires_ms: seconds_to_ms(token.expires_at),
+            lifetime_ms: None,
             // Populated by orchestration layer via JWT decode, not the proto response
             acceptable_root_domains: Vec::new(),
         })

@@ -23,6 +23,12 @@ pub struct UserInfo {
     pub token: String,
     pub preferred_username: String,
     pub is_service_account: bool,
+    /// JWT `iat` claim, in milliseconds since the UNIX epoch.
+    pub issued_at: Option<u64>,
+    /// Local wall-clock time when the token was received, in milliseconds since the UNIX epoch.
+    pub received_at: Option<u64>,
+    /// Remaining lifetime reported by the issuer at receipt (`expires_in`), in milliseconds.
+    pub lifetime_ms: Option<u64>,
     pub expires: u64,
 }
 
@@ -49,6 +55,8 @@ pub struct JWTUserInfo {
     pub name: Option<String>,
     pub preferred_username: Option<String>,
     pub is_service_account: Option<bool>,
+    #[serde(default, rename = "iat", deserialize_with = "lenient_numeric_date")]
+    pub issued_at: Option<u64>,
     #[serde(rename = "exp")]
     pub expires: u64,
     #[serde_as(as = "OneOrMany<_, PreferMany>")]
@@ -69,6 +77,24 @@ where
     D: serde::Deserializer<'de>,
 {
     serde_json::Value::deserialize(deserializer).map(Some)
+}
+
+/// Decodes an optional RFC 7519 `NumericDate` (`iat`), rounding fractional seconds up so token
+/// lifetimes are never overestimated, and falling back to `None` on unexpected types so a
+/// malformed `iat` never rejects an otherwise usable token.
+fn lenient_numeric_date<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let seconds = match value {
+        serde_json::Value::Number(num) => num.as_u64().or_else(|| {
+            let f = num.as_f64()?.ceil();
+            (f.is_finite() && f >= 0.0 && f < (u64::MAX as f64)).then_some(f as u64)
+        }),
+        _ => None,
+    };
+    Ok(seconds)
 }
 
 impl JWTUserInfo {
@@ -148,7 +174,7 @@ where
 {
     lore_debug!("Get user {identity} info from {auth_url}");
 
-    let Ok(token) = crate::token_store::load_user_token(
+    let Ok(stored) = crate::token_store::load_stored_token(
         auth_url,
         identity,
         token_filter,
@@ -160,7 +186,10 @@ where
         return None;
     };
 
-    user_info_from_token(token)
+    let mut info = user_info_from_token(stored.token)?;
+    info.received_at = stored.receipt.received_at;
+    info.lifetime_ms = stored.receipt.lifetime_ms;
+    Some(info)
 }
 
 pub fn identity_from_token(token: &str) -> String {
@@ -244,9 +273,15 @@ pub fn user_info_from_token(token: String) -> Option<UserInfo> {
         token,
         preferred_username: token_data.claims.preferred_username.unwrap_or_default(),
         is_service_account: token_data.claims.is_service_account.unwrap_or_default(),
+        issued_at: token_data
+            .claims
+            .issued_at
+            .map(|iat| iat.saturating_mul(1000)),
+        received_at: None,
+        lifetime_ms: None,
         // JWT has number of seconds since UNIX epoch in UTC - we want milliseconds like
         // all other timestamps in Lore, also in UTC
-        expires: token_data.claims.expires * 1000,
+        expires: token_data.claims.expires.saturating_mul(1000),
     })
 }
 
@@ -261,6 +296,85 @@ pub fn domain_in_root_domains(domain: &str, root_domains: &[String]) -> bool {
         let apex = acceptable_root.strip_prefix('.').unwrap_or(acceptable_root);
         domain == apex || domain.ends_with(&format!(".{apex}"))
     })
+}
+
+/// Early-refresh margin in milliseconds so a token is not presented seconds before it expires.
+pub const EARLY_REFRESH_MARGIN_MS: u64 = 10_000;
+
+/// Current local wall-clock time in milliseconds since the UNIX epoch, or 0 if the clock is
+/// before the epoch.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Checks whether a deadline `expires` (ms since UNIX epoch) has passed at `now_ms`.
+fn is_expired_at(expires: u64, now_ms: u64) -> bool {
+    now_ms >= expires
+}
+
+/// Checks whether a deadline `expires` (ms since UNIX epoch) has passed on the local wall clock.
+pub fn is_expired(expires: u64) -> bool {
+    is_expired_at(expires, now_ms())
+}
+
+/// Checks whether a token has expired or is within its early-refresh margin at `now_ms`.
+///
+/// When `received_at` is known and the local clock has not stepped backwards past it, expiry is
+/// measured as elapsed local time since `received_at` against the token's remaining lifetime:
+///
+/// 1. `lifetime_ms` (from the issuer's `expires_in` response) is preferred because it reflects the
+///    remaining lifetime at receipt, unaffected by clock skew, backdated `iat` claims, or omitted
+///    `iat`.
+/// 2. Otherwise, `exp - iat` is used when `0 < iat < exp`. When `received_at` is within 10 minutes
+///    after `iat`, the effective lifetime is capped by `exp.saturating_sub(received_at)` so a
+///    backdated `iat` or an already-expired token on a synced clock does not extend past `exp`.
+///
+/// The early-refresh margin is `EARLY_REFRESH_MARGIN_MS` capped at half the lifetime so
+/// short-lived tokens remain usable right after issue. When no receipt-relative lifetime is
+/// available (or the clock stepped backwards past `received_at`), falls back to comparing `exp`
+/// against `now_ms`. A backward clock step smaller than the time since `received_at` is not
+/// detected.
+pub fn is_token_expired_at(
+    issued_at: Option<u64>,
+    expires: u64,
+    received_at: Option<u64>,
+    lifetime_ms: Option<u64>,
+    now_ms: u64,
+) -> bool {
+    // Issuers like Entra ID backdate `iat` by ~5 min; treat a gap beyond 10 min as clock skew
+    // rather than backdating.
+    const BACKDATED_IAT_TOLERANCE_MS: u64 = 10 * 60 * 1000;
+
+    if let Some(received_at) = received_at
+        && let Some(elapsed) = now_ms.checked_sub(received_at)
+    {
+        let effective_lifetime = lifetime_ms.or_else(|| {
+            let iat = issued_at.filter(|&iat| iat > 0 && iat < expires)?;
+            let claim_lifetime = expires - iat;
+            if received_at >= iat && received_at - iat <= BACKDATED_IAT_TOLERANCE_MS {
+                Some(claim_lifetime.min(expires.saturating_sub(received_at)))
+            } else {
+                Some(claim_lifetime)
+            }
+        });
+        if let Some(lifetime) = effective_lifetime {
+            let margin = EARLY_REFRESH_MARGIN_MS.min(lifetime / 2);
+            return elapsed.saturating_add(margin) >= lifetime;
+        }
+    }
+    is_expired_at(expires, now_ms)
+}
+
+/// Checks whether a token has expired at the current local wall clock.
+pub fn is_token_expired(
+    issued_at: Option<u64>,
+    expires: u64,
+    received_at: Option<u64>,
+    lifetime_ms: Option<u64>,
+) -> bool {
+    is_token_expired_at(issued_at, expires, received_at, lifetime_ms, now_ms())
 }
 
 pub fn verify_jwt_usage_for_remote(

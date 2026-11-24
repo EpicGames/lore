@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use crate::auth::LoreAuthPendingEventData;
 use crate::auth::LoreAuthUrlEventData;
-use crate::auth::userinfo::session_valid;
+use crate::auth::userinfo::token_session_valid;
 use crate::errors::AddressNotFound;
 use crate::errors::Disconnected;
 use crate::errors::Maintenance;
@@ -179,7 +179,7 @@ async fn store_authentication(
     .forward::<LoginError>("verifying JWT usage for remote")?;
 
     if !execution_context().globals().dry_run() {
-        token_store::store_user_token_and_refresh_token(
+        token_store::store_user_token_and_refresh_token_with_receipt(
             auth_url,
             user_info.id.as_str(),
             &authn.token,
@@ -187,6 +187,7 @@ async fn store_authentication(
             authn.refresh_token.as_deref(),
             authn.refresh_expires_ms,
             authn.scope.as_deref(),
+            token_store::TokenReceipt::now(authn.lifetime_ms),
         )
         .await
         .forward::<LoginError>("storing user token")?;
@@ -255,7 +256,9 @@ pub(crate) async fn with_token(
 
         if let Some(user_info) = lore_credential::user_info_from_token(token.to_string()) {
             if !execution_context().globals().dry_run() {
-                token_store::store_user_token_and_refresh_token(
+                // Externally supplied tokens may already be aged, so omit receipt metadata and
+                // fall back to the token's `exp` claim.
+                token_store::store_user_token_and_refresh_token_with_receipt(
                     auth_url.as_str(),
                     user_info.id.as_str(),
                     token,
@@ -263,6 +266,7 @@ pub(crate) async fn with_token(
                     None,
                     0,
                     None,
+                    token_store::TokenReceipt::default(),
                 )
                 .await
                 .forward::<LoginError>("storing user token")?;
@@ -439,7 +443,7 @@ pub async fn interactive(
 
     lore_debug!("Auth successful");
     if !execution_context().globals().dry_run() {
-        token_store::store_user_token_and_refresh_token(
+        token_store::store_user_token_and_refresh_token_with_receipt(
             auth_url.as_str(),
             authn.user_id.as_str(),
             authn.token.as_str(),
@@ -447,6 +451,7 @@ pub async fn interactive(
             authn.refresh_token.as_deref(),
             authn.refresh_expires_ms,
             authn.scope.as_deref(),
+            token_store::TokenReceipt::now(authn.lifetime_ms),
         )
         .await
         .forward::<InteractiveLoginError>("storing user token")?;
@@ -494,7 +499,7 @@ async fn valid_stored_login(auth_url: &str, remote_domain: String) -> Option<Use
     )
     .await?;
     let refresh_expires = token_store::load_refresh_expires(auth_url, &identity).await;
-    session_valid(user_info.expires, refresh_expires).then_some(user_info)
+    token_session_valid(&user_info, refresh_expires).then_some(user_info)
 }
 
 /// Polls `session` until the user approves it, at the cadence the session

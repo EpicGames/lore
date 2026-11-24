@@ -157,6 +157,7 @@ async fn an_exchange_names_the_partition_as_one_resource() {
 
     assert_eq!(authz.token, exchanged_token(&provider.issuer));
     assert_eq!(authz.expires_ms, (EXPIRES + 60) * 1000);
+    assert_eq!(authz.lifetime_ms, Some(300_000));
 }
 
 /// With `scope_template`, the partition is the one `scope` value and no `resource` is sent.

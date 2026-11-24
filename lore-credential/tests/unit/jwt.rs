@@ -185,3 +185,225 @@ fn an_unsigned_identity_token_names_its_identity() {
     assert_eq!(info.id, "alice");
     assert_eq!(info.preferred_username, "alice");
 }
+
+#[test]
+fn iat_decodes_integers_rounds_floats_up_and_ignores_invalid_values() {
+    let base = r#""iss":"i","sub":"alice","exp":2000000000,"aud":["example.com"]"#;
+
+    let integer = user_info_from_token(token_with_claims(&format!(
+        r#"{{{base},"iat":1700000000}}"#
+    )))
+    .expect("decodes");
+    assert_eq!(integer.issued_at, Some(1_700_000_000_000));
+
+    let fractional = user_info_from_token(token_with_claims(&format!(
+        r#"{{{base},"iat":1700000000.75}}"#
+    )))
+    .expect("decodes");
+    assert_eq!(fractional.issued_at, Some(1_700_000_001_000));
+
+    for bad_iat in [r#""not-a-number""#, "-5", "null", "true"] {
+        let info =
+            user_info_from_token(token_with_claims(&format!(r#"{{{base},"iat":{bad_iat}}}"#)))
+                .expect("invalid iat does not reject token");
+        assert_eq!(info.issued_at, None, "iat={bad_iat}");
+    }
+}
+
+#[test]
+fn token_expiry_uses_expires_in_and_iat_lifetime_handles_edge_cases_and_caps_margin() {
+    use lore_credential::EARLY_REFRESH_MARGIN_MS;
+    use lore_credential::is_token_expired_at;
+
+    let margin = EARLY_REFRESH_MARGIN_MS;
+    let now = 2_000_000_000_000u64;
+
+    // 1. Issuer-reported lifetime_ms (expires_in) takes precedence over both exp and iat.
+    // Client clock 2 hours ahead of issuer, token omits iat entirely: still valid for 1 hour.
+    let received_at = now - 60_000;
+    assert!(!is_token_expired_at(
+        None,
+        now - 3_600_000,
+        Some(received_at),
+        Some(3_600_000),
+        now
+    ));
+    assert!(is_token_expired_at(
+        None,
+        now - 3_600_000,
+        Some(received_at),
+        Some(3_600_000),
+        received_at + 3_600_000 - margin
+    ));
+    // Backdated iat (Entra ID style: iat 5 min before issue, exp 60 min after issue -> exp - iat
+    // = 65 min) does not stretch validity past expires_in (60 min).
+    let entra_iat = received_at - 300_000;
+    let entra_exp = received_at + 3_600_000;
+    assert!(is_token_expired_at(
+        Some(entra_iat),
+        entra_exp,
+        Some(received_at),
+        Some(3_600_000),
+        received_at + 3_600_000 - margin
+    ));
+
+    // 2. Without lifetime_ms, falls back to exp - iat when clock skew is present.
+    // Client clock 2 hours ahead of issuer: exp is in the past locally, but 1-hour lifetime was
+    // just received.
+    let iat = now - 7_200_000;
+    let exp = iat + 3_600_000;
+    assert!(!is_token_expired_at(
+        Some(iat),
+        exp,
+        Some(received_at),
+        None,
+        now
+    ));
+    let near_end = received_at + 3_600_000 - margin;
+    assert!(is_token_expired_at(
+        Some(iat),
+        exp,
+        Some(received_at),
+        None,
+        near_end
+    ));
+    assert!(!is_token_expired_at(
+        Some(iat),
+        exp,
+        Some(received_at),
+        None,
+        near_end - 1
+    ));
+
+    // Client clock 2 hours behind issuer: exp is far in the future locally, but lifetime elapsed.
+    let iat_future = now + 7_200_000;
+    let exp_future = iat_future + 3_600_000;
+    let received_long_ago = now - 3_600_000;
+    assert!(is_token_expired_at(
+        Some(iat_future),
+        exp_future,
+        Some(received_long_ago),
+        None,
+        now
+    ));
+
+    // Backdated iat (5 min) on a synced clock without lifetime_ms: capped by exp - received_at
+    // so the token does not outlive exp.
+    assert!(is_token_expired_at(
+        Some(entra_iat),
+        entra_exp,
+        Some(received_at),
+        None,
+        entra_exp - margin
+    ));
+    assert!(!is_token_expired_at(
+        Some(entra_iat),
+        entra_exp,
+        Some(received_at),
+        None,
+        entra_exp - margin - 1
+    ));
+
+    // Already-expired token received on a synced clock (iat = R-6m, exp = R-1m): capped to 0,
+    // not treated as valid for 5 more minutes.
+    assert!(is_token_expired_at(
+        Some(received_at - 360_000),
+        received_at - 60_000,
+        Some(received_at),
+        None,
+        received_at
+    ));
+
+    // Bogus iat == 0 without lifetime_ms falls back to exp rather than producing a 56-year lifetime.
+    assert!(is_token_expired_at(
+        Some(0),
+        now - 1_000,
+        Some(received_at),
+        None,
+        now
+    ));
+
+    // Bogus iat >= exp (e.g. issuer sent iat in milliseconds) falls back to exp instead of
+    // reporting an unexpired token as expired.
+    assert!(!is_token_expired_at(
+        Some(now + 10_000),
+        now + 3_600_000,
+        Some(now),
+        None,
+        now
+    ));
+    assert!(is_token_expired_at(
+        Some(now + 10_000),
+        now,
+        Some(now),
+        None,
+        now
+    ));
+
+    // Clock stepped backwards past received_at: fall back to exp rather than clamping elapsed to 0.
+    assert!(is_token_expired_at(
+        Some(now - 7_200_000),
+        now - 3_600_000,
+        Some(now + 10_000),
+        Some(3_600_000),
+        now
+    ));
+    assert!(!is_token_expired_at(
+        Some(now - 60_000),
+        now + 3_600_000,
+        Some(now + 10_000),
+        Some(3_600_000),
+        now
+    ));
+
+    // iat > exp gives zero lifetime -> expired immediately.
+    assert!(is_token_expired_at(
+        Some(now + 10_000),
+        now,
+        Some(now),
+        None,
+        now
+    ));
+
+    // Missing receipt metadata falls back to comparing exp directly with now_ms (no uncapped margin).
+    assert!(is_token_expired_at(None, now, None, None, now));
+    assert!(!is_token_expired_at(None, now + 1, None, None, now));
+    assert!(is_token_expired_at(
+        Some(now - 60_000),
+        now,
+        None,
+        None,
+        now
+    ));
+    assert!(!is_token_expired_at(
+        Some(now - 60_000),
+        now + 1,
+        None,
+        None,
+        now
+    ));
+
+    // Short-lived token caps the early-refresh margin at half its lifetime.
+    let short_exp = now + 3_000;
+    assert!(!is_token_expired_at(
+        Some(now),
+        short_exp,
+        Some(now),
+        Some(3_000),
+        now
+    ));
+    assert!(!is_token_expired_at(
+        Some(now),
+        short_exp,
+        Some(now),
+        Some(3_000),
+        now + 1_499
+    ));
+    assert!(is_token_expired_at(
+        Some(now),
+        short_exp,
+        Some(now),
+        Some(3_000),
+        now + 1_500
+    ));
+}

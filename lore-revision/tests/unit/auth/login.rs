@@ -74,6 +74,7 @@ fn complete() -> PollAnswer {
         user_id: "alice".into(),
         user_name: "Alice".into(),
         expires_ms: 0,
+        lifetime_ms: None,
         acceptable_root_domains: Vec::new(),
         refresh_token: None,
         refresh_expires_ms: 0,

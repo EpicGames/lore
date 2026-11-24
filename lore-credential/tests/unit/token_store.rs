@@ -460,6 +460,7 @@ fn grant(
         presented.lock().unwrap().push(refresh);
         std::future::ready(Refreshed::Token {
             token,
+            lifetime_ms: None,
             refresh_token: refresh_token.map(str::to_owned),
             refresh_expires: GRANT_REFRESH_EXPIRES,
             scope: None,
@@ -744,6 +745,7 @@ async fn concurrent_refreshes_present_the_refresh_token_once() {
             tokio::task::yield_now().await;
             Refreshed::<TokenStoreError>::Token {
                 token: fresh.clone(),
+                lifetime_ms: None,
                 refresh_token: Some("refresh-2".to_owned()),
                 refresh_expires: GRANT_REFRESH_EXPIRES,
                 scope: None,
@@ -881,4 +883,85 @@ async fn removing_all_tokens_returns_every_refresh_token() {
         .await
         .expect("remove every token again");
     assert!(again.is_empty());
+}
+
+#[tokio::test]
+async fn receipt_round_trips_clamps_to_toml_max_and_legacy_entry_loads_as_empty() {
+    use lore_credential::token_store::TokenReceipt;
+    use lore_credential::token_store::load_stored_token_from_store;
+    use lore_credential::token_store::store_user_token_and_refresh_token_with_receipt;
+
+    let _alone = STORE_FILE.write().await;
+    const ENDPOINT: &str = "oidc+https://receipt-roundtrip.test.invalid";
+
+    // Round-trip a populated receipt through disk and verify u64::MAX is clamped for TOML i64.
+    let huge_receipt = TokenReceipt {
+        received_at: Some(1_700_000_000_000),
+        lifetime_ms: Some(u64::MAX),
+    };
+    store_user_token_and_refresh_token_with_receipt(
+        ENDPOINT,
+        "alice",
+        "token-with-receipt",
+        Vec::new(),
+        Some("refresh-1"),
+        0,
+        None,
+        huge_receipt,
+    )
+    .await
+    .expect("store with huge lifetime_ms");
+
+    let file = store_file().expect("the token store's file");
+    let raw = std::fs::read_to_string(&file).expect("read tokenstore.toml");
+    assert!(raw.contains("received_at"), "{raw}");
+    assert!(raw.contains("lifetime_ms"), "{raw}");
+
+    let stored = load_stored_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens())
+        .await
+        .expect("load stored token");
+    assert_eq!(stored.token, "token-with-receipt");
+    assert_eq!(stored.receipt.received_at, Some(1_700_000_000_000));
+    assert_eq!(stored.receipt.lifetime_ms, Some(i64::MAX as u64));
+
+    // Refresh persists the new lifetime_ms (clamped) and refreshes received_at.
+    let fresh = jwt("alice", VALID, 9);
+    let fresh_clone = fresh.clone();
+    refresh_user_token(ENDPOINT, "alice", "token-with-receipt", |_| {
+        std::future::ready(Refreshed::<TokenStoreError>::Token {
+            token: fresh_clone,
+            lifetime_ms: Some(3_600_000),
+            refresh_token: Some("refresh-2".to_owned()),
+            refresh_expires: GRANT_REFRESH_EXPIRES,
+            scope: None,
+        })
+    })
+    .await
+    .expect("refresh succeeds");
+    let refreshed = load_stored_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens())
+        .await
+        .expect("load refreshed token");
+    assert_eq!(refreshed.token, fresh);
+    assert!(refreshed.receipt.received_at.is_some());
+    assert_eq!(refreshed.receipt.lifetime_ms, Some(3_600_000));
+
+    // Strip receipt fields from the on-disk TOML and reload to simulate an entry written by an
+    // older client.
+    let raw_after_refresh = std::fs::read_to_string(&file).expect("read tokenstore.toml");
+    let legacy_raw: String = raw_after_refresh
+        .lines()
+        .filter(|line| {
+            !line.trim_start().starts_with("received_at")
+                && !line.trim_start().starts_with("lifetime_ms")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&file, legacy_raw).expect("write legacy tokenstore.toml");
+    let _ = remove_user_token_if(ENDPOINT, "alice", "non-matching").await;
+
+    let reloaded = load_stored_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens())
+        .await
+        .expect("load legacy entry from disk");
+    assert_eq!(reloaded.token, fresh);
+    assert_eq!(reloaded.receipt, TokenReceipt::default());
 }

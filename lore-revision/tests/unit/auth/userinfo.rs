@@ -160,6 +160,40 @@ fn session_without_token_is_expired() {
     assert!(!resolved.session_valid());
 }
 
+#[test]
+fn session_valid_uses_receipt_and_iat_under_clock_drift() {
+    let now = lore_credential::now_ms();
+    // Client clock 2 hours ahead: exp is in the past locally, but 1-hour lifetime was just stored.
+    let ahead = ResolvedIdentity {
+        id: "alice".to_string(),
+        name: "Alice".to_string(),
+        local_user_info: Some(lore_credential::UserInfo {
+            issued_at: Some(now - 7_200_000),
+            expires: now - 3_600_000,
+            received_at: Some(now - 60_000),
+            lifetime_ms: Some(3_600_000),
+            ..Default::default()
+        }),
+        refresh_expires: None,
+    };
+    assert!(ahead.session_valid());
+
+    // Client clock 2 hours behind: exp is in the future locally, but 1-hour lifetime has elapsed.
+    let behind = ResolvedIdentity {
+        id: "alice".to_string(),
+        name: "Alice".to_string(),
+        local_user_info: Some(lore_credential::UserInfo {
+            issued_at: Some(now + 3_600_000),
+            expires: now + 7_200_000,
+            received_at: Some(now - 3_660_000),
+            lifetime_ms: Some(3_600_000),
+            ..Default::default()
+        }),
+        refresh_expires: None,
+    };
+    assert!(!behind.session_valid());
+}
+
 /// `{"iss":"lore","sub":"alice","name":"Alice","exp":2000000000,"aud":["example.com"]}`
 const ALICE_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
 

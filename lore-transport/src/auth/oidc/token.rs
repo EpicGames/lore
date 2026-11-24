@@ -3,10 +3,8 @@
 //! The token endpoint (RFC 6749 §3.2): the request every grant POSTs to it, and the
 //! success and error responses it answers with (§5.1, §5.2).
 
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
-
 use lore_base::lore_warn;
+use lore_credential::now_ms;
 use serde::Deserialize;
 
 use super::FormResponse;
@@ -165,7 +163,7 @@ pub fn authentication_token(response: TokenResponse) -> Result<AuthenticationTok
     let TokenResponse {
         access_token,
         token_type,
-        expires_in: _,
+        expires_in,
         refresh_token,
         refresh_token_expires_in,
         refresh_expires_in,
@@ -202,6 +200,7 @@ pub fn authentication_token(response: TokenResponse) -> Result<AuthenticationTok
         user_id: access.id,
         user_name,
         expires_ms: access.expires,
+        lifetime_ms: lifetime_ms(expires_in),
         // Populated by the orchestration layer from the token's claims.
         acceptable_root_domains: Vec::new(),
         refresh_expires_ms: refresh_token.as_ref().map_or(0, |_| {
@@ -212,6 +211,14 @@ pub fn authentication_token(response: TokenResponse) -> Result<AuthenticationTok
     })
 }
 
+/// Remaining lifetime in milliseconds for `expires_in` seconds, capped where TOML can still hold
+/// it, or `None` when absent or zero.
+pub(super) fn lifetime_ms(expires_in: Option<u64>) -> Option<u64> {
+    expires_in
+        .filter(|&seconds| seconds > 0)
+        .map(|seconds| seconds.saturating_mul(1000).min(i64::MAX as u64))
+}
+
 /// The deadline `expires_in` seconds from now, in milliseconds since the UNIX epoch, or 0 for
 /// none. A `0` is none too: Keycloak sends it for offline tokens. The deadline is capped where
 /// the token store's TOML can still hold it.
@@ -219,10 +226,8 @@ fn refresh_deadline(expires_in: Option<u64>) -> u64 {
     let Some(expires_in) = expires_in.filter(|&seconds| seconds > 0) else {
         return 0;
     };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis() as u64);
-    now.saturating_add(expires_in.saturating_mul(1000))
+    now_ms()
+        .saturating_add(expires_in.saturating_mul(1000))
         .min(i64::MAX as u64)
 }
 
