@@ -670,10 +670,17 @@ fn is_link(node: Node<'_>) -> bool {
     matches!(node, Node::Link(_))
 }
 
-/// `err`, which `doing` the extended attribute `name` failed with, naming both.
+/// `err`, which `doing` the extended attribute `name` failed with, naming both. An `err` of
+/// `ENOTSUP` becomes [`io::ErrorKind::Unsupported`] on every platform.
 fn failed_on(err: io::Error, doing: &str, name: &CStr) -> io::Error {
+    // std maps EOPNOTSUPP but not ENOTSUP to Unsupported. The two share a number on Linux but
+    // not on macOS.
+    let kind = match err.raw_os_error() {
+        Some(libc::ENOTSUP) => io::ErrorKind::Unsupported,
+        _ => err.kind(),
+    };
     io::Error::new(
-        err.kind(),
+        kind,
         format!(
             "{doing} the extended attribute {}: {err}",
             name.to_string_lossy()
