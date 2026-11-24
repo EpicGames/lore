@@ -1,11 +1,15 @@
 #!/usr/bin/python3
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
+import base64
+import hashlib
+import hmac
+import json
 import logging
 import os
 import uuid
 from pathlib import Path
-from time import sleep
+from time import sleep, time
 
 import grpc
 import pytest
@@ -27,6 +31,9 @@ logger = logging.getLogger(__name__)
 
 REPOSITORY_GET = "/lore.repository.v1.RepositoryService/RepositoryGet"
 LOCK_QUERY = "/urc.lock.LockService/Query"
+LOCK_LOCK = "/urc.lock.LockService/Lock"
+LOCK_STATUS = "/urc.lock.LockService/Status"
+LOCK_UNLOCK = "/urc.lock.LockService/Unlock"
 
 
 def allocate_server_ports() -> dict[str, int]:
@@ -107,16 +114,65 @@ def repository_name_in_response(body: bytes) -> str:
     return field_string(repository, 2) if repository else ""
 
 
-def lock_descriptions_in_response(body: bytes) -> list[str]:
-    """The resource description of each `Lock` a `QueryResponse` carries.
-
-    `result` is repeated field 1 of the response, `resource` is field 1 of
-    `Lock`, and `description` is field 3 of `Resource`."""
-    descriptions = []
+def locked_resources_in_response(body: bytes) -> list[bytes]:
+    """The encoded `Resource` of each `Lock` in a `QueryResponse`,
+    `LockResponse` or `StatusResponse`, all of which carry their locks as
+    repeated field 1."""
+    resources = []
     for lock in parse_fields(body).get(1, []):
-        resource = field_message(parse_fields(lock), 1)
-        descriptions.append(field_string(resource, 3) if resource else "")
-    return descriptions
+        resources.extend(parse_fields(lock).get(1, []))
+    return resources
+
+
+def resources_request(resources: list[bytes]) -> bytes:
+    """A `LockRequest`, `StatusRequest` or `UnlockRequest`, all of which carry
+    their resources as repeated field 1."""
+    return b"".join(encode_bytes_field(1, resource) for resource in resources)
+
+
+def unsigned_identity_metadata(
+    repo_id: str, identity: str
+) -> tuple[tuple[str, bytes], ...]:
+    """Repository metadata plus a bearer token naming `identity`, built as the
+    client builds one for a server with `trust_unsigned_identity`: HS256 under
+    an empty key, with the client's unsigned-identity issuer and claims."""
+
+    def part(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    def json_part(obj: dict) -> str:
+        return part(json.dumps(obj, separators=(",", ":")).encode())
+
+    issuer = "lore-unsigned-identity"
+    now = int(time())
+    claims = {
+        "iss": issuer,
+        "aud": [issuer],
+        "sub": identity,
+        "name": identity,
+        "preferred_username": identity,
+        "iat": now,
+        "exp": now + 3600,
+    }
+    signing_input = f"{json_part({'alg': 'HS256', 'typ': 'JWT'})}.{json_part(claims)}"
+    signature = hmac.new(b"", signing_input.encode(), hashlib.sha256).digest()
+    token = f"{signing_input}.{part(signature)}"
+    return (*repository_metadata(repo_id), ("authorization", f"Bearer {token}"))
+
+
+def server_locks(request, server_config, repo_id: str) -> list[bytes]:
+    """The encoded `Resource` of every lock a server's own store holds for the
+    repository, read from a server that forwards no lock RPC."""
+    code, body, details = call(
+        grpc_target(request, server_config),
+        LOCK_QUERY,
+        b"",
+        metadata=repository_metadata(repo_id),
+    )
+    assert code == grpc.StatusCode.OK, (
+        f"Lock Query should succeed, got {code} '{details}'"
+    )
+    return locked_resources_in_response(body)
 
 
 def log_contains(log_path: Path, expected: str, attempts: int = 30) -> bool:
@@ -641,14 +697,16 @@ class TestForwardedRepositoryGet:
 
 @pytest.mark.smoke
 @pytest.mark.xdist_group("forwarded_requests")
-class TestForwardedLockQuery:
+class TestForwardedLocks:
     """
     Smoke test for the forwarded-request delegation path for the lock service's
-    Query.
+    Query, Lock, Status and Unlock.
 
-    Each server keeps its own local lock store. A lock is acquired through
-    Server 1 only, for a repository Server 2's stores never held, so Server 2
-    can only report that lock by forwarding the query to Server 1.
+    Each server keeps its own local lock store. Locks are taken through
+    Server 1, for a repository Server 2's stores never held, so a lock Server 2
+    reports, takes or releases can only have come from Server 1's store by
+    forwarding. Server 1 forwards nothing, so querying it directly shows what
+    its store holds.
     """
 
     @pytest.fixture(scope="class")
@@ -662,15 +720,16 @@ class TestForwardedLockQuery:
             server_root, server_env, lore_server_executable_path
         )
         yield server_proc, log_path, log_fd
-        _kill_server_by_pid(
-            server_proc.pid, log_path, label="forwarded lock query server 1"
-        )
+        _kill_server_by_pid(server_proc.pid, log_path, label="forwarded locks server 1")
         log_fd.close()
 
     @pytest.fixture(scope="class")
     def server_2_config(self, request, tmp_path_factory, server_1_config):
         return delegation_source_config(
-            request, tmp_path_factory, server_1_config, ["lock_query"]
+            request,
+            tmp_path_factory,
+            server_1_config,
+            ["lock_query", "lock_lock", "lock_status", "lock_unlock"],
         )
 
     @pytest.fixture(scope="class")
@@ -685,32 +744,36 @@ class TestForwardedLockQuery:
             server_root, server_env, lore_server_executable_path
         )
         yield server_proc, log_path, log_fd
-        _kill_server_by_pid(
-            server_proc.pid, log_path, label="forwarded lock query server 2"
-        )
+        _kill_server_by_pid(server_proc.pid, log_path, label="forwarded locks server 2")
         log_fd.close()
 
-    @pytest.mark.smoke
-    def test_lock_query_delegates_read_to_server_1(
-        self,
-        request,
-        server_1_config,
-        server_2_config,
-        server_1,
-        server_2,
-        new_lore_repo,
+    @pytest.fixture()
+    def locked_on_server_1(
+        self, request, server_1_config, server_1, server_2, new_lore_repo
     ):
-        """Verify delegation by finding a lock only Server 1's store holds."""
+        """A lock on `locked.txt` taken through Server 1 only. Returns the
+        repository id and the lock's encoded `Resource`, as Server 1's store
+        holds it."""
         server_1_url = remote_url(request, server_1_config)
         repo_id = uuid.uuid4().hex
-        repo_name = f"delegated-lock-{repo_id[:8]}"
         repo = new_lore_repo(
             remote_url=server_1_url,
-            remote_path=f"{server_1_url}/{repo_name}",
+            remote_path=f"{server_1_url}/delegated-lock-{repo_id[:8]}",
             repo_id=repo_id,
         )
         repo.write_commit_push(None, {"locked.txt": "locked content"})
         repo.lock_acquire("locked.txt")
+
+        resources = server_locks(request, server_1_config, repo_id)
+        assert len(resources) == 1, f"Server 1 should hold one lock, got {resources}"
+        return repo_id, resources[0]
+
+    @pytest.mark.smoke
+    def test_lock_query_delegates_read_to_server_1(
+        self, request, server_2_config, locked_on_server_1
+    ):
+        """Verify delegation by finding a lock only Server 1's store holds."""
+        repo_id, resource = locked_on_server_1
 
         # An empty QueryRequest asks for every lock in the repository the
         # metadata names.
@@ -723,10 +786,203 @@ class TestForwardedLockQuery:
         assert code == grpc.StatusCode.OK, (
             f"Lock Query via server 2 should succeed, got {code} '{details}'"
         )
-        descriptions = lock_descriptions_in_response(body)
-        assert len(descriptions) == 1 and descriptions[0].endswith("locked.txt"), (
-            "The delegated response should carry the lock acquired on server 1, "
-            f"got {descriptions}"
+        assert locked_resources_in_response(body) == [resource], (
+            "The delegated response should carry the lock acquired on server 1"
+        )
+
+    @pytest.mark.smoke
+    def test_lock_status_delegates_read_to_server_1(
+        self, request, server_2_config, locked_on_server_1
+    ):
+        """Verify delegation by reporting a lock only Server 1's store holds."""
+        repo_id, resource = locked_on_server_1
+
+        code, body, details = call(
+            grpc_target(request, server_2_config),
+            LOCK_STATUS,
+            resources_request([resource]),
+            metadata=repository_metadata(repo_id),
+        )
+        assert code == grpc.StatusCode.OK, (
+            f"Lock Status via server 2 should succeed, got {code} '{details}'"
+        )
+        assert locked_resources_in_response(body) == [resource], (
+            "The delegated status should report the lock acquired on server 1"
+        )
+
+    @pytest.mark.smoke
+    def test_lock_unlock_delegates_write_to_server_1(
+        self, request, server_1_config, server_2_config, locked_on_server_1
+    ):
+        """Verify delegation by releasing, through Server 2, a lock Server 1's
+        store holds."""
+        repo_id, resource = locked_on_server_1
+
+        code, body, details = call(
+            grpc_target(request, server_2_config),
+            LOCK_UNLOCK,
+            resources_request([resource]),
+            metadata=repository_metadata(repo_id),
+        )
+        assert code == grpc.StatusCode.OK, (
+            f"Unlock via server 2 should succeed, got {code} '{details}'"
+        )
+        # `resources` is repeated field 1 of UnlockResponse.
+        assert parse_fields(body).get(1, []) == [resource], (
+            "The delegated response should name the released resource"
+        )
+        assert server_locks(request, server_1_config, repo_id) == [], (
+            "The lock should be gone from server 1's store"
+        )
+
+    @pytest.mark.smoke
+    def test_lock_lock_delegates_write_to_server_1(
+        self, request, server_1_config, server_2_config, locked_on_server_1
+    ):
+        """Verify delegation by taking a lock through Server 2 that lands in
+        Server 1's store."""
+        repo_id, resource = locked_on_server_1
+        server_1_target = grpc_target(request, server_1_config)
+        metadata = repository_metadata(repo_id)
+
+        # Released on server 1 directly, so the lock below is the only one.
+        code, _body, details = call(
+            server_1_target, LOCK_UNLOCK, resources_request([resource]), metadata
+        )
+        assert code == grpc.StatusCode.OK, (
+            f"Unlock on server 1 should succeed, got {code} '{details}'"
+        )
+        assert server_locks(request, server_1_config, repo_id) == [], (
+            "The lock should be released from server 1's store before relocking"
+        )
+
+        code, body, details = call(
+            grpc_target(request, server_2_config),
+            LOCK_LOCK,
+            resources_request([resource]),
+            metadata=metadata,
+        )
+        assert code == grpc.StatusCode.OK, (
+            f"Lock via server 2 should succeed, got {code} '{details}'"
+        )
+        assert locked_resources_in_response(body) == [resource], (
+            "The delegated response should carry the lock taken"
+        )
+        assert server_locks(request, server_1_config, repo_id) == [resource], (
+            "The lock should be in server 1's store"
+        )
+
+
+@pytest.mark.smoke
+@pytest.mark.xdist_group("forwarded_requests")
+class TestForwardedUnlockChecksOwnership:
+    """
+    A forwarded Unlock from a caller who is not elevated releases only the
+    caller's own locks.
+
+    Both servers trust unsigned identities, so each caller is named by the
+    token it sends and none holds `owner` or `admin`. The lock is taken through
+    Server 1 as one user, and released through Server 2, which forwards
+    Unlock, so only Server 1 can check who holds it.
+    """
+
+    @pytest.fixture(scope="class")
+    def server_1_config(self, request, tmp_path_factory):
+        server_root, server_env = delegation_target_config(request, tmp_path_factory)
+        server_env["LORE__SERVER__TRUST_UNSIGNED_IDENTITY"] = "true"
+        return server_root, server_env
+
+    @pytest.fixture(scope="class")
+    def server_1(self, server_1_config, lore_server_executable_path):
+        server_root, server_env = server_1_config
+        server_proc, log_path, log_fd = launch_lore_server(
+            server_root, server_env, lore_server_executable_path
+        )
+        yield server_proc, log_path, log_fd
+        _kill_server_by_pid(
+            server_proc.pid, log_path, label="forwarded unlock ownership server 1"
+        )
+        log_fd.close()
+
+    @pytest.fixture(scope="class")
+    def server_2_config(self, request, tmp_path_factory, server_1_config):
+        server_root, server_env = delegation_source_config(
+            request, tmp_path_factory, server_1_config, ["lock_query", "lock_unlock"]
+        )
+        server_env["LORE__SERVER__TRUST_UNSIGNED_IDENTITY"] = "true"
+        return server_root, server_env
+
+    @pytest.fixture(scope="class")
+    def server_2(self, server_2_config, server_1, lore_server_executable_path):
+        """
+        Depends on server_1 so the target's internal gRPC port is ready before
+        Server 2 starts. Server 2 connects to its peer while starting up and
+        fails to start if that connection is refused.
+        """
+        server_root, server_env = server_2_config
+        server_proc, log_path, log_fd = launch_lore_server(
+            server_root, server_env, lore_server_executable_path
+        )
+        yield server_proc, log_path, log_fd
+        _kill_server_by_pid(
+            server_proc.pid, log_path, label="forwarded unlock ownership server 2"
+        )
+        log_fd.close()
+
+    @pytest.mark.smoke
+    def test_forwarded_unlock_releases_only_the_callers_own_lock(
+        self,
+        request,
+        server_1_config,
+        server_2_config,
+        server_1,
+        server_2,
+        new_lore_repo,
+    ):
+        server_1_url = remote_url(request, server_1_config)
+        repo_id = uuid.uuid4().hex
+        repo = new_lore_repo(
+            remote_url=server_1_url,
+            remote_path=f"{server_1_url}/delegated-ownership-{repo_id[:8]}",
+            repo_id=repo_id,
+        )
+        repo.write_commit_push(None, {"locked.txt": "locked content"})
+        repo.lock_acquire("locked.txt", identity="alice")
+
+        resources = server_locks(request, server_1_config, repo_id)
+        assert len(resources) == 1, f"Server 1 should hold one lock, got {resources}"
+        unlock_request = resources_request(resources)
+        server_2_target = grpc_target(request, server_2_config)
+
+        code, _body, details = call(
+            server_2_target,
+            LOCK_UNLOCK,
+            unlock_request,
+            metadata=unsigned_identity_metadata(repo_id, "bob"),
+        )
+        assert code == grpc.StatusCode.FAILED_PRECONDITION, (
+            "Bob's unlock of Alice's lock should be refused as not owned, got "
+            f"{code} '{details}'"
+        )
+        assert repo.lock_status("locked.txt", identity="bob")[0].owner == "alice", (
+            "Alice's lock should still be held on server 1"
+        )
+
+        code, body, details = call(
+            server_2_target,
+            LOCK_UNLOCK,
+            unlock_request,
+            metadata=unsigned_identity_metadata(repo_id, "alice"),
+        )
+        assert code == grpc.StatusCode.OK, (
+            f"Alice's unlock of her own lock should succeed, got {code} '{details}'"
+        )
+        # `resources` is repeated field 1 of UnlockResponse.
+        assert parse_fields(body).get(1, []) == resources, (
+            "The delegated response should name the released resource"
+        )
+        assert server_locks(request, server_1_config, repo_id) == [], (
+            "Alice's lock should be gone from server 1's store"
         )
 
 

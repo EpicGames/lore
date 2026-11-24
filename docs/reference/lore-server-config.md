@@ -385,9 +385,17 @@ absent by default, and no RPC is forwarded until it is named under `enabled_rpcs
 per forwardable RPC, all `false` by default. Releases add to the set; an unknown
 key here is ignored, so a name that is not yet forwardable forwards nothing.
 
-`lock_query` forwards the lock service's `Query`. The peer answers it only if
+`lock_query`, `lock_lock`, `lock_status` and `lock_unlock` forward the lock
+service's `Query`, `Lock`, `Status` and `Unlock`. The peer answers them only if
 its own `[lock_store]` is at a mode other than `none`; otherwise it answers
-`UNIMPLEMENTED`, which the forwarding server relays to its client.
+`UNIMPLEMENTED`, which the forwarding server relays to its client. The
+forwarding server authorizes the caller before it forwards, including whether
+an `Unlock` may release other users' locks, and the peer sends the lock and
+unlock notifications. The peer trusts that authorization, as it does for every
+forwarded RPC, so only Lore servers should hold a client certificate its
+internal endpoint accepts. A peer running a release without one of
+these RPCs answers it `UNIMPLEMENTED` as well, so upgrade the peer before
+turning a flag on.
 
 `[server.grpc_public_services.forwarded_requests.client]` configures the channel to
 the peer. The defaults suit a long-lived connection that sits idle between

@@ -47,6 +47,27 @@ impl ::prost::Name for Lock {
         "/urc.lock.Lock".into()
     }
 }
+/// An `Unlock` forwarded from another Lore Server, which has already authorized
+/// the caller
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ForwardedUnlockRequest {
+    #[prost(message, repeated, tag = "1")]
+    pub resources: ::prost::alloc::vec::Vec<Resource>,
+    /// Set when the caller is an owner or admin of the repository, which lets
+    /// them release locks other users hold.
+    #[prost(bool, tag = "2")]
+    pub elevated_caller: bool,
+}
+impl ::prost::Name for ForwardedUnlockRequest {
+    const NAME: &'static str = "ForwardedUnlockRequest";
+    const PACKAGE: &'static str = "urc.lock";
+    fn full_name() -> ::prost::alloc::string::String {
+        "urc.lock.ForwardedUnlockRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/urc.lock.ForwardedUnlockRequest".into()
+    }
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LockRequest {
     #[prost(message, repeated, tag = "1")]
@@ -907,6 +928,69 @@ pub mod forwarded_lock_service_client {
                 .insert(GrpcMethod::new("urc.lock.ForwardedLockService", "Query"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn lock(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LockRequest>,
+        ) -> std::result::Result<tonic::Response<super::LockResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/urc.lock.ForwardedLockService/Lock",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("urc.lock.ForwardedLockService", "Lock"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn status(
+            &mut self,
+            request: impl tonic::IntoRequest<super::StatusRequest>,
+        ) -> std::result::Result<tonic::Response<super::StatusResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/urc.lock.ForwardedLockService/Status",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("urc.lock.ForwardedLockService", "Status"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn unlock(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ForwardedUnlockRequest>,
+        ) -> std::result::Result<tonic::Response<super::UnlockResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/urc.lock.ForwardedLockService/Unlock",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("urc.lock.ForwardedLockService", "Unlock"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -926,6 +1010,18 @@ pub mod forwarded_lock_service_server {
             &self,
             request: tonic::Request<super::QueryRequest>,
         ) -> std::result::Result<tonic::Response<super::QueryResponse>, tonic::Status>;
+        async fn lock(
+            &self,
+            request: tonic::Request<super::LockRequest>,
+        ) -> std::result::Result<tonic::Response<super::LockResponse>, tonic::Status>;
+        async fn status(
+            &self,
+            request: tonic::Request<super::StatusRequest>,
+        ) -> std::result::Result<tonic::Response<super::StatusResponse>, tonic::Status>;
+        async fn unlock(
+            &self,
+            request: tonic::Request<super::ForwardedUnlockRequest>,
+        ) -> std::result::Result<tonic::Response<super::UnlockResponse>, tonic::Status>;
     }
     /// A service to receive requests forwarded on from another Lore Server,
     /// to perform an RPC on behalf of a client
@@ -1035,6 +1131,140 @@ pub mod forwarded_lock_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = QuerySvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/urc.lock.ForwardedLockService/Lock" => {
+                    #[allow(non_camel_case_types)]
+                    struct LockSvc<T: ForwardedLockService>(pub Arc<T>);
+                    impl<
+                        T: ForwardedLockService,
+                    > tonic::server::UnaryService<super::LockRequest> for LockSvc<T> {
+                        type Response = super::LockResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::LockRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ForwardedLockService>::lock(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LockSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/urc.lock.ForwardedLockService/Status" => {
+                    #[allow(non_camel_case_types)]
+                    struct StatusSvc<T: ForwardedLockService>(pub Arc<T>);
+                    impl<
+                        T: ForwardedLockService,
+                    > tonic::server::UnaryService<super::StatusRequest>
+                    for StatusSvc<T> {
+                        type Response = super::StatusResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::StatusRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ForwardedLockService>::status(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StatusSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/urc.lock.ForwardedLockService/Unlock" => {
+                    #[allow(non_camel_case_types)]
+                    struct UnlockSvc<T: ForwardedLockService>(pub Arc<T>);
+                    impl<
+                        T: ForwardedLockService,
+                    > tonic::server::UnaryService<super::ForwardedUnlockRequest>
+                    for UnlockSvc<T> {
+                        type Response = super::UnlockResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ForwardedUnlockRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ForwardedLockService>::unlock(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UnlockSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

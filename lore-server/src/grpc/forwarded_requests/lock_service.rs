@@ -16,6 +16,21 @@ pub trait ForwardedLockServiceClient: Send + Sync {
         &mut self,
         request: Request<lock::QueryRequest>,
     ) -> ForwardedRequestResult<lock::QueryResponse>;
+
+    async fn lock(
+        &mut self,
+        request: Request<lock::LockRequest>,
+    ) -> ForwardedRequestResult<lock::LockResponse>;
+
+    async fn status(
+        &mut self,
+        request: Request<lock::StatusRequest>,
+    ) -> ForwardedRequestResult<lock::StatusResponse>;
+
+    async fn unlock(
+        &mut self,
+        request: Request<lock::ForwardedUnlockRequest>,
+    ) -> ForwardedRequestResult<lock::UnlockResponse>;
 }
 
 pub struct GrpcForwardedLockServiceClient {
@@ -41,5 +56,26 @@ impl ForwardedLockServiceClient for GrpcForwardedLockServiceClient {
         request: Request<lock::QueryRequest>,
     ) -> ForwardedRequestResult<lock::QueryResponse> {
         classify_forwarded_result(self.client.query(request).await)
+    }
+
+    async fn lock(
+        &mut self,
+        request: Request<lock::LockRequest>,
+    ) -> ForwardedRequestResult<lock::LockResponse> {
+        classify_forwarded_result(self.client.lock(request).await)
+    }
+
+    async fn status(
+        &mut self,
+        request: Request<lock::StatusRequest>,
+    ) -> ForwardedRequestResult<lock::StatusResponse> {
+        classify_forwarded_result(self.client.status(request).await)
+    }
+
+    async fn unlock(
+        &mut self,
+        request: Request<lock::ForwardedUnlockRequest>,
+    ) -> ForwardedRequestResult<lock::UnlockResponse> {
+        classify_forwarded_result(self.client.unlock(request).await)
     }
 }

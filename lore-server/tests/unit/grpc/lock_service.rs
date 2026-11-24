@@ -73,10 +73,143 @@ pub(super) mod store {
     }
 }
 
+mod lock {
+    use lore_base::types::LockData;
+    use lore_base::types::LockResource;
+    use lore_proto::lock::Lock;
+    use lore_proto::lock::LockRequest;
+    use lore_proto::lock::LockResponse;
+    use lore_server::grpc::forwarded_requests::CallerContext;
+    use lore_server::grpc::forwarded_requests::RpcFlags;
+    use tonic::Response;
+
+    use super::forwarding::*;
+    use super::*;
+
+    #[tokio::test]
+    async fn locks_in_the_local_store_when_lock_lock_is_not_enabled() {
+        let repository = random::<RepositoryId>();
+        let mut lock_store = store::MockMockLockStore::new();
+        lock_store
+            .expect_lock_resources()
+            .withf(move |owner, repo, resources| {
+                owner == "caller" && *repo == repository && resources.len() == 1
+            })
+            .return_once(|_, _, resources| {
+                Ok(vec![LockData {
+                    resource: resources[0].clone(),
+                    owner: "caller".into(),
+                    locked_at: 0,
+                }])
+            });
+        let lock_service = lock_service_forwarding(
+            lock_store,
+            Arc::new(AllowAllRepositoryAuthorizer),
+            RpcFlags {
+                lock_lock: false,
+                ..every_rpc()
+            },
+            MockLockClient::new(),
+        );
+
+        let response = lock_service
+            .lock(from_caller(
+                LockRequest {
+                    resources: one_resource(),
+                },
+                repository,
+            ))
+            .await
+            .expect("local lock should succeed");
+
+        let owners: Vec<String> = response
+            .into_inner()
+            .locks
+            .into_iter()
+            .map(|lock| lock.owner)
+            .collect();
+        assert_eq!(owners, vec!["caller".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn forwards_the_lock_on_behalf_of_the_caller_and_returns_the_peer_answer() {
+        let repository = random::<RepositoryId>();
+        let sent = sent::<LockRequest>();
+        let keep = Arc::clone(&sent);
+        let mut client = MockLockClient::new();
+        client.expect_lock().return_once(move |request| {
+            *keep.lock().unwrap() = Some(request);
+            Ok(Ok(Response::new(LockResponse {
+                locks: vec![Lock {
+                    resource: Some(LockResource::default().into()),
+                    owner: "peer-owner".into(),
+                    locked_at: None,
+                }],
+            })))
+        });
+        let lock_service = lock_service_forwarding(
+            store::MockMockLockStore::new(),
+            Arc::new(AllowAllRepositoryAuthorizer),
+            every_rpc(),
+            client,
+        );
+
+        let response = lock_service
+            .lock(from_caller(
+                LockRequest {
+                    resources: one_resource(),
+                },
+                repository,
+            ))
+            .await
+            .expect("forwarded lock should succeed");
+
+        let owners: Vec<String> = response
+            .into_inner()
+            .locks
+            .into_iter()
+            .map(|lock| lock.owner)
+            .collect();
+        assert_eq!(owners, vec!["peer-owner".to_string()]);
+
+        let sent = take_sent(&sent);
+        let caller = CallerContext::from_forwarded_request(&sent)
+            .expect("the forwarded request should carry the caller");
+        assert_eq!(caller.repository_id, repository);
+        assert_eq!(caller.user_id, "caller");
+        assert_eq!(sent.into_inner().resources, one_resource());
+    }
+
+    #[tokio::test]
+    async fn empty_request_is_answered_without_forwarding() {
+        let lock_service = lock_service_forwarding(
+            store::MockMockLockStore::new(),
+            Arc::new(AllowAllRepositoryAuthorizer),
+            every_rpc(),
+            MockLockClient::new(),
+        );
+
+        let response = lock_service
+            .lock(from_caller(
+                LockRequest { resources: vec![] },
+                random::<RepositoryId>(),
+            ))
+            .await
+            .expect("an empty lock should succeed");
+
+        assert!(response.into_inner().locks.is_empty());
+    }
+}
+
 mod status {
     use lore_proto::lock::Resource;
     use lore_proto::lock::StatusRequest;
+    use lore_proto::lock::StatusResponse;
+    use lore_server::grpc::forwarded_requests::CallerContext;
+    use lore_server::grpc::forwarded_requests::RpcFlags;
+    use tonic::Response;
 
+    use super::forwarding::*;
     use super::*;
 
     #[tokio::test]
@@ -137,15 +270,124 @@ mod status {
             .await
             .expect("Status should succeed when resource count is at limit");
     }
+
+    #[tokio::test]
+    async fn reads_the_local_store_when_lock_status_is_not_enabled() {
+        let repository = random::<RepositoryId>();
+        let mut lock_store = store::MockMockLockStore::new();
+        lock_store
+            .expect_check_locks_status()
+            .withf(move |repo, resources| *repo == repository && resources.len() == 1)
+            .return_once(|_, _| Ok(vec![]));
+        let lock_service = lock_service_forwarding(
+            lock_store,
+            Arc::new(AllowAllRepositoryAuthorizer),
+            RpcFlags {
+                lock_status: false,
+                ..every_rpc()
+            },
+            MockLockClient::new(),
+        );
+
+        lock_service
+            .status(from_caller(
+                StatusRequest {
+                    resources: one_resource(),
+                },
+                repository,
+            ))
+            .await
+            .expect("local status should succeed");
+    }
+
+    #[tokio::test]
+    async fn forwards_the_status_on_behalf_of_the_caller() {
+        let repository = random::<RepositoryId>();
+        let sent = sent::<StatusRequest>();
+        let keep = Arc::clone(&sent);
+        let mut client = MockLockClient::new();
+        client.expect_status().return_once(move |request| {
+            *keep.lock().unwrap() = Some(request);
+            Ok(Ok(Response::new(StatusResponse { locks: vec![] })))
+        });
+        let lock_service = lock_service_forwarding(
+            store::MockMockLockStore::new(),
+            Arc::new(AllowAllRepositoryAuthorizer),
+            every_rpc(),
+            client,
+        );
+
+        lock_service
+            .status(from_caller(
+                StatusRequest {
+                    resources: one_resource(),
+                },
+                repository,
+            ))
+            .await
+            .expect("forwarded status should succeed");
+
+        let sent = take_sent(&sent);
+        let caller = CallerContext::from_forwarded_request(&sent)
+            .expect("the forwarded request should carry the caller");
+        assert_eq!(caller.repository_id, repository);
+        assert_eq!(caller.user_id, "caller");
+        assert_eq!(sent.into_inner().resources, one_resource());
+    }
+
+    #[tokio::test]
+    async fn resource_count_over_the_limit_is_refused_without_forwarding() {
+        let repository = random::<RepositoryId>();
+        let lock_service = lock_service_forwarding(
+            store::MockMockLockStore::new(),
+            Arc::new(AllowAllRepositoryAuthorizer),
+            every_rpc(),
+            MockLockClient::new(),
+        );
+        let resources: Vec<Resource> = (0..101).flat_map(|_| one_resource()).collect();
+
+        let err = lock_service
+            .status(from_caller(StatusRequest { resources }, repository))
+            .await
+            .expect_err("status over the resource limit should fail");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn empty_request_is_answered_without_forwarding() {
+        let lock_service = lock_service_forwarding(
+            store::MockMockLockStore::new(),
+            Arc::new(AllowAllRepositoryAuthorizer),
+            every_rpc(),
+            MockLockClient::new(),
+        );
+
+        let response = lock_service
+            .status(from_caller(
+                StatusRequest { resources: vec![] },
+                random::<RepositoryId>(),
+            ))
+            .await
+            .expect("an empty status should succeed");
+
+        assert!(response.into_inner().locks.is_empty());
+    }
 }
 
 mod unlock {
     use lore_proto::lock::AdminLockRequest;
+    use lore_proto::lock::ForwardedUnlockRequest;
     use lore_proto::lock::LockRequest;
     use lore_proto::lock::Resource;
     use lore_proto::lock::StatusRequest;
     use lore_proto::lock::UnlockRequest;
+    use lore_proto::lock::UnlockResponse;
+    use lore_server::grpc::forwarded_requests::CallerContext;
+    use lore_server::grpc::forwarded_requests::RpcFlags;
+    use tonic::Response;
 
+    use super::forwarding::*;
     use super::*;
 
     #[tokio::test]
@@ -259,6 +501,95 @@ mod unlock {
 
         assert_eq!(error_status.code(), Code::FailedPrecondition);
     }
+
+    #[tokio::test]
+    async fn unlocks_in_the_local_store_when_lock_unlock_is_not_enabled() {
+        let repository = random::<RepositoryId>();
+        let mut lock_store = store::MockMockLockStore::new();
+        lock_store
+            .expect_unlock_resources()
+            .withf(move |owner, validate_user, repo, resources| {
+                owner == "caller" && *validate_user && *repo == repository && resources.len() == 1
+            })
+            .return_once(|_, _, _, _| Ok(vec![]));
+        let lock_service = lock_service_forwarding(
+            lock_store,
+            Arc::new(AllowAllRepositoryAuthorizer),
+            RpcFlags {
+                lock_unlock: false,
+                ..every_rpc()
+            },
+            MockLockClient::new(),
+        );
+
+        lock_service
+            .unlock(from_caller(
+                UnlockRequest {
+                    resources: one_resource(),
+                },
+                repository,
+            ))
+            .await
+            .expect("local unlock should succeed");
+    }
+
+    #[tokio::test]
+    async fn forwards_the_unlock_on_behalf_of_the_caller_and_returns_the_peer_answer() {
+        let repository = random::<RepositoryId>();
+        let sent = sent::<ForwardedUnlockRequest>();
+        let keep = Arc::clone(&sent);
+        let mut client = MockLockClient::new();
+        client.expect_unlock().return_once(move |request| {
+            *keep.lock().unwrap() = Some(request);
+            Ok(Ok(Response::new(UnlockResponse {
+                resources: one_resource(),
+            })))
+        });
+        let lock_service = lock_service_forwarding(
+            store::MockMockLockStore::new(),
+            Arc::new(AllowAllRepositoryAuthorizer),
+            every_rpc(),
+            client,
+        );
+
+        let response = lock_service
+            .unlock(from_caller(
+                UnlockRequest {
+                    resources: one_resource(),
+                },
+                repository,
+            ))
+            .await
+            .expect("forwarded unlock should succeed");
+
+        assert_eq!(response.into_inner().resources, one_resource());
+        let sent = take_sent(&sent);
+        let caller = CallerContext::from_forwarded_request(&sent)
+            .expect("the forwarded request should carry the caller");
+        assert_eq!(caller.repository_id, repository);
+        assert_eq!(caller.user_id, "caller");
+        assert_eq!(sent.into_inner().resources, one_resource());
+    }
+
+    #[tokio::test]
+    async fn empty_request_is_answered_without_forwarding() {
+        let lock_service = lock_service_forwarding(
+            store::MockMockLockStore::new(),
+            Arc::new(AllowAllRepositoryAuthorizer),
+            every_rpc(),
+            MockLockClient::new(),
+        );
+
+        let response = lock_service
+            .unlock(from_caller(
+                UnlockRequest { resources: vec![] },
+                random::<RepositoryId>(),
+            ))
+            .await
+            .expect("an empty unlock should succeed");
+
+        assert!(response.into_inner().resources.is_empty());
+    }
 }
 
 /// Elevated action checks: unlock elevates on `owner`/`admin`,
@@ -266,7 +597,6 @@ mod unlock {
 /// authorizer from the verified token — on both OIDC tiers.
 mod actions {
     use lore_proto::lock::AdminLockRequest;
-    use lore_proto::lock::Resource;
     use lore_proto::lock::UnlockRequest;
     use lore_server::auth::jwt::AuthorizationToken;
     use lore_server::auth::jwt::ResourcePermission;
@@ -275,6 +605,7 @@ mod actions {
     use lore_server::authnz::resource_grants_authorizer::ResourceGrantsAuthorizer;
     use serde_json::json;
 
+    use super::forwarding::one_resource;
     use super::*;
 
     /// Tier 1, reading the actions from a dotted global claim.
@@ -332,14 +663,6 @@ mod actions {
         request
     }
 
-    fn one_resource() -> Vec<Resource> {
-        vec![Resource {
-            branch: Default::default(),
-            hash: Default::default(),
-            description: "".to_string(),
-        }]
-    }
-
     /// The store records the `validate_user` flag it was called with,
     /// which is what elevation waives.
     fn store_expecting_validate_user(validate: bool) -> store::MockMockLockStore {
@@ -394,6 +717,78 @@ mod actions {
     async fn unlock_without_write_or_elevation_is_refused() {
         let repository = random::<RepositoryId>();
         let lock_service = lock_service_with(store::MockMockLockStore::new(), tier2());
+        let denied = lock_service
+            .unlock(request_with_token(
+                UnlockRequest {
+                    resources: one_resource(),
+                },
+                repository,
+                Some(token_granting(repository, &["read"])),
+            ))
+            .await
+            .expect_err("unlock without `write` is refused");
+        assert_eq!(denied.code(), Code::PermissionDenied);
+    }
+
+    /// The peer can't see the caller's grants, so the forwarded unlock
+    /// carries the origin's elevation decision.
+    #[tokio::test]
+    async fn forwarded_unlock_carries_whether_the_caller_is_elevated() {
+        for (action, elevated_caller) in [("owner", true), ("admin", true), ("write", false)] {
+            let repository = random::<RepositoryId>();
+            let mut client = super::forwarding::MockLockClient::new();
+            client
+                .expect_unlock()
+                .withf(move |request| request.get_ref().elevated_caller == elevated_caller)
+                .return_once(|_| {
+                    Ok(Ok(tonic::Response::new(lore_proto::lock::UnlockResponse {
+                        resources: vec![],
+                    })))
+                });
+            let lock_service = super::forwarding::lock_service_forwarding(
+                store::MockMockLockStore::new(),
+                tier2(),
+                super::forwarding::every_rpc(),
+                client,
+            );
+
+            lock_service
+                .unlock(request_with_token(
+                    UnlockRequest {
+                        resources: one_resource(),
+                    },
+                    repository,
+                    Some(token_granting(repository, &[action])),
+                ))
+                .await
+                .expect("forwarded unlock should succeed");
+        }
+    }
+
+    /// The origin authorizes before forwarding: a caller without `write` is
+    /// refused there and nothing reaches the peer.
+    #[tokio::test]
+    async fn forwarded_lock_and_unlock_without_write_are_refused_before_forwarding() {
+        let repository = random::<RepositoryId>();
+        let lock_service = super::forwarding::lock_service_forwarding(
+            store::MockMockLockStore::new(),
+            tier2(),
+            super::forwarding::every_rpc(),
+            super::forwarding::MockLockClient::new(),
+        );
+
+        let denied = lock_service
+            .lock(request_with_token(
+                lore_proto::lock::LockRequest {
+                    resources: one_resource(),
+                },
+                repository,
+                Some(token_granting(repository, &["read"])),
+            ))
+            .await
+            .expect_err("lock without `write` is refused");
+        assert_eq!(denied.code(), Code::PermissionDenied);
+
         let denied = lock_service
             .unlock(request_with_token(
                 UnlockRequest {
@@ -492,87 +887,60 @@ mod actions {
     }
 }
 
-mod query {
+/// A peer for the forwarding tests: `RpcFlags` decide which RPCs forward, and
+/// a mock client answers the one call a test forwards. A mock with no
+/// expectations panics on any call, so it also checks nothing was forwarded.
+pub(super) mod forwarding {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
-    use lore_base::types::LockData;
-    use lore_base::types::LockResource;
-    use lore_proto::lock::Lock;
+    use lore_proto::lock::ForwardedUnlockRequest;
+    use lore_proto::lock::LockRequest;
+    use lore_proto::lock::LockResponse;
     use lore_proto::lock::QueryRequest;
     use lore_proto::lock::QueryResponse;
-    use lore_revision::lock::LockQuery;
-    use lore_server::auth::jwt::AuthorizationToken;
-    use lore_server::grpc::forwarded_requests::CallerContext;
+    use lore_proto::lock::StatusRequest;
+    use lore_proto::lock::StatusResponse;
+    use lore_proto::lock::UnlockResponse;
     use lore_server::grpc::forwarded_requests::ForwardedRequestResult;
     use lore_server::grpc::forwarded_requests::ForwardedRequests;
-    use lore_server::grpc::forwarded_requests::InternalClientError;
     use lore_server::grpc::forwarded_requests::RpcFlags;
     use lore_server::grpc::forwarded_requests::lock_service::ForwardedLockServiceClient;
     use lore_server::grpc::forwarded_requests::repository_service::ForwardedRepositoryServiceClient;
     use lore_server::grpc::forwarded_requests::revision_service::ForwardedRevisionServiceClient;
-    use tonic::Response;
-    use tonic::Status;
 
     use super::*;
 
-    type SharedResponse = Arc<Mutex<Option<ForwardedRequestResult<QueryResponse>>>>;
-    type SharedRequest = Arc<Mutex<Option<Request<QueryRequest>>>>;
+    mockall::mock! {
+        pub LockClient {}
 
-    /// Answers its one call with a pre-configured result and keeps the request
-    /// it was sent.
-    struct SingleShotClient {
-        response: SharedResponse,
-        sent: SharedRequest,
-    }
+        #[async_trait]
+        impl ForwardedLockServiceClient for LockClient {
+            async fn query(
+                &mut self,
+                request: Request<QueryRequest>,
+            ) -> ForwardedRequestResult<QueryResponse>;
 
-    #[async_trait]
-    impl ForwardedLockServiceClient for SingleShotClient {
-        async fn query(
-            &mut self,
-            request: Request<QueryRequest>,
-        ) -> ForwardedRequestResult<QueryResponse> {
-            *self.sent.lock().unwrap() = Some(request);
-            self.response
-                .lock()
-                .unwrap()
-                .take()
-                .expect("query called more than once")
+            async fn lock(
+                &mut self,
+                request: Request<LockRequest>,
+            ) -> ForwardedRequestResult<LockResponse>;
+
+            async fn status(
+                &mut self,
+                request: Request<StatusRequest>,
+            ) -> ForwardedRequestResult<StatusResponse>;
+
+            async fn unlock(
+                &mut self,
+                request: Request<ForwardedUnlockRequest>,
+            ) -> ForwardedRequestResult<UnlockResponse>;
         }
     }
 
-    struct StubForwardedRequests {
+    pub struct StubForwardedRequests {
         flags: RpcFlags,
-        response: SharedResponse,
-        sent: SharedRequest,
-    }
-
-    impl StubForwardedRequests {
-        fn new(flags: RpcFlags, response: ForwardedRequestResult<QueryResponse>) -> Arc<Self> {
-            Arc::new(Self {
-                flags,
-                response: Arc::new(Mutex::new(Some(response))),
-                sent: Arc::new(Mutex::new(None)),
-            })
-        }
-
-        fn forwarding_enabled(response: ForwardedRequestResult<QueryResponse>) -> Arc<Self> {
-            Self::new(
-                RpcFlags {
-                    lock_query: true,
-                    ..Default::default()
-                },
-                response,
-            )
-        }
-
-        fn sent_request(&self) -> Request<QueryRequest> {
-            self.sent
-                .lock()
-                .unwrap()
-                .take()
-                .expect("no request was forwarded")
-        }
+        client: Mutex<Option<MockLockClient>>,
     }
 
     impl ForwardedRequests for StubForwardedRequests {
@@ -581,31 +949,127 @@ mod query {
         }
 
         fn forwarded_revision_service(&self) -> Box<dyn ForwardedRevisionServiceClient> {
-            unreachable!("forwarded_revision_service should not be called in query tests")
+            unreachable!("forwarded_revision_service should not be called in lock tests")
         }
 
         fn forwarded_repository_service(&self) -> Box<dyn ForwardedRepositoryServiceClient> {
-            unreachable!("forwarded_repository_service should not be called in query tests")
+            unreachable!("forwarded_repository_service should not be called in lock tests")
         }
 
         fn forwarded_lock_service(&self) -> Box<dyn ForwardedLockServiceClient> {
-            Box::new(SingleShotClient {
-                response: Arc::clone(&self.response),
-                sent: Arc::clone(&self.sent),
-            })
+            Box::new(
+                self.client
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("a lock RPC was forwarded more than once"),
+            )
         }
     }
 
-    fn lock_service_forwarding(
+    /// Flags with every forwardable RPC on.
+    pub fn every_rpc() -> RpcFlags {
+        RpcFlags {
+            revision_branch_create: true,
+            revision_branch_delete: true,
+            revision_branch_get: true,
+            revision_branch_list: true,
+            repository_create: true,
+            repository_get: true,
+            lock_query: true,
+            lock_lock: true,
+            lock_status: true,
+            lock_unlock: true,
+        }
+    }
+
+    pub fn lock_service_forwarding(
         lock_store: store::MockMockLockStore,
-        forwarded_requests: Arc<StubForwardedRequests>,
+        authorizer: Arc<dyn RepositoryAuthorizer>,
+        flags: RpcFlags,
+        client: MockLockClient,
     ) -> LoreLockService {
         LoreLockService::new(
             Arc::new(lock_store),
             Arc::new(lore_server::notification::local::NotificationSender::default()),
-            Arc::new(AllowAllRepositoryAuthorizer),
-            Some(forwarded_requests),
+            authorizer,
+            Some(Arc::new(StubForwardedRequests {
+                flags,
+                client: Mutex::new(Some(client)),
+            })),
             Duration::from_secs(60),
+        )
+    }
+
+    /// A request from the authenticated user `caller` against `repository`.
+    pub fn from_caller<T>(body: T, repository: RepositoryId) -> Request<T> {
+        let mut request = Request::new(body);
+        request.metadata_mut().insert_bin(
+            REPOSITORY_ID_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+        );
+        request
+            .extensions_mut()
+            .insert(lore_server::auth::jwt::AuthorizationToken {
+                user_id: "caller".into(),
+                ..Default::default()
+            });
+        request
+    }
+
+    /// One resource in the shape a server returns it, so it compares equal
+    /// after a trip through the lock types.
+    pub fn one_resource() -> Vec<lore_proto::lock::Resource> {
+        vec![
+            lore_base::types::LockResource {
+                description: "a/file.uasset".to_string(),
+                ..Default::default()
+            }
+            .into(),
+        ]
+    }
+
+    /// Holds the request a mock client was sent.
+    pub type Sent<T> = Arc<Mutex<Option<Request<T>>>>;
+
+    pub fn sent<T>() -> Sent<T> {
+        Arc::new(Mutex::new(None))
+    }
+
+    pub fn take_sent<T>(sent: &Sent<T>) -> Request<T> {
+        sent.lock()
+            .unwrap()
+            .take()
+            .expect("no request was forwarded")
+    }
+}
+
+mod query {
+    use lore_base::types::LockData;
+    use lore_base::types::LockResource;
+    use lore_proto::lock::Lock;
+    use lore_proto::lock::QueryRequest;
+    use lore_proto::lock::QueryResponse;
+    use lore_revision::lock::LockQuery;
+    use lore_server::auth::jwt::AuthorizationToken;
+    use lore_server::grpc::forwarded_requests::CallerContext;
+    use lore_server::grpc::forwarded_requests::InternalClientError;
+    use lore_server::grpc::forwarded_requests::RpcFlags;
+    use tonic::Response;
+    use tonic::Status;
+
+    use super::forwarding::*;
+    use super::*;
+
+    fn forwarding_query(
+        lock_store: store::MockMockLockStore,
+        client: MockLockClient,
+    ) -> LoreLockService {
+        lock_service_forwarding(
+            lock_store,
+            Arc::new(AllowAllRepositoryAuthorizer),
+            every_rpc(),
+            client,
         )
     }
 
@@ -667,20 +1131,15 @@ mod query {
     async fn answers_from_the_local_store_when_lock_query_is_not_enabled() {
         let repository = random::<RepositoryId>();
         // Every other forwardable RPC is on, so only `lock_query` decides.
-        let forwarded_requests = StubForwardedRequests::new(
+        let lock_service = lock_service_forwarding(
+            store_answering(repository, "alice"),
+            Arc::new(AllowAllRepositoryAuthorizer),
             RpcFlags {
-                revision_branch_create: true,
-                revision_branch_delete: true,
-                revision_branch_get: true,
-                revision_branch_list: true,
-                repository_create: true,
-                repository_get: true,
                 lock_query: false,
+                ..every_rpc()
             },
-            Err(InternalClientError::internal("must not be forwarded")),
+            MockLockClient::new(),
         );
-        let lock_service =
-            lock_service_forwarding(store_answering(repository, "alice"), forwarded_requests);
 
         let response = lock_service
             .query(query_by_owner(repository, "alice"))
@@ -693,19 +1152,17 @@ mod query {
     #[tokio::test]
     async fn returns_the_peer_answer_without_reading_the_local_store() {
         let repository = random::<RepositoryId>();
-        let forwarded_requests =
-            StubForwardedRequests::forwarding_enabled(Ok(Ok(Response::new(QueryResponse {
+        let mut client = MockLockClient::new();
+        client.expect_query().return_once(|_| {
+            Ok(Ok(Response::new(QueryResponse {
                 result: vec![Lock {
                     resource: None,
                     owner: "peer-owner".into(),
                     locked_at: None,
                 }],
-            }))));
-        // A mock with no expectations panics on any call.
-        let lock_service = lock_service_forwarding(
-            store::MockMockLockStore::new(),
-            Arc::clone(&forwarded_requests),
-        );
+            })))
+        });
+        let lock_service = forwarding_query(store::MockMockLockStore::new(), client);
 
         let response = lock_service
             .query(query_by_owner(repository, "alice"))
@@ -718,21 +1175,21 @@ mod query {
     #[tokio::test]
     async fn forwards_the_query_on_behalf_of_the_caller() {
         let repository = random::<RepositoryId>();
-        let forwarded_requests =
-            StubForwardedRequests::forwarding_enabled(Ok(Ok(Response::new(QueryResponse {
-                result: vec![],
-            }))));
-        let lock_service = lock_service_forwarding(
-            store::MockMockLockStore::new(),
-            Arc::clone(&forwarded_requests),
-        );
+        let sent = sent::<QueryRequest>();
+        let mut client = MockLockClient::new();
+        let keep = Arc::clone(&sent);
+        client.expect_query().return_once(move |request| {
+            *keep.lock().unwrap() = Some(request);
+            Ok(Ok(Response::new(QueryResponse { result: vec![] })))
+        });
+        let lock_service = forwarding_query(store::MockMockLockStore::new(), client);
 
         lock_service
             .query(query_by_owner(repository, "alice"))
             .await
             .expect("forwarded query should succeed");
 
-        let sent = forwarded_requests.sent_request();
+        let sent = take_sent(&sent);
         let caller = CallerContext::from_forwarded_request(&sent)
             .expect("the forwarded request should carry the caller");
         assert_eq!(caller.repository_id, repository);
@@ -743,11 +1200,13 @@ mod query {
     #[tokio::test]
     async fn peer_error_reaches_the_client_as_the_peer_wrote_it() {
         let repository = random::<RepositoryId>();
-        let forwarded_requests = StubForwardedRequests::forwarding_enabled(Ok(Err(
-            Status::invalid_argument("unsupported lock query combination"),
-        )));
-        let lock_service =
-            lock_service_forwarding(store::MockMockLockStore::new(), forwarded_requests);
+        let mut client = MockLockClient::new();
+        client.expect_query().return_once(|_| {
+            Ok(Err(Status::invalid_argument(
+                "unsupported lock query combination",
+            )))
+        });
+        let lock_service = forwarding_query(store::MockMockLockStore::new(), client);
 
         let err = lock_service
             .query(query_by_owner(repository, "alice"))
@@ -761,11 +1220,11 @@ mod query {
     #[tokio::test]
     async fn unreachable_peer_is_the_origin_own_internal_error() {
         let repository = random::<RepositoryId>();
-        let forwarded_requests = StubForwardedRequests::forwarding_enabled(Err(
-            InternalClientError::internal("peer unreachable"),
-        ));
-        let lock_service =
-            lock_service_forwarding(store::MockMockLockStore::new(), forwarded_requests);
+        let mut client = MockLockClient::new();
+        client
+            .expect_query()
+            .return_once(|_| Err(InternalClientError::internal("peer unreachable")));
+        let lock_service = forwarding_query(store::MockMockLockStore::new(), client);
 
         let err = lock_service
             .query(query_by_owner(repository, "alice"))

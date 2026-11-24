@@ -55,6 +55,18 @@ service LockService {
 // to perform an RPC on behalf of a client
 service ForwardedLockService {
   rpc Query(QueryRequest) returns (QueryResponse);
+  rpc Lock(LockRequest) returns (LockResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+  rpc Unlock(ForwardedUnlockRequest) returns (UnlockResponse);
+}
+
+// An `Unlock` forwarded from another Lore Server, which has already authorized
+// the caller
+message ForwardedUnlockRequest {
+  repeated Resource resources = 1;
+  // Set when the caller is an owner or admin of the repository, which lets
+  // them release locks other users hold.
+  bool elevated_caller = 2;
 }
 
 message LockRequest { repeated Resource resources = 1; }

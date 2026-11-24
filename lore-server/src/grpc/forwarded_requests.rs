@@ -197,6 +197,12 @@ pub struct RpcFlags {
 
     #[serde(default)]
     pub lock_query: bool,
+    #[serde(default)]
+    pub lock_lock: bool,
+    #[serde(default)]
+    pub lock_status: bool,
+    #[serde(default)]
+    pub lock_unlock: bool,
 }
 
 pub trait ForwardedRequests: Send + Sync {

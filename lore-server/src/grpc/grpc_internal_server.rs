@@ -254,7 +254,7 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
 
         if let Some(lock_store) = self.0.lock_store {
             router = router.add_service(ForwardedLockServiceServer::new(
-                LoreForwardedLockService::new(lock_store, rpc_timeout),
+                LoreForwardedLockService::new(lock_store, self.0.notification_sender, rpc_timeout),
             ));
         }
 
