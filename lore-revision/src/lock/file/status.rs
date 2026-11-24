@@ -97,7 +97,9 @@ impl EventError for StatusError {
 
 /// Data for an event that marks the start of a lock status report.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileStatusBeginEventData {
     /// Number of status entries that follow.
@@ -106,7 +108,7 @@ pub struct LoreLockFileStatusBeginEventData {
 
 /// Data for an event reporting the lock status of a single path.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileStatusEventData {
     /// Path the status applies to.

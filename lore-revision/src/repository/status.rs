@@ -67,7 +67,9 @@ use crate::util::serde::u8_as_bool;
 /// Revision status of a repository, describing the current, local, and remote
 /// positions of the active branch.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Debug, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Serialize, Debug, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryStatusRevisionEventData {
     /// Repository identifier
@@ -158,7 +160,9 @@ impl LoreRepositoryStatusRevisionEventData {
 
 /// Status of a single file or node reported by a repository status operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Debug, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Serialize, Debug, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryStatusFileEventData {
     /// Path of the file, relative to the root of the working tree.
@@ -248,7 +252,9 @@ impl LoreRepositoryStatusFileEventData {
 
 /// Counts of directories and files in the repository tree.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Debug, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Serialize, Debug, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryStatusCountEventData {
     /// Number of directories in the tree, view-filtered (staged state if
@@ -264,7 +270,9 @@ pub struct LoreRepositoryStatusCountEventData {
 /// the changes detected against the filesystem; for `--check-dirty` they are
 /// the nodes that remained dirty after the filesystem verification.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Debug, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Serialize, Debug, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryStatusSummaryEventData {
     /// Number of files added.

@@ -35,7 +35,16 @@ use crate::revision_tree::handle::RevisionTreeInternal;
 
 /// One metadata key to read.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 pub struct LoreRevisionTreeMetadataGetEntry {
     /// Caller-chosen id echoed back as `entry_id` on this entry's `METADATA_GET_COMPLETE`
     pub entry_id: u64,
@@ -45,7 +54,16 @@ pub struct LoreRevisionTreeMetadataGetEntry {
 
 /// Arguments for `lore_revision_tree_metadata_get`.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(metadata_get_impl)]
 pub struct LoreRevisionTreeMetadataGetArgs {
     /// Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`

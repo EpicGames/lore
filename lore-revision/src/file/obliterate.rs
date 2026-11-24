@@ -29,7 +29,7 @@ pub mod impact;
 
 /// Data for the event emitted when file content is obliterated.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileObliterateEventData {
     /// Address of the obliterated content.

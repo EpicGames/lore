@@ -31,7 +31,9 @@ use crate::call::repository_call_write;
 use crate::call_delegation::dispatch_call;
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(dependency_add_local)]
 /// Arguments for adding file dependencies, expanded from flat parallel arrays.
 pub struct LoreFileDependencyAddArgs {
@@ -145,7 +147,9 @@ async fn dependency_add_impl(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(dependency_remove_local)]
 /// Arguments for removing file dependencies, expanded from flat parallel arrays.
 pub struct LoreFileDependencyRemoveArgs {
@@ -253,7 +257,9 @@ async fn dependency_remove_impl(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(dependency_list_local)]
 /// Arguments for listing file dependencies (or dependents) at a given revision.
 pub struct LoreFileDependencyListArgs {

@@ -110,7 +110,17 @@ impl EventError for AuditError {
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Debug,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum LoreFileAuditOutcome {
     /// Resolved to the revision that last changed the lines.
@@ -166,7 +176,9 @@ impl LoreFileAuditOutcome {
 /// audit that fails before the walk starts reports no range. Read the
 /// completion status before treating the ranges received as the whole answer.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileAuditEventData {
     /// Identifier of the repository the range came from. A walk that follows

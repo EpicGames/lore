@@ -33,7 +33,17 @@ use crate::storage::store::StoreInternal;
 
 /// Arguments for `lore_revision_tree_close`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(close_impl)]
 pub struct LoreRevisionTreeCloseArgs {
     /// Per-call correlation id echoed back in events

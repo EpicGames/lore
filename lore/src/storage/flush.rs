@@ -23,7 +23,16 @@ use crate::storage::handle::LoreStore;
 
 /// Arguments for `lore_storage_flush`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(flush_local)]
 pub struct LoreStorageFlushArgs {
     /// Open handle whose pending writes to flush

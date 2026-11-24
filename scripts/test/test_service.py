@@ -7,8 +7,10 @@ import os
 import platform
 import shutil
 import signal
+import socket
 import subprocess
 import sys
+import threading
 import uuid
 from pathlib import Path
 from time import monotonic, sleep
@@ -22,8 +24,19 @@ from service_util import (
     LORE_SERVICE_CLAIM_REFUSED_MESSAGE,
     LORE_SERVICE_ENVIRONMENT,
     LORE_SERVICE_RUNNING_MESSAGE,
+    FRAME_MESSAGE,
+    FRAME_REFUSAL,
+    FRAME_STOP,
+    FRAME_STOP_RESULT,
     SERVICE_UNAVAILABLE,
+    read_frame,
     service_claim_path,
+    service_socket_path,
+    uds_accept,
+    uds_connect,
+    uds_listen,
+    write_frame,
+    write_hello,
     stop_lore_service,
     LORE_SERVICE_STATUS_LABELS,
     LORE_EXTERNAL_ROOT_STATUS_LABELS,
@@ -1059,6 +1072,171 @@ def test_a_second_service_exits_rather_than_take_the_socket(
     assert LORE_SERVICE_RUNNING_MESSAGE in status.stdout.splitlines(), (
         f"the first service still answers: {status.stdout}{status.stderr}"
     )
+
+
+# Schemas no build has: a hello carrying them is one from a client of another
+# build.
+FOREIGN_SCHEMAS = (0x1111111111111111, 0x2222222222222222)
+
+
+def run_service_command(
+    lore_service_runner, *args: str
+) -> subprocess.CompletedProcess[str]:
+    """Runs `lore service <args>` against this run's socket."""
+    return subprocess.run(
+        [lore_service_runner.lore_executable_path, "service", *args],
+        capture_output=True,
+        text=True,
+        env=lore_service_runner.lore_subprocess_env,
+        check=False,
+        timeout=60,
+    )
+
+
+@pytest.mark.smoke
+def test_a_service_refuses_a_client_of_another_build(
+    lore_service_runner, lore_service_socket
+):
+    """A service refuses a client whose message schemas differ from its own,
+    before it decodes the command the client sent after its hello, says why,
+    and goes on serving clients of its own build. The refusal reaches the
+    service's log, which `service status` hands back."""
+    service = lore_service_runner.start()
+
+    with uds_connect(service_socket_path(lore_service_socket)) as connection:
+        connection.settimeout(30)
+        write_hello(connection, *FOREIGN_SCHEMAS)
+        # A command its service would fail to decode, sent back-to-back with
+        # the hello as a client sends its first.
+        write_frame(connection, FRAME_MESSAGE, b"not a command of this build")
+        answer = read_frame(connection)
+        assert answer is not None, "the service closed without answering"
+        kind, payload = answer
+        reason = payload.decode()
+        assert kind == FRAME_REFUSAL, (
+            f"expected a refusal, got frame {kind}: {payload!r}"
+        )
+        assert reason, "the refusal gives a reason"
+        assert read_frame(connection) is None, "the service closes a refused connection"
+
+    status = run_service_command(lore_service_runner, "status")
+    output = status.stdout + status.stderr
+    assert service.poll() is None, f"the service exited on the refusal: {output}"
+    assert status.returncode == 0, f"the service serves its own build: {output}"
+    assert reason in output, f"the refusal reaches the service's log: {output}"
+
+
+@pytest.mark.smoke
+def test_a_service_stops_on_the_stop_request_of_a_client_of_another_build(
+    lore_service_runner, lore_service_socket
+):
+    """A stop carries no hello, so a service honours it from a client of any
+    build: that is how a client replaces a service of another build."""
+    service = lore_service_runner.start()
+
+    with uds_connect(service_socket_path(lore_service_socket)) as connection:
+        connection.settimeout(30)
+        write_frame(connection, FRAME_STOP, bytes([False]))  # Not forced.
+        answer = read_frame(connection)
+    assert answer is not None, "the service closed without answering the stop"
+    kind, payload = answer
+    assert kind == FRAME_STOP_RESULT, f"expected a stop result, got frame {kind}"
+    status = int.from_bytes(payload[:4], "little", signed=True)
+    assert (status, payload[4:]) == (0, b""), f"the stop failed: {payload!r}"
+    try:
+        code = service.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        pytest.fail("the service did not exit on the stop")
+    assert code == 0, f"the service exits cleanly on a stop, got exit code {code}"
+
+
+@contextlib.contextmanager
+def fake_service(socket_name: str, answer):
+    """Listens on `socket_name` in place of a service, handing each connection
+    to `answer`, which plays a service of another build."""
+    path = service_socket_path(socket_name)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+    listener = uds_listen(path)
+    stopping = threading.Event()
+
+    def serve():
+        while True:
+            connection = uds_accept(listener)
+            with connection:
+                if stopping.is_set():
+                    return
+                connection.settimeout(30)
+                answer(connection)
+
+    server = threading.Thread(target=serve, daemon=True)
+    server.start()
+    try:
+        yield
+    finally:
+        stopping.set()
+        # Wakes the accept the server waits in, so that it sees it is stopping.
+        uds_connect(path).close()
+        server.join(timeout=30)
+        listener.close()
+        path.unlink(missing_ok=True)
+
+
+def answer_as_an_older_protocol(connection: socket.socket):
+    """Answers as a service built before the handshake does: it reads the
+    first byte, finds a protocol it doesn't read, and closes the connection
+    without answering."""
+    connection.recv(1)
+
+
+# `MountsBusy`, which a service serving a busy mount refuses a stop with.
+# Paired with its `ffi_code` in `lore-base/src/error.rs`.
+MOUNTS_BUSY = 51
+
+
+@pytest.mark.smoke
+def test_a_stop_the_service_refuses_reports_why(
+    lore_service_runner, lore_service_socket, stops_background_services
+):
+    """A service that refuses a stop, as one serving a busy mount does,
+    answers with the status and its reason. The client exits with that status
+    and prints the reason, which is all a user has to go on. Played by a fake
+    service, since only a busy FUSE mount makes a real one refuse."""
+    reason = "Mounts are busy: /a-mount-a-shell-is-in"
+
+    def refuse_the_stop(connection: socket.socket):
+        request = read_frame(connection)
+        assert request is not None and request[0] == FRAME_STOP, request
+        write_frame(
+            connection,
+            FRAME_STOP_RESULT,
+            MOUNTS_BUSY.to_bytes(4, "little", signed=True) + reason.encode(),
+        )
+
+    with fake_service(lore_service_socket, refuse_the_stop):
+        stop = run_service_command(lore_service_runner, "stop")
+    output = stop.stdout + stop.stderr
+    assert stop.returncode == MOUNTS_BUSY, (
+        f"the stop exits with the status the service refused it with: {output}"
+    )
+    assert reason in output, f"the stop prints the service's reason: {output}"
+
+
+@pytest.mark.smoke
+def test_a_client_reports_a_service_of_an_older_protocol_as_unavailable(
+    lore_service_runner, lore_service_socket, stops_background_services
+):
+    """A service that predates the handshake closes the connection rather than
+    answer the hello. The client fails a command and a stop with the
+    service-unavailable code, rather than as an internal error."""
+    with fake_service(lore_service_socket, answer_as_an_older_protocol):
+        for command in ("status", "stop"):
+            result = run_service_command(lore_service_runner, command)
+            output = result.stdout + result.stderr
+            assert result.returncode == SERVICE_UNAVAILABLE, (
+                f"`service {command}` exits with the service-unavailable code "
+                f"{SERVICE_UNAVAILABLE}, got {result.returncode}: {output}"
+            )
 
 
 # `InvalidArguments`: a refused target of `service set-external-directory`.

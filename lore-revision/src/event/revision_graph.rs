@@ -19,7 +19,7 @@ use crate::util::serde::u8_as_bool;
 
 /// One branch, as one location holds it.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionGraphBranchEventData {
     /// The `id` from the call's arguments.
@@ -55,7 +55,7 @@ pub struct LoreRevisionGraphBranchEventData {
 
 /// One repository instance on a branch, as the local store records it.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionGraphInstanceEventData {
     /// The `id` from the call's arguments.
@@ -78,7 +78,7 @@ pub struct LoreRevisionGraphInstanceEventData {
 
 /// One revision, as one location resolves it.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionGraphRevisionEventData {
     /// The `id` from the call's arguments.
@@ -95,7 +95,7 @@ pub struct LoreRevisionGraphRevisionEventData {
 
 /// One metadata entry of a branch, as one location holds it.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionGraphBranchMetadataEventData {
     /// The `id` from the call's arguments.
@@ -112,7 +112,7 @@ pub struct LoreRevisionGraphBranchMetadataEventData {
 
 /// The call's outcome at one location, after that location's record events.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionGraphLocationCompleteEventData {
     /// The `id` from the call's arguments.
@@ -128,7 +128,7 @@ pub struct LoreRevisionGraphLocationCompleteEventData {
 
 /// A branch sync's outcome: the local latest before the call and after it.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionGraphBranchSyncedEventData {
     /// The `id` from the call's arguments.
@@ -145,7 +145,7 @@ pub struct LoreRevisionGraphBranchSyncedEventData {
 /// A branch push's outcome: the last revision the call published, the remote latest and the local
 /// latest when the call finished.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionGraphBranchPushedEventData {
     /// The `id` from the call's arguments.

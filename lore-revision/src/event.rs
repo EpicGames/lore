@@ -289,7 +289,7 @@ pub trait EventError: std::fmt::Display {
 /// Data for a generic progress event.
 // TODO(vri): Implement with a union to enable command-specific progress events
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreProgressEventData {
     /// Placeholder field; carries no meaningful value.
@@ -300,7 +300,16 @@ pub struct LoreProgressEventData {
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 /// Staged change to a link itself, as opposed to content inside it.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Debug,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreLinkStagedState {
     /// The link carries no staged change.
@@ -317,7 +326,7 @@ pub enum LoreLinkStagedState {
 /// branch identifier rather than its name; a consumer that wants the name
 /// resolves it, so listing links costs no branch metadata reads.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLinkEntryEventData {
     /// Identifier of the repository the link points to.
@@ -345,7 +354,7 @@ pub struct LoreLinkEntryEventData {
 /// Data for an event describing a single link in detail: everything `LinkEntry`
 /// reports, plus the state only `link info` gathers.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLinkInfoEventData {
     /// The link as `LinkEntry` reports it.
@@ -490,7 +499,16 @@ impl core::fmt::Debug for LoreBytesMut {
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 #[derive(
-    Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, bitcode::Encode, bitcode::Decode,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Eq,
+    PartialEq,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub enum LoreErrorCode {
     /// No error; the operation succeeded.
@@ -523,7 +541,7 @@ const _: () = assert!(LoreErrorCode::Oversized as i32 == lore_base::error::Overs
 
 /// Data for an error event.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreErrorEventData {
     /// The error code, matching one of the error codes.
@@ -543,7 +561,7 @@ impl LoreErrorEventData {
 
 /// Data for a completion event, marking the end of an operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCompleteEventData {
     /// The completion status code of the operation.
@@ -555,7 +573,7 @@ pub struct LoreCompleteEventData {
 
 /// Data for a metadata event, carrying a single key and value.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreMetadataEventData {
     /// The metadata key.
@@ -591,7 +609,9 @@ impl LoreMetadataEventData {
 
 /// Data for a log event.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLogEventData {
     /// The severity level of the log message.
@@ -608,7 +628,16 @@ pub struct LoreLogEventData {
 
 /// Data for an end event, marking the final event of a callback stream.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Default,
+    PartialEq,
+    Debug,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreEndEventData {
     /// Placeholder field; carries no meaningful value.
@@ -617,7 +646,7 @@ pub struct LoreEndEventData {
 
 /// Data for a maintenance event, carrying an informational message.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreMaintenanceEventData {
     /// The maintenance message text.
@@ -637,7 +666,9 @@ pub struct LoreMaintenanceEventData {
 /// event. A consumer that keeps any of this data must copy it out before the
 /// callback returns.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreTraceLocation {
     /// The source file path.
@@ -696,7 +727,9 @@ impl std::fmt::Display for LoreTraceLocation {
 ///
 /// [`MAX_TRACE_DEPTH`]: lore_error_set::MAX_TRACE_DEPTH
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreErrorDetail {
     /// The error's error code. `0` on success; `-1` for an internal error.
@@ -775,7 +808,7 @@ impl LoreErrorDetail {
 
 /// Data for the start of a store eviction pass.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreEvictionBeginEventData {
     /// Fragment capacity the pass is reducing the store toward.
@@ -784,7 +817,7 @@ pub struct LoreEvictionBeginEventData {
 
 /// Data for one bucket evicted during a store eviction pass.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreEvictionProgressEventData {
     /// Fragments evicted from this bucket.
@@ -793,7 +826,7 @@ pub struct LoreEvictionProgressEventData {
 
 /// Data for the end of a store eviction pass.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreEvictionEndEventData {
     /// Total fragments evicted across the pass.
@@ -802,7 +835,7 @@ pub struct LoreEvictionEndEventData {
 
 /// Data for the start of a store compaction pass.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCompactionBeginEventData {
     /// Store size in bytes the pass is reducing the store toward.
@@ -811,7 +844,7 @@ pub struct LoreCompactionBeginEventData {
 
 /// Data for one group compacted during a store compaction pass.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCompactionProgressEventData {
     /// Bytes reclaimed from this group.
@@ -820,7 +853,7 @@ pub struct LoreCompactionProgressEventData {
 
 /// Data for the end of a store compaction pass.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCompactionEndEventData {
     /// Total bytes reclaimed across the pass.
@@ -830,7 +863,7 @@ pub struct LoreCompactionEndEventData {
 /// Data for the service status event, reporting whether the service is running
 /// and its current metadata.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreServiceStatusEventData {
     /// Whether the service is running: 1 for running, 0 for not running.
@@ -868,7 +901,16 @@ pub struct LoreServiceStatusEventData {
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 #[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, bitcode::Encode, bitcode::Decode,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 #[serde(rename_all = "camelCase")]
 pub enum LoreExternalRootState {
@@ -894,7 +936,7 @@ impl From<&crate::global::external_dir::resolve::Availability> for LoreExternalR
 
 /// Data for a service log message captured outside command execution.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreServiceMessageEventData {
     /// The severity level of the log message.
@@ -908,7 +950,15 @@ pub struct LoreServiceMessageEventData {
 /// An event delivered to a callback. Each variant names a kind of event and
 /// carries the data for that event.
 #[repr(C, u32)]
-#[derive(Clone, PartialEq, Serialize, VariantTypeSize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    PartialEq,
+    Serialize,
+    VariantTypeSize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[serde(tag = "tagName", content = "data", rename_all = "camelCase")]
 pub enum LoreEvent {
     // Standard events

@@ -110,7 +110,7 @@ use crate::util::serde::u8_as_bool;
 
 /// Data for the event sent when a branch merge starts.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeStartBeginEventData {
     /// The source branch being merged.
@@ -123,7 +123,7 @@ pub struct LoreBranchMergeStartBeginEventData {
 
 /// Data for the event sent when a branch merge finishes.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeStartEndEventData {
     /// Progress totals collected while applying the merge.
@@ -136,7 +136,7 @@ pub struct LoreBranchMergeStartEndEventData {
 
 /// Data for the event sent when a branch merge abort starts.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeAbortBeginEventData {
     /// The staged revision being discarded.
@@ -147,7 +147,9 @@ pub struct LoreBranchMergeAbortBeginEventData {
 
 /// Data for the event sent when a branch merge abort finishes.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeAbortEndEventData {
     /// Placeholder field. The event carries no payload.
@@ -156,7 +158,9 @@ pub struct LoreBranchMergeAbortEndEventData {
 
 /// Data for the event sent before files are merged into the working tree.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeIntoFileBeginEventData {
     /// The number of files to merge.
@@ -165,7 +169,9 @@ pub struct LoreBranchMergeIntoFileBeginEventData {
 
 /// Data for the event sent for each file merged into the working tree.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeIntoFileEventData {
     /// The path of the file.
@@ -187,7 +193,9 @@ pub struct LoreBranchMergeIntoFileEventData {
 
 /// Data for the event sent after files are merged into the working tree.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeIntoFileEndEventData {
     /// The number of files merged.
@@ -196,7 +204,9 @@ pub struct LoreBranchMergeIntoFileEndEventData {
 
 /// Data for the event sent before the merge synchronizes revisions.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeIntoSyncBeginEventData {
     /// The number of revisions to synchronize.
@@ -205,7 +215,9 @@ pub struct LoreBranchMergeIntoSyncBeginEventData {
 
 /// Data for the event sent after the merge synchronizes revisions.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeIntoSyncEndEventData {
     /// The number of revisions synchronized.
@@ -214,7 +226,7 @@ pub struct LoreBranchMergeIntoSyncEndEventData {
 
 /// Data for the event sent before the merge transfers fragments.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeIntoFragmentBeginEventData {
     /// The number of fragments to transfer.
@@ -223,7 +235,7 @@ pub struct LoreBranchMergeIntoFragmentBeginEventData {
 
 /// Data for the event sent as the merge transfers fragments.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeIntoFragmentProgressEventData {
     /// The number of fragments transferred so far.
@@ -234,7 +246,7 @@ pub struct LoreBranchMergeIntoFragmentProgressEventData {
 
 /// Data for the event sent after the merge transfers fragments.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeIntoFragmentEndEventData {
     /// The number of fragments transferred.
@@ -243,7 +255,9 @@ pub struct LoreBranchMergeIntoFragmentEndEventData {
 
 /// Data for the event sent for each revision merged into the working tree.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeIntoRevisionEventData {
     /// The revision merged.
@@ -254,7 +268,7 @@ pub struct LoreBranchMergeIntoRevisionEventData {
 
 /// Data for the event sent for each file the merge left in conflict.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeConflictFileEventData {
     /// The path of the conflicted file.
@@ -279,7 +293,7 @@ pub enum LinkMergeSkipReason {
 
 /// Data for the event sent when a link is skipped during a merge.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeLinkSkippedEventData {
     /// The mount path of the skipped link.
@@ -294,7 +308,16 @@ pub struct LoreBranchMergeLinkSkippedEventData {
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 /// Which side a divergent link row was settled to.
-#[derive(Copy, Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy,
+    Clone,
+    PartialEq,
+    Debug,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreLinkPinResolution {
     /// The row this branch held.
@@ -314,7 +337,9 @@ impl From<LoreLinkPinResolution> for LinkMergeResolution {
 
 /// One side of a link row the two branches disagree on.
 #[repr(C)]
-#[derive(Clone, PartialEq, Default, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Default, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLinkPinSideData {
     /// The branch the row resolves to.
@@ -331,7 +356,7 @@ pub struct LoreLinkPinSideData {
 
 /// Data for the event sent when a link row diverges across a merge.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeLinkPinConflictEventData {
     /// The mount path of the divergent link.
@@ -346,7 +371,7 @@ pub struct LoreBranchMergeLinkPinConflictEventData {
 
 /// Data for the event sent when a divergent link row is settled.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeLinkPinResolvedEventData {
     /// The mount path of the settled link.
@@ -357,7 +382,7 @@ pub struct LoreBranchMergeLinkPinResolvedEventData {
 
 /// Data for the event sent when a file in a merge is marked unresolved.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeUnresolveFileEventData {
     /// The path of the file marked unresolved.
@@ -366,7 +391,7 @@ pub struct LoreBranchMergeUnresolveFileEventData {
 
 /// Data for the event sent when a revision in a merge is marked unresolved.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeUnresolveRevisionEventData {
     /// The repository of the revision marked unresolved.
@@ -377,7 +402,7 @@ pub struct LoreBranchMergeUnresolveRevisionEventData {
 
 /// Data for the event sent when a file in a merge is marked resolved.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeResolveFileEventData {
     /// The path of the file marked resolved.
@@ -386,7 +411,7 @@ pub struct LoreBranchMergeResolveFileEventData {
 
 /// Data for the event sent when a revision in a merge is marked resolved.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMergeResolveRevisionEventData {
     /// The repository of the revision marked resolved.

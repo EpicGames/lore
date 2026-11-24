@@ -111,7 +111,7 @@ impl EventError for LayerError {
 
 /// Data for the event emitted when a layer is added.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLayerAddEventData {
     /// Path in the outer repository where the layer is placed.
@@ -128,7 +128,7 @@ pub struct LoreLayerAddEventData {
 
 /// Data for the event describing a single configured layer.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLayerEntryEventData {
     /// Path in the outer repository where the layer is placed.
@@ -145,7 +145,7 @@ pub struct LoreLayerEntryEventData {
 
 /// Data for the event describing a layer that has staged changes.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLayerStagedEntryEventData {
     /// Path in the outer repository where the layer is placed.
@@ -158,7 +158,7 @@ pub struct LoreLayerStagedEntryEventData {
 
 /// Data for the event emitted when a layer is removed.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLayerRemoveEventData {
     /// Path in the outer repository where the layer was placed.

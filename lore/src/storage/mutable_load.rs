@@ -37,7 +37,15 @@ use crate::storage::store::StoreInternal;
 /// One `mutable_load` item — the `(partition, key, key_type)` to read.
 #[repr(C)]
 #[derive(
-    Copy, Clone, Default, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+    Copy,
+    Clone,
+    Default,
+    Debug,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct LoreStorageMutableLoadItem {
     /// Caller-chosen id echoed back in `MUTABLE_LOAD_ITEM_COMPLETE`
@@ -52,7 +60,16 @@ pub struct LoreStorageMutableLoadItem {
 
 /// Arguments for `lore_storage_mutable_load`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(mutable_load_impl)]
 pub struct LoreStorageMutableLoadArgs {
     /// Open storage handle

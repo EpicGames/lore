@@ -31,6 +31,14 @@ mod tests {
     use lore::interface::LoreEvent;
     use lore::interface::LoreEventCallback;
     use lore::interface::LoreString;
+    use lore::remote::message::Answer;
+    use lore::remote::message::FrameKind;
+    use lore::remote::message::Header;
+    use lore::remote::message::Schemas;
+    use lore::remote::message::blocking_read_answer;
+    use lore::remote::message::blocking_read_stop_result;
+    use lore::remote::message::write_payload;
+    use lore::remote::message::write_stop;
     use lore::revision::LoreRevisionCherryPickArgs;
     use lore::service::LoreServiceQuitArgs;
     use lore::service::LoreServiceRunArgs;
@@ -596,6 +604,126 @@ mod tests {
             assert_eq!(status, 0);
 
             assert_eq!(quit().await, 0, "a quit after the service ended is a no-op");
+        });
+    }
+
+    /// What `read` reads of the service's answer to `opening`, written on a
+    /// connection of its own to this target's socket.
+    ///
+    /// Runs on a thread of its own rather than on the runtime's blocking pool:
+    /// this process relays its calls, so the pool is small, and the service's
+    /// accept loop and its read of the opening each hold a thread of it.
+    async fn exchange<Answer: Send + 'static>(
+        opening: Vec<u8>,
+        read: fn(&mut lore::remote::network::UdsStream) -> Answer,
+    ) -> Answer {
+        let (answered, answer) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let mut connection =
+                lore::remote::network::UdsStream::connect(lore::remote::service_socket_name())
+                    .expect("the service must accept a connection");
+            // Not checked: a service that refuses the hello closes the connection without
+            // reading what follows it, which can fail the write of a large call.
+            let _ = std::io::Write::write_all(connection.writer(), &opening);
+            let _ = answered.send(read(&mut connection));
+        });
+        tokio::time::timeout(Duration::from_secs(15), answer)
+            .await
+            .expect("the service must answer within 15 seconds")
+            .expect("the exchange must not panic")
+    }
+
+    fn hello_of(schemas: [u64; 2]) -> Vec<u8> {
+        let mut hello = vec![3];
+        hello.extend_from_slice(&Header::new(16, FrameKind::Hello).to_bytes());
+        hello.extend_from_slice(&schemas[0].to_le_bytes());
+        hello.extend_from_slice(&schemas[1].to_le_bytes());
+        hello
+    }
+
+    fn read_answer(connection: &mut lore::remote::network::UdsStream) -> Answer {
+        blocking_read_answer(connection.reader()).expect("the service must answer")
+    }
+
+    /// A service answers the hello of a client of its own build with its schemas,
+    /// and refuses one whose schemas differ in either direction, or whose
+    /// protocol is another, before it reads a call. It goes on serving after a
+    /// refusal.
+    #[test]
+    #[serial]
+    fn a_service_refuses_a_client_of_another_build() {
+        let _settings = machine_settings("service-api-handshake-");
+
+        lore::runtime().block_on(async {
+            let service = run_service_here().await;
+            let ours = Schemas::THIS_BUILD;
+
+            assert_eq!(
+                exchange(hello_of([ours.to_server, ours.to_client]), read_answer).await,
+                Answer::Hello(ours)
+            );
+            // A call larger than the socket buffers hold follows the hello, and the client still
+            // reads the refusal the service wrote before it closed the connection.
+            let mut refused_call = hello_of([ours.to_server ^ 1, ours.to_client]);
+            write_payload(&mut refused_call, &vec![0; 8 << 20]).expect("the call must write");
+            assert!(matches!(
+                exchange(refused_call, read_answer).await,
+                Answer::Refusal(_)
+            ));
+            for schemas in [
+                [ours.to_server ^ 1, ours.to_client],
+                [ours.to_server, ours.to_client ^ 1],
+            ] {
+                assert!(
+                    matches!(
+                        exchange(hello_of(schemas), read_answer).await,
+                        Answer::Refusal(_)
+                    ),
+                    "schemas {schemas:x?} must be refused"
+                );
+            }
+            // The first bytes of a call of protocol version 2.
+            let mut older = hello_of([ours.to_server, ours.to_client]);
+            older[0] = 1;
+            assert!(matches!(
+                exchange(older, read_answer).await,
+                Answer::Refusal(_)
+            ));
+
+            assert!(socket_is_accepting(), "a refusal must not end the service");
+            assert_eq!(quit().await, 0);
+            tokio::time::timeout(Duration::from_secs(15), service)
+                .await
+                .expect("the service must end after a quit")
+                .expect("the service task must not panic");
+        });
+    }
+
+    /// A service stops on the stop request that any build of its protocol writes,
+    /// whatever that build's schemas, and answers it with the stop's status.
+    #[test]
+    #[serial]
+    fn a_service_stops_on_a_stop_request() {
+        let _settings = machine_settings("service-api-stop-request-");
+
+        lore::runtime().block_on(async {
+            let service = run_service_here().await;
+            let mut stop = Vec::new();
+            write_stop(&mut stop, false).expect("the stop must write");
+
+            let (status, message) = exchange(stop, |connection| {
+                blocking_read_stop_result(connection.reader())
+                    .expect("the service must answer the stop")
+                    .expect("the service must not close the connection unanswered")
+            })
+            .await;
+            assert_eq!((status, message.as_str()), (0, ""));
+
+            let status = tokio::time::timeout(Duration::from_secs(15), service)
+                .await
+                .expect("the service must end after a stop")
+                .expect("the service task must not panic");
+            assert_eq!(status, 0);
         });
     }
 
@@ -1459,21 +1587,14 @@ mod tests {
         );
     }
 
-    /// A service whose status doesn't decode is stopped as `lore service stop` stops one, the
-    /// socket is held once it stops answering, and no service is started again.
+    /// A service of another build, which refuses the status, is stopped as `lore service stop`
+    /// stops one, the socket is held once it stops answering, and no service is started again.
     #[test]
     #[serial]
-    fn a_status_that_does_not_decode_is_stopped_with_no_restart() {
+    fn a_service_of_another_build_is_stopped_with_no_restart() {
         let settings = machine_settings("service-api-other-build-");
         let global = global_data_dir(&settings);
-        let stopped_reply =
-            lore::remote::message::encode_message(&lore::remote::message::MessageToClient::<
-                LoreEvent,
-            >::ApiResult(0));
-        let other_build = Replier::in_turn(
-            use_a_socket_of_our_own(),
-            vec![vec![0xff; 8], stopped_reply],
-        );
+        let other_build = Replier::other_build(use_a_socket_of_our_own());
 
         let ended = lore::runtime().block_on(async {
             let found = lore::service::external_root::find_service()
@@ -1501,6 +1622,74 @@ mod tests {
             Ok(lore::service::external_root::Restart::NoneStopped),
             "the service is stopped and none is started again"
         );
+        assert_eq!(answered, 2, "the status and the stop reach the service");
+    }
+
+    /// The code and message `stop_for_move` refuses with, for the service `replier` stands in
+    /// for, and the calls and stops that reached it.
+    fn refusal_of_a_move_past(
+        settings: &TempDir,
+        replier: Replier,
+    ) -> (Option<(i32, String)>, usize) {
+        let global = global_data_dir(settings);
+        let refused = lore::runtime().block_on(async {
+            let found = lore::service::external_root::find_service()
+                .await
+                .expect("the status");
+            lore::service::external_root::stop_for_move(
+                &global,
+                &settings.path().join("target"),
+                found,
+                false,
+                Duration::from_secs(10),
+                std::future::pending(),
+            )
+            .await
+            .err()
+            .map(|error| (error.ffi_code(), error.to_string()))
+        });
+        (refused, replier.answered())
+    }
+
+    /// A socket that a move by another build holds, which refuses the status as a service of
+    /// another build does, and then the stop, refuses the move with `MountsBusy`.
+    #[test]
+    #[serial]
+    fn a_socket_held_by_a_move_of_another_build_refuses_the_move() {
+        let settings = machine_settings("service-api-held-other-build-");
+        let held = Replier::held_by_another_build(use_a_socket_of_our_own());
+
+        let (refused, answered) = refusal_of_a_move_past(&settings, held);
+
+        let (code, message) = refused.expect("the move is refused");
+        assert_eq!(
+            code,
+            code_of(lore_base::error::MountsBusy {
+                paths: String::new()
+            })
+        );
+        assert!(message.contains("the Lore service socket"), "{message}");
+        assert_eq!(answered, 2, "the status and the stop reach the socket");
+    }
+
+    /// A service that closes the connection on the status and on the stop, as one of an older
+    /// protocol does, can't be stopped, and refuses the move with `MountsBusy`.
+    #[test]
+    #[serial]
+    fn a_service_that_leaves_the_stop_unanswered_refuses_the_move() {
+        let settings = machine_settings("service-api-older-protocol-");
+        let older = Replier::older_protocol(use_a_socket_of_our_own());
+
+        let (refused, answered) = refusal_of_a_move_past(&settings, older);
+
+        let (code, message) = refused.expect("the move is refused");
+        assert_eq!(
+            code,
+            code_of(lore_base::error::MountsBusy {
+                paths: String::new()
+            })
+        );
+        assert!(message.contains("couldn't be asked to stop"), "{message}");
         assert_eq!(answered, 2, "the status and the stop reach the service");
     }
 
@@ -1536,20 +1725,6 @@ mod tests {
         reply
     }
 
-    /// The reply of a service of this build that has carried out a stop.
-    #[cfg(target_family = "unix")]
-    fn stopped_reply() -> Vec<u8> {
-        let mut reply = Vec::new();
-        lore::remote::message::write_payload(
-            &mut reply,
-            &lore::remote::message::encode_message(&lore::remote::message::MessageToClient::<
-                LoreEvent,
-            >::ApiResult(0)),
-        )
-        .expect("frame the reply");
-        reply
-    }
-
     /// An executable at `path` that, run as the service, makes `ran` and then waits `seconds`.
     #[cfg(target_family = "unix")]
     fn fake_service_executable(path: &std::path::Path, ran: &std::path::Path, seconds: u32) {
@@ -1578,9 +1753,9 @@ mod tests {
             .arg("60")
             .spawn()
             .expect("a process that doesn't exit");
-        let service = Replier::in_turn_framed(
+        let service = Replier::service(
             use_a_socket_of_our_own(),
-            vec![status_reply(process.id(), &executable), stopped_reply()],
+            vec![status_reply(process.id(), &executable)],
         );
 
         let began = Instant::now();
@@ -1628,9 +1803,9 @@ mod tests {
         let mut process = std::process::Command::new("true")
             .spawn()
             .expect("a process that exits");
-        let service = Replier::in_turn_framed(
+        let service = Replier::service(
             use_a_socket_of_our_own(),
-            vec![status_reply(process.id(), &executable), stopped_reply()],
+            vec![status_reply(process.id(), &executable)],
         );
         let shared =
             lore_base::fs::lock::FSLock::try_acquire_shared_file_lock(global.join("external"))
@@ -1684,9 +1859,9 @@ mod tests {
         let mut process = std::process::Command::new("true")
             .spawn()
             .expect("a process that exits");
-        let service = Replier::in_turn_framed(
+        let service = Replier::service(
             use_a_socket_of_our_own(),
-            vec![status_reply(process.id(), &executable), stopped_reply()],
+            vec![status_reply(process.id(), &executable)],
         );
 
         let ended = lore::runtime().block_on(async {
@@ -1780,13 +1955,14 @@ mod tests {
         );
     }
 
-    /// A service that closes the connection without answering the status, as no service of another
-    /// build does, fails the reading of the status, rather than reading as one of another build.
+    /// A service that answers the hello and then closes the connection without answering the
+    /// status, as no service of another build does, fails the reading of the status, rather than
+    /// reading as one of another build.
     #[test]
     #[serial]
     fn a_status_closed_without_an_answer_fails() {
         let _settings = machine_settings("service-api-status-closed-");
-        let service = Replier::in_turn_framed(use_a_socket_of_our_own(), vec![Vec::new()]);
+        let service = Replier::service(use_a_socket_of_our_own(), vec![Vec::new()]);
 
         let found = lore::runtime().block_on(lore::service::external_root::find_service());
         drop(service);

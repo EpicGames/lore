@@ -98,6 +98,7 @@ pub const ANCHOR_COMMITTING: &str = "anchor-committing";
     Serialize,
     bitcode::Encode,
     bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct InstanceId {
     /// The raw 16-byte identifier
@@ -814,7 +815,7 @@ fn read_registration(
 
 /// Event data warning that several instances share the same checked-out branch.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMultipleInstanceEventData {
     /// The branch checked out by more than one instance
@@ -1352,7 +1353,7 @@ use crate::event::LoreEvent;
 
 /// Event data describing an instance — used for both listing and prune notifications.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryInstanceEventData {
     /// Identifier of the instance
@@ -1375,7 +1376,7 @@ pub struct LoreRepositoryInstanceEventData {
 
 /// Event data for the start of an instance delete operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryInstanceDeleteBeginEventData {
     /// Identifier of the instance being deleted
@@ -1390,7 +1391,17 @@ pub struct LoreRepositoryInstanceDeleteBeginEventData {
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreRepositoryInstanceDeletePhase {
     /// Unmounting the instance, an SWFS instance or a virtual clone
@@ -1403,7 +1414,7 @@ pub enum LoreRepositoryInstanceDeletePhase {
 
 /// Event data for progress during an instance delete operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryInstanceDeleteProgressEventData {
     /// Current phase of the delete operation
@@ -1412,7 +1423,7 @@ pub struct LoreRepositoryInstanceDeleteProgressEventData {
 
 /// Event data for the completion of an instance delete operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryInstanceDeleteCompleteEventData {
     /// Identifier of the deleted instance
@@ -1421,7 +1432,7 @@ pub struct LoreRepositoryInstanceDeleteCompleteEventData {
 
 /// Event data for the start of an instance move operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryInstanceMoveBeginEventData {
     /// Identifier of the instance being moved
@@ -1434,7 +1445,7 @@ pub struct LoreRepositoryInstanceMoveBeginEventData {
 
 /// Event data for the completion of an instance move operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryInstanceMoveCompleteEventData {
     /// Identifier of the moved instance
@@ -1447,7 +1458,17 @@ pub struct LoreRepositoryInstanceMoveCompleteEventData {
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreRepositoryInstanceCloneMethod {
     /// The clone shares the instance's data blocks, costing filesystem metadata, not content
@@ -1460,7 +1481,7 @@ pub enum LoreRepositoryInstanceCloneMethod {
 
 /// Event data for the start of an instance clone operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryInstanceCloneBeginEventData {
     /// Identifier of the instance being cloned
@@ -1495,7 +1516,17 @@ pub struct LoreRepositoryInstanceCloneBeginEventData {
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreRepositoryInstanceClonePhase {
     /// Removing a directory an interrupted clone to the same destination left, named by the
@@ -1511,7 +1542,7 @@ pub enum LoreRepositoryInstanceClonePhase {
 
 /// Event data for progress during an instance clone operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryInstanceCloneProgressEventData {
     /// Current phase of the clone operation
@@ -1529,7 +1560,7 @@ pub struct LoreRepositoryInstanceCloneProgressEventData {
 
 /// Event data for the completion of an instance clone operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryInstanceCloneCompleteEventData {
     /// Identifier of the new instance, zero in a dry run

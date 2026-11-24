@@ -30,7 +30,16 @@ use crate::revision_tree::handle::RevisionTreeInternal;
 
 /// One metadata key to remove.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 pub struct LoreRevisionTreeMetadataClearEntry {
     /// Caller-chosen id echoed back as `entry_id` on this entry's `METADATA_CLEAR_COMPLETE`
     pub entry_id: u64,
@@ -40,7 +49,16 @@ pub struct LoreRevisionTreeMetadataClearEntry {
 
 /// Arguments for `lore_revision_tree_metadata_clear`.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(metadata_clear_impl)]
 pub struct LoreRevisionTreeMetadataClearArgs {
     /// Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`

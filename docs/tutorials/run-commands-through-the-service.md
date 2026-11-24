@@ -191,9 +191,17 @@ starting /opt/lore/bin/lore failed: No such file or directory (os error 2)
 
 The command never ran, because no service could be reached and none could be started from the executable that is named. Check that the path in `[service] executable` still exists — this is what you see after a build directory is cleaned or a version is uninstalled. Exit code `32` means the service was unreachable, distinct from the command itself having run and failed, so a script can retry it after starting a service.
 
+### A service of another build refuses the command, exit code 32
+
+```text
+[Error] Failed to send command to Lore service because: Lore service unavailable: the Lore service is of a build whose messages differ from the client's (...); stop it with `lore service stop` to use a service of the client's build
+```
+
+The command never ran. A client and the service exchange commands only when they come from builds whose commands and events match, and the service running on the socket comes from another build than the `lore` you ran, typically one from before an update. `lore service status` is refused the same way. `lore service stop` still stops it, so name the build you want serving with `lore service set-executable <path>` if it changed, then run `lore service stop`. The next command starts a service from the named build. A service from a build that predates this check closes the connection on any command from a newer `lore`, the stop included: stop it with the `lore` it came from, or end its process.
+
 ### A command reached a service, but not the one you expected
 
-A build directory that is still on the machine keeps serving commands after you have moved on to another one, because the executable is resolved from the stored setting rather than from the client you ran. `lore service status` names the build that is actually serving the socket, so compare its `Executable` against the client you meant to use and re-run `lore service set-executable <path>` followed by `lore service stop` if they differ. The next command starts a service from the newly named build.
+A build directory that is still on the machine keeps serving commands after you have moved on to another one, because the executable is resolved from the stored setting rather than from the client you ran. Unless that build refuses your client's commands, as the previous section describes, `lore service status` names the build that is actually serving the socket, so compare its `Executable` against the client you meant to use and re-run `lore service set-executable <path>` followed by `lore service stop` if they differ. The next command starts a service from the newly named build.
 
 ### A test run or a second checkout keeps stopping your service
 

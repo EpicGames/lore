@@ -1243,7 +1243,7 @@ impl std::fmt::Display for LineFault {
 
 /// Data for the event reporting a revision found by a search.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionFindEventData {
     /// Signature of the revision that was found.

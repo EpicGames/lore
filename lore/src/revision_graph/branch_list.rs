@@ -57,7 +57,16 @@ const RECORDS_IN_FLIGHT: usize = 16;
 
 /// Arguments for `lore_revision_graph_branch_list`.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(branch_list_impl)]
 pub struct LoreRevisionGraphBranchListArgs {
     /// Caller-chosen id echoed back in every event this surface defines for the call. Separate

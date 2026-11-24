@@ -76,7 +76,9 @@ impl EventError for AuthStoreError {
 
 /// Arguments for resolving user IDs to display names via the remote user service.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(resolve_user_info_local)]
 pub struct LoreAuthUserInfoArgs {
     /// User IDs to resolve; empty resolves the current user locally
@@ -234,7 +236,9 @@ fn send_user_info(user_info: UserInfo) {
 
 /// Arguments for authenticating against a remote URL using a provided token.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(login_with_token_local)]
 pub struct LoreAuthLoginWithTokenArgs {
     /// Remote URL; empty resolves from the repository config
@@ -364,7 +368,9 @@ async fn login_with_client_credentials_impl(
 
 /// Arguments for authenticating interactively via browser-based login flow.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(login_interactive_local)]
 pub struct LoreAuthLoginInteractiveArgs {
     /// Remote URL; empty resolves from the repository config
@@ -446,7 +452,16 @@ async fn login_interactive_local(
 
 /// Arguments for listing all stored authentication identities across endpoints.
 #[repr(C)]
-#[derive(Debug, Clone, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(list_local)]
 pub struct LoreAuthListArgs {
     /// Include the decrypted cached token in each identity
@@ -528,7 +543,9 @@ async fn list_local(
 
 /// Arguments for removing stored authentication and authorization tokens.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(logout_local)]
 pub struct LoreAuthLogoutArgs {
     /// Auth service URL; empty resolves from the repository
@@ -625,7 +642,16 @@ async fn logout_local(
 
 /// Arguments for clearing all stored authentication identities and tokens.
 #[repr(C)]
-#[derive(Debug, Clone, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(clear_local)]
 pub struct LoreAuthClearArgs {
     _unused: u8,
@@ -678,7 +704,9 @@ async fn clear_local(
 
 /// Arguments for resolving user identities from locally stored JWT tokens.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(local_user_info_impl)]
 pub struct LoreAuthLocalUserInfoArgs {
     /// Auth service remote URL; empty resolves from the repository's remote environment

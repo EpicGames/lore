@@ -69,7 +69,9 @@ const MAX_SWAPS: usize = 8;
 
 /// One entry `lore_revision_graph_branch_metadata_set` sets in a branch's metadata.
 #[repr(C)]
-#[derive(Clone, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 pub struct LoreRevisionGraphBranchMetadataEntry {
     /// Key to set, replacing the value it holds. Not empty, not a read-only key, and named once
     /// across `entries` and `remove`.
@@ -81,7 +83,16 @@ pub struct LoreRevisionGraphBranchMetadataEntry {
 
 /// Arguments for `lore_revision_graph_branch_metadata_set`.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(branch_metadata_set_impl)]
 pub struct LoreRevisionGraphBranchMetadataSetArgs {
     /// Caller-chosen id echoed back in every event this surface defines for the call. Separate

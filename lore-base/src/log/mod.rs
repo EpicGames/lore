@@ -13,7 +13,16 @@ use serde::Serialize;
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 #[derive(
-    Debug, Copy, Clone, Default, PartialEq, PartialOrd, Serialize, bitcode::Encode, bitcode::Decode,
+    Debug,
+    Copy,
+    Clone,
+    Default,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 #[serde(rename_all = "camelCase")]
 pub enum LoreLogLevel {

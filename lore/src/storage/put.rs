@@ -39,7 +39,9 @@ use crate::storage::store::StoreInternal;
 
 /// One put item — a buffer to hash and store at `(partition, context)`.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy, Clone, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 pub struct LoreStoragePutItem {
     /// Caller-chosen id echoed back in `PUT_ITEM_COMPLETE`
     pub id: u64,
@@ -92,7 +94,16 @@ impl core::fmt::Debug for LoreStoragePutItem {
 
 /// Arguments for `lore_storage_put`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(put_local)]
 pub struct LoreStoragePutArgs {
     /// Open storage handle

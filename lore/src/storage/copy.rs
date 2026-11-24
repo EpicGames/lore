@@ -67,7 +67,15 @@ use crate::storage::store::StoreInternal;
 /// `(target_partition, source_address.hash, target_context)`, preserving the content hash.
 #[repr(C)]
 #[derive(
-    Copy, Clone, Default, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+    Copy,
+    Clone,
+    Default,
+    Debug,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct LoreStorageCopyItem {
     /// Caller-chosen id echoed back in `COPY_ITEM_COMPLETE`
@@ -86,7 +94,16 @@ pub struct LoreStorageCopyItem {
 
 /// Arguments for `lore_storage_copy`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(copy_local)]
 pub struct LoreStorageCopyArgs {
     /// Open storage handle

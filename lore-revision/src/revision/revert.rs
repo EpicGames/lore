@@ -34,7 +34,7 @@ use crate::state::State;
 
 /// Event data reported at the start of a revert.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevertStartBeginEventData {
     /// Branch identifier.
@@ -47,7 +47,7 @@ pub struct LoreRevertStartBeginEventData {
 
 /// Event data reported at the end of a revert.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevertStartEndEventData {
     /// Progress statistics for the applied changes.
@@ -60,7 +60,7 @@ pub struct LoreRevertStartEndEventData {
 
 /// Event data reported at the start of aborting a revert.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevertAbortBeginEventData {
     /// Identifier of the staged revision being discarded.
@@ -71,7 +71,9 @@ pub struct LoreRevertAbortBeginEventData {
 
 /// Event data reported at the end of aborting a revert.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevertAbortEndEventData {
     /// Unused placeholder field.
@@ -80,7 +82,7 @@ pub struct LoreRevertAbortEndEventData {
 
 /// Event data reported when a file is resolved during a revert.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevertResolveFileEventData {
     /// Path of the file.
@@ -89,7 +91,7 @@ pub struct LoreRevertResolveFileEventData {
 
 /// Event data reported when a revision is resolved during a revert.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevertResolveRevisionEventData {
     /// Repository identifier.
@@ -100,7 +102,7 @@ pub struct LoreRevertResolveRevisionEventData {
 
 /// Event data reported for a file in conflict during a revert.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevertConflictFileEventData {
     /// Path of the file.
@@ -109,7 +111,7 @@ pub struct LoreRevertConflictFileEventData {
 
 /// Event data reported when a file is unresolved during a revert.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevertUnresolveFileEventData {
     /// Path of the file.
@@ -118,7 +120,7 @@ pub struct LoreRevertUnresolveFileEventData {
 
 /// Event data reported when a revision is unresolved during a revert.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevertUnresolveRevisionEventData {
     /// Repository identifier.

@@ -24,7 +24,7 @@ use crate::util::path::RelativePath;
 
 /// Details of a single file that differs between two revisions.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionDiffFileEventData {
     /// Path of the file, relative to the root of the working tree.

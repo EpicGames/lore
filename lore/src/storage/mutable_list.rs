@@ -34,7 +34,15 @@ use crate::storage::store::StoreInternal;
 /// One `mutable_list` item — the `(partition, key_type)` to list.
 #[repr(C)]
 #[derive(
-    Copy, Clone, Default, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+    Copy,
+    Clone,
+    Default,
+    Debug,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct LoreStorageMutableListItem {
     /// Caller-chosen id echoed back on every entry and the terminal event
@@ -47,7 +55,16 @@ pub struct LoreStorageMutableListItem {
 
 /// Arguments for `lore_storage_mutable_list`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(mutable_list_local)]
 pub struct LoreStorageMutableListArgs {
     /// Open storage handle

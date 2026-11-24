@@ -114,7 +114,9 @@ impl RevisionGraphError {
 /// `revision_number` on `branch`, where 0 names the branch's latest. A string identifier such as
 /// `main@5` names its branch by name; `lore_revision_graph_branch_resolve` finds the branch's id.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 pub struct LoreRevisionIdentifier {
     /// Non-zero: the revision with this hash. `branch` and `revision_number` must then be zero.
     pub hash: Hash,

@@ -16,7 +16,7 @@ const DEFAULT_LATEST_LIST_LIMIT: u32 = 30;
 
 /// Event data reported for each entry in a branch latest-revision history listing.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 pub struct LoreBranchLatestListEntryEventData {
     /// Branch identifier.
     pub branch: BranchId,

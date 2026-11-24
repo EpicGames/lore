@@ -34,7 +34,7 @@ impl crate::event::EventError for NotificationError {}
 
 /// Data for a notification that a branch received a new revision.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationBranchPushedEventData {
     /// Hash of the pushed revision.
@@ -49,7 +49,7 @@ pub struct LoreNotificationBranchPushedEventData {
 
 /// Data for a notification that a branch was created.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationBranchCreatedEventData {
     /// Identifier of the created branch.
@@ -58,7 +58,7 @@ pub struct LoreNotificationBranchCreatedEventData {
 
 /// Data for a notification that a branch was deleted.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationBranchDeletedEventData {
     /// Identifier of the deleted branch.
@@ -67,7 +67,7 @@ pub struct LoreNotificationBranchDeletedEventData {
 
 /// Data for a notification that resources were locked.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationResourceLockedEventData {
     /// Identifier of the user that locked the resources.
@@ -80,7 +80,7 @@ pub struct LoreNotificationResourceLockedEventData {
 
 /// Data for a notification that resources were unlocked.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationResourceUnlockedEventData {
     /// Identifier of the user that unlocked the resources.
@@ -111,7 +111,7 @@ pub struct LoreNotificationBinaryDataEventData {
 
 /// Data for a notification that a subscription to a repository was established.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationSubscribedEventData {
     /// Identifier of the subscribed repository.
@@ -120,7 +120,7 @@ pub struct LoreNotificationSubscribedEventData {
 
 /// Data for a notification that a subscription to a repository was removed.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationUnsubscribedEventData {
     /// Identifier of the unsubscribed repository.

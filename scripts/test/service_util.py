@@ -4,6 +4,8 @@ import contextlib
 import logging
 import os
 import platform
+import socket
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -99,14 +101,20 @@ def service_supported():
     return platform.system() in ("Windows", "Linux", "Darwin")
 
 
-def service_claim_path(socket_name: str) -> Path:
-    """The lock file a service claims `socket_name` with, beside the socket.
-    Paired with `uds_sock_dir` in `lore/src/remote/network/unix.rs` and
-    `uds_sock_path` in `lore/src/remote/network/windows.rs`."""
+def service_socket_path(socket_name: str) -> Path:
+    """The socket a service named `socket_name` listens on. Paired with
+    `uds_sock_dir` in `lore/src/remote/network/unix.rs` and `uds_sock_path` in
+    `lore/src/remote/network/windows.rs`."""
     if sys.platform == "win32":
-        return _windows_temp_path() / f"{socket_name}.lock"
+        return _windows_temp_path() / socket_name
     base = os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("TMPDIR") or "/tmp"
-    return Path(base) / f"lore-{os.getuid()}" / f"{socket_name}.lock"
+    return Path(base) / f"lore-{os.getuid()}" / socket_name
+
+
+def service_claim_path(socket_name: str) -> Path:
+    """The lock file a service claims `socket_name` with, beside the socket."""
+    socket_path = service_socket_path(socket_name)
+    return socket_path.with_name(f"{socket_path.name}.lock")
 
 
 def _windows_temp_path() -> Path:
@@ -150,3 +158,139 @@ def stop_lore_service(lore_executable_path: str, global_dir_name: str) -> str:
     output = stop.stdout + stop.stderr
     logger.info("Stopping Lore service: %s", output)
     return output
+
+
+# The service's wire protocol, as `lore/src/remote/message.rs` writes it, for a
+# test to speak to a service, or to a client, of another build. A frame is the
+# protocol version, the payload's size as a little-endian u32, the frame's kind,
+# then the payload. Each value pairs with one there and has to change with it.
+MESSAGE_PROTOCOL = 3
+FRAME_MESSAGE = 0
+FRAME_HELLO = 1
+FRAME_REFUSAL = 2
+FRAME_STOP = 3
+FRAME_STOP_RESULT = 4
+_FRAME_HEADER = struct.Struct("<BIB")
+
+
+def write_frame(connection: socket.socket, kind: int, payload: bytes):
+    """Writes one frame of `kind` carrying `payload`."""
+    connection.sendall(
+        _FRAME_HEADER.pack(MESSAGE_PROTOCOL, len(payload), kind) + payload
+    )
+
+
+def write_hello(connection: socket.socket, to_server: int, to_client: int):
+    """Writes a hello carrying the schemas of a build's two message types."""
+    write_frame(connection, FRAME_HELLO, struct.pack("<QQ", to_server, to_client))
+
+
+def read_frame(connection: socket.socket) -> tuple[int, bytes] | None:
+    """Reads one frame as its kind and payload, or `None` where the peer closed
+    the connection before it, as a reset reads too."""
+    try:
+        header = _read_exactly(connection, _FRAME_HEADER.size)
+    except (ConnectionResetError, ConnectionAbortedError):
+        return None
+    if header is None:
+        return None
+    protocol, size, kind = _FRAME_HEADER.unpack(header)
+    assert protocol == MESSAGE_PROTOCOL, f"a frame of protocol {protocol}"
+    payload = _read_exactly(connection, size)
+    assert payload is not None, "the connection closed inside a frame"
+    return kind, payload
+
+
+def _read_exactly(connection: socket.socket, size: int) -> bytes | None:
+    """Reads `size` bytes, or `None` where the connection closes before the first."""
+    data = b""
+    while len(data) < size:
+        chunk = connection.recv(size - len(data))
+        if not chunk:
+            assert not data, "the connection closed inside a frame"
+            return None
+        data += chunk
+    return data
+
+
+def uds_connect(path: Path) -> socket.socket:
+    """A connection to the Unix domain socket at `path`."""
+    if sys.platform != "win32":
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.connect(str(path))
+        return connection
+    return _winsock_uds(path, "connect")
+
+
+def uds_listen(path: Path) -> socket.socket:
+    """A socket listening at `path`, whose connections `uds_accept` takes."""
+    if sys.platform != "win32":
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(path))
+    else:
+        listener = _winsock_uds(path, "bind")
+    listener.listen()
+    return listener
+
+
+def uds_accept(listener: socket.socket) -> socket.socket:
+    """The next connection to `listener`, waiting for one."""
+    if sys.platform != "win32":
+        return listener.accept()[0]
+    # Through Winsock, because Python's `accept` can't read an address of a
+    # family it wasn't built with.
+    handle = _winsock().accept(listener.fileno(), None, None)
+    if handle == _INVALID_SOCKET:
+        raise OSError(_ctypes().get_last_error(), "accepting a connection")
+    return socket.socket(fileno=handle)
+
+
+# Windows has Unix domain sockets, but Python's `socket` module on Windows is
+# built without `AF_UNIX`: a socket is made and addressed through Winsock, then
+# wrapped, which its reads and writes work on.
+_WINDOWS_AF_UNIX = 1
+_INVALID_SOCKET = (1 << 64) - 1
+
+
+def _ctypes():
+    import ctypes
+
+    return ctypes
+
+
+def _winsock():
+    ctypes = _ctypes()
+    winsock = ctypes.WinDLL("ws2_32", use_last_error=True)
+    winsock.socket.restype = ctypes.c_size_t
+    winsock.socket.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    for addressed in (winsock.connect, winsock.bind):
+        addressed.argtypes = [ctypes.c_size_t, ctypes.c_void_p, ctypes.c_int]
+    winsock.accept.restype = ctypes.c_size_t
+    winsock.accept.argtypes = [ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p]
+    winsock.closesocket.argtypes = [ctypes.c_size_t]
+    return winsock
+
+
+def _winsock_uds(path: Path, operation: str) -> socket.socket:
+    """A Winsock Unix domain socket that `operation`, `connect` or `bind`, has
+    addressed to `path`."""
+    ctypes = _ctypes()
+
+    class SockaddrUn(ctypes.Structure):
+        _fields_ = (
+            ("sun_family", ctypes.c_ushort),
+            ("sun_path", ctypes.c_char * 108),
+        )
+
+    winsock = _winsock()
+    handle = winsock.socket(_WINDOWS_AF_UNIX, socket.SOCK_STREAM, 0)
+    if handle == _INVALID_SOCKET:
+        raise OSError(ctypes.get_last_error(), "creating a socket")
+    address = SockaddrUn(_WINDOWS_AF_UNIX, os.fsencode(path))
+    if getattr(winsock, operation)(
+        handle, ctypes.byref(address), ctypes.sizeof(address)
+    ):
+        error = ctypes.get_last_error()
+        winsock.closesocket(handle)
+        raise OSError(error, f"{operation} to {path}")
+    return socket.socket(fileno=handle)

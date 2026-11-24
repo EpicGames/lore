@@ -18,7 +18,7 @@ use crate::state;
 
 /// Data for an event reporting that revision metadata was cleared.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreMetadataClearRevisionEventData {
     /// Hash of the revision whose metadata was cleared.
@@ -27,7 +27,7 @@ pub struct LoreMetadataClearRevisionEventData {
 
 /// Data for an event reporting that a file's metadata was cleared.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreMetadataClearFileEventData {
     /// Path of the file whose metadata was cleared.

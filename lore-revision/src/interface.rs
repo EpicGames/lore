@@ -649,7 +649,9 @@ pub const DEFAULT_EVENT_INTERVAL_MS: u64 = 100;
 /// its default, and a field a release adds in its padding is left unset by
 /// code built against an earlier header.
 #[repr(C)]
-#[derive(Default, Debug, Clone, PartialEq, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Default, Debug, Clone, PartialEq, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 pub struct LoreGlobalArgs {
     /// Repository path
     pub repository_path: LoreString,
@@ -1268,7 +1270,7 @@ pub enum LoreError {
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C, u32)]
-#[derive(Clone, Debug, PartialEq, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, Debug, PartialEq, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 pub enum LoreMetadata {
     /// An address value.
     Address(Address) = LoreMetadataType::Address as u32,
@@ -1296,7 +1298,16 @@ pub enum LoreMetadata {
 ///
 /// There is deliberately no zero value: a zero-initialized field has not chosen
 /// a type and must not be passed as one.
-#[derive(Debug, Copy, Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreMetadataType {
     /// A content address: 48 bytes, the 32-byte hash followed by the 16-byte
@@ -1416,7 +1427,16 @@ impl ValidateText for LoreMetadata {
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 /// The kind of a tracked node.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Debug,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreNodeType {
     /// A directory.
@@ -1455,7 +1475,16 @@ pub enum LoreNodeStagedAction {
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 /// The change applied to a file.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Debug,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreFileAction {
     /// The file is unchanged.
@@ -1474,7 +1503,16 @@ pub enum LoreFileAction {
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 /// Where a branch is located.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Debug,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreBranchLocation {
     /// A branch held locally.
@@ -1494,7 +1532,16 @@ impl Display for LoreBranchLocation {
 
 /// A branch paired with a revision on that branch.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Debug,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 pub struct LoreBranchPoint {
     /// The branch.
     pub branch: BranchId,

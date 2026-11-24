@@ -24,6 +24,7 @@ use serde::Serialize;
     Deserialize,
     bitcode::Encode,
     bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum AuthMode {

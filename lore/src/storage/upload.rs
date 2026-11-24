@@ -45,7 +45,15 @@ use crate::storage::store::StoreInternal;
 /// One upload item — the `(partition, address)` of locally-stored content to push to remote.
 #[repr(C)]
 #[derive(
-    Copy, Clone, Default, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+    Copy,
+    Clone,
+    Default,
+    Debug,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct LoreStorageUploadItem {
     /// Caller-chosen id echoed back in `UPLOAD_ITEM_COMPLETE`
@@ -58,7 +66,16 @@ pub struct LoreStorageUploadItem {
 
 /// Arguments for `lore_storage_upload`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(upload_local)]
 pub struct LoreStorageUploadArgs {
     /// Open storage handle; must have been opened with `remote_config`

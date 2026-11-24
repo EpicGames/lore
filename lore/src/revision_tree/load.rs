@@ -36,7 +36,17 @@ use crate::storage::handle::LoreStore;
 
 /// Arguments for `lore_revision_tree_load`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(load_impl)]
 pub struct LoreRevisionTreeLoadArgs {
     /// Open storage handle the revision tree is loaded against

@@ -123,7 +123,16 @@ fn retain_closed_stores(store: &StoreInternal, claims: &StoreHold) {
 
 /// Arguments for `lore_storage_close`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(close_local)]
 pub struct LoreStorageCloseArgs {
     /// Handle to release; from `LORE_EVENT_STORAGE_OPENED`

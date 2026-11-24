@@ -364,9 +364,10 @@ service that starts finishes or removes what it left, as Virtual instances descr
   `RepositoryInstanceMove`, the last variant today, since bitcode identifies a variant by its position
   ([ADR-00022](../developing/decisions/00022-service-ipc-bitcode.md)); no existing command changes
   position. An older service sent it drops the connection, and the client reports "Lore service closed
-  connection without sending a result" (`lore/src/remote/call.rs`). The handshake
-  [ADR-00025](../developing/decisions/00025-service-version-compatibility.md) proposes would turn that into a
-  clear refusal.
+  connection without sending a result" (`lore/src/remote/call.rs`). A client built with the handshake
+  [ADR-00025](../developing/decisions/00025-service-version-compatibility.md) adopts fails with
+  `ServiceUnavailable` instead, as such a service, built before the handshake, closes the connection on the
+  protocol version before it decodes the command.
 - **On-disk format** — Cloning an on-disk instance writes the same files and store keys as any instance. The
   in-progress directory is a sibling of the destination, not part of any instance. The in-progress mark, which
   a crash between the rename and its removal can leave in an instance's Lore directory, is a file older

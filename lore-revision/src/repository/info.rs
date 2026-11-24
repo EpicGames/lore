@@ -26,7 +26,7 @@ use crate::runtime::execution_context;
 
 /// Descriptive data for a repository.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryDataEventData {
     /// Remote URL of the repository.

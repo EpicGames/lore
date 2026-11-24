@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+// Lets `lore_macro`'s derives name this crate as `::lore_base` inside it too.
+extern crate self as lore_base;
+
 pub mod allocator;
 pub mod directories;
 pub mod env;
@@ -17,3 +20,4 @@ pub mod timestamp;
 pub mod types;
 pub mod units;
 pub mod version;
+pub mod wire_schema;

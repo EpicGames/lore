@@ -37,7 +37,15 @@ const SERVICE_STORE_FLUSH_SECONDS: NonZeroU64 = NonZeroU64::new(30).unwrap();
 /// Builds the execution context callback that buffers service-level logs and
 /// errors in `service_state`, so a status report can hand them back later.
 fn service_log_callback(service_state: Arc<ServiceStateImpl>) -> LoreEventCallback {
-    Some(Box::new(move |event| match event {
+    Some(Box::new(move |event| {
+        push_service_log(&service_state, event);
+    }))
+}
+
+/// Buffers `event` in `service_state` where it is a log or an error, so a status report can hand
+/// it back later.
+pub(crate) fn push_service_log(service_state: &ServiceStateImpl, event: &LoreEvent) {
+    match event {
         LoreEvent::Log(data) => {
             service_state.push_log(data.level, data.message.as_str().to_string());
         }
@@ -48,7 +56,7 @@ fn service_log_callback(service_state: Arc<ServiceStateImpl>) -> LoreEventCallba
             );
         }
         _ => {}
-    }))
+    }
 }
 
 /// Brings up the service, and answers whether it has work for [`background_recovery`]: a move

@@ -6,6 +6,7 @@ mod lore_instrument;
 mod test_pub;
 mod validate_text;
 mod variant;
+mod wire_schema;
 
 use proc_macro::TokenStream;
 use syn::DeriveInput;
@@ -37,6 +38,21 @@ pub fn lore_command(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
 
     lore_command::get_lore_command_impl(&ast)
+}
+
+/// Implements `lore_base::wire_schema::WireSchema` for a type that derives `bitcode::Encode` and
+/// `bitcode::Decode`, so that a change to its encoding changes the schema a client and the service
+/// compare.
+///
+/// The schema covers the order, names and schemas of the type's fields and variants, and leaves
+/// out a field that `#[bitcode(skip)]` leaves out of the encoding. Each type parameter must
+/// implement the trait. A type that holds itself, however indirectly, fails to compile, since its
+/// schema would be defined by its own.
+#[proc_macro_derive(WireSchema)]
+pub fn wire_schema(input: TokenStream) -> TokenStream {
+    let ast = parse_macro_input!(input as DeriveInput);
+
+    wire_schema::get_wire_schema_impl(&ast)
 }
 
 #[proc_macro_attribute]

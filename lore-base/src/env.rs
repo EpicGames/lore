@@ -10,6 +10,8 @@ use std::any::Any;
 use std::sync::OnceLock;
 
 use crate::runtime::LORE_CONTEXT;
+use crate::wire_schema::WireSchema;
+use crate::wire_schema::schema_text;
 
 /// Directory holding the global configuration and data, in place of the per-user default.
 pub const GLOBAL_PATH_VAR: &str = "LORE_GLOBAL_PATH";
@@ -49,6 +51,7 @@ impl AuthStore {
 }
 
 /// The variables a call carries.
+#[lore_macro::test_pub]
 const CALL_VARIABLES: [&str; 3] = [GLOBAL_PATH_VAR, AUTH_PATH_VAR, AUTH_STORE_VAR];
 
 /// A process's values of the variables a call carries, unset ones included, so that a variable
@@ -57,6 +60,24 @@ const CALL_VARIABLES: [&str; 3] = [GLOBAL_PATH_VAR, AUTH_PATH_VAR, AUTH_STORE_VA
 #[derive(Clone, Debug, Default, PartialEq, bitcode::Encode, bitcode::Decode)]
 pub struct CallEnvironment {
     values: [Option<String>; CALL_VARIABLES.len()],
+}
+
+/// The schema of the values with the names of the variables they hold, in order: which value is
+/// which is decided by [`CALL_VARIABLES`], which the values' type doesn't carry.
+impl WireSchema for CallEnvironment {
+    const SCHEMA: u64 = call_environment_schema(&CALL_VARIABLES);
+}
+
+/// The schema of a [`CallEnvironment`] that carries the variables `names` names, in order.
+#[lore_macro::test_pub]
+const fn call_environment_schema(names: &[&str]) -> u64 {
+    let mut hash = <[Option<String>; CALL_VARIABLES.len()] as WireSchema>::SCHEMA;
+    let mut index = 0;
+    while index < names.len() {
+        hash = schema_text(hash, names[index]);
+        index += 1;
+    }
+    hash
 }
 
 impl CallEnvironment {

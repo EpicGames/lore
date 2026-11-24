@@ -5,7 +5,9 @@
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
-#[derive(Debug, Copy, Clone, Default, PartialEq, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Copy, Clone, Default, PartialEq, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 pub enum KeyType {
     /// Key has no specific type.
     #[default]

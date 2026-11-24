@@ -35,7 +35,6 @@ use lore_revision::service_state::ServiceStateImpl;
 use lore_revision::util::config::SaveableConfig;
 
 use crate::call::no_repository_call;
-use crate::call_delegation::refuse_handed_back;
 use crate::interface::LoreArray;
 use crate::interface::LoreEvent;
 use crate::interface::LoreEventCallback;
@@ -44,6 +43,7 @@ use crate::remote::call::EXTERNAL_ROOT_MOVING;
 use crate::remote::call::HandedBack;
 use crate::remote::call::Relayed;
 use crate::remote::call::run_service_call;
+use crate::remote::call::run_service_stop;
 use crate::remote::network::UdsStream;
 use crate::remote::service_process::Reached;
 use crate::remote::service_process::ServiceProcessError;
@@ -62,7 +62,16 @@ use crate::service::service_main::service_main;
 use crate::service::set_external_directory::Form;
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(start_local)]
 /// Arguments for starting the Lore service process (no parameters).
 pub struct LoreServiceStartArgs {}
@@ -157,7 +166,16 @@ async fn relay_a_status(connection: UdsStream) -> Result<(), ServiceProcessError
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(stop_local)]
 /// Arguments for stopping the Lore service process.
 pub struct LoreServiceStopArgs {}
@@ -233,21 +251,15 @@ async fn stop_local(
         return stop_here(globals, args, callback).await;
     }
 
-    // Reached in the process the caller ran. Hand the command to the service so
-    // that the branch above runs there, over a connection made here: a stop acts
-    // on a service that is running and must not be what starts one.
+    // Reached in the process the caller ran. Ask the service to stop so that the
+    // branch above runs there, over a connection made here: a stop acts on a
+    // service that is running and must not be what starts one. The request is
+    // one a service of another build honours too, so that such a service, which
+    // refuses this build's calls, can be stopped.
     match reach_running_service().await {
         Ok(Reached::Here) => stop_here(globals, args, callback).await,
         Ok(Reached::Connected(connection)) => {
-            let status = match run_service_call(Some(connection), globals, args.into(), callback)
-                .await
-            {
-                Relayed::Ran(status) => status,
-                Relayed::HandedBack(call) => {
-                    return refuse_handed_back(call, "stop", "A stop needs a running Lore service")
-                        .await;
-                }
-            };
+            let status = run_service_stop(connection, globals.force(), callback).await;
             if status != 0 {
                 return status;
             }
@@ -266,11 +278,11 @@ async fn stop_local(
                     0
                 }
                 Err(error) => {
-                    // Reported through the return value alone. The service
-                    // already sent the `Complete` for the stop it carried out,
-                    // and that stop did succeed; this is the wait after it. See
-                    // the note in the commit for what making the two agree
-                    // would cost.
+                    // Reported through the return value alone. This process
+                    // already completed the stop with the status the service
+                    // answered, and that stop did succeed; this is the wait
+                    // after it. See the note in the commit for what making the
+                    // two agree would cost.
                     lore_warn!("{error}");
                     error.ffi_code()
                 }
@@ -296,7 +308,16 @@ async fn stop_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(set_executable_local)]
 /// Arguments for naming the executable the Lore service runs from.
 pub struct LoreServiceSetExecutableArgs {
@@ -381,7 +402,16 @@ async fn set_executable_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(set_external_directory_local)]
 /// Arguments for moving the external root, where every virtual instance's external directory
 /// lives.
@@ -503,7 +533,16 @@ async fn set_external_directory_with(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(set_use_automatically_local)]
 /// Arguments for setting whether commands are carried out by the Lore service.
 pub struct LoreServiceSetUseAutomaticallyArgs {
@@ -579,7 +618,16 @@ async fn set_use_automatically_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(status_local)]
 /// Arguments for querying the Lore service status (no parameters).
 pub struct LoreServiceStatusArgs {}

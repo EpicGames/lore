@@ -66,7 +66,7 @@ use crate::util::serde::u8_as_bool;
 
 /// Data for the event sent when a branch push starts.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushEventData {
     /// The remote being pushed to.
@@ -101,7 +101,7 @@ pub struct LoreBranchPushEventData {
 
 /// Data for the event sent before a revision's parent is rewritten during push.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushRevisionUpdateBeginEventData {
     /// The repository being pushed.
@@ -118,7 +118,7 @@ pub struct LoreBranchPushRevisionUpdateBeginEventData {
 
 /// Data for the event sent after a revision's parent is rewritten during push.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushRevisionUpdateEndEventData {
     /// The repository being pushed.
@@ -131,7 +131,7 @@ pub struct LoreBranchPushRevisionUpdateEndEventData {
 
 /// Data for the event sent before fragments are transferred during push.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushFragmentBeginEventData {
     /// The repository being pushed.
@@ -146,7 +146,7 @@ pub struct LoreBranchPushFragmentBeginEventData {
 
 /// Data for the event sent as fragments are transferred during push.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushFragmentProgressEventData {
     /// The repository being pushed.
@@ -165,7 +165,7 @@ pub struct LoreBranchPushFragmentProgressEventData {
 
 /// Data for the event sent after fragments are transferred during push.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushFragmentEndEventData {
     /// The repository being pushed.
@@ -189,7 +189,16 @@ pub struct LoreBranchPushFragmentEndEventData {
 /// deduplicated, copied or put, unless the push ended before it was reached.
 #[repr(C)]
 #[derive(
-    Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, bitcode::Encode, bitcode::Decode,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Debug,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushStatsEventData {
@@ -203,7 +212,7 @@ pub struct LoreBranchPushStatsEventData {
 
 /// Data for the event sent before a branch is created on the remote.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushBranchCreateBeginEventData {
     /// The repository the branch is created in.
@@ -216,7 +225,7 @@ pub struct LoreBranchPushBranchCreateBeginEventData {
 
 /// Data for the event sent after a branch is created on the remote.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushBranchCreateEndEventData {
     /// The repository being pushed.
@@ -229,7 +238,7 @@ pub struct LoreBranchPushBranchCreateEndEventData {
 
 /// Data for the event sent before a revision is pushed to the remote.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushRevisionPushBeginEventData {
     /// The repository being pushed.
@@ -244,7 +253,7 @@ pub struct LoreBranchPushRevisionPushBeginEventData {
 
 /// Data for the event sent when the remote assigns a pushed revision a new identity.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushRevisionPushUpdateEventData {
     /// The repository being pushed.
@@ -261,7 +270,7 @@ pub struct LoreBranchPushRevisionPushUpdateEventData {
 
 /// Data for the event sent after a revision is pushed to the remote.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushRevisionPushEndEventData {
     /// The repository that was pushed.

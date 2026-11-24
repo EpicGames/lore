@@ -62,7 +62,15 @@ use crate::storage::store::StoreInternal;
 /// Options of `lore_revision_graph_branch_sync`.
 #[repr(C)]
 #[derive(
-    Copy, Clone, Debug, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct LoreRevisionGraphBranchSyncOptions {
     /// Non-zero: move the local latest to the target even where the target isn't a first-parent
@@ -74,7 +82,16 @@ pub struct LoreRevisionGraphBranchSyncOptions {
 
 /// Arguments for `lore_revision_graph_branch_sync`.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(branch_sync_impl)]
 pub struct LoreRevisionGraphBranchSyncArgs {
     /// Caller-chosen id echoed back in every event this surface defines for the call. Separate

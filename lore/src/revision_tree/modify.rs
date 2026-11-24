@@ -44,7 +44,15 @@ use crate::revision_tree::handle::SharedClaim;
 /// One node to rewrite. The node must already exist and be a file.
 #[repr(C)]
 #[derive(
-    Copy, Clone, Debug, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct LoreRevisionTreeModifyEntry {
     /// Caller-chosen id echoed back as `entry_id` on this entry's `MODIFY_COMPLETE`
@@ -61,7 +69,16 @@ pub struct LoreRevisionTreeModifyEntry {
 
 /// Arguments for `lore_revision_tree_modify`.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(modify_impl)]
 pub struct LoreRevisionTreeModifyArgs {
     /// Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`

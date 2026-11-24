@@ -55,7 +55,16 @@ use crate::revision_tree::handle::RevisionTreeInternal;
 
 /// One node to move. The node must already exist and must not be the root.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 pub struct LoreRevisionTreeMoveEntry {
     /// Caller-chosen id echoed back as `entry_id` on this entry's `MOVE_COMPLETE`
     pub entry_id: u64,
@@ -69,7 +78,16 @@ pub struct LoreRevisionTreeMoveEntry {
 
 /// Arguments for `lore_revision_tree_move`.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(move_node_impl)]
 pub struct LoreRevisionTreeMoveArgs {
     /// Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`

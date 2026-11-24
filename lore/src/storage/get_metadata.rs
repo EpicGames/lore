@@ -54,7 +54,15 @@ use crate::storage::store::StoreInternal;
 /// One `get_metadata` item — the `(partition, address)` to look up.
 #[repr(C)]
 #[derive(
-    Copy, Clone, Default, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+    Copy,
+    Clone,
+    Default,
+    Debug,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct LoreStorageGetMetadataItem {
     /// Caller-chosen id echoed back in `GET_METADATA_ITEM_COMPLETE`
@@ -67,7 +75,16 @@ pub struct LoreStorageGetMetadataItem {
 
 /// Arguments for `lore_storage_get_metadata`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(get_metadata_local)]
 pub struct LoreStorageGetMetadataArgs {
     /// Open storage handle

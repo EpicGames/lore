@@ -36,7 +36,15 @@ use crate::storage::store::StoreInternal;
 /// One `mutable_store` item — the `(partition, key, value, key_type)` to write.
 #[repr(C)]
 #[derive(
-    Copy, Clone, Default, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+    Copy,
+    Clone,
+    Default,
+    Debug,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct LoreStorageMutableStoreItem {
     /// Caller-chosen id echoed back in `MUTABLE_STORE_ITEM_COMPLETE`
@@ -53,7 +61,16 @@ pub struct LoreStorageMutableStoreItem {
 
 /// Arguments for `lore_storage_mutable_store`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(mutable_store_impl)]
 pub struct LoreStorageMutableStoreArgs {
     /// Open storage handle

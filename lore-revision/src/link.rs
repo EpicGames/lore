@@ -380,7 +380,7 @@ pub(crate) async fn open_shared_linked_state(
 
 /// Data for an event reporting a change to a link.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLinkChangeEventData {
     /// Path of the link within the parent repository.
@@ -427,7 +427,7 @@ impl LoreLinkChangeEventData {
 /// repository. A repository can be linked at more than one mount path, so a
 /// consumer must key on `link_path` together with `link_repository`.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLinkBranchCreateEventData {
     /// Path of the link within the parent repository.

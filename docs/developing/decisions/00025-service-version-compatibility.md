@@ -1,6 +1,6 @@
 ---
-status: proposed
-date: 2026-10-21
+status: accepted
+date: 2026-11-13
 deciders: Matt Hoffman, Mattias Jansson, Raghav Narula
 informed: Łukasz Jastrzębski
 ---
@@ -53,3 +53,32 @@ Both of these require incrementing the existing wire format version from 2 to 3.
 Chosen option: "Startup handshake between client and service" with "Message struct version derived at compile time".
 We are expecting use cases where a client will send many commands to the same service, which benefits from the
 handshake, while one-shot commands which are impacted aren't as performance sensitive.
+
+The version is a schema hash that a `WireSchema` derive computes at compile time for each type a message carries,
+from the order, names and schemas of its fields and variants. The handshake belongs to the connection, not to its
+messages: the hello is a message of its own, which the client writes once, back-to-back with its first command,
+without waiting for the service's answer, so it adds no round trip. The service reads the hello before it decodes
+the command, and the commands that follow on the same connection carry no hello. Since the service runs the command
+as soon as it accepts the hello, the client's hello carries the schemas of both its `MessageToServer` and its
+`MessageToClient`, and the service refuses a client whose schemas differ in either. A client that is refused fails
+the command with `ServiceUnavailable`, giving the reason the service sent. A connection carries one command until
+clients keep their connections, so for now the handshake runs once per command.
+
+A stop is a request of the wire format version alone, which a service honours whatever the client's schemas, so
+that a client can stop a service of another build to replace it with one of its own.
+
+### Consequences
+
+- Good, because a client and a service of builds whose messages differ refuse each other before either decodes
+  a message of the other.
+- Good, because the handshake costs a call no round trip, and costs a connection that carries several commands
+  one hello, not one per command.
+- Bad, because a rename of a field or a variant changes the schema, though not the encoding.
+- Bad, because a service built before wire format version 3 can't read a stop from a client of version 3, so
+  the first update past it needs the service stopped with the client it came from. A service of version 3 can't
+  read a call or a stop from a client built before it either.
+- Bad, because the stop answers with a status and a message only: the stop's log events and the trace of its
+  failure reach the service's log, not the client.
+- Neutral, because the schema covers what the derive sees: a change to the encoding of a type with a hand-written
+  schema, to the meaning a constant outside a type gives its values, or to bitcode itself, has to change that
+  schema by hand.

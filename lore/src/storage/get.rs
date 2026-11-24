@@ -62,7 +62,16 @@ use crate::storage::store::StoreInternal;
 
 /// One get item — the `(partition, address)` to read, and the range of it to read.
 #[repr(C)]
-#[derive(Copy, Clone, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy,
+    Clone,
+    Default,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 pub struct LoreStorageGetItem {
     /// Caller-chosen id echoed back in every event for this item
     pub id: u64,
@@ -111,7 +120,16 @@ impl core::fmt::Debug for LoreStorageGetItem {
 
 /// Arguments for `lore_storage_get`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(get_local)]
 pub struct LoreStorageGetArgs {
     /// Open storage handle

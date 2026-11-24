@@ -59,7 +59,16 @@ use crate::storage::store::StoreInternal;
 
 /// Arguments for `lore_revision_graph_branch_archive`.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(branch_archive_impl)]
 pub struct LoreRevisionGraphBranchArchiveArgs {
     /// Caller-chosen id echoed back in every event this surface defines for the call. Separate

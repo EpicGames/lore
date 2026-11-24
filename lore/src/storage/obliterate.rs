@@ -38,7 +38,15 @@ use crate::storage::store::StoreInternal;
 /// One obliterate item — the `(partition, address)` to delete.
 #[repr(C)]
 #[derive(
-    Copy, Clone, Default, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+    Copy,
+    Clone,
+    Default,
+    Debug,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct LoreStorageObliterateItem {
     /// Caller-chosen id echoed back in `OBLITERATE_ITEM_COMPLETE`
@@ -51,7 +59,16 @@ pub struct LoreStorageObliterateItem {
 
 /// Arguments for `lore_storage_obliterate`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(obliterate_local)]
 pub struct LoreStorageObliterateArgs {
     /// Open storage handle

@@ -21,7 +21,9 @@ use crate::util::serde::u8_as_bool;
 
 /// Progress of a bisect search across a range of revisions.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionBisectEventData {
     /// Revision number at the start of the search range.

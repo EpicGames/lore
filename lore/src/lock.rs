@@ -15,7 +15,9 @@ use crate::interface::LoreString;
 
 /// Arguments for acquiring file locks on the given paths for a branch.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(file_acquire_local)]
 pub struct LoreLockFileAcquireArgs {
     /// Paths to acquire locks on
@@ -101,7 +103,9 @@ pub async fn file_acquire_as_owner(
 
 /// Arguments for returning the lock status of the given files on a branch.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(file_status_local)]
 pub struct LoreLockFileStatusArgs {
     /// Paths to get the lock status of
@@ -162,7 +166,9 @@ fn file_status_local(
 
 /// Arguments for querying file locks on a branch, optionally filtered by owner and path.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(file_query_local)]
 pub struct LoreLockFileQueryArgs {
     /// Branch to query locks on; empty queries every branch, or the current branch where `path`
@@ -228,7 +234,9 @@ fn file_query_local(
 
 /// Arguments for releasing file locks on the given paths for a branch and owner.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(file_release_local)]
 pub struct LoreLockFileReleaseArgs {
     /// Paths to release locks on

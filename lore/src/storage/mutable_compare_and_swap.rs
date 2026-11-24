@@ -38,7 +38,15 @@ use crate::storage::store::StoreInternal;
 /// One `mutable_compare_and_swap` item — the `(partition, key, expected, value, key_type)` swap.
 #[repr(C)]
 #[derive(
-    Copy, Clone, Default, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+    Copy,
+    Clone,
+    Default,
+    Debug,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct LoreStorageMutableCompareAndSwapItem {
     /// Caller-chosen id echoed back in `MUTABLE_COMPARE_AND_SWAP_ITEM_COMPLETE`
@@ -57,7 +65,16 @@ pub struct LoreStorageMutableCompareAndSwapItem {
 
 /// Arguments for `lore_storage_mutable_compare_and_swap`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(mutable_compare_and_swap_impl)]
 pub struct LoreStorageMutableCompareAndSwapArgs {
     /// Open storage handle

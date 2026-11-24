@@ -109,7 +109,7 @@ async fn list_recursive(
 
 /// Data for an event describing a link that has staged changes.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLinkStagedEntryEventData {
     /// Path of the link within the parent repository.

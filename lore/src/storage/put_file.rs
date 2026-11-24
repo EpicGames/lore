@@ -40,7 +40,15 @@ use crate::storage::store::StoreInternal;
 /// One `put_file` item — read the file at `path` and store it at
 /// `(partition, context)`.
 #[repr(C)]
-#[derive(Clone, PartialEq, Default, ValidateText, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    PartialEq,
+    Default,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 pub struct LoreStoragePutFileItem {
     /// Caller-chosen id echoed back in `PUT_ITEM_COMPLETE`
     pub id: u64,
@@ -120,7 +128,16 @@ impl core::fmt::Debug for LoreStoragePutFileItem {
 
 /// Arguments for `lore_storage_put_file`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(put_file_local)]
 pub struct LoreStoragePutFileArgs {
     /// Open storage handle

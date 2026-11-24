@@ -10,7 +10,9 @@ use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(subscribe_local)]
 /// Arguments for subscribing to repository notifications (no parameters).
 pub struct LoreNotificationSubscribeArgs {}
@@ -49,7 +51,9 @@ pub fn subscribe(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(unsubscribe_local)]
 /// Arguments for unsubscribing from repository notifications (no parameters).
 pub struct LoreNotificationUnsubscribeArgs {}

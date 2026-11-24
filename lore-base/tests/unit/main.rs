@@ -20,3 +20,4 @@ mod timer;
 mod timestamp;
 mod types;
 mod units;
+mod wire_schema;

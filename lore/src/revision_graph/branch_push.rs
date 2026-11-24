@@ -49,7 +49,15 @@ use crate::storage::store::StoreInternal;
 /// Options of `lore_revision_graph_branch_push`.
 #[repr(C)]
 #[derive(
-    Copy, Clone, Debug, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct LoreRevisionGraphBranchPushOptions {
     /// Non-zero: offer the local history even where the remote latest has moved, which overwrites
@@ -62,7 +70,16 @@ pub struct LoreRevisionGraphBranchPushOptions {
 
 /// Arguments for `lore_revision_graph_branch_push`.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(branch_push_impl)]
 pub struct LoreRevisionGraphBranchPushArgs {
     /// Caller-chosen id echoed back in every event this surface defines for the call. Separate

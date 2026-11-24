@@ -1,15 +1,29 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use bytes::Bytes;
+use lore::remote::call::blocking_check_answer;
+use lore::remote::call::blocking_request_stop;
 use lore::remote::command::LoreCommand;
+use lore::remote::message::Answer;
+use lore::remote::message::CONTROL_FRAME_LIMIT;
+use lore::remote::message::FrameKind;
 use lore::remote::message::Header;
+use lore::remote::message::MessageError;
 use lore::remote::message::MessageToClient;
 use lore::remote::message::MessageToServer;
-use lore::remote::message::SerializationType;
+use lore::remote::message::Opening;
+use lore::remote::message::Schemas;
+use lore::remote::message::blocking_read_answer;
 use lore::remote::message::blocking_read_message;
+use lore::remote::message::blocking_read_opening;
+use lore::remote::message::blocking_read_stop_result;
 use lore::remote::message::encode_message;
+use lore::remote::message::write_hello;
 use lore::remote::message::write_message;
 use lore::remote::message::write_payload;
+use lore::remote::message::write_refusal;
+use lore::remote::message::write_stop;
+use lore::remote::message::write_stop_result;
 use lore::repository::LoreRepositoryDeleteArgs;
 use lore::repository::LoreRepositoryInstanceCloneArgs;
 use lore::repository::LoreRepositoryStatusArgs;
@@ -56,7 +70,7 @@ fn relayed(command: LoreCommand) -> LoreCommand {
 
 #[test]
 fn header_to_and_from_bytes() {
-    let header = Header::new(0xffeeddcc, SerializationType::Bitcode);
+    let header = Header::new(0xffeeddcc, FrameKind::Message);
 
     let bytes = header.to_bytes();
     let processed_header = Header::from_bytes(&bytes);
@@ -69,6 +83,350 @@ fn header_to_and_from_bytes() {
     let bad_processed_header = Header::from_bytes(&bad_bytes);
 
     assert!(bad_processed_header.is_err());
+}
+
+/// The bytes `write` writes.
+fn written(write: impl FnOnce(&mut Vec<u8>) -> Result<(), MessageError>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    write(&mut bytes).expect("a frame must write");
+    bytes
+}
+
+/// A frame of protocol version 3 holding `payload`.
+fn frame(kind: FrameKind, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![3];
+    bytes.extend_from_slice(&Header::new(payload.len() as u32, kind).to_bytes());
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+#[test]
+fn a_hello_carries_the_schemas_of_this_build() {
+    let hello = written(write_hello);
+    assert_eq!(
+        blocking_read_opening(&mut hello.as_slice()).expect("a hello must read"),
+        Some(Opening::Hello(Schemas::THIS_BUILD))
+    );
+    assert_eq!(
+        blocking_read_answer(&mut hello.as_slice()).expect("a hello must read"),
+        Answer::Hello(Schemas::THIS_BUILD)
+    );
+}
+
+/// The hello of a client of another build reads as that build's schemas, which the service then
+/// compares with its own.
+#[test]
+fn a_hello_of_another_build_reads_as_its_schemas() {
+    let mut payload = 7u64.to_le_bytes().to_vec();
+    payload.extend_from_slice(&9u64.to_le_bytes());
+    let schemas = Schemas {
+        to_server: 7,
+        to_client: 9,
+    };
+    assert_ne!(schemas, Schemas::THIS_BUILD);
+    assert_eq!(
+        blocking_read_opening(&mut frame(FrameKind::Hello, &payload).as_slice())
+            .expect("a hello must read"),
+        Some(Opening::Hello(schemas))
+    );
+}
+
+#[test]
+fn a_stop_or_stop_result_of_the_wrong_size_is_an_error() {
+    for payload in [&[][..], &[1, 1]] {
+        assert!(blocking_read_opening(&mut frame(FrameKind::Stop, payload).as_slice()).is_err());
+    }
+    assert!(
+        blocking_read_stop_result(&mut frame(FrameKind::StopResult, &[0; 3]).as_slice()).is_err()
+    );
+}
+
+#[test]
+fn a_hello_of_the_wrong_size_is_an_error() {
+    for payload in [&[0u8; 8][..], &[0; 17], &[]] {
+        let hello = frame(FrameKind::Hello, payload);
+        assert!(blocking_read_opening(&mut hello.as_slice()).is_err());
+        assert!(blocking_read_answer(&mut hello.as_slice()).is_err());
+    }
+}
+
+#[test]
+fn a_stop_carries_its_force() {
+    for force in [false, true] {
+        let stop = written(|bytes| write_stop(bytes, force));
+        assert_eq!(
+            blocking_read_opening(&mut stop.as_slice()).expect("a stop must read"),
+            Some(Opening::Stop { force })
+        );
+    }
+}
+
+/// A client of a build from before protocol version 3 writes version 2, whose byte is 1.
+#[test]
+fn an_opening_of_another_protocol_reads_as_that_protocol() {
+    let mut opening = frame(FrameKind::Message, b"payload");
+    opening[0] = 1;
+    assert_eq!(
+        blocking_read_opening(&mut opening.as_slice()).expect("the protocol byte must read"),
+        Some(Opening::OtherProtocol(1))
+    );
+}
+
+#[test]
+fn a_connection_closed_before_its_opening_reads_as_none() {
+    assert_eq!(
+        blocking_read_opening(&mut [].as_slice()).expect("a closed connection must read"),
+        None
+    );
+}
+
+/// A call opens with a hello, so a message in its place is an error rather than decoded.
+#[test]
+fn a_message_without_a_hello_is_an_error() {
+    let message = written(|bytes| write_payload(bytes, b"payload"));
+    assert!(blocking_read_opening(&mut message.as_slice()).is_err());
+}
+
+#[test]
+fn a_refusal_carries_its_reason() {
+    let refusal = written(|bytes| write_refusal(bytes, "another build"));
+    assert_eq!(
+        blocking_read_answer(&mut refusal.as_slice()).expect("a refusal must read"),
+        Answer::Refusal("another build".to_string())
+    );
+}
+
+/// A service of an older protocol closes the connection on a hello it can't read.
+#[test]
+fn a_service_that_closes_without_answering_refuses_the_call() {
+    assert!(matches!(
+        blocking_read_answer(&mut [].as_slice()).expect("a closed connection must read"),
+        Answer::Closed
+    ));
+}
+
+/// A connection that the peer reset, as the OS may report a peer that closed it with this side's
+/// data unread.
+struct Reset;
+
+impl std::io::Read for Reset {
+    fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::ConnectionReset.into())
+    }
+}
+
+/// A service of an older protocol closes the connection on a hello it can't read, with the call
+/// that follows the hello unread, which the OS may report as a reset.
+#[test]
+fn a_service_that_resets_the_connection_refuses_the_call() {
+    assert!(matches!(
+        blocking_read_answer(&mut Reset).expect("a reset connection must read as closed"),
+        Answer::Closed
+    ));
+    assert_eq!(
+        blocking_read_stop_result(&mut Reset).expect("a reset connection must read as closed"),
+        None
+    );
+}
+
+/// A service of another protocol answers in its own, as this one answers a client of another, so
+/// that a client of any protocol can tell it was refused.
+#[test]
+fn an_answer_of_another_protocol_reads_as_one() {
+    for protocol in [1, 4] {
+        let mut hello = written(write_hello);
+        hello[0] = protocol;
+        assert_eq!(
+            blocking_read_answer(&mut hello.as_slice()).expect("an answer of any protocol reads"),
+            Answer::OtherProtocol(protocol)
+        );
+    }
+}
+
+#[test]
+fn a_stop_result_carries_its_status_and_message() {
+    for (status, message) in [(0, ""), (51, "Mounts are busy: /mnt/a")] {
+        let result = written(|bytes| write_stop_result(bytes, status, message));
+        assert_eq!(
+            blocking_read_stop_result(&mut result.as_slice()).expect("a stop result must read"),
+            Some((status, message.to_string()))
+        );
+    }
+}
+
+#[test]
+fn a_service_that_closes_without_answering_a_stop_reads_as_none() {
+    assert_eq!(
+        blocking_read_stop_result(&mut [].as_slice()).expect("a closed connection must read"),
+        None
+    );
+}
+
+/// Text longer than a control frame holds is cut at a character boundary, so that the frame is
+/// read rather than refused.
+#[test]
+fn a_long_text_is_cut_to_fit_a_control_frame() {
+    // Offset by one byte, so that the limit falls inside a character.
+    let text = format!("a{}", "é".repeat(CONTROL_FRAME_LIMIT as usize));
+    let refusal = written(|bytes| write_refusal(bytes, &text));
+    let Answer::Refusal(read) =
+        blocking_read_answer(&mut refusal.as_slice()).expect("a long refusal must read")
+    else {
+        panic!("a refusal must read as one");
+    };
+    assert!(!read.is_empty() && text.starts_with(&read));
+
+    let result = written(|bytes| write_stop_result(bytes, 51, &text));
+    let (status, read) = blocking_read_stop_result(&mut result.as_slice())
+        .expect("a long stop result must read")
+        .expect("a stop result must be present");
+    assert_eq!(status, 51);
+    assert!(!read.is_empty() && text.starts_with(&read));
+}
+
+/// A control frame larger than the limit is an error, though it carries all the bytes its header
+/// claims, so that a peer can't make the reader allocate what a header claims. A frame of exactly
+/// the limit reads.
+#[test]
+fn a_control_frame_larger_than_the_limit_is_an_error() {
+    let limit = CONTROL_FRAME_LIMIT as usize;
+    let at_limit = vec![b'a'; limit];
+    let past_limit = vec![b'a'; limit + 1];
+
+    assert!(matches!(
+        blocking_read_answer(&mut frame(FrameKind::Refusal, &at_limit).as_slice()),
+        Ok(Answer::Refusal(_))
+    ));
+    assert!(blocking_read_answer(&mut frame(FrameKind::Refusal, &past_limit).as_slice()).is_err());
+
+    assert!(matches!(
+        blocking_read_stop_result(&mut frame(FrameKind::StopResult, &at_limit).as_slice()),
+        Ok(Some(_))
+    ));
+    assert!(
+        blocking_read_stop_result(&mut frame(FrameKind::StopResult, &past_limit).as_slice())
+            .is_err()
+    );
+}
+
+/// A reader of control frames refuses a message from its header, leaving its payload unread, so
+/// that a peer can't make it allocate a payload it would refuse.
+#[test]
+fn a_reader_of_control_frames_refuses_a_message_before_its_payload() {
+    let payload = vec![b'a'; CONTROL_FRAME_LIMIT as usize + 1];
+    let message = frame(FrameKind::Message, &payload);
+
+    let mut opening = message.as_slice();
+    assert!(blocking_read_opening(&mut opening).is_err());
+    assert_eq!(opening.len(), payload.len(), "an opening read the payload");
+
+    let mut answer = message.as_slice();
+    assert!(blocking_read_answer(&mut answer).is_err());
+    assert_eq!(answer.len(), payload.len(), "an answer read the payload");
+
+    let mut stop_result = message.as_slice();
+    assert!(blocking_read_stop_result(&mut stop_result).is_err());
+    assert_eq!(
+        stop_result.len(),
+        payload.len(),
+        "a stop result read the payload"
+    );
+}
+
+/// The client completes a call with `ServiceUnavailable` wherever the service didn't accept its
+/// hello: a refusal, schemas of another build in either direction, or no answer at all.
+#[test]
+fn a_client_fails_a_call_the_service_did_not_accept() {
+    let ours = Schemas::THIS_BUILD;
+    assert!(blocking_check_answer(&mut written(write_hello).as_slice(), Ok(())).is_ok());
+
+    let hello_of = |to_server: u64, to_client: u64| {
+        let mut payload = to_server.to_le_bytes().to_vec();
+        payload.extend_from_slice(&to_client.to_le_bytes());
+        frame(FrameKind::Hello, &payload)
+    };
+    for answer in [
+        written(|bytes| write_refusal(bytes, "another build")),
+        hello_of(ours.to_server ^ 1, ours.to_client),
+        hello_of(ours.to_server, ours.to_client ^ 1),
+        {
+            let mut later = written(write_hello);
+            later[0] = 4;
+            later
+        },
+        Vec::new(),
+    ] {
+        let error = blocking_check_answer(&mut answer.as_slice(), Ok(()))
+            .expect_err("a call the service didn't accept must fail");
+        assert!(error.is_service_unavailable(), "{error}");
+    }
+    let error =
+        blocking_check_answer(&mut Reset, Ok(())).expect_err("a reset connection must fail");
+    assert!(error.is_service_unavailable(), "{error}");
+}
+
+/// A call whose write failed against a service that closed the connection without answering, as
+/// one that exited does, fails with `ServiceUnavailable` and gives the write's failure.
+#[test]
+fn a_client_gives_the_write_that_failed_against_a_closed_connection() {
+    let write_error = || MessageError::internal("the write of the call");
+    let written_text = write_error().to_string();
+    let error = blocking_check_answer(&mut [].as_slice(), Err(write_error()))
+        .expect_err("a call the service didn't answer must fail");
+    assert!(error.is_service_unavailable(), "{error}");
+    assert!(
+        error.to_string().contains(&written_text),
+        "{error} must give {written_text}"
+    );
+
+    // A refusal gives its own reason, which explains a write it cut short.
+    let refusal = written(|bytes| write_refusal(bytes, "another build"));
+    let error = blocking_check_answer(&mut refusal.as_slice(), Err(write_error()))
+        .expect_err("a refused call must fail");
+    assert!(error.is_service_unavailable(), "{error}");
+    assert!(!error.to_string().contains(&written_text), "{error}");
+
+    // A service that accepted the call leaves the write's failure as it is.
+    let error = blocking_check_answer(&mut written(write_hello).as_slice(), Err(write_error()))
+        .expect_err("a call whose write failed must fail");
+    assert!(!error.is_service_unavailable(), "{error}");
+}
+
+/// A stop writes the request a service reads as one, and completes with the service's answer,
+/// or with `ServiceUnavailable` where the service closes the connection without one.
+#[test]
+fn a_client_stop_reads_the_service_answer() {
+    for force in [false, true] {
+        let mut request = Vec::new();
+        let answer = written(|bytes| write_stop_result(bytes, 51, "busy"));
+        assert_eq!(
+            blocking_request_stop(&mut request, &mut answer.as_slice(), force)
+                .expect("an answered stop must succeed"),
+            (51, "busy".to_string())
+        );
+        assert_eq!(
+            blocking_read_opening(&mut request.as_slice()).expect("the request must read"),
+            Some(Opening::Stop { force })
+        );
+    }
+
+    let error = blocking_request_stop(&mut Vec::new(), &mut [].as_slice(), false)
+        .expect_err("an unanswered stop must fail");
+    assert!(error.is_service_unavailable(), "{error}");
+}
+
+#[test]
+fn a_frame_other_than_a_message_is_not_read_as_one() {
+    let hello = written(write_hello);
+    assert!(blocking_read_message::<MessageToClient, _>(&mut hello.as_slice()).is_err());
+}
+
+#[test]
+fn a_message_of_another_protocol_is_an_error() {
+    let mut message =
+        written(|bytes| write_message(bytes, &MessageToClient::<LoreEvent>::ApiResult(0)));
+    message[0] = 1;
+    assert!(blocking_read_message::<MessageToClient, _>(&mut message.as_slice()).is_err());
 }
 
 /// A message from a client carries its globals, its command and its environment.

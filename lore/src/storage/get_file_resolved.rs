@@ -55,7 +55,15 @@ use crate::storage::store::StoreInternal;
 /// One `get_file_resolved` item — the mutable key to resolve and the file to write the content it
 /// names to.
 #[repr(C)]
-#[derive(Clone, PartialEq, Default, ValidateText, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    PartialEq,
+    Default,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 pub struct LoreStorageGetFileResolvedItem {
     /// Caller-chosen id echoed back in `GET_ITEM_COMPLETE`
     pub id: u64,
@@ -99,7 +107,16 @@ impl core::fmt::Debug for LoreStorageGetFileResolvedItem {
 
 /// Arguments for `lore_storage_get_file_resolved`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(get_file_resolved_local)]
 pub struct LoreStorageGetFileResolvedArgs {
     /// Open storage handle

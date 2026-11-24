@@ -51,7 +51,9 @@ impl EventError for UserInfoError {
 
 /// Event data resolving a user identity to a display name.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreAuthUserInfoEventData {
     /// User identity
@@ -62,7 +64,9 @@ pub struct LoreAuthUserInfoEventData {
 
 /// Event data describing a stored authentication identity.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreAuthIdentityEventData {
     /// Auth service URL
@@ -389,7 +393,9 @@ fn strip_current_user(ids: Vec<String>, current_user_id: &str) -> (bool, Vec<Str
 
 /// Event data carrying a user token along with the identity it belongs to.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreAuthUserTokenEventData {
     /// User identity

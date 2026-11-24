@@ -52,6 +52,10 @@ and authorizations obtained with them, it keys by that store.
 chose no store uses the secure store rather than the one the service's own environment names. The
 service keys a cached encryption key by the token store and the store that keeps the key.
 
+**Amended 2026-11-13:** [ADR-00025](00025-service-version-compatibility.md) replaces message protocol
+version 2 with version 3, under which a client and the service compare the schemas of their messages
+before a call, so two builds whose messages differ refuse each other.
+
 ### Consequences
 
 - Good, because every call relays, including the storage calls that carry buffers.

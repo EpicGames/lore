@@ -79,10 +79,12 @@ documentation_style = "c99"
 # filter verdict down as it descends, and so the filter tests can build one.
 # `FileInfo` is public so the walk and the stage path can pass what a path
 # measured. `FlushOptions` is how a store's flush is asked to write, which a C
-# caller sets through the `sync_data` and `fast_flush` globals. All four are
-# Rust-side only -- no C entry point takes or returns them -- so cbindgen would
-# otherwise emit opaque typedefs no caller can use.
-exclude = ["FileInfo", "FilterState", "FilterStates", "FlushOptions"]
+# caller sets through the `sync_data` and `fast_flush` globals. `Schemas` is
+# what a client and the service compare before a call, which cbindgen sees
+# though it is crate-visible. All five are Rust-side only -- no C entry point
+# takes or returns them -- so cbindgen would otherwise emit opaque typedefs no
+# caller can use.
+exclude = ["FileInfo", "FilterState", "FilterStates", "FlushOptions", "Schemas"]
 # `LoreStore` and `LoreRevisionTree` are reachable via `lore_*_args_t::handle`
 # but cbindgen misses transitive types behind a typedef field; emit them
 # explicitly. The `lore_revision_tree_*_args_t` and

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use lore_base::error::InvalidArguments;
 use lore_base::error::MountsBusy;
+use lore_base::error::ServiceUnavailable;
 use lore_base::fs::lock::FSLock;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_error_set::prelude::*;
@@ -26,17 +27,18 @@ use crate::interface::LoreEvent;
 use crate::interface::LoreEventCallback;
 use crate::remote::call::Relayed;
 use crate::remote::call::run_service_call;
+use crate::remote::call::run_service_stop;
 use crate::remote::command::LoreCommand;
 use crate::remote::network::UdsStream;
 use crate::remote::occupy::OccupiedSocket;
 use crate::remote::occupy::READ_TIMEOUT;
+use crate::remote::occupy::stop_refusal;
 use crate::remote::service_process::Reached;
 use crate::remote::service_process::ServiceProcessError;
 use crate::remote::service_process::reach_running_service;
 use crate::remote::service_process::spawn_service_and_connect;
 use crate::remote::service_socket_name;
 use crate::service::LoreServiceStatusArgs;
-use crate::service::LoreServiceStopArgs;
 
 /// How long a move waits, from the stop, for the stopped service to give up its socket, for its
 /// process to exit and for its shared access to the root to be released. It covers the service's
@@ -111,26 +113,25 @@ pub(crate) fn service_of_this_program() -> MountsBusy {
     }
 }
 
-/// Reads the status of the service that answers on the socket. A reply this build can't read, or
-/// a success that brings no status of a running service, is one of another build; any other
-/// failure fails. Refuses with [`service_of_this_program`] where that service runs in this
-/// process.
+/// Reads the status of the service that answers on the socket. A call that fails with
+/// `ServiceUnavailable`, as a service whose messages differ from this build's fails it by refusing
+/// its hello, or a success that brings no status of a running service, is one of another build;
+/// any other failure fails. Refuses with [`service_of_this_program`] where that service runs in
+/// this process.
 pub async fn find_service() -> Result<FoundService, StopForMoveError> {
     let connection = match reach_service().await? {
         Some(connection) => connection,
         None => return Ok(FoundService::None),
     };
-    let found: Arc<Mutex<(Option<LoreServiceStatusEventData>, String)>> = Arc::default();
+    let found: Arc<Mutex<(Option<LoreServiceStatusEventData>, i32, String)>> = Arc::default();
     let callback: LoreEventCallback = Some(Box::new({
         let found = Arc::clone(&found);
         move |event: &LoreEvent| match event {
             LoreEvent::ServiceStatus(status) => found.lock().0 = Some(status.clone()),
             LoreEvent::Complete(complete) if complete.status != 0 => {
-                complete
-                    .error
-                    .message
-                    .as_str()
-                    .clone_into(&mut found.lock().1);
+                let mut found = found.lock();
+                found.1 = complete.error.error_code;
+                complete.error.message.as_str().clone_into(&mut found.2);
             }
             _ => {}
         }
@@ -142,25 +143,20 @@ pub async fn find_service() -> Result<FoundService, StopForMoveError> {
         callback,
     )
     .await;
-    let (status, failure) = std::mem::take(&mut *found.lock());
+    let (status, code, failure) = std::mem::take(&mut *found.lock());
     match (relayed, status) {
         (Relayed::HandedBack(_), _) => Ok(FoundService::Moving),
         (Relayed::Ran(0), Some(status)) if status.running != 0 => {
             Ok(FoundService::Reporting(status))
         }
         (Relayed::Ran(0), _) => Ok(FoundService::OtherBuild),
-        (Relayed::Ran(_), _) if shows_another_build(&failure) => Ok(FoundService::OtherBuild),
+        (Relayed::Ran(_), _) if code == ServiceUnavailable::FFI_CODE => {
+            Ok(FoundService::OtherBuild)
+        }
         (Relayed::Ran(_), _) => Err(StopForMoveError::internal(format!(
             "reading the Lore service's status: {failure}"
         ))),
     }
-}
-
-/// Whether the failure `failure` of a call is one a service of another build causes: a reply of
-/// another protocol version, or one this build can't decode.
-fn shows_another_build(failure: &str) -> bool {
-    failure.contains(crate::remote::message::WRONG_VERSION)
-        || failure.contains(crate::remote::message::DECODING_MESSAGE)
 }
 
 /// Refuses to stop the service `status` reports for a move of the external root of `global`, a
@@ -323,8 +319,9 @@ impl Stopped {
 }
 
 /// Asks the service that answers on the socket to stop, detaching busy FUSE mounts lazily where
-/// `force` is set, as `lore service stop` does. Fails with `MountsBusy` where a busy mount refuses
-/// the stop.
+/// `force` is set, as `lore service stop` does, with the request a service of another build
+/// honours too. Fails with `MountsBusy` where a busy mount refuses the stop, another move holds
+/// the socket, or the service leaves the stop unanswered, as one of an older protocol does.
 async fn stop_service(force: bool) -> Result<(), StopForMoveError> {
     let Some(connection) = reach_service().await? else {
         return Ok(());
@@ -343,15 +340,7 @@ async fn stop_service(force: bool) -> Result<(), StopForMoveError> {
             }
         }
     }));
-    let globals = LoreGlobalArgs {
-        force: u8::from(force),
-        ..LoreGlobalArgs::default()
-    };
-    let status =
-        match relay_quietly(connection, globals, LoreServiceStopArgs {}.into(), callback).await {
-            Relayed::Ran(status) => status,
-            Relayed::HandedBack(_) => return Err(socket_held().into()),
-        };
+    let status = quietly(run_service_stop(connection, force, callback)).await;
     if status == 0 {
         return Ok(());
     }
@@ -359,6 +348,18 @@ async fn stop_service(force: bool) -> Result<(), StopForMoveError> {
         .lock()
         .take()
         .unwrap_or_else(|| (status, String::new()));
+    if code == ServiceUnavailable::FFI_CODE {
+        if message == stop_refusal() {
+            return Err(socket_held().into());
+        }
+        return Err(MountsBusy {
+            paths: format!(
+                "the Lore service, which couldn't be asked to stop ({message}). Stop it with the \
+                 `lore` it came from"
+            ),
+        }
+        .into());
+    }
     if code == MountsBusy::FFI_CODE {
         let paths = message
             .strip_prefix("Mounts are busy: ")
@@ -373,17 +374,28 @@ async fn stop_service(force: bool) -> Result<(), StopForMoveError> {
     )))
 }
 
-/// Runs `command` on the service over `connection`, with `callback` handed its events, from an
-/// execution of its own, so that none of its events reach the caller's callback.
-async fn relay_quietly(
+/// Runs `command` on the service over `connection`, with `callback` handed its events,
+/// [`quietly`].
+#[inline]
+fn relay_quietly(
     connection: UdsStream,
     globals: LoreGlobalArgs,
     command: LoreCommand,
     callback: LoreEventCallback,
-) -> Relayed {
-    let relay = run_service_call(Some(connection), globals, command, callback);
+) -> impl Future<Output = Relayed> {
+    quietly(run_service_call(
+        Some(connection),
+        globals,
+        command,
+        callback,
+    ))
+}
+
+/// Runs `relay` from an execution of its own, so that none of its events reach the caller's
+/// callback.
+fn quietly<Relay: Future>(relay: Relay) -> impl Future<Output = Relay::Output> {
     let quiet = crate::call::setup_execution(LoreGlobalArgs::default(), None);
-    LORE_CONTEXT.scope(quiet, relay).await
+    LORE_CONTEXT.scope(quiet, relay)
 }
 
 /// The refusal of a move while another process holds the service socket.

@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::io::Read;
+use std::io::Write;
 use std::ops::ControlFlow;
 
 use bytes::Bytes;
@@ -9,16 +11,26 @@ use lore_base::log::LoreLogLevel;
 use lore_error_set::prelude::*;
 use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
+use lore_revision::interface::LoreArray;
 use lore_revision::relay::EventDispatcher;
 use tokio::task::JoinHandle;
 
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::remote::command::LoreCommand;
+use crate::remote::message::Answer;
+use crate::remote::message::MessageError;
 use crate::remote::message::MessageToClient;
 use crate::remote::message::MessageToServer;
+use crate::remote::message::Schemas;
+use crate::remote::message::UNANSWERED;
+use crate::remote::message::blocking_read_answer;
 use crate::remote::message::blocking_read_message;
+use crate::remote::message::blocking_read_stop_result;
+use crate::remote::message::schemas_differ;
+use crate::remote::message::write_hello;
 use crate::remote::message::write_message;
+use crate::remote::message::write_stop;
 use crate::remote::network::UdsStream;
 use crate::remote::network::uds_supported;
 use crate::remote::service_process::ServiceStart;
@@ -65,6 +77,7 @@ pub(crate) struct HandedBack {
 }
 
 /// Why a call can't run while a move of the external root holds the service socket.
+#[lore_macro::test_pub]
 pub(crate) const EXTERNAL_ROOT_MOVING: &str = "the Lore service is stopped while the external \
     directories of its virtual instances move. Run the command again once the move has finished";
 
@@ -107,18 +120,7 @@ pub(crate) fn run_service_call(
         };
         let relayed = match result {
             Ok(relayed) => relayed,
-            Err(err) => {
-                // No service completed the command, so it completes here as a failing
-                // command does, with the failure's own code: a caller has to be able
-                // to tell a call that never reached a service from one the service
-                // ran and reported on.
-                event_dispatcher.send(LoreEvent::Log(EventDispatcher::make_log(
-                    LoreLogLevel::Error,
-                    format!("Failed to send command to Lore service because: {err}"),
-                )));
-                let detail = LoreErrorDetail::from_error(&err);
-                return Relayed::Ran(event_dispatcher.complete(detail).await);
-            }
+            Err(err) => return Relayed::Ran(fail_service_call(&event_dispatcher, err).await),
         };
         match relayed {
             Relayed::Ran(status) => {
@@ -136,10 +138,25 @@ pub(crate) fn run_service_call(
     }
 }
 
+/// Completes a call that no service completed with the error that kept it from running.
+async fn fail_service_call(event_dispatcher: &EventDispatcher, err: ServiceCallError) -> i32 {
+    // No service completed the command, so it completes here as a failing
+    // command does, with the failure's own code: a caller has to be able
+    // to tell a call that never reached a service from one the service
+    // ran and reported on.
+    event_dispatcher.send(LoreEvent::Log(EventDispatcher::make_log(
+        LoreLogLevel::Error,
+        format!("Failed to send command to Lore service because: {err}"),
+    )));
+    event_dispatcher
+        .complete(LoreErrorDetail::from_error(&err))
+        .await
+}
+
 /// What the service socket answered first to a request. Unboxed, as every call's first message
 /// passes through it.
 #[allow(clippy::large_enum_variant)]
-enum Answer {
+enum Response {
     /// The connection the service runs the call over, with its first message, or `None` where it
     /// closed the connection without one.
     Serving(UdsStream, Option<(MessageToClient, Bytes)>),
@@ -147,22 +164,130 @@ enum Answer {
     Moving(Box<HandedBack>),
 }
 
-/// Writes `message` over `connection` and reads the first answer. Blocking.
+/// Writes the hello and `message` over `connection`, checks the answer to the hello, and reads the
+/// first message. Blocking.
 fn request(
     mut connection: UdsStream,
     message: MessageToServer,
-) -> Result<Answer, ServiceCallError> {
-    write_message(connection.writer(), &message).forward::<ServiceCallError>("sending message")?;
+) -> Result<Response, ServiceCallError> {
+    let sent = write_hello(connection.writer())
+        .and_then(|()| write_message(connection.writer(), &message));
+    // The answer is read before a failed write is reported: a service that refuses the hello
+    // closes the connection without reading the call, which fails the write of a call larger than
+    // the socket buffers.
+    blocking_check_answer(connection.reader(), sent)?;
     let first = blocking_read_message(connection.reader())
         .forward::<ServiceCallError>("receiving message")?;
     if let Some((MessageToClient::ExternalRootMove, _)) = first {
-        return Ok(Answer::Moving(Box::new(HandedBack {
+        return Ok(Response::Moving(Box::new(HandedBack {
             globals: message.globals,
             command: message.command,
             callback: None,
         })));
     }
-    Ok(Answer::Serving(connection, first))
+    Ok(Response::Serving(connection, first))
+}
+
+/// Reads the service's answer to the hello a call opened with, then reports `sent`, the write of
+/// the hello and the call. Fails with `ServiceUnavailable` where the service refused the call, its
+/// schemas differ from this build's, or it closed the connection without answering, giving a
+/// failed write in the reason for the last.
+#[lore_macro::test_pub]
+fn blocking_check_answer<Reader: Read>(
+    reader: &mut Reader,
+    sent: Result<(), MessageError>,
+) -> Result<(), ServiceCallError> {
+    let reason = match blocking_read_answer(reader)
+        .forward::<ServiceCallError>("receiving the service's hello")?
+    {
+        Answer::Hello(schemas) if schemas == Schemas::THIS_BUILD => {
+            return sent.forward::<ServiceCallError>("sending message");
+        }
+        Answer::Hello(schemas) => schemas_differ(schemas, Schemas::THIS_BUILD),
+        // The refusal says why a write it cut short failed.
+        Answer::Refusal(reason) => reason,
+        Answer::OtherProtocol(protocol) => format!(
+            "the Lore service answered in protocol version {protocol}, where this client reads \
+             version 3; stop it with the `lore` it came from to use a service of the client's \
+             build"
+        ),
+        Answer::Closed => match sent {
+            Ok(()) => UNANSWERED.to_string(),
+            // Kept, as it tells a service that exited from one that closed on the hello.
+            Err(err) => {
+                let reason = format!("{UNANSWERED}; sending the call failed: {err}");
+                return Err(ServiceCallError::ServiceUnavailable(
+                    ServiceUnavailable { reason }.chain_err_from(err, "sending message"),
+                ));
+            }
+        },
+    };
+    Err(ServiceUnavailable { reason }.into())
+}
+
+/// Writes a request that the service stop and reads the status and message it answers with,
+/// failing with `ServiceUnavailable` where the service closes the connection without answering.
+#[lore_macro::test_pub]
+fn blocking_request_stop<Writer: Write, Reader: Read>(
+    writer: &mut Writer,
+    reader: &mut Reader,
+    force: bool,
+) -> Result<(i32, String), ServiceCallError> {
+    write_stop(writer, force)
+        .and_then(|()| blocking_read_stop_result(reader))
+        .forward::<ServiceCallError>("asking the service to stop")?
+        .ok_or_else(|| {
+            ServiceUnavailable {
+                reason: UNANSWERED.to_string(),
+            }
+            .into()
+        })
+}
+
+/// Asks the service on `connection` to stop, with a request that a service of this protocol
+/// honours whatever its schemas, so that a service of another build can be stopped. Completes with
+/// the status and message the service answers with, or with the failure of
+/// [`blocking_request_stop`].
+///
+/// The stop's events aren't relayed, since they would arrive as messages of the service's build,
+/// which this build may not read. The service keeps the stop's log in its own.
+pub(crate) async fn run_service_stop(
+    mut connection: UdsStream,
+    force: bool,
+    callback: LoreEventCallback,
+) -> i32 {
+    let event_dispatcher = EventDispatcher::new(callback);
+    let answered = lore_base::lore_spawn_blocking!(move || {
+        let mut reader = connection.try_clone().internal("cloning connection")?;
+        blocking_request_stop(connection.writer(), reader.reader(), force)
+    })
+    .await
+    .unwrap_or_else(|err| {
+        Err(ServiceCallError::internal_with_context(
+            err,
+            "joining the stop task",
+        ))
+    });
+    match answered {
+        Ok((status, message)) => {
+            // Logged here, as the service's own log of the failure stays in the service: a caller
+            // such as the CLI says nothing of a `Complete`, so this is all it has to report.
+            if status != 0 {
+                event_dispatcher.send(LoreEvent::Log(EventDispatcher::make_log(
+                    LoreLogLevel::Error,
+                    message.clone(),
+                )));
+            }
+            event_dispatcher
+                .complete(LoreErrorDetail {
+                    error_code: status,
+                    message: message.into(),
+                    trace_locations: LoreArray::default(),
+                })
+                .await
+        }
+        Err(err) => fail_service_call(&event_dispatcher, err).await,
+    }
 }
 
 /// The connection the call runs over: `connection` where the caller holds one, or else one to the
@@ -190,7 +315,7 @@ async fn reach_service(connection: Option<UdsStream>) -> Result<UdsStream, Servi
 /// and read the first answer, and returns the call's result, or the call handed back.
 async fn relay_events(
     event_dispatcher: &EventDispatcher,
-    sent: JoinHandle<Result<Answer, ServiceCallError>>,
+    sent: JoinHandle<Result<Response, ServiceCallError>>,
 ) -> Result<Relayed, ServiceCallError> {
     let connection = match handle_answer(
         event_dispatcher,
@@ -220,11 +345,11 @@ async fn relay_events(
 /// the rest from, or what came of the call where nothing more is to be read.
 fn handle_answer(
     event_dispatcher: &EventDispatcher,
-    answer: Answer,
+    answer: Response,
 ) -> Result<ControlFlow<Relayed, UdsStream>, ServiceCallError> {
     let (connection, first) = match answer {
-        Answer::Serving(connection, first) => (connection, first),
-        Answer::Moving(handed_back) => {
+        Response::Serving(connection, first) => (connection, first),
+        Response::Moving(handed_back) => {
             return Ok(ControlFlow::Break(Relayed::HandedBack(handed_back)));
         }
     };

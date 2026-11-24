@@ -30,7 +30,7 @@ use crate::util::serde::u8_as_bool;
 
 /// Summary information about a single revision.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionInfoEventData {
     /// Repository identifier the revision belongs to.
@@ -57,7 +57,7 @@ impl LoreRevisionInfoEventData {
 
 /// Per-file change information between a revision and its parent.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionInfoDeltaEventData {
     /// Path of the file relative to the repository root.

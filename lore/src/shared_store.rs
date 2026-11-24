@@ -25,7 +25,16 @@ use crate::interface::LoreGlobalArgs;
 use crate::interface::LoreString;
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(create_local)]
 /// Arguments for creating a new shared store.
 pub struct LoreSharedStoreCreateArgs {
@@ -115,7 +124,16 @@ fn create_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(info_local)]
 /// Arguments for querying the configured default shared store (no parameters).
 pub struct LoreSharedStoreInfoArgs {}
@@ -188,7 +206,16 @@ async fn info_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(list_local)]
 /// Arguments for listing the registry of shared stores.
 pub struct LoreSharedStoreListArgs {
@@ -267,7 +294,16 @@ async fn list_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(set_use_automatically_local)]
 /// Arguments for setting whether to automatically use the shared store.
 pub struct LoreSharedStoreSetUseAutomaticallyArgs {

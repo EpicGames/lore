@@ -42,7 +42,15 @@ use crate::storage::store::StoreInternal;
 /// Tuneables for `lore_revision_tree_commit`.
 #[repr(C)]
 #[derive(
-    Copy, Clone, Debug, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct LoreRevisionTreeCommitOptions {
     /// Also upload the new revision to remote (local-only by default)
@@ -57,7 +65,17 @@ pub struct LoreRevisionTreeCommitOptions {
 
 /// Arguments for `lore_revision_tree_commit`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(commit_impl)]
 pub struct LoreRevisionTreeCommitArgs {
     /// Per-call correlation id echoed back in events

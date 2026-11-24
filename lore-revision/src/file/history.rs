@@ -36,7 +36,7 @@ use crate::util::path::RelativePath;
 
 /// Data for the event describing one entry in a file's history.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileHistoryEventData {
     /// Path of the file.

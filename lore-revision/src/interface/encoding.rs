@@ -15,6 +15,8 @@ use bitcode::__private::Result;
 use bitcode::__private::View;
 use bitcode::Decode;
 use bitcode::Encode;
+use lore_base::wire_schema::WireSchema;
+use lore_base::wire_schema::schema_leaf;
 
 use super::LoreArray;
 use super::LoreBinary;
@@ -229,4 +231,26 @@ impl<T: Encode> Encode for LoreArray<T> {
 
 impl<'a, T: Decode<'a>> Decode<'a> for LoreArray<T> {
     type Decoder = LoreArrayDecoder<'a, T>;
+}
+
+/// Named for what it encodes as, a byte string, as [`LoreBinary`] and [`LoreBytes`] are. The name
+/// stands for the layout [`BytesEncoder`] writes, so a change to that layout has to change the
+/// name.
+impl WireSchema for LoreString {
+    const SCHEMA: u64 = schema_leaf("bytes");
+}
+
+/// Named for the layout [`BytesEncoder`] writes, as for [`LoreString`].
+impl WireSchema for LoreBinary {
+    const SCHEMA: u64 = schema_leaf("bytes");
+}
+
+/// Named for the layout [`BytesEncoder`] writes, as for [`LoreString`].
+impl WireSchema for LoreBytes {
+    const SCHEMA: u64 = schema_leaf("bytes");
+}
+
+/// The schema of the slice an array encodes as.
+impl<T: WireSchema> WireSchema for LoreArray<T> {
+    const SCHEMA: u64 = <[T] as WireSchema>::SCHEMA;
 }

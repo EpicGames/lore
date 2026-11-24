@@ -108,7 +108,9 @@ use crate::util::serde::u8_as_bool;
 
 /// Event data reported at the start of a commit.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionCommitBeginEventData {
     /// Unused placeholder field.
@@ -117,7 +119,7 @@ pub struct LoreRevisionCommitBeginEventData {
 
 /// Progress counters describing how far a commit has advanced.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionCommitCountData {
     /// Number of directories processed so far.
@@ -171,7 +173,7 @@ impl LoreRevisionCommitCountData {
 
 /// Event data reporting commit progress.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionCommitProgressEventData {
     /// Current progress counters.
@@ -180,7 +182,7 @@ pub struct LoreRevisionCommitProgressEventData {
 
 /// Event data reported at the end of a commit.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionCommitEndEventData {
     /// Final progress counters.
@@ -193,7 +195,16 @@ pub struct LoreRevisionCommitEndEventData {
 /// node flags name.
 #[repr(C)]
 #[derive(
-    Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, bitcode::Encode, bitcode::Decode,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Debug,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCommitFileStatsData {
@@ -235,7 +246,9 @@ pub struct LoreCommitFileStatsData {
 /// statistics level one and above. A commit that failed reports what it had done
 /// by then.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, Copy, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionCommitStatsEventData {
     /// Files committed, by action.
@@ -246,7 +259,7 @@ pub struct LoreRevisionCommitStatsEventData {
 
 /// Event data describing a revision produced by a commit.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionCommitRevisionEventData {
     /// Identifier of the repository the revision belongs to.

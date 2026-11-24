@@ -61,7 +61,9 @@ use crate::storage::store::StoreInternal;
 
 /// One put-resolved item — the buffer to store and the mutable key to publish it under.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy, Clone, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 pub struct LoreStoragePutResolvedItem {
     /// Caller-chosen id echoed back in `PUT_ITEM_COMPLETE`
     pub id: u64,
@@ -120,7 +122,16 @@ impl core::fmt::Debug for LoreStoragePutResolvedItem {
 
 /// Arguments for `lore_storage_put_resolved`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(put_resolved_local)]
 pub struct LoreStoragePutResolvedArgs {
     /// Open storage handle

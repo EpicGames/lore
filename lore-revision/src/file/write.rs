@@ -34,7 +34,7 @@ use crate::util::path::repository_relative_path;
 
 /// Data for the event emitted when file content is written to a destination.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileWriteEventData {
     /// Path that was written.
