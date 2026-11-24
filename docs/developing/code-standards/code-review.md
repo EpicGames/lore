@@ -67,7 +67,9 @@ Flag:
 - A changed limit, budget, buffer or chunk size, flush point, channel capacity, batch size, or concurrency cap. State the new ceiling.
 - A whole-object read that replaces streaming, or has unbounded size.
 - One server call becoming several, or a call moved into a loop.
-- Blocking IO, compression, or hashing in `async` without `lore_spawn_blocking!`.
+- Work in the wrong place, by [Where work runs](tasks.md#where-work-runs): library file IO through `std::fs` or `tokio::fs` rather than `lore-io`, a blocking OS call made directly in `async`, or a network client built on the core runtime.
+- Anything other than a short blocking OS call sent to `lore_spawn_blocking!`, CPU work above all. The pool has a few threads for the whole process, so one long job there stalls every other blocking caller.
+- CPU work whose cost grows with its input and that runs without a cap on that input. A cap on bytes doesn't bound a diff or other super-linear algorithm; check that the cap covers what drives the time. Name the input and the fallback for an oversized one.
 - A lock held across `.await`.
 - Independent IO or server calls run in sequence that could run concurrently.
 - A value recomputed in a hot path, such as a hash, parse, or path join, that could be computed once.

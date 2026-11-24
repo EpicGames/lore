@@ -405,7 +405,15 @@ macro_rules! lore_spawn_core {
     };
 }
 
-/// Spawns a blocking task with `LORE_CONTEXT` set.
+/// Spawns a blocking task with `LORE_CONTEXT` set, on the core runtime's blocking pool.
+///
+/// The pool holds a few threads for the whole process, whatever the processor count, and is
+/// shared with every library on the core runtime that calls `spawn_blocking` itself (`tokio::fs`
+/// and DNS resolution among them). It is for short calls into blocking OS APIs with no async
+/// form. CPU work does not belong here: run it inline, bounded as
+/// `docs/developing/code-standards/tasks.md` requires. A closure here that runs for long holds a
+/// thread of the pool for that time, and once every thread is held, all other blocking work in
+/// the process waits.
 ///
 /// Uses `sync_scope` to make the context available in the blocking closure.
 #[macro_export]
@@ -440,35 +448,6 @@ macro_rules! lore_spawn_blocking {
         {
             $crate::runtime::core_runtime()
                 .spawn_blocking($crate::runtime::spawned_blocking_task($expression))
-        }
-    }};
-}
-
-/// Spawns a blocking task without context propagation.
-#[macro_export]
-macro_rules! lore_spawn_blocking_nocontext {
-    ($joinset:ident, $name:literal, $expression:expr) => {{
-        #[allow(clippy::disallowed_methods)]
-        {
-            $joinset.spawn_blocking_on($expression, &$crate::runtime::runtime())
-        }
-    }};
-    ($joinset:ident, $expression:expr) => {{
-        #[allow(clippy::disallowed_methods)]
-        {
-            $joinset.spawn_blocking_on($expression, &$crate::runtime::runtime())
-        }
-    }};
-    ($name:literal, $expression:expr) => {{
-        #[allow(clippy::disallowed_methods)]
-        {
-            $crate::runtime::runtime().spawn_blocking($expression)
-        }
-    }};
-    ($expression:expr) => {{
-        #[allow(clippy::disallowed_methods)]
-        {
-            $crate::runtime::runtime().spawn_blocking($expression)
         }
     }};
 }
@@ -813,7 +792,9 @@ const MIN_THREADS_PER_POOL: usize = 2;
 /// this serves only genuinely blocking OS APIs with no async form (OS keyring
 /// access, AWS SDK initialization, service IPC pipe reads). Fixed and
 /// processor-count-independent by design — see the async file I/O enhancement
-/// proposal's thread budget.
+/// proposal's thread budget. Libraries running on the core runtime share it
+/// through their own `spawn_blocking` calls, so a task that holds a thread here
+/// for long can stall work in an unrelated subsystem.
 #[lore_macro::test_pub]
 const CORE_BLOCKING_THREADS: usize = 2;
 

@@ -71,7 +71,6 @@ pub mod projfs;
 pub use lore_base::lore_drain_tasks;
 pub use lore_base::lore_limit_drain_tasks;
 pub use lore_base::lore_spawn_blocking;
-pub use lore_base::lore_spawn_blocking_nocontext;
 
 /// Ceiling on concurrently-spawned tasks in a filesystem or state tree walk:
 /// the diff, stage, realize and verify-filesystem walks.

@@ -4,7 +4,7 @@
 mod test {
     use lore_base::lore_drain_tasks;
     use lore_base::lore_spawn;
-    use lore_base::lore_spawn_blocking_nocontext;
+    use lore_base::lore_spawn_blocking;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_revision::branch::BranchError;
     use lore_revision::interface::LoreGlobalArgs;
@@ -51,21 +51,21 @@ mod test {
     #[tokio::test]
     async fn test_spawn_blocking() {
         assert_eq!(
-            lore_spawn_blocking_nocontext!(|| { "finished".to_string() })
+            lore_spawn_blocking!(|| { "finished".to_string() })
                 .await
                 .expect("Task failed"),
             "finished"
         );
         assert_eq!(
-            lore_spawn_blocking_nocontext!("test-task", || { "finished".to_string() })
+            lore_spawn_blocking!("test-task", || { "finished".to_string() })
                 .await
                 .expect("Task failed"),
             "finished"
         );
 
         let mut tasks = JoinSet::new();
-        let _ = lore_spawn_blocking_nocontext!(tasks, || { "finished".to_string() });
-        let _ = lore_spawn_blocking_nocontext!(tasks, "test-task", || { "finished".to_string() });
+        let _ = lore_spawn_blocking!(tasks, || { "finished".to_string() });
+        let _ = lore_spawn_blocking!(tasks, "test-task", || { "finished".to_string() });
 
         let results = tasks.join_all().await;
         assert!(results.len() == 2);
