@@ -4694,9 +4694,11 @@ impl MissingLinkBranches {
             return Ok(());
         }
         link::create_branches_for_merged_links(
-            repository.clone(),
-            &self.branches,
-            self.resolve.current,
+            &[link::MergedLinks {
+                holder: repository,
+                incoming: &self.branches,
+                branch: self.resolve.current,
+            }],
             self.resolve.chosen,
         )
         .await

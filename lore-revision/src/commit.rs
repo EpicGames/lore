@@ -3701,8 +3701,7 @@ async fn uncommitted_link_pins(
                     if linked.revision_number() != 0 {
                         return Ok(None);
                     }
-                    let Ok(path) = RelativePath::from_str(&path);
-                    let Some(mount_path) = mount.spell(&path) else {
+                    let Some(mount_path) = mount.spell_str(&path) else {
                         return Ok(None);
                     };
                     let nested = link::Mount::of_link(&context, &linked, node.child, mount_path)

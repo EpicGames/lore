@@ -5,7 +5,7 @@ import os
 import shutil
 
 import pytest
-from lore_parsers import parse_status_json
+from lore_parsers import parse_jsonl, parse_status_json
 from test_utils import registered_links
 
 from lore import Lore
@@ -516,6 +516,39 @@ def test_merge_of_a_link_removed_with_incoming_changes_under_a_view(
             assert input_file.read() == "linked v2\n", (
                 "the added link should expose the revision the merged branch pins"
             )
+
+
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
+@pytest.mark.smoke
+def test_merge_of_a_link_removed_out_of_view_creates_no_branch_for_the_links_it_brings_in(
+    new_lore_repo, scratch_dir
+):
+    """A link following branches, which the merged branch removes out of view while its
+    repository brings in a link to a repository with no branch for it to land on, leaves that
+    repository's branches as they were."""
+    old_path = "hidden/plugins/old"
+    nested: Lore = new_lore_repo()
+    nested.write_commit_push("nested v1", {"nested.txt": "nested v1\n"})
+
+    def change_links(repo: Lore, link_repo: Lore):
+        link_repo.link_add("deps/nested", nested.get_id(), "/")
+        link_repo.commit("link a repository inside")
+        link_repo.push()
+        repo.link_remove(old_path)
+
+    clone, _ = _merge_links_under_view(
+        new_lore_repo,
+        scratch_dir,
+        [old_path],
+        change_links,
+        follow_branches=True,
+    )
+
+    assert registered_links(clone) == {}
+    branches = parse_jsonl(
+        nested.branch_list(remote=True, json=True), "branchListEntry"
+    )
+    assert [entry["name"] for entry in branches] == ["main"]
 
 
 @pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")

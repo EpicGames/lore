@@ -709,48 +709,78 @@ pub(crate) async fn repositories_the_merge_keeps(
     Ok(kept.into_iter().flatten().collect())
 }
 
-/// Gives each repository in `incoming`, which holds no branch for the links a merge brought in to
-/// land on, that branch.
+/// The repositories a merge brings in to `holder`, on `branch`, that hold no branch for their links
+/// to land on.
+pub(crate) struct MergedLinks<'a> {
+    pub holder: &'a Arc<RepositoryContext>,
+    pub incoming: &'a [(RepositoryId, Vec<IncomingLink>)],
+    pub branch: BranchId,
+}
+
+/// Gives each repository of each of `merged` the branch its links land on, and so each repository
+/// its revision links at every depth, as `branch create` does, reusing one a repository holds
+/// already.
 ///
 /// `link add` and `branch create` make that branch when a link starts following a parent branch,
 /// and a merged-in link skips both, so without this its revision has no branch to be pushed to. It
-/// branches from where the link followed on the merged side, at the revision the link pins.
+/// branches from where the link followed on `merged_branch`, at the revision the link pins.
 pub(crate) async fn create_branches_for_merged_links(
-    repository: Arc<RepositoryContext>,
-    incoming: &[(RepositoryId, Vec<IncomingLink>)],
-    current_branch: BranchId,
+    merged: &[MergedLinks<'_>],
     merged_branch: BranchId,
 ) -> Result<(), LinkError> {
-    if incoming.is_empty() {
-        return Ok(());
-    }
-
-    let branch_metadata = branch::metadata(repository.clone(), current_branch)
-        .await
-        .forward::<LinkError>("Failed getting branch metadata")?;
-    let branch_name =
-        branch::name(&branch_metadata).forward::<LinkError>("Failed getting branch metadata")?;
-    let branch_category = branch::category(&branch_metadata).unwrap_or_default();
+    let holders = try_join_links(
+        merged
+            .iter()
+            .filter(|merged| !merged.incoming.is_empty())
+            .map(async |merged| {
+                let metadata = branch::metadata(merged.holder.clone(), merged.branch)
+                    .await
+                    .forward::<LinkError>("Failed getting branch metadata")?;
+                let name = branch::name(&metadata)
+                    .forward::<LinkError>("Failed getting branch metadata")?
+                    .to_owned();
+                let category = branch::category(&metadata).unwrap_or_default().to_owned();
+                let first_level = merged
+                    .incoming
+                    .iter()
+                    .flat_map(|(link_id, mounts)| {
+                        mounts.iter().map(|mount| LinkReach {
+                            repository: *link_id,
+                            pin: mount.link_reference.signature,
+                            branch: mount.link_reference.resolve_branch(merged_branch),
+                            mount_path: mount.link_path.clone(),
+                            depth: 1,
+                            leads: true,
+                        })
+                    })
+                    .collect();
+                let reached = Box::pin(collect_with_context(merged.holder, first_level)).await?;
+                Ok::<_, LinkError>((merged.branch, name, category, reached))
+            })
+            .collect(),
+    )
+    .await?;
 
     // Every creation runs to completion, so a failure knows each branch the others made.
     let results = try_join_links(
-        incoming
+        holders
             .iter()
-            .map(|(link_id, mounts)| {
-                let link = repository.to_link_context(*link_id);
-                let leader = mounts[0].link_reference;
-                async move {
-                    let created = create_merged_link_branch(
-                        link.await,
-                        current_branch,
-                        branch_name,
-                        branch_category,
-                        leader.resolve_branch(merged_branch),
-                        leader.signature,
-                    )
-                    .await;
-                    Ok::<_, LinkError>((*link_id, mounts, created))
-                }
+            .flat_map(|(branch, name, category, reached)| {
+                reached.iter().map(move |linked| {
+                    let start = &linked.reaches[0];
+                    async move {
+                        let created = create_merged_link_branch(
+                            linked.context.clone(),
+                            *branch,
+                            name,
+                            category,
+                            start.branch,
+                            start.pin,
+                        )
+                        .await;
+                        Ok::<_, LinkError>((linked, *branch, created))
+                    }
+                })
             })
             .collect(),
     )
@@ -758,9 +788,9 @@ pub(crate) async fn create_branches_for_merged_links(
 
     let mut failure = None;
     let mut created = Vec::with_capacity(results.len());
-    for (link_id, mounts, result) in results {
+    for (linked, branch, result) in results {
         match result {
-            Ok((link_remote, outcome)) => created.push((link_id, mounts, link_remote, outcome)),
+            Ok((link_remote, outcome)) => created.push((linked, branch, link_remote, outcome)),
             Err(err) => {
                 failure.get_or_insert(err);
             }
@@ -769,15 +799,14 @@ pub(crate) async fn create_branches_for_merged_links(
     if let Some(err) = failure {
         // A branch this merge made would outlive the merge, so it is taken back. A retry
         // recreates it.
-        for (link_id, _, link_remote, outcome) in created {
+        for (linked, branch, link_remote, outcome) in created {
             if outcome.reused {
                 continue;
             }
-            if let Err(delete_err) =
-                branch::delete_remote(link_remote, link_id, current_branch).await
-            {
+            let link_id = linked.repository;
+            if let Err(delete_err) = branch::delete_remote(link_remote, link_id, branch).await {
                 crate::lore_warn!(
-                    "Failed to remove branch {current_branch} from linked repository {link_id}: \
+                    "Failed to remove branch {branch} from linked repository {link_id}: \
                      {delete_err}"
                 );
             }
@@ -785,12 +814,12 @@ pub(crate) async fn create_branches_for_merged_links(
         return Err(err);
     }
 
-    for (link_id, mounts, _, outcome) in created {
-        for mount in mounts {
+    for (linked, branch, _, outcome) in created {
+        for reach in &linked.reaches {
             report_branch_outcome(
-                &mount.link_path,
-                link_id,
-                current_branch,
+                &reach.mount_path,
+                linked.repository,
+                branch,
                 outcome.revision,
                 outcome.reused,
             );
@@ -2884,6 +2913,7 @@ pub struct DescribedLink {
 }
 
 /// Where the working tree materializes the subtree at `source` of a repository.
+#[derive(Clone)]
 pub(crate) struct Mount {
     pub path: RelativePath,
     pub source: RelativePath,
@@ -2916,6 +2946,12 @@ impl Mount {
     /// subtree.
     pub(crate) fn spell(&self, path: &RelativePath) -> Option<RelativePath> {
         path.below(&self.source).map(|below| self.path.join(below))
+    }
+
+    /// [`Self::spell`] of `path`, a path of the repository as stored.
+    pub(crate) fn spell_str(&self, path: &str) -> Option<RelativePath> {
+        let Ok(path) = RelativePath::from_str(path);
+        self.spell(&path)
     }
 }
 
