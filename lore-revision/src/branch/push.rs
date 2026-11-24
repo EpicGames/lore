@@ -705,7 +705,8 @@ pub async fn push_branch(
 }
 
 /// Fails the push where the remote lacks a revision of another repository that a revision `target`
-/// pushes links, or refuses the caller that repository, before anything is pushed.
+/// pushes links, or refuses the caller that repository, before anything is pushed. A pin the plan
+/// holds is not asked about.
 ///
 /// The linked revisions are asked about a linked repository at a time, each repository's once,
 /// through the storage sessions of its context, in queries of the remote's batch size. A revision
@@ -717,8 +718,8 @@ async fn check_links_on_remote(target: &PushTarget) -> Result<(), PushError> {
         .revisions
         .iter()
         .flat_map(|pushed| &pushed.links)
-        .filter(|link| !link.signature.is_zero())
         .map(|link| (link.repository, link.signature))
+        .filter(|pin| !pin.1.is_zero() && !target.plan.held_links.contains(pin))
         .collect();
     linked.sort_unstable();
     linked.dedup();
@@ -839,6 +840,12 @@ struct TargetPlan {
     /// What the peer answered for the latest revision of each branch a line of the plan is on,
     /// so that each branch is asked about once.
     peer_latest: Vec<(BranchId, Hash)>,
+    /// The links, by linked repository and pinned revision, of the revisions of the peer the plan
+    /// starts from: each of `peer_latest`, and where the branch diverged, the first parent of the
+    /// oldest local revision, each unless the plan pushes it. A revision reaches the peer only
+    /// after the revisions its links pin, so these need no push or check. A pin held after a
+    /// revision linking it was scanned leaves the target that revision joined in place.
+    held_links: HashSet<(RepositoryId, Hash)>,
 }
 
 impl TargetPlan {
@@ -1015,7 +1022,7 @@ async fn plan_requests(collection: &mut TargetCollection, force: bool) -> Result
 
 /// Join the links of the pushing repository's current revision at the latest revision of the
 /// branch each resolves to, so that what was committed in a linked repository since the last
-/// revision naming it is pushed too.
+/// revision naming it is pushed too. A latest revision the root's plan holds is left out.
 async fn join_latest_links(collection: &mut TargetCollection) -> Result<(), PushError> {
     let Some(root) = collection.targets.first() else {
         return Ok(());
@@ -1034,7 +1041,8 @@ async fn join_latest_links(collection: &mut TargetCollection) -> Result<(), Push
         let link_latest = branch::load_latest(link_repository.clone(), link_branch)
             .await
             .unwrap_or_default();
-        if link_latest.is_zero() {
+        let held = &collection.targets[0].plan.held_links;
+        if link_latest.is_zero() || held.contains(&(link.repository, link_latest)) {
             continue;
         }
         join_target(
@@ -1157,7 +1165,7 @@ async fn place_pending(target: &mut PushTarget, force: bool) -> Result<(), PushE
 }
 
 /// Extend `target`'s plan to `revision`, which `line` reaches from its latest revision through
-/// first parents, newest first.
+/// first parents, newest first, holding the pins of each peer latest revision it learns of.
 async fn extend_plan(
     target: &mut PushTarget,
     revision: Hash,
@@ -1186,6 +1194,7 @@ async fn extend_plan(
     let (local, merges) = read_history(&target.repository, line).await?;
     let mut visited = plan.pushed.clone();
     visited.extend(line.iter().copied());
+    let known = plan.peer_latest.len();
     let divergent = collect_divergent_history(
         &target.repository,
         &plan.remote,
@@ -1197,13 +1206,15 @@ async fn extend_plan(
     for added in divergent.into_iter().rev().chain(local.into_iter().rev()) {
         plan.add(added);
     }
+    hold_remote_links(&target.repository, plan, known, Hash::default()).await;
     plan.local_history += line.len();
     target.latest = revision;
     Ok(())
 }
 
 /// Add the line of `revision`, a revision of `revision_branch`, to `target`'s plan, back to what
-/// the peer holds of that branch, or to the target's latest revision when the peer holds none.
+/// the peer holds of that branch, or to the target's latest revision when the peer holds none,
+/// holding the pins of the peer's latest revision of that branch.
 async fn upload_line(
     target: &mut PushTarget,
     revision: Hash,
@@ -1211,6 +1222,7 @@ async fn upload_line(
 ) -> Result<(), PushError> {
     lore_debug!("Revision {revision} is on branch {revision_branch}, uploading its line");
     let plan = &mut target.plan;
+    let known = plan.peer_latest.len();
     let peer_latest = peer_latest_for_branch(
         plan.remote.clone(),
         target.repository.id,
@@ -1236,19 +1248,22 @@ async fn upload_line(
             );
         }
     }
+    hold_remote_links(&target.repository, plan, known, Hash::default()).await;
     Ok(())
 }
 
 /// Join the links of the revisions `target`'s plan gained since its last scan, newest first, each
-/// to the target of the branch it resolves to.
+/// to the target of the branch it resolves to, leaving out the pins the plan holds.
 ///
 /// Newest first, a target is requested at the newest revision linked, so that the older ones are
 /// in its plan rather than placed against it.
+#[lore_macro::test_pub]
 async fn scan_target(collection: &mut TargetCollection, target: usize) {
     let scanning = &mut collection.targets[target];
     let branch = scanning.branch;
     let start = scanning.scanned;
     scanning.scanned = scanning.plan.revisions.len();
+    let held = &scanning.plan.held_links;
     let links: Vec<(Hash, LinkReference)> = scanning.plan.revisions[start..]
         .iter_mut()
         .rev()
@@ -1258,7 +1273,9 @@ async fn scan_target(collection: &mut TargetCollection, target: usize) {
                 .into_iter()
                 .map(move |link| (revision, link))
         })
-        .filter(|(_, link)| !link.signature.is_zero())
+        .filter(|(_, link)| {
+            !link.signature.is_zero() && !held.contains(&(link.repository, link.signature))
+        })
         .collect();
 
     for (holder, link) in links {
@@ -1982,10 +1999,20 @@ async fn plan_target(
         revisions: vec![],
         pushed: HashSet::new(),
         peer_latest: vec![(branch, created_latest)],
+        held_links: HashSet::new(),
     };
     if remote_latest == latest {
+        hold_remote_links(repository, &mut plan, 0, Hash::default()).await;
         return Ok(plan);
     }
+
+    let fork = match local_history.last() {
+        Some(&oldest) if plan.diverged => State::deserialize(repository.clone(), oldest)
+            .await
+            .forward::<PushError>("deserializing the oldest local revision")?
+            .parent_self(),
+        _ => Hash::default(),
+    };
 
     if local_history.is_empty() && !latest.is_zero() && force {
         local_history.push(latest);
@@ -2003,7 +2030,47 @@ async fn plan_target(
     for revision in divergent.into_iter().rev().chain(local.into_iter().rev()) {
         plan.add(revision);
     }
+    hold_remote_links(repository, &mut plan, 0, fork).await;
     Ok(plan)
+}
+
+/// Add to `plan`'s held links the links of each revision of `plan.peer_latest` from position `from`
+/// on and of `fork`, revisions of `repository` the peer holds, where the plan doesn't push it. A
+/// revision that can't be read holds none, so its links are pushed or checked.
+#[lore_macro::test_pub]
+async fn hold_remote_links(
+    repository: &Arc<RepositoryContext>,
+    plan: &mut TargetPlan,
+    from: usize,
+    fork: Hash,
+) {
+    let mut held: Vec<Hash> = plan.peer_latest[from..]
+        .iter()
+        .map(|&(_, latest)| latest)
+        .collect();
+    if !held.contains(&fork) {
+        held.push(fork);
+    }
+    for revision in held {
+        if revision.is_zero() || plan.pushes(revision) {
+            continue;
+        }
+        let state = match State::deserialize(repository.clone(), revision).await {
+            Ok(state) => state,
+            Err(err) => {
+                lore_debug!("Not holding the links of revision {revision}: {err}");
+                continue;
+            }
+        };
+        match revision_links(repository, &state).await {
+            Ok(links) => plan.held_links.extend(
+                links
+                    .into_iter()
+                    .map(|link| (link.repository, link.signature)),
+            ),
+            Err(err) => lore_debug!("Not holding the links of revision {revision}: {err}"),
+        }
+    }
 }
 
 /// What a target's push keeps from one revision to the next.
@@ -3307,11 +3374,14 @@ async fn failed_mount_push(
             line,
         );
     }
+    let mut err = err;
+    if repository.is_link() && is_refusal(&err) {
+        err.push_context(crate::link::unreachable(repository.id));
+    }
     let line = format!(
         "Failed to push the {} at {} (branch {}): {err}",
         name.kind, name.path, name.branch
     );
-    let mut err = err;
     err.push_context(context);
     (err, line)
 }

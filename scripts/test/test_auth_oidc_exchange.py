@@ -23,6 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 from error_types import LoreException, ProtectedError
+from lore_parsers import parse_jsonl
 from lore_server import (
     _kill_server_by_pid,
     allocate_free_port,
@@ -429,11 +430,11 @@ def test_a_link_that_cannot_branch_the_linked_repository_points_at_requesting_ac
 
 def denied_clone_of_a_link(
     exchange_env, make_repo, new_lore_repo, scratch_dir
-) -> tuple[Lore, str, Lore]:
+) -> tuple[Lore, str, Lore, Lore]:
     """A fresh clone of a parent that linked a repository while the stub
     granted it, made after the grant is revoked, the linked repository's id,
-    and the linked repository. The clone runs from a token store of its own, which holds no
-    partition token from the link's addition."""
+    the linked repository, and the parent. The clone runs from a token store of its own, which
+    holds no partition token from the link's addition."""
     provider = exchange_env.provider
     linked, linked_id = granted_repository(exchange_env, make_repo)
     seed_commit_and_push(linked)
@@ -449,7 +450,7 @@ def denied_clone_of_a_link(
     )
     Path(denied.path).mkdir()
     denied.run(["repository", "clone", parent.remote_path, denied.path])
-    return denied, linked_id, linked
+    return denied, linked_id, linked, parent
 
 
 def assert_points_at_requesting_access(refused: LoreException, linked_id: str):
@@ -465,7 +466,7 @@ def test_listing_a_link_to_a_repository_no_longer_granted_points_at_requesting_a
     """Listing links from a clone without access to the linked repository
     fails as an authorization failure, names the linked repository, and says
     how to get access."""
-    denied, linked_id, _ = denied_clone_of_a_link(
+    denied, linked_id, _, _ = denied_clone_of_a_link(
         exchange_env, make_repo, new_lore_repo, scratch_dir
     )
 
@@ -482,7 +483,7 @@ def test_updating_a_link_to_a_repository_no_longer_granted_points_at_requesting_
     """Updating a link from a clone without access to the linked repository
     fails as an authorization failure, names the linked repository, and says
     how to get access."""
-    denied, linked_id, _ = denied_clone_of_a_link(
+    denied, linked_id, _, _ = denied_clone_of_a_link(
         exchange_env, make_repo, new_lore_repo, scratch_dir
     )
 
@@ -500,7 +501,7 @@ def test_updating_a_link_to_a_pin_in_a_repository_no_longer_granted_points_at_re
     """Updating a link to a pinned revision or branch latest from a clone
     without access to the linked repository fails as an authorization failure,
     names the linked repository, and says how to get access."""
-    denied, linked_id, linked = denied_clone_of_a_link(
+    denied, linked_id, linked, _ = denied_clone_of_a_link(
         exchange_env, make_repo, new_lore_repo, scratch_dir
     )
     pin = pin_in_form(linked, pin_form)
@@ -512,23 +513,105 @@ def test_updating_a_link_to_a_pin_in_a_repository_no_longer_granted_points_at_re
 
 
 @pytest.mark.smoke
-def test_listing_staged_links_from_a_repository_no_longer_granted_points_at_requesting_access(
+def test_listing_staged_links_from_a_repository_no_longer_granted_lists_none(
     exchange_env, make_repo, new_lore_repo, scratch_dir
 ):
     """Listing links with staged changes from a clone without access to the
-    linked repository fails as an authorization failure, names the linked
-    repository, and says how to get access."""
-    denied, linked_id, _ = denied_clone_of_a_link(
+    linked repository, with a file of the parent staged, succeeds and lists no
+    link."""
+    denied, _, _, _ = denied_clone_of_a_link(
         exchange_env, make_repo, new_lore_repo, scratch_dir
     )
     with denied.open_file("staged.txt", "w+") as f:
         f.write("staged\n")
     denied.stage("staged.txt")
 
-    with pytest.raises(LoreException) as refused:
-        denied.link_list(staged=True)
+    listed = denied.link_list(staged=True, json=True)
 
-    assert_points_at_requesting_access(refused.value, linked_id)
+    assert parse_jsonl(listed, "linkStagedEntry") == [], listed
+
+
+def commit_a_file(repo: Lore, name: str, content: str) -> str:
+    with repo.open_file(name, "w+") as f:
+        f.write(content)
+    repo.stage(name)
+    return repo.commit(f"edit {name}")
+
+
+@pytest.mark.smoke
+def test_a_clone_without_access_to_a_linked_repository_pushes_what_leaves_the_link_alone(
+    exchange_env, make_repo, new_lore_repo, scratch_dir
+):
+    """A clone without access to a linked repository pushes two commits that
+    leave the link's pin as the remote holds it, and the parent's owner syncs
+    both, with the link still at its pin."""
+    denied, linked_id, linked, parent = denied_clone_of_a_link(
+        exchange_env, make_repo, new_lore_repo, scratch_dir
+    )
+    pin = linked.branch_info().local_latest
+    commit_a_file(denied, "a.txt", "first\n")
+    commit_a_file(denied, "b.txt", "second\n")
+
+    denied.push()
+
+    assert denied.branch_info().remote_latest == denied.branch_info().local_latest
+    parent.sync()
+    assert parent.read_files()["a.txt"] == "first\n"
+    assert parent.read_files()["b.txt"] == "second\n"
+    links = parse_jsonl(parent.link_list(json=True), "linkEntry")
+    assert [(link["linkPath"], link["link"], link["revision"]) for link in links] == [
+        ("lib", linked_id, pin)
+    ]
+
+
+@pytest.mark.smoke
+def test_a_commit_in_a_clone_without_access_to_a_linked_repository_reports_only_its_success(
+    exchange_env, make_repo, new_lore_repo, scratch_dir
+):
+    """A commit in a clone without access to a linked repository reports
+    success and nothing else."""
+    denied, _, _, _ = denied_clone_of_a_link(
+        exchange_env, make_repo, new_lore_repo, scratch_dir
+    )
+
+    output = commit_a_file(denied, "a.txt", "edit\n")
+
+    assert output.strip().splitlines()[-1] == "Commit succeeded", output
+    assert "Not authorized" not in output, output
+
+
+@pytest.mark.smoke
+def test_a_push_repinning_a_link_the_token_cannot_read_is_refused_naming_it(
+    exchange_env, make_repo
+):
+    """A push of a revision that moves a link's pin, with a token granting the
+    parent alone, is refused with the authorization failure's exit code before
+    anything is pushed, and names the link and the linked repository."""
+    provider = exchange_env.provider
+    linked, linked_id = granted_repository(exchange_env, make_repo)
+    parent, parent_id = granted_repository(exchange_env, make_repo)
+    seed_commit_and_push(linked)
+    seed_commit_and_push(parent)
+    parent.link_add("lib", linked_id, "/")
+    parent.commit("link lib")
+    parent.push()
+    pushed = parent.branch_info().local_latest
+    commit_a_file(linked, "next.txt", "next\n")
+    linked.push()
+    parent.link_update("lib", pin=linked.branch_info().local_latest)
+    parent.commit("repin lib")
+    scoped = provider.mint_token(
+        USER,
+        resources=[{"resource_id": f"urc-{parent_id}", "permission": GRANTED}],
+    )
+
+    with pytest.raises(LoreException) as refused:
+        parent.push(identity_token=scoped, access_token=scoped)
+
+    assert refused.value.returncode == 17, "the refusal must keep its exit code"
+    assert "link at lib" in str(refused.value), str(refused.value)
+    assert f"linked repository {linked_id}" in str(refused.value), str(refused.value)
+    assert parent.clone().branch_info().local_latest == pushed
 
 
 @pytest.mark.smoke
