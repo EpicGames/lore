@@ -12,6 +12,7 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
 use std::time::Duration;
+use std::time::Instant;
 
 use parking_lot::Condvar;
 use parking_lot::Mutex;
@@ -266,15 +267,60 @@ pub(crate) fn retry_on_interrupt<T>(
 }
 
 #[lore_macro::test_pub]
+struct Queued {
+    job: Arc<dyn Job>,
+    submitted_at: Instant,
+}
+
+#[lore_macro::test_pub]
 struct PoolState {
-    queue: VecDeque<Arc<dyn Job>>,
+    queue: VecDeque<Queued>,
     idle: usize,
     running: usize,
+    /// Threads that have started and not yet exited. `running` also counts slots reserved for
+    /// threads still being spawned.
+    alive: usize,
     /// Threads of the pool's cap lent out by [`SyscallPool::lend`], which the pool starts no
     /// thread of its own for while they are lent.
     lent: usize,
     queue_high_water: usize,
     threads_high_water: usize,
+    submitted: u64,
+    started: u64,
+    saturated: u64,
+    spawn_refused: u64,
+    queue_wait: Duration,
+    window: PoolWindow,
+}
+
+impl PoolState {
+    #[lore_macro::test_pub]
+    fn push(&mut self, job: Arc<dyn Job>, submitted_at: Instant) {
+        self.queue.push_back(Queued { job, submitted_at });
+        self.submitted += 1;
+        let depth = self.queue.len();
+        self.queue_high_water = self.queue_high_water.max(depth);
+        self.window.queue_high_water = self.window.queue_high_water.max(depth);
+    }
+
+    /// Takes the oldest job and adds the time it spent queued to the wait totals.
+    #[lore_macro::test_pub]
+    fn pop(&mut self) -> Option<Arc<dyn Job>> {
+        let Queued { job, submitted_at } = self.queue.pop_front()?;
+        let waited = submitted_at.elapsed();
+        self.started += 1;
+        self.queue_wait += waited;
+        self.window.max_queue_wait = self.window.max_queue_wait.max(waited);
+        Some(job)
+    }
+
+    /// Counts a worker thread once it is running, and raises the thread peaks to match.
+    #[lore_macro::test_pub]
+    fn thread_started(&mut self) {
+        self.alive += 1;
+        self.threads_high_water = self.threads_high_water.max(self.alive);
+        self.window.threads_high_water = self.window.threads_high_water.max(self.alive);
+    }
 }
 
 /// A snapshot of the syscall pool's occupancy.
@@ -286,7 +332,8 @@ struct PoolState {
 pub struct PoolStats {
     /// Jobs submitted and not yet started.
     pub queued: usize,
-    /// Jobs currently running on a pool thread.
+    /// Jobs currently running on a pool thread. Work run on the submitting thread or on a thread
+    /// of its own is not counted.
     pub executing: usize,
     /// Threads alive, idle ones included.
     pub threads: usize,
@@ -299,6 +346,29 @@ pub struct PoolStats {
     /// Threads of the cap lent out, which `threads` stays below the cap by once the idle threads
     /// past it have woken and ended.
     pub lent: usize,
+    /// Jobs queued for a pool thread since the pool was created. Work run on the submitting
+    /// thread, or on a thread of its own that started, never queues and is not counted.
+    pub submitted: u64,
+    /// Jobs a thread has taken from the queue since the pool was created.
+    pub started: u64,
+    /// Jobs queued with no thread idle and no room under the cap, less the threads lent, to start
+    /// one.
+    pub saturated: u64,
+    /// Submissions whose new thread the operating system refused to start.
+    pub spawn_refused: u64,
+    /// Total time the `started` jobs spent queued, from submission until a thread took them.
+    /// Dividing its increase by the increase in `started` gives the mean wait over an interval.
+    pub queue_wait: Duration,
+}
+
+/// Peaks in the syscall pool's occupancy since each was last read. The depth and thread peaks
+/// restart from the current level when read, and the wait peak restarts from zero.
+#[lore_macro::test_pub]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PoolWindow {
+    queue_high_water: usize,
+    threads_high_water: usize,
+    max_queue_wait: Duration,
 }
 
 #[lore_macro::test_pub]
@@ -389,7 +459,6 @@ impl Lent<'_> {
             let room = inner.max_threads.saturating_sub(state.running + state.lent);
             let spawn = room.min(state.queue.len().saturating_sub(state.idle));
             state.running += spawn;
-            state.threads_high_water = state.threads_high_water.max(state.running);
             spawn
         };
         for started in 0..spawn {
@@ -427,9 +496,16 @@ impl SyscallPool {
                     queue: VecDeque::new(),
                     idle: 0,
                     running: 0,
+                    alive: 0,
                     lent: 0,
                     queue_high_water: 0,
                     threads_high_water: 0,
+                    submitted: 0,
+                    started: 0,
+                    saturated: 0,
+                    spawn_refused: 0,
+                    queue_wait: Duration::ZERO,
+                    window: PoolWindow::default(),
                 }),
                 work_available: Condvar::new(),
                 max_threads,
@@ -507,18 +583,19 @@ impl SyscallPool {
 
     /// Queues `job` for a pool thread, starting one where none is idle and the cap allows.
     fn enqueue(&self, job: Arc<dyn Job>) {
+        // Read before the lock, so time spent waiting for it counts as queueing.
+        let submitted_at = Instant::now();
         let spawn_worker = {
             let mut state = self.inner.state.lock();
-            state.queue.push_back(job);
-            state.queue_high_water = state.queue_high_water.max(state.queue.len());
+            state.push(job, submitted_at);
             if state.idle > 0 {
                 self.inner.work_available.notify_one();
                 false
             } else if state.running + state.lent < self.inner.max_threads {
                 state.running += 1;
-                state.threads_high_water = state.threads_high_water.max(state.running);
                 true
             } else {
+                state.saturated += 1;
                 false
             }
         };
@@ -534,13 +611,50 @@ impl SyscallPool {
         let state = self.inner.state.lock();
         PoolStats {
             queued: state.queue.len(),
-            executing: state.running.saturating_sub(state.idle),
-            threads: state.running,
+            executing: state.alive.saturating_sub(state.idle),
+            threads: state.alive,
             threads_high_water: state.threads_high_water,
             queue_high_water: state.queue_high_water,
             max_threads: self.inner.max_threads,
+            submitted: state.submitted,
+            started: state.started,
+            saturated: state.saturated,
+            spawn_refused: state.spawn_refused,
+            queue_wait: state.queue_wait,
             lent: state.lent,
         }
+    }
+
+    /// The deepest the queue has been since the previous call, or since the pool was created.
+    /// The next peak starts from the current depth, so a burst spanning two calls is reported by
+    /// both.
+    #[lore_macro::test_pub]
+    pub(crate) fn take_queue_high_water(&self) -> usize {
+        let mut state = self.inner.state.lock();
+        let depth = state.queue.len();
+        std::mem::replace(&mut state.window.queue_high_water, depth)
+    }
+
+    /// The most threads alive at once since the previous call, or since the pool was created.
+    /// The next peak starts from the threads alive now.
+    #[lore_macro::test_pub]
+    pub(crate) fn take_threads_high_water(&self) -> usize {
+        let mut state = self.inner.state.lock();
+        let alive = state.alive;
+        std::mem::replace(&mut state.window.threads_high_water, alive)
+    }
+
+    /// The longest any job has waited in the queue since the previous call, or since the pool was
+    /// created. A job still queued counts with its wait so far, so a pool whose threads are all
+    /// blocked reports its oldest job's wait rather than nothing.
+    #[lore_macro::test_pub]
+    pub(crate) fn take_max_queue_wait(&self) -> Duration {
+        let mut state = self.inner.state.lock();
+        let oldest = state
+            .queue
+            .front()
+            .map_or(Duration::ZERO, |queued| queued.submitted_at.elapsed());
+        std::mem::replace(&mut state.window.max_queue_wait, Duration::ZERO).max(oldest)
     }
 
     /// Recovers from the operating system refusing the first of `unstarted` worker threads whose
@@ -570,8 +684,9 @@ impl SyscallPool {
         let job = {
             let mut state = self.inner.state.lock();
             state.running -= 1;
+            state.spawn_refused += 1;
             if state.running == 0 {
-                state.queue.pop_front()
+                state.pop()
             } else {
                 None
             }
@@ -612,6 +727,7 @@ fn spawn_worker_thread(inner: Arc<PoolInner>) -> std::io::Result<()> {
 }
 
 fn worker_loop(inner: &PoolInner) {
+    inner.state.lock().thread_started();
     let idle_hooks = IDLE_HOOKS.get();
     loop {
         // Whether the thread ran the begin hook since its last job.
@@ -623,9 +739,10 @@ fn worker_loop(inner: &PoolInner) {
                 // here, and the threads within the cap take the queued work.
                 if state.running + state.lent > inner.max_threads {
                     state.running -= 1;
+                    state.alive -= 1;
                     break None;
                 }
-                if let Some(job) = state.queue.pop_front() {
+                if let Some(job) = state.pop() {
                     break Some(job);
                 }
                 if let Some(hooks) = idle_hooks.filter(|_| !waited) {
@@ -646,6 +763,7 @@ fn worker_loop(inner: &PoolInner) {
                 state.idle -= 1;
                 if timed_out && state.queue.is_empty() {
                     state.running -= 1;
+                    state.alive -= 1;
                     break None;
                 }
             }

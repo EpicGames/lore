@@ -131,6 +131,7 @@ use crate::store::resolve_plugin_config_with_fallback;
 use crate::telemetry::OtelTokioRuntimeMetrics;
 use crate::telemetry::ResourceDetectorProvider;
 use crate::telemetry::TelemetryInitializer;
+use crate::telemetry::register_io_pool_metrics;
 use crate::tls::load_client_tls;
 use crate::topology::configure_topology_with_registry;
 use crate::util::setup_execution;
@@ -2060,6 +2061,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             }
         }));
     }
+
+    register_io_pool_metrics(&lore_telemetry::meter("lore.io.pool"));
 
     if let Some(mode) = settings
         .environment

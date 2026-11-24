@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Waker;
 use std::time::Duration;
+use std::time::Instant;
 
 use lore_io::pool::*;
 use parking_lot::Mutex;
@@ -187,18 +188,31 @@ fn a_refused_worker_thread_releases_its_slot_and_runs_the_job() {
     let flag = Arc::clone(&ran);
     {
         let mut state = pool.inner.state.lock();
-        state.queue.push_back(queued_job(move || {
-            flag.fetch_add(1, Ordering::SeqCst);
-        }));
+        state.push(
+            queued_job(move || {
+                flag.fetch_add(1, Ordering::SeqCst);
+            }),
+            Instant::now(),
+        );
         state.running += 1;
     }
 
     pool.run_without_worker();
 
     assert_eq!(ran.load(Ordering::SeqCst), 1, "the job never ran");
-    let state = pool.inner.state.lock();
-    assert_eq!(state.running, 0, "the reserved slot was not released");
-    assert!(state.queue.is_empty());
+    {
+        let state = pool.inner.state.lock();
+        assert_eq!(state.running, 0, "the reserved slot was not released");
+        assert!(state.queue.is_empty());
+        assert_eq!(state.spawn_refused, 1);
+        assert_eq!(state.saturated, 0, "the pool was below its cap");
+    }
+    assert_eq!(
+        pool.take_threads_high_water(),
+        0,
+        "a refused thread reached the window"
+    );
+    assert_eq!(pool.stats().threads_high_water, 0);
 }
 
 /// A live worker will drain the queue, so blocking the caller would buy nothing.
@@ -209,9 +223,12 @@ fn a_refused_worker_thread_leaves_the_job_when_one_is_alive() {
     let flag = Arc::clone(&ran);
     {
         let mut state = pool.inner.state.lock();
-        state.queue.push_back(queued_job(move || {
-            flag.fetch_add(1, Ordering::SeqCst);
-        }));
+        state.push(
+            queued_job(move || {
+                flag.fetch_add(1, Ordering::SeqCst);
+            }),
+            Instant::now(),
+        );
         state.running += 2;
     }
 
@@ -225,6 +242,8 @@ fn a_refused_worker_thread_leaves_the_job_when_one_is_alive() {
     let state = pool.inner.state.lock();
     assert_eq!(state.running, 1, "only the refused slot comes back");
     assert_eq!(state.queue.len(), 1);
+    assert_eq!(state.spawn_refused, 1);
+    assert_eq!(state.saturated, 0, "the pool was below its cap");
 }
 
 /// The default is a tuned position on a measured curve, not an arbitrary number, so it is
@@ -366,6 +385,212 @@ fn other_errors_are_not_retried() {
 
     assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     assert_eq!(attempts, 1);
+}
+
+/// Lets a job held by [`occupy_the_only_thread`] finish. Dropping it does the same, so a test
+/// that fails before opening it does not leave a pool thread spinning.
+struct Release(Arc<AtomicBool>);
+
+impl Release {
+    fn open(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.open();
+    }
+}
+
+/// Submits a job that holds the pool's only thread until it is released, and returns once that
+/// job has started, so whatever is submitted next queues behind it.
+fn occupy_the_only_thread(pool: &SyscallPool) -> (Release, SyscallTask<()>) {
+    let release = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicBool::new(false));
+    let running = Arc::clone(&started);
+    let gate = Arc::clone(&release);
+    let blocker = pool.submit(move || {
+        running.store(true, Ordering::SeqCst);
+        while !gate.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    });
+    while !started.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    (Release(release), blocker)
+}
+
+const HOLD: Duration = Duration::from_millis(20);
+const QUEUED: usize = 8;
+
+/// Fills a one-thread pool's queue behind a job held for [`HOLD`], then lets it all run.
+async fn queue_behind_a_held_job(pool: &SyscallPool) {
+    let (release, blocker) = occupy_the_only_thread(pool);
+    let queued: Vec<_> = (0..QUEUED)
+        .map(|index| pool.submit(move || index))
+        .collect();
+    std::thread::sleep(HOLD);
+    release.open();
+
+    blocker.await;
+    for (index, task) in queued.into_iter().enumerate() {
+        assert_eq!(task.await, index);
+    }
+}
+
+mod stats {
+    use super::*;
+
+    /// A job counts as started and its queue wait is recorded when it leaves the queue. A job
+    /// still queued counts as submitted but not started.
+    #[tokio::test]
+    async fn a_queued_job_is_submitted_but_not_started() {
+        let pool = SyscallPool::new(1);
+        let (release, blocker) = occupy_the_only_thread(&pool);
+        let queued = pool.submit(|| ());
+
+        let stats = pool.stats();
+        assert_eq!(stats.submitted, 2);
+        assert_eq!(stats.started, 1);
+
+        release.open();
+        blocker.await;
+        queued.await;
+        assert_eq!(pool.stats().started, 2);
+    }
+
+    /// Every submission is counted, and one that finds the only thread busy is counted as
+    /// saturated. Each queued job waited at least as long as the job ahead of it was held.
+    #[tokio::test]
+    async fn counts_submissions_saturation_and_queue_wait() {
+        let pool = SyscallPool::new(1);
+        queue_behind_a_held_job(&pool).await;
+
+        let stats = pool.stats();
+        assert_eq!(stats.submitted, QUEUED as u64 + 1);
+        assert_eq!(stats.started, QUEUED as u64 + 1);
+        assert_eq!(stats.saturated, QUEUED as u64);
+        assert!(
+            stats.queue_wait >= HOLD * QUEUED as u32,
+            "{:?} queued in total behind a job held for {HOLD:?}",
+            stats.queue_wait
+        );
+    }
+
+    /// With a cap no smaller than the number of jobs, a submission can always reserve a new
+    /// thread, whatever the existing ones are doing.
+    #[tokio::test]
+    async fn a_pool_below_its_cap_is_not_saturated() {
+        let pool = SyscallPool::new(8);
+        for index in 0..8 {
+            assert_eq!(pool.submit(move || index).await, index);
+        }
+
+        let stats = pool.stats();
+        assert_eq!(stats.submitted, 8);
+        assert_eq!(stats.saturated, 0);
+    }
+}
+
+mod take_queue_high_water {
+    use super::*;
+
+    #[tokio::test]
+    async fn reports_the_peak_of_a_burst_that_has_drained() {
+        let pool = SyscallPool::new(1);
+        queue_behind_a_held_job(&pool).await;
+
+        assert_eq!(pool.take_queue_high_water(), QUEUED);
+        assert_eq!(pool.stats().queued, 0, "the burst has drained");
+    }
+
+    /// Taking the peak starts the next from the current depth, and leaves the high-water mark
+    /// since creation in place.
+    #[tokio::test]
+    async fn starts_the_next_peak_from_the_current_depth() {
+        let pool = SyscallPool::new(1);
+        queue_behind_a_held_job(&pool).await;
+        pool.take_queue_high_water();
+
+        assert_eq!(pool.take_queue_high_water(), 0);
+        assert_eq!(pool.stats().queue_high_water, QUEUED);
+    }
+}
+
+mod take_threads_high_water {
+    use super::*;
+
+    /// A thread still alive when the peak is taken is counted in the next one, and the peak
+    /// since creation is left in place.
+    #[tokio::test]
+    async fn starts_the_next_peak_from_the_threads_alive() {
+        let pool = SyscallPool::new(1);
+        let (release, blocker) = occupy_the_only_thread(&pool);
+
+        assert_eq!(pool.take_threads_high_water(), 1);
+        assert_eq!(
+            pool.take_threads_high_water(),
+            1,
+            "the busy thread dropped out"
+        );
+        release.open();
+        blocker.await;
+        assert_eq!(pool.stats().threads_high_water, 1);
+    }
+
+    /// A reserved slot does not count as a thread, in the peaks or the current count, until the
+    /// thread starts.
+    #[test]
+    fn counts_only_threads_that_have_started() {
+        let pool = SyscallPool::new(2);
+        pool.inner.state.lock().running += 1;
+
+        assert_eq!(pool.take_threads_high_water(), 0);
+        let stats = pool.stats();
+        assert_eq!(stats.threads_high_water, 0);
+        assert_eq!(stats.threads, 0);
+        assert_eq!(stats.executing, 0);
+    }
+}
+
+mod take_max_queue_wait {
+    use super::*;
+
+    #[tokio::test]
+    async fn reports_the_longest_wait_of_a_burst_that_has_drained() {
+        let pool = SyscallPool::new(1);
+        queue_behind_a_held_job(&pool).await;
+
+        let longest = pool.take_max_queue_wait();
+        assert!(
+            longest >= HOLD,
+            "{longest:?} at most behind a job held for {HOLD:?}"
+        );
+        assert_eq!(pool.take_max_queue_wait(), Duration::ZERO);
+    }
+
+    /// A pool whose only thread is blocked reports the wait of the job queued behind it, though
+    /// that job has not started.
+    #[tokio::test]
+    async fn counts_a_job_that_is_still_queued() {
+        let pool = SyscallPool::new(1);
+        let (release, blocker) = occupy_the_only_thread(&pool);
+        let queued = pool.submit(|| ());
+        std::thread::sleep(HOLD);
+
+        let longest = pool.take_max_queue_wait();
+        release.open();
+        blocker.await;
+        queued.await;
+
+        assert_eq!(pool.stats().started, 2);
+        assert!(
+            longest >= HOLD,
+            "{longest:?} reported for a job queued for {HOLD:?}"
+        );
+    }
 }
 
 /// The pool lends at most half its cap in all, and starts no more threads than its cap less what
@@ -543,9 +768,12 @@ fn refused_threads_reserved_together_release_their_slots() {
     let flag = Arc::clone(&ran);
     {
         let mut state = pool.inner.state.lock();
-        state.queue.push_back(queued_job(move || {
-            flag.fetch_add(1, Ordering::SeqCst);
-        }));
+        state.push(
+            queued_job(move || {
+                flag.fetch_add(1, Ordering::SeqCst);
+            }),
+            Instant::now(),
+        );
         state.running += 3;
     }
 

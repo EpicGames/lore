@@ -125,3 +125,24 @@ pub use uring::UringStats;
 pub fn pool_stats() -> PoolStats {
     pool::SyscallPool::global().stats()
 }
+
+/// The deepest the process-wide syscall pool's queue has been since the previous call.
+///
+/// A burst shorter than the interval between samples reads as an empty queue in [`pool_stats`],
+/// and the high-water mark there only rises. This peak resets to the current depth on each call,
+/// so it belongs to a single reader.
+pub fn take_pool_queue_high_water() -> usize {
+    pool::SyscallPool::global().take_queue_high_water()
+}
+
+/// The most threads the process-wide syscall pool has had alive at once since the previous call.
+/// Resets on each call, so it belongs to a single reader.
+pub fn take_pool_threads_high_water() -> usize {
+    pool::SyscallPool::global().take_threads_high_water()
+}
+
+/// The longest any job has waited in the process-wide syscall pool's queue since the previous
+/// call, counting jobs still queued. Resets on each call, so it belongs to a single reader.
+pub fn take_pool_max_queue_wait() -> std::time::Duration {
+    pool::SyscallPool::global().take_max_queue_wait()
+}

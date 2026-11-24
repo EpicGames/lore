@@ -2832,6 +2832,7 @@ dependencies = [
  "lore-credential",
  "lore-error-set",
  "lore-hashicorp",
+ "lore-io",
  "lore-macro",
  "lore-notification",
  "lore-proto",

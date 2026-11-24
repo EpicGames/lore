@@ -7,8 +7,10 @@
 //! - OTLP export configuration
 //! - Resource detection for AWS/Nomad environments
 //! - Tokio runtime metrics bridging
+//! - `lore-io` syscall pool metrics
 
 mod guard;
+mod io_pool;
 mod log;
 mod metrics;
 #[cfg(not(feature = "test-util"))]
@@ -29,6 +31,7 @@ pub mod trace;
 use std::fs::File;
 
 pub use guard::TelemetryGuard;
+pub use io_pool::register_io_pool_metrics;
 use lore_error_set::prelude::*;
 use lore_telemetry::LogFormat;
 use lore_telemetry::LogOutput;
