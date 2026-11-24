@@ -1,6 +1,27 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::time::Duration;
+
 use lore_base::retry::*;
+
+mod reset_attempts {
+    use super::*;
+
+    /// Restored attempts carry on from the interval already reached rather than the start.
+    #[test]
+    fn restores_every_wait_and_keeps_the_interval() {
+        let mut retry = retry_with_jitter(100, 10_000, 2, 0.0);
+        assert_eq!(retry.next_interval(), Some(Duration::from_millis(100)));
+        assert_eq!(retry.next_interval(), Some(Duration::from_millis(200)));
+        assert_eq!(retry.next_interval(), None);
+
+        retry.reset_attempts();
+
+        assert_eq!(retry.next_interval(), Some(Duration::from_millis(400)));
+        assert_eq!(retry.next_interval(), Some(Duration::from_millis(800)));
+        assert_eq!(retry.next_interval(), None);
+    }
+}
 
 #[test]
 fn deviation_is_symmetric_about_the_interval() {

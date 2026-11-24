@@ -45,6 +45,12 @@ impl Retry {
         Some(Duration::from_millis(interval))
     }
 
+    /// Restore all `limit` waits, keeping the current interval so the back-off goes on growing
+    /// from where it is.
+    pub fn reset_attempts(&mut self) {
+        self.counter = 0;
+    }
+
     pub fn counter(&self) -> usize {
         self.counter
     }

@@ -548,6 +548,227 @@ mod offer {
     }
 }
 
+mod query_batches {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use lore_base::error::SlowDown;
+    use lore_base::retry::Retry;
+    use lore_base::retry::retry_with_jitter;
+    use tokio::sync::Semaphore;
+
+    use super::*;
+
+    const BACK_OFF: Duration = Duration::from_millis(50);
+
+    /// Back-off of exactly [`BACK_OFF`] every time, exhausted after `limit` waits.
+    fn back_off(limit: usize) -> Retry {
+        retry_with_jitter(
+            BACK_OFF.as_millis() as u64,
+            BACK_OFF.as_millis() as u64,
+            limit,
+            0.0,
+        )
+    }
+
+    /// A peer that throttles a batch if any address in it has been refused fewer times than that
+    /// address's refusal count. Otherwise, it answers `NotFound` for every address.
+    struct Peer {
+        refusals: HashMap<Address, usize>,
+        /// When each address with a refusal count was asked, throttled or answered.
+        asks: Mutex<HashMap<Address, Vec<Instant>>>,
+        /// Every batch asked, in the order asked.
+        batches: Mutex<Vec<Vec<Address>>>,
+    }
+
+    impl Peer {
+        fn new(refusals: &[(Address, usize)]) -> Arc<Self> {
+            Arc::new(Self {
+                refusals: refusals.iter().copied().collect(),
+                asks: Mutex::new(HashMap::new()),
+                batches: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn answer(&self, batch: &[Address]) -> Result<Bytes, ProtocolError> {
+            self.batches.lock().expect("batches").push(batch.to_vec());
+            let mut asks = self.asks.lock().expect("asks");
+            let mut throttle = false;
+            for address in batch {
+                if let Some(&refusals) = self.refusals.get(address) {
+                    let asked = asks.entry(*address).or_default();
+                    asked.push(Instant::now());
+                    throttle |= asked.len() <= refusals;
+                }
+            }
+            if throttle {
+                return Err(ProtocolError::from(SlowDown));
+            }
+            Ok(Bytes::from(vec![QueryStatus::NotFound as u8; batch.len()]))
+        }
+
+        fn asks(&self, address: Address) -> Vec<Instant> {
+            self.asks
+                .lock()
+                .expect("asks")
+                .get(&address)
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        fn batch_count(&self) -> usize {
+            self.batches.lock().expect("batches").len()
+        }
+    }
+
+    fn slots() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(Semaphore::MAX_PERMITS))
+    }
+
+    async fn run(
+        peer: &Arc<Peer>,
+        addresses: Vec<Address>,
+        batch_size: usize,
+        retry: Retry,
+    ) -> Result<PushQueryResult, PushError> {
+        let peer = peer.clone();
+        query_batches(addresses, Some(batch_size), slots(), retry, move |batch| {
+            let peer = peer.clone();
+            async move {
+                let result = peer.answer(&batch);
+                (batch, result)
+            }
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn every_address_is_answered_once_across_batches() {
+        let addresses: Vec<Address> = (0..25).map(address).collect();
+        let peer = Peer::new(&[]);
+
+        let queried = run(&peer, addresses.clone(), 10, back_off(0))
+            .await
+            .expect("an unthrottled query needs no back-off");
+
+        assert_eq!(queried.absent, addresses);
+        assert_eq!(peer.batch_count(), 3);
+    }
+
+    /// A throttled batch is asked again only after a full back-off, and the batches the peer
+    /// answered are not asked again with it.
+    #[tokio::test]
+    async fn a_throttled_batch_waits_for_the_back_off_before_it_is_asked_again() {
+        let addresses: Vec<Address> = (0..30).map(address).collect();
+        let peer = Peer::new(&[(address(5), 1)]);
+
+        let queried = run(&peer, addresses.clone(), 10, back_off(1))
+            .await
+            .expect("one back-off is enough for a batch throttled once");
+
+        assert_eq!(queried.absent, addresses);
+        let asks = peer.asks(address(5));
+        assert_eq!(asks.len(), 2, "the throttled batch is asked twice");
+        assert!(
+            asks[1] - asks[0] >= BACK_OFF,
+            "asked again after {:?}",
+            asks[1] - asks[0]
+        );
+        assert_eq!(
+            peer.batch_count(),
+            4,
+            "only the throttled batch is asked again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_keeps_throttling_fails_the_query_with_slow_down() {
+        let peer = Peer::new(&[(address(0), usize::MAX)]);
+
+        let error = run(&peer, vec![address(0)], 10, back_off(3))
+            .await
+            .expect_err("the back-off is spent");
+
+        assert!(error.is_slow_down(), "{error:?}");
+        assert!(error.translated() == LoreError::SlowDown);
+        assert_eq!(
+            peer.asks(address(0)).len(),
+            4,
+            "the first ask and one per back-off"
+        );
+    }
+
+    /// The back-off limit counts consecutive rounds with no answers. Waiting continues as long as
+    /// the peer answers some of the held batches in each round.
+    #[tokio::test]
+    async fn a_round_that_answers_any_batch_restarts_the_back_off() {
+        let addresses: Vec<Address> = (0..4).map(address).collect();
+        let refusals: Vec<(Address, usize)> =
+            (1..4).map(|seed| (address(seed), seed as usize)).collect();
+        let peer = Peer::new(&refusals);
+
+        let queried = run(&peer, addresses.clone(), 1, back_off(1))
+            .await
+            .expect("every round answers a batch, so one back-off per round is enough");
+
+        assert_eq!(queried.absent, addresses);
+        assert_eq!(
+            peer.asks(address(3)).len(),
+            4,
+            "the last address held for three rounds"
+        );
+    }
+
+    /// Rounds that each answer something still end the query once there have been more of them
+    /// than the cap allows.
+    #[tokio::test]
+    async fn throttled_rounds_are_capped_even_while_each_answers_something() {
+        let last = MAX_THROTTLED_ROUNDS as u8 + 1;
+        let addresses: Vec<Address> = (0..=last).map(address).collect();
+        let refusals: Vec<(Address, usize)> = (1..=last)
+            .map(|seed| (address(seed), seed as usize))
+            .collect();
+        let peer = Peer::new(&refusals);
+        let brief_back_off = retry_with_jitter(1, 1, 1, 0.0);
+
+        let error = run(&peer, addresses, 1, brief_back_off)
+            .await
+            .expect_err("the last address outlasts the cap");
+
+        assert!(error.is_slow_down(), "{error:?}");
+        assert_eq!(
+            peer.asks(address(last)).len(),
+            MAX_THROTTLED_ROUNDS + 1,
+            "the first round and one per throttled round the cap allows"
+        );
+    }
+
+    /// Any failure other than throttling ends the query immediately, without waiting for the
+    /// back-off.
+    #[tokio::test]
+    async fn a_failure_other_than_throttling_is_not_retried() {
+        let asks = Arc::new(AtomicUsize::new(0));
+        let counted = asks.clone();
+
+        let error = query_batches(vec![address(0)], None, slots(), back_off(3), move |batch| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            async move {
+                let result = Err(ProtocolError::from(AddressNotFound { address: [7u8; 48] }));
+                (batch, result)
+            }
+        })
+        .await
+        .expect_err("the peer failed the query");
+
+        assert!(error.is_address_not_found(), "{error:?}");
+        assert_eq!(asks.load(Ordering::Relaxed), 1, "the peer is asked once");
+    }
+}
+
 /// Asking the peer to duplicate an association it already holds, as a push does before it uploads.
 /// The peer answers copy requests with `SlowDown`, a refusal, or success.
 mod duplicate_association {

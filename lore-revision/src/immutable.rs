@@ -292,11 +292,9 @@ pub async fn store_raw_remote_retry(
     loop {
         match remote_storage.put(address, fragment, payload.clone()).await {
             Ok(_) => return Ok(()),
-            Err(ProtocolError::SlowDown(_)) => {
+            Err(error @ ProtocolError::SlowDown(_)) => {
                 if !retry.wait().await {
-                    return Err(ImmutableError::internal(
-                        "Failed to store fragments, remote error",
-                    ));
+                    return Err(error).forward::<ImmutableError>("storing fragment to remote");
                 }
             }
             Err(ProtocolError::Disconnected(_)) => {

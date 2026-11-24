@@ -13,7 +13,9 @@ use futures::StreamExt;
 use futures::stream;
 use futures::stream::FuturesUnordered;
 use lore_base::error::RevisionNotFound;
+use lore_base::error::SlowDown;
 use lore_base::lore_spawn;
+use lore_base::retry::Retry;
 use lore_base::types::BranchMetadata;
 use lore_error_set::prelude::*;
 use lore_storage::CopyOutcome;
@@ -2766,6 +2768,12 @@ pub const RETRY_START_DURATION: u64 = 100;
 pub const RETRY_MAX_DURATION: u64 = 10_000;
 pub const RETRY_MAX_ATTEMPTS: usize = 10;
 
+/// Maximum number of rounds a fragment query waits while the peer throttles it, including rounds
+/// that answered some batches. Beyond this limit, the query fails with the peer's `SlowDown`, so a
+/// peer that keeps answering a little at a time cannot hold a query in back-off indefinitely.
+#[lore_macro::test_pub]
+const MAX_THROTTLED_ROUNDS: usize = 50;
+
 /// What the peer answered about the fragments a push is about to send, split by what it takes to
 /// register each one.
 ///
@@ -2792,6 +2800,11 @@ impl PushQueryResult {
     /// fragment total in the push progress events.
     pub fn len(&self) -> usize {
         self.absent.len() + self.copyable.len()
+    }
+
+    /// How many addresses the peer has answered, whatever the answer.
+    fn answered(&self) -> usize {
+        self.absent.len() + self.copyable.len() + self.present.len()
     }
 }
 
@@ -2821,91 +2834,16 @@ pub(crate) async fn push_query(
 
     let address_count = addresses.len();
     let slots = execution_context().push_budget().queries.clone();
-
-    let mut tasks = JoinSet::new();
-    let mut remain = addresses;
-
-    let mut failure = None;
-    let mut queried = PushQueryResult::default();
-    let mut retry =
+    let retry =
         crate::util::time::retry(RETRY_START_DURATION, RETRY_MAX_DURATION, RETRY_MAX_ATTEMPTS);
-    let max_batch_size = if let Some(max_batch_size) = max_batch_size
-        && max_batch_size > 0
-    {
-        max_batch_size
-    } else {
-        1000
-    };
-
-    fn handle_join_result(
-        result: Result<(Vec<Address>, Result<Bytes, ProtocolError>), JoinError>,
-        remain: &mut Vec<Address>,
-        queried: &mut PushQueryResult,
-    ) -> Result<(), PushError> {
-        let (mut batch, result) = result.internal("query task panicked")?;
-        match result {
-            Ok(result) => {
-                classify_query_batch(&batch, &result, queried);
-                Ok(())
-            }
-            Err(ProtocolError::SlowDown(_)) => {
-                remain.append(&mut batch);
-                Ok(())
-            }
-            err => err
-                .map(|_| ())
-                .forward::<PushError>("querying server for existing fragments"),
+    let queried = query_batches(addresses, max_batch_size, slots, retry, move |batch| {
+        let storage = storage.clone();
+        async move {
+            let result = storage.query(batch.as_slice()).await;
+            (batch, result)
         }
-    }
-
-    while !remain.is_empty() {
-        while !remain.is_empty() && failure.is_none() {
-            let Ok(slot) = slots.clone().acquire_owned().await else {
-                failure = Some(PushError::internal("query slots closed"));
-                break;
-            };
-            let mut batch = remain.split_off(remain.len().saturating_sub(max_batch_size));
-
-            let storage = storage.clone();
-            lore_spawn!(tasks, async move {
-                let _slot = slot;
-                batch.sort_unstable();
-                batch.dedup();
-
-                let result = storage.query(batch.as_slice()).await;
-                (batch, result)
-            });
-
-            while failure.is_none()
-                && let Some(result) = tasks.try_join_next()
-            {
-                failure = handle_join_result(result, remain.as_mut(), &mut queried).err();
-            }
-        }
-
-        while let Some(result) = tasks.join_next().await {
-            if failure.is_none() {
-                failure = handle_join_result(result, remain.as_mut(), &mut queried).err();
-            }
-        }
-
-        if let Some(failure) = failure {
-            return Err(failure);
-        }
-
-        if !remain.is_empty() && !retry.wait().await {
-            return Err(PushError::internal(
-                "Failed to query server for existing fragments",
-            ));
-        }
-    }
-
-    queried.absent.sort_unstable();
-    queried.absent.dedup();
-    queried.copyable.sort_unstable();
-    queried.copyable.dedup();
-    queried.present.sort_unstable();
-    queried.present.dedup();
+    })
+    .await?;
 
     stats.deduplicated(queried.present.len() as u64);
 
@@ -2916,6 +2854,125 @@ pub(crate) async fn push_query(
         queried.copyable.len(),
         queried.present.len()
     );
+
+    Ok(queried)
+}
+
+/// Ask the peer which of `addresses` it holds, in batches of up to `max_batch_size`, each holding
+/// one of `slots` while it is in flight. A batch the peer throttles is held until the next back-off
+/// from `retry`.
+///
+/// `query` answers one sorted, de-duplicated batch, handing the batch back with the peer's
+/// statuses for it.
+#[lore_macro::test_pub]
+async fn query_batches<Query, Answer>(
+    addresses: Vec<Address>,
+    max_batch_size: Option<usize>,
+    slots: Arc<Semaphore>,
+    mut retry: Retry,
+    query: Query,
+) -> Result<PushQueryResult, PushError>
+where
+    Query: Fn(Vec<Address>) -> Answer + Send + Sync + 'static,
+    Answer: Future<Output = (Vec<Address>, Result<Bytes, ProtocolError>)> + Send,
+{
+    let query = Arc::new(query);
+    let mut throttled_rounds = 0;
+    let mut tasks = JoinSet::new();
+    let mut remain = addresses;
+    let mut throttled = Vec::new();
+    let mut throttle = None;
+
+    let mut failure = None;
+    let mut queried = PushQueryResult::default();
+    let max_batch_size = if let Some(max_batch_size) = max_batch_size
+        && max_batch_size > 0
+    {
+        max_batch_size
+    } else {
+        1000
+    };
+
+    fn handle_join_result(
+        result: Result<(Vec<Address>, Result<Bytes, ProtocolError>), JoinError>,
+        throttled: &mut Vec<Address>,
+        throttle: &mut Option<ProtocolError>,
+        queried: &mut PushQueryResult,
+    ) -> Result<(), PushError> {
+        let (mut batch, result) = result.internal("query task panicked")?;
+        match result {
+            Ok(result) => {
+                classify_query_batch(&batch, &result, queried);
+                Ok(())
+            }
+            // Held until the next back-off, so the peer is not sent this batch again before then.
+            Err(error @ ProtocolError::SlowDown(_)) => {
+                throttled.append(&mut batch);
+                *throttle = Some(error);
+                Ok(())
+            }
+            err => err
+                .map(|_| ())
+                .forward::<PushError>("querying server for existing fragments"),
+        }
+    }
+
+    while !remain.is_empty() {
+        let answered_before = queried.answered();
+        while !remain.is_empty() && failure.is_none() {
+            let Ok(slot) = slots.clone().acquire_owned().await else {
+                failure = Some(PushError::internal("query slots closed"));
+                break;
+            };
+            let mut batch = remain.split_off(remain.len().saturating_sub(max_batch_size));
+
+            let query = query.clone();
+            lore_spawn!(tasks, async move {
+                let _slot = slot;
+                batch.sort_unstable();
+                batch.dedup();
+                query(batch).await
+            });
+
+            while failure.is_none()
+                && let Some(result) = tasks.try_join_next()
+            {
+                failure =
+                    handle_join_result(result, &mut throttled, &mut throttle, &mut queried).err();
+            }
+        }
+
+        while let Some(result) = tasks.join_next().await {
+            if failure.is_none() {
+                failure =
+                    handle_join_result(result, &mut throttled, &mut throttle, &mut queried).err();
+            }
+        }
+
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+
+        if let Some(error) = throttle.take() {
+            // A round with any answered batch restores the back-off's attempts, so its limit
+            // counts consecutive rounds that answered nothing.
+            if queried.answered() > answered_before {
+                retry.reset_attempts();
+            }
+            throttled_rounds += 1;
+            if throttled_rounds > MAX_THROTTLED_ROUNDS || !retry.wait().await {
+                return Err(error).forward::<PushError>("querying server for existing fragments");
+            }
+            remain.append(&mut throttled);
+        }
+    }
+
+    queried.absent.sort_unstable();
+    queried.absent.dedup();
+    queried.copyable.sort_unstable();
+    queried.copyable.dedup();
+    queried.present.sort_unstable();
+    queried.present.dedup();
 
     Ok(queried)
 }
@@ -3088,7 +3145,7 @@ async fn push_fragments_within(
             immutable::store_raw_remote_retry(storage.clone(), address, fragment, Some(payload))
                 .await
                 .map_err(|err| {
-                    if err.is_disconnected() || is_refusal(&err) {
+                    if err.is_disconnected() || err.is_slow_down() || is_refusal(&err) {
                         err.forward("putting fragment to remote")
                     } else {
                         PushError::internal_with_context(err, "putting fragment to remote")
