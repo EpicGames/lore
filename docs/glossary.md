@@ -28,6 +28,20 @@ The pair (hash, context) that identifies a fragment in the immutable store: 32 b
 
 Also see: hash, context, fragment.
 
+### Adoption
+
+A push that brings an unmergeable file to the content its chain latest already holds, normally by merging the branch that concluded it. It needs no lock and doesn't move the chain latest, so a branch that's behind can catch up even while another branch holds the file's lock.
+
+Also see: chain latest, behind, caught up.
+
+### Ahead
+
+A branch's relation to an unmergeable file's chain latest when the file's history on the branch holds the chain latest's content and the branch has changed the file since. A branch that's ahead contains every concluded edit to the file, so the caught-up check grants it a lock.
+
+Compare to: caught up, behind.
+
+Also see: chain latest.
+
 ### Amend
 
 To replace a branch's latest revision with a new revision that has the same content and a different message (`lore revision amend`). The new revision gets a new hash signature, and the original stays in the store.
@@ -42,9 +56,9 @@ Also see: bare, repository instance.
 
 ### Archive
 
-To retire a branch so it no longer appears in branch listings and its name can be reused, keeping its history (`lore branch archive`). Archived branches can still be listed with `lore branch list --archived`.
+To retire a branch so it no longer appears in branch listings and its name can be reused, keeping its history (`lore branch archive`). Archived branches can still be listed with `lore branch list --archived`. Archiving a scope (`lore scope archive`) likewise drops its name and keeps its state, and restoring it brings the name back.
 
-Also see: branch.
+Also see: branch, scope, purge.
 
 ### Authentication service
 
@@ -71,6 +85,14 @@ Also see: anchor, working tree.
 The nearest common ancestor of two branches' latest revisions, from which a branch diff or a three-way merge operation calculates the changes on each side.
 
 Also see: three-way merge, branch point.
+
+### Behind
+
+A branch's relation to an unmergeable file's chain latest when the file's history on the branch, walked back to the revision that produced the chain latest's content, never holds that content, so the branch is missing a concluded edit. Under strict chain enforcement, the branch's lock request for the file is denied until it merges that content in.
+
+Compare to: caught up, ahead.
+
+Also see: chain latest, adoption.
 
 ### Binary-first
 
@@ -113,9 +135,25 @@ The policy for staging a path whose name changed only in letter case (`lore stag
 
 Also see: stage.
 
+### Caught up
+
+A branch's relation to an unmergeable file's chain latest when the file's content at the branch's latest revision equals the chain latest's content. The caught-up check settles it with a single comparison and grants the branch a lock.
+
+Compare to: ahead, behind.
+
+Also see: chain latest.
+
 ### CDC
 
 See content-defined chunking.
+
+### Chain latest
+
+The record of an unmergeable file's edit chain in one scope: the file's content when the last session on it there concluded, or the content backfill seeded it with, and the revision that produced that content — the one that authored it, not a later revision that only carried it. When that session deleted the file, the record is a tombstone that keeps the last concluded content and marks the file deleted. It's stored as the file's latest entry in the lock store.
+
+Compare to: latest.
+
+Also see: caught up, ahead, behind, conclude, scope, lock (n).
 
 ### Change request
 
@@ -169,6 +207,12 @@ The background process that keeps the local store under its maximum size by remo
 
 Also see: eviction, garbage collection.
 
+### Conclude
+
+To end a session by releasing its lock and recording the file's content, and the revision that produced it, as the file's chain latest. A push to the branch that holds the lock concludes by default when the session changed the file, unless it keeps the lock (`lore push --keep-lock`), and a push that deletes the file concludes even then; a push to another branch concludes only the files it names (`lore push --unlock`), and `lore lock release --conclude` concludes at the holding branch's latest revision. A client that predates causal locks concludes when it releases the lock, if its branch isn't behind. Releasing a lock without concluding leaves the chain latest where it was, and before a repository's backfill completes a conclusion releases the lock and records nothing.
+
+Also see: session, chain latest, lock (n).
+
 ### Conflict
 
 A path that both sides changed in ways Lore can't combine automatically when merging, cherry-picking, or reverting, left for the user to resolve. A path can be resolved, marked unresolved again, or restarted, and the whole operation can be aborted.
@@ -189,7 +233,7 @@ Compare to: fixed-size chunking.
 
 ### Context
 
-A 16-byte opaque tag carried alongside a content hash to track identity — typically a file's stable ID across moves and copies, and the scope for obliteration. It's a deduplication and identity construct, not an access boundary.
+A 16-byte opaque tag carried alongside a content hash to track identity — typically a file's stable ID across moves and copies, and the unit obliteration acts on. It's a deduplication and identity construct, not an access boundary.
 
 Compare to: partition.
 
@@ -374,6 +418,12 @@ The content-addressed data store that holds every byte Lore persists, keyed by B
 
 Compare to: mutable store.
 
+### Indeterminate
+
+The caught-up check's result when its walk through a file's history runs out of budget before it can place the branch as ahead or behind. Under strict chain enforcement the lock request is denied, and an `Owner` or `Admin` can grant past it (`lore lock acquire --override-indeterminate`); under advisory chain enforcement it's granted with a warning.
+
+Also see: caught up, ahead, behind.
+
 ### Inherited metadata
 
 Metadata keys carried from a source revision onto the revision that merging or cherry-picking creates (`--inherit-metadata <key>`, or `*` for every key not reserved to the operation). Nothing is carried unless requested.
@@ -405,7 +455,15 @@ JWT <https://datatracker.ietf.org/doc/html/rfc7519>
 
 The pointer to a branch's most recent revision. The local and remote latest can differ until the next sync.
 
+Compare to: chain latest.
+
 Also see: branch, mutable store, sync, reset.
+
+### Latest entry
+
+The lock store's record of a file's chain latest in one scope, keyed by the scope and the file: the concluded content, the revision that produced it, and, while one is set, the off-protocol marker. A concluded delete turns it into a tombstone.
+
+Also see: chain latest, tombstone, off-protocol edit.
 
 ### Layer
 
@@ -423,6 +481,12 @@ Compare to: prefetch.
 
 Also see: sparse working tree, fragment.
 
+### Lease
+
+How long a held lock lasts without work on it. The holder's own work on the file renews it — marking the file dirty, committing a change to it, or pushing a change to it — and a lock left untouched for the whole lease is released without concluding. A lock taken through the original lock service lasts 30 days, renewed by any call its owner makes to that service.
+
+Also see: lock (n), session.
+
 ### Link
 
 A reference from one repository to a revision of another, mounted at a path and recorded in the parent's revisions, so every instance cloned from them has it. The other Lore analog to a Git submodule.
@@ -433,13 +497,17 @@ Also see: mount path, pin, partition.
 
 ### Lock (n)
 
-An exclusive claim on a file on a branch, used to coordinate edits to content that can't be merged, such as binary assets. Locks are advisory: Lore doesn't stop anyone from committing or pushing changes to a locked file.
+An exclusive hold on a file in one scope, held by a branch and the authenticated user who took it until its session concludes or the lock is released. A push from that user to that branch concludes the session by default when the session changed the file. That user can move the lock to another branch in the scope without ending the session (`lore lock acquire --from`). For an unmergeable file, repository policy decides whether a push that changes the file without its lock is refused or lands with a warning.
 
-Also see: binary-first.
+Also see: scope, session, unmergeable file, binary-first.
 
 ### Lock (v)
 
-To claim a file on a branch so others know not to edit it until it's unlocked (`lore lock`). Locking fails if another user already holds a lock on the same file.
+To take a file's lock for a branch and the authenticated user (`lore lock acquire`), so no other branch in its scope, and no other user on the branch, can lock the file until the session ends. Locking fails while another branch in the scope holds the lock, or another user does on the branch unless the caller holds the conclude-on-behalf permission, `Owner` or `Admin`; and, for an unmergeable file under strict chain enforcement, when the branch is behind on it or the check is indeterminate.
+
+### Lock scope
+
+See scope.
 
 ### Lore
 
@@ -500,7 +568,7 @@ Also see: link, layer.
 
 ### Multi-tenancy
 
-Hosting many unrelated repositories on one backend deployment without cross-tenant content leakage, even when tenants can guess each other's content hashes. It's enforced by partition-scoped access.
+Hosting many unrelated repositories on one backend deployment without cross-tenant content leakage, even when tenants can guess each other's content hashes. It's enforced by per-partition access.
 
 Also see: partition.
 
@@ -526,6 +594,12 @@ The permanent removal of stored content, while the revisions that reference it s
 
 Also see: context, address.
 
+### Off-protocol edit
+
+A change to an unmergeable file that landed without the protocol's approval: a push that changed the file without its lock under advisory lock enforcement or while the lock store couldn't be reached, or a conclusion from a branch that's behind under advisory chain enforcement. The latest entry records the most recent one until a conclusion from a branch that isn't behind clears it, and the audit trail records each.
+
+Also see: latest entry, chain latest.
+
 ### Offline mode
 
 A mode in which commands work only with what's on the machine, without contacting the remote (`--offline`). Commands that can't work without the remote fail instead of trying to connect.
@@ -536,7 +610,7 @@ Also see: remote URL.
 
 ### Partition
 
-A 16-byte opaque identifier that scopes content in the storage subsystem and is Lore's access boundary: every fragment and mutable-store key belongs to exactly one partition, and a session is authorized per partition. Each repository corresponds to one partition.
+A 16-byte opaque identifier that namespaces content in the storage subsystem and is Lore's access boundary: every fragment and mutable-store key belongs to exactly one partition, and a connection is authorized per partition. Each repository corresponds to one partition.
 
 Also see: multi-tenancy, context.
 
@@ -548,7 +622,7 @@ Also see: link.
 
 ### Prefetch
 
-Fetching a listed set of files while cloning, ahead of demand (`lore clone --prefetch <file>`).
+Fetching a listed set of files while cloning, before they're needed (`lore clone --prefetch <file>`).
 
 Compare to: lazy fetch.
 
@@ -560,9 +634,9 @@ Also see: branch, push.
 
 ### Purge
 
-An option that also deletes files Lore doesn't track when resetting paths or removing a layer (`--purge`). Without it, such files are left in place.
+To permanently remove what the default form of an operation leaves in place. The `--purge` option of resetting paths or removing a layer also deletes files Lore doesn't track, and `lore scope purge` removes a scope's metadata and latest entries, which archiving the scope keeps.
 
-Also see: reset, layer.
+Also see: reset, layer, scope.
 
 ### Push
 
@@ -616,9 +690,11 @@ Also see: conflict, mine, theirs.
 
 ### Restore
 
-To make an earlier revision's content the branch's newest state by committing it as a new revision (`lore revision restore`). History is kept: the new revision's parent is the branch's latest.
+To make an earlier revision's content the branch's newest state by committing it as a new revision (`lore revision restore`). History is kept: the new revision's parent is the branch's latest. Restoring an archived scope (`lore scope restore`) brings back its name instead.
 
 Compare to: revert, reset.
+
+Also see: archive.
 
 ### Revert
 
@@ -668,6 +744,12 @@ A walk of the file system under given paths that reconciles each file against th
 
 Also see: dirty, stage.
 
+### Scope
+
+A server-side unit of lock causality in a repository, with its own ID, name and lifecycle (`lore scope`). Each branch belongs to one scope, set when the branch is created — its parent's unless it names another — and branches in one scope share each file's lock and each unmergeable file's chain latest.
+
+Also see: chain latest, lock (n), branch.
+
 ### Selective sync
 
 Cloning or syncing limited to chosen root files and the files they depend on (`--root-file`). Dependency tags and a depth limit narrow which dependencies are followed.
@@ -677,6 +759,12 @@ Also see: dependency, root file, sparse working tree.
 ### Service process
 
 A long-running `lore` process that carries out CLI commands for the processes that issue them, so one service process handles every command a user runs on a machine (`lore service`). Commands use it automatically once it's configured.
+
+### Session
+
+The life of one lock, from acquiring it to concluding or releasing it; moving the lock to another branch in its scope continues the session. A push to the branch that holds the lock concludes the session by default when the session changed the file, so a session lasts one push unless the holder keeps the lock across several. Only a session that concludes moves the file's chain latest.
+
+Also see: conclude, lock (n).
 
 ### Shared store
 
@@ -739,7 +827,19 @@ Also see: base revision.
 For more information, see:
 Three-way merge <https://en.wikipedia.org/wiki/Merge_(version_control)>
 
+### Tombstone
+
+The latest entry a concluded delete leaves in place of a file's chain latest. It keeps the file's last concluded content, so a branch that still has the file is judged against that content, and a branch that carries the delete can lock the file to bring it back.
+
+Also see: chain latest, latest entry.
+
 ## U
+
+### Unmergeable file
+
+A file whose divergent edits can't be combined, such as a binary asset, so changing it takes its lock. The repository defines which files are unmergeable.
+
+Also see: lock (n), chain latest.
 
 ### Unresolve
 
