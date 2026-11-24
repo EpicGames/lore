@@ -309,6 +309,37 @@ mod tests {
         .await;
     }
 
+    /// Removing an empty directory answers not found where nothing stands at the path, and
+    /// another error where the directory holds an entry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn instance_operation_remove_empty_directory_answers_not_found_where_nothing_stands() {
+        run_fs_test(|_repository, operation, path| async move {
+            std::fs::create_dir_all(path.join("dir")).expect("Create directory failed");
+            std::fs::File::create(path.join("dir/file.txt")).expect("Create file failed");
+
+            let missing = operation
+                .remove_empty_directory(&RelativePath::new_from_initial_path("none").unwrap())
+                .await;
+            let holding = operation
+                .remove_empty_directory(&RelativePath::new_from_initial_path("dir").unwrap())
+                .await;
+
+            assert!(
+                missing
+                    .as_ref()
+                    .is_err_and(|error| error.is_file_not_found()),
+                "{missing:?}"
+            );
+            assert!(
+                holding
+                    .as_ref()
+                    .is_err_and(|error| !error.is_file_not_found()),
+                "{holding:?}"
+            );
+        })
+        .await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_remove_recursive() {
         run_fs_test(|_repository, operation, path| async move {

@@ -995,7 +995,8 @@ pub trait InstanceOperation: Send + Sync {
     /// Delete a file or empty directory.
     fn remove(&self, path: &RelativePath) -> impl Future<Output = Result<(), FsError>> + Send;
 
-    /// Delete the directory at `path`, which fails where `path` holds entries or is no directory.
+    /// Delete the directory at `path`, which fails where `path` holds entries or is no directory,
+    /// with [`FileNotFound`] where nothing stands at `path`.
     fn remove_empty_directory(
         &self,
         path: &RelativePath,
@@ -2273,6 +2274,8 @@ pub mod test_util {
         pub directory_reads: Arc<AtomicUsize>,
         /// How many directory creates were asked for.
         pub directory_creates: Arc<AtomicUsize>,
+        /// Paths each removal of an empty directory was asked for.
+        pub empty_directory_removals: Arc<Mutex<Vec<String>>>,
         /// How many renames were asked for.
         pub rename_count: Arc<AtomicUsize>,
         /// The error that refuses each rename, by the number of renames asked for before it, or
@@ -2541,8 +2544,10 @@ pub mod test_util {
             }
         }
 
-        /// Removes under the directory the provider reads from, and panics where it reads from none.
+        /// Records the path and removes under the directory the provider reads from, and panics
+        /// where it reads from none.
         async fn remove_empty_directory(&self, path: &RelativePath) -> Result<(), FsError> {
+            self.empty_directory_removals.lock().push(path.to_string());
             match &self.reads {
                 Some(reads) => reads.remove_empty_directory(path).await,
                 None => panic!("Test operation unimplemented except finalize"),

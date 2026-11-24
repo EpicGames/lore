@@ -1799,6 +1799,12 @@ impl InstanceOperation for FuseOperation {
         let mut changed = self.changes();
         let removed = Box::pin(self.remove_empty_directory_at(&mut changed.batch, path)).await;
         changed.send().await;
+        if removed == Err(Errno::ENOENT) {
+            return Err(FileNotFound {
+                resource: path.to_string(),
+            }
+            .into());
+        }
         written(removed, ACTION, path)
     }
 

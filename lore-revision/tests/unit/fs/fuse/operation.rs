@@ -458,6 +458,33 @@ async fn mode_at(fs: &FuseFilesystem, at: &str) -> u32 {
     fs.getattr(&req(), ino).await.expect("getattr").attr.mode
 }
 
+/// Removing an empty directory answers not found where nothing stands at the path, and another
+/// error where the directory holds an entry.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_an_empty_directory_answers_not_found_where_nothing_stands() {
+    in_context(async {
+        let w = working(&[("dir/a.txt", b"alpha")]).await;
+        let op = operation_of(&w.fs);
+
+        let missing = op.remove_empty_directory(&path("none")).await;
+        let holding = op.remove_empty_directory(&path("dir")).await;
+
+        assert!(
+            missing
+                .as_ref()
+                .is_err_and(|error| error.is_file_not_found()),
+            "{missing:?}"
+        );
+        assert!(
+            holding
+                .as_ref()
+                .is_err_and(|error| !error.is_file_not_found()),
+            "{holding:?}"
+        );
+    })
+    .await;
+}
+
 /// Each instance write method changes the filesystem State and `write/` as the same request
 /// through the kernel does, and a remount keeps what it wrote.
 #[tokio::test(flavor = "multi_thread")]

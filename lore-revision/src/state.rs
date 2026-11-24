@@ -8835,7 +8835,8 @@ fn add_change_where(
 /// identity, they pair in the order they stand.
 ///
 /// The vector is modified in place: the add becomes the move, taking the delete's `from` as its
-/// source, and the delete is dropped. Changes that are not coalesced keep their order.
+/// source and its [`change::Flags::KeptBeside`], and the delete is dropped. Changes that are not
+/// coalesced keep their order.
 pub fn detect_and_coalesce_moves(changes: &mut Vec<NodeChange>) {
     let is_candidate = |change: &NodeChange| {
         matches!(change.action, FileAction::Add | FileAction::Delete)
@@ -8883,6 +8884,7 @@ pub fn detect_and_coalesce_moves(changes: &mut Vec<NodeChange>) {
         };
 
         let from_state = changes[delete].from.clone();
+        let kept_beside = changes[delete].flags & change::Flags::KeptBeside;
         lore_trace!(
             "Detected move: {} -> {}",
             from_state.mapping.path.as_str(),
@@ -8891,6 +8893,7 @@ pub fn detect_and_coalesce_moves(changes: &mut Vec<NodeChange>) {
         let moved = &mut changes[add];
         moved.action = FileAction::Move;
         moved.from = from_state;
+        moved.flags |= kept_beside;
         if moved.from.differs_from(&moved.to) {
             moved.flags |= change::Flags::Modify;
         }
@@ -9034,7 +9037,46 @@ pub(crate) struct DiffSide {
     pub(crate) node: NodeID,
 }
 
+/// The live children of a directory by name hash, sorted, read once for every name looked up in it.
+pub(crate) struct ChildIndex(Vec<StateNamedNode>);
+
+/// What a [`ChildIndex`] holds at a name.
+pub(crate) enum IndexedChild {
+    /// No child.
+    Absent,
+    /// The one child carrying the name's hash.
+    One(NodeID),
+    /// Two or more children sharing the name's hash, which a find by path tells apart.
+    Several,
+}
+
+impl ChildIndex {
+    /// The child named `name`.
+    pub(crate) fn find(&self, name: &str) -> IndexedChild {
+        let name_hash = hash::hash_string(name);
+        let first = self.0.partition_point(|child| child.name < name_hash);
+        match self.0.get(first..).unwrap_or_default() {
+            [child, next, ..] if child.name == name_hash && next.name == name_hash => {
+                IndexedChild::Several
+            }
+            [child, ..] if child.name == name_hash => IndexedChild::One(child.node),
+            _ => IndexedChild::Absent,
+        }
+    }
+}
+
 impl DiffSide {
+    /// The live children of this side's directory `node`, indexed by name.
+    pub(crate) async fn child_index(&self, node: NodeID) -> Result<ChildIndex, StateError> {
+        let mut children = self
+            .state
+            .collect_children_unsorted(self.repository.clone(), node, false, false)
+            .await?
+            .children;
+        children.sort_unstable_by_key(|child| (child.name, child.node));
+        Ok(ChildIndex(children))
+    }
+
     /// Where `path` below this side's node stops.
     pub(crate) async fn stop(&self, path: &str) -> Result<PathStop, StateError> {
         if !self.node.is_valid_or_root_node_id() {
@@ -9557,14 +9599,16 @@ pub(crate) async fn diff_subtree_paths(
 /// A subtree a working copy materializes somewhere other than where the repository holding it
 /// spells it from — what a link mounts — is diffed by naming its node in each revision and
 /// reporting at the path it is materialized at, so no change carries the other spelling.
+/// `flags` are joined to the flags the sides derive.
 pub async fn diff_collect_subtree(
     from: NodeChangeState,
     to: NodeChangeState,
     path: RelativePath,
+    flags: DiffFlags,
     filter_mode: FilterMode,
 ) -> Result<Vec<NodeChange>, StateError> {
     let mut changes = ChangeStream::spawn(async move |changes| {
-        diff::diff_subtree(from, to, path, None, &changes, filter_mode).await
+        diff::diff_subtree_flagged(from, to, path, None, flags, &changes, filter_mode).await
     })
     .collect()
     .await?;
@@ -9577,12 +9621,54 @@ pub async fn diff_collect_subtree(
 /// preserving the post-walk move-coalescing and path-sort that the legacy
 /// `state::diff` performed. Callers that want a `Vec<NodeChange>` use this
 /// wrapper; callers that want streaming use `diff` directly.
-pub async fn diff_collect(
+pub fn diff_collect(
     repository_from: Arc<RepositoryContext>,
     state_from: Arc<State>,
     repository_to: Arc<RepositoryContext>,
     state_to: Arc<State>,
     path: Option<RelativePath>,
+    filter_mode: FilterMode,
+) -> impl Future<Output = Result<Vec<NodeChange>, StateError>> {
+    collect_coalesced(
+        repository_from,
+        state_from,
+        repository_to,
+        state_to,
+        path,
+        DiffFlags::empty(),
+        filter_mode,
+    )
+}
+
+/// [`diff_collect`] of the whole trees, with `flags` joined to the flags the sides derive.
+pub(crate) fn diff_collect_flagged(
+    repository_from: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    repository_to: Arc<RepositoryContext>,
+    state_to: Arc<State>,
+    flags: DiffFlags,
+    filter_mode: FilterMode,
+) -> impl Future<Output = Result<Vec<NodeChange>, StateError>> {
+    collect_coalesced(
+        repository_from,
+        state_from,
+        repository_to,
+        state_to,
+        None,
+        flags,
+        filter_mode,
+    )
+}
+
+/// [`collect_diff`] with every directory deleted as a whole listed path by path, its moves
+/// coalesced and the changes sorted by path.
+async fn collect_coalesced(
+    repository_from: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    repository_to: Arc<RepositoryContext>,
+    state_to: Arc<State>,
+    path: Option<RelativePath>,
+    flags: DiffFlags,
     filter_mode: FilterMode,
 ) -> Result<Vec<NodeChange>, StateError> {
     let mut changes = collect_diff(
@@ -9591,6 +9677,7 @@ pub async fn diff_collect(
         repository_to,
         state_to,
         path,
+        flags,
         filter_mode,
         Deletes::Each,
     )
@@ -9601,28 +9688,47 @@ pub async fn diff_collect(
 }
 
 /// Every change [`diff`] emits below `path`, in the order it emits them, with a directory deleted as
-/// a whole emitted as `deletes` says.
+/// a whole emitted as `deletes` says. `flags` join the flags of a walk of the whole trees, where
+/// `path` is `None`, and are empty for a walk below a path.
+#[allow(clippy::too_many_arguments)]
 async fn collect_diff(
     repository_from: Arc<RepositoryContext>,
     state_from: Arc<State>,
     repository_to: Arc<RepositoryContext>,
     state_to: Arc<State>,
     path: Option<RelativePath>,
+    flags: DiffFlags,
     filter_mode: FilterMode,
     deletes: Deletes,
 ) -> Result<Vec<NodeChange>, StateError> {
-    let walk = async move |changes: ChangeSender| {
-        diff(
-            repository_from,
-            state_from,
-            repository_to,
-            state_to,
-            path,
-            None,
-            &changes,
-            filter_mode,
-        )
-        .await
+    let walk = async move |changes: ChangeSender| match path {
+        None => {
+            diff_whole_trees(
+                repository_from,
+                state_from,
+                repository_to,
+                state_to,
+                None,
+                flags,
+                &changes,
+                filter_mode,
+            )
+            .await
+        }
+        path => {
+            debug_assert!(flags.is_empty());
+            diff(
+                repository_from,
+                state_from,
+                repository_to,
+                state_to,
+                path,
+                None,
+                &changes,
+                filter_mode,
+            )
+            .await
+        }
     };
     let changes = match deletes {
         Deletes::Each => ChangeStream::spawn(walk),
@@ -9631,7 +9737,7 @@ async fn collect_diff(
     changes.collect().await
 }
 
-/// [`diff_collect`] where a directory deleted as a whole is one change carrying
+/// [`diff_collect_flagged`] where a directory deleted as a whole is one change carrying
 /// [`Flags::Subtree`](change::Flags::Subtree), which the caller expands as it gets to it through
 /// the [`Subtrees`] answered beside the changes.
 ///
@@ -9644,6 +9750,7 @@ pub(crate) async fn diff_collect_subtrees(
     state_from: Arc<State>,
     repository_to: Arc<RepositoryContext>,
     state_to: Arc<State>,
+    flags: DiffFlags,
     filter_mode: FilterMode,
 ) -> Result<(Vec<NodeChange>, Arc<Subtrees>), StateError> {
     let mut changes = collect_diff(
@@ -9652,6 +9759,7 @@ pub(crate) async fn diff_collect_subtrees(
         repository_to,
         state_to,
         None,
+        flags,
         filter_mode,
         Deletes::Whole,
     )

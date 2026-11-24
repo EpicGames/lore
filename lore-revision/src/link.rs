@@ -2693,6 +2693,7 @@ async fn link_pin_diff(
         )
         .await,
         link_path.clone(),
+        state::DiffFlags::empty(),
         FilterMode::View,
     )
     .await
@@ -2839,7 +2840,7 @@ async fn apply_link_pin_changes(
         None,
         false, /* Not dry run */
         None,  /* Not a merge */
-        None,  /* No view change */
+        Some(&crate::fs::realize::EmptiedDirectories::Excluded),
         stats,
     )
     .await

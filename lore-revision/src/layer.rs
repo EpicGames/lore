@@ -1014,7 +1014,7 @@ pub(crate) async fn sync_in_operation(
     .await;
     let target =
         drawn_subtree_state(&repository_target, &state_target, &source_path, &mount_path).await;
-    let view_change = options.view.is_some().then(|| NodeMapping {
+    let looked_up = (options.view.is_some() || options.reset).then(|| NodeMapping {
         repository: target.mapping.repository.clone(),
         state: target.mapping.state.clone(),
         path: mount_path.clone(),
@@ -1033,9 +1033,20 @@ pub(crate) async fn sync_in_operation(
             state_current.revision_number(),
             state_target.revision_number()
         );
-        state::diff_collect_subtree(current, target, mount_path.clone(), options.filter_mode)
-            .await
-            .forward::<LayerError>("Failed to calculate state diff when synchronizing")?
+        let flags = if repository_target.filter.view.is_empty() {
+            state::DiffFlags::empty()
+        } else {
+            state::DiffFlags::PlacesDirectories
+        };
+        state::diff_collect_subtree(
+            current,
+            target,
+            mount_path.clone(),
+            flags,
+            options.filter_mode,
+        )
+        .await
+        .forward::<LayerError>("Failed to calculate state diff when synchronizing")?
     } else {
         // Reverse the changes since diff filesystem returns changes from state to filesystem,
         // while we want to do filesystem to state
@@ -1112,7 +1123,7 @@ pub(crate) async fn sync_in_operation(
         None,
         dry_run,
         None, /* Not a merge */
-        None, /* No view change */
+        Some(&crate::fs::realize::EmptiedDirectories::Excluded),
         stats.clone(),
     )
     .await
@@ -1123,7 +1134,10 @@ pub(crate) async fn sync_in_operation(
             &repository_target,
             &changes,
             &mount_path,
-            view_change.as_ref(),
+            &looked_up.map_or(
+                crate::fs::realize::EmptiedDirectories::Unplaced,
+                crate::fs::realize::EmptiedDirectories::Target,
+            ),
             &stats,
         )
         .await;

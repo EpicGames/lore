@@ -1347,6 +1347,7 @@ mod tests {
                     lore_revision::state::State::deserialize(instance.repository.clone(), second)
                         .await
                         .expect("The second revision"),
+                    lore_revision::state::diff::DiffFlags::empty(),
                     lore_revision::filter::FilterMode::Full,
                 )
                 .await

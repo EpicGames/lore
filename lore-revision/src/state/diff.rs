@@ -90,6 +90,7 @@ use crate::state::node_change_state;
 use crate::state::os_diff::ensure_scan_dir_chain;
 use crate::state::stream::emit;
 use crate::util::path::RelativePath;
+use crate::util::path::RelativePathBuf;
 
 /// Decides whether a source subtree can be adopted whole during a merge.
 ///
@@ -183,7 +184,7 @@ bitflags! {
     /// every step below.
     #[repr(transparent)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct DiffFlags: u32 {
+    pub struct DiffFlags: u8 {
         /// The sides filter through different filters, so neither side's verdict
         /// answers for the other side.
         const TwoViews = 0b1;
@@ -204,6 +205,11 @@ bitflags! {
         /// The walk reports a link it would descend as a change of the link node and doesn't
         /// read the linked repository.
         const ReportsLinkNodes = 0b10000;
+        /// The walk's changes are realized into a working tree under the to side's view, so a
+        /// paired directory whose emptiness changes whether that view creates it is reported, as
+        /// one the two views place differently is ([`presence_change`]), and a delete beside a
+        /// file the view keeps carries [`change::Flags::KeptBeside`].
+        const PlacesDirectories = 0b100000;
     }
 }
 
@@ -822,8 +828,11 @@ fn diff_subtree_node(
 /// 2. In `from_nodes` but not `to_nodes` → Deleted or was Moved.
 /// 3. In both → Modified, case-only rename, or unchanged.
 ///
+/// The from children are taken by a 32-bit index, as node IDs are, which the future holds in less
+/// room than an iterator.
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+#[allow(clippy::while_let_loop)] // Keep the scrutinee out of the await state.
 fn diff_subtree_node_walk(
     from: &NodeChangeState,
     to: &NodeChangeState,
@@ -852,7 +861,13 @@ fn diff_subtree_node_walk(
             to_parent,
         };
         let mut to_index = 0;
-        for from_named_node in from_nodes.children.iter() {
+        let mut keeps_a_file = None;
+        let mut from_index = 0u32;
+        loop {
+            let Some(from_named_node) = from_nodes.children.get(from_index as usize) else {
+                break;
+            };
+            from_index += 1;
             while to_index < to_nodes.children.len()
                 && to_nodes.children[to_index].name < from_named_node.name
             {
@@ -922,8 +937,10 @@ fn diff_subtree_node_walk(
                 )
                 .await?;
             } else {
+                let kept_beside = deletes_kept_beside(context, &mut keeps_a_file).await;
                 add_change_for_solo_from_node(
                     context,
+                    kept_beside,
                     from_named_node,
                     to,
                     &from_node_search,
@@ -1067,8 +1084,25 @@ fn moved_since_listed(
     moved
 }
 
+/// Whether the deletes a walk reports in its to directory carry [`change::Flags::KeptBeside`]:
+/// where it places directories, the directory holds something its view places
+/// ([`holds_a_placed_entry`]), which `keeps_a_file` caches for the directory. The root, which no
+/// realize removes, and a directory a view line names, which stays on disk, aren't read.
+async fn deletes_kept_beside(context: DiffContext<'_>, keeps_a_file: &mut Option<bool>) -> bool {
+    context.flags.contains(DiffFlags::PlacesDirectories)
+        && !context.paths.to.is_empty()
+        && !context.states.to.creates_directory(false)
+        && *match keeps_a_file {
+            Some(keeps) => keeps,
+            None => keeps_a_file.insert(holds_a_placed_entry(context).await),
+        }
+}
+
+/// Reports the delete of a from child the to side does not hold, unless the to side moved it,
+/// carrying [`change::Flags::KeptBeside`] where `kept_beside` ([`deletes_kept_beside`]).
 async fn add_change_for_solo_from_node(
     context: DiffContext<'_>,
+    kept_beside: bool,
     from_named_node: &StateNamedNode,
     to: &NodeChangeState,
     from_node_search: &NodeSearchResult,
@@ -1136,7 +1170,11 @@ async fn add_change_for_solo_from_node(
             from,
             to.invalid(from_path.clone()),
             change::FileAction::Delete,
-            change::Flags::None,
+            if kept_beside {
+                change::Flags::KeptBeside
+            } else {
+                change::Flags::None
+            },
             changes,
             filter_mode,
             from_node_states,
@@ -1144,6 +1182,75 @@ async fn add_change_for_solo_from_node(
         .await?;
     }
     Ok(())
+}
+
+/// Whether the to directory the walk stands in holds something its view places without reading
+/// below it: a file it keeps ([`keeps_file`]), a link it keeps, or a directory a view line names,
+/// reading its listed children until one turns up: one name read and one filter verdict for each
+/// child read. A walk standing at a file holds none, and a child whose name the state cannot read
+/// is passed over.
+async fn holds_a_placed_entry(context: DiffContext<'_>) -> bool {
+    let to_nodes = context.to_nodes;
+    if context.to_parent.is_none() {
+        return false;
+    }
+    let filter = &to_nodes.repository.filter;
+    let mut path: Option<RelativePathBuf> = None;
+    for child in to_nodes.children.iter() {
+        let Ok(name) = to_nodes
+            .state
+            .node_name_ref(to_nodes.repository.clone(), child.node)
+            .await
+        else {
+            continue;
+        };
+        context.stats.queried();
+        let flags = child.flags();
+        let placed = if flags.contains(NodeFlags::File) {
+            keeps_file(
+                filter,
+                context.states.to,
+                &mut path,
+                &context.paths.to,
+                &name,
+            )
+        } else {
+            let spelled = match &mut path {
+                Some(spelled) => spelled.pop().push(&*name),
+                None => path.insert(context.paths.to.push_into_buf(&*name)),
+            };
+            if flags.contains(NodeFlags::Link) {
+                !filter.excludes_tree(&*spelled, true, FilterMode::View)
+            } else {
+                filter
+                    .child_excludes_tree(context.states.to, &*spelled, true, FilterMode::View)
+                    .0
+                    .creates_directory(false)
+            }
+        };
+        if placed {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `filter`'s view, at the directory `directory` with the verdicts `states`, keeps its
+/// file `name`, spelled in `spelled`, the buffer every child of the directory is spelled on.
+fn keeps_file(
+    filter: &Filter,
+    states: FilterStates,
+    spelled: &mut Option<RelativePathBuf>,
+    directory: &RelativePath,
+    name: &str,
+) -> bool {
+    let path = match spelled {
+        Some(spelled) => spelled.pop().push(name),
+        None => spelled.insert(directory.push_into_buf(name)),
+    };
+    !filter
+        .child_excludes_tree(states, &*path, false, FilterMode::View)
+        .1
 }
 
 async fn add_change_for_solo_to_node(
@@ -1363,7 +1470,9 @@ fn views_diverge_below(
 }
 
 /// The add or the delete of a paired directory alone, where one view creates it
-/// ([`FilterStates::creates_directory`]) and the other does not place it on disk that way.
+/// ([`FilterStates::creates_directory`]) and the other does not place it on disk that way. Under
+/// one view the two sides differ only where the directory's emptiness does, and are compared only
+/// under [`DiffFlags::PlacesDirectories`].
 ///
 /// A view places a directory it creates, and one it includes whose subtree it covers, since then
 /// everything below stands. Any other directory stands on disk only for content below it: the walk
@@ -1372,7 +1481,8 @@ fn views_diverge_below(
 /// and the source view does not place it, and deleted where the source view created it and the
 /// target view does not place it. A delete of a directory still holding
 /// something keeps it, and an add of one standing for its content finds it there. Two equal
-/// verdicts place it alike, as one view does. The change carries no hierarchy.
+/// verdicts place it alike, as one view does. The change carries no hierarchy, and comes with
+/// whether the two verdicts are one view's.
 #[allow(clippy::too_many_arguments)]
 fn presence_change(
     from_filter: &Filter,
@@ -1384,8 +1494,16 @@ fn presence_change(
     from_states: FilterStates,
     to_states: FilterStates,
     mode: FilterMode,
-) -> Option<change::FileAction> {
-    if !mode.contains(FilterMode::View) || from_states.view == to_states.view {
+    flags: DiffFlags,
+) -> Option<(change::FileAction, bool)> {
+    if !mode.contains(FilterMode::View) {
+        return None;
+    }
+    let one_view = from_states.view == to_states.view;
+    if one_view
+        && (!flags.contains(DiffFlags::PlacesDirectories)
+            || from_node.child().is_none() == to_node.child().is_none())
+    {
         return None;
     }
     let from_creates = from_states.creates_directory(from_node.child().is_none());
@@ -1394,12 +1512,68 @@ fn presence_change(
         filter.covers_subtree(states, path, depth, FilterMode::View)
     };
     if to_creates && !from_creates && !covers(from_filter, from_states) {
-        Some(change::FileAction::Add)
+        Some((change::FileAction::Add, one_view))
     } else if from_creates && !to_creates && !covers(to_filter, to_states) {
-        Some(change::FileAction::Delete)
+        Some((change::FileAction::Delete, one_view))
     } else {
         None
     }
+}
+
+/// Whether the directory `node` of `nodes` at `path`, with the view verdicts `states`, holds
+/// something the view places: a file it keeps ([`keeps_file`]), a link it keeps, or a directory it
+/// creates, at any depth, reading directories one after another until one turns up. Under one view
+/// such a directory stands for what it holds, so the walk reports no delete of it.
+///
+/// Its caller boxes it: only a directory a revision fills where it held it empty reaches it, so
+/// what it reads is what the revision adds, and inline it would make the future of every paired
+/// node as large as its own.
+async fn directory_places_content(
+    nodes: &StateChildrenNodes,
+    node: NodeID,
+    path: &RelativePath,
+    states: FilterStates,
+) -> Result<bool, StateError> {
+    let filter = &nodes.repository.filter;
+    let mut pending = vec![(node, path.clone(), states)];
+    while let Some((node, path, states)) = pending.pop() {
+        let mut children = super::StateNodeChildrenWithNameIterator::new(
+            nodes.state.clone(),
+            nodes.repository.clone(),
+            node,
+        )
+        .await?;
+        let mut spelled: Option<RelativePathBuf> = None;
+        loop {
+            let Some((child_id, child, name)) = children.next().await? else {
+                break;
+            };
+            if child.is_file() {
+                if keeps_file(filter, states, &mut spelled, &path, &name) {
+                    return Ok(true);
+                }
+                continue;
+            }
+            let child_path = path.push_into_buf(&*name).freeze();
+            drop(name);
+            if child.is_link() {
+                if !filter.excludes_tree(&child_path, true, FilterMode::View) {
+                    return Ok(true);
+                }
+                continue;
+            }
+            let (child_states, excluded) =
+                filter.child_excludes_tree(states, &child_path, true, FilterMode::View);
+            if excluded {
+                continue;
+            }
+            if child_states.creates_directory(child.child().is_none()) {
+                return Ok(true);
+            }
+            pending.push((child_id, child_path, child_states));
+        }
+    }
+    Ok(false)
 }
 
 /// Whether the walk descends into a paired directory for the from side's node alone: a staged
@@ -1659,7 +1833,7 @@ async fn add_change_for_paired_nodes(
             let child_depth = paths.depth + 1;
 
             if to_type == LoreNodeType::Directory
-                && let Some(action) = presence_change(
+                && let Some((action, one_view)) = presence_change(
                     &from_nodes.repository.filter,
                     &to_nodes.repository.filter,
                     &subpath,
@@ -1669,7 +1843,17 @@ async fn add_change_for_paired_nodes(
                     from_node_states,
                     to_subtree_states,
                     filter_mode,
+                    flags,
                 )
+                && !(one_view
+                    && matches!(action, change::FileAction::Delete)
+                    && Box::pin(directory_places_content(
+                        to_nodes,
+                        to_named_node.node,
+                        &subpath,
+                        to_subtree_states,
+                    ))
+                    .await?)
             {
                 emit(changes, || NodeChange {
                     action,

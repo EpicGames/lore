@@ -4475,7 +4475,7 @@ async fn restart_reset_conflicts(
         None,
         dry_run,
         None, /* Not a merge */
-        None, /* No view change */
+        Some(&crate::fs::realize::EmptiedDirectories::Excluded),
         Arc::new(sync::SyncRealizeStats::default()),
     )
     .await
@@ -4521,11 +4521,25 @@ async fn realize_diff_over_filesystem(args: RealizeDiff<'_>) -> Result<(), Merge
             state: args.state_to.clone(),
             staged: args.resumed.cloned(),
         }),
-        None, /* No view change */
+        None, /* Placed below, against the merged tree */
         args.stats.clone(),
     )
     .await
     .forward::<MergeError>("realizing non-conflict changes")?;
+    if !args.skip_filesystem && !args.repository.is_layer() {
+        crate::fs::realize::remove_emptied_directories(
+            args.operation,
+            args.repository,
+            args.changes,
+            &RelativePath::new(),
+            &crate::fs::realize::EmptiedDirectories::Merged {
+                merged: NodeMapping::root(args.repository.clone(), args.state_staged.clone()),
+                current: NodeMapping::root(args.repository.clone(), args.state_to.clone()),
+            },
+            args.stats,
+        )
+        .await;
+    }
     lore_debug!("Realized non-conflict changes");
 
     crate::fs::realize::realize_conflicts(
@@ -5998,6 +6012,35 @@ async fn merge_abort_ignore_links(
     Ok(())
 }
 
+/// The changes from `state_staged` back to `state_current` over the whole tree, for the removal
+/// of the directories a merge under `repository`'s view placed ([`remove_emptied_directories`]):
+/// its view-scoped diff leaves out what the view hides. `None` with no view, where the merge
+/// placed none.
+///
+/// [`remove_emptied_directories`]: crate::fs::realize::remove_emptied_directories
+async fn placed_changes(
+    repository: &Arc<RepositoryContext>,
+    state_current: &Arc<State>,
+    state_staged: &Arc<State>,
+) -> Result<Option<Vec<NodeChange>>, MergeError> {
+    if repository.filter.view.is_empty() {
+        return Ok(None);
+    }
+    let full_tree = full_tree_context(repository);
+    let mut changes = state::diff_collect(
+        full_tree.clone(),
+        state_current.clone(),
+        full_tree,
+        state_staged.clone(),
+        None, /* No subpath */
+        FilterMode::empty(),
+    )
+    .await
+    .forward::<MergeError>("running merge abort diff over the whole tree")?;
+    change::reverse(&mut changes);
+    Ok(Some(changes))
+}
+
 pub async fn merge_abort(
     repository: Arc<RepositoryContext>,
     merge_type: MergeType,
@@ -6077,6 +6120,7 @@ pub async fn merge_abort(
             }
         }
 
+        let stats = Arc::new(sync::SyncRealizeStats::default());
         crate::fs::realize::realize_changes(
             repository.clone(),
             operation.clone(),
@@ -6086,11 +6130,27 @@ pub async fn merge_abort(
             None,
             dry_run,
             None, /* Not a merge */
-            None, /* No view change */
-            Arc::new(sync::SyncRealizeStats::default()),
+            None, /* Placed below, against the revision the abort returns to */
+            stats.clone(),
         )
         .await
         .forward::<MergeError>("realizing abort changes")?;
+        if !dry_run
+            && let Some(placed) = placed_changes(&repository, &state_current, &state_staged).await?
+        {
+            crate::fs::realize::remove_emptied_directories(
+                &operation,
+                &repository,
+                &placed,
+                &RelativePath::new(),
+                &crate::fs::realize::EmptiedDirectories::Merged {
+                    merged: NodeMapping::root(repository.clone(), state_current.clone()),
+                    current: NodeMapping::root(repository.clone(), state_staged.clone()),
+                },
+                &stats,
+            )
+            .await;
+        }
 
         Ok::<_, MergeError>(operation.take_modified_times())
     })

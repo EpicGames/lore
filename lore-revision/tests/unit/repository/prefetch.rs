@@ -729,10 +729,15 @@ async fn a_whole_tree_walk_reads_every_block_its_trees_differ_in() {
                 mode: 0,
             };
 
-            let changes =
-                diff_collect_subtree(side(from), side(to), RelativePath::new(), FilterMode::View)
-                    .await
-                    .expect("the walk");
+            let changes = diff_collect_subtree(
+                side(from),
+                side(to),
+                RelativePath::new(),
+                lore_revision::state::diff::DiffFlags::empty(),
+                FilterMode::View,
+            )
+            .await
+            .expect("the walk");
 
             assert_eq!(
                 changes

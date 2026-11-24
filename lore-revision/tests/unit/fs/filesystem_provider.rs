@@ -60,6 +60,10 @@ pub struct TestFilesystemProvider {
     pub stale_on_scan: Arc<Mutex<Vec<(String, NodeID)>>>,
     /// Paths each recursive removal was asked for.
     pub removed: Arc<Mutex<Vec<String>>>,
+    /// Paths each removal of an empty directory its operations were asked for.
+    pub empty_directory_removals: Arc<Mutex<Vec<String>>>,
+    /// How many directory creates its operations were asked for.
+    pub directory_creates: Arc<AtomicUsize>,
     identity: TestIdentity,
     /// How many directories its operations read.
     pub directory_reads: Arc<AtomicUsize>,
@@ -269,7 +273,8 @@ impl FilesystemProvider for TestFilesystemProvider {
                 identity: self.identity,
                 case_lookup: self.case_lookup,
                 directory_reads: self.directory_reads.clone(),
-                directory_creates: Arc::default(),
+                directory_creates: self.directory_creates.clone(),
+                empty_directory_removals: self.empty_directory_removals.clone(),
                 rename_count: Arc::default(),
                 refuses_rename: None,
             }),

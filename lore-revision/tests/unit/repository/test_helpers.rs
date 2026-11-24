@@ -101,6 +101,15 @@ pub async fn working_tree_repository_filtered(
     path: &Path,
     filter: Filter,
 ) -> Arc<RepositoryContext> {
+    working_tree_repository_over(path, filter, None).await
+}
+
+/// [`working_tree_repository_filtered`] whose working tree `provider` serves where given.
+pub async fn working_tree_repository_over(
+    path: &Path,
+    filter: Filter,
+    provider: Option<Arc<dyn lore_revision::fs::filesystem_provider::FilesystemProvider>>,
+) -> Arc<RepositoryContext> {
     let immutable_store = lore_storage::local::immutable_store::create(
         None::<&str>,
         lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
@@ -117,13 +126,14 @@ pub async fn working_tree_repository_filtered(
     .await
     .expect("in-memory mutable store");
 
+    let mut args = default_repository_creation_args(immutable_store, mutable_store)
+        .with_path(path)
+        .with_filter(Arc::new(filter));
+    if let Some(provider) = provider {
+        args = args.with_filesystem_provider(provider);
+    }
     Arc::new(
-        RepositoryContext::new(
-            default_repository_creation_args(immutable_store, mutable_store)
-                .with_path(path)
-                .with_filter(Arc::new(filter)),
-        )
-        .with_write_token(RepositoryWriteToken::acquire(path).await),
+        RepositoryContext::new(args).with_write_token(RepositoryWriteToken::acquire(path).await),
     )
 }
 

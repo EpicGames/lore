@@ -387,11 +387,19 @@ impl InstanceOperation for OsOperation {
         Ok(())
     }
 
-    async fn remove_empty_directory(&self, path: &RelativePath) -> Result<(), FsError> {
-        lore_io::IoDriver::global()
-            .remove_dir(self.absolute(path)?)
-            .await?;
-        Ok(())
+    /// Not an `async fn`, which would hold a second copy of its arguments.
+    #[allow(clippy::manual_async_fn)]
+    fn remove_empty_directory(
+        &self,
+        path: &RelativePath,
+    ) -> impl Future<Output = Result<(), FsError>> + Send {
+        async move {
+            lore_io::IoDriver::global()
+                .remove_dir(self.absolute(path)?)
+                .await
+                .map_err(|error| removal_failure(error, path))?;
+            Ok(())
+        }
     }
 
     /// Takes the mode for the executable bit from the metadata the write captured, or from a
@@ -784,6 +792,19 @@ fn unify_refused_rename<'a>(
         lore_debug!("Renamed {} -> {}", from_path.display(), to_path.display());
         Ok(())
     }
+}
+
+/// What removing the directory `path` answers for `error`: a path holding nothing is not found.
+#[cold]
+#[inline(never)]
+fn removal_failure(error: std::io::Error, path: &RelativePath) -> FsError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return lore_base::error::FileNotFound {
+            resource: path.to_string(),
+        }
+        .into();
+    }
+    error.into()
 }
 
 /// What a listing of `path` answers for `error`: a path holding no directory, nothing or a file,

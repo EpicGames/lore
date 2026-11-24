@@ -6447,7 +6447,7 @@ pub(crate) async fn stage_from_parent_state(
         None,
         false, /* No dry run */
         None,  /* Not a merge */
-        None,  /* No view change */
+        Some(&crate::fs::realize::EmptiedDirectories::Excluded),
         Arc::new(SyncRealizeStats::default()),
     )
     .await

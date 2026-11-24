@@ -656,12 +656,13 @@ def test_sync_view_removes_what_it_no_longer_creates_in_links_and_layers(
 
 
 @pytest.mark.smoke
-def test_a_merge_under_an_unchanged_view_keeps_what_a_branch_switch_keeps(
+def test_a_merge_under_an_unchanged_view_leaves_what_a_branch_switch_leaves(
     new_lore_repo, scratch_dir
 ):
     """A merge that deletes the one kept file of `a/b`, beside a file the view
-    excludes, keeps `a` and `a/b`, as a switch to a branch holding the same tree
-    does: neither changes the view."""
+    excludes, removes `a` and `a/b`, as a switch to a branch holding the same tree
+    does: neither changes the view, and an instance cloned at that tree with it
+    holds neither."""
     repo: Lore = new_lore_repo()
     commit_and_push_files(repo, ["a/b/x.txt", "a/b/y.bat"])
     repo.branch_create("feature")
@@ -678,5 +679,5 @@ def test_a_merge_under_an_unchanged_view_keeps_what_a_branch_switch_keeps(
     merged.branch_merge("feature")
     switched.branch_switch("feature")
 
-    assert working_tree_files(switched, directories=True) == ["a", "a/b"]
-    assert working_tree_files(merged, directories=True) == ["a", "a/b", "other.txt"]
+    assert working_tree_files(switched, directories=True) == []
+    assert working_tree_files(merged, directories=True) == ["other.txt"]

@@ -37,6 +37,7 @@ use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::ListedEntry;
 use crate::fs::filesystem_provider::MeasuredNode;
 use crate::hash;
+use crate::interface::LoreNodeType;
 use crate::interface::LoreString;
 use crate::link::LinkFlags;
 use crate::lore::BranchId;
@@ -82,6 +83,7 @@ use crate::state::os_diff::ListedSpellings;
 use crate::state::os_diff::types_agree;
 use crate::util;
 use crate::util::path::RelativePath;
+use crate::util::path::RelativePathBuf;
 use crate::util::path::expand_path_ancestors;
 use crate::util::path::sorted_holds_below;
 
@@ -324,10 +326,16 @@ pub async fn realize_state(
         );
     }
 
-    let view_change = options
-        .view
-        .is_some()
-        .then(|| NodeMapping::root(repository_target.clone(), state_target.clone()));
+    let emptied = if !options.root_files.is_empty() {
+        EmptiedDirectories::Excluded
+    } else if options.view.is_some() || options.reset {
+        EmptiedDirectories::Target(NodeMapping::root(
+            repository_target.clone(),
+            state_target.clone(),
+        ))
+    } else {
+        EmptiedDirectories::Unplaced
+    };
     realize_changes(
         repository_target,
         operation,
@@ -337,7 +345,7 @@ pub async fn realize_state(
         None,
         dry_run,
         None, /* Not a merge */
-        view_change.as_ref(),
+        Some(&emptied),
         stats,
     )
     .await?;
@@ -358,37 +366,50 @@ pub async fn realize_state(
 /// Such a directory is one change, expanded as verification and realization get to it, so a sync
 /// deleting millions of files doesn't hold a change for each. Where the changes are taken one by
 /// one, by a dependency set, by keeping local work file by file or by hashing every file, each is
-/// listed.
-async fn diff_for_sync(
+/// listed. Under a target view, but for a dependency set, a paired directory whose emptiness
+/// changes whether the view creates it is reported added or deleted
+/// ([`DiffFlags::PlacesDirectories`](state::DiffFlags::PlacesDirectories)).
+///
+/// Not an `async fn`, which would hold a second copy of `repository_target` across the walk.
+#[allow(clippy::manual_async_fn)]
+fn diff_for_sync(
     repository_current: Arc<RepositoryContext>,
     state_current: Arc<State>,
     repository_target: Arc<RepositoryContext>,
     state_target: Arc<State>,
     options: &SyncOptions,
-) -> Result<(Vec<NodeChange>, Option<Arc<state::Subtrees>>), SyncError> {
-    if options.root_files.is_empty() && !options.forward_changes && !options.force_hash_check {
-        let (changes, subtrees) = state::diff_collect_subtrees(
+) -> impl Future<Output = Result<(Vec<NodeChange>, Option<Arc<state::Subtrees>>), SyncError>> + '_ {
+    let flags = if repository_target.filter.view.is_empty() || !options.root_files.is_empty() {
+        state::DiffFlags::empty()
+    } else {
+        state::DiffFlags::PlacesDirectories
+    };
+    async move {
+        if options.root_files.is_empty() && !options.forward_changes && !options.force_hash_check {
+            let (changes, subtrees) = state::diff_collect_subtrees(
+                repository_current,
+                state_current,
+                repository_target,
+                state_target,
+                flags,
+                options.filter_mode,
+            )
+            .await
+            .forward::<SyncError>("Failed to calculate delta changes between states")?;
+            return Ok((changes, Some(subtrees)));
+        }
+        let changes = state::diff_collect_flagged(
             repository_current,
             state_current,
             repository_target,
             state_target,
+            flags,
             options.filter_mode,
         )
         .await
         .forward::<SyncError>("Failed to calculate delta changes between states")?;
-        return Ok((changes, Some(subtrees)));
+        Ok((changes, None))
     }
-    let changes = state::diff_collect(
-        repository_current,
-        state_current,
-        repository_target,
-        state_target,
-        None, /* No subpath */
-        options.filter_mode,
-    )
-    .await
-    .forward::<SyncError>("Failed to calculate delta changes between states")?;
-    Ok((changes, None))
 }
 
 /// The changes a verify leaves to realize, and the files a link delete among them keeps.
@@ -2970,9 +2991,9 @@ impl MergeCurrent {
 /// from its base; it is `None` for changes that start from the revision the working tree stands
 /// on.
 ///
-/// `view_change` is the target revision at the root where the realize carries the tree to another
-/// view, as `lore sync --view` does, for the removal of the directories the new view no longer
-/// creates ([`remove_emptied_directories`]); it is `None` everywhere else.
+/// `emptied` says which directories the realize removes, or creates, once its deletes and moves are
+/// done, which it does last ([`remove_emptied_directories`]); with `None` it leaves them to its
+/// caller.
 ///
 /// A change staged in `state_stage` inside a directory marked dirty as moved stages the
 /// directory's whole move, as staging inside it does.
@@ -2989,7 +3010,7 @@ pub(crate) fn realize_changes<'a>(
     state_stage: Option<Arc<State>>,
     dry_run: bool,
     merge_current: Option<MergeCurrent>,
-    view_change: Option<&'a NodeMapping>,
+    emptied: Option<&'a EmptiedDirectories>,
     stats: Arc<SyncRealizeStats>,
 ) -> impl Future<Output = Result<(), SyncError>> + 'a {
     async move {
@@ -3022,7 +3043,6 @@ pub(crate) fn realize_changes<'a>(
             state_stage: state_stage.clone(),
             dry_run,
             merge_current: merge_current.clone(),
-            view_change: view_change.cloned(),
             stats: stats.clone(),
         });
         let kept_directories =
@@ -3089,6 +3109,20 @@ pub(crate) fn realize_changes<'a>(
         drained?;
 
         remove_directories_moved_out_of(&operation, &changes, kept_directories).await;
+        if let Some(emptied) = emptied
+            && !dry_run
+            && !repository.is_layer()
+        {
+            remove_emptied_directories(
+                &operation,
+                &repository,
+                &changes,
+                &RelativePath::new(),
+                emptied,
+                &stats,
+            )
+            .await;
+        }
 
         Ok(())
     }
@@ -3313,9 +3347,6 @@ struct DeleteContext {
     dry_run: bool,
     /// What a merge's realize reads the working tree against ([`realize_changes`]).
     merge_current: Option<MergeCurrent>,
-    /// The target revision at the root, where the realize carries the tree to another view
-    /// ([`realize_changes`]).
-    view_change: Option<NodeMapping>,
     stats: Arc<SyncRealizeStats>,
 }
 
@@ -3388,18 +3419,6 @@ async fn realize_changes_delete(
         if !realize_delete(context, change, variants, &kept_lowercase).await? {
             kept.push(change.clone());
         }
-    }
-
-    if !context.dry_run && !context.repository.is_layer() {
-        remove_emptied_directories(
-            &context.operation,
-            &context.repository,
-            &delete_changes,
-            &RelativePath::new(),
-            context.view_change.as_ref(),
-            &context.stats,
-        )
-        .await;
     }
 
     Ok(kept)
@@ -3804,7 +3823,6 @@ async fn realize_delete(
         state_stage,
         dry_run,
         merge_current,
-        view_change: _,
         stats,
     } = context;
     let (dry_run, is_merge) = (*dry_run, merge_current.is_some());
@@ -3887,128 +3905,541 @@ async fn realize_delete(
     Ok(deleted)
 }
 
-/// Removes each directory below `floor` and above a delete in `changes` that the deletes left
-/// empty and the view does not place on disk ([`unplaced`]), deepest first, reporting each one
-/// removed. Each removal counts as a delete in `stats`, done and in total, and a progress event
-/// follows the last.
+/// Which directories a realize removes once its deletes leave them empty.
+#[lore_macro::test_pub]
+pub(crate) enum EmptiedDirectories {
+    /// Those the view excludes, where it re-includes below a directory it excludes.
+    Excluded,
+    /// Those the view no longer places, the changes carrying the tree to another revision under
+    /// one view, from a walk that reports a directory whose emptiness changes whether the view
+    /// creates it ([`DiffFlags::PlacesDirectories`](state::DiffFlags::PlacesDirectories)).
+    Unplaced,
+    /// Those the view leaves off the disk in the target revision, at the floor, where each is
+    /// looked up: the realize carries the tree to another view, or resets it to the revision from
+    /// the working tree.
+    Target(NodeMapping),
+    /// Those the view no longer places, the changes being a merge's, a cherry-pick's or a
+    /// revert's, `merged` the tree they leave and `current` the revision the working tree stands
+    /// on, both at the root. A directory the merged tree holds empty, which the view includes, is
+    /// created where the current revision leaves it off the disk.
+    Merged {
+        merged: NodeMapping,
+        current: NodeMapping,
+    },
+}
+
+/// Removes each directory below `floor` above a delete or a move's source in `changes`
+/// ([`emptied_directory_candidates`]) that is empty and that the view does not place on disk
+/// ([`placement`]), deepest first, reporting each one removed, and creates and reports one a merge
+/// leaves empty that the view includes. Each removal counts as a delete in `stats`, done and in
+/// total, and a progress event follows the last.
 ///
-/// One still holding anything, a local file included, is kept. `view_change` is the target
-/// revision at `floor` where the deletes carry the tree to another view. `floor` is the root, or
-/// the mount of a layer, which stands whatever the view and is realized under the layer's context,
-/// so the layer's sync removes the directories below it rather than the realize. A realize under a
-/// link's context keeps every directory. The directories of a link the realized tree mounts are
-/// treated as any other. Under one view without a rule re-including below a directory it excludes,
-/// none of them is on disk to remove. Ancestors a delete shares with the one before it are
-/// gathered once, which sorted deletes make the most of.
+/// A directory stays where something stays below it ([`StayingDirectories`]): a write in
+/// `changes` the view places, a file the walk found beside a delete, a directory the view places,
+/// or one still holding anything, a local file included, which an `rmdir` refusing it finds. One
+/// the disk doesn't hold keeps none above it. Under
+/// [`EmptiedDirectories::Unplaced`] a directory above a delete in a linked tree stays, as the
+/// link's mount does. `floor` is the root, or the mount of a layer, which stands whatever the view
+/// and is realized under the layer's context, so the layer's sync removes the directories below it
+/// rather than the realize. A realize under a link's context keeps every directory. Under one view
+/// without a rule re-including below a directory it excludes, no excluded directory is on disk to
+/// remove, and with no view every directory stays. Ancestors a change shares with the one before
+/// it are gathered once, which sorted changes make the most of.
 #[lore_macro::test_pub]
 pub(crate) async fn remove_emptied_directories(
     operation: &InstanceOperationImpl,
     repository: &RepositoryContext,
     changes: &[NodeChange],
     floor: &RelativePath,
-    view_change: Option<&NodeMapping>,
+    emptied: &EmptiedDirectories,
     stats: &Arc<SyncRealizeStats>,
 ) {
-    if repository.is_link() || (view_change.is_none() && !repository.filter.view.reincludes()) {
+    let view = &repository.filter.view;
+    let nothing_to_remove = match emptied {
+        EmptiedDirectories::Excluded => !view.reincludes(),
+        _ => view.is_empty(),
+    };
+    if repository.is_link() || nothing_to_remove {
         return;
     }
+    let hidden =
+        matches!(emptied, EmptiedDirectories::Merged { .. }).then_some(&*repository.filter);
+    let mut staying = emptied_directory_candidates(changes, floor, hidden);
+    if staying.directories.is_empty() {
+        return;
+    }
+    staying.mark_writes(repository, changes, emptied).await;
+    let mut parents = None;
     let mut removed = false;
-    for directory in emptied_directory_candidates(changes, floor) {
-        if !unplaced(repository, view_change, &directory).await {
+    let mut next = 0;
+    loop {
+        let index = next;
+        let Some((directory, stays)) = staying.directories.get(index) else {
+            break;
+        };
+        next += 1;
+        if *stays {
             continue;
         }
-        if operation.remove_empty_directory(&directory).await.is_ok() {
-            stats
-                .complete
-                .file_delete_total
-                .fetch_add(1, Ordering::Relaxed);
-            stats.complete.file_delete.fetch_add(1, Ordering::Relaxed);
-            event::LoreEvent::RevisionSyncFile(LoreRevisionSyncFileEventData {
-                path: LoreString::from(&directory),
-                size: 0,
-                action: change::FileAction::Delete.into(),
-                flag_file: 0,
-            })
-            .send();
-            removed = true;
+        match placement(repository, emptied, directory, &mut parents).await {
+            Placement::Stays => {
+                staying.mark(index);
+                continue;
+            }
+            Placement::Created => {
+                if operation.create_dir_all(directory).await.is_ok() {
+                    event::LoreEvent::RevisionSyncFile(LoreRevisionSyncFileEventData {
+                        path: LoreString::from(directory),
+                        size: 0,
+                        action: change::FileAction::Add.into(),
+                        flag_file: 0,
+                    })
+                    .send();
+                    staying.mark(index);
+                }
+                continue;
+            }
+            Placement::Absent => continue,
+            Placement::Unplaced => {}
         }
+        match operation.remove_empty_directory(directory).await {
+            Ok(()) => {}
+            Err(error) if error.is_file_not_found() => continue,
+            Err(_) => {
+                staying.mark(index);
+                continue;
+            }
+        }
+        stats
+            .complete
+            .file_delete_total
+            .fetch_add(1, Ordering::Relaxed);
+        stats.complete.file_delete.fetch_add(1, Ordering::Relaxed);
+        event::LoreEvent::RevisionSyncFile(LoreRevisionSyncFileEventData {
+            path: LoreString::from(directory),
+            size: 0,
+            action: change::FileAction::Delete.into(),
+            flag_file: 0,
+        })
+        .send();
+        removed = true;
     }
     if removed {
         stats.send_progress();
     }
 }
 
-/// Each directory below `floor` above a delete in `changes`, deepest first.
-fn emptied_directory_candidates(changes: &[NodeChange], floor: &RelativePath) -> Vec<RelativePath> {
+/// The directories [`remove_emptied_directories`] may remove, deepest first, each marked where it
+/// stays on disk. A directory staying keeps every directory above it, so marking one marks its
+/// ancestors among them, and stops at the first already marked, whose ancestors are.
+struct StayingDirectories {
+    /// Each directory with whether it stays, sorted by path, descending, which puts a directory
+    /// after every directory below it.
+    directories: Vec<(RelativePath, bool)>,
+}
+
+impl StayingDirectories {
+    /// Whether the directory at `index` stays.
+    fn stays(&self, index: usize) -> bool {
+        self.directories[index].1
+    }
+
+    /// The index of the directory at `path`, if it is one of them.
+    fn find(&self, path: &str) -> Option<usize> {
+        position(&self.directories, path)
+    }
+
+    /// The index of the nearest of them at or above `path`.
+    fn nearest_at_or_above(&self, path: &str) -> Option<usize> {
+        let mut path = path;
+        loop {
+            if let Some(index) = self.find(path) {
+                return Some(index);
+            }
+            path = path.rsplit_once('/')?.0;
+        }
+    }
+
+    /// Marks the directory at `index` and each one above it, which sort after it.
+    fn mark(&mut self, index: usize) {
+        let (marked, above) = self.directories.split_at_mut(index + 1);
+        let (directory, stays) = &mut marked[index];
+        *stays = true;
+        let mut path = directory.as_str();
+        while let Some((parent, _)) = path.rsplit_once('/') {
+            if let Some(index) = position(above, parent) {
+                if above[index].1 {
+                    return;
+                }
+                above[index].1 = true;
+            }
+            path = parent;
+        }
+    }
+
+    /// Marks each directory at or above a write in `changes` the realize places on disk
+    /// ([`places_write`]), and each directory above a delete or a move's source the walk found a
+    /// file the view keeps beside ([`change::Flags::KeptBeside`]). Under
+    /// [`EmptiedDirectories::Unplaced`] it marks each directory above a delete or a move's source
+    /// in a linked tree as well, since the walk names no link's mount. A write is asked about only
+    /// below a directory not yet marked, and changes in one directory, adjacent in sorted changes,
+    /// look its candidate up once.
+    async fn mark_writes(
+        &mut self,
+        repository: &RepositoryContext,
+        changes: &[NodeChange],
+        emptied: &EmptiedDirectories,
+    ) {
+        let filter = &repository.filter;
+        let mut previous: Option<(&str, Option<usize>)> = None;
+        for change in changes {
+            let in_link = matches!(emptied, EmptiedDirectories::Unplaced)
+                && change.from.mapping.repository.is_link();
+            if (in_link || change.flags.contains(change::Flags::KeptBeside))
+                && let Some((parent, _)) = change
+                    .move_source()
+                    .and_then(|source| source.as_str().rsplit_once('/'))
+                && let Some(index) = self.nearest_at_or_above(parent)
+                && !self.stays(index)
+            {
+                self.mark(index);
+            }
+            let path = change.path().as_str();
+            let (path, places) = if change.action == change::FileAction::Delete {
+                let stays = in_link || change.flags.contains(change::Flags::KeptBeside);
+                match path.rsplit_once('/') {
+                    Some((parent, _)) if stays => (parent, None),
+                    _ => continue,
+                }
+            } else {
+                (path, Some(change))
+            };
+            let nearest = self.find(path).or_else(|| {
+                let parent = path.rsplit_once('/')?.0;
+                match previous {
+                    Some((directory, nearest)) if directory == parent => nearest,
+                    _ => {
+                        let nearest = self.nearest_at_or_above(parent);
+                        previous = Some((parent, nearest));
+                        nearest
+                    }
+                }
+            });
+            let Some(index) = nearest.filter(|&index| !self.stays(index)) else {
+                continue;
+            };
+            if let Some(write) = places
+                && !places_write(filter, write).await
+            {
+                continue;
+            }
+            self.mark(index);
+        }
+    }
+}
+
+/// Whether `filter`'s view keeps `write`, a change deleting nothing, at its path: a file or a link
+/// it keeps, or a directory it includes.
+fn keeps_write(filter: &Filter, write: &NodeChange) -> bool {
+    let path = write.path();
+    match write.to.flags.node_type() {
+        LoreNodeType::File => !filter.excludes(path, false, FilterMode::View),
+        LoreNodeType::Link => !filter.excludes_tree(path, true, FilterMode::View),
+        LoreNodeType::Directory => !filter.exclusion_states(path).excluded(FilterMode::View),
+    }
+}
+
+/// Whether the realize of `write`, a change deleting nothing, places its node on disk whatever is
+/// written below it: one `filter`'s view keeps ([`keeps_write`]), a directory only where the view
+/// creates it ([`FilterStates::creates_directory`]), which reads the node where no view line
+/// names it.
+async fn places_write(filter: &Filter, write: &NodeChange) -> bool {
+    if !keeps_write(filter, write) {
+        return false;
+    }
+    if write.to.flags.node_type() != LoreNodeType::Directory {
+        return true;
+    }
+    filter
+        .exclusion_states(write.path())
+        .creates_directory(false)
+        || write
+            .to
+            .get_node()
+            .await
+            .is_ok_and(|node| node.child().is_none())
+}
+
+/// The index of the directory at `path` in `directories`, sorted by path, descending.
+fn position(directories: &[(RelativePath, bool)], path: &str) -> Option<usize> {
+    directories
+        .binary_search_by(|(directory, _)| path.cmp(directory.as_str()))
+        .ok()
+}
+
+/// Each directory below `floor` above a delete or a move's source in `changes`, deepest first,
+/// and, where `hidden` is the view a merge's changes are realized under, above an add it doesn't
+/// keep ([`keeps_write`]), none of them marked yet.
+fn emptied_directory_candidates(
+    changes: &[NodeChange],
+    floor: &RelativePath,
+    hidden: Option<&Filter>,
+) -> StayingDirectories {
     let mut directories = Vec::new();
     let mut previous = "";
-    for change in changes
-        .iter()
-        .filter(|change| change.action == change::FileAction::Delete)
-    {
-        let mut directory = change.path().parent_path();
+    for change in changes {
+        let vacated = match change.action {
+            change::FileAction::Delete => change.path(),
+            _ => match change.move_source() {
+                Some(source) => source,
+                None if change.action == change::FileAction::Add
+                    && hidden.is_some_and(|filter| !keeps_write(filter, change)) =>
+                {
+                    change.path()
+                }
+                None => continue,
+            },
+        };
+        let mut directory = vacated.parent_path();
         while directory
             .below(floor)
             .is_some_and(|below| !below.is_empty())
             && !directory.covers(&previous)
         {
             let parent = directory.parent_path();
-            directories.push(directory);
+            directories.push((directory, false));
             directory = parent;
         }
-        previous = change.path().as_str();
+        previous = vacated.as_str();
     }
-    directories.sort_unstable_by(|left, right| right.as_str().cmp(left.as_str()));
-    directories.dedup_by(|left, right| left.as_str() == right.as_str());
-    directories
+    directories.sort_unstable_by(|(left, _), (right, _)| right.as_str().cmp(left.as_str()));
+    directories.dedup_by(|(left, _), (right, _)| left.as_str() == right.as_str());
+    StayingDirectories { directories }
 }
 
-/// Whether `repository`'s view leaves `directory` off the disk once nothing below it stands: it
-/// excludes it, or, where the realize carries the tree to that view from another, `view_change`
-/// being the target revision at the realize's floor, the view includes it without creating it
-/// ([`FilterStates::creates_directory`]) or covering its subtree, and the target revision holds it
-/// with children ([`held_directory`]).
-async fn unplaced(
+/// What [`remove_emptied_directories`] does with a directory nothing below it marks as staying.
+enum Placement {
+    /// It stays, with no system call.
+    Stays,
+    /// It is not on disk, with no system call, and keeps nothing above it.
+    Absent,
+    /// It is removed where empty.
+    Unplaced,
+    /// It is created, where the merged tree holds it empty.
+    Created,
+}
+
+/// Where `repository`'s view leaves `directory` once nothing below it stands: off the disk where
+/// it excludes it, which under one view without a rule re-including below a directory it
+/// excludes is never on disk, or, except under [`EmptiedDirectories::Excluded`], where it
+/// includes it without creating it ([`FilterStates::creates_directory`]) or covering its subtree.
+/// On a change of view or a reset the target revision then holds it with children
+/// ([`held_directory`]), and one it doesn't hold is passed over, as its changes delete it; under
+/// one view the walk reports a directory the revision empties, so one left among the candidates
+/// is held with children. After a merge, the revision the working tree stands on passes over a
+/// directory it doesn't hold, which was never on disk, and tells one already on disk, which isn't
+/// created again; the merged tree answers the rest ([`merged_placement`]).
+///
+/// `parents` is allocated for the first directory looked up, once for the removal, which keeps the
+/// lookups out of the future of [`remove_emptied_directories`] across its system calls.
+async fn placement(
     repository: &RepositoryContext,
-    view_change: Option<&NodeMapping>,
+    emptied: &EmptiedDirectories,
     directory: &RelativePath,
-) -> bool {
+    parents: &mut Option<Box<(ParentLookup, ParentLookup)>>,
+) -> Placement {
     let filter = &repository.filter;
     let states = filter.exclusion_states(directory);
     if states.excluded(FilterMode::View) {
-        return true;
+        if !filter.view.reincludes() && !matches!(emptied, EmptiedDirectories::Target(_)) {
+            return Placement::Absent;
+        }
+        return Placement::Unplaced;
     }
-    let Some(target) = view_change else {
-        return false;
-    };
-    if states.creates_directory(false) || filter.view_covers_subtree(states, directory) {
-        return false;
+    if matches!(emptied, EmptiedDirectories::Excluded)
+        || states.creates_directory(false)
+        || filter.view_covers_subtree(states, directory)
+    {
+        return Placement::Stays;
     }
-    held_directory(target, directory)
-        .await
-        .is_some_and(|node| node.child().is_some())
+    match emptied {
+        EmptiedDirectories::Target(target) => {
+            let parents = parents.get_or_insert_default();
+            match held_directory(target, directory, &mut parents.0).await {
+                Held::Directory(side, node) => match side.state.node(side.repository, node).await {
+                    Ok(node) if node.child().is_some() => Placement::Unplaced,
+                    _ => Placement::Stays,
+                },
+                Held::Mount => Placement::Stays,
+                Held::Nothing => Placement::Absent,
+            }
+        }
+        EmptiedDirectories::Merged { merged, current } => {
+            let parents = parents.get_or_insert_default();
+            if matches!(
+                held_directory(current, directory, &mut parents.1).await,
+                Held::Nothing
+            ) {
+                return Placement::Absent;
+            }
+            match merged_placement(filter, states, merged, directory, &mut parents.0).await {
+                Placement::Created => {
+                    match merged_placement(filter, states, current, directory, &mut parents.1).await
+                    {
+                        Placement::Stays | Placement::Created => Placement::Stays,
+                        _ => Placement::Created,
+                    }
+                }
+                placed => placed,
+            }
+        }
+        _ => Placement::Unplaced,
+    }
 }
 
-/// The node `target`'s revision holds at the directory `directory`, spelled from the top-level
-/// root below `target`'s path, crossing each link on the way into its linked tree; `None` where
-/// the revision holds nothing there, or `directory` is a link's mount, which stands on disk for
-/// the link whatever the view.
-async fn held_directory(target: &NodeMapping, directory: &RelativePath) -> Option<Node> {
-    let mut rest = directory.below(&target.path)?;
+/// Where a merge leaves `directory`, which the view includes with `states` without naming it: it
+/// is created where the merged tree `target` holds it empty, stays where it holds a child the view
+/// places or is a link's mount, and is removed where empty otherwise. Where the tree holds nothing
+/// there, the changes delete what stands on disk, so it is passed over. A child is placed where
+/// the view keeps the file or the link, or creates the directory. Each child's path is spelled on
+/// one buffer.
+async fn merged_placement(
+    filter: &Filter,
+    states: FilterStates,
+    target: &NodeMapping,
+    directory: &RelativePath,
+    parents: &mut ParentLookup,
+) -> Placement {
+    let (side, node) = match held_directory(target, directory, parents).await {
+        Held::Directory(side, node) => (side, node),
+        Held::Mount => return Placement::Stays,
+        Held::Nothing => return Placement::Absent,
+    };
+    let Ok(mut children) =
+        state::StateNodeChildrenWithNameIterator::new(side.state, side.repository, node).await
+    else {
+        return Placement::Stays;
+    };
+    let mut empty = true;
+    let mut spelled: Option<RelativePathBuf> = None;
+    loop {
+        let (child, path) = match children.next().await {
+            Ok(Some((_, child, name))) => {
+                let path = match &mut spelled {
+                    Some(path) => path.pop().push(&*name),
+                    None => spelled.insert(directory.push_into_buf(&*name)),
+                };
+                (child, &*path)
+            }
+            Ok(None) => break,
+            Err(_) => return Placement::Stays,
+        };
+        if child.is_staged_delete() {
+            continue;
+        }
+        empty = false;
+        let (child_states, excluded) =
+            filter.child_excludes_tree(states, path, !child.is_file(), FilterMode::View);
+        let places = if child.is_directory() {
+            !child_states.excluded(FilterMode::View)
+                && child_states.creates_directory(child.child().is_none())
+        } else {
+            !excluded
+        };
+        if places {
+            return Placement::Stays;
+        }
+    }
+    if empty {
+        Placement::Created
+    } else {
+        Placement::Unplaced
+    }
+}
+
+/// What a revision holds at a directory ([`held_directory`]).
+enum Held {
+    /// Nothing, or what can't be read.
+    Nothing,
+    /// A link's mount, which stands on disk for the link whatever the view.
+    Mount,
+    /// The directory node, in the tree holding it.
+    Directory(state::DiffSide, NodeID),
+}
+
+/// What `target`'s revision holds at the directory `directory`, spelled from the top-level root
+/// below `target`'s path, crossing each link on the way into its linked tree. The children of the
+/// directory's parent are read once into `parents`, which answers the parent's other children
+/// from memory, and a directory below a parent the revision doesn't hold is held nowhere.
+async fn held_directory(
+    target: &NodeMapping,
+    directory: &RelativePath,
+    parents: &mut ParentLookup,
+) -> Held {
+    let parent = directory.parent_path();
+    if parents
+        .at
+        .as_ref()
+        .is_none_or(|(at, _, _)| at.as_str() != parent.as_str())
+    {
+        parents.at = None;
+        match held_by_path(target, &parent).await {
+            Held::Directory(side, node) => {
+                if let Ok(index) = side.child_index(node).await {
+                    parents.at = Some((parent, side, index));
+                }
+            }
+            Held::Nothing => return Held::Nothing,
+            Held::Mount => {}
+        }
+    }
+    let Some((_, side, index)) = &parents.at else {
+        return held_by_path(target, directory).await;
+    };
+    match index.find(directory.name()) {
+        state::IndexedChild::Absent => Held::Nothing,
+        state::IndexedChild::One(node) => {
+            match side.state.node(side.repository.clone(), node).await {
+                Ok(found) if found.is_link() => Held::Mount,
+                Ok(_) => Held::Directory(side.clone(), node),
+                Err(_) => Held::Nothing,
+            }
+        }
+        state::IndexedChild::Several => held_by_path(target, directory).await,
+    }
+}
+
+/// The parent directory [`held_directory`] read the children of last, with the tree holding it.
+#[derive(Default)]
+struct ParentLookup {
+    at: Option<(RelativePath, state::DiffSide, state::ChildIndex)>,
+}
+
+/// What `target`'s revision holds at `directory`, found by its path from `target`'s node.
+async fn held_by_path(target: &NodeMapping, directory: &RelativePath) -> Held {
+    let Some(mut rest) = directory.below(&target.path) else {
+        return Held::Nothing;
+    };
     let mut side = state::DiffSide {
         repository: target.repository.clone(),
         state: target.state.clone(),
         node: target.node,
     };
     loop {
-        let stop = side.stop(rest).await.ok()?;
+        let Ok(stop) = side.stop(rest).await else {
+            return Held::Nothing;
+        };
         match stop.at {
-            state::Stop::End => return side.state.node(side.repository, stop.node).await.ok(),
+            state::Stop::End => return Held::Directory(side, stop.node),
             state::Stop::Link(link) if stop.length < rest.len() => {
                 rest = &rest[stop.length + 1..];
-                side = side.enter(&link).await.ok()?;
+                let Ok(linked) = side.enter(&link).await else {
+                    return Held::Nothing;
+                };
+                side = linked;
             }
-            state::Stop::Link(_) | state::Stop::Missing => return None,
+            state::Stop::Link(_) => return Held::Mount,
+            state::Stop::Missing => return Held::Nothing,
         }
     }
 }

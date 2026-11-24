@@ -1008,6 +1008,7 @@ async fn report_layer_staged_diff(
         )
         .await,
         selection.mount_path.clone(),
+        state::DiffFlags::empty(),
         FilterMode::CHANGES,
     )
     .await

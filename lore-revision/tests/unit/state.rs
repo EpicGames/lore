@@ -3244,6 +3244,7 @@ async fn a_whole_directory_is_listed_once_and_expands_to_the_full_diff() {
             from,
             repository.clone(),
             to,
+            lore_revision::state::diff::DiffFlags::empty(),
             FilterMode::Full,
         )
         .await
@@ -3337,6 +3338,7 @@ async fn files_of_a_deleted_directory_sharing_an_identity_with_an_add_are_listed
             from,
             repository.clone(),
             to,
+            lore_revision::state::diff::DiffFlags::empty(),
             FilterMode::Full,
         )
         .await
@@ -3416,6 +3418,7 @@ async fn a_directory_moved_to_another_parent_lists_each_file_as_a_move_once() {
             from,
             repository.clone(),
             to,
+            lore_revision::state::diff::DiffFlags::empty(),
             FilterMode::Full,
         )
         .await
@@ -3491,6 +3494,7 @@ async fn a_level_of_a_deleted_directory_holds_its_children_alone() {
             from,
             repository.clone(),
             to,
+            lore_revision::state::diff::DiffFlags::empty(),
             FilterMode::Full,
         )
         .await
@@ -4309,6 +4313,7 @@ async fn realize_with_subtrees(
         from,
         repository.clone(),
         to,
+        lore_revision::state::diff::DiffFlags::empty(),
         FilterMode::Full,
     )
     .await
@@ -4327,7 +4332,7 @@ async fn realize_with_subtrees(
         None,
         false,
         None, /* Not a merge */
-        None, /* No view change */
+        Some(&lore_revision::fs::realize::EmptiedDirectories::Excluded),
         Arc::default(),
     )
     .await
@@ -4360,6 +4365,7 @@ async fn a_listed_file_below_a_deleted_directory_that_no_move_pairs_is_deleted()
             from,
             repository.clone(),
             to,
+            lore_revision::state::diff::DiffFlags::empty(),
             FilterMode::Full,
         )
         .await
@@ -4382,7 +4388,6 @@ async fn a_listed_file_below_a_deleted_directory_that_no_move_pairs_is_deleted()
             state_stage: None,
             dry_run: false,
             merge_current: None,
-            view_change: None,
             stats: Arc::default(),
         });
         let deleted = lore_revision::fs::realize::realize_changes_delete(
